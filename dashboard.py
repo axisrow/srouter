@@ -27,10 +27,14 @@ SCUTIL = "/usr/sbin/scutil"
 # Скопируй шаблон: cp srouter_config.example.py srouter_config.py
 try:
     import srouter_config as _cfg
-    VPS_IP = _cfg.VPS_IP
     GATEWAY = _cfg.GATEWAY
     VPN_SERVER = _cfg.VPN_SERVER
     VPN_EXIT_IP = _cfg.VPN_EXIT_IP
+    _CFG_VPS_IP = getattr(_cfg, "VPS_IP", "")   # legacy fallback
+    import node_registry
+    def _active_host():
+        return node_registry.active_node().get("host") or _CFG_VPS_IP
+    VPS_IP = _active_host()
 except ImportError:
     raise SystemExit("Нет srouter_config.py — скопируй: cp srouter_config.example.py srouter_config.py")
 

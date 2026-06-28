@@ -1,0 +1,32 @@
+[
+  {
+    "name": "nl-ams-01",
+    "host": "203.0.113.10",
+    "port": 443,
+    "country_code": "NL",
+    "uuid": "00000000-0000-4000-8000-000000000001",
+    "enabled": true,
+    "reality": {
+      "public_key": "REPLACE_WITH_REALITY_PUBLIC_KEY",
+      "short_id": "0123456789abcdef",
+      "sni": "www.microsoft.com",
+      "dest": "www.microsoft.com:443",
+      "flow": "xtls-rprx-vision"
+    }
+  },
+  {
+    "name": "sg-sin-01",
+    "host": "198.51.100.20",
+    "port": 443,
+    "country_code": "SG",
+    "uuid": "00000000-0000-4000-8000-000000000002",
+    "enabled": false,
+    "reality": {
+      "public_key": "REPLACE_WITH_REALITY_PUBLIC_KEY",
+      "short_id": "fedcba9876543210",
+      "sni": "www.apple.com",
+      "dest": "www.apple.com:443",
+      "flow": "xtls-rprx-vision"
+    }
+  }
+]
