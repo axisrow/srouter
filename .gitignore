@@ -1,6 +1,12 @@
 # Локальная конфигурация (реальные адреса инфраструктуры)
 srouter_config.py
 
+# Секреты окружения
+.env
+.env.*
+*.env
+!.env.example
+
 # Local MCP config (may contain API keys)
 .mcp.json
 
@@ -18,3 +24,7 @@ diag-vpn.txt
 
 # Служебные экспорты сессий
 *local-command-caveat*.md
+
+# Нерелевантные srouter файлы (остаются на диске)
+CLAUDE.md
+habr-claude-code-china.md
