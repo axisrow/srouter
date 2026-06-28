@@ -1,0 +1,20 @@
+# Локальная конфигурация (реальные адреса инфраструктуры)
+srouter_config.py
+
+# Local MCP config (may contain API keys)
+.mcp.json
+
+# Python
+__pycache__/
+*.pyc
+
+# Бэкапы и временное
+*.bak
+*.bak-*
+dashboard.py.bak-*
+
+# Диагностика с реальными сетевыми данными
+diag-vpn.txt
+
+# Служебные экспорты сессий
+*local-command-caveat*.md
