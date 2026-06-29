@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "nodes": [
+    {
+      "name": "sg-1",
+      "endpoint_host": "203.0.113.10",
+      "route_ip": "203.0.113.10",
+      "port": 443,
+      "country_code": "SG",
+      "enabled": true,
+      "uuid": "00000000-0000-4000-8000-000000000000",
+      "reality": {
+        "public_key": "PLACEHOLDER",
+        "short_id": "0123456789abcdef",
+        "sni": "www.163.com",
+        "dest": "www.163.com:443",
+        "flow": "xtls-rprx-vision"
+      },
+      "probe": { "socks_port": 11080 }
+    },
+    {
+      "name": "hk-1",
+      "endpoint_host": "203.0.113.20",
+      "route_ip": "203.0.113.20",
+      "port": 443,
+      "country_code": "HK",
+      "enabled": false,
+      "uuid": "00000000-0000-4000-8000-000000000001",
+      "reality": {
+        "public_key": "PLACEHOLDER",
+        "short_id": "fedcba9876543210",
+        "sni": "www.163.com",
+        "dest": "www.163.com:443",
+        "flow": "xtls-rprx-vision"
+      },
+      "probe": { "socks_port": 11081 }
+    }
+  ],
+  "active_node": { "name": "sg-1", "pending": null },
+  "probes": {
+    "reachability_targets": ["https://api.ip.sb/ip", "https://www.cloudflare.com/cdn-cgi/trace"],
+    "throughput_targets": [{ "url": "https://speed.cloudflare.com/__down?bytes=1048576", "bytes": 1048576 }],
+    "connect_timeout_sec": 4,
+    "max_time_sec": 8
+  },
+  "network": {
+    "gateway": "192.0.2.1",
+    "vpn_server": "198.51.100.20",
+    "vpn_exit_ip": "198.51.100.20",
+    "channels": { "wifi_service": "Wi-Fi", "usb_tether_service": "" }
+  },
+  "traffic_guard": { "mode": "off", "domains": { "example.com": "allow" } },
+  "detected_environment": { "last_checked_at": null, "brew": null, "xray": null, "privoxy": null, "dnsmasq": null },
+  "runtime": { "last_apply": null, "last_error": null }
+}
