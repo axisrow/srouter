@@ -1,0 +1,16 @@
+{
+  "log": {
+    "loglevel": "warning"
+  },
+  "srouter": {
+    "marker": "srouter-managed",
+    "managed": true,
+    "generated_by": "gen_xray_config.py"
+  },
+  "inbounds": [],
+  "outbounds": [],
+  "routing": {
+    "domainStrategy": "AsIs",
+    "rules": []
+  }
+}
