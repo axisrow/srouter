@@ -22,6 +22,7 @@ import local_state
 
 
 MARKER = "srouter-managed"
+TEXT_MARKER = "srouter-managed-config-v1"
 ROOT = Path(__file__).resolve().parent
 
 BREW = "/opt/homebrew/bin/brew"
@@ -122,7 +123,7 @@ def _has_marker(path):
     first_line = head.splitlines()[0].strip() if head.splitlines() else ""
     if first_line.startswith("#"):
         first_line = first_line[1:].strip()
-    return first_line == MARKER or first_line.startswith(MARKER + ":")
+    return first_line == TEXT_MARKER
 
 
 def _parse_brew_services(text):
