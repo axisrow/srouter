@@ -50,6 +50,13 @@
     "channels": { "wifi_service": "Wi-Fi", "usb_tether_service": "" }
   },
   "traffic_guard": { "mode": "off", "domains": { "example.com": "allow" } },
-  "detected_environment": { "last_checked_at": null, "brew": null, "xray": null, "privoxy": null, "dnsmasq": null },
+  "detected_environment": {
+    "last_checked_at": null,
+    "brew": null,
+    "xray": null,
+    "privoxy": null,
+    "dnsmasq": null,
+    "launchagent": null
+  },
   "runtime": { "last_apply": null, "last_error": null }
 }
