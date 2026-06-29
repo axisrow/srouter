@@ -11,6 +11,7 @@ ENDPOINT_HOST=""
 ROUTE_IP=""
 COUNTRY_CODE=""
 ENABLED="true"
+COMPOSE_WAIT_TIMEOUT="${COMPOSE_WAIT_TIMEOUT:-60}"
 PROBE_SOCKS_PORT="11080"
 LISTEN_PORT="443"
 XRAY_DEST="www.163.com:443"
@@ -421,6 +422,11 @@ write_full_node_from_partial() {
   printf '%s\n' "$full_node"
 }
 
+print_rendered_node_object() {
+  [[ -s "$NODE_OBJECT_PATH" ]] || die "node-object bundle не найден: ${NODE_OBJECT_PATH}"
+  cat "$NODE_OBJECT_PATH"
+}
+
 render_bundle() {
   local partial_json
 
@@ -443,15 +449,13 @@ docker_compose() {
 }
 
 deploy_bundle() {
-  local partial_json
-
   assert_docker_compose
   render_bundle >/dev/null
-  docker_compose up -d --build
-  if ! partial_json="$(docker_compose exec -T reality-node cat /var/lib/srouter-reality/node_object.json)"; then
-    die "не удалось прочитать node-object из контейнера reality-node"
-  fi
-  write_full_node_from_partial "$partial_json"
+  docker_compose up -d --build --wait --wait-timeout "$COMPOSE_WAIT_TIMEOUT"
+  # Не читаем node_object.json из persistent volume: при повторном deploy там может
+  # лежать старый объект до завершения entrypoint. Источник истины для вывода —
+  # текущий bundle/.env; health wait выше подтверждает, что контейнер применился.
+  print_rendered_node_object
 }
 
 main() {

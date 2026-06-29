@@ -274,7 +274,7 @@ def test_deploy_requires_docker_compose_before_rendering(tmp_path):
     assert docker_calls.read_text(encoding="utf-8").splitlines() == ["docker compose version"]
 
 
-def test_deploy_runs_compose_and_merges_container_node_object(tmp_path):
+def test_deploy_runs_compose_wait_and_prints_env_node_object(tmp_path):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     key_calls = tmp_path / "key-calls.log"
@@ -291,23 +291,7 @@ def test_deploy_runs_compose_and_merges_container_node_object(tmp_path):
         if [[ "${{1:-}}" == "compose" && "${{2:-}}" == "version" ]]; then
           exit 0
         fi
-        if [[ "$*" == *" up -d --build" ]]; then
-          exit 0
-        fi
-        if [[ "$*" == *" exec -T reality-node cat /var/lib/srouter-reality/node_object.json" ]]; then
-          cat <<'JSON'
-        {{
-          "port": 443,
-          "uuid": "{UUID}",
-          "reality": {{
-            "public_key": "{PUBLIC_KEY}",
-            "short_id": "{SHORT_ID}",
-            "sni": "www.163.com",
-            "dest": "www.163.com:443",
-            "flow": "xtls-rprx-vision"
-          }}
-        }}
-        JSON
+        if [[ "$*" == *" up -d --build --wait --wait-timeout 60" ]]; then
           exit 0
         fi
         exit 70
@@ -342,8 +326,7 @@ def test_deploy_runs_compose_and_merges_container_node_object(tmp_path):
     assert node["reality"]["public_key"] == PUBLIC_KEY
     assert docker_calls.read_text(encoding="utf-8").splitlines() == [
         "docker compose version",
-        f"docker compose --env-file {bundle / '.env'} -f {bundle / 'docker-compose.yml'} up -d --build",
-        f"docker compose --env-file {bundle / '.env'} -f {bundle / 'docker-compose.yml'} exec -T reality-node cat /var/lib/srouter-reality/node_object.json",
+        f"docker compose --env-file {bundle / '.env'} -f {bundle / 'docker-compose.yml'} up -d --build --wait --wait-timeout 60",
     ]
 
 
@@ -398,11 +381,7 @@ def test_deploy_reuses_generate_bundle_without_second_key_generation(tmp_path):
         if [[ "${{1:-}}" == "compose" && "${{2:-}}" == "version" ]]; then
           exit 0
         fi
-        if [[ "$*" == *" up -d --build" ]]; then
-          exit 0
-        fi
-        if [[ "$*" == *" exec -T reality-node cat /var/lib/srouter-reality/node_object.json" ]]; then
-          cat "{bundle / 'node_object.partial.json'}"
+        if [[ "$*" == *" up -d --build --wait --wait-timeout 60" ]]; then
           exit 0
         fi
         exit 70
@@ -431,6 +410,72 @@ def test_deploy_reuses_generate_bundle_without_second_key_generation(tmp_path):
         "xray x25519",
         f"xray x25519 -i {PRIVATE_KEY}",
     ]
+
+
+def test_deploy_does_not_print_stale_volume_node_object(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    key_calls = tmp_path / "key-calls.log"
+    docker_calls = tmp_path / "docker.log"
+    bundle = tmp_path / "bundle"
+    _fake_key_tools(bin_dir, key_calls)
+    old_uuid = "11111111-1111-4111-8111-111111111111"
+    old_public_key = "ccccccccccccccccccccccccccccccccccccccccccc"
+
+    _write_tool(
+        bin_dir,
+        "docker",
+        f"""
+        #!/usr/bin/env bash
+        set -euo pipefail
+        printf 'docker %s\\n' "$*" >> "{docker_calls}"
+        if [[ "${{1:-}}" == "compose" && "${{2:-}}" == "version" ]]; then
+          exit 0
+        fi
+        if [[ "$*" == *" up -d --build --wait --wait-timeout 60" ]]; then
+          exit 0
+        fi
+        if [[ "$*" == *" exec -T reality-node cat /var/lib/srouter-reality/node_object.json" ]]; then
+          cat <<'JSON'
+        {{
+          "port": 443,
+          "uuid": "{old_uuid}",
+          "reality": {{
+            "public_key": "{old_public_key}",
+            "short_id": "ffffffffffffffff",
+            "sni": "www.163.com",
+            "dest": "www.163.com:443",
+            "flow": "xtls-rprx-vision"
+          }}
+        }}
+        JSON
+          exit 0
+        fi
+        exit 70
+        """,
+    )
+
+    proc = _run(
+        [
+            "bash",
+            str(SERVER / "deploy.sh"),
+            "deploy",
+            "--bundle-dir",
+            str(bundle),
+            "--name",
+            "sg-1",
+            "--endpoint-host",
+            "203.0.113.77",
+        ],
+        env=_env_with(bin_dir),
+    )
+
+    node = json.loads(proc.stdout)
+    assert node["uuid"] == UUID
+    assert node["reality"]["public_key"] == PUBLIC_KEY
+    assert node["uuid"] != old_uuid
+    assert node["reality"]["public_key"] != old_public_key
+    assert all("exec -T reality-node cat" not in line for line in docker_calls.read_text(encoding="utf-8").splitlines())
 
 
 def test_shell_syntax_valid():
