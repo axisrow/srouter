@@ -86,12 +86,12 @@ def test_rank_nodes_weight_sum_and_single_node_degenerate_score():
 
     assert node_selector.W_TPUT + node_selector.W_LAT + node_selector.W_LOSS == pytest.approx(1.0)
 
-    ranked = node_selector.rank_nodes(
-        [{"name": "sg-1", "ping_ms": 20, "loss": 0.0, "throughput_kbps": 1000, "status": "ok"}]
-    )
+    metrics = {"name": "sg-1", "ping_ms": 20, "loss": 0.0, "throughput_kbps": 1000, "status": "ok"}
+    ranked = node_selector.rank_nodes([metrics])
 
     assert ranked[0]["score"] == pytest.approx(1.0)
     assert ranked[0]["rank"] == 1
+    assert node_selector.score_node(metrics) == ranked[0]["score"]
 
 
 def test_rank_nodes_puts_unusable_measurements_last_by_name():
@@ -286,6 +286,40 @@ def test_select_node_restart_failure_rolls_back_active_and_config(tmp_path, monk
     assert "outbound_hook" in write_kwargs[0]
     assert "outbound_hook" not in write_kwargs[1]
     assert runner_calls == [(node_selector.XRAY_RESTART_CMD, 40), (node_selector.XRAY_RESTART_CMD, 40)]
+
+
+def test_select_node_restart_failure_reports_rollback_failed_when_restore_write_fails(tmp_path, monkeypatch):
+    import node_selector
+
+    state_path = tmp_path / "srouter.local.json"
+    _write_state(state_path, _state())
+    write_kwargs = []
+    runner_calls = []
+
+    def fake_write(path, state_path=None, **kwargs):
+        write_kwargs.append(kwargs)
+        return len(write_kwargs) == 1
+
+    monkeypatch.setattr(gen_xray_config, "write_config", fake_write)
+
+    out = node_selector.select_node(
+        "hk-1",
+        enabled_names={"sg-1", "hk-1"},
+        runner=lambda cmd, timeout: runner_calls.append((cmd, timeout)) or {"rc": 1, "out": "", "err": "boom", "timeout": False},
+        state_path=state_path,
+        config_path=tmp_path / "config.json",
+    )
+
+    assert out["ok"] is False
+    assert out["step"] == "rollback_failed"
+    assert out["failed_step"] == "restart"
+    assert out["active"] == "sg-1"
+    assert out["rollback"]["restore_ok"] is False
+    assert "rollback config restore failed" in out["error"]
+    assert _active_state(state_path) == {"name": "sg-1", "pending": None}
+    assert "outbound_hook" in write_kwargs[0]
+    assert "outbound_hook" not in write_kwargs[1]
+    assert runner_calls == [(node_selector.XRAY_RESTART_CMD, 40)]
 
 
 def test_select_node_restart_timeout_rolls_back_without_promoting(tmp_path, monkeypatch):

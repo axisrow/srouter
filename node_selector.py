@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import subprocess
+import threading
 
 import gen_xray_config
 import local_state
@@ -21,6 +22,7 @@ W_TPUT, W_LAT, W_LOSS = 0.45, 0.35, 0.20
 SWITCH_MARGIN = 0.05
 _RESTART_TIMEOUT_SEC = 40
 _UNUSABLE_STATUSES = {"down", "unknown"}
+_SELECT_LOCK = threading.Lock()
 
 
 def _num(value):
@@ -59,16 +61,9 @@ def _is_usable(metrics):
 
 
 def score_node(metrics):
-    """Pure score одного узла; None означает, что измерение нельзя ранжировать как годное."""
-    if not _is_usable(metrics):
-        return None
-    ping = _num(metrics.get("ping_ms"))
-    throughput = _num(metrics.get("throughput_kbps"))
-    loss = _num(metrics.get("loss"))
-    lat_score = 1.0 if ping is not None else 0.0
-    tput_score = 1.0 if throughput is not None else 0.0
-    loss_score = 1.0 - _clamp((loss or 0.0) / 100.0)
-    return W_TPUT * tput_score + W_LAT * lat_score + W_LOSS * loss_score
+    """Pure score одного узла; та же нормализация, что у rank_nodes для single-node окна."""
+    ranked = rank_nodes([metrics])
+    return ranked[0].get("score") if ranked else None
 
 
 def rank_nodes(metrics_list):
@@ -174,16 +169,33 @@ def _restart_failed(result):
 
 
 def _rollback(state_path, config_path, runner):
-    """Best-effort откат: active не трогаем, pending чистим, конфиг рендерим для previous active."""
+    """Blocking откат: если previous-конфиг не восстановлен, вызывающий обязан сигналить failure."""
     try:
         local_state.clear_pending(path=state_path)
-    except Exception:
-        pass
+    except Exception as exc:
+        return {"ok": False, "error": f"clear pending failed: {exc}", "restore_ok": False}
     try:
-        gen_xray_config.write_config(config_path, state_path=state_path)
-    except Exception:
-        pass
-    _run_restart(runner)
+        restored = gen_xray_config.write_config(config_path, state_path=state_path)
+    except Exception as exc:
+        return {"ok": False, "error": f"rollback config restore failed: {exc}", "restore_ok": False}
+    if not restored:
+        return {"ok": False, "error": "rollback config restore failed", "restore_ok": False}
+    restart = _run_restart(runner)
+    return {"ok": True, "restore_ok": True, "restart": restart}
+
+
+def _rollback_failed(previous, failed_step, rollback, *, error=None, extra=None):
+    out = {
+        "ok": False,
+        "active": previous,
+        "step": "rollback_failed",
+        "failed_step": failed_step,
+        "error": rollback.get("error") or error or "rollback failed",
+        "rollback": rollback,
+    }
+    if isinstance(extra, dict):
+        out.update(extra)
+    return out
 
 
 def _pending_active_hook(pending_name, state_path):
@@ -203,6 +215,17 @@ def _pending_active_hook(pending_name, state_path):
 
 def select_node(name, *, enabled_names, runner=None, state_path=None, config_path=XRAY_CONFIG_PATH):
     """Безопасно применить ручной active-node выбор. Функция никогда не бросает наружу."""
+    with _SELECT_LOCK:
+        return _select_node_locked(
+            name,
+            enabled_names=enabled_names,
+            runner=runner,
+            state_path=state_path,
+            config_path=config_path,
+        )
+
+
+def _select_node_locked(name, *, enabled_names, runner=None, state_path=None, config_path=XRAY_CONFIG_PATH):
     runner = runner or _default_runner
     previous = None
     begun = False
@@ -224,12 +247,22 @@ def select_node(name, *, enabled_names, runner=None, state_path=None, config_pat
             outbound_hook=_pending_active_hook(name, state_path),
         )
         if not rendered:
-            _rollback(state_path, config_path, runner)
+            rollback = _rollback(state_path, config_path, runner)
+            if not rollback.get("ok"):
+                return _rollback_failed(previous, "generate", rollback, error="xray config generation failed")
             return {"ok": False, "active": previous, "step": "generate", "error": "xray config generation failed"}
 
         restart = _run_restart(runner)
         if _restart_failed(restart):
-            _rollback(state_path, config_path, runner)
+            rollback = _rollback(state_path, config_path, runner)
+            if not rollback.get("ok"):
+                return _rollback_failed(
+                    previous,
+                    "restart",
+                    rollback,
+                    error=restart.get("err") or "xray restart failed",
+                    extra={"restart": restart},
+                )
             return {
                 "ok": False,
                 "active": previous,
@@ -241,10 +274,14 @@ def select_node(name, *, enabled_names, runner=None, state_path=None, config_pat
         local_state.commit_active_node_change(name, path=state_path)
         current = _active_name(state_path)
         if current != name:
-            _rollback(state_path, config_path, runner)
+            rollback = _rollback(state_path, config_path, runner)
+            if not rollback.get("ok"):
+                return _rollback_failed(previous, "commit", rollback, error="active node was not committed")
             return {"ok": False, "active": previous, "step": "commit", "error": "active node was not committed"}
         return {"ok": True, "active": current, "step": "done"}
     except Exception as exc:
         if begun:
-            _rollback(state_path, config_path, runner)
+            rollback = _rollback(state_path, config_path, runner)
+            if not rollback.get("ok"):
+                return _rollback_failed(previous, "internal", rollback, error=str(exc))
         return {"ok": False, "active": previous, "step": "internal", "error": str(exc)}
