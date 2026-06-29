@@ -36,7 +36,14 @@ _DEFAULT_STATE = {
     },
     "network": {"gateway": "", "vpn_server": "", "vpn_exit_ip": "", "channels": {}},
     "traffic_guard": {"mode": "off", "domains": {}},
-    "detected_environment": {"last_checked_at": None, "brew": None, "xray": None, "privoxy": None, "dnsmasq": None},
+    "detected_environment": {
+        "last_checked_at": None,
+        "brew": None,
+        "xray": None,
+        "privoxy": None,
+        "dnsmasq": None,
+        "launchagent": None,
+    },
     "runtime": {"last_apply": None, "last_error": None},
 }
 
