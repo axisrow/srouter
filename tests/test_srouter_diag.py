@@ -73,3 +73,32 @@ def test_srouter_diag_reads_enabled_nodes_without_real_network(tmp_path):
     assert "11080/closed" in result.stdout
     assert "https://reach.local/ping" in result.stdout
     assert "node.probe.socks_port" in result.stdout
+
+
+def test_srouter_diag_missing_local_state_reports_friendly_error(tmp_path):
+    false_bin = shutil.which("false")
+    assert false_bin
+    isolated_script = tmp_path / "srouter-diag.sh"
+    shutil.copy2(SCRIPT, isolated_script)
+    env = os.environ.copy()
+    env.update(
+        {
+            "SROUTER_PYTHON": sys.executable,
+            "SROUTER_CURL": false_bin,
+            "SROUTER_DIG": false_bin,
+            "SROUTER_LSOF": false_bin,
+            "SROUTER_ROUTE": false_bin,
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", str(isolated_script), "novpn"],
+        capture_output=True,
+        env=env,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode != 0
+    assert "local_state не найден рядом со скриптом" in result.stderr
+    assert "Traceback" not in result.stderr

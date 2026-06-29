@@ -74,6 +74,23 @@ done
 need_cmd "$PYTHON_BIN"
 need_cmd "$CURL_BIN"
 
+check_local_state() {
+  local module_path="${ROOT_DIR}/local_state.py"
+  local rc
+  [[ -f "$module_path" ]] || die "local_state не найден рядом со скриптом ($module_path)"
+  set +e
+  "$PYTHON_BIN" - "$ROOT_DIR" >/dev/null 2>&1 <<'PY'
+import sys
+
+root_dir = sys.argv[1]
+sys.path.insert(0, root_dir)
+import local_state  # noqa: F401,E402
+PY
+  rc=$?
+  set -e
+  [[ "$rc" -eq 0 ]] || die "local_state не импортируется рядом со скриптом ($module_path)"
+}
+
 # Читаем state через local_state: он валидирует узлы и даёт safe-defaults.
 read_state() {
   "$PYTHON_BIN" - "$ROOT_DIR" "$STATE_PATH" <<'PY'
@@ -156,7 +173,16 @@ for node in nodes:
 PY
 }
 
-STATE_DUMP="$(read_state)"
+check_local_state
+STATE_DUMP=""
+STATE_RC=0
+set +e
+STATE_DUMP="$(read_state 2>/dev/null)"
+STATE_RC=$?
+set -e
+if [[ "$STATE_RC" -ne 0 ]]; then
+  die "не удалось прочитать srouter.local.json через local_state (${STATE_PATH:-${ROOT_DIR}/srouter.local.json})"
+fi
 STATE_DISPLAY=""
 ACTIVE_NODE=""
 CONNECT_TIMEOUT="4"
