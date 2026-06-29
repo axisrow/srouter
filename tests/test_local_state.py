@@ -1,3 +1,4 @@
+import json
 import re
 
 import local_state
@@ -67,3 +68,56 @@ def test_save_state_atomic_creates_file(tmp_path):
     p = tmp_path / "new.json"
     local_state.save_state({"nodes": []}, path=p)
     assert p.exists()
+
+
+def test_load_nodes_drops_invalid(tmp_path):
+    p = tmp_path / "n.json"
+    p.write_text(
+        json.dumps(
+            {
+                "nodes": [
+                    {"name": "ok", "endpoint_host": "203.0.113.10", "route_ip": "203.0.113.10", "enabled": True},
+                    {"name": "bad_host", "endpoint_host": "a;rm", "route_ip": "a;rm", "enabled": True},
+                    "not-a-dict",
+                    {"name": "no_host", "enabled": True},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    names = [n["name"] for n in local_state.load_nodes(path=p)]
+    assert names == ["ok"]
+
+
+def test_enabled_nodes_strict_true(tmp_path):
+    p = tmp_path / "n.json"
+    p.write_text(
+        json.dumps(
+            {
+                "nodes": [
+                    {"name": "a", "endpoint_host": "203.0.113.10", "route_ip": "203.0.113.10", "enabled": True},
+                    {"name": "b", "endpoint_host": "203.0.113.20", "route_ip": "203.0.113.20", "enabled": False},
+                    {"name": "c", "endpoint_host": "203.0.113.30", "route_ip": "203.0.113.30"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    names = [n["name"] for n in local_state.enabled_nodes(path=p)]
+    assert names == ["a"]  # строго enabled is True
+
+
+def test_get_node_returns_dict_or_empty(tmp_path):
+    p = tmp_path / "n.json"
+    p.write_text(
+        json.dumps(
+            {
+                "nodes": [
+                    {"name": "a", "endpoint_host": "203.0.113.10", "route_ip": "203.0.113.10", "enabled": True},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert local_state.get_node("a", path=p)["name"] == "a"
+    assert local_state.get_node("missing", path=p) == {}

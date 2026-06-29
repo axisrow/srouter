@@ -81,3 +81,43 @@ def _copy_default():
     import copy
 
     return copy.deepcopy(_DEFAULT_STATE)
+
+
+def _is_valid_node(n):
+    """Запись узла валидна, если это dict с name + валидными endpoint_host/route_ip."""
+    if not isinstance(n, dict):
+        return False
+    if not isinstance(n.get("name"), str) or not n.get("name"):
+        return False
+    if not _is_valid_host(n.get("endpoint_host")):
+        return False
+    # route_ip может отсутствовать (вычисляется через resolve_route_ip),
+    # но если есть — обязан быть валидным хостом.
+    rip = n.get("route_ip")
+    if rip is not None and not _is_valid_host(rip):
+        return False
+    return True
+
+
+def load_nodes(path=None):
+    """Список валидных узлов; невалидные отбрасываются. Никогда не бросает."""
+    state = load_state(path)
+    nodes = state.get("nodes")
+    if not isinstance(nodes, list):
+        return []
+    return [n for n in nodes if _is_valid_node(n)]
+
+
+def enabled_nodes(path=None):
+    """Только узлы с enabled is True (строго)."""
+    return [n for n in load_nodes(path) if n.get("enabled") is True]
+
+
+def get_node(name, path=None):
+    """Узел по имени или {} если нет."""
+    if not isinstance(name, str):
+        return {}
+    for n in load_nodes(path):
+        if n.get("name") == name:
+            return n
+    return {}
