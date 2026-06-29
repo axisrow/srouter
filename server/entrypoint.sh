@@ -4,6 +4,7 @@ set -euo pipefail
 STATE_DIR="${XRAY_STATE_DIR:-/var/lib/srouter-reality}"
 TEMPLATE_PATH="${XRAY_TEMPLATE_PATH:-/etc/srouter-reality/config.template.json}"
 RENDERED_CONFIG="${XRAY_RENDERED_CONFIG:-/etc/xray/rendered/config.json}"
+NODE_OBJECT_PATH="${XRAY_NODE_OBJECT_PATH:-${STATE_DIR}/node_object.json}"
 
 log() {
   printf '[srouter-reality] %s\n' "$*"
@@ -26,9 +27,17 @@ read_state_value() {
 write_state_value() {
   local path="$1"
   local value="$2"
+  local path_dir
+  local tmp_path
 
+  path_dir="$(dirname "$path")"
+  mkdir -p "$path_dir"
   umask 077
-  printf '%s\n' "$value" > "$path"
+  tmp_path="$(mktemp "${path_dir}/.tmp.XXXXXX")"
+  printf '%s\n' "$value" > "$tmp_path"
+  chmod 600 "$tmp_path"
+  mv "$tmp_path" "$path"
+  chmod 600 "$path"
 }
 
 parse_x25519_field() {
@@ -101,12 +110,18 @@ load_or_generate_private_key() {
 }
 
 validate_config_values() {
+  local dest_host
+  local dest_port
+  local dest_port_num
+  local listen_port_num
+
   case "$LISTEN_PORT" in
     ''|*[!0-9]*)
       die "LISTEN_PORT должен быть числом от 1 до 65535"
       ;;
   esac
-  (( LISTEN_PORT >= 1 && LISTEN_PORT <= 65535 )) || die "LISTEN_PORT вне диапазона 1..65535"
+  listen_port_num=$((10#$LISTEN_PORT))
+  (( listen_port_num >= 1 && listen_port_num <= 65535 )) || die "LISTEN_PORT вне диапазона 1..65535"
 
   [[ -n "$XRAY_UUID" ]] || die "XRAY_UUID пуст"
   [[ -n "$XRAY_PRIVATE_KEY" ]] || die "XRAY_PRIVATE_KEY пуст"
@@ -115,11 +130,25 @@ validate_config_values() {
   [[ -n "$XRAY_SNI" ]] || die "XRAY_SNI пуст"
   [[ -n "$XRAY_FLOW" ]] || die "XRAY_FLOW пуст"
 
+  [[ "$XRAY_UUID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] \
+    || die "XRAY_UUID должен быть UUID в canonical-формате"
+  [[ "$XRAY_PRIVATE_KEY" =~ ^[A-Za-z0-9_-]{40,64}$ ]] \
+    || die "XRAY_PRIVATE_KEY должен быть base64url-ключом X25519 без кавычек"
   [[ "$XRAY_SHORT_ID" =~ ^[0-9a-fA-F]+$ ]] || die "XRAY_SHORT_ID должен быть hex-строкой"
   (( ${#XRAY_SHORT_ID} <= 16 )) || die "XRAY_SHORT_ID длиннее 16 hex-символов"
   (( ${#XRAY_SHORT_ID} % 2 == 0 )) || die "XRAY_SHORT_ID должен иметь чётную длину"
+  [[ "$XRAY_FLOW" =~ ^[A-Za-z0-9._-]+$ ]] || die "XRAY_FLOW содержит недопустимые символы"
+  [[ "$XRAY_SNI" =~ ^[A-Za-z0-9._-]+$ ]] || die "XRAY_SNI содержит недопустимые символы"
+  [[ "$XRAY_DEST" =~ ^[A-Za-z0-9._-]+:[0-9]{1,5}$ ]] \
+    || die "XRAY_DEST должен иметь формат host:port без кавычек"
 
   XRAY_SHORT_ID="$(printf '%s' "$XRAY_SHORT_ID" | tr 'A-F' 'a-f')"
+
+  dest_host="${XRAY_DEST%:*}"
+  dest_port="${XRAY_DEST##*:}"
+  dest_port_num=$((10#$dest_port))
+  [[ -n "$dest_host" ]] || die "XRAY_DEST host пуст"
+  (( dest_port_num >= 1 && dest_port_num <= 65535 )) || die "XRAY_DEST port вне диапазона 1..65535"
 }
 
 render_config() {
@@ -149,8 +178,7 @@ test_rendered_config() {
   fi
 }
 
-print_public_node_object() {
-  log "Публичные параметры для node-object (#4):"
+node_object_json() {
   cat <<EOF
 {
   "port": ${LISTEN_PORT},
@@ -164,6 +192,22 @@ print_public_node_object() {
   }
 }
 EOF
+}
+
+write_node_object() {
+  local node_object
+  local node_object_dir
+
+  node_object="$(node_object_json)"
+  node_object_dir="$(dirname "$NODE_OBJECT_PATH")"
+  mkdir -p "$node_object_dir"
+  write_state_value "$NODE_OBJECT_PATH" "$node_object"
+  log "node-object для #4 записан в ${NODE_OBJECT_PATH}"
+
+  if [[ "${PRINT_NODE_OBJECT:-0}" == "1" ]]; then
+    log "PRINT_NODE_OBJECT=1: печатаю node-object в stdout"
+    printf '%s\n' "$node_object"
+  fi
 }
 
 main() {
@@ -189,7 +233,7 @@ main() {
   validate_config_values
   render_config
   test_rendered_config
-  print_public_node_object
+  write_node_object
 
   if [[ $# -eq 0 ]]; then
     set -- xray run -config "$RENDERED_CONFIG"
