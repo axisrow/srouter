@@ -1,0 +1,10 @@
+# Секреты и локальные env-файлы не должны попадать в Docker build context.
+.env
+.env.*
+!.env.example
+
+# Rendered-конфиги, ключи и deploy-бандлы создаются только на сервере.
+.generated/
+generated/
+rendered/
+deploy-bundles/

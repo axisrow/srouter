@@ -8,6 +8,12 @@ srouter.local.json
 *.env
 !.env.example
 
+# Сгенерированные серверные артефакты и ключи
+server/.generated/
+server/generated/
+server/rendered/
+server/deploy-bundles/
+
 # Local MCP config (may contain API keys)
 .mcp.json
 
@@ -22,6 +28,7 @@ dashboard.py.bak-*
 
 # Диагностика с реальными сетевыми данными
 diag-vpn.txt
+diag-*.txt
 
 # Служебные экспорты сессий
 *local-command-caveat*.md
