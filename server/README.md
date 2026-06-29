@@ -1,6 +1,7 @@
 # srouter Reality node
 
 Docker-first серверный узел Xray VLESS + Reality для Linux Docker host.
+Pinned-версия upstream Xray задаётся в `server/Dockerfile` через `XRAY_VERSION`.
 
 ## Быстрый старт
 

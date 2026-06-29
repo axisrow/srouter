@@ -1,9 +1,9 @@
 # syntax=docker/dockerfile:1.7
 
-ARG XRAY_IMAGE=ghcr.io/xtls/xray-core:25.6.8
+ARG XRAY_VERSION=25.6.8
 
 # Официальный pinned-образ Xray: используем его как источник бинаря и geodata.
-FROM ${XRAY_IMAGE} AS xray
+FROM ghcr.io/xtls/xray-core:${XRAY_VERSION} AS xray
 
 # Runtime с bash/envsubst/openssl для defensive entrypoint и первого запуска.
 FROM alpine:3.22

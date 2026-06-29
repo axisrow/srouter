@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: srouter-reality:25.6.8
+    image: srouter-reality:local
     restart: unless-stopped
     ports:
       - "${LISTEN_PORT:-443}:${LISTEN_PORT:-443}/tcp"
