@@ -45,19 +45,30 @@ def load_state(path=None):
     """Загрузить state. Missing/broken/non-object -> безопасный _DEFAULT_STATE (копия).
     Никогда не бросает.
     """
+    state, _readable = _load_state_checked(path)
+    return state
+
+
+def _load_state_checked(path=None):
+    """Загрузить state и отличить missing file от битого existing file.
+
+    readable=False значит: файл был найден, но его нельзя безопасно перезаписывать мутатором.
+    """
     p = Path(path) if path else _DEFAULT_PATH
     try:
         with open(p, "r", encoding="utf-8") as f:
             data = json.load(f)
+    except FileNotFoundError:
+        return _copy_default(), True
     except (OSError, ValueError):
-        return _copy_default()
+        return _copy_default(), False
     if not isinstance(data, dict):
-        return _copy_default()
+        return _copy_default(), False
     # Не возвращаем мутируемый _DEFAULT_STATE напрямую — глубокая копия секций.
     merged = _copy_default()
     for k, v in data.items():
         merged[k] = v
-    return merged
+    return merged, True
 
 
 def save_state(state, path=None):
@@ -103,6 +114,10 @@ def _is_valid_node(n):
 def load_nodes(path=None):
     """Список валидных узлов; невалидные отбрасываются. Никогда не бросает."""
     state = load_state(path)
+    return _nodes_from_state(state)
+
+
+def _nodes_from_state(state):
     nodes = state.get("nodes")
     if not isinstance(nodes, list):
         return []
@@ -142,11 +157,13 @@ def active_node(path=None):
 
 def begin_active_node_change(name, path=None):
     """Записать pending intent только для валидного enabled узла. Возвращает state."""
-    state = load_state(path)
+    state, readable = _load_state_checked(path)
+    if not readable:
+        return state
     an = state.get("active_node")
     if not isinstance(an, dict):
         an = {"name": None, "pending": None}
-    if any(n.get("name") == name and n.get("enabled") is True for n in enabled_nodes(path)):
+    if any(n.get("name") == name and n.get("enabled") is True for n in _nodes_from_state(state)):
         an["pending"] = name
     state["active_node"] = an
     save_state(state, path)
@@ -157,7 +174,9 @@ def commit_active_node_change(name, path=None):
     """Промотировать pending -> active только если pending совпадает с name.
     Вызывается ТОЛЬКО после успеха generator/restart (#8).
     """
-    state = load_state(path)
+    state, readable = _load_state_checked(path)
+    if not readable:
+        return
     an = state.get("active_node")
     if not isinstance(an, dict):
         return
@@ -170,7 +189,9 @@ def commit_active_node_change(name, path=None):
 
 def clear_pending(path=None):
     """Сбросить pending intent (после неудачи generator/restart)."""
-    state = load_state(path)
+    state, readable = _load_state_checked(path)
+    if not readable:
+        return
     an = state.get("active_node")
     if isinstance(an, dict) and an.get("pending") is not None:
         an["pending"] = None

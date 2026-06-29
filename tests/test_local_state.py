@@ -180,6 +180,14 @@ def test_begin_rejects_unknown_node(tmp_path):
     assert local_state.load_state(path=p)["active_node"].get("pending") is None
 
 
+def test_begin_preserves_existing_broken_state_file(tmp_path):
+    p = tmp_path / "n.json"
+    broken = '{ "nodes": [{"name": "a"}], '
+    p.write_text(broken, encoding="utf-8")
+    local_state.begin_active_node_change("a", path=p)
+    assert p.read_text(encoding="utf-8") == broken
+
+
 def test_commit_promotes_after_success(tmp_path):
     p = tmp_path / "n.json"
     _base_state(p)
