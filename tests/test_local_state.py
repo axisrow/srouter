@@ -293,3 +293,45 @@ def test_example_json_active_resolves():
     """active_node example разрешается в enabled узел."""
     example = Path(__file__).resolve().parent.parent / "srouter.local.example.json"
     assert local_state.active_node(path=example)["name"] == "sg-1"
+
+
+def test_traffic_guard_validation_rejects_auto_mode():
+    errors = local_state.validate_traffic_guard({"mode": "auto", "domains": {}})
+
+    assert any("auto" in error for error in errors)
+
+
+def test_traffic_guard_validation_rejects_throttle_policy():
+    errors = local_state.validate_traffic_guard(
+        {"mode": "on", "domains": {"video.example.com": "throttle"}}
+    )
+
+    assert any("throttle" in error for error in errors)
+
+
+def test_traffic_guard_validation_rejects_non_string_policy_without_throwing():
+    errors = local_state.validate_traffic_guard({"mode": "on", "domains": {"video.example.com": ["block"]}})
+
+    assert any("video.example.com" in error for error in errors)
+
+
+def test_traffic_guard_validation_rejects_parent_child_policy_conflict():
+    errors = local_state.validate_traffic_guard(
+        {"mode": "on", "domains": {"example.com": "block", "api.example.com": "allow"}}
+    )
+
+    assert any("example.com" in error and "api.example.com" in error for error in errors)
+
+
+def test_traffic_guard_domain_match_exact_and_subdomain():
+    assert local_state._traffic_guard_domain_matches("example.com", "example.com")
+    assert local_state._traffic_guard_domain_matches("api.example.com", "example.com")
+    assert not local_state._traffic_guard_domain_matches("badexample.com", "example.com")
+
+
+def test_traffic_guard_validation_rejects_unsafe_domain():
+    errors = local_state.validate_traffic_guard(
+        {"mode": "on", "domains": {"safe.example.com;touch": "block"}}
+    )
+
+    assert any("domain" in error for error in errors)

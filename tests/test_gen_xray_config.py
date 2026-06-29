@@ -42,7 +42,7 @@ def test_generate_config_from_example_contains_active_direct_and_probe_socks():
     assert cfg["srouter"]["active_reality_dest"] == "www.163.com:443"
 
     routing = cfg["routing"]["rules"]
-    assert any(rule.get("outboundTag") == "active" for rule in routing)
+    assert not any(rule.get("outboundTag") == "active" and rule.get("domain") for rule in routing)
     assert any(rule.get("inboundTag") == ["probe-sg-1"] and rule.get("outboundTag") == "probe-out-sg-1" for rule in routing)
 
 
@@ -78,3 +78,45 @@ def test_generate_config_extension_api_adds_inbound_rule_and_hooks_outbound():
     assert any(item.get("tag") == "extra-socks" for item in cfg["inbounds"])
     assert any(rule.get("inboundTag") == ["extra-socks"] for rule in cfg["routing"]["rules"])
     assert next(item for item in cfg["outbounds"] if item["tag"] == "active")["mux"] == {"enabled": False}
+
+
+def test_generate_config_emits_blackhole_only_for_block_domains(tmp_path):
+    state = json.loads(EXAMPLE.read_text(encoding="utf-8"))
+    state["traffic_guard"] = {
+        "mode": "on",
+        "domains": {
+            "video.example.com": "block",
+            "safe.example.com": "allow",
+        },
+    }
+    path = _dump_state(tmp_path, state)
+
+    cfg = gen_xray_config.generate_config(state_path=path)
+
+    outbounds = {item["tag"]: item for item in cfg["outbounds"]}
+    assert outbounds["traffic-guard-blackhole"]["protocol"] == "blackhole"
+
+    block_rules = [rule for rule in cfg["routing"]["rules"] if rule.get("outboundTag") == "traffic-guard-blackhole"]
+    assert block_rules == [
+        {
+            "type": "field",
+            "inboundTag": ["srouter-socks"],
+            "domain": ["domain:video.example.com"],
+            "outboundTag": "traffic-guard-blackhole",
+        }
+    ]
+    assert all("domain:safe.example.com" not in rule.get("domain", []) for rule in block_rules)
+
+    active_rules = [rule for rule in cfg["routing"]["rules"] if rule.get("outboundTag") == "active"]
+    assert any("domain:safe.example.com" in rule.get("domain", []) for rule in active_rules)
+
+
+def test_generate_config_ignores_invalid_traffic_guard_domains(tmp_path):
+    state = json.loads(EXAMPLE.read_text(encoding="utf-8"))
+    state["traffic_guard"] = {"mode": "on", "domains": {"bad.example.com;touch": "block"}}
+    path = _dump_state(tmp_path, state)
+
+    rendered = json.dumps(gen_xray_config.generate_config(state_path=path), ensure_ascii=False)
+
+    assert "traffic-guard-blackhole" not in rendered
+    assert ";touch" not in rendered
