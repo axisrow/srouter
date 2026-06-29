@@ -121,3 +121,57 @@ def get_node(name, path=None):
         if n.get("name") == name:
             return n
     return {}
+
+
+def active_node(path=None):
+    """Активный узел. active_name обязан разрешаться в enabled узел;
+    иначе fallback на первый enabled; иначе {}.
+    """
+    enabled = enabled_nodes(path)
+    if not enabled:
+        return {}
+    state = load_state(path)
+    an = state.get("active_node") or {}
+    name = an.get("name") if isinstance(an, dict) else None
+    for n in enabled:
+        if n.get("name") == name:
+            return n
+    return enabled[0]  # fallback на первый enabled
+
+
+def begin_active_node_change(name, path=None):
+    """Записать pending intent только для валидного enabled узла. Возвращает state."""
+    state = load_state(path)
+    an = state.get("active_node")
+    if not isinstance(an, dict):
+        an = {"name": None, "pending": None}
+    if any(n.get("name") == name and n.get("enabled") is True for n in enabled_nodes(path)):
+        an["pending"] = name
+    state["active_node"] = an
+    save_state(state, path)
+    return state
+
+
+def commit_active_node_change(name, path=None):
+    """Промотировать pending -> active только если pending совпадает с name.
+    Вызывается ТОЛЬКО после успеха generator/restart (#8).
+    """
+    state = load_state(path)
+    an = state.get("active_node")
+    if not isinstance(an, dict):
+        return
+    if an.get("pending") == name:
+        an["name"] = name
+        an["pending"] = None
+        state["active_node"] = an
+        save_state(state, path)
+
+
+def clear_pending(path=None):
+    """Сбросить pending intent (после неудачи generator/restart)."""
+    state = load_state(path)
+    an = state.get("active_node")
+    if isinstance(an, dict) and an.get("pending") is not None:
+        an["pending"] = None
+        state["active_node"] = an
+        save_state(state, path)

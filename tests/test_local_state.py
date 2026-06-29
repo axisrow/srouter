@@ -121,3 +121,86 @@ def test_get_node_returns_dict_or_empty(tmp_path):
     )
     assert local_state.get_node("a", path=p)["name"] == "a"
     assert local_state.get_node("missing", path=p) == {}
+
+
+def _write(p, state):
+    p.write_text(json.dumps(state), encoding="utf-8")
+
+
+def _base_state(p):
+    _write(
+        p,
+        {
+            "nodes": [
+                {"name": "a", "endpoint_host": "203.0.113.10", "route_ip": "203.0.113.10", "enabled": True},
+                {"name": "b", "endpoint_host": "203.0.113.20", "route_ip": "203.0.113.20", "enabled": True},
+            ]
+        },
+    )
+
+
+def test_active_node_resolves_enabled(tmp_path):
+    p = tmp_path / "n.json"
+    _base_state(p)
+    _write(p, json.loads(p.read_text(encoding="utf-8")) | {"active_node": {"name": "b", "pending": None}})
+    assert local_state.active_node(path=p)["name"] == "b"
+
+
+def test_active_node_fallback_first_enabled_when_disabled(tmp_path):
+    p = tmp_path / "n.json"
+    _base_state(p)
+    _write(p, json.loads(p.read_text(encoding="utf-8")) | {"active_node": {"name": "b", "pending": None}})
+    # запретим b
+    st = json.loads(p.read_text(encoding="utf-8"))
+    st["nodes"][1]["enabled"] = False
+    _write(p, st)
+    assert local_state.active_node(path=p)["name"] == "a"  # fallback на первый enabled
+
+
+def test_active_node_empty_when_no_enabled(tmp_path):
+    p = tmp_path / "n.json"
+    _write(p, {"nodes": []})
+    assert local_state.active_node(path=p) == {}
+
+
+def test_begin_writes_pending_only_for_valid_enabled(tmp_path):
+    p = tmp_path / "n.json"
+    _base_state(p)
+    local_state.begin_active_node_change("b", path=p)
+    st = local_state.load_state(path=p)
+    assert st["active_node"]["pending"] == "b"
+    assert st["active_node"]["name"] != "b"  # ещё не промотирован
+
+
+def test_begin_rejects_unknown_node(tmp_path):
+    p = tmp_path / "n.json"
+    _base_state(p)
+    local_state.begin_active_node_change("ghost", path=p)
+    assert local_state.load_state(path=p)["active_node"].get("pending") is None
+
+
+def test_commit_promotes_after_success(tmp_path):
+    p = tmp_path / "n.json"
+    _base_state(p)
+    local_state.begin_active_node_change("b", path=p)
+    local_state.commit_active_node_change("b", path=p)
+    st = local_state.load_state(path=p)
+    assert st["active_node"]["name"] == "b"
+    assert st["active_node"]["pending"] is None
+
+
+def test_commit_does_not_promote_on_mismatch(tmp_path):
+    p = tmp_path / "n.json"
+    _base_state(p)
+    local_state.begin_active_node_change("b", path=p)
+    local_state.commit_active_node_change("a", path=p)  # другой name — не продвигаем
+    st = local_state.load_state(path=p)
+    assert st["active_node"]["name"] != "a"
+
+
+def test_clear_pending(tmp_path):
+    p = tmp_path / "n.json"
+    _base_state(p)
+    local_state.begin_active_node_change("b", path=p)
+    local_state.clear_pending(path=p)
+    assert local_state.load_state(path=p)["active_node"]["pending"] is None
