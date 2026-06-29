@@ -206,6 +206,8 @@ def _looks_like_ip(host):
         return False
     parts = host.split(".")
     if len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
+        if any(len(p) > 1 and p.startswith("0") for p in parts):
+            return False
         return True
     return ":" in host  # грубый IPv6-эвристик
 

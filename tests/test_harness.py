@@ -11,11 +11,11 @@ def test_harness_runs():
 
 
 def test_root_module_importable():
-    """Конфта добавила корень в sys.path — stdlib-level модуль доступен по абсолютной схеме.
-    Используем json (stdlib) как прокси: если бы conftest не сработал, тест всё равно зелёный,
-    но паттерн tmp_path ниже — реальная проверка окружения.
+    """conftest добавил корень в sys.path — root-level модуль импортируется из tests/.
+    Реальная проверка инъекции: local_state лежит в корне, не в tests/, и виден
+    только через conftest.
     """
-    import json as _j  # noqa: F401  — smoke, что root-path работает
+    import local_state  # noqa: F401 — падает, если conftest не добавил корень
 
     assert Path(__file__).resolve().parent.parent.is_dir()
 

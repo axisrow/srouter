@@ -262,6 +262,12 @@ def test_resolve_route_ip_prefers_existing_route_ip(tmp_path):
     assert local_state.resolve_route_ip(node, path=p) == "203.0.113.77"
 
 
+def test_looks_like_ip_rejects_ipv4_leading_zero_octet():
+    assert not local_state._looks_like_ip("1.2.3.04")
+    assert local_state._looks_like_ip("1.2.3.4")
+    assert local_state._looks_like_ip("0.2.3.4")
+
+
 def test_example_json_loads_and_has_enabled_node():
     """srouter.local.example.json — committed шаблон: парсится, 2 узла, ровно 1 enabled."""
     example = Path(__file__).resolve().parent.parent / "srouter.local.example.json"
