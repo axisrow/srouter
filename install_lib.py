@@ -10,8 +10,6 @@ import argparse
 import json
 import os
 import shutil
-import socket
-import subprocess
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -20,6 +18,9 @@ from pathlib import Path
 
 import gen_xray_config
 import local_state
+from sys_probe import BREW_COMPONENTS
+from sys_probe import parse_brew_services as _parse_brew_services
+from sys_probe import port_open, run
 
 
 MARKER = "srouter-managed"
@@ -34,32 +35,13 @@ NETWORKSETUP = "/usr/sbin/networksetup"
 SUDO = "/usr/bin/sudo"
 LAUNCHCTL = "/bin/launchctl"
 
-COMPONENTS = ("xray", "privoxy", "dnsmasq")
+COMPONENTS = BREW_COMPONENTS
 CHOICES = ("adopt", "overwrite", "skip")
 PORTS = {"xray": ("tcp", 10808), "privoxy": ("tcp", 8118), "dnsmasq": ("udp", 53)}
 LAUNCHAGENT_LABEL = "com.srouter.dashboard"
 LAUNCHAGENT_FILE = f"{LAUNCHAGENT_LABEL}.plist"
 LAUNCHAGENT_MARKER = "srouter-managed-launchagent-v1"
 UNINSTALL_CATEGORIES = ("configs", "services", "dns", "launchagent")
-
-
-def run(cmd_list, timeout):
-    """Паттерн как в dashboard.py: список аргументов, не бросает."""
-    try:
-        p = subprocess.run(cmd_list, capture_output=True, text=True, timeout=timeout)
-        return {"rc": p.returncode, "out": p.stdout.strip(), "err": p.stderr.strip(), "timeout": False}
-    except subprocess.TimeoutExpired:
-        return {"rc": None, "out": "", "err": "timeout", "timeout": True}
-    except Exception as exc:
-        return {"rc": None, "out": "", "err": str(exc), "timeout": True}
-
-
-def port_open(host, port, timeout=0.5):
-    try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
-    except OSError:
-        return False
 
 
 def _now():
@@ -191,17 +173,6 @@ def _install_launchagent(env, runner):
     if fallback.get("timeout") or fallback.get("rc") != 0:
         return False, "launchagent_load_failed"
     return True, ""
-
-
-def _parse_brew_services(text):
-    services = {}
-    if not isinstance(text, str):
-        return services
-    for line in text.splitlines():
-        fields = line.split()
-        if len(fields) >= 2 and fields[0] in COMPONENTS:
-            services[fields[0]] = fields[1]
-    return services
 
 
 def _port_owner(name, runner):

@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 import install_lib
+import sys_probe
 
 
 class FakeRunner:
@@ -32,6 +33,12 @@ def test_plan_does_not_write_local_state(tmp_path):
 
     assert plan["mode"] == "plan"
     assert not env.state_path.exists()
+
+
+def test_install_lib_reuses_shared_probe_helpers():
+    assert install_lib.run is sys_probe.run
+    assert install_lib.port_open is sys_probe.port_open
+    assert install_lib._parse_brew_services is sys_probe.parse_brew_services
 
 
 def test_conflict_detection_reports_foreign_config_and_port_owner(tmp_path):
