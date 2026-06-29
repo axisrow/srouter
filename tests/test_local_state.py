@@ -48,6 +48,19 @@ def test_load_state_broken_json_returns_default(tmp_path):
     assert state["nodes"] == []  # деградация, не исключение
 
 
+def test_load_state_checked_distinguishes_missing_from_broken(tmp_path):
+    missing = tmp_path / "missing.json"
+    missing_state, missing_readable = local_state.load_state_checked(path=missing)
+    assert missing_readable is True
+    assert missing_state["nodes"] == []
+
+    broken = tmp_path / "broken.json"
+    broken.write_text("{ not json", encoding="utf-8")
+    broken_state, broken_readable = local_state.load_state_checked(path=broken)
+    assert broken_readable is False
+    assert broken_state["nodes"] == []
+
+
 def test_load_state_non_object_returns_default(tmp_path):
     p = tmp_path / "arr.json"
     p.write_text("[1,2,3]", encoding="utf-8")  # валидный JSON, но не dict

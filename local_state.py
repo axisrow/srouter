@@ -49,6 +49,15 @@ def load_state(path=None):
     return state
 
 
+def load_state_checked(path=None):
+    """Загрузить state и вернуть (state, readable) для мутирующих операций.
+
+    readable=False означает: файл существует, но его нельзя безопасно
+    перезаписывать без явного backup/решения вызывающего кода.
+    """
+    return _load_state_checked(path)
+
+
 def _load_state_checked(path=None):
     """Загрузить state и отличить missing file от битого existing file.
 

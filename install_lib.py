@@ -104,8 +104,25 @@ def _read_head(path, limit=4096):
         return ""
 
 
+def _json_has_marker(path):
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return False
+    marker = data.get("srouter", {}).get("marker") if isinstance(data, dict) else None
+    return marker == MARKER
+
+
 def _has_marker(path):
-    return MARKER in _read_head(path)
+    head = _read_head(path)
+    if not head:
+        return False
+    if head.lstrip().startswith("{"):
+        return _json_has_marker(path)
+    first_line = head.splitlines()[0].strip() if head.splitlines() else ""
+    if first_line.startswith("#"):
+        first_line = first_line[1:].strip()
+    return first_line == MARKER or first_line.startswith(MARKER + ":")
 
 
 def _parse_brew_services(text):
@@ -347,7 +364,9 @@ def _management_for(mode, item):
 
 
 def _write_state_after_apply(env, plan, modes, backups):
-    state = local_state.load_state(path=env.state_path)
+    state, readable = local_state.load_state_checked(path=env.state_path)
+    if not readable:
+        return "state_unreadable"
     detected = state.get("detected_environment") if isinstance(state.get("detected_environment"), dict) else {}
     for name, item in plan["components"].items():
         mode = modes.get(name, "skipped")
@@ -366,7 +385,9 @@ def _write_state_after_apply(env, plan, modes, backups):
     runtime["last_apply"] = env.now
     runtime["last_error"] = None
     state["runtime"] = runtime
-    return local_state.save_state(state, path=env.state_path) is not None
+    if local_state.save_state(state, path=env.state_path) is None:
+        return "state_write_failed"
+    return ""
 
 
 def apply_install(env=None, *, confirm=False, choices=None, runner=run, port_checker=port_open):
@@ -384,6 +405,10 @@ def apply_install(env=None, *, confirm=False, choices=None, runner=run, port_che
             unresolved.append(name)
     if unresolved:
         return {"ok": False, "blocked": unresolved, "actions": [], "plan": plan}
+
+    _state, state_readable = local_state.load_state_checked(path=env.state_path)
+    if not state_readable:
+        return {"ok": False, "blocked": ["state_unreadable"], "actions": [], "plan": plan}
 
     modes = {}
     for name, item in plan["components"].items():
@@ -424,8 +449,9 @@ def apply_install(env=None, *, confirm=False, choices=None, runner=run, port_che
             _apply_dns(env, plan, runner)
         actions.append({"component": name, "mode": mode, "changed": True})
 
-    if not _write_state_after_apply(env, plan, modes, backups):
-        return {"ok": False, "blocked": ["state_write_failed"], "actions": actions, "plan": plan}
+    state_error = _write_state_after_apply(env, plan, modes, backups)
+    if state_error:
+        return {"ok": False, "blocked": [state_error], "actions": actions, "plan": plan}
     return {"ok": True, "blocked": [], "actions": actions, "plan": plan}
 
 

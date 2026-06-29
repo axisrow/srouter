@@ -114,3 +114,41 @@ def test_overwrite_conflict_backs_up_and_writes_managed_config(tmp_path):
     assert backup_path.read_text(encoding="utf-8") == "foreign config\n"
     state = json.loads(env.state_path.read_text(encoding="utf-8"))
     assert state["detected_environment"]["privoxy"]["backup"] == str(backup_path)
+
+
+def test_apply_blocks_broken_existing_state_without_overwriting(tmp_path):
+    env = _env(tmp_path)
+    broken = '{ "nodes": [{"name": "real-secret-node"}], '
+    env.state_path.write_text(broken, encoding="utf-8")
+
+    result = install_lib.apply_install(
+        env=env,
+        confirm=True,
+        choices={"xray": "skip", "privoxy": "skip", "dnsmasq": "skip"},
+        runner=FakeRunner(),
+        port_checker=lambda *_: False,
+    )
+
+    assert result["ok"] is False
+    assert result["blocked"] == ["state_unreadable"]
+    assert env.state_path.read_text(encoding="utf-8") == broken
+
+
+def test_foreign_config_with_marker_substring_is_conflict_and_blocks_apply(tmp_path):
+    env = _env(tmp_path)
+    config_path = env.component_paths("privoxy")["config"]
+    config_path.parent.mkdir(parents=True)
+    original = "# my own notes about srouter-managed alternatives\nlisten-address 127.0.0.1:8118\n"
+    config_path.write_text(original, encoding="utf-8")
+
+    result = install_lib.apply_install(
+        env=env,
+        confirm=True,
+        choices={"xray": "skip", "dnsmasq": "skip"},
+        runner=FakeRunner(),
+        port_checker=lambda *_: False,
+    )
+
+    assert result["ok"] is False
+    assert "privoxy" in result["blocked"]
+    assert config_path.read_text(encoding="utf-8") == original
