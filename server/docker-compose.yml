@@ -1,0 +1,29 @@
+services:
+  reality-node:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: srouter-reality:local
+    restart: unless-stopped
+    ports:
+      - "${LISTEN_PORT:-443}:${LISTEN_PORT:-443}/tcp"
+    environment:
+      LISTEN_PORT: "${LISTEN_PORT:-443}"
+      XRAY_UUID: "${XRAY_UUID:-}"
+      XRAY_PRIVATE_KEY: "${XRAY_PRIVATE_KEY:-}"
+      XRAY_SHORT_ID: "${XRAY_SHORT_ID:-}"
+      XRAY_DEST: "${XRAY_DEST:-www.163.com:443}"
+      XRAY_SNI: "${XRAY_SNI:-www.163.com}"
+      XRAY_FLOW: "${XRAY_FLOW:-xtls-rprx-vision}"
+      PRINT_NODE_OBJECT: "${PRINT_NODE_OBJECT:-0}"
+    volumes:
+      - srouter-reality-state:/var/lib/srouter-reality
+    healthcheck:
+      test: ["CMD", "xray", "run", "-test", "-config", "/etc/xray/rendered/config.json"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  srouter-reality-state:
