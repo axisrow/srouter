@@ -44,6 +44,7 @@ VPS_IP = local_state.resolve_route_ip(_active) or ACTIVE_ENDPOINT  # для rout
 PRIVOXY = ("127.0.0.1", 8118)
 XRAY_SOCKS = ("127.0.0.1", 10808)
 HTTP_PROXY_URL = "http://127.0.0.1:8118"
+PROBE_SOCKS_HOST = "127.0.0.1"
 PORT = 8787
 
 app = Flask(__name__)
@@ -73,6 +74,89 @@ def port_open(host, port, timeout=0.5):
 def _first(pattern, text):
     m = re.search(pattern, text)
     return m.group(1) if m else ""
+
+
+def _http_url(value):
+    """Только http(s)-targets из local state; curl всё равно вызывается списком args."""
+    return isinstance(value, str) and value.startswith(("http://", "https://"))
+
+
+def _safe_seconds(value, default):
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return default
+    if seconds <= 0 or seconds > 120:
+        return default
+    return int(seconds) if seconds.is_integer() else seconds
+
+
+def _seconds_arg(value):
+    return str(int(value)) if isinstance(value, int) or float(value).is_integer() else str(value)
+
+
+def _safe_port(value):
+    if isinstance(value, bool):
+        return None
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        return None
+    return port if 1 <= port <= 65535 else None
+
+
+def _probe_defaults():
+    try:
+        return local_state._DEFAULT_STATE.get("probes", {})
+    except Exception:
+        return {
+            "reachability_targets": ["https://api.ip.sb/ip"],
+            "throughput_targets": [{"url": "https://speed.cloudflare.com/__down?bytes=1048576", "bytes": 1048576}],
+            "connect_timeout_sec": 4,
+            "max_time_sec": 8,
+        }
+
+
+def _normalize_reachability_targets(raw, defaults):
+    items = raw if isinstance(raw, list) else defaults.get("reachability_targets", [])
+    targets = [x for x in items if _http_url(x)]
+    return targets or [x for x in defaults.get("reachability_targets", []) if _http_url(x)]
+
+
+def _normalize_throughput_targets(raw, defaults):
+    items = raw if isinstance(raw, list) else defaults.get("throughput_targets", [])
+    targets = []
+    for item in items:
+        if not isinstance(item, dict) or not _http_url(item.get("url")):
+            continue
+        try:
+            expected_bytes = int(item.get("bytes"))
+        except (TypeError, ValueError):
+            continue
+        if expected_bytes > 0:
+            targets.append({"url": item["url"], "bytes": expected_bytes})
+    if targets:
+        return targets
+    if raw is defaults.get("throughput_targets"):
+        return []
+    return _normalize_throughput_targets(defaults.get("throughput_targets", []), defaults)
+
+
+def _probe_options(state_path=None):
+    """Прочитать probes из local state без записи; битые значения заменяются defaults."""
+    defaults = _probe_defaults()
+    state = local_state.load_state(path=state_path)
+    raw = state.get("probes") if isinstance(state, dict) and isinstance(state.get("probes"), dict) else {}
+    connect_timeout = _safe_seconds(raw.get("connect_timeout_sec"), defaults.get("connect_timeout_sec", 4))
+    max_time = _safe_seconds(raw.get("max_time_sec"), defaults.get("max_time_sec", 8))
+    if max_time < connect_timeout:
+        max_time = connect_timeout
+    return {
+        "reachability_targets": _normalize_reachability_targets(raw.get("reachability_targets"), defaults),
+        "throughput_targets": _normalize_throughput_targets(raw.get("throughput_targets"), defaults),
+        "connect_timeout_sec": connect_timeout,
+        "max_time_sec": max_time,
+    }
 
 
 # ============================ probe-функции ============================
@@ -256,16 +340,23 @@ def probe_ips():
             "vps": node(VPS_IP, "vps"), "status": status}
 
 
-def _ping_avg(host):
-    if not host:
+def _parse_ping_stats(text):
+    """Разобрать macOS ping summary: avg RTT + packet loss. Не бросает."""
+    if not text:
         return (None, None)
-    r = run([PING, "-c", "3", "-t", "4", host], timeout=8)
-    avg = _first(r"=\s*[\d.]+/([\d.]+)/", r["out"])
-    loss = _first(r"([\d.]+)%\s*packet loss", r["out"])
+    avg = _first(r"=\s*[\d.]+/([\d.]+)/", text)
+    loss = _first(r"([\d.]+)%\s*packet loss", text)
     try:
         return (round(float(avg)) if avg else None, float(loss) if loss else None)
     except ValueError:
         return (None, None)
+
+
+def _ping_avg(host):
+    if not host:
+        return (None, None)
+    r = run([PING, "-c", "3", "-t", "4", host], timeout=8)
+    return _parse_ping_stats(r["out"])
 
 
 def probe_ping():
@@ -275,6 +366,150 @@ def probe_ping():
     st = "down" if vps_ms is None else ("ok" if vps_ms < 120 else "warn")
     return {"vps_ms": vps_ms, "vps_loss": vps_loss, "vpn_ms": vpn_ms,
             "vpn_loss": vpn_loss, "status": st}
+
+
+def _parse_http_code(text):
+    if not text:
+        return None
+    first = text.split()[0]
+    try:
+        return int(first)
+    except (TypeError, ValueError):
+        return None
+
+
+def _http_code_ok(text):
+    code = _parse_http_code(text)
+    return code is not None and 200 <= code < 400
+
+
+def _parse_throughput_output(text, expected_bytes):
+    """Разобрать curl -w 'code time size' и вернуть kbps. Битый вывод -> None."""
+    if not text:
+        return None
+    parts = text.split()
+    if len(parts) < 2 or not _http_code_ok(parts[0]):
+        return None
+    try:
+        elapsed = float(parts[1])
+        downloaded = float(parts[2]) if len(parts) >= 3 else float(expected_bytes)
+    except (TypeError, ValueError):
+        return None
+    if elapsed <= 0:
+        return None
+    if downloaded <= 0:
+        try:
+            downloaded = float(expected_bytes)
+        except (TypeError, ValueError):
+            return None
+    if downloaded <= 0:
+        return None
+    return round(downloaded * 8 / elapsed / 1000)
+
+
+def _probe_proxy_arg(port):
+    return f"socks5h://{PROBE_SOCKS_HOST}:{port}"
+
+
+def _curl_reachable_via_socks(port, opts):
+    """Лёгкая проверка, что per-node SOCKS вообще ведёт наружу."""
+    proxy = _probe_proxy_arg(port)
+    connect_timeout = _seconds_arg(opts["connect_timeout_sec"])
+    max_time = _seconds_arg(opts["max_time_sec"])
+    for url in opts["reachability_targets"]:
+        cmd = [CURL, "-sS", "-o", "/dev/null", "-x", proxy,
+               "--connect-timeout", connect_timeout, "--max-time", max_time,
+               "-w", "%{http_code}", url]
+        r = run(cmd, timeout=opts["max_time_sec"] + 2)
+        if not r["timeout"] and _http_code_ok(r["out"]):
+            return True
+    return False
+
+
+def _curl_throughput_via_socks(port, opts):
+    """Скорость через уже поднятый per-node SOCKS inbound; xray тут не трогаем."""
+    proxy = _probe_proxy_arg(port)
+    connect_timeout = _seconds_arg(opts["connect_timeout_sec"])
+    max_time = _seconds_arg(opts["max_time_sec"])
+    for target in opts["throughput_targets"]:
+        cmd = [CURL, "-sS", "-o", "/dev/null", "-x", proxy,
+               "--connect-timeout", connect_timeout, "--max-time", max_time,
+               "-w", "%{http_code} %{time_total} %{size_download}", target["url"]]
+        r = run(cmd, timeout=opts["max_time_sec"] + 2)
+        if r["timeout"]:
+            continue
+        kbps = _parse_throughput_output(r["out"], target["bytes"])
+        if kbps is not None:
+            return kbps
+    return None
+
+
+def _node_probe_status(ping_ms, loss, throughput_kbps, *, has_socks, socks_open, reachable):
+    if not has_socks:
+        return "unknown"
+    if throughput_kbps is not None:
+        if ping_ms is None or (loss is not None and loss >= 50) or ping_ms > 250:
+            return "warn"
+        return "ok"
+    if socks_open and reachable:
+        return "warn"
+    return "down"
+
+
+def _empty_node_probe(node):
+    endpoint = node.get("endpoint_host", "") if isinstance(node, dict) else ""
+    route_ip = node.get("route_ip", "") if isinstance(node, dict) else ""
+    return {"name": node.get("name", "") if isinstance(node, dict) else "",
+            "endpoint_host": endpoint or "", "route_ip": route_ip or endpoint or "",
+            "ping_ms": None, "loss": None, "throughput_kbps": None, "geo": {}, "status": "unknown"}
+
+
+def _probe_node(node, opts):
+    out = _empty_node_probe(node)
+    target = out["route_ip"] or out["endpoint_host"]
+    ping_ms, loss = _ping_avg(target)
+    out["ping_ms"], out["loss"] = ping_ms, loss
+    out["geo"] = _geo_lookup(target) if target else {}
+
+    probe = node.get("probe") if isinstance(node.get("probe"), dict) else {}
+    socks_port = _safe_port(probe.get("socks_port"))
+    if socks_port is None:
+        out["status"] = _node_probe_status(ping_ms, loss, None, has_socks=False, socks_open=False, reachable=False)
+        return out
+
+    socks_open = port_open(PROBE_SOCKS_HOST, socks_port, timeout=min(1.0, float(opts["connect_timeout_sec"])))
+    reachable = False
+    throughput_kbps = None
+    if socks_open:
+        reachable = _curl_reachable_via_socks(socks_port, opts)
+        throughput_kbps = _curl_throughput_via_socks(socks_port, opts)
+    out["throughput_kbps"] = throughput_kbps
+    out["status"] = _node_probe_status(ping_ms, loss, throughput_kbps,
+                                       has_socks=True, socks_open=socks_open, reachable=reachable)
+    return out
+
+
+def probe_nodes(state_path=None):
+    """Multi-node probes из unified local state. READ-ONLY: state не мутируется."""
+    try:
+        nodes = local_state.enabled_nodes(path=state_path)
+        opts = _probe_options(state_path=state_path)
+    except Exception:
+        return []
+    if not nodes:
+        return []
+
+    def safe_probe(node):
+        # Один битый узел не должен ломать весь dashboard: деградируем по ячейке.
+        try:
+            return _probe_node(node, opts)
+        except Exception:
+            item = _empty_node_probe(node)
+            item["status"] = "unknown"
+            return item
+
+    with ThreadPoolExecutor(max_workers=min(8, len(nodes))) as ex:
+        return list(ex.map(safe_probe, nodes))
 
 
 def _dns_check(ip):
@@ -360,9 +595,10 @@ def gather_status():
                   "route": probe_route_to_vps, "direct": probe_direct,
                   # --- киношная телеметрия ---
                   "ips": probe_ips, "ping": probe_ping, "dns": probe_dns,
-                  "ifaces": probe_ifaces, "geo_distance": probe_geo_distance}
+                  "ifaces": probe_ifaces, "geo_distance": probe_geo_distance,
+                  "nodes": probe_nodes}
         out = {}
-        with ThreadPoolExecutor(max_workers=11) as ex:
+        with ThreadPoolExecutor(max_workers=len(probes)) as ex:
             futs = {k: ex.submit(fn) for k, fn in probes.items()}
             for k, f in futs.items():
                 try:
