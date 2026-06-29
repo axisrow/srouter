@@ -204,3 +204,38 @@ def test_clear_pending(tmp_path):
     local_state.begin_active_node_change("b", path=p)
     local_state.clear_pending(path=p)
     assert local_state.load_state(path=p)["active_node"]["pending"] is None
+
+
+def test_resolve_route_ip_ip_passthrough(tmp_path):
+    p = tmp_path / "n.json"
+    _write(p, {"nodes": []})  # state должен существовать для path-контракта
+    assert local_state.resolve_route_ip({"name": "a", "endpoint_host": "203.0.113.10"}, path=p) == "203.0.113.10"
+
+
+def test_resolve_route_ip_hostname_falls_back_when_offline(monkeypatch, tmp_path):
+    # Имитируем offline: socket.gethostbyname бросает -> fallback на endpoint_host
+    p = tmp_path / "n.json"
+    _write(p, {"nodes": []})
+    import socket as _s
+
+    def _boom(host):
+        raise _s.gaierror("offline")
+
+    monkeypatch.setattr(_s, "gethostbyname", _boom)
+    out = local_state.resolve_route_ip({"name": "a", "endpoint_host": "node.example.com"}, path=p)
+    assert out == "node.example.com"  # D1: fallback на endpoint_host, не исключение
+
+
+def test_resolve_route_ip_empty_for_invalid_node(tmp_path):
+    p = tmp_path / "n.json"
+    _write(p, {"nodes": []})
+    assert local_state.resolve_route_ip({}, path=p) == ""
+    assert local_state.resolve_route_ip("not-a-node", path=p) == ""
+
+
+def test_resolve_route_ip_prefers_existing_route_ip(tmp_path):
+    p = tmp_path / "n.json"
+    _write(p, {"nodes": []})
+    node = {"name": "a", "endpoint_host": "host.example.com", "route_ip": "203.0.113.77"}
+    # route_ip уже задан и валиден -> используем его без DNS
+    assert local_state.resolve_route_ip(node, path=p) == "203.0.113.77"

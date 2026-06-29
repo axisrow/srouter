@@ -6,6 +6,7 @@ Path по умолчанию — рядом с модулем (не cwd), что
 """
 import json
 import re
+import socket
 from pathlib import Path
 
 # Путь к локальному state по умолчанию — рядом с этим модулем, не cwd.
@@ -175,3 +176,36 @@ def clear_pending(path=None):
         an["pending"] = None
         state["active_node"] = an
         save_state(state, path)
+
+
+def _looks_like_ip(host):
+    """True если строка — IPv4/IPv6-подобная (без DNS-запроса)."""
+    if not isinstance(host, str) or not host:
+        return False
+    parts = host.split(".")
+    if len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
+        return True
+    return ":" in host  # грубый IPv6-эвристик
+
+
+def resolve_route_ip(node, path=None):
+    """route_ip узла. Приоритет: уже заданный route_ip -> DNS-resolve endpoint_host
+    -> fallback на endpoint_host -> ''. D1: никогда не бросает.
+    """
+    if not isinstance(node, dict):
+        return ""
+    rip = node.get("route_ip")
+    if isinstance(rip, str) and rip and _is_valid_host(rip):
+        return rip
+    host = node.get("endpoint_host")
+    if not isinstance(host, str) or not host or not _is_valid_host(host):
+        return ""
+    if _looks_like_ip(host):
+        return host  # уже IP — passthrough
+    try:
+        resolved = socket.gethostbyname(host)
+        if resolved and _is_valid_host(resolved):
+            return resolved
+    except Exception:
+        pass
+    return host  # fallback на endpoint_host
