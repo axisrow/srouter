@@ -14,7 +14,7 @@ _DEFAULT_PATH = Path(__file__).resolve().parent / "srouter.local.json"
 
 # D2: валидация хоста — только безопасные символы, shell-метасимволы запрещены.
 # Переиспользовано из закрытого PR #19; закреплено в #2.
-_HOST_RE = re.compile(r"^[A-Za-z0-9.:_-]+$")
+_HOST_RE = re.compile(r"^[A-Za-z0-9.:_-]+\Z")
 
 
 def _is_valid_host(host):

@@ -17,6 +17,10 @@ def test_host_regex_rejects_shell_metachars():
         assert not local_state._is_valid_host(bad), bad
 
 
+def test_host_regex_rejects_trailing_newline():
+    assert not local_state._is_valid_host("1.2.3.4\n")
+
+
 def test_default_state_has_sections():
     for key in (
         "nodes",
