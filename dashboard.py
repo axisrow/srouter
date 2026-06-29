@@ -11,7 +11,7 @@ import time
 import re
 import json
 import math
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from flask import Flask, jsonify, Response
 
 import local_state
@@ -46,6 +46,9 @@ XRAY_SOCKS = ("127.0.0.1", 10808)
 HTTP_PROXY_URL = "http://127.0.0.1:8118"
 PROBE_SOCKS_HOST = "127.0.0.1"
 PORT = 8787
+STATUS_CACHE_TTL_SEC = 1.5
+STATUS_PROBE_BUDGET_SEC = 12
+NODE_PROBE_TTL_SEC = 300
 
 app = Flask(__name__)
 
@@ -464,6 +467,31 @@ def _empty_node_probe(node):
             "ping_ms": None, "loss": None, "throughput_kbps": None, "geo": {}, "status": "unknown"}
 
 
+_nodes_cache = {"ts": 0.0, "data": None}
+_nodes_lock = threading.Lock()
+
+
+def _store_node_probe_cache(data):
+    with _nodes_lock:
+        _nodes_cache.update(ts=time.time(), data=data)
+
+
+def probe_nodes_snapshot(state_path=None):
+    """Быстрый snapshot для /api/status: не запускает ping/curl/geo и не тратит трафик."""
+    now = time.time()
+    if state_path is None:
+        with _nodes_lock:
+            data = _nodes_cache.get("data")
+            if data is not None and now - _nodes_cache.get("ts", 0.0) <= NODE_PROBE_TTL_SEC:
+                return data
+            if data is not None:
+                return data  # лучше отдать stale snapshot, чем жечь throughput из status poll.
+    try:
+        return [_empty_node_probe(n) for n in local_state.enabled_nodes(path=state_path)]
+    except Exception:
+        return []
+
+
 def _probe_node(node, opts):
     out = _empty_node_probe(node)
     target = out["route_ip"] or out["endpoint_host"]
@@ -509,7 +537,10 @@ def probe_nodes(state_path=None):
             return item
 
     with ThreadPoolExecutor(max_workers=min(8, len(nodes))) as ex:
-        return list(ex.map(safe_probe, nodes))
+        data = list(ex.map(safe_probe, nodes))
+    if state_path is None:
+        _store_node_probe_cache(data)
+    return data
 
 
 def _dns_check(ip):
@@ -585,29 +616,46 @@ _cache = {"ts": 0.0, "data": None}
 _lock = threading.Lock()
 
 
+def _run_status_probe_set(probes, budget_sec):
+    """Запустить быстрые probes с общим бюджетом и не ждать зависшие futures после timeout."""
+    if not probes:
+        return {}
+    out = {}
+    ex = ThreadPoolExecutor(max_workers=len(probes))
+    futs = {k: ex.submit(fn) for k, fn in probes.items()}
+    try:
+        done, _pending = wait(futs.values(), timeout=max(0.0, float(budget_sec)))
+        for k, f in futs.items():
+            if f not in done:
+                out[k] = {"status": "unknown", "error": "timeout"}
+                continue
+            try:
+                out[k] = f.result()
+            except Exception as e:
+                out[k] = {"status": "unknown", "error": str(e) or e.__class__.__name__}
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
+    return out
+
+
 def gather_status():
+    now = time.time()
     with _lock:
-        now = time.time()
-        if _cache["data"] and now - _cache["ts"] < 1.5:
+        if _cache["data"] and now - _cache["ts"] < STATUS_CACHE_TTL_SEC:
             return _cache["data"]
-        probes = {"services": probe_services, "tunnel": probe_tunnel,
-                  "exit_ip": probe_exit_ip, "vpn": probe_vpn,
-                  "route": probe_route_to_vps, "direct": probe_direct,
-                  # --- киношная телеметрия ---
-                  "ips": probe_ips, "ping": probe_ping, "dns": probe_dns,
-                  "ifaces": probe_ifaces, "geo_distance": probe_geo_distance,
-                  "nodes": probe_nodes}
-        out = {}
-        with ThreadPoolExecutor(max_workers=len(probes)) as ex:
-            futs = {k: ex.submit(fn) for k, fn in probes.items()}
-            for k, f in futs.items():
-                try:
-                    out[k] = f.result(timeout=12)
-                except Exception as e:
-                    out[k] = {"status": "unknown", "error": str(e)}
-        out["ts"] = now
+
+    probes = {"services": probe_services, "tunnel": probe_tunnel,
+              "exit_ip": probe_exit_ip, "vpn": probe_vpn,
+              "route": probe_route_to_vps, "direct": probe_direct,
+              # --- киношная телеметрия ---
+              "ips": probe_ips, "ping": probe_ping, "dns": probe_dns,
+              "ifaces": probe_ifaces, "geo_distance": probe_geo_distance}
+    out = _run_status_probe_set(probes, STATUS_PROBE_BUDGET_SEC)
+    out["nodes"] = probe_nodes_snapshot()
+    out["ts"] = now
+    with _lock:
         _cache.update(ts=now, data=out)
-        return out
+    return out
 
 
 # ============================ privileged: osascript-мост ============================
@@ -635,6 +683,11 @@ def service_control(name, action):
 @app.get("/api/status")
 def api_status():
     return jsonify(gather_status())
+
+
+@app.get("/api/probe/nodes")
+def api_probe_nodes():
+    return jsonify(probe_nodes())
 
 
 @app.post("/api/route/<action>")

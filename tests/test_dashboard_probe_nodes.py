@@ -1,6 +1,7 @@
 import importlib
 import json
 import sys
+import time
 import types
 
 
@@ -13,6 +14,7 @@ def _fresh_dashboard(monkeypatch):
     monkeypatch.setitem(sys.modules, "srouter_config", cfg)
     dashboard = importlib.import_module("dashboard")
     dashboard._cache.update(ts=0.0, data=None)
+    dashboard._nodes_cache.update(ts=0.0, data=None)
     return dashboard
 
 
@@ -166,9 +168,10 @@ def test_probe_nodes_missing_or_invalid_socks_degrades_without_curl(monkeypatch,
     assert all(call[0] == dashboard.PING for call in calls)
 
 
-def test_gather_status_registers_probe_nodes(monkeypatch):
+def test_gather_status_returns_node_snapshot_without_running_heavy_probe(monkeypatch):
     dashboard = _fresh_dashboard(monkeypatch)
     dashboard._cache.update(ts=0.0, data=None)
+    called = False
 
     for name in (
         "probe_services",
@@ -185,8 +188,79 @@ def test_gather_status_registers_probe_nodes(monkeypatch):
     ):
         monkeypatch.setattr(dashboard, name, lambda name=name: {"status": "ok", "probe": name})
 
+    def slow_probe_nodes():
+        nonlocal called
+        called = True
+        time.sleep(0.2)
+        return [{"name": "sg-1", "status": "ok"}]
+
+    monkeypatch.setattr(dashboard, "probe_nodes", slow_probe_nodes)
+    monkeypatch.setattr(
+        dashboard.local_state,
+        "enabled_nodes",
+        lambda path=None: [{"name": "sg-1", "endpoint_host": "203.0.113.10", "route_ip": "203.0.113.10", "enabled": True}],
+    )
+
+    started = time.monotonic()
+    out = dashboard.gather_status()
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.1
+    assert called is False
+    assert out["nodes"] == [
+        {
+            "name": "sg-1",
+            "endpoint_host": "203.0.113.10",
+            "route_ip": "203.0.113.10",
+            "ping_ms": None,
+            "loss": None,
+            "throughput_kbps": None,
+            "geo": {},
+            "status": "unknown",
+        }
+    ]
+
+
+def test_gather_status_timeout_does_not_wait_for_executor_shutdown(monkeypatch):
+    dashboard = _fresh_dashboard(monkeypatch)
+    dashboard._cache.update(ts=0.0, data=None)
+    monkeypatch.setattr(dashboard, "STATUS_PROBE_BUDGET_SEC", 0.01)
+
+    def slow_probe():
+        time.sleep(0.2)
+        return {"status": "ok"}
+
+    for name in (
+        "probe_services",
+        "probe_tunnel",
+        "probe_exit_ip",
+        "probe_vpn",
+        "probe_route_to_vps",
+        "probe_direct",
+        "probe_ips",
+        "probe_ping",
+        "probe_dns",
+        "probe_ifaces",
+        "probe_geo_distance",
+    ):
+        monkeypatch.setattr(dashboard, name, slow_probe if name == "probe_services" else lambda: {"status": "ok"})
+    monkeypatch.setattr(dashboard, "probe_nodes_snapshot", lambda: [])
+
+    started = time.monotonic()
+    out = dashboard.gather_status()
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.1
+    assert out["services"]["status"] == "unknown"
+    assert out["tunnel"]["status"] == "ok"
+    assert out["nodes"] == []
+
+
+def test_api_probe_nodes_is_explicit_heavy_probe_endpoint(monkeypatch):
+    dashboard = _fresh_dashboard(monkeypatch)
     monkeypatch.setattr(dashboard, "probe_nodes", lambda: [{"name": "sg-1", "status": "ok"}])
 
-    out = dashboard.gather_status()
+    response = dashboard.app.test_client().get("/api/probe/nodes")
 
-    assert out["nodes"] == [{"name": "sg-1", "status": "ok"}]
+    assert response.status_code == 200
+    assert response.get_json() == [{"name": "sg-1", "status": "ok"}]
