@@ -72,7 +72,7 @@ def _load_state_checked(path=None):
 
 
 def save_state(state, path=None):
-    """Атомарная запись (temp + rename). Возвращает записанный state. Не бросает."""
+    """Атомарная запись (temp + rename). Возвращает state при успехе, None при ошибке. Не бросает."""
     p = Path(path) if path else _DEFAULT_PATH
     tmp = p.with_suffix(p.suffix + ".tmp")
     try:
@@ -80,11 +80,12 @@ def save_state(state, path=None):
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
         tmp.replace(p)  # atomic rename
-    except OSError:
+    except (OSError, TypeError, ValueError):
         try:
             tmp.unlink(missing_ok=True)
         except OSError:
             pass
+        return None
     return state
 
 

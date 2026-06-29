@@ -71,6 +71,14 @@ def test_save_state_atomic_creates_file(tmp_path):
     assert p.exists()
 
 
+def test_save_state_unserializable_returns_none_and_cleans_tmp(tmp_path):
+    p = tmp_path / "bad.json"
+    result = local_state.save_state({"nodes": {object()}}, path=p)
+    assert result is None
+    assert not p.exists()
+    assert not (tmp_path / "bad.json.tmp").exists()
+
+
 def test_load_nodes_drops_invalid(tmp_path):
     p = tmp_path / "n.json"
     p.write_text(
