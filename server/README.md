@@ -20,6 +20,28 @@ docker compose up -d --build
 docker compose logs -f reality-node
 ```
 
+## Двухфазный deploy workflow
+
+`deploy.sh` создаёт ignored bundle в `server/.generated/<node>/` и печатает полный JSON-объект,
+который можно вставить в `srouter.local.json.nodes[]` без конверсии схемы:
+
+```bash
+./server/deploy.sh generate --endpoint-host 203.0.113.10 --name sg-1 --country-code SG
+```
+
+`generate` только рендерит bundle: `.env`, Docker assets и `node_object.json`; Docker Compose в этом
+режиме не запускается. `deploy` сначала проверяет доступность `docker compose`, затем применяет тот же
+bundle с `docker compose up -d --build --wait` и печатает node-object из текущего bundle:
+
+```bash
+./server/deploy.sh deploy --endpoint-host 203.0.113.10 --name sg-1 --country-code SG
+```
+
+Ключи генерирует `gen-keys.sh` теми же командами и форматами, что entrypoint контейнера. Deploy-фаза
+передаёт эти значения в контейнер через `.env`, чтобы не было второй независимой генерации. Вывод
+deploy не читает `/var/lib/srouter-reality/node_object.json` из persistent volume: при повторном deploy
+там может временно лежать старый объект до завершения entrypoint.
+
 Compose читает значения из `server/.env`. Если `XRAY_UUID`, `XRAY_PRIVATE_KEY` или
 `XRAY_SHORT_ID` оставить пустыми, `entrypoint.sh` сгенерирует их при первом старте и сохранит в
 volume `srouter-reality-state`. Private key остаётся только на сервере; node-object для #4

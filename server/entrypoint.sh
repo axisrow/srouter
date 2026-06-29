@@ -42,7 +42,15 @@ write_state_value() {
 
 parse_x25519_field() {
   local field="$1"
-  awk -F': ' -v field="$field" '$1 == field { print $2 }'
+  awk -F': *' -v field="$field" '
+    function matches(label) {
+      return label == field ||
+        (field == "Private key" && label == "PrivateKey") ||
+        (field == "Public key" && label == "PublicKey") ||
+        (field == "Public key" && label == "Password (PublicKey)")
+    }
+    matches($1) { print $2; exit }
+  '
 }
 
 derive_public_key() {
@@ -162,6 +170,8 @@ render_config() {
   tmp_path="$(mktemp "${rendered_dir}/config.json.XXXXXX")"
 
   export LISTEN_PORT XRAY_UUID XRAY_PRIVATE_KEY XRAY_SHORT_ID XRAY_DEST XRAY_SNI XRAY_FLOW
+  # envsubst должен увидеть literal ${...}; Bash не должен раскрывать эти placeholders.
+  # shellcheck disable=SC2016
   envsubst '${LISTEN_PORT} ${XRAY_UUID} ${XRAY_PRIVATE_KEY} ${XRAY_SHORT_ID} ${XRAY_DEST} ${XRAY_SNI} ${XRAY_FLOW}' \
     < "$TEMPLATE_PATH" > "$tmp_path"
 
