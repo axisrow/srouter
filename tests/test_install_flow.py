@@ -20,6 +20,7 @@ def _env(tmp_path):
         root=Path(__file__).resolve().parent.parent,
         prefix=tmp_path / "homebrew",
         state_path=tmp_path / "srouter.local.json",
+        launchagent_dir=tmp_path / "LaunchAgents",
         now="2026-06-29T00:00:00Z",
     )
 
