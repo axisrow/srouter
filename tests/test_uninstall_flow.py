@@ -132,6 +132,30 @@ def test_uninstall_restores_managed_config_only_after_category_confirmation(tmp_
     assert config.read_text(encoding="utf-8") == "foreign config\n"
 
 
+def test_uninstall_restore_then_separate_stop_services_does_not_stop_restored_component(tmp_path):
+    env = _env(tmp_path)
+    backup = tmp_path / "privoxy.backup"
+    backup.write_text("foreign config\n", encoding="utf-8")
+    config = env.component_paths("privoxy")["config"]
+    config.parent.mkdir(parents=True)
+    config.write_text("# srouter-managed-config-v1\nlisten-address 127.0.0.1:8118\n", encoding="utf-8")
+    _write_state(env, {"privoxy": _managed_component(env, "privoxy", backup)})
+
+    restored = install_lib.apply_uninstall(env=env, confirmations={"configs": True}, runner=FakeRunner())
+    assert restored["ok"] is True
+    state_after_restore = json.loads(env.state_path.read_text(encoding="utf-8"))
+    assert state_after_restore["detected_environment"]["privoxy"]["management"] == {
+        "mode": "restored",
+        "managed": False,
+    }
+
+    runner = FakeRunner()
+    stopped = install_lib.apply_uninstall(env=env, confirmations={"services": True}, runner=runner)
+
+    assert stopped["ok"] is True
+    assert [install_lib.BREW, "services", "stop", "privoxy"] not in runner.calls
+
+
 def test_uninstall_does_not_delete_user_data_by_default(tmp_path):
     env = _env(tmp_path)
     backup = tmp_path / "xray.backup"
