@@ -570,6 +570,13 @@ def _is_adopted_entry(entry):
     return management.get("mode") == "adopted"
 
 
+def _is_restored_entry(entry):
+    if not isinstance(entry, dict):
+        return False
+    management = entry.get("management") if isinstance(entry.get("management"), dict) else {}
+    return management.get("mode") == "restored"
+
+
 def _component_uninstall_item(name, env, detected):
     entry = detected.get(name) if isinstance(detected.get(name), dict) else {}
     config_path = Path(entry.get("config_path") or env.component_paths(name)["config"])
@@ -577,9 +584,12 @@ def _component_uninstall_item(name, env, detected):
     marker_present = config_path.exists() and _has_marker(config_path)
     managed = _is_managed_entry(entry)
     adopted = _is_adopted_entry(entry)
+    restored = _is_restored_entry(entry)
     restorable = managed and marker_present and bool(backup_path and backup_path.exists())
     if adopted:
         status = "adopted — left untouched"
+    elif restored:
+        status = "restored — left untouched"
     elif restorable:
         status = "managed — restore available"
     elif managed:
@@ -592,6 +602,7 @@ def _component_uninstall_item(name, env, detected):
         "backup": str(backup_path) if backup_path else "",
         "managed": managed,
         "adopted": adopted,
+        "restored": restored,
         "marker_present": marker_present,
         "restorable": restorable,
         "status": status,
@@ -693,6 +704,31 @@ def _restore_backup(backup_path, target_path):
         return False
 
 
+def _mark_component_restored(env, item):
+    state, readable = local_state.load_state_checked(path=env.state_path)
+    if not readable:
+        return "state_unreadable"
+    detected = state.get("detected_environment") if isinstance(state.get("detected_environment"), dict) else {}
+    entry = detected.get(item["name"]) if isinstance(detected.get(item["name"]), dict) else {}
+    entry["config_path"] = item.get("config_path")
+    if item.get("backup"):
+        entry["backup"] = item["backup"]
+        entry["restored_from_backup"] = item["backup"]
+    # После restore текущий config снова принадлежит пользователю/системе.
+    # Это фиксирует прогресс rollback и не даёт повторному apply остановить foreign service.
+    entry["management"] = {"mode": "restored", "managed": False}
+    entry["restored_at"] = env.now
+    detected[item["name"]] = entry
+    state["detected_environment"] = detected
+
+    runtime = state.get("runtime") if isinstance(state.get("runtime"), dict) else {}
+    runtime["last_uninstall_restore"] = env.now
+    state["runtime"] = runtime
+    if local_state.save_state(state, path=env.state_path) is None:
+        return "state_write_failed"
+    return ""
+
+
 def _stop_service(name, runner):
     if name == "dnsmasq":
         return runner([SUDO, BREW, "services", "stop", "dnsmasq"], 40)
@@ -744,6 +780,9 @@ def apply_uninstall(env=None, *, confirmations=None, runner=run):
                 continue
             if not _restore_backup(Path(item["backup"]), Path(item["config_path"])):
                 return {"ok": False, "blocked": [f"{item['name']}_restore_failed"], "actions": actions, "plan": plan}
+            state_error = _mark_component_restored(env, item)
+            if state_error:
+                return {"ok": False, "blocked": [state_error], "actions": actions, "plan": plan}
             actions.append({"category": "configs", "component": item["name"], "changed": True})
     else:
         components.extend(plan["components"])
