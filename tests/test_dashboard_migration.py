@@ -22,7 +22,7 @@ def test_dashboard_source_has_no_legacy_vps_config_lookup():
 
 def test_dashboard_import_uses_local_state_without_legacy_vps(monkeypatch):
     dashboard = _fresh_dashboard_without_legacy_vps(monkeypatch)
-    assert dashboard.ACTIVE_ROUTE_IP == ""
+    assert dashboard.VPS_IP == ""
     assert dashboard.ACTIVE_ENDPOINT == ""
 
 
