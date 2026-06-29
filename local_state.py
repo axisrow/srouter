@@ -38,3 +38,46 @@ _DEFAULT_STATE = {
     "detected_environment": {"last_checked_at": None, "brew": None, "xray": None, "privoxy": None, "dnsmasq": None},
     "runtime": {"last_apply": None, "last_error": None},
 }
+
+
+def load_state(path=None):
+    """Загрузить state. Missing/broken/non-object -> безопасный _DEFAULT_STATE (копия).
+    Никогда не бросает.
+    """
+    p = Path(path) if path else _DEFAULT_PATH
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return _copy_default()
+    if not isinstance(data, dict):
+        return _copy_default()
+    # Не возвращаем мутируемый _DEFAULT_STATE напрямую — глубокая копия секций.
+    merged = _copy_default()
+    for k, v in data.items():
+        merged[k] = v
+    return merged
+
+
+def save_state(state, path=None):
+    """Атомарная запись (temp + rename). Возвращает записанный state. Не бросает."""
+    p = Path(path) if path else _DEFAULT_PATH
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+        tmp.replace(p)  # atomic rename
+    except OSError:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return state
+
+
+def _copy_default():
+    """Глубокая копия дефолтного state, чтобы тесты/мутирующие вызовы не портили константу."""
+    import copy
+
+    return copy.deepcopy(_DEFAULT_STATE)
