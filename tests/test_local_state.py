@@ -1,5 +1,6 @@
 import json
 import re
+from pathlib import Path
 
 import local_state
 
@@ -239,3 +240,17 @@ def test_resolve_route_ip_prefers_existing_route_ip(tmp_path):
     node = {"name": "a", "endpoint_host": "host.example.com", "route_ip": "203.0.113.77"}
     # route_ip уже задан и валиден -> используем его без DNS
     assert local_state.resolve_route_ip(node, path=p) == "203.0.113.77"
+
+
+def test_example_json_loads_and_has_enabled_node():
+    """srouter.local.example.json — committed шаблон: парсится, 2 узла, ровно 1 enabled."""
+    example = Path(__file__).resolve().parent.parent / "srouter.local.example.json"
+    nodes = local_state.load_nodes(path=example)
+    assert len(nodes) == 2
+    assert len(local_state.enabled_nodes(path=example)) == 1
+
+
+def test_example_json_active_resolves():
+    """active_node example разрешается в enabled узел."""
+    example = Path(__file__).resolve().parent.parent / "srouter.local.example.json"
+    assert local_state.active_node(path=example)["name"] == "sg-1"
