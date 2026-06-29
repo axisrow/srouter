@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor, wait
 from flask import Flask, jsonify, Response
 
 import local_state
+import node_selector
 
 # --- захардкоженные факты окружения (проверены) ---
 BREW = "/opt/homebrew/bin/brew"          # абсолютный путь: launchd/GUI PATH его не содержит
@@ -688,6 +689,22 @@ def api_status():
 @app.get("/api/probe/nodes")
 def api_probe_nodes():
     return jsonify(probe_nodes())
+
+
+@app.get("/api/nodes/ranking")
+def api_nodes_ranking():
+    metrics = probe_nodes_snapshot()
+    active = (local_state.active_node() or {}).get("name")
+    return jsonify(node_selector.recommendation(metrics, active))
+
+
+@app.post("/api/node/select/<name>")
+def api_node_select(name):
+    enabled = {n.get("name") for n in local_state.enabled_nodes()}
+    if name not in enabled:
+        return jsonify({"ok": False, "err": "node not enabled or unknown"}), 400
+    result = node_selector.select_node(name, enabled_names=enabled, runner=run, state_path=None)
+    return jsonify(result), (200 if result.get("ok") else 500)
 
 
 @app.post("/api/route/<action>")
