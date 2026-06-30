@@ -1,0 +1,22 @@
+# Шаблон systemd unit для bare Linux install.
+# Плейсхолдеры подставляет server/bare-install.sh, чтобы тестовый root не
+# требовал записи в настоящие /etc и /usr/local.
+[Unit]
+Description=srouter Reality node (Xray)
+Documentation=https://github.com/axisrow/srouter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=__XRAY_BIN__ run -config __XRAY_CONFIG__
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=1048576
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
