@@ -82,6 +82,50 @@ def test_apply_blocks_unresolved_conflict(tmp_path):
     assert not env.state_path.exists()
 
 
+def test_apply_blocks_invalid_traffic_guard_before_writing_xray_config(tmp_path):
+    env = _env(tmp_path)
+    env.state_path.write_text(
+        json.dumps({"traffic_guard": {"mode": "on", "domains": {"example.com": "block", "api.example.com": "allow"}}}),
+        encoding="utf-8",
+    )
+
+    result = install_lib.apply_install(
+        env=env,
+        confirm=True,
+        choices={},
+        runner=FakeRunner(),
+        port_checker=lambda *_: False,
+        install_launchagent=False,
+    )
+
+    assert result["ok"] is False
+    assert result["blocked"] == ["traffic_guard_invalid"]
+    assert "traffic_guard" in result["error"]
+    assert "api.example.com" in result["error"]
+    assert not env.component_paths("xray")["config"].exists()
+
+
+def test_apply_allows_invalid_traffic_guard_when_xray_is_skipped(tmp_path):
+    env = _env(tmp_path)
+    env.state_path.write_text(
+        json.dumps({"traffic_guard": {"mode": "auto", "domains": {"video.example.com": "block"}}}),
+        encoding="utf-8",
+    )
+
+    result = install_lib.apply_install(
+        env=env,
+        confirm=True,
+        choices={"xray": "skip", "privoxy": "skip", "dnsmasq": "skip"},
+        runner=FakeRunner(),
+        port_checker=lambda *_: False,
+        install_launchagent=False,
+    )
+
+    assert result["ok"] is True
+    assert all(action["mode"] == "skipped" for action in result["actions"])
+    assert not env.component_paths("xray")["config"].exists()
+
+
 def test_adopt_conflict_marks_component_unmanaged_and_does_not_write_config(tmp_path):
     env = _env(tmp_path)
     config_path = env.component_paths("privoxy")["config"]

@@ -2,6 +2,8 @@ import copy
 import json
 from pathlib import Path
 
+import pytest
+
 import gen_xray_config
 
 
@@ -111,12 +113,35 @@ def test_generate_config_emits_blackhole_only_for_block_domains(tmp_path):
     assert any("domain:safe.example.com" in rule.get("domain", []) for rule in active_rules)
 
 
-def test_generate_config_ignores_invalid_traffic_guard_domains(tmp_path):
+@pytest.mark.parametrize(
+    "traffic_guard",
+    [
+        {"mode": "auto", "domains": {"video.example.com": "block"}},
+        {"mode": "on", "domains": {"video.example.com": "throttle"}},
+        {"mode": "on", "domains": {"example.com": "block", "api.example.com": "allow"}},
+        {"mode": "on", "domains": {"bad.example.com;touch": "block"}},
+    ],
+)
+def test_generate_and_write_config_fail_closed_for_invalid_traffic_guard(tmp_path, traffic_guard):
     state = json.loads(EXAMPLE.read_text(encoding="utf-8"))
-    state["traffic_guard"] = {"mode": "on", "domains": {"bad.example.com;touch": "block"}}
+    state["traffic_guard"] = traffic_guard
+    path = _dump_state(tmp_path, state)
+    output = tmp_path / "config.json"
+
+    with pytest.raises(gen_xray_config.TrafficGuardValidationError):
+        gen_xray_config.generate_config(state_path=path)
+
+    assert gen_xray_config.write_config(output, state_path=path) is False
+    assert not output.exists()
+
+
+def test_generate_config_mode_off_is_valid_without_guard_rules(tmp_path):
+    state = json.loads(EXAMPLE.read_text(encoding="utf-8"))
+    state["traffic_guard"] = {"mode": "off", "domains": {"video.example.com": "block"}}
     path = _dump_state(tmp_path, state)
 
-    rendered = json.dumps(gen_xray_config.generate_config(state_path=path), ensure_ascii=False)
+    cfg = gen_xray_config.generate_config(state_path=path)
 
+    rendered = json.dumps(cfg, ensure_ascii=False)
     assert "traffic-guard-blackhole" not in rendered
-    assert ";touch" not in rendered
+    assert "domain:video.example.com" not in rendered

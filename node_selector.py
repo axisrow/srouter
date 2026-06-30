@@ -168,6 +168,13 @@ def _restart_failed(result):
     return bool(result.get("timeout")) or result.get("rc") != 0
 
 
+def _traffic_guard_preflight_error(state_path):
+    errors = gen_xray_config.traffic_guard_validation_errors(state_path=state_path)
+    if not errors:
+        return ""
+    return "traffic_guard невалиден: " + "; ".join(errors)
+
+
 def _rollback(state_path, config_path, runner):
     """Blocking откат: если previous-конфиг не восстановлен, вызывающий обязан сигналить failure."""
     try:
@@ -234,6 +241,10 @@ def _select_node_locked(name, *, enabled_names, runner=None, state_path=None, co
         allowed = {n for n in enabled_names if isinstance(n, str)} if enabled_names is not None else set()
         if name not in allowed:
             return {"ok": False, "active": previous, "step": "whitelist", "error": "node not enabled or unknown"}
+
+        guard_error = _traffic_guard_preflight_error(state_path)
+        if guard_error:
+            return {"ok": False, "active": previous, "step": "validate", "error": guard_error}
 
         local_state.begin_active_node_change(name, path=state_path)
         begun = True

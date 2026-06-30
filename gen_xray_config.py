@@ -28,6 +28,14 @@ _HEX_RE = re.compile(r"^[A-Fa-f0-9]{0,32}\Z")
 _TOKEN_RE = re.compile(r"^[A-Za-z0-9._:-]+\Z")
 
 
+class TrafficGuardValidationError(ValueError):
+    """Traffic Guard невалиден; генерация должна fail-closed, а не выключать защиту."""
+
+    def __init__(self, errors):
+        self.errors = [str(error) for error in errors if error] or ["traffic_guard invalid"]
+        super().__init__("traffic_guard невалиден: " + "; ".join(self.errors))
+
+
 def _default_template():
     return {
         "log": {"loglevel": "warning"},
@@ -183,8 +191,25 @@ def _apply_outbound_hook(outbound, outbound_hook, *, node, role):
         return outbound
 
 
-def _traffic_guard_domains(state_path=None, policy=None):
+def traffic_guard_validation_errors(state_path=None):
+    """Ошибки Traffic Guard для apply/preflight-слоёв. Пустой список значит generation-safe."""
     guard = local_state.traffic_guard_config(path=state_path)
+    if guard.get("valid") is not True:
+        errors = guard.get("errors") if isinstance(guard.get("errors"), list) else []
+        return [str(error) for error in errors if error] or ["traffic_guard invalid"]
+    return []
+
+
+def validate_traffic_guard_for_generation(state_path=None):
+    """Fail-closed gate: invalid guard не должен рендериться как обычный config."""
+    errors = traffic_guard_validation_errors(state_path=state_path)
+    if errors:
+        raise TrafficGuardValidationError(errors)
+    return local_state.traffic_guard_config(path=state_path)
+
+
+def _traffic_guard_domains(state_path=None, policy=None, guard=None):
+    guard = guard if isinstance(guard, dict) else validate_traffic_guard_for_generation(state_path=state_path)
     if guard.get("mode") != "on" or guard.get("valid") is not True:
         return []
     domains = guard.get("domains") if isinstance(guard.get("domains"), dict) else {}
@@ -211,11 +236,12 @@ def generate_config(
     outbound_hook=None,
     template_path=None,
 ):
-    """Вернуть dict xray config. Любая ошибка деградирует в минимальный direct-конфиг.
+    """Вернуть dict xray config.
 
     Extension API:
     - extra_inbounds / extra_rules / extra_outbounds добавляют секции без правки тела генератора;
     - outbound_hook(outbound, *, node, role) может заменить outbound для active/probe ролей.
+    Невалидный Traffic Guard бросает TrafficGuardValidationError: для block-фичи нужен fail-closed.
     """
     cfg = _load_template(template_path)
     cfg = copy.deepcopy(cfg)
@@ -232,8 +258,9 @@ def generate_config(
     inbounds = [_main_socks_inbound()]
     rules = []
     outbounds = [{"tag": "direct", "protocol": "freedom", "settings": {}}]
-    block_domains = _traffic_guard_domains(state_path, policy="block")
-    allow_domains = _traffic_guard_domains(state_path, policy="allow")
+    traffic_guard = validate_traffic_guard_for_generation(state_path=state_path)
+    block_domains = _traffic_guard_domains(state_path, policy="block", guard=traffic_guard)
+    allow_domains = _traffic_guard_domains(state_path, policy="allow", guard=traffic_guard)
 
     for node in nodes:
         inbound = _probe_inbound(node)
