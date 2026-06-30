@@ -26,6 +26,7 @@ IFCONFIG = "/sbin/ifconfig"
 OSASCRIPT = "/usr/bin/osascript"
 PING = "/sbin/ping"
 SCUTIL = "/usr/sbin/scutil"
+NETWORKSETUP = "/usr/sbin/networksetup"
 
 # Адреса инфраструктуры — из локального srouter_config.py (не в репозитории).
 # Скопируй шаблон: cp srouter_config.example.py srouter_config.py
@@ -294,6 +295,183 @@ def probe_direct():
     # показывает реальную работу сети без прокси, а не вечный DOWN.
     d = _curl_through("https://api.ip.sb/ip", proxy=False)
     return {"code": d["code"], "ms": d["ms"], "status": "ok" if d["up"] else "down"}
+
+
+def _parse_hardware_ports(text):
+    """networksetup -> device -> hardware port. Битый вывод просто даёт пустую карту."""
+    ports = {}
+    current = {}
+
+    def flush():
+        device = current.get("device", "")
+        if device:
+            ports[device] = dict(current)
+
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            flush()
+            current = {}
+            continue
+        if line.startswith("Hardware Port:"):
+            if current:
+                flush()
+                current = {}
+            current["hardware_port"] = line.split(":", 1)[1].strip()
+        elif line.startswith("Device:"):
+            current["device"] = line.split(":", 1)[1].strip()
+        elif line.startswith("Ethernet Address:"):
+            current["ethernet_address"] = line.split(":", 1)[1].strip()
+    flush()
+    return ports
+
+
+def _hardware_ports():
+    r = run([NETWORKSETUP, "-listallhardwareports"], timeout=4)
+    if r["timeout"] or not r["out"]:
+        return {}
+    return _parse_hardware_ports(r["out"])
+
+
+def _channel_for_iface(name, hardware_port, ifconfig_block):
+    """Классификация канала без угадывания: Wi-Fi и известный USB-tether, иначе other/unknown."""
+    text = f"{hardware_port or ''}\n{ifconfig_block or ''}".lower()
+    if "wi-fi" in text or "wifi" in text or "airport" in text:
+        return "wifi"
+    usb_tether_tokens = ("iphone usb", "android", "rndis", "usb tether", "tether")
+    if any(token in text for token in usb_tether_tokens):
+        return "usb_tether"
+    if not name and not hardware_port and not ifconfig_block:
+        return "unknown"
+    return "other"
+
+
+def _parse_ifconfig_ifaces(text, default_iface, hardware_ports):
+    ifaces = []
+    if not text:
+        return ifaces
+    for b in re.split(r"\n(?=\S)", text):
+        head = re.match(r"^(\w[\w.]*?):\s.*?mtu\s+(\d+)", b)
+        if not head:
+            continue
+        name, mtu = head.group(1), head.group(2)
+        if not re.match(r"(en\d|ppp\d|utun\d)", name):
+            continue
+        addr = _first(r"inet\s+(\d+\.\d+\.\d+\.\d+)", b)
+        if not addr and name not in (default_iface, "ppp0"):
+            continue
+        port = hardware_ports.get(name, {}) if isinstance(hardware_ports, dict) else {}
+        hardware_port = port.get("hardware_port", "") if isinstance(port, dict) else ""
+        ifaces.append({"name": name, "addr": addr or "", "mtu": mtu,
+                       "is_default": name == default_iface,
+                       "hardware_port": hardware_port,
+                       "channel": _channel_for_iface(name, hardware_port, b)})
+    ifaces.sort(key=lambda x: (not x["is_default"], x["name"]))
+    return ifaces
+
+
+def _connectivity_target():
+    try:
+        targets = _probe_options().get("reachability_targets", [])
+    except Exception:
+        targets = []
+    for target in targets:
+        if _http_url(target):
+            return target
+    return "https://api.ip.sb/ip"
+
+
+def _probe_direct_reachability():
+    """Реальная проверка интернета: curl до HTTP target, а не только link-up интерфейса."""
+    target = _connectivity_target()
+    cmd = [CURL, "-sS", "-o", "/dev/null", "--connect-timeout", "4", "--max-time", "8",
+           "-w", "%{http_code} %{time_total}", target]
+    r = run(cmd, timeout=10)
+    base = {"target": target, "code": "000", "ms": None, "reachable": None, "status": "unknown"}
+    if r["timeout"]:
+        return base
+    if not r["out"]:
+        base["reachable"] = False
+        base["status"] = "down"
+        return base
+    parts = r["out"].split()
+    if len(parts) < 2:
+        return base
+    code, elapsed = parts[0], parts[1]
+    try:
+        ms = round(float(elapsed) * 1000)
+    except (TypeError, ValueError):
+        ms = None
+    if code == "000":
+        return {"target": target, "code": code, "ms": ms, "reachable": False, "status": "down"}
+    try:
+        code_int = int(code)
+    except (TypeError, ValueError):
+        return base
+    reachable = 100 <= code_int < 600
+    return {"target": target, "code": code, "ms": ms, "reachable": reachable,
+            "status": "ok" if reachable else "down"}
+
+
+def _metered_guess(channel):
+    # На macOS нет стабильного metered API; честно отмечаем только очевидный USB-tether.
+    if channel == "usb_tether":
+        return True, "usb_tether"
+    return None, "unknown"
+
+
+def probe_connectivity():
+    """Активный канал + real reachability. Наблюдает, ничего не переключает."""
+    try:
+        dr = run([ROUTE, "-n", "get", "default"], timeout=3)
+        default_iface = _first(r"interface:\s*(\S+)", dr["out"]) if not dr["timeout"] else ""
+        hardware_ports = _hardware_ports()
+        ic = run([IFCONFIG], timeout=4)
+        ifaces = _parse_ifconfig_ifaces(ic["out"] if not ic["timeout"] else "", default_iface, hardware_ports)
+        active = next((item for item in ifaces if item["name"] == default_iface), None)
+        port = hardware_ports.get(default_iface, {}) if default_iface else {}
+        hardware_port = ""
+        if isinstance(port, dict):
+            hardware_port = port.get("hardware_port", "") or ""
+        if active and not hardware_port:
+            hardware_port = active.get("hardware_port", "") or ""
+        channel = active.get("channel", "") if active else _channel_for_iface(default_iface, hardware_port, "")
+        if (not default_iface or (not active and not hardware_port)) and channel == "other":
+            channel = "unknown"
+
+        reach = _probe_direct_reachability()
+        metered, reason = _metered_guess(channel)
+        return {
+            "active_iface": default_iface,
+            "default_iface": default_iface,
+            "addr": active.get("addr", "") if active else "",
+            "hardware_port": hardware_port,
+            "channel": channel,
+            "link_up": bool(active),
+            "reachable": reach.get("reachable"),
+            "reachability": reach,
+            "metered": metered,
+            "limited": metered,
+            "metered_reason": reason,
+            "status": reach.get("status", "unknown"),
+        }
+    except Exception as e:
+        return {
+            "active_iface": "",
+            "default_iface": "",
+            "addr": "",
+            "hardware_port": "",
+            "channel": "unknown",
+            "link_up": False,
+            "reachable": None,
+            "reachability": {"target": "", "code": "000", "ms": None,
+                             "reachable": None, "status": "unknown"},
+            "metered": None,
+            "limited": None,
+            "metered_reason": "unknown",
+            "status": "unknown",
+            "error": str(e) or e.__class__.__name__,
+        }
 
 
 def probe_traffic_guard(state_path=None):
@@ -649,22 +827,9 @@ def probe_ifaces():
     """Активные интерфейсы (en0/ppp0/utunN) addr+MTU, маркер default-маршрута."""
     dr = run([ROUTE, "-n", "get", "default"], timeout=3)
     default_iface = _first(r"interface:\s*(\S+)", dr["out"]) if not dr["timeout"] else ""
+    hardware_ports = _hardware_ports()
     r = run([IFCONFIG], timeout=4)
-    ifaces = []
-    if not r["timeout"] and r["out"]:
-        for b in re.split(r"\n(?=\S)", r["out"]):
-            head = re.match(r"^(\w[\w.]*?):\s.*?mtu\s+(\d+)", b)
-            if not head:
-                continue
-            name, mtu = head.group(1), head.group(2)
-            if not re.match(r"(en\d|ppp\d|utun\d)", name):
-                continue
-            addr = _first(r"inet\s+(\d+\.\d+\.\d+\.\d+)", b)
-            if not addr and name not in (default_iface, "ppp0"):
-                continue
-            ifaces.append({"name": name, "addr": addr or "", "mtu": mtu,
-                           "is_default": name == default_iface})
-    ifaces.sort(key=lambda x: (not x["is_default"], x["name"]))
+    ifaces = _parse_ifconfig_ifaces(r["out"] if not r["timeout"] else "", default_iface, hardware_ports)
     return {"ifaces": ifaces[:8], "default": default_iface,
             "status": "ok" if ifaces else "down"}
 
@@ -737,6 +902,7 @@ def gather_status():
         "route": lambda: probe_route_to_vps(route_ip=active_route_ip),
         "direct": probe_direct,
         "traffic_guard": probe_traffic_guard,
+        "connectivity": probe_connectivity,
         # --- киношная телеметрия ---
         "ips": lambda: probe_ips(route_ip=active_route_ip),
         "ping": lambda: probe_ping(route_ip=active_route_ip),
