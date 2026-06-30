@@ -12,6 +12,7 @@ import re
 import json
 import math
 import ipaddress
+import shlex
 from concurrent.futures import ThreadPoolExecutor, wait
 from flask import Flask, jsonify, Response
 
@@ -27,6 +28,8 @@ OSASCRIPT = "/usr/bin/osascript"
 PING = "/sbin/ping"
 SCUTIL = "/usr/sbin/scutil"
 NETWORKSETUP = "/usr/sbin/networksetup"
+CHANNEL_TARGETS = ("wifi", "usb")
+CHANNEL_SERVICE_KEYS = {"wifi": "wifi_service", "usb": "usb_tether_service"}
 
 # Адреса инфраструктуры — из локального srouter_config.py (не в репозитории).
 # Скопируй шаблон: cp srouter_config.example.py srouter_config.py
@@ -920,6 +923,136 @@ def gather_status():
 
 
 # ============================ privileged: osascript-мост ============================
+def _parse_network_services(text):
+    """networksetup -listallnetworkservices -> ordered service names, disabled marker stripped."""
+    services = []
+    for raw in (text or "").splitlines():
+        name = raw.strip()
+        if not name or name.startswith("An asterisk"):
+            continue
+        if name.startswith("*"):
+            name = name[1:].strip()
+        if name:
+            services.append(name)
+    return services
+
+
+def _known_service_name(name, services):
+    if not isinstance(name, str):
+        return ""
+    wanted = name.strip()
+    if not wanted:
+        return ""
+    for service in services:
+        if service == wanted:
+            return service
+    wanted_low = wanted.lower()
+    for service in services:
+        if service.lower() == wanted_low:
+            return service
+    return ""
+
+
+def _configured_channel_service(target, services):
+    try:
+        state = local_state.load_state()
+    except Exception:
+        state = {}
+    network = state.get("network") if isinstance(state, dict) else {}
+    channels = network.get("channels") if isinstance(network, dict) else {}
+    if not isinstance(channels, dict):
+        return ""
+    return _known_service_name(channels.get(CHANNEL_SERVICE_KEYS[target], ""), services)
+
+
+def _hardware_channel_service(target, services):
+    expected = "usb_tether" if target == "usb" else target
+    for port in _hardware_ports().values():
+        if not isinstance(port, dict):
+            continue
+        hardware_port = port.get("hardware_port", "") or ""
+        device = port.get("device", "") or ""
+        if _channel_for_iface(device, hardware_port, "") != expected:
+            continue
+        service = _known_service_name(hardware_port, services)
+        if service:
+            return service
+    return ""
+
+
+def _named_channel_service(target, services):
+    expected = "usb_tether" if target == "usb" else target
+    for service in services:
+        if _channel_for_iface("", service, "") == expected:
+            return service
+    if target == "usb":
+        for service in services:
+            if any(token in service.lower() for token in ("iphone", "android", "rndis", "tether")):
+                return service
+    return ""
+
+
+def _channel_service_name(target, services):
+    return (
+        _configured_channel_service(target, services)
+        or _hardware_channel_service(target, services)
+        or _named_channel_service(target, services)
+    )
+
+
+def _channel_result(target, result, service=""):
+    err = result.get("err") or ""
+    cancelled = result.get("rc") == -128 or "-128" in err
+    timeout = bool(result.get("timeout"))
+    return {
+        "ok": result.get("rc") == 0 and not timeout,
+        "rc": result.get("rc"),
+        "out": result.get("out") or "",
+        "err": err,
+        "cancelled": cancelled,
+        "timeout": timeout,
+        "target": target,
+        "service": service,
+    }
+
+
+def _shell_join(args):
+    return " ".join(shlex.quote(str(arg)) for arg in args)
+
+
+def _applescript_text(text):
+    return str(text).replace("\\", "\\\\").replace('"', '\\"')
+
+
+def switch_channel(target):
+    if target not in CHANNEL_TARGETS:
+        return _channel_result(target, {"rc": None, "out": "", "err": "bad channel target", "timeout": False})
+
+    listed = run([NETWORKSETUP, "-listallnetworkservices"], timeout=4)
+    if listed["timeout"] or listed["rc"] != 0:
+        return _channel_result(target, listed)
+
+    services = _parse_network_services(listed["out"])
+    service = _channel_service_name(target, services)
+    if not service:
+        return _channel_result(
+            target,
+            {"rc": None, "out": "", "err": f"network service not found for channel: {target}", "timeout": False},
+        )
+
+    ordered_services = [service] + [item for item in services if item != service]
+    enable_cmd = _shell_join([NETWORKSETUP, "-setnetworkserviceenabled", service, "on"])
+    reorder_cmd = _shell_join([NETWORKSETUP, "-ordernetworkservices", *ordered_services])
+    shell_cmd = f"{enable_cmd} && {reorder_cmd}"
+
+    # ВАЖНО: target проходит strict whitelist, а shell_cmd собран только из констант,
+    # флагов-литералов и network-service names, подтверждённых networksetup. Ввод
+    # запроса в shell-строку не попадает; новые динамические части требуют whitelist + escaping.
+    applescript = f'do shell script "{_applescript_text(shell_cmd)}" with administrator privileges'
+    result = run([OSASCRIPT, "-e", applescript], timeout=60)
+    return _channel_result(target, result, service=service)
+
+
 def sudo_route(action):
     route_ip = _active_route_ip()
     if not route_ip:
@@ -975,6 +1108,20 @@ def api_route(action):
     r = sudo_route(action)
     cancelled = r["rc"] not in (0, None) and "-128" in (r["err"] or "")
     return jsonify({"ok": r["rc"] == 0, "cancelled": cancelled, **r})
+
+
+@app.post("/api/channel")
+@app.post("/api/channel/")
+def api_channel_empty():
+    return jsonify({"ok": False, "err": "bad channel target"}), 400
+
+
+@app.post("/api/channel/<target>")
+def api_channel(target):
+    if target not in CHANNEL_TARGETS:
+        return jsonify({"ok": False, "err": "bad channel target"}), 400
+    result = switch_channel(target)
+    return jsonify(result), (200 if result.get("ok") or result.get("cancelled") else 500)
 
 
 @app.post("/api/service/<name>/<action>")
