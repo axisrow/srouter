@@ -14,6 +14,7 @@ PROBE_NAMES = (
     "probe_route_to_vps",
     "probe_direct",
     "probe_traffic_guard",
+    "probe_connectivity",
     "probe_ips",
     "probe_ping",
     "probe_dns",

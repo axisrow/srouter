@@ -58,4 +58,5 @@ def test_gather_status_registers_traffic_guard_probe(monkeypatch):
     out = dashboard.gather_status()
 
     assert "traffic_guard" in seen
+    assert "connectivity" in seen
     assert out["traffic_guard"] == {"status": "ok"}
