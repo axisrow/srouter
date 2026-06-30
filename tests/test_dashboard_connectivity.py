@@ -122,6 +122,61 @@ Ethernet Address: 12:34:56:78:90:ab
     assert out["status"] == "down"
 
 
+def test_probe_direct_reachability_empty_output_is_unknown(monkeypatch):
+    dashboard = _fresh_dashboard(monkeypatch)
+
+    def fake_run(cmd, timeout):
+        if cmd[0] == dashboard.CURL:
+            return {"rc": 0, "out": "", "err": "", "timeout": False}
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(dashboard, "run", fake_run)
+
+    out = dashboard._probe_direct_reachability()
+
+    assert out["reachable"] is None
+    assert out["status"] == "unknown"
+
+
+def test_probe_direct_reachability_curl_000_is_down(monkeypatch):
+    dashboard = _fresh_dashboard(monkeypatch)
+
+    def fake_run(cmd, timeout):
+        if cmd[0] == dashboard.CURL:
+            return {"rc": 28, "out": "000 0.000000", "err": "", "timeout": False}
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(dashboard, "run", fake_run)
+
+    out = dashboard._probe_direct_reachability()
+
+    assert out["reachable"] is False
+    assert out["status"] == "down"
+
+
+def test_probe_connectivity_unknown_channel_with_reachability_is_not_ok(monkeypatch):
+    dashboard = _fresh_dashboard(monkeypatch)
+
+    def fake_run(cmd, timeout):
+        if cmd == [dashboard.ROUTE, "-n", "get", "default"]:
+            return {"rc": 0, "out": "", "err": "", "timeout": False}
+        if cmd == [dashboard.IFCONFIG]:
+            return {"rc": 0, "out": "", "err": "", "timeout": False}
+        if cmd == [dashboard.NETWORKSETUP, "-listallhardwareports"]:
+            return {"rc": 0, "out": "", "err": "", "timeout": False}
+        if cmd[0] == dashboard.CURL:
+            return {"rc": 0, "out": "200 0.100000", "err": "", "timeout": False}
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(dashboard, "run", fake_run)
+
+    out = dashboard.probe_connectivity()
+
+    assert out["channel"] == "unknown"
+    assert out["reachable"] is True
+    assert out["status"] == "unknown"
+
+
 def test_probe_connectivity_defensive_on_empty_ifconfig_and_curl_timeout(monkeypatch):
     dashboard = _fresh_dashboard(monkeypatch)
 

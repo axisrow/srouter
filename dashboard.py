@@ -391,8 +391,6 @@ def _probe_direct_reachability():
     if r["timeout"]:
         return base
     if not r["out"]:
-        base["reachable"] = False
-        base["status"] = "down"
         return base
     parts = r["out"].split()
     if len(parts) < 2:
@@ -408,9 +406,9 @@ def _probe_direct_reachability():
         code_int = int(code)
     except (TypeError, ValueError):
         return base
-    reachable = 100 <= code_int < 600
-    return {"target": target, "code": code, "ms": ms, "reachable": reachable,
-            "status": "ok" if reachable else "down"}
+    if 100 <= code_int < 600:
+        return {"target": target, "code": code, "ms": ms, "reachable": True, "status": "ok"}
+    return base
 
 
 def _metered_guess(channel):
@@ -441,6 +439,9 @@ def probe_connectivity():
 
         reach = _probe_direct_reachability()
         metered, reason = _metered_guess(channel)
+        status = reach.get("status", "unknown")
+        if channel == "unknown" and status == "ok":
+            status = "unknown"
         return {
             "active_iface": default_iface,
             "default_iface": default_iface,
@@ -453,7 +454,7 @@ def probe_connectivity():
             "metered": metered,
             "limited": metered,
             "metered_reason": reason,
-            "status": reach.get("status", "unknown"),
+            "status": status,
         }
     except Exception as e:
         return {
