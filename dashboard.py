@@ -257,6 +257,38 @@ def probe_direct():
     return {"code": d["code"], "ms": d["ms"], "status": "ok" if d["up"] else "down"}
 
 
+def probe_traffic_guard(state_path=None):
+    """Только status probe: редактор Traffic Guard остаётся scope #15."""
+    guard = local_state.traffic_guard_config(path=state_path)
+    errors = guard.get("errors") if isinstance(guard.get("errors"), list) else []
+    if guard.get("valid") is not True:
+        return {
+            "mode": "off",
+            "config_status": "invalid",
+            "configured_domains": 0,
+            "blocked_domains": 0,
+            "allowed_domains": 0,
+            "rule_count": 0,
+            "errors": errors,
+            "status": "warn",
+        }
+    mode = guard.get("mode") if guard.get("mode") in ("on", "off") else "off"
+    domains = guard.get("domains") if isinstance(guard.get("domains"), dict) else {}
+    enabled = mode == "on"
+    blocked = [domain for domain, policy in domains.items() if policy == "block"]
+    allowed = [domain for domain, policy in domains.items() if policy == "allow"]
+    return {
+        "mode": mode,
+        "config_status": mode,
+        "configured_domains": len(domains),
+        "blocked_domains": len(blocked) if enabled else 0,
+        "allowed_domains": len(allowed) if enabled else 0,
+        "rule_count": len(blocked) if enabled else 0,
+        "errors": [],
+        "status": "ok",
+    }
+
+
 # ============================ киношная телеметрия: гео-кэш + хелперы ============================
 _GEO_TTL = 3600
 _geo_cache = {}            # ip -> {"ts": float, "data": dict}
@@ -648,6 +680,7 @@ def gather_status():
     probes = {"services": probe_services, "tunnel": probe_tunnel,
               "exit_ip": probe_exit_ip, "vpn": probe_vpn,
               "route": probe_route_to_vps, "direct": probe_direct,
+              "traffic_guard": probe_traffic_guard,
               # --- киношная телеметрия ---
               "ips": probe_ips, "ping": probe_ping, "dns": probe_dns,
               "ifaces": probe_ifaces, "geo_distance": probe_geo_distance}

@@ -181,6 +181,31 @@ def test_select_node_begin_rejection_preserves_previous_and_skips_apply(tmp_path
     assert runner_calls == []
 
 
+def test_select_node_blocks_invalid_traffic_guard_before_pending_write(tmp_path):
+    import node_selector
+
+    state_path = tmp_path / "srouter.local.json"
+    state = _state()
+    state["traffic_guard"] = {"mode": "auto", "domains": {"video.example.com": "block"}}
+    _write_state(state_path, state)
+    runner_calls = []
+
+    out = node_selector.select_node(
+        "hk-1",
+        enabled_names={"sg-1", "hk-1"},
+        runner=lambda cmd, timeout: runner_calls.append((cmd, timeout)),
+        state_path=state_path,
+        config_path=tmp_path / "config.json",
+    )
+
+    assert out["ok"] is False
+    assert out["step"] == "validate"
+    assert "traffic_guard" in out["error"]
+    assert _active_state(state_path) == {"name": "sg-1", "pending": None}
+    assert runner_calls == []
+    assert not (tmp_path / "config.json").exists()
+
+
 def test_select_node_success_promotes_only_after_whitelisted_restart_and_renders_pending(tmp_path, monkeypatch):
     import node_selector
 

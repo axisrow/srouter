@@ -21,10 +21,19 @@ ROOT = Path(__file__).resolve().parent
 TEMPLATE_PATH = ROOT / "templates" / "xray-config.template.json"
 LISTEN_HOST = "127.0.0.1"
 XRAY_SOCKS_PORT = 10808
+TRAFFIC_GUARD_BLACKHOLE_TAG = "traffic-guard-blackhole"
 
 _TAG_RE = re.compile(r"[^A-Za-z0-9_-]+")
 _HEX_RE = re.compile(r"^[A-Fa-f0-9]{0,32}\Z")
 _TOKEN_RE = re.compile(r"^[A-Za-z0-9._:-]+\Z")
+
+
+class TrafficGuardValidationError(ValueError):
+    """Traffic Guard невалиден; генерация должна fail-closed, а не выключать защиту."""
+
+    def __init__(self, errors):
+        self.errors = [str(error) for error in errors if error] or ["traffic_guard invalid"]
+        super().__init__("traffic_guard невалиден: " + "; ".join(self.errors))
 
 
 def _default_template():
@@ -182,19 +191,40 @@ def _apply_outbound_hook(outbound, outbound_hook, *, node, role):
         return outbound
 
 
-def _traffic_guard_domains(state_path=None):
-    state = local_state.load_state(path=state_path)
-    guard = state.get("traffic_guard") if isinstance(state, dict) else {}
-    domains = guard.get("domains") if isinstance(guard, dict) else {}
-    if not isinstance(domains, dict):
+def traffic_guard_validation_errors(state_path=None):
+    """Ошибки Traffic Guard для apply/preflight-слоёв. Пустой список значит generation-safe."""
+    guard = local_state.traffic_guard_config(path=state_path)
+    if guard.get("valid") is not True:
+        errors = guard.get("errors") if isinstance(guard.get("errors"), list) else []
+        return [str(error) for error in errors if error] or ["traffic_guard invalid"]
+    return []
+
+
+def validate_traffic_guard_for_generation(state_path=None):
+    """Fail-closed gate: invalid guard не должен рендериться как обычный config."""
+    errors = traffic_guard_validation_errors(state_path=state_path)
+    if errors:
+        raise TrafficGuardValidationError(errors)
+    return local_state.traffic_guard_config(path=state_path)
+
+
+def _traffic_guard_domains(state_path=None, policy=None, guard=None):
+    guard = guard if isinstance(guard, dict) else validate_traffic_guard_for_generation(state_path=state_path)
+    if guard.get("mode") != "on" or guard.get("valid") is not True:
         return []
+    domains = guard.get("domains") if isinstance(guard.get("domains"), dict) else {}
     out = []
-    for domain, mode in domains.items():
-        if mode in (False, None, "direct", "skip"):
+    for domain, domain_policy in domains.items():
+        if policy is not None and domain_policy != policy:
             continue
         if _valid_host(domain):
+            # Xray `domain:example.com` покрывает exact + subdomains.
             out.append(f"domain:{domain}")
     return out
+
+
+def _traffic_guard_blackhole_outbound():
+    return {"tag": TRAFFIC_GUARD_BLACKHOLE_TAG, "protocol": "blackhole", "settings": {}}
 
 
 def generate_config(
@@ -206,11 +236,12 @@ def generate_config(
     outbound_hook=None,
     template_path=None,
 ):
-    """Вернуть dict xray config. Любая ошибка деградирует в минимальный direct-конфиг.
+    """Вернуть dict xray config.
 
     Extension API:
     - extra_inbounds / extra_rules / extra_outbounds добавляют секции без правки тела генератора;
     - outbound_hook(outbound, *, node, role) может заменить outbound для active/probe ролей.
+    Невалидный Traffic Guard бросает TrafficGuardValidationError: для block-фичи нужен fail-closed.
     """
     cfg = _load_template(template_path)
     cfg = copy.deepcopy(cfg)
@@ -227,6 +258,9 @@ def generate_config(
     inbounds = [_main_socks_inbound()]
     rules = []
     outbounds = [{"tag": "direct", "protocol": "freedom", "settings": {}}]
+    traffic_guard = validate_traffic_guard_for_generation(state_path=state_path)
+    block_domains = _traffic_guard_domains(state_path, policy="block", guard=traffic_guard)
+    allow_domains = _traffic_guard_domains(state_path, policy="allow", guard=traffic_guard)
 
     for node in nodes:
         inbound = _probe_inbound(node)
@@ -241,19 +275,29 @@ def generate_config(
             outbounds.append(outbound)
             rules.append({"type": "field", "inboundTag": [inbound["tag"]], "outboundTag": tag})
 
+    if block_domains:
+        outbounds.append(_traffic_guard_blackhole_outbound())
+        rules.append(
+            {
+                "type": "field",
+                "inboundTag": ["srouter-socks"],
+                "domain": block_domains,
+                "outboundTag": TRAFFIC_GUARD_BLACKHOLE_TAG,
+            }
+        )
+
     active_outbound = _vless_outbound(active, "active", state_path=state_path)
     active_outbound = _apply_outbound_hook(active_outbound, outbound_hook, node=active, role="active")
     if active_outbound:
         outbounds.append(active_outbound)
         cfg["srouter"]["active_node"] = active.get("name") or ""
         cfg["srouter"]["active_reality_dest"] = active_outbound.get("srouter", {}).get("reality_dest", "")
-        domains = _traffic_guard_domains(state_path)
-        if domains:
+        if allow_domains:
             rules.append(
                 {
                     "type": "field",
                     "inboundTag": ["srouter-socks"],
-                    "domain": domains,
+                    "domain": allow_domains,
                     "outboundTag": "active",
                 }
             )
