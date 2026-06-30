@@ -36,11 +36,11 @@ try:
 except ImportError:
     raise SystemExit("Нет srouter_config.py — скопируй: cp srouter_config.example.py srouter_config.py")
 
-# Активный узел из unified local state (#2). Legacy srouter_config.VPS_IP fallback больше нет:
-# empty state деградирует в пустой endpoint/route_ip без падения dashboard.
-_active = local_state.active_node()
-ACTIVE_ENDPOINT = _active.get("endpoint_host", "") or ""  # для xray/Reality-семантики
-VPS_IP = local_state.resolve_route_ip(_active) or ACTIVE_ENDPOINT  # для route -host / probe-совместимость
+# Активный узел нельзя замораживать на import: #8 меняет srouter.local.json в рантайме.
+# Эти имена оставлены только для совместимости старых импорт-тестов; рабочий код ниже
+# каждый раз вызывает _active_route_ip().
+ACTIVE_ENDPOINT = ""
+VPS_IP = ""
 
 PRIVOXY = ("127.0.0.1", 8118)
 XRAY_SOCKS = ("127.0.0.1", 10808)
@@ -163,6 +163,20 @@ def _probe_options(state_path=None):
     }
 
 
+def _active_route_ip():
+    """Свежий route_ip активного узла. Empty/broken state -> "" без падения dashboard."""
+    try:
+        active = local_state.active_node() or {}
+    except Exception:
+        active = {}
+    endpoint = active.get("endpoint_host", "") if isinstance(active, dict) else ""
+    try:
+        route_ip = local_state.resolve_route_ip(active)
+    except Exception:
+        route_ip = ""
+    return route_ip or endpoint or ""
+
+
 # ============================ probe-функции ============================
 def probe_services():
     """Порты (быстрая правда) + brew-статус (может быть unknown)."""
@@ -217,7 +231,8 @@ def probe_exit_ip():
     r = run([CURL, "-sS", "-x", HTTP_PROXY_URL, "--connect-timeout", "4",
              "--max-time", "8", "https://api.ip.sb/ip"], timeout=10)
     ip = r["out"] if not r["timeout"] else ""
-    if VPS_IP and ip == VPS_IP:
+    route_ip = _active_route_ip()
+    if route_ip and ip == route_ip:
         return {"ip": ip, "label_key": "vps_direct",
                 "label": "VPS (direct exit)", "status": "ok"}
     elif ip == VPN_EXIT_IP:
@@ -240,9 +255,10 @@ def probe_vpn():
 
 
 def probe_route_to_vps():
-    if not VPS_IP:
+    route_ip = _active_route_ip()
+    if not route_ip:
         return {"interface": "", "gateway": "", "split_active": False, "status": "down"}
-    r = run([ROUTE, "-n", "get", "-host", VPS_IP], timeout=3)
+    r = run([ROUTE, "-n", "get", "-host", route_ip], timeout=3)
     iface = _first(r"interface:\s*(\S+)", r["out"]) if not r["timeout"] else ""
     gw = _first(r"gateway:\s*(\S+)", r["out"]) if not r["timeout"] else ""
     bypass = (iface == "en0") or (gw == GATEWAY)
@@ -356,6 +372,7 @@ def probe_ips():
     """3 IP (прямой/VPN, выход цепочки, VPS) + гео каждого."""
     chain_ip = _exit_ip(via_proxy=True)
     direct_ip = _exit_ip(via_proxy=False)
+    route_ip = _active_route_ip()
 
     def node(ip, role):
         g = _geo_lookup(ip) if ip else {}
@@ -364,7 +381,7 @@ def probe_ips():
                 "city": g.get("city", ""), "isp": g.get("isp", ""), "asn": g.get("asn", ""),
                 "asn_org": g.get("asn_org", ""), "lat": g.get("lat"), "lon": g.get("lon")}
 
-    if chain_ip and VPS_IP and chain_ip == VPS_IP:
+    if chain_ip and route_ip and chain_ip == route_ip:
         status = "ok"
     elif chain_ip and direct_ip and chain_ip == direct_ip:
         status = "warn"
@@ -373,7 +390,7 @@ def probe_ips():
     else:
         status = "warn"
     return {"direct": node(direct_ip, "direct"), "chain": node(chain_ip, "chain"),
-            "vps": node(VPS_IP, "vps"), "status": status}
+            "vps": node(route_ip, "vps"), "status": status}
 
 
 def _parse_ping_stats(text):
@@ -397,7 +414,7 @@ def _ping_avg(host):
 
 def probe_ping():
     """avg RTT до VPS и VPN-сервера + потери."""
-    vps_ms, vps_loss = _ping_avg(VPS_IP)
+    vps_ms, vps_loss = _ping_avg(_active_route_ip())
     vpn_ms, vpn_loss = _ping_avg(VPN_SERVER)
     st = "down" if vps_ms is None else ("ok" if vps_ms < 120 else "warn")
     return {"vps_ms": vps_ms, "vps_loss": vps_loss, "vpn_ms": vpn_ms,
@@ -629,7 +646,7 @@ def probe_ifaces():
 def probe_geo_distance():
     """Великокружная дистанция (км) от локального выхода до VPS (haversine)."""
     here = _geo_lookup(_exit_ip(via_proxy=False))
-    there = _geo_lookup(VPS_IP)
+    there = _geo_lookup(_active_route_ip())
     la1, lo1, la2, lo2 = here.get("lat"), here.get("lon"), there.get("lat"), there.get("lon")
     if la1 is None or lo1 is None or la2 is None or lo2 is None:
         return {"km": None, "from_city": here.get("city", ""),
@@ -645,7 +662,7 @@ def probe_geo_distance():
 
 
 # ============================ сборка статуса ============================
-_cache = {"ts": 0.0, "data": None}
+_cache = {"ts": 0.0, "data": None, "active_route_ip": ""}
 _lock = threading.Lock()
 
 
@@ -673,8 +690,13 @@ def _run_status_probe_set(probes, budget_sec):
 
 def gather_status():
     now = time.time()
+    active_route_ip = _active_route_ip()
     with _lock:
-        if _cache["data"] and now - _cache["ts"] < STATUS_CACHE_TTL_SEC:
+        if (
+            _cache["data"]
+            and _cache.get("active_route_ip") == active_route_ip
+            and now - _cache["ts"] < STATUS_CACHE_TTL_SEC
+        ):
             return _cache["data"]
 
     probes = {"services": probe_services, "tunnel": probe_tunnel,
@@ -688,18 +710,19 @@ def gather_status():
     out["nodes"] = probe_nodes_snapshot()
     out["ts"] = now
     with _lock:
-        _cache.update(ts=now, data=out)
+        _cache.update(ts=now, data=out, active_route_ip=active_route_ip)
     return out
 
 
 # ============================ privileged: osascript-мост ============================
 def sudo_route(action):
-    if not VPS_IP:
+    route_ip = _active_route_ip()
+    if not route_ip:
         return {"rc": None, "out": "", "err": "Нет active route_ip: настрой srouter.local.json", "timeout": False}
     if action == "add":
-        shell_cmd = f"{ROUTE} -n add -host {VPS_IP} {GATEWAY}"
+        shell_cmd = f"{ROUTE} -n add -host {route_ip} {GATEWAY}"
     elif action == "remove":
-        shell_cmd = f"{ROUTE} -n delete -host {VPS_IP}"
+        shell_cmd = f"{ROUTE} -n delete -host {route_ip}"
     else:
         raise ValueError("bad action")        # глубокая защита
     # ВАЖНО: shell_cmd собран из констант и validated local_state, ввод запроса сюда не попадает никогда.
