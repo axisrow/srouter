@@ -128,6 +128,50 @@ def _fake_host_tools(bin_dir: Path, apt_log: Path, systemctl_log: Path) -> None:
     )
 
 
+def _fake_restore_cp_failure(bin_dir: Path, cp_log: Path, fail_target_suffix: str) -> None:
+    _write_tool(
+        bin_dir,
+        "cp",
+        f"""
+        #!/usr/bin/env bash
+        set -euo pipefail
+        printf 'cp %s\\n' "$*" >> "{cp_log}"
+        source_arg=""
+        for arg in "$@"; do
+          if [[ "$arg" == -* ]]; then
+            continue
+          fi
+          source_arg="$arg"
+          break
+        done
+        target_arg="${{@: -1}}"
+        if [[ "$source_arg" == *"/backups/"* && "$target_arg" == *"{fail_target_suffix}" ]]; then
+          printf 'forced restore cp failure\\n' >&2
+          exit 77
+        fi
+        exec /bin/cp "$@"
+        """,
+    )
+
+
+def _fake_latest_mv_failure(bin_dir: Path, mv_log: Path) -> None:
+    _write_tool(
+        bin_dir,
+        "mv",
+        f"""
+        #!/usr/bin/env bash
+        set -euo pipefail
+        printf 'mv %s\\n' "$*" >> "{mv_log}"
+        target_arg="${{@: -1}}"
+        if [[ "$target_arg" == *"/var/lib/srouter-reality/backups/latest" ]]; then
+          printf 'forced latest pointer failure\\n' >&2
+          exit 73
+        fi
+        exec /bin/mv "$@"
+        """,
+    )
+
+
 def _write_os_release(root: Path) -> None:
     etc = root / "etc"
     etc.mkdir(parents=True)
@@ -318,6 +362,109 @@ def test_bare_update_failure_restores_previous_binary_and_config(tmp_path):
     assert "marker:v1" in (root / "usr/local/bin/xray").read_text(encoding="utf-8")
     assert (root / "etc/xray/rendered/config.json").read_text(encoding="utf-8") == old_config
     assert "systemctl restart srouter-reality.service" in systemctl_log.read_text(encoding="utf-8")
+
+
+def test_bare_update_marks_recovery_failed_when_restore_copy_fails(tmp_path):
+    root = tmp_path / "root"
+    bin_dir = tmp_path / "bin"
+    source_v1 = tmp_path / "xray-v1"
+    source_bad = tmp_path / "xray-bad"
+    bundle = tmp_path / "bundle"
+    bin_dir.mkdir()
+    key_log = tmp_path / "keys.log"
+    xray_log = tmp_path / "xray.log"
+    apt_log = tmp_path / "apt.log"
+    systemctl_log = tmp_path / "systemctl.log"
+    cp_log = tmp_path / "cp.log"
+    _write_os_release(root)
+    _fake_key_tools(bin_dir, key_log)
+    _fake_host_tools(bin_dir, apt_log, systemctl_log)
+    _fake_xray_source(source_v1, xray_log, "v1")
+
+    _run(_install_args(bundle), env=_env(root, bin_dir, source_v1))
+    _fake_restore_cp_failure(bin_dir, cp_log, "/usr/local/share/xray")
+    _fake_xray_source(source_bad, xray_log, "bad", test_ok=False)
+
+    proc = _run(
+        [
+            "bash",
+            str(SERVER / "bare-install.sh"),
+            "update",
+            "--bundle-dir",
+            str(bundle),
+            "--xray-sni",
+            "broken.example",
+            "--xray-dest",
+            "broken.example:443",
+        ],
+        env=_env(root, bin_dir, source_bad),
+        check=False,
+    )
+
+    assert proc.returncode == 88
+    assert "восстанавливаю backup" in proc.stderr
+    assert "не удалось восстановить directory" in proc.stderr
+    assert "автоматический rollback не удался" in proc.stderr
+    assert "/backups/" in cp_log.read_text(encoding="utf-8")
+    assert systemctl_log.read_text(encoding="utf-8").splitlines() == [
+        "systemctl daemon-reload",
+        "systemctl enable --now srouter-reality.service",
+    ]
+
+
+def test_bare_update_rolls_back_when_latest_pointer_write_fails_after_restart(tmp_path):
+    root = tmp_path / "root"
+    bin_dir = tmp_path / "bin"
+    source_v1 = tmp_path / "xray-v1"
+    source_v2 = tmp_path / "xray-v2"
+    bundle = tmp_path / "bundle"
+    bin_dir.mkdir()
+    key_log = tmp_path / "keys.log"
+    xray_log = tmp_path / "xray.log"
+    apt_log = tmp_path / "apt.log"
+    systemctl_log = tmp_path / "systemctl.log"
+    mv_log = tmp_path / "mv.log"
+    _write_os_release(root)
+    _fake_key_tools(bin_dir, key_log)
+    _fake_host_tools(bin_dir, apt_log, systemctl_log)
+    _fake_xray_source(source_v1, xray_log, "v1")
+
+    _run(_install_args(bundle), env=_env(root, bin_dir, source_v1))
+    old_config = (root / "etc/xray/rendered/config.json").read_text(encoding="utf-8")
+    _fake_latest_mv_failure(bin_dir, mv_log)
+    _fake_xray_source(source_v2, xray_log, "v2")
+
+    proc = _run(
+        [
+            "bash",
+            str(SERVER / "bare-install.sh"),
+            "update",
+            "--bundle-dir",
+            str(bundle),
+            "--xray-sni",
+            "example.com",
+            "--xray-dest",
+            "example.com:443",
+        ],
+        env=_env(root, bin_dir, source_v2),
+        check=False,
+    )
+
+    assert proc.returncode == 73
+    assert "восстанавливаю backup" in proc.stderr
+    assert "автоматический rollback не удался" not in proc.stderr
+    assert "marker:v1" in (root / "usr/local/bin/xray").read_text(encoding="utf-8")
+    assert (root / "etc/xray/rendered/config.json").read_text(encoding="utf-8") == old_config
+    assert not (root / "var/lib/srouter-reality/backups/latest").exists()
+    assert "var/lib/srouter-reality/backups/latest" in mv_log.read_text(encoding="utf-8")
+    assert systemctl_log.read_text(encoding="utf-8").splitlines() == [
+        "systemctl daemon-reload",
+        "systemctl enable --now srouter-reality.service",
+        "systemctl daemon-reload",
+        "systemctl restart srouter-reality.service",
+        "systemctl daemon-reload",
+        "systemctl restart srouter-reality.service",
+    ]
 
 
 def test_bare_rollback_restores_latest_successful_update_backup(tmp_path):

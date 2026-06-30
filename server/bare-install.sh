@@ -647,9 +647,15 @@ restore_backup() {
   local target
   local backup_path
 
-  [[ -n "$backup_dir" ]] || die "backup-dir пуст"
+  [[ -n "$backup_dir" ]] || {
+    log "ОШИБКА: backup-dir пуст"
+    return 1
+  }
   manifest="${backup_dir}/manifest.tsv"
-  [[ -f "$manifest" ]] || die "backup manifest не найден: ${manifest}"
+  [[ -f "$manifest" ]] || {
+    log "ОШИБКА: backup manifest не найден: ${manifest}"
+    return 1
+  }
 
   while IFS=$'\t' read -r kind rel_path; do
     [[ -n "$kind" ]] || continue
@@ -657,20 +663,42 @@ restore_backup() {
     backup_path="${backup_dir}/${rel_path}"
     case "$kind" in
       missing)
-        rm -rf "$target"
+        rm -rf "$target" || {
+          log "ОШИБКА: не удалось удалить отсутствовавший target: ${target}"
+          return 1
+        }
         ;;
       file)
-        mkdir -p "$(dirname "$target")"
-        rm -rf "$target"
-        cp -a "$backup_path" "$target"
+        mkdir -p "$(dirname "$target")" || {
+          log "ОШИБКА: не удалось создать parent directory для ${target}"
+          return 1
+        }
+        rm -rf "$target" || {
+          log "ОШИБКА: не удалось заменить target: ${target}"
+          return 1
+        }
+        cp -a "$backup_path" "$target" || {
+          log "ОШИБКА: не удалось восстановить file ${target} из ${backup_path}"
+          return 1
+        }
         ;;
       dir)
-        mkdir -p "$(dirname "$target")"
-        rm -rf "$target"
-        cp -a "$backup_path" "$target"
+        mkdir -p "$(dirname "$target")" || {
+          log "ОШИБКА: не удалось создать parent directory для ${target}"
+          return 1
+        }
+        rm -rf "$target" || {
+          log "ОШИБКА: не удалось заменить target directory: ${target}"
+          return 1
+        }
+        cp -a "$backup_path" "$target" || {
+          log "ОШИБКА: не удалось восстановить directory ${target} из ${backup_path}"
+          return 1
+        }
         ;;
       *)
-        die "неизвестный тип backup entry: ${kind}"
+        log "ОШИБКА: неизвестный тип backup entry: ${kind}"
+        return 1
         ;;
     esac
   done < "$manifest"
@@ -746,9 +774,9 @@ run_update() {
   trap on_apply_error ERR
   node_tmp="$(mktemp)"
   apply_server_state update > "$node_tmp"
+  write_latest_backup "$APPLY_BACKUP_DIR"
   trap - ERR
   ROLLBACK_ON_ERROR=0
-  write_latest_backup "$APPLY_BACKUP_DIR"
   cat "$node_tmp"
   rm -f "$node_tmp"
 }
