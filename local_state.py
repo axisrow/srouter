@@ -15,11 +15,117 @@ _DEFAULT_PATH = Path(__file__).resolve().parent / "srouter.local.json"
 # D2: валидация хоста — только безопасные символы, shell-метасимволы запрещены.
 # Переиспользовано из закрытого PR #19; закреплено в #2.
 _HOST_RE = re.compile(r"^[A-Za-z0-9.:_-]+\Z")
+_TRAFFIC_GUARD_MODES = {"on", "off"}
+_TRAFFIC_GUARD_POLICIES = {"block", "allow"}
 
 
 def _is_valid_host(host):
     """True если строка содержит только безопасные для shell символы."""
     return bool(isinstance(host, str) and _HOST_RE.match(host))
+
+
+def _normalize_traffic_guard_domain(domain):
+    """Нормализовать domain-rule для exact+subdomain match; пустая строка значит reject."""
+    if not isinstance(domain, str):
+        return ""
+    normalized = domain.strip().lower().rstrip(".")
+    if not normalized or normalized.startswith(".") or ".." in normalized:
+        return ""
+    # Traffic Guard принимает домены, не host:port/IPv6; shell-символы всё равно режет _HOST_RE.
+    if ":" in normalized or not _is_valid_host(normalized):
+        return ""
+    return normalized
+
+
+def _traffic_guard_domain_matches(candidate, rule_domain):
+    """Xray `domain:example.com` матчится на example.com и любые *.example.com."""
+    candidate_norm = _normalize_traffic_guard_domain(candidate)
+    rule_norm = _normalize_traffic_guard_domain(rule_domain)
+    if not candidate_norm or not rule_norm:
+        return False
+    return candidate_norm == rule_norm or candidate_norm.endswith("." + rule_norm)
+
+
+def validate_traffic_guard(guard):
+    """Вернуть список явных ошибок Traffic Guard v1. Не бросает.
+
+    v1 сознательно принимает только mode on/off и политики block/allow.
+    auto/throttle отклоняются валидацией, а не молча приводятся к другой семантике.
+    """
+    errors = []
+    if guard is None or guard is False:
+        return errors
+    if not isinstance(guard, dict):
+        return ["traffic_guard must be an object"]
+
+    mode = guard.get("mode", "off")
+    if mode == "auto":
+        errors.append('traffic_guard.mode "auto" is not supported in v1')
+    elif not isinstance(mode, str) or mode not in _TRAFFIC_GUARD_MODES:
+        errors.append('traffic_guard.mode must be "on" or "off"')
+
+    domains = guard.get("domains", {})
+    if domains is None:
+        return errors
+    if not isinstance(domains, dict):
+        errors.append("traffic_guard.domains must be an object")
+        return errors
+
+    normalized = {}
+    for domain, policy in domains.items():
+        domain_norm = _normalize_traffic_guard_domain(domain)
+        if not domain_norm:
+            errors.append(f"traffic_guard domain is invalid: {domain!r}")
+            continue
+        if policy == "throttle":
+            errors.append(f'traffic_guard policy "throttle" is not supported in v1: {domain_norm}')
+            continue
+        if not isinstance(policy, str) or policy not in _TRAFFIC_GUARD_POLICIES:
+            errors.append(f'traffic_guard policy must be "block" or "allow": {domain_norm}')
+            continue
+        previous = normalized.get(domain_norm)
+        if previous is not None and previous != policy:
+            errors.append(f"conflicting traffic_guard policies for {domain_norm}: {previous} vs {policy}")
+            continue
+        normalized[domain_norm] = policy
+
+    ordered = sorted(normalized.items(), key=lambda item: item[0].count("."))
+    for index, (parent, parent_policy) in enumerate(ordered):
+        for child, child_policy in ordered[index + 1 :]:
+            if parent_policy != child_policy and _traffic_guard_domain_matches(child, parent):
+                errors.append(
+                    f"conflicting traffic_guard policies: {parent}={parent_policy} vs {child}={child_policy}"
+                )
+    return errors
+
+
+def traffic_guard_config(path=None, state=None):
+    """Нормализованный Traffic Guard для generator/probe.
+
+    Возвращает dict с valid/errors; при ошибках безопасно отключает правила, но
+    сохраняет явную причину для status/apply-слоёв.
+    """
+    if state is None:
+        state = load_state(path)
+    guard = state.get("traffic_guard") if isinstance(state, dict) else {}
+    errors = validate_traffic_guard(guard)
+    if errors:
+        return {"mode": "off", "domains": {}, "valid": False, "errors": errors}
+    if not isinstance(guard, dict):
+        guard = {}
+    domains = guard.get("domains") if isinstance(guard.get("domains"), dict) else {}
+    normalized = {}
+    for domain, policy in domains.items():
+        domain_norm = _normalize_traffic_guard_domain(domain)
+        if domain_norm and policy in _TRAFFIC_GUARD_POLICIES:
+            normalized[domain_norm] = policy
+    mode = guard.get("mode", "off")
+    return {
+        "mode": mode if mode in _TRAFFIC_GUARD_MODES else "off",
+        "domains": normalized,
+        "valid": True,
+        "errors": [],
+    }
 
 
 # Safe-default state: секции v1 (#2). probes — эталонные defaults (G3);

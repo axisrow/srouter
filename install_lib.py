@@ -386,6 +386,13 @@ def _write_component_config(name, env):
     return _write_text_atomic(path, text)
 
 
+def _traffic_guard_preflight_error(env):
+    errors = gen_xray_config.traffic_guard_validation_errors(state_path=env.state_path)
+    if not errors:
+        return ""
+    return "traffic_guard невалиден: " + "; ".join(errors)
+
+
 def _ensure_package(name, runner):
     listed = runner([BREW, "list", "--versions", name], 12)
     if listed.get("rc") == 0 and listed.get("out"):
@@ -482,6 +489,11 @@ def apply_install(env=None, *, confirm=False, choices=None, runner=run, port_che
             modes[name] = "skipped"
         else:
             modes[name] = "managed"
+
+    if modes.get("xray") == "managed":
+        guard_error = _traffic_guard_preflight_error(env)
+        if guard_error:
+            return {"ok": False, "blocked": ["traffic_guard_invalid"], "error": guard_error, "actions": [], "plan": plan}
 
     needs_brew = any(mode == "managed" for mode in modes.values())
     if needs_brew and not plan.get("homebrew", {}).get("available"):
