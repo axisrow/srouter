@@ -85,3 +85,38 @@ xray run -test -config /etc/xray/rendered/config.json
 
 Для ротации автоматически созданных ключей останови контейнер и удали volume
 `srouter-reality-state`.
+
+## Bare Linux install без Docker
+
+`bare-install.sh` — отдельный future-path для Reality-узла без Docker. Scope намеренно узкий:
+Debian/Ubuntu family с `apt` и `systemd`. Скрипт ставит официальный bare-бинарь Xray той же
+версии, что Dockerfile (`25.6.8` по умолчанию), рендерит тот же `config.template.json` в
+host-конфиг и ставит `srouter-reality.service`.
+
+Install:
+
+```bash
+sudo ./server/bare-install.sh install --endpoint-host 203.0.113.10 --name sg-1 --country-code SG
+```
+
+Update с сохранением ключей и node defaults из `/var/lib/srouter-reality`:
+
+```bash
+sudo ./server/bare-install.sh update
+```
+
+Rollback к backup, созданному перед последним успешным `update`:
+
+```bash
+sudo ./server/bare-install.sh rollback
+```
+
+Bare-путь не генерирует ключи и node-object сам: он вызывает `deploy.sh generate`, который, в свою
+очередь, использует `gen-keys.sh` и печатает тот же полный объект для `srouter.local.json.nodes[]`,
+что Docker workflow. Секреты остаются на host в `/var/lib/srouter-reality/.env` и
+`/var/lib/srouter-reality/node_object.json` с правами `0600`; rendered config пишется в
+`/etc/xray/rendered/config.json`.
+
+Backup перед `update` лежит в `/var/lib/srouter-reality/backups/`. Если проверка нового config
+через `xray run -test -config ...` падает, скрипт автоматически восстанавливает предыдущие binary,
+geodata, config, unit и state-файлы, затем делает `systemctl restart srouter-reality.service`.
