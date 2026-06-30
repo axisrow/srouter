@@ -186,7 +186,7 @@ def test_gather_status_returns_node_snapshot_without_running_heavy_probe(monkeyp
         "probe_ifaces",
         "probe_geo_distance",
     ):
-        monkeypatch.setattr(dashboard, name, lambda name=name: {"status": "ok", "probe": name})
+        monkeypatch.setattr(dashboard, name, lambda *args, name=name, **kwargs: {"status": "ok", "probe": name})
 
     def slow_probe_nodes():
         nonlocal called
@@ -243,7 +243,11 @@ def test_gather_status_timeout_does_not_wait_for_executor_shutdown(monkeypatch):
         "probe_ifaces",
         "probe_geo_distance",
     ):
-        monkeypatch.setattr(dashboard, name, slow_probe if name == "probe_services" else lambda: {"status": "ok"})
+        monkeypatch.setattr(
+            dashboard,
+            name,
+            slow_probe if name == "probe_services" else lambda *args, **kwargs: {"status": "ok"},
+        )
     monkeypatch.setattr(dashboard, "probe_nodes_snapshot", lambda: [])
 
     started = time.monotonic()

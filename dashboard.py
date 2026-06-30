@@ -11,6 +11,7 @@ import time
 import re
 import json
 import math
+import ipaddress
 from concurrent.futures import ThreadPoolExecutor, wait
 from flask import Flask, jsonify, Response
 
@@ -163,18 +164,38 @@ def _probe_options(state_path=None):
     }
 
 
-def _active_route_ip():
-    """Свежий route_ip активного узла. Empty/broken state -> "" без падения dashboard."""
+def _ip_literal(value):
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
+
+
+def _active_route_context():
+    """Свежий route target без DNS. Hostname без route_ip не блокирует status path."""
     try:
         active = local_state.active_node() or {}
     except Exception:
         active = {}
-    endpoint = active.get("endpoint_host", "") if isinstance(active, dict) else ""
-    try:
-        route_ip = local_state.resolve_route_ip(active)
-    except Exception:
-        route_ip = ""
-    return route_ip or endpoint or ""
+    if not isinstance(active, dict):
+        active = {}
+    name = active.get("name", "") if isinstance(active.get("name"), str) else ""
+    endpoint = active.get("endpoint_host", "") if isinstance(active.get("endpoint_host"), str) else ""
+    explicit_route_ip = active.get("route_ip", "") if isinstance(active.get("route_ip"), str) else ""
+    # Dashboard hot path не делает DNS: иначе /api/status может зависнуть на gethostbyname.
+    # Для split-route нужен явный route_ip; IP endpoint допустим как safe fallback.
+    route_ip = explicit_route_ip if _ip_literal(explicit_route_ip) else ""
+    if not route_ip and _ip_literal(endpoint):
+        route_ip = endpoint
+    return {"key": (name, explicit_route_ip, endpoint), "route_ip": route_ip}
+
+
+def _active_route_ip():
+    """Свежий route_ip активного узла. Empty/broken/hostname-only state -> ""."""
+    return _active_route_context()["route_ip"]
 
 
 # ============================ probe-функции ============================
@@ -224,14 +245,15 @@ def probe_tunnel():
     return {"anthropic": a, "openai": o, "status": "ok" if up else "down"}
 
 
-def probe_exit_ip():
+def probe_exit_ip(route_ip=None):
     # api.ip.sb доступен и через VPS-туннель, и через VPN/прямой выход — поэтому честно
     # показывает РЕАЛЬНУЮ точку выхода (VPS vs VPN). api.ipify.org из Китая часто таймаутит
     # и давал ложный "цепочка недоступна".
     r = run([CURL, "-sS", "-x", HTTP_PROXY_URL, "--connect-timeout", "4",
              "--max-time", "8", "https://api.ip.sb/ip"], timeout=10)
     ip = r["out"] if not r["timeout"] else ""
-    route_ip = _active_route_ip()
+    if route_ip is None:
+        route_ip = _active_route_ip()
     if route_ip and ip == route_ip:
         return {"ip": ip, "label_key": "vps_direct",
                 "label": "VPS (direct exit)", "status": "ok"}
@@ -254,8 +276,9 @@ def probe_vpn():
             "status": "warn" if iface == "ppp0" else "ok"}
 
 
-def probe_route_to_vps():
-    route_ip = _active_route_ip()
+def probe_route_to_vps(route_ip=None):
+    if route_ip is None:
+        route_ip = _active_route_ip()
     if not route_ip:
         return {"interface": "", "gateway": "", "split_active": False, "status": "down"}
     r = run([ROUTE, "-n", "get", "-host", route_ip], timeout=3)
@@ -368,11 +391,12 @@ def _exit_ip(via_proxy):
     return ip if (ip and len(ip) <= 45 and (":" in ip or ip.count(".") == 3)) else ""
 
 
-def probe_ips():
+def probe_ips(route_ip=None):
     """3 IP (прямой/VPN, выход цепочки, VPS) + гео каждого."""
     chain_ip = _exit_ip(via_proxy=True)
     direct_ip = _exit_ip(via_proxy=False)
-    route_ip = _active_route_ip()
+    if route_ip is None:
+        route_ip = _active_route_ip()
 
     def node(ip, role):
         g = _geo_lookup(ip) if ip else {}
@@ -412,9 +436,11 @@ def _ping_avg(host):
     return _parse_ping_stats(r["out"])
 
 
-def probe_ping():
+def probe_ping(route_ip=None):
     """avg RTT до VPS и VPN-сервера + потери."""
-    vps_ms, vps_loss = _ping_avg(_active_route_ip())
+    if route_ip is None:
+        route_ip = _active_route_ip()
+    vps_ms, vps_loss = _ping_avg(route_ip)
     vpn_ms, vpn_loss = _ping_avg(VPN_SERVER)
     st = "down" if vps_ms is None else ("ok" if vps_ms < 120 else "warn")
     return {"vps_ms": vps_ms, "vps_loss": vps_loss, "vpn_ms": vpn_ms,
@@ -643,10 +669,12 @@ def probe_ifaces():
             "status": "ok" if ifaces else "down"}
 
 
-def probe_geo_distance():
+def probe_geo_distance(route_ip=None):
     """Великокружная дистанция (км) от локального выхода до VPS (haversine)."""
+    if route_ip is None:
+        route_ip = _active_route_ip()
     here = _geo_lookup(_exit_ip(via_proxy=False))
-    there = _geo_lookup(_active_route_ip())
+    there = _geo_lookup(route_ip)
     la1, lo1, la2, lo2 = here.get("lat"), here.get("lon"), there.get("lat"), there.get("lon")
     if la1 is None or lo1 is None or la2 is None or lo2 is None:
         return {"km": None, "from_city": here.get("city", ""),
@@ -662,7 +690,7 @@ def probe_geo_distance():
 
 
 # ============================ сборка статуса ============================
-_cache = {"ts": 0.0, "data": None, "active_route_ip": ""}
+_cache = {"ts": 0.0, "data": None, "active_route_ip": "", "active_route_key": None}
 _lock = threading.Lock()
 
 
@@ -690,27 +718,37 @@ def _run_status_probe_set(probes, budget_sec):
 
 def gather_status():
     now = time.time()
-    active_route_ip = _active_route_ip()
+    active_route = _active_route_context()
+    active_route_ip = active_route["route_ip"]
+    active_route_key = active_route["key"]
     with _lock:
         if (
             _cache["data"]
-            and _cache.get("active_route_ip") == active_route_ip
+            and _cache.get("active_route_key") == active_route_key
             and now - _cache["ts"] < STATUS_CACHE_TTL_SEC
         ):
             return _cache["data"]
 
-    probes = {"services": probe_services, "tunnel": probe_tunnel,
-              "exit_ip": probe_exit_ip, "vpn": probe_vpn,
-              "route": probe_route_to_vps, "direct": probe_direct,
-              "traffic_guard": probe_traffic_guard,
-              # --- киношная телеметрия ---
-              "ips": probe_ips, "ping": probe_ping, "dns": probe_dns,
-              "ifaces": probe_ifaces, "geo_distance": probe_geo_distance}
+    probes = {
+        "services": probe_services,
+        "tunnel": probe_tunnel,
+        "exit_ip": lambda: probe_exit_ip(route_ip=active_route_ip),
+        "vpn": probe_vpn,
+        "route": lambda: probe_route_to_vps(route_ip=active_route_ip),
+        "direct": probe_direct,
+        "traffic_guard": probe_traffic_guard,
+        # --- киношная телеметрия ---
+        "ips": lambda: probe_ips(route_ip=active_route_ip),
+        "ping": lambda: probe_ping(route_ip=active_route_ip),
+        "dns": probe_dns,
+        "ifaces": probe_ifaces,
+        "geo_distance": lambda: probe_geo_distance(route_ip=active_route_ip),
+    }
     out = _run_status_probe_set(probes, STATUS_PROBE_BUDGET_SEC)
     out["nodes"] = probe_nodes_snapshot()
     out["ts"] = now
     with _lock:
-        _cache.update(ts=now, data=out, active_route_ip=active_route_ip)
+        _cache.update(ts=now, data=out, active_route_ip=active_route_ip, active_route_key=active_route_key)
     return out
 
 

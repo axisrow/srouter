@@ -2,6 +2,7 @@ import importlib
 import json
 import sys
 import threading
+import time
 import types
 
 
@@ -58,7 +59,7 @@ def _fresh_dashboard(monkeypatch, state_path):
     cfg.VPN_EXIT_IP = "198.51.100.20"
     monkeypatch.setitem(sys.modules, "srouter_config", cfg)
     dashboard = importlib.import_module("dashboard")
-    dashboard._cache.update(ts=0.0, data=None, active_route_ip="")
+    dashboard._cache.update(ts=0.0, data=None, active_route_ip="", active_route_key=None)
     dashboard._nodes_cache.update(ts=0.0, data=None)
     return dashboard
 
@@ -85,7 +86,7 @@ def test_gather_status_cache_invalidates_when_active_route_ip_changes(monkeypatc
     lock = threading.Lock()
 
     def fake_probe(name):
-        def inner():
+        def inner(*args, **kwargs):
             nonlocal run_count
             with lock:
                 run_count += 1
@@ -99,12 +100,13 @@ def test_gather_status_cache_invalidates_when_active_route_ip_changes(monkeypatc
     monkeypatch.setattr(
         dashboard,
         "probe_nodes_snapshot",
-        lambda: [{"active_route_ip": dashboard._active_route_ip(), "status": "unknown"}],
+        lambda: [{"status": "unknown"}],
     )
 
     first = dashboard.gather_status()
     assert run_count == len(PROBE_NAMES)
     assert dashboard._cache["active_route_ip"] == "203.0.113.10"
+    assert dashboard._cache["active_route_key"] == ("sg-1", "203.0.113.10", "203.0.113.10")
 
     cached = dashboard.gather_status()
     assert cached is first
@@ -116,7 +118,66 @@ def test_gather_status_cache_invalidates_when_active_route_ip_changes(monkeypatc
     assert second is not first
     assert run_count == len(PROBE_NAMES) * 2
     assert dashboard._cache["active_route_ip"] == "203.0.113.20"
-    assert second["nodes"] == [{"active_route_ip": "203.0.113.20", "status": "unknown"}]
+    assert dashboard._cache["active_route_key"] == ("hk-1", "203.0.113.20", "203.0.113.20")
+    assert second["nodes"] == [{"status": "unknown"}]
+
+
+def test_gather_status_hostname_without_route_ip_does_not_block_on_dns(monkeypatch, tmp_path):
+    import local_state
+
+    state_path = tmp_path / "srouter.local.json"
+    _write_state(
+        state_path,
+        _state(
+            "sg-1",
+            nodes=[
+                {
+                    "name": "sg-1",
+                    "endpoint_host": "node.example.test",
+                    "enabled": True,
+                }
+            ],
+        ),
+    )
+    dns_calls = []
+
+    def slow_dns(host):
+        dns_calls.append(host)
+        time.sleep(1.0)
+        return "203.0.113.99"
+
+    monkeypatch.setattr(local_state.socket, "gethostbyname", slow_dns)
+    dashboard = _fresh_dashboard(monkeypatch, state_path)
+    monkeypatch.setattr(dashboard, "STATUS_CACHE_TTL_SEC", 999)
+
+    run_count = 0
+    kwargs_seen = []
+
+    def fake_probe(name):
+        def inner(*args, **kwargs):
+            nonlocal run_count
+            run_count += 1
+            kwargs_seen.append(kwargs)
+            return {"status": "ok", "probe": name}
+
+        return inner
+
+    for name in PROBE_NAMES:
+        monkeypatch.setattr(dashboard, name, fake_probe(name))
+    monkeypatch.setattr(dashboard, "probe_nodes_snapshot", lambda: [])
+
+    started = time.monotonic()
+    first = dashboard.gather_status()
+    cached = dashboard.gather_status()
+    elapsed = time.monotonic() - started
+
+    assert cached is first
+    assert run_count == len(PROBE_NAMES)
+    assert dashboard._cache["active_route_ip"] == ""
+    assert dashboard._cache["active_route_key"] == ("sg-1", "", "node.example.test")
+    assert dns_calls == []
+    assert elapsed < 0.5
+    assert {kwargs["route_ip"] for kwargs in kwargs_seen if "route_ip" in kwargs} == {""}
 
 
 def test_empty_active_route_degrades_without_route_commands(monkeypatch, tmp_path):
