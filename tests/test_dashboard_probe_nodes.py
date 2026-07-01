@@ -4,6 +4,8 @@ import sys
 import time
 import types
 
+import sys_probe
+
 
 def _fresh_dashboard(monkeypatch):
     monkeypatch.delitem(sys.modules, "dashboard", raising=False)
@@ -100,8 +102,8 @@ def test_probe_nodes_reads_enabled_nodes_and_state_targets_read_only(monkeypatch
             return {"rc": 0, "out": "200 0.500000 2048", "err": "", "timeout": False}
         raise AssertionError(f"unexpected command: {cmd}")
 
-    monkeypatch.setattr(dashboard, "run", fake_run)
-    monkeypatch.setattr(dashboard, "port_open", lambda host, port, timeout=0.5: True)
+    monkeypatch.setattr(sys_probe, "run", fake_run)
+    monkeypatch.setattr(sys_probe, "port_open", lambda host, port, timeout=0.5: True)
     monkeypatch.setattr(dashboard, "_geo_lookup", lambda ip: {"country_code": "SG", "flag": "SG"})
     monkeypatch.setattr(
         dashboard.local_state,
@@ -157,7 +159,7 @@ def test_probe_nodes_missing_or_invalid_socks_degrades_without_curl(monkeypatch,
             return {"rc": 1, "out": "3 packets transmitted, 0 packets received, 100.0% packet loss", "err": "", "timeout": False}
         raise AssertionError("curl must not run without valid per-node socks_port")
 
-    monkeypatch.setattr(dashboard, "run", fake_run)
+    monkeypatch.setattr(sys_probe, "run", fake_run)
     monkeypatch.setattr(dashboard, "_geo_lookup", lambda ip: {})
 
     out = dashboard.probe_nodes(state_path=state_path)

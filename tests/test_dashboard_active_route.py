@@ -5,6 +5,8 @@ import threading
 import time
 import types
 
+import sys_probe
+
 
 PROBE_NAMES = (
     "probe_services",
@@ -191,7 +193,7 @@ def test_empty_active_route_degrades_without_route_commands(monkeypatch, tmp_pat
         calls.append(cmd)
         return {"rc": 0, "out": "", "err": "", "timeout": False}
 
-    monkeypatch.setattr(dashboard, "run", fake_run)
+    monkeypatch.setattr(sys_probe, "run", fake_run)
 
     assert dashboard._active_route_ip() == ""
     assert dashboard.probe_route_to_vps() == {"interface": "", "gateway": "", "split_active": False, "status": "down"}
@@ -210,7 +212,7 @@ def test_broken_state_degrades_without_route_commands(monkeypatch, tmp_path):
     def fail_route_run(cmd, timeout):
         raise AssertionError("route command must not run without active route_ip")
 
-    monkeypatch.setattr(dashboard, "run", fail_route_run)
+    monkeypatch.setattr(sys_probe, "run", fail_route_run)
 
     assert dashboard._active_route_ip() == ""
     assert dashboard.probe_route_to_vps() == {"interface": "", "gateway": "", "split_active": False, "status": "down"}

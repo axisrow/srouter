@@ -17,8 +17,9 @@ from flask import Flask, jsonify, Response
 
 import local_state
 from dashboard_common import *
+from dashboard_network import *
 import node_selector
-from sys_probe import run, port_open
+import sys_probe
 
 # Активный узел нельзя замораживать на import: #8 меняет srouter.local.json в рантайме.
 # Эти имена оставлены только для совместимости старых импорт-тестов; рабочий код ниже
@@ -34,103 +35,6 @@ app = Flask(__name__)
 
 
 # ============================ probe-функции ============================
-def probe_services():
-    """Порты (быстрая правда) + brew-статус (может быть unknown)."""
-    privoxy_up = port_open(*PRIVOXY)
-    xray_up = port_open(*XRAY_SOCKS)
-    r = run([BREW, "services", "list"], timeout=8)
-
-    def brew_state(name):
-        if r["timeout"]:
-            return "unknown"
-        for line in r["out"].splitlines():
-            f = line.split()
-            if f and f[0] == name:
-                return f[1] if len(f) > 1 else "unknown"
-        return "none"
-
-    return {
-        "privoxy": {"listening": privoxy_up, "brew": brew_state("privoxy"),
-                    "status": "ok" if privoxy_up else "down"},
-        "xray": {"listening": xray_up, "brew": brew_state("xray"),
-                 "status": "ok" if xray_up else "down"},
-    }
-
-
-def _curl_through(url, proxy=True):
-    cmd = [CURL, "-sS", "-o", "/dev/null", "--connect-timeout", "4", "--max-time", "8",
-           "-w", "%{http_code} %{time_total}"]
-    if proxy:
-        cmd += ["-x", HTTP_PROXY_URL]
-    cmd.append(url)
-    r = run(cmd, timeout=10)
-    if r["timeout"] or not r["out"]:
-        return {"code": "000", "ms": None, "up": False}
-    try:
-        code, t = r["out"].split()
-        return {"code": code, "ms": round(float(t) * 1000), "up": code != "000"}
-    except ValueError:
-        return {"code": "000", "ms": None, "up": False}
-
-
-def probe_tunnel():
-    a = _curl_through("https://api.anthropic.com/")
-    o = _curl_through("https://api.openai.com/")
-    up = a["up"] or o["up"]
-    return {"anthropic": a, "openai": o, "status": "ok" if up else "down"}
-
-
-def probe_exit_ip(route_ip=None):
-    # api.ip.sb доступен и через VPS-туннель, и через VPN/прямой выход — поэтому честно
-    # показывает РЕАЛЬНУЮ точку выхода (VPS vs VPN). api.ipify.org из Китая часто таймаутит
-    # и давал ложный "цепочка недоступна".
-    r = run([CURL, "-sS", "-x", HTTP_PROXY_URL, "--connect-timeout", "4",
-             "--max-time", "8", "https://api.ip.sb/ip"], timeout=10)
-    ip = r["out"] if not r["timeout"] else ""
-    if route_ip is None:
-        route_ip = _active_route_ip()
-    if route_ip and ip == route_ip:
-        return {"ip": ip, "label_key": "vps_direct",
-                "label": "VPS (direct exit)", "status": "ok"}
-    elif ip == VPN_EXIT_IP:
-        return {"ip": ip, "label_key": "via_vpn",
-                "label": "via VPN — split-route needed", "status": "warn"}
-    elif not ip:
-        return {"ip": "", "label_key": "chain_down",
-                "label": "chain unavailable", "status": "down"}
-    return {"ip": ip, "label_key": "unexpected",
-            "label": "unexpected exit", "status": "warn"}
-
-
-def probe_vpn():
-    ic = run([IFCONFIG, "ppp0"], timeout=3)
-    vpn_up = ic["rc"] == 0
-    dr = run([ROUTE, "-n", "get", "default"], timeout=3)
-    iface = _first(r"interface:\s*(\S+)", dr["out"])
-    return {"vpn_up": vpn_up, "default_iface": iface, "vpn_server": VPN_SERVER,
-            "status": "warn" if iface == "ppp0" else "ok"}
-
-
-def probe_route_to_vps(route_ip=None):
-    if route_ip is None:
-        route_ip = _active_route_ip()
-    if not route_ip:
-        return {"interface": "", "gateway": "", "split_active": False, "status": "down"}
-    r = run([ROUTE, "-n", "get", "-host", route_ip], timeout=3)
-    iface = _first(r"interface:\s*(\S+)", r["out"]) if not r["timeout"] else ""
-    gw = _first(r"gateway:\s*(\S+)", r["out"]) if not r["timeout"] else ""
-    bypass = (iface == "en0") or (gw == GATEWAY)
-    return {"interface": iface, "gateway": gw, "split_active": bypass,
-            "status": "ok" if bypass else "warn"}
-
-
-def probe_direct():
-    # api.ip.sb доступен из Китая напрямую (в отличие от ipify) — карточка "прямой доступ"
-    # показывает реальную работу сети без прокси, а не вечный DOWN.
-    d = _curl_through("https://api.ip.sb/ip", proxy=False)
-    return {"code": d["code"], "ms": d["ms"], "status": "ok" if d["up"] else "down"}
-
-
 def _parse_hardware_ports(text):
     """networksetup -> device -> hardware port. Битый вывод просто даёт пустую карту."""
     ports = {}
@@ -161,7 +65,7 @@ def _parse_hardware_ports(text):
 
 
 def _hardware_ports():
-    r = run([NETWORKSETUP, "-listallhardwareports"], timeout=4)
+    r = sys_probe.run([NETWORKSETUP, "-listallhardwareports"], timeout=4)
     if r["timeout"] or not r["out"]:
         return {}
     return _parse_hardware_ports(r["out"])
@@ -220,7 +124,7 @@ def _probe_direct_reachability():
     target = _connectivity_target()
     cmd = [CURL, "-sS", "-o", "/dev/null", "--connect-timeout", "4", "--max-time", "8",
            "-w", "%{http_code} %{time_total}", target]
-    r = run(cmd, timeout=10)
+    r = sys_probe.run(cmd, timeout=10)
     base = {"target": target, "code": "000", "ms": None, "reachable": None, "status": "unknown"}
     if r["timeout"]:
         return base
@@ -255,10 +159,10 @@ def _metered_guess(channel):
 def probe_connectivity():
     """Активный канал + real reachability. Наблюдает, ничего не переключает."""
     try:
-        dr = run([ROUTE, "-n", "get", "default"], timeout=3)
+        dr = sys_probe.run([ROUTE, "-n", "get", "default"], timeout=3)
         default_iface = _first(r"interface:\s*(\S+)", dr["out"]) if not dr["timeout"] else ""
         hardware_ports = _hardware_ports()
-        ic = run([IFCONFIG], timeout=4)
+        ic = sys_probe.run([IFCONFIG], timeout=4)
         ifaces = _parse_ifconfig_ifaces(ic["out"] if not ic["timeout"] else "", default_iface, hardware_ports)
         active = next((item for item in ifaces if item["name"] == default_iface), None)
         port = hardware_ports.get(default_iface, {}) if default_iface else {}
@@ -376,8 +280,8 @@ def _geo_lookup(ip):
         c = _geo_cache.get(ip)
         if c and now - c["ts"] < _GEO_TTL:
             return c["data"]
-    r = run([CURL, "-sS", "-A", "Mozilla/5.0", "--connect-timeout", "3", "--max-time", "5",
-             "https://api.ip.sb/geoip/" + ip], timeout=6)   # UA обязателен (без него 403); вызов ВНЕ lock
+    r = sys_probe.run([CURL, "-sS", "-A", "Mozilla/5.0", "--connect-timeout", "3", "--max-time", "5",
+                       "https://api.ip.sb/geoip/" + ip], timeout=6)   # UA обязателен (без него 403); вызов ВНЕ lock
     data = {}
     if not r["timeout"] and r["out"]:
         try:
@@ -399,7 +303,7 @@ def _exit_ip(via_proxy):
     if via_proxy:
         cmd += ["-x", HTTP_PROXY_URL]
     cmd.append("https://api.ip.sb/ip")
-    r = run(cmd, timeout=10)
+    r = sys_probe.run(cmd, timeout=10)
     ip = r["out"].strip() if not r["timeout"] else ""
     return ip if (ip and len(ip) <= 45 and (":" in ip or ip.count(".") == 3)) else ""
 
@@ -428,36 +332,6 @@ def probe_ips(route_ip=None):
         status = "warn"
     return {"direct": node(direct_ip, "direct"), "chain": node(chain_ip, "chain"),
             "vps": node(route_ip, "vps"), "status": status}
-
-
-def _parse_ping_stats(text):
-    """Разобрать macOS ping summary: avg RTT + packet loss. Не бросает."""
-    if not text:
-        return (None, None)
-    avg = _first(r"=\s*[\d.]+/([\d.]+)/", text)
-    loss = _first(r"([\d.]+)%\s*packet loss", text)
-    try:
-        return (round(float(avg)) if avg else None, float(loss) if loss else None)
-    except ValueError:
-        return (None, None)
-
-
-def _ping_avg(host):
-    if not host:
-        return (None, None)
-    r = run([PING, "-c", "3", "-t", "4", host], timeout=8)
-    return _parse_ping_stats(r["out"])
-
-
-def probe_ping(route_ip=None):
-    """avg RTT до VPS и VPN-сервера + потери."""
-    if route_ip is None:
-        route_ip = _active_route_ip()
-    vps_ms, vps_loss = _ping_avg(route_ip)
-    vpn_ms, vpn_loss = _ping_avg(VPN_SERVER)
-    st = "down" if vps_ms is None else ("ok" if vps_ms < 120 else "warn")
-    return {"vps_ms": vps_ms, "vps_loss": vps_loss, "vpn_ms": vpn_ms,
-            "vpn_loss": vpn_loss, "status": st}
 
 
 def _parse_http_code(text):
@@ -512,7 +386,7 @@ def _curl_reachable_via_socks(port, opts):
         cmd = [CURL, "-sS", "-o", "/dev/null", "-x", proxy,
                "--connect-timeout", connect_timeout, "--max-time", max_time,
                "-w", "%{http_code}", url]
-        r = run(cmd, timeout=opts["max_time_sec"] + 2)
+        r = sys_probe.run(cmd, timeout=opts["max_time_sec"] + 2)
         if not r["timeout"] and _http_code_ok(r["out"]):
             return True
     return False
@@ -527,7 +401,7 @@ def _curl_throughput_via_socks(port, opts):
         cmd = [CURL, "-sS", "-o", "/dev/null", "-x", proxy,
                "--connect-timeout", connect_timeout, "--max-time", max_time,
                "-w", "%{http_code} %{time_total} %{size_download}", target["url"]]
-        r = run(cmd, timeout=opts["max_time_sec"] + 2)
+        r = sys_probe.run(cmd, timeout=opts["max_time_sec"] + 2)
         if r["timeout"]:
             continue
         kbps = _parse_throughput_output(r["out"], target["bytes"])
@@ -594,7 +468,7 @@ def _probe_node(node, opts):
         out["status"] = _node_probe_status(ping_ms, loss, None, has_socks=False, socks_open=False, reachable=False)
         return out
 
-    socks_open = port_open(PROBE_SOCKS_HOST, socks_port, timeout=min(1.0, float(opts["connect_timeout_sec"])))
+    socks_open = sys_probe.port_open(PROBE_SOCKS_HOST, socks_port, timeout=min(1.0, float(opts["connect_timeout_sec"])))
     reachable = False
     throughput_kbps = None
     if socks_open:
@@ -635,14 +509,14 @@ def probe_nodes(state_path=None):
 def _dns_check(ip):
     """TCP :53 доступность + грубый ms."""
     t0 = time.time()
-    up = port_open(ip, 53, timeout=1.5)
+    up = sys_probe.port_open(ip, 53, timeout=1.5)
     ms = round((time.time() - t0) * 1000) if up else None
     return {"ip": ip, "name": _DNS_KNOWN.get(ip, ""), "up": up, "ms": ms}
 
 
 def probe_dns():
     """Системные резолверы (scutil) + проверка доступности публичных DNS."""
-    r = run([SCUTIL, "--dns"], timeout=4)
+    r = sys_probe.run([SCUTIL, "--dns"], timeout=4)
     seen, servers = set(), []
     if not r["timeout"]:
         for line in r["out"].splitlines():
@@ -660,10 +534,10 @@ def probe_dns():
 
 def probe_ifaces():
     """Активные интерфейсы (en0/ppp0/utunN) addr+MTU, маркер default-маршрута."""
-    dr = run([ROUTE, "-n", "get", "default"], timeout=3)
+    dr = sys_probe.run([ROUTE, "-n", "get", "default"], timeout=3)
     default_iface = _first(r"interface:\s*(\S+)", dr["out"]) if not dr["timeout"] else ""
     hardware_ports = _hardware_ports()
-    r = run([IFCONFIG], timeout=4)
+    r = sys_probe.run([IFCONFIG], timeout=4)
     ifaces = _parse_ifconfig_ifaces(r["out"] if not r["timeout"] else "", default_iface, hardware_ports)
     return {"ifaces": ifaces[:8], "default": default_iface,
             "status": "ok" if ifaces else "down"}
@@ -846,7 +720,7 @@ def switch_channel(target):
     if target not in CHANNEL_TARGETS:
         return _channel_result(target, {"rc": None, "out": "", "err": "bad channel target", "timeout": False})
 
-    listed = run([NETWORKSETUP, "-listallnetworkservices"], timeout=4)
+    listed = sys_probe.run([NETWORKSETUP, "-listallnetworkservices"], timeout=4)
     if listed["timeout"] or listed["rc"] != 0:
         return _channel_result(target, listed)
 
@@ -867,7 +741,7 @@ def switch_channel(target):
     # флагов-литералов и network-service names, подтверждённых networksetup. Ввод
     # запроса в shell-строку не попадает; новые динамические части требуют whitelist + escaping.
     applescript = f'do shell script "{_applescript_text(shell_cmd)}" with administrator privileges'
-    result = run([OSASCRIPT, "-e", applescript], timeout=60)
+    result = sys_probe.run([OSASCRIPT, "-e", applescript], timeout=60)
     return _channel_result(target, result, service=service)
 
 
@@ -884,12 +758,12 @@ def sudo_route(action):
     # ВАЖНО: shell_cmd собран из констант и validated local_state, ввод запроса сюда не попадает никогда.
     # Если кто-то добавит динамическую команду — обязан добавить вайтлист + экранирование.
     applescript = f'do shell script "{shell_cmd}" with administrator privileges'
-    return run([OSASCRIPT, "-e", applescript], timeout=60)
+    return sys_probe.run([OSASCRIPT, "-e", applescript], timeout=60)
 
 
 # ============================ non-privileged: сервисы ============================
 def service_control(name, action):
-    return run([BREW, "services", action, name], timeout=20)
+    return sys_probe.run([BREW, "services", action, name], timeout=20)
 
 
 # ============================ Flask-роуты ============================
@@ -915,7 +789,7 @@ def api_node_select(name):
     enabled = {n.get("name") for n in local_state.enabled_nodes()}
     if name not in enabled:
         return jsonify({"ok": False, "err": "node not enabled or unknown"}), 400
-    result = node_selector.select_node(name, enabled_names=enabled, runner=run, state_path=None)
+    result = node_selector.select_node(name, enabled_names=enabled, runner=sys_probe.run, state_path=None)
     return jsonify(result), (200 if result.get("ok") else 500)
 
 
