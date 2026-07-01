@@ -2,6 +2,8 @@ import importlib
 import sys
 import types
 
+import sys_probe
+
 
 def _fresh_dashboard(monkeypatch):
     monkeypatch.delitem(sys.modules, "dashboard", raising=False)
@@ -49,7 +51,7 @@ def test_probe_connectivity_classifies_wifi_and_real_reachability(monkeypatch):
             return {"rc": 0, "out": "204 0.125000", "err": "", "timeout": False}
         raise AssertionError(cmd)
 
-    monkeypatch.setattr(dashboard, "run", fake_run)
+    monkeypatch.setattr(sys_probe, "run", fake_run)
 
     out = dashboard.probe_connectivity()
 
@@ -77,7 +79,7 @@ def test_probe_connectivity_classifies_iphone_usb_as_metered(monkeypatch):
             return {"rc": 0, "out": "200 0.250000", "err": "", "timeout": False}
         raise AssertionError(cmd)
 
-    monkeypatch.setattr(dashboard, "run", fake_run)
+    monkeypatch.setattr(sys_probe, "run", fake_run)
 
     out = dashboard.probe_connectivity()
 
@@ -112,7 +114,7 @@ Ethernet Address: 12:34:56:78:90:ab
             return {"rc": 28, "out": "000 0.000000", "err": "", "timeout": False}
         raise AssertionError(cmd)
 
-    monkeypatch.setattr(dashboard, "run", fake_run)
+    monkeypatch.setattr(sys_probe, "run", fake_run)
 
     out = dashboard.probe_connectivity()
 
@@ -130,7 +132,7 @@ def test_probe_direct_reachability_empty_output_is_unknown(monkeypatch):
             return {"rc": 0, "out": "", "err": "", "timeout": False}
         raise AssertionError(cmd)
 
-    monkeypatch.setattr(dashboard, "run", fake_run)
+    monkeypatch.setattr(sys_probe, "run", fake_run)
 
     out = dashboard._probe_direct_reachability()
 
@@ -146,7 +148,7 @@ def test_probe_direct_reachability_curl_000_is_down(monkeypatch):
             return {"rc": 28, "out": "000 0.000000", "err": "", "timeout": False}
         raise AssertionError(cmd)
 
-    monkeypatch.setattr(dashboard, "run", fake_run)
+    monkeypatch.setattr(sys_probe, "run", fake_run)
 
     out = dashboard._probe_direct_reachability()
 
@@ -168,7 +170,7 @@ def test_probe_connectivity_unknown_channel_with_reachability_is_not_ok(monkeypa
             return {"rc": 0, "out": "200 0.100000", "err": "", "timeout": False}
         raise AssertionError(cmd)
 
-    monkeypatch.setattr(dashboard, "run", fake_run)
+    monkeypatch.setattr(sys_probe, "run", fake_run)
 
     out = dashboard.probe_connectivity()
 
@@ -191,7 +193,7 @@ def test_probe_connectivity_defensive_on_empty_ifconfig_and_curl_timeout(monkeyp
             return {"rc": None, "out": "", "err": "timeout", "timeout": True}
         raise AssertionError(cmd)
 
-    monkeypatch.setattr(dashboard, "run", fake_run)
+    monkeypatch.setattr(sys_probe, "run", fake_run)
 
     out = dashboard.probe_connectivity()
 
