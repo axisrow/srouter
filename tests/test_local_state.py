@@ -1,5 +1,4 @@
 import json
-import re
 from pathlib import Path
 
 import local_state
@@ -295,10 +294,89 @@ def test_example_json_active_resolves():
     assert local_state.active_node(path=example)["name"] == "sg-1"
 
 
-def test_traffic_guard_validation_rejects_auto_mode():
-    errors = local_state.validate_traffic_guard({"mode": "auto", "domains": {}})
+def test_traffic_guard_validation_accepts_auto_channel_domains():
+    guard = {
+        "mode": "auto",
+        "domains": {
+            "wifi": {"video.example.com": "allow"},
+            "usb_tether": {"video.example.com": "block"},
+            "metered": {"heavy.example.com": "block"},
+        },
+    }
 
-    assert any("auto" in error for error in errors)
+    assert local_state.validate_traffic_guard(guard) == []
+
+    cfg = local_state.traffic_guard_config(state={"traffic_guard": guard}, channel="usb")
+
+    assert cfg["mode"] == "auto"
+    assert cfg["channel"] == "usb_tether"
+    assert cfg["domains"] == {"video.example.com": "block"}
+    assert cfg["channels"]["wifi"] == {"video.example.com": "allow"}
+
+
+def test_traffic_guard_validation_rejects_invalid_auto_channel_domains():
+    errors = local_state.validate_traffic_guard(
+        {
+            "mode": "auto",
+            "domains": {
+                "wifi": ["video.example.com"],
+                "bluetooth": {"music.example.com": "block"},
+            },
+        }
+    )
+
+    assert any("wifi" in error and "object" in error for error in errors)
+    assert any("channel" in error and "bluetooth" in error for error in errors)
+
+
+def test_traffic_guard_validation_rejects_null_auto_channel_domains():
+    errors = local_state.validate_traffic_guard({"mode": "auto", "domains": {"wifi": None}})
+
+    assert errors == ["traffic_guard.domains.wifi must be an object"]
+
+
+def test_traffic_guard_validation_rejects_empty_auto_channel_policy_map():
+    errors = local_state.validate_traffic_guard({"mode": "auto", "domains": {"wifi": {}}})
+
+    assert errors == ["traffic_guard.domains.wifi must define at least one policy"]
+
+
+def test_traffic_guard_validation_rejects_empty_auto_domains():
+    cases = [
+        {"mode": "auto"},
+        {"mode": "auto", "domains": None},
+        {"mode": "auto", "domains": {}},
+    ]
+
+    for guard in cases:
+        errors = local_state.validate_traffic_guard(guard)
+        assert errors == ["traffic_guard.domains must define channel policies for auto mode"]
+
+
+def test_traffic_guard_validation_allows_legacy_missing_or_null_domains():
+    assert local_state.validate_traffic_guard({"mode": "on"}) == []
+    assert local_state.validate_traffic_guard({"mode": "on", "domains": None}) == []
+    assert local_state.validate_traffic_guard({"mode": "off"}) == []
+    assert local_state.validate_traffic_guard({"mode": "off", "domains": None}) == []
+
+    cfg = local_state.traffic_guard_config(state={"traffic_guard": {"mode": "on", "domains": None}})
+
+    assert cfg["valid"] is True
+    assert cfg["domains"] == {}
+
+
+def test_traffic_guard_validation_rejects_auto_parent_child_conflict_per_channel():
+    errors = local_state.validate_traffic_guard(
+        {
+            "mode": "auto",
+            "domains": {
+                "wifi": {"example.com": "block", "api.example.com": "allow"},
+                "usb_tether": {"example.com": "block", "api.example.com": "block"},
+            },
+        }
+    )
+
+    assert any("wifi" in error and "example.com" in error and "api.example.com" in error for error in errors)
 
 
 def test_traffic_guard_validation_rejects_throttle_policy():
