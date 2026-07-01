@@ -113,6 +113,82 @@ def test_generate_config_emits_blackhole_only_for_block_domains(tmp_path):
     assert any("domain:safe.example.com" in rule.get("domain", []) for rule in active_rules)
 
 
+def test_generate_config_auto_uses_explicit_channel_domains(tmp_path):
+    state = json.loads(EXAMPLE.read_text(encoding="utf-8"))
+    state["traffic_guard"] = {
+        "mode": "auto",
+        "domains": {
+            "wifi": {
+                "video.example.com": "allow",
+                "wifi-only.example.com": "block",
+            },
+            "usb_tether": {
+                "video.example.com": "block",
+                "safe.example.com": "allow",
+            },
+            "metered": {
+                "metered.example.com": "block",
+            },
+        },
+    }
+    path = _dump_state(tmp_path, state)
+
+    cfg = gen_xray_config.generate_config(state_path=path, traffic_guard_channel="usb")
+
+    block_rules = [rule for rule in cfg["routing"]["rules"] if rule.get("outboundTag") == "traffic-guard-blackhole"]
+    assert block_rules == [
+        {
+            "type": "field",
+            "inboundTag": ["srouter-socks"],
+            "domain": ["domain:video.example.com"],
+            "outboundTag": "traffic-guard-blackhole",
+        }
+    ]
+
+    active_rules = [rule for rule in cfg["routing"]["rules"] if rule.get("outboundTag") == "active"]
+    assert any("domain:safe.example.com" in rule.get("domain", []) for rule in active_rules)
+    rendered = json.dumps(cfg, ensure_ascii=False)
+    assert "domain:wifi-only.example.com" not in rendered
+    assert "domain:metered.example.com" not in rendered
+
+
+def test_generate_config_auto_requires_channel_for_generation(tmp_path):
+    state = json.loads(EXAMPLE.read_text(encoding="utf-8"))
+    state["traffic_guard"] = {
+        "mode": "auto",
+        "domains": {
+            "wifi": {"video.example.com": "block"},
+        },
+    }
+    path = _dump_state(tmp_path, state)
+    output = tmp_path / "config.json"
+
+    with pytest.raises(gen_xray_config.TrafficGuardValidationError) as exc:
+        gen_xray_config.generate_config(state_path=path)
+
+    assert any("traffic_guard_channel" in error for error in exc.value.errors)
+    assert gen_xray_config.write_config(output, state_path=path) is False
+    assert not output.exists()
+
+
+def test_generate_config_auto_uses_state_default_channel(tmp_path):
+    state = json.loads(EXAMPLE.read_text(encoding="utf-8"))
+    state["traffic_guard"] = {
+        "mode": "auto",
+        "channel": "wifi",
+        "domains": {
+            "wifi": {"video.example.com": "block"},
+            "usb_tether": {"video.example.com": "allow"},
+        },
+    }
+    path = _dump_state(tmp_path, state)
+
+    cfg = gen_xray_config.generate_config(state_path=path)
+
+    block_rules = [rule for rule in cfg["routing"]["rules"] if rule.get("outboundTag") == "traffic-guard-blackhole"]
+    assert block_rules[0]["domain"] == ["domain:video.example.com"]
+
+
 @pytest.mark.parametrize(
     "traffic_guard",
     [

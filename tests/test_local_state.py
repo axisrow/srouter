@@ -295,10 +295,53 @@ def test_example_json_active_resolves():
     assert local_state.active_node(path=example)["name"] == "sg-1"
 
 
-def test_traffic_guard_validation_rejects_auto_mode():
-    errors = local_state.validate_traffic_guard({"mode": "auto", "domains": {}})
+def test_traffic_guard_validation_accepts_auto_channel_domains():
+    guard = {
+        "mode": "auto",
+        "domains": {
+            "wifi": {"video.example.com": "allow"},
+            "usb_tether": {"video.example.com": "block"},
+            "metered": {"heavy.example.com": "block"},
+        },
+    }
 
-    assert any("auto" in error for error in errors)
+    assert local_state.validate_traffic_guard(guard) == []
+
+    cfg = local_state.traffic_guard_config(state={"traffic_guard": guard}, channel="usb")
+
+    assert cfg["mode"] == "auto"
+    assert cfg["channel"] == "usb_tether"
+    assert cfg["domains"] == {"video.example.com": "block"}
+    assert cfg["channels"]["wifi"] == {"video.example.com": "allow"}
+
+
+def test_traffic_guard_validation_rejects_invalid_auto_channel_domains():
+    errors = local_state.validate_traffic_guard(
+        {
+            "mode": "auto",
+            "domains": {
+                "wifi": ["video.example.com"],
+                "bluetooth": {"music.example.com": "block"},
+            },
+        }
+    )
+
+    assert any("wifi" in error and "object" in error for error in errors)
+    assert any("channel" in error and "bluetooth" in error for error in errors)
+
+
+def test_traffic_guard_validation_rejects_auto_parent_child_conflict_per_channel():
+    errors = local_state.validate_traffic_guard(
+        {
+            "mode": "auto",
+            "domains": {
+                "wifi": {"example.com": "block", "api.example.com": "allow"},
+                "usb_tether": {"example.com": "block", "api.example.com": "block"},
+            },
+        }
+    )
+
+    assert any("wifi" in error and "example.com" in error and "api.example.com" in error for error in errors)
 
 
 def test_traffic_guard_validation_rejects_throttle_policy():

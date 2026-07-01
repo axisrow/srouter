@@ -15,8 +15,9 @@ _DEFAULT_PATH = Path(__file__).resolve().parent / "srouter.local.json"
 # D2: валидация хоста — только безопасные символы, shell-метасимволы запрещены.
 # Переиспользовано из закрытого PR #19; закреплено в #2.
 _HOST_RE = re.compile(r"^[A-Za-z0-9.:_-]+\Z")
-_TRAFFIC_GUARD_MODES = {"on", "off"}
+_TRAFFIC_GUARD_MODES = {"on", "off", "auto"}
 _TRAFFIC_GUARD_POLICIES = {"block", "allow"}
+_TRAFFIC_GUARD_CHANNELS = {"wifi", "usb_tether", "metered"}
 
 
 def _is_valid_host(host):
@@ -46,11 +47,134 @@ def _traffic_guard_domain_matches(candidate, rule_domain):
     return candidate_norm == rule_norm or candidate_norm.endswith("." + rule_norm)
 
 
+def _normalize_traffic_guard_channel(channel):
+    """Нормализовать канал из #10/#11; пустая строка значит reject/unknown."""
+    if not isinstance(channel, str):
+        return ""
+    normalized = channel.strip().lower().replace("-", "_").replace(" ", "_")
+    if normalized in {"wifi", "wi_fi"}:
+        return "wifi"
+    if normalized in {"usb", "usb_tether", "usbtether"}:
+        return "usb_tether"
+    if normalized == "metered":
+        return "metered"
+    return ""
+
+
+def _validate_traffic_guard_domain_map(domains, errors, context):
+    if domains is None:
+        return {}
+    if not isinstance(domains, dict):
+        errors.append(f"{context} must be an object")
+        return {}
+
+    normalized = {}
+    for domain, policy in domains.items():
+        domain_norm = _normalize_traffic_guard_domain(domain)
+        if not domain_norm:
+            errors.append(f"{context} domain is invalid: {domain!r}")
+            continue
+        if policy == "throttle":
+            errors.append(f'{context} policy "throttle" is not supported in v1: {domain_norm}')
+            continue
+        if not isinstance(policy, str) or policy not in _TRAFFIC_GUARD_POLICIES:
+            errors.append(f'{context} policy must be "block" or "allow": {domain_norm}')
+            continue
+        previous = normalized.get(domain_norm)
+        if previous is not None and previous != policy:
+            errors.append(f"conflicting {context} policies for {domain_norm}: {previous} vs {policy}")
+            continue
+        normalized[domain_norm] = policy
+
+    ordered = sorted(normalized.items(), key=lambda item: item[0].count("."))
+    for index, (parent, parent_policy) in enumerate(ordered):
+        for child, child_policy in ordered[index + 1 :]:
+            if parent_policy != child_policy and _traffic_guard_domain_matches(child, parent):
+                errors.append(f"conflicting {context} policies: {parent}={parent_policy} vs {child}={child_policy}")
+    return normalized
+
+
+def _validate_traffic_guard_channel_domains(domains, errors):
+    if domains is None:
+        return {}
+    if not isinstance(domains, dict):
+        errors.append("traffic_guard.domains must be an object")
+        return {}
+
+    normalized = {}
+    for channel, channel_domains in domains.items():
+        channel_norm = _normalize_traffic_guard_channel(channel)
+        if not channel_norm:
+            errors.append(f"traffic_guard channel is invalid: {channel!r}")
+            continue
+        if channel_norm in normalized:
+            errors.append(f"duplicate traffic_guard channel: {channel_norm}")
+            continue
+        context = f"traffic_guard.domains.{channel_norm}"
+        normalized[channel_norm] = _validate_traffic_guard_domain_map(channel_domains, errors, context)
+    return normalized
+
+
+def _normalized_traffic_guard_domain_map(domains):
+    normalized = {}
+    if not isinstance(domains, dict):
+        return normalized
+    for domain, policy in domains.items():
+        domain_norm = _normalize_traffic_guard_domain(domain)
+        if domain_norm and policy in _TRAFFIC_GUARD_POLICIES:
+            normalized[domain_norm] = policy
+    return normalized
+
+
+def _normalized_traffic_guard_channel_domains(domains):
+    normalized = {}
+    if not isinstance(domains, dict):
+        return normalized
+    for channel, channel_domains in domains.items():
+        channel_norm = _normalize_traffic_guard_channel(channel)
+        if not channel_norm or channel_norm in normalized:
+            continue
+        normalized[channel_norm] = _normalized_traffic_guard_domain_map(channel_domains)
+    return normalized
+
+
+def _traffic_guard_state_channel(guard, state, channel):
+    for candidate in (channel, guard.get("channel"), guard.get("active_channel")):
+        channel_norm = _normalize_traffic_guard_channel(candidate)
+        if channel_norm:
+            return channel_norm
+    network = state.get("network") if isinstance(state, dict) else {}
+    if isinstance(network, dict):
+        for candidate in (
+            network.get("traffic_guard_channel"),
+            network.get("active_channel"),
+            network.get("channel"),
+        ):
+            channel_norm = _normalize_traffic_guard_channel(candidate)
+            if channel_norm:
+                return channel_norm
+    return ""
+
+
+def _traffic_guard_domains_for_channel(channels, channel):
+    if not isinstance(channels, dict):
+        return {}
+    channel_norm = _normalize_traffic_guard_channel(channel)
+    if not channel_norm:
+        return {}
+    if isinstance(channels.get(channel_norm), dict):
+        return dict(channels[channel_norm])
+    # USB tether в #10 является очевидно metered; общий metered-набор служит fallback.
+    if channel_norm == "usb_tether" and isinstance(channels.get("metered"), dict):
+        return dict(channels["metered"])
+    return {}
+
+
 def validate_traffic_guard(guard):
     """Вернуть список явных ошибок Traffic Guard v1. Не бросает.
 
-    v1 сознательно принимает только mode on/off и политики block/allow.
-    auto/throttle отклоняются валидацией, а не молча приводятся к другой семантике.
+    mode:auto opt-in: domains становится картой channel -> domain policies.
+    throttle по-прежнему отклоняется валидацией, а не молча приводится к другой семантике.
     """
     errors = []
     if guard is None or guard is False:
@@ -59,47 +183,20 @@ def validate_traffic_guard(guard):
         return ["traffic_guard must be an object"]
 
     mode = guard.get("mode", "off")
-    if mode == "auto":
-        errors.append('traffic_guard.mode "auto" is not supported in v1')
-    elif not isinstance(mode, str) or mode not in _TRAFFIC_GUARD_MODES:
-        errors.append('traffic_guard.mode must be "on" or "off"')
+    if not isinstance(mode, str) or mode not in _TRAFFIC_GUARD_MODES:
+        errors.append('traffic_guard.mode must be "on", "off", or "auto"')
 
     domains = guard.get("domains", {})
     if domains is None:
         return errors
-    if not isinstance(domains, dict):
-        errors.append("traffic_guard.domains must be an object")
-        return errors
-
-    normalized = {}
-    for domain, policy in domains.items():
-        domain_norm = _normalize_traffic_guard_domain(domain)
-        if not domain_norm:
-            errors.append(f"traffic_guard domain is invalid: {domain!r}")
-            continue
-        if policy == "throttle":
-            errors.append(f'traffic_guard policy "throttle" is not supported in v1: {domain_norm}')
-            continue
-        if not isinstance(policy, str) or policy not in _TRAFFIC_GUARD_POLICIES:
-            errors.append(f'traffic_guard policy must be "block" or "allow": {domain_norm}')
-            continue
-        previous = normalized.get(domain_norm)
-        if previous is not None and previous != policy:
-            errors.append(f"conflicting traffic_guard policies for {domain_norm}: {previous} vs {policy}")
-            continue
-        normalized[domain_norm] = policy
-
-    ordered = sorted(normalized.items(), key=lambda item: item[0].count("."))
-    for index, (parent, parent_policy) in enumerate(ordered):
-        for child, child_policy in ordered[index + 1 :]:
-            if parent_policy != child_policy and _traffic_guard_domain_matches(child, parent):
-                errors.append(
-                    f"conflicting traffic_guard policies: {parent}={parent_policy} vs {child}={child_policy}"
-                )
+    if mode == "auto":
+        _validate_traffic_guard_channel_domains(domains, errors)
+    else:
+        _validate_traffic_guard_domain_map(domains, errors, "traffic_guard.domains")
     return errors
 
 
-def traffic_guard_config(path=None, state=None):
+def traffic_guard_config(path=None, state=None, channel=None):
     """Нормализованный Traffic Guard для generator/probe.
 
     Возвращает dict с valid/errors; при ошибках безопасно отключает правила, но
@@ -110,19 +207,28 @@ def traffic_guard_config(path=None, state=None):
     guard = state.get("traffic_guard") if isinstance(state, dict) else {}
     errors = validate_traffic_guard(guard)
     if errors:
-        return {"mode": "off", "domains": {}, "valid": False, "errors": errors}
+        return {"mode": "off", "domains": {}, "channels": {}, "channel": "", "valid": False, "errors": errors}
     if not isinstance(guard, dict):
         guard = {}
     domains = guard.get("domains") if isinstance(guard.get("domains"), dict) else {}
-    normalized = {}
-    for domain, policy in domains.items():
-        domain_norm = _normalize_traffic_guard_domain(domain)
-        if domain_norm and policy in _TRAFFIC_GUARD_POLICIES:
-            normalized[domain_norm] = policy
     mode = guard.get("mode", "off")
+    mode = mode if mode in _TRAFFIC_GUARD_MODES else "off"
+    if mode == "auto":
+        channels = _normalized_traffic_guard_channel_domains(domains)
+        active_channel = _traffic_guard_state_channel(guard, state, channel)
+        return {
+            "mode": "auto",
+            "domains": _traffic_guard_domains_for_channel(channels, active_channel),
+            "channels": channels,
+            "channel": active_channel,
+            "valid": True,
+            "errors": [],
+        }
     return {
-        "mode": mode if mode in _TRAFFIC_GUARD_MODES else "off",
-        "domains": normalized,
+        "mode": mode,
+        "domains": _normalized_traffic_guard_domain_map(domains),
+        "channels": {},
+        "channel": "",
         "valid": True,
         "errors": [],
     }

@@ -191,26 +191,32 @@ def _apply_outbound_hook(outbound, outbound_hook, *, node, role):
         return outbound
 
 
-def traffic_guard_validation_errors(state_path=None):
+def traffic_guard_validation_errors(state_path=None, traffic_guard_channel=None):
     """Ошибки Traffic Guard для apply/preflight-слоёв. Пустой список значит generation-safe."""
-    guard = local_state.traffic_guard_config(path=state_path)
+    guard = local_state.traffic_guard_config(path=state_path, channel=traffic_guard_channel)
     if guard.get("valid") is not True:
         errors = guard.get("errors") if isinstance(guard.get("errors"), list) else []
         return [str(error) for error in errors if error] or ["traffic_guard invalid"]
+    if guard.get("mode") == "auto" and not guard.get("channel"):
+        return ['traffic_guard.mode "auto" requires traffic_guard_channel or traffic_guard.channel']
     return []
 
 
-def validate_traffic_guard_for_generation(state_path=None):
+def validate_traffic_guard_for_generation(state_path=None, traffic_guard_channel=None):
     """Fail-closed gate: invalid guard не должен рендериться как обычный config."""
-    errors = traffic_guard_validation_errors(state_path=state_path)
+    errors = traffic_guard_validation_errors(state_path=state_path, traffic_guard_channel=traffic_guard_channel)
     if errors:
         raise TrafficGuardValidationError(errors)
-    return local_state.traffic_guard_config(path=state_path)
+    return local_state.traffic_guard_config(path=state_path, channel=traffic_guard_channel)
 
 
-def _traffic_guard_domains(state_path=None, policy=None, guard=None):
-    guard = guard if isinstance(guard, dict) else validate_traffic_guard_for_generation(state_path=state_path)
-    if guard.get("mode") != "on" or guard.get("valid") is not True:
+def _traffic_guard_domains(state_path=None, policy=None, guard=None, traffic_guard_channel=None):
+    guard = (
+        guard
+        if isinstance(guard, dict)
+        else validate_traffic_guard_for_generation(state_path=state_path, traffic_guard_channel=traffic_guard_channel)
+    )
+    if guard.get("mode") not in ("on", "auto") or guard.get("valid") is not True:
         return []
     domains = guard.get("domains") if isinstance(guard.get("domains"), dict) else {}
     out = []
@@ -235,6 +241,7 @@ def generate_config(
     extra_outbounds=None,
     outbound_hook=None,
     template_path=None,
+    traffic_guard_channel=None,
 ):
     """Вернуть dict xray config.
 
@@ -258,9 +265,15 @@ def generate_config(
     inbounds = [_main_socks_inbound()]
     rules = []
     outbounds = [{"tag": "direct", "protocol": "freedom", "settings": {}}]
-    traffic_guard = validate_traffic_guard_for_generation(state_path=state_path)
-    block_domains = _traffic_guard_domains(state_path, policy="block", guard=traffic_guard)
-    allow_domains = _traffic_guard_domains(state_path, policy="allow", guard=traffic_guard)
+    traffic_guard = validate_traffic_guard_for_generation(
+        state_path=state_path, traffic_guard_channel=traffic_guard_channel
+    )
+    block_domains = _traffic_guard_domains(
+        state_path, policy="block", guard=traffic_guard, traffic_guard_channel=traffic_guard_channel
+    )
+    allow_domains = _traffic_guard_domains(
+        state_path, policy="allow", guard=traffic_guard, traffic_guard_channel=traffic_guard_channel
+    )
 
     for node in nodes:
         inbound = _probe_inbound(node)
@@ -339,10 +352,16 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Сгенерировать xray config из srouter.local.json")
     parser.add_argument("--state", dest="state_path", default=None, help="Путь к srouter.local.json")
     parser.add_argument("-o", "--output", dest="output_path", default=None, help="Куда записать config.json")
+    parser.add_argument(
+        "--traffic-guard-channel",
+        dest="traffic_guard_channel",
+        default=None,
+        help="Канал для mode:auto: wifi, usb_tether/usb или metered",
+    )
     args = parser.parse_args(argv)
 
     try:
-        cfg = generate_config(state_path=args.state_path)
+        cfg = generate_config(state_path=args.state_path, traffic_guard_channel=args.traffic_guard_channel)
         text = json.dumps(cfg, ensure_ascii=False, indent=2) + "\n"
         if args.output_path:
             path = Path(args.output_path)
