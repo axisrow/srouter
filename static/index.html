@@ -40,6 +40,15 @@
     .dns-pill { font-family:var(--bs-font-monospace); font-size:.75rem; }
     .dns-dot { display:inline-block; width:7px; height:7px; border-radius:50%; margin-left:4px; }
     .dns-up { background:#3fb950; } .dns-down { background:#f85149; }
+    .node-row { border:1px solid var(--bs-border-color); border-radius:.6rem; padding:.75rem;
+      background:var(--bs-body-bg); }
+    .node-row + .node-row { margin-top:.5rem; }
+    .node-row.active { border-color:rgba(var(--bs-success-rgb), .55); }
+    .node-row.best { box-shadow:inset 3px 0 0 var(--bs-primary); }
+    .node-row.pending { border-color:rgba(var(--bs-warning-rgb), .65); }
+    .node-row.failed { border-color:rgba(var(--bs-danger-rgb), .55); }
+    .node-metrics { display:grid; grid-template-columns:repeat(auto-fit,minmax(130px,1fr)); gap:.35rem .75rem; }
+    .node-metric .k { display:block; font-size:.72rem; color:var(--bs-secondary-color); }
   </style>
 </head>
 <body>
@@ -88,6 +97,17 @@
     </div>
 
     <div id="cards" class="row g-3"></div>
+
+    <div class="card mt-3">
+      <div class="card-header d-flex align-items-center">
+        <i class="bi bi-hdd-rack me-2"></i>
+        <span data-i18n="node_selector_title">Node selection</span>
+        <span class="ms-auto badge bg-secondary ops" id="node-selector-badge">—</span>
+      </div>
+      <div class="card-body">
+        <div id="node-selector"></div>
+      </div>
+    </div>
 
     <div class="card mt-3">
       <div class="card-header d-flex align-items-center">
@@ -152,7 +172,17 @@
         card_ip_vps: "VPS endpoint", card_ping: "Ping → VPS", ping_sub: "loss {0}% · VPN {1}",
         card_distance: "Distance to VPS", km: "km", card_dns: "DNS resolvers", resolvers: "resolvers",
         card_dns_public: "Public DNS", card_ifaces: "Interfaces", active: "active",
-        no_geo: "no geo data", mode_simple: "Simple mode", mode_cinematic: "Cinematic mode"
+        no_geo: "no geo data", mode_simple: "Simple mode", mode_cinematic: "Cinematic mode",
+        node_selector_title: "Node selection", node_selector_empty: "no enabled nodes",
+        node_selector_badge: "{0} nodes", node_recommend_label: "recommendation",
+        node_recommend_hold: "hold", node_recommend_switch: "switch to {0}",
+        node_recommend_no_data: "no recommendation", node_best: "best", node_pending: "pending",
+        node_failed: "failed", node_select: "Select", node_selected: "Selected",
+        node_rank: "rank {0}", node_score: "score", node_no_score: "no score",
+        node_latency: "latency", node_throughput: "throughput", node_geo: "geo",
+        node_endpoint: "endpoint", node_route_ip: "route IP", node_select_ok: "Selected node {0}",
+        node_select_err: "Failed to select {0}: {1}", node_select_cancelled: "Node selection cancelled",
+        node_apply_step: "step {0}", action_in_progress: "Action in progress", kbps: "kbps"
       },
       ru: {
         brand: "Tunnel Dashboard", theme_title: "Тема", theme_auto: "Авто",
@@ -180,7 +210,17 @@
         card_ip_vps: "Точка VPS", card_ping: "Пинг → VPS", ping_sub: "потери {0}% · VPN {1}",
         card_distance: "Расстояние до VPS", km: "км", card_dns: "DNS-серверы", resolvers: "серверов",
         card_dns_public: "Публичные DNS", card_ifaces: "Интерфейсы", active: "активно",
-        no_geo: "нет гео-данных", mode_simple: "Простой режим", mode_cinematic: "Кинорежим"
+        no_geo: "нет гео-данных", mode_simple: "Простой режим", mode_cinematic: "Кинорежим",
+        node_selector_title: "Выбор узла", node_selector_empty: "нет включённых узлов",
+        node_selector_badge: "узлов: {0}", node_recommend_label: "рекомендация",
+        node_recommend_hold: "оставить", node_recommend_switch: "переключить на {0}",
+        node_recommend_no_data: "нет рекомендации", node_best: "лучший", node_pending: "ожидает",
+        node_failed: "сбой", node_select: "Выбрать", node_selected: "Выбран",
+        node_rank: "ранг {0}", node_score: "оценка", node_no_score: "нет оценки",
+        node_latency: "задержка", node_throughput: "скорость", node_geo: "гео",
+        node_endpoint: "адрес", node_route_ip: "IP маршрута", node_select_ok: "Выбран узел {0}",
+        node_select_err: "Не удалось выбрать {0}: {1}", node_select_cancelled: "Выбор узла отменён",
+        node_apply_step: "шаг {0}", action_in_progress: "Действие уже выполняется", kbps: "кбит/с"
       },
       zh: {
         brand: "隧道仪表盘", theme_title: "主题", theme_auto: "自动",
@@ -208,7 +248,17 @@
         card_ip_vps: "VPS 节点", card_ping: "延迟 → VPS", ping_sub: "丢包 {0}% · VPN {1}",
         card_distance: "到 VPS 距离", km: "公里", card_dns: "DNS 解析器", resolvers: "个解析器",
         card_dns_public: "公共 DNS", card_ifaces: "网络接口", active: "活动",
-        no_geo: "无地理数据", mode_simple: "简洁模式", mode_cinematic: "影院模式"
+        no_geo: "无地理数据", mode_simple: "简洁模式", mode_cinematic: "影院模式",
+        node_selector_title: "节点选择", node_selector_empty: "没有启用节点",
+        node_selector_badge: "{0} 个节点", node_recommend_label: "建议",
+        node_recommend_hold: "保持", node_recommend_switch: "切换到 {0}",
+        node_recommend_no_data: "无建议", node_best: "最佳", node_pending: "待处理",
+        node_failed: "失败", node_select: "选择", node_selected: "已选择",
+        node_rank: "排名 {0}", node_score: "评分", node_no_score: "无评分",
+        node_latency: "延迟", node_throughput: "吞吐", node_geo: "地理位置",
+        node_endpoint: "端点", node_route_ip: "路由 IP", node_select_ok: "已选择节点 {0}",
+        node_select_err: "选择 {0} 失败：{1}", node_select_cancelled: "节点选择已取消",
+        node_apply_step: "步骤 {0}", action_in_progress: "操作正在进行", kbps: "kbps"
       }
     };
 
@@ -375,7 +425,171 @@
     }
 
     /* ============================ Render ============================ */
-    function render(d) {
+    var LAST_STATUS = null;
+    var LAST_RANKING = null;
+    var NODE_APPLY = null;
+    var MUTATION = null;
+
+    function num(v) {
+      if (v === null || v === undefined || v === '') return null;
+      var n = Number(v);
+      return isFinite(n) ? n : null;
+    }
+    function fmtNumber(v) {
+      var n = num(v);
+      if (n === null) return '—';
+      return (Math.round(n) === n ? n : n.toFixed(1)).toLocaleString();
+    }
+    function fmtScore(v) {
+      var n = num(v);
+      return n === null ? t('node_no_score') : Math.round(n * 100) + '%';
+    }
+    function fmtLatency(v) {
+      var n = num(v);
+      return n === null ? '—' : fmtNumber(n) + ' ' + t('ms');
+    }
+    function fmtThroughput(v) {
+      var n = num(v);
+      return n === null ? '—' : Math.round(n).toLocaleString() + ' ' + t('kbps');
+    }
+    function nodeApplyPending() {
+      return !!(NODE_APPLY && NODE_APPLY.state === 'pending');
+    }
+    function mutationInFlight() {
+      return !!MUTATION;
+    }
+    function setMutationControlsDisabled(on) {
+      document.querySelectorAll('.act').forEach(function (b) { b.disabled = on; });
+    }
+    function tryBeginMutation(kind, ev) {
+      if (mutationInFlight()) {
+        if (ev) ev.preventDefault();
+        toast(t('action_in_progress'), 'warn');
+        return false;
+      }
+      MUTATION = { kind: kind };
+      paused = true;
+      setMutationControlsDisabled(true);
+      return true;
+    }
+    function finishMutation() {
+      MUTATION = null;
+      paused = false;
+      setMutationControlsDisabled(false);
+    }
+    function nodeGeoText(node) {
+      var geo = node && typeof node.geo === 'object' && node.geo ? node.geo : {};
+      var cc = geo.country_code || node.country_code || '';
+      var fl = flag(cc);
+      var loc = [geo.city, geo.country].filter(Boolean).join(', ');
+      if (!loc && cc) loc = cc.toUpperCase();
+      return [fl, loc].filter(Boolean).join(' ') || t('no_geo');
+    }
+    function recommendationLabel(ranking) {
+      var rec = ranking && ranking.recommendation ? String(ranking.recommendation) : '';
+      if (rec.indexOf('switch:') === 0) return t('node_recommend_switch', rec.slice(7));
+      if (rec === 'hold') return t('node_recommend_hold');
+      if (rec === 'no-data') return t('node_recommend_no_data');
+      return rec || t('node_recommend_no_data');
+    }
+    function buildNodeRows(statusNodes, ranking) {
+      var nodes = Array.isArray(statusNodes) ? statusNodes : [];
+      var ranked = Array.isArray(ranking && ranking.score_window) ? ranking.score_window : [];
+      var byName = {};
+      nodes.forEach(function (node) {
+        if (node && node.name) byName[node.name] = node;
+      });
+      var seen = {};
+      var rows = ranked.map(function (scoreRow) {
+        var name = scoreRow && scoreRow.name ? scoreRow.name : '';
+        seen[name] = true;
+        var node = byName[name] || { name: name };
+        return Object.assign({}, node, {
+          score: scoreRow ? scoreRow.score : node.score,
+          rank: scoreRow ? scoreRow.rank : node.rank,
+          status: (scoreRow && scoreRow.status) || node.status
+        });
+      });
+      nodes.forEach(function (node) {
+        if (node && node.name && !seen[node.name]) rows.push(node);
+      });
+      return rows;
+    }
+    function nodeStatusBadges(row, activeName, bestName, pendingName, failedName) {
+      var badges = [];
+      if (row.name === activeName) badges.push('<span class="badge text-bg-success">' + esc(t('active')) + '</span>');
+      if (row.name === bestName) badges.push('<span class="badge text-bg-primary">' + esc(t('node_best')) + '</span>');
+      if (row.name === pendingName) badges.push('<span class="badge text-bg-warning">' + esc(t('node_pending')) + '</span>');
+      if (row.name === failedName) badges.push('<span class="badge text-bg-danger">' + esc(t('node_failed')) + '</span>');
+      badges.push('<span class="badge ' + badgeClass(row.status) + '">' + esc(badgeText(row.status)) + '</span>');
+      return badges.join(' ');
+    }
+    function renderNodeSelector(d, ranking) {
+      var box = document.getElementById('node-selector');
+      var badge = document.getElementById('node-selector-badge');
+      if (!box) return;
+      ranking = ranking || {};
+      var rows = buildNodeRows(d && d.nodes, ranking);
+      var activeName = ranking.active || '';
+      var bestName = ranking.best || '';
+      var pendingName = (ranking.pending || (d && d.active_node && d.active_node.pending) ||
+        (NODE_APPLY && NODE_APPLY.state === 'pending' ? NODE_APPLY.name : ''));
+      var failedName = (ranking.failed || (NODE_APPLY && NODE_APPLY.state === 'failed' ? NODE_APPLY.name : ''));
+      if (badge) {
+        badge.className = 'ms-auto badge ops ' + (rows.length ? 'bg-primary' : 'bg-secondary');
+        badge.textContent = rows.length ? t('node_selector_badge', rows.length) : '—';
+      }
+      if (!rows.length) {
+        box.innerHTML = '<div class="text-secondary ops">' + esc(t('node_selector_empty')) + '</div>';
+        return;
+      }
+      var route = (d && d.route) || {};
+      var summary = '<div class="d-flex flex-wrap gap-2 mb-3 ops">' +
+        '<span class="badge text-bg-light">' + esc(t('node_recommend_label')) + ': ' +
+          esc(recommendationLabel(ranking)) + '</span>' +
+        '<span class="badge text-bg-light">' + esc(t('active')) + ': ' + esc(activeName || '—') + '</span>' +
+        '<span class="badge text-bg-light">' + esc(route.split_active ? t('split_on') : t('split_off')) + '</span>' +
+        '</div>';
+      var html = rows.map(function (row, idx) {
+        var rank = row.rank || (idx + 1);
+        var statusClass = 'node-row' + (row.name === activeName ? ' active' : '') +
+          (row.name === bestName ? ' best' : '') + (row.name === pendingName ? ' pending' : '') +
+          (row.name === failedName ? ' failed' : '');
+        var applyBusy = nodeApplyPending();
+        var selected = row.name === activeName;
+        var button = selected
+          ? '<button class="btn btn-sm btn-outline-success" type="button" disabled>' +
+            '<i class="bi bi-check2"></i> ' + esc(t('node_selected')) + '</button>'
+          : '<button class="btn btn-sm btn-outline-primary act node-select" type="button" ' +
+            'data-node-name="' + esc(row.name || '') + '"' + (applyBusy ? ' disabled' : '') + '>' +
+            '<span class="lbl"><i class="bi bi-arrow-right-circle"></i> ' + esc(t('node_select')) + '</span></button>';
+        return '<div class="' + statusClass + '">' +
+          '<div class="d-flex flex-wrap align-items-start gap-2">' +
+            '<div class="me-auto">' +
+              '<div class="d-flex flex-wrap align-items-center gap-2">' +
+                '<span class="fw-semibold mono">' + esc(row.name || '—') + '</span>' +
+                '<span class="text-secondary small">' + esc(t('node_rank', rank)) + '</span>' +
+                nodeStatusBadges(row, activeName, bestName, pendingName, failedName) +
+              '</div>' +
+              '<div class="node-metrics mt-2 ops">' +
+                '<div class="node-metric"><span class="k">' + esc(t('node_score')) + '</span>' + esc(fmtScore(row.score)) + '</div>' +
+                '<div class="node-metric"><span class="k">' + esc(t('node_latency')) + '</span>' + esc(fmtLatency(row.ping_ms)) + '</div>' +
+                '<div class="node-metric"><span class="k">' + esc(t('node_throughput')) + '</span>' + esc(fmtThroughput(row.throughput_kbps)) + '</div>' +
+                '<div class="node-metric"><span class="k">' + esc(t('node_geo')) + '</span>' + esc(nodeGeoText(row)) + '</div>' +
+                '<div class="node-metric"><span class="k">' + esc(t('node_endpoint')) + '</span><span class="mono">' + esc(row.endpoint_host || '—') + '</span></div>' +
+                '<div class="node-metric"><span class="k">' + esc(t('node_route_ip')) + '</span><span class="mono">' + esc(row.route_ip || '—') + '</span></div>' +
+              '</div>' +
+            '</div>' +
+            '<div class="ms-auto">' + button + '</div>' +
+          '</div>' +
+        '</div>';
+      }).join('');
+      box.innerHTML = summary + html;
+    }
+
+    function render(d, ranking) {
+      LAST_STATUS = d;
+      LAST_RANKING = ranking || {};
       var tun = d.tunnel || {};
       var an = tun.anthropic || {}, oa = tun.openai || {};
       pushHistory('anthropic', an.ms);
@@ -494,6 +708,8 @@
 
       document.getElementById('cards').innerHTML = html;
       renderFlow(d);
+      renderNodeSelector(d, LAST_RANKING);
+      if (mutationInFlight()) setMutationControlsDisabled(true);
 
       var ts = d.ts ? new Date(d.ts * 1000) : new Date();
       document.getElementById('updated').textContent = t('updated_at', ts.toLocaleTimeString());
@@ -547,10 +763,18 @@
       document.getElementById('cards').innerHTML = html;
       var fs = document.getElementById('flow-strip');
       if (fs) fs.innerHTML = '<div class="text-secondary ops">' + esc(t('no_server')) + '</div>';
+      var ns = document.getElementById('node-selector');
+      if (ns) ns.innerHTML = '<div class="text-secondary ops">' + esc(t('no_server')) + '</div>';
+      var nb = document.getElementById('node-selector-badge');
+      if (nb) {
+        nb.className = 'ms-auto badge bg-secondary ops';
+        nb.textContent = '—';
+      }
     }
 
     /* ============================ Polling ============================ */
     var inFlight = false;
+    var currentPoll = null;
     var paused = false;
     var refreshBtn = document.getElementById('refreshBtn');
 
@@ -559,36 +783,105 @@
       refreshBtn.querySelector('i').className = on ? 'bi bi-arrow-clockwise pulse' : 'bi bi-arrow-clockwise';
     }
 
-    function poll(manual) {
-      if (inFlight) return;
-      if (paused && !manual) return;
-      inFlight = true;
-      setRefreshing(true);
-      fetch('/api/status', { headers: { 'Accept': 'application/json' }, cache: 'no-store' })
+    function fetchJson(url) {
+      return fetch(url, { headers: { 'Accept': 'application/json' }, cache: 'no-store' })
         .then(function (r) {
           if (!r.ok) throw new Error('HTTP ' + r.status);
           return r.json();
+        });
+    }
+
+    function poll(manual) {
+      if (inFlight) {
+        if (manual) {
+          return (currentPoll || Promise.resolve()).then(function () { return poll(true); });
+        }
+        return currentPoll || Promise.resolve();
+      }
+      if (paused && !manual) return Promise.resolve();
+      inFlight = true;
+      setRefreshing(true);
+      currentPoll = fetchJson('/api/status')
+        .then(function (d) {
+          return fetchJson('/api/nodes/ranking')
+            .catch(function () { return {}; })
+            .then(function (ranking) { render(d, ranking); });
         })
-        .then(function (d) { render(d); })
         .catch(function (e) {
           renderFetchFailed();
           toast(t('fetch_status_failed', e.message), 'err');
         })
-        .finally(function () { inFlight = false; setRefreshing(false); });
+        .finally(function () {
+          inFlight = false;
+          setRefreshing(false);
+          currentPoll = null;
+        });
+      return currentPoll;
     }
 
     refreshBtn.addEventListener('click', function () { poll(true); });
 
     /* ============================ Actions ============================ */
+    function handleNodeSelect(btn) {
+      var name = btn.getAttribute('data-node-name') || '';
+      if (!name) return;
+      if (!tryBeginMutation('node-select')) return;
+      var nextApply = null;
+      NODE_APPLY = { name: name, state: 'pending' };
+      renderNodeSelector(LAST_STATUS || { nodes: [] }, LAST_RANKING || {});
+      setMutationControlsDisabled(true);
+      var buttons = document.querySelectorAll('.node-select');
+      btn = Array.prototype.filter.call(buttons, function (b) {
+        return b.getAttribute('data-node-name') === name;
+      })[0] || btn;
+      var lbl = btn.querySelector('.lbl');
+      var orig = lbl ? lbl.innerHTML : '';
+      buttons.forEach(function (b) { b.disabled = true; });
+      if (lbl) lbl.innerHTML = '<span class="spinner-border spinner-border-sm"></span>';
+
+      fetch('/api/node/select/' + encodeURIComponent(name), { method: 'POST', headers: { 'Accept': 'application/json' } })
+        .then(function (r) {
+          return r.json().catch(function () { return { ok: r.ok, error: 'HTTP ' + r.status }; })
+            .then(function (res) { res._status = r.status; return res; });
+        })
+        .then(function (res) {
+          if (res && res.cancelled) {
+            nextApply = null;
+            toast(t('node_select_cancelled'), 'warn');
+          } else if (res && res.ok) {
+            nextApply = null;
+            toast(t('node_select_ok', res.active || name), 'ok');
+          } else {
+            var detail = (res && (res.error || res.err || res.out)) ? String(res.error || res.err || res.out)
+              : ('HTTP ' + (res && res._status ? res._status : 500));
+            if (res && res.step) detail = t('node_apply_step', res.step) + ' · ' + detail;
+            nextApply = { name: name, state: 'failed', step: res && res.step, error: detail };
+            toast(t('node_select_err', name, detail.slice(0, 200)), 'err');
+          }
+        })
+        .catch(function (e) {
+          nextApply = { name: name, state: 'failed', error: e.message };
+          toast(t('node_select_err', name, e.message), 'err');
+        })
+        .finally(function () {
+          return poll(true).finally(function () {
+            if (lbl) lbl.innerHTML = orig;
+            NODE_APPLY = nextApply;
+            renderNodeSelector(LAST_STATUS || { nodes: [] }, LAST_RANKING || {});
+            finishMutation();
+          });
+        });
+    }
+
     document.addEventListener('click', function (ev) {
       var btn = ev.target.closest('.act');
       if (!btn) return;
+      if (btn.classList.contains('node-select')) {
+        handleNodeSelect(btn);
+        return;
+      }
+      if (!tryBeginMutation('action', ev)) return;
       var url = btn.getAttribute('data-url');
-      var group = btn.closest('.btn-group');
-      var siblings = group ? group.querySelectorAll('.act') : [btn];
-
-      paused = true;
-      siblings.forEach(function (b) { b.disabled = true; });
       var lbl = btn.querySelector('.lbl');
       var orig = lbl ? lbl.innerHTML : '';
       if (lbl) lbl.innerHTML = '<span class="spinner-border spinner-border-sm"></span>';
@@ -609,10 +902,10 @@
         })
         .catch(function (e) { toast(t('req_failed', url, e.message), 'err'); })
         .finally(function () {
-          if (lbl) lbl.innerHTML = orig;
-          siblings.forEach(function (b) { b.disabled = false; });
-          paused = false;
-          poll(true);
+          return poll(true).finally(function () {
+            if (lbl) lbl.innerHTML = orig;
+            finishMutation();
+          });
         });
     });
 
