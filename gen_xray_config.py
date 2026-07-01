@@ -197,8 +197,15 @@ def traffic_guard_validation_errors(state_path=None, traffic_guard_channel=None)
     if guard.get("valid") is not True:
         errors = guard.get("errors") if isinstance(guard.get("errors"), list) else []
         return [str(error) for error in errors if error] or ["traffic_guard invalid"]
-    if guard.get("mode") == "auto" and not guard.get("channel"):
-        return ['traffic_guard.mode "auto" requires traffic_guard_channel or traffic_guard.channel']
+    if guard.get("mode") == "auto":
+        channel = guard.get("channel")
+        if not channel:
+            return ['traffic_guard.mode "auto" requires traffic_guard_channel or traffic_guard.channel']
+        # Канал резолвлен, но для него (после usb_tether->metered fallback) 0 политик:
+        # config сгенерировался бы валидным с пустой защитой — тихое fail-open. Fail-closed.
+        domains = guard.get("domains") if isinstance(guard.get("domains"), dict) else {}
+        if not domains:
+            return [f"traffic_guard.auto: selected channel {channel} has no policies"]
     return []
 
 

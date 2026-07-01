@@ -214,6 +214,82 @@ def test_generate_config_auto_rejects_empty_channel_policies(tmp_path, traffic_g
     assert not output.exists()
 
 
+@pytest.mark.parametrize(
+    "channel_kwargs, state_extra, expected_channel",
+    [
+        ({"traffic_guard_channel": "metered"}, {}, "metered"),  # explicit channel
+        ({"traffic_guard_channel": "usb"}, {}, "usb_tether"),  # explicit usb, no metered fallback set
+        ({}, {"channel": "metered"}, "metered"),  # traffic_guard.channel
+        ({}, {"active_channel": "usb_tether"}, "usb_tether"),  # traffic_guard.active_channel
+    ],
+)
+def test_generate_config_auto_rejects_channel_without_policies(
+    tmp_path, channel_kwargs, state_extra, expected_channel
+):
+    """auto с политиками только для wifi + resolved-канал без политик => fail-closed на generation."""
+    state = json.loads(EXAMPLE.read_text(encoding="utf-8"))
+    state["traffic_guard"] = {
+        "mode": "auto",
+        "domains": {"wifi": {"video.example.com": "block"}},
+        **state_extra,
+    }
+    path = _dump_state(tmp_path, state)
+    output = tmp_path / "config.json"
+
+    errors = gen_xray_config.traffic_guard_validation_errors(state_path=path, **channel_kwargs)
+    assert errors == [f"traffic_guard.auto: selected channel {expected_channel} has no policies"]
+
+    with pytest.raises(gen_xray_config.TrafficGuardValidationError) as exc:
+        gen_xray_config.generate_config(state_path=path, **channel_kwargs)
+    assert exc.value.errors == errors
+
+    assert gen_xray_config.write_config(output, state_path=path, **channel_kwargs) is False
+    assert not output.exists()
+
+
+def test_generate_config_auto_rejects_network_channel_without_policies(tmp_path):
+    """Канал из state.network.* тоже резолвится и обязан иметь политики => fail-closed."""
+    state = json.loads(EXAMPLE.read_text(encoding="utf-8"))
+    state["traffic_guard"] = {"mode": "auto", "domains": {"wifi": {"video.example.com": "block"}}}
+    state.setdefault("network", {})["traffic_guard_channel"] = "metered"
+    path = _dump_state(tmp_path, state)
+    output = tmp_path / "config.json"
+
+    errors = gen_xray_config.traffic_guard_validation_errors(state_path=path)
+    assert errors == ["traffic_guard.auto: selected channel metered has no policies"]
+
+    with pytest.raises(gen_xray_config.TrafficGuardValidationError):
+        gen_xray_config.generate_config(state_path=path)
+    assert gen_xray_config.write_config(output, state_path=path) is False
+    assert not output.exists()
+
+
+def test_generate_config_auto_matching_channel_still_generates(tmp_path):
+    """Тот же state, но resolved-канал wifi имеет политики => генерится нормально."""
+    state = json.loads(EXAMPLE.read_text(encoding="utf-8"))
+    state["traffic_guard"] = {"mode": "auto", "domains": {"wifi": {"video.example.com": "block"}}}
+    path = _dump_state(tmp_path, state)
+
+    assert gen_xray_config.traffic_guard_validation_errors(state_path=path, traffic_guard_channel="wifi") == []
+
+    cfg = gen_xray_config.generate_config(state_path=path, traffic_guard_channel="wifi")
+    block_rules = [rule for rule in cfg["routing"]["rules"] if rule.get("outboundTag") == "traffic-guard-blackhole"]
+    assert block_rules[0]["domain"] == ["domain:video.example.com"]
+
+
+def test_generate_config_auto_usb_tether_uses_metered_fallback(tmp_path):
+    """usb_tether без своего набора, но с metered-политиками => fallback покрывает канал, generation OK."""
+    state = json.loads(EXAMPLE.read_text(encoding="utf-8"))
+    state["traffic_guard"] = {"mode": "auto", "domains": {"metered": {"video.example.com": "block"}}}
+    path = _dump_state(tmp_path, state)
+
+    assert gen_xray_config.traffic_guard_validation_errors(state_path=path, traffic_guard_channel="usb_tether") == []
+
+    cfg = gen_xray_config.generate_config(state_path=path, traffic_guard_channel="usb_tether")
+    block_rules = [rule for rule in cfg["routing"]["rules"] if rule.get("outboundTag") == "traffic-guard-blackhole"]
+    assert block_rules[0]["domain"] == ["domain:video.example.com"]
+
+
 def test_generate_config_auto_uses_state_default_channel(tmp_path):
     state = json.loads(EXAMPLE.read_text(encoding="utf-8"))
     state["traffic_guard"] = {
