@@ -980,29 +980,16 @@ def _hardware_channel_service(target, services):
     return ""
 
 
-def _named_channel_service(target, services):
-    expected = "usb_tether" if target == "usb" else target
-    for service in services:
-        if _channel_for_iface("", service, "") == expected:
-            return service
-    if target == "usb":
-        for service in services:
-            if any(token in service.lower() for token in ("iphone", "android", "rndis", "tether")):
-                return service
-    return ""
-
-
 def _channel_service_name(target, services):
     return (
         _configured_channel_service(target, services)
         or _hardware_channel_service(target, services)
-        or _named_channel_service(target, services)
     )
 
 
 def _channel_result(target, result, service=""):
     err = result.get("err") or ""
-    cancelled = result.get("rc") == -128 or "-128" in err
+    cancelled = result.get("rc") == -128 or bool(re.search(r"\(-128\)\s*\Z", err))
     timeout = bool(result.get("timeout"))
     return {
         "ok": result.get("rc") == 0 and not timeout,

@@ -227,6 +227,41 @@ def test_switch_channel_missing_service_does_not_call_osascript(monkeypatch):
     assert _osascript_calls(calls, dashboard) == []
 
 
+def test_switch_channel_usb_without_config_or_hardware_match_fails_closed(monkeypatch):
+    dashboard = _fresh_dashboard(monkeypatch)
+    monkeypatch.setattr(dashboard.local_state, "load_state", lambda path=None: _state(wifi="", usb=""))
+    calls = _install_channel_runner(
+        monkeypatch,
+        dashboard,
+        services=NETWORK_SERVICES,
+        ports="",
+    )
+
+    out = dashboard.switch_channel("usb")
+
+    assert out["ok"] is False
+    assert "not found" in out["err"]
+    assert out["service"] == ""
+    assert _osascript_calls(calls, dashboard) == []
+
+
+def test_switch_channel_usb_configured_service_survives_missing_hardware_probe(monkeypatch):
+    dashboard = _fresh_dashboard(monkeypatch)
+    monkeypatch.setattr(dashboard.local_state, "load_state", lambda path=None: _state(wifi="", usb="iPhone USB"))
+    calls = _install_channel_runner(
+        monkeypatch,
+        dashboard,
+        services=NETWORK_SERVICES,
+        ports="",
+    )
+
+    out = dashboard.switch_channel("usb")
+
+    assert out["ok"] is True
+    assert out["service"] == "iPhone USB"
+    assert len(_osascript_calls(calls, dashboard)) == 1
+
+
 def test_api_channel_wifi_success_and_bad_targets(monkeypatch):
     dashboard = _fresh_dashboard(monkeypatch)
     calls = []
@@ -260,6 +295,39 @@ def test_api_channel_wifi_success_and_bad_targets(monkeypatch):
     assert empty.get_json() == {"ok": False, "err": "bad channel target"}
     assert empty_slash.status_code == 400
     assert calls == ["wifi"]
+
+
+def test_api_channel_incidental_minus_128_is_failure_not_cancel(monkeypatch):
+    dashboard = _fresh_dashboard(monkeypatch)
+    monkeypatch.setattr(dashboard.local_state, "load_state", lambda path=None: _state())
+    _install_channel_runner(
+        monkeypatch,
+        dashboard,
+        osascript_result={"rc": 7, "out": "", "err": "networksetup detail -128 but not osascript cancel", "timeout": False},
+    )
+
+    response = dashboard.app.test_client().post("/api/channel/wifi")
+
+    assert response.status_code == 500
+    body = response.get_json()
+    assert body["ok"] is False
+    assert body["cancelled"] is False
+    assert body["rc"] == 7
+
+
+def test_switch_channel_canonical_osascript_cancel_marker_is_cancelled(monkeypatch):
+    dashboard = _fresh_dashboard(monkeypatch)
+    monkeypatch.setattr(dashboard.local_state, "load_state", lambda path=None: _state())
+    _install_channel_runner(
+        monkeypatch,
+        dashboard,
+        osascript_result={"rc": 1, "out": "", "err": "User canceled. (-128)", "timeout": False},
+    )
+
+    out = dashboard.switch_channel("wifi")
+
+    assert out["ok"] is False
+    assert out["cancelled"] is True
 
 
 def test_security_rejects_injected_target_without_runner_call(monkeypatch):
