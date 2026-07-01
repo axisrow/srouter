@@ -182,7 +182,7 @@
         node_latency: "latency", node_throughput: "throughput", node_geo: "geo",
         node_endpoint: "endpoint", node_route_ip: "route IP", node_select_ok: "Selected node {0}",
         node_select_err: "Failed to select {0}: {1}", node_select_cancelled: "Node selection cancelled",
-        node_apply_step: "step {0}", kbps: "kbps"
+        node_apply_step: "step {0}", node_apply_in_progress: "Node apply in progress", kbps: "kbps"
       },
       ru: {
         brand: "Tunnel Dashboard", theme_title: "Тема", theme_auto: "Авто",
@@ -220,7 +220,7 @@
         node_latency: "задержка", node_throughput: "скорость", node_geo: "гео",
         node_endpoint: "адрес", node_route_ip: "IP маршрута", node_select_ok: "Выбран узел {0}",
         node_select_err: "Не удалось выбрать {0}: {1}", node_select_cancelled: "Выбор узла отменён",
-        node_apply_step: "шаг {0}", kbps: "кбит/с"
+        node_apply_step: "шаг {0}", node_apply_in_progress: "Идёт применение узла", kbps: "кбит/с"
       },
       zh: {
         brand: "隧道仪表盘", theme_title: "主题", theme_auto: "自动",
@@ -258,7 +258,7 @@
         node_latency: "延迟", node_throughput: "吞吐", node_geo: "地理位置",
         node_endpoint: "端点", node_route_ip: "路由 IP", node_select_ok: "已选择节点 {0}",
         node_select_err: "选择 {0} 失败：{1}", node_select_cancelled: "节点选择已取消",
-        node_apply_step: "步骤 {0}", kbps: "kbps"
+        node_apply_step: "步骤 {0}", node_apply_in_progress: "正在应用节点", kbps: "kbps"
       }
     };
 
@@ -451,6 +451,9 @@
       var n = num(v);
       return n === null ? '—' : Math.round(n).toLocaleString() + ' ' + t('kbps');
     }
+    function nodeApplyPending() {
+      return !!(NODE_APPLY && NODE_APPLY.state === 'pending');
+    }
     function nodeGeoText(node) {
       var geo = node && typeof node.geo === 'object' && node.geo ? node.geo : {};
       var cc = geo.country_code || node.country_code || '';
@@ -529,7 +532,7 @@
         var statusClass = 'node-row' + (row.name === activeName ? ' active' : '') +
           (row.name === bestName ? ' best' : '') + (row.name === pendingName ? ' pending' : '') +
           (row.name === failedName ? ' failed' : '');
-        var applyBusy = NODE_APPLY && NODE_APPLY.state === 'pending';
+        var applyBusy = nodeApplyPending();
         var selected = row.name === activeName;
         var button = selected
           ? '<button class="btn btn-sm btn-outline-success" type="button" disabled>' +
@@ -747,6 +750,7 @@
 
     /* ============================ Polling ============================ */
     var inFlight = false;
+    var currentPoll = null;
     var paused = false;
     var refreshBtn = document.getElementById('refreshBtn');
 
@@ -764,11 +768,16 @@
     }
 
     function poll(manual) {
-      if (inFlight) return;
-      if (paused && !manual) return;
+      if (inFlight) {
+        if (manual) {
+          return (currentPoll || Promise.resolve()).then(function () { return poll(true); });
+        }
+        return currentPoll || Promise.resolve();
+      }
+      if (paused && !manual) return Promise.resolve();
       inFlight = true;
       setRefreshing(true);
-      fetchJson('/api/status')
+      currentPoll = fetchJson('/api/status')
         .then(function (d) {
           return fetchJson('/api/nodes/ranking')
             .catch(function () { return {}; })
@@ -778,7 +787,12 @@
           renderFetchFailed();
           toast(t('fetch_status_failed', e.message), 'err');
         })
-        .finally(function () { inFlight = false; setRefreshing(false); });
+        .finally(function () {
+          inFlight = false;
+          setRefreshing(false);
+          currentPoll = null;
+        });
+      return currentPoll;
     }
 
     refreshBtn.addEventListener('click', function () { poll(true); });
@@ -787,6 +801,11 @@
     function handleNodeSelect(btn) {
       var name = btn.getAttribute('data-node-name') || '';
       if (!name) return;
+      if (nodeApplyPending()) {
+        toast(t('node_apply_in_progress'), 'warn');
+        return;
+      }
+      var nextApply = null;
       paused = true;
       NODE_APPLY = { name: name, state: 'pending' };
       renderNodeSelector(LAST_STATUS || { nodes: [] }, LAST_RANKING || {});
@@ -806,28 +825,31 @@
         })
         .then(function (res) {
           if (res && res.cancelled) {
-            NODE_APPLY = null;
+            nextApply = null;
             toast(t('node_select_cancelled'), 'warn');
           } else if (res && res.ok) {
-            NODE_APPLY = null;
+            nextApply = null;
             toast(t('node_select_ok', res.active || name), 'ok');
           } else {
             var detail = (res && (res.error || res.err || res.out)) ? String(res.error || res.err || res.out)
               : ('HTTP ' + (res && res._status ? res._status : 500));
             if (res && res.step) detail = t('node_apply_step', res.step) + ' · ' + detail;
-            NODE_APPLY = { name: name, state: 'failed', step: res && res.step, error: detail };
+            nextApply = { name: name, state: 'failed', step: res && res.step, error: detail };
             toast(t('node_select_err', name, detail.slice(0, 200)), 'err');
           }
         })
         .catch(function (e) {
-          NODE_APPLY = { name: name, state: 'failed', error: e.message };
+          nextApply = { name: name, state: 'failed', error: e.message };
           toast(t('node_select_err', name, e.message), 'err');
         })
         .finally(function () {
-          if (lbl) lbl.innerHTML = orig;
-          buttons.forEach(function (b) { b.disabled = false; });
-          paused = false;
-          poll(true);
+          return poll(true).finally(function () {
+            if (lbl) lbl.innerHTML = orig;
+            buttons.forEach(function (b) { b.disabled = false; });
+            NODE_APPLY = nextApply;
+            paused = false;
+            renderNodeSelector(LAST_STATUS || { nodes: [] }, LAST_RANKING || {});
+          });
         });
     }
 
@@ -836,6 +858,11 @@
       if (!btn) return;
       if (btn.classList.contains('node-select')) {
         handleNodeSelect(btn);
+        return;
+      }
+      if (nodeApplyPending()) {
+        ev.preventDefault();
+        toast(t('node_apply_in_progress'), 'warn');
         return;
       }
       var url = btn.getAttribute('data-url');
