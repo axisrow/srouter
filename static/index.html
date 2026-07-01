@@ -111,6 +111,17 @@
 
     <div class="card mt-3">
       <div class="card-header d-flex align-items-center">
+        <i class="bi bi-shield-check me-2"></i>
+        <span data-i18n="guard_title">Traffic Guard</span>
+        <span class="ms-auto badge bg-secondary ops" id="guard-badge">—</span>
+      </div>
+      <div class="card-body">
+        <div id="guard-editor"></div>
+      </div>
+    </div>
+
+    <div class="card mt-3">
+      <div class="card-header d-flex align-items-center">
         <i class="bi bi-sliders me-2"></i> <span data-i18n="ctrl_title">Control</span>
       </div>
       <div class="card-body">
@@ -182,7 +193,18 @@
         node_latency: "latency", node_throughput: "throughput", node_geo: "geo",
         node_endpoint: "endpoint", node_route_ip: "route IP", node_select_ok: "Selected node {0}",
         node_select_err: "Failed to select {0}: {1}", node_select_cancelled: "Node selection cancelled",
-        node_apply_step: "step {0}", action_in_progress: "Action in progress", kbps: "kbps"
+        node_apply_step: "step {0}", action_in_progress: "Action in progress", kbps: "kbps",
+        guard_title: "Traffic Guard", guard_badge_off: "off", guard_badge_rules: "{0} blocked",
+        guard_mode: "Guard mode", guard_mode_on: "On", guard_mode_off: "Off",
+        guard_domain: "Domain", guard_policy: "Policy", guard_block: "Block", guard_allow: "Allow",
+        guard_add_row: "Add domain", guard_remove_row: "Remove", guard_save: "Save Traffic Guard",
+        guard_empty: "No domain rules yet — add one below.",
+        guard_domain_ph: "example.com",
+        guard_help: "Exact domain plus its subdomains are matched (example.com also covers www.example.com). Only block and allow are available in v1.",
+        guard_counts: "{0} blocked · {1} allowed · {2} rules",
+        guard_saved: "Traffic Guard saved", guard_save_failed: "Failed to save Traffic Guard: {0}",
+        guard_invalid: "Traffic Guard rejected: {0}", guard_conflict_hint: "Fix conflicting block/allow rules and retry.",
+        guard_dup_domain: "Duplicate domain: {0}", guard_no_domain: "Enter a domain first."
       },
       ru: {
         brand: "Tunnel Dashboard", theme_title: "Тема", theme_auto: "Авто",
@@ -220,7 +242,18 @@
         node_latency: "задержка", node_throughput: "скорость", node_geo: "гео",
         node_endpoint: "адрес", node_route_ip: "IP маршрута", node_select_ok: "Выбран узел {0}",
         node_select_err: "Не удалось выбрать {0}: {1}", node_select_cancelled: "Выбор узла отменён",
-        node_apply_step: "шаг {0}", action_in_progress: "Действие уже выполняется", kbps: "кбит/с"
+        node_apply_step: "шаг {0}", action_in_progress: "Действие уже выполняется", kbps: "кбит/с",
+        guard_title: "Traffic Guard", guard_badge_off: "выкл", guard_badge_rules: "блок: {0}",
+        guard_mode: "Режим защиты", guard_mode_on: "Вкл", guard_mode_off: "Выкл",
+        guard_domain: "Домен", guard_policy: "Политика", guard_block: "Блок", guard_allow: "Разрешить",
+        guard_add_row: "Добавить домен", guard_remove_row: "Удалить", guard_save: "Сохранить Traffic Guard",
+        guard_empty: "Правил ещё нет — добавьте домен ниже.",
+        guard_domain_ph: "example.com",
+        guard_help: "Совпадает точный домен и его поддомены (example.com покрывает и www.example.com). В v1 доступны только block и allow.",
+        guard_counts: "блок: {0} · разрешено: {1} · правил: {2}",
+        guard_saved: "Traffic Guard сохранён", guard_save_failed: "Не удалось сохранить Traffic Guard: {0}",
+        guard_invalid: "Traffic Guard отклонён: {0}", guard_conflict_hint: "Исправьте конфликт block/allow и повторите.",
+        guard_dup_domain: "Домен повторяется: {0}", guard_no_domain: "Сначала введите домен."
       },
       zh: {
         brand: "隧道仪表盘", theme_title: "主题", theme_auto: "自动",
@@ -258,7 +291,18 @@
         node_latency: "延迟", node_throughput: "吞吐", node_geo: "地理位置",
         node_endpoint: "端点", node_route_ip: "路由 IP", node_select_ok: "已选择节点 {0}",
         node_select_err: "选择 {0} 失败：{1}", node_select_cancelled: "节点选择已取消",
-        node_apply_step: "步骤 {0}", action_in_progress: "操作正在进行", kbps: "kbps"
+        node_apply_step: "步骤 {0}", action_in_progress: "操作正在进行", kbps: "kbps",
+        guard_title: "流量守卫", guard_badge_off: "关", guard_badge_rules: "拦截 {0}",
+        guard_mode: "守卫模式", guard_mode_on: "开", guard_mode_off: "关",
+        guard_domain: "域名", guard_policy: "策略", guard_block: "拦截", guard_allow: "放行",
+        guard_add_row: "添加域名", guard_remove_row: "删除", guard_save: "保存流量守卫",
+        guard_empty: "暂无域名规则 — 在下方添加。",
+        guard_domain_ph: "example.com",
+        guard_help: "匹配精确域名及其子域名（example.com 也涵盖 www.example.com）。v1 仅支持拦截与放行。",
+        guard_counts: "拦截 {0} · 放行 {1} · 规则 {2}",
+        guard_saved: "流量守卫已保存", guard_save_failed: "保存流量守卫失败：{0}",
+        guard_invalid: "流量守卫被拒绝：{0}", guard_conflict_hint: "请修复冲突的拦截/放行规则后重试。",
+        guard_dup_domain: "域名重复：{0}", guard_no_domain: "请先输入域名。"
       }
     };
 
@@ -429,6 +473,11 @@
     var LAST_RANKING = null;
     var NODE_APPLY = null;
     var MUTATION = null;
+    /* Модель редактора Traffic Guard. GUARD_DIRTY защищает несохранённые правки
+       от перезаписи фоновым поллингом /api/guard. */
+    var GUARD_MODEL = { mode: 'off', rows: [] };
+    var GUARD_DIRTY = false;
+    var GUARD_LOADED = false;
 
     function num(v) {
       if (v === null || v === undefined || v === '') return null;
@@ -587,6 +636,155 @@
       box.innerHTML = summary + html;
     }
 
+    /* ============================ Traffic Guard editor ============================ */
+    function guardModeOn() { return GUARD_MODEL.mode === 'on'; }
+    function guardRowsToDomains() {
+      /* Собрать карту domain->policy из строк редактора. Пустые домены пропускаем,
+         дубликаты — оставляем последнюю политику (backend всё равно провалидирует). */
+      var out = {};
+      GUARD_MODEL.rows.forEach(function (row) {
+        var domain = (row.domain || '').trim().toLowerCase();
+        if (!domain) return;
+        out[domain] = (row.policy === 'allow') ? 'allow' : 'block';
+      });
+      return out;
+    }
+    function guardDomainsToRows(domains) {
+      /* Нормализовать серверную карту в строки редактора (сортировка для стабильности). */
+      var rows = [];
+      if (domains && typeof domains === 'object') {
+        Object.keys(domains).sort().forEach(function (domain) {
+          rows.push({ domain: domain, policy: domains[domain] === 'allow' ? 'allow' : 'block' });
+        });
+      }
+      return rows;
+    }
+    function syncGuardFromServer(payload) {
+      /* Обновить модель из /api/guard, только если пользователь ничего не редактирует. */
+      if (GUARD_DIRTY) return;
+      GUARD_MODEL = {
+        mode: (payload && payload.mode === 'on') ? 'on' : 'off',
+        rows: guardDomainsToRows(payload && payload.domains)
+      };
+      GUARD_LOADED = true;
+      renderGuard();
+    }
+    function updateGuardBadge(guardProbe) {
+      var badge = document.getElementById('guard-badge');
+      if (!badge) return;
+      var probe = guardProbe || (LAST_STATUS && LAST_STATUS.traffic_guard) || {};
+      var on = probe.config_status === 'on' || probe.mode === 'on';
+      var rules = num(probe.rule_count) || 0;
+      badge.className = 'ms-auto badge ops ' + (on && rules ? 'bg-primary' : 'bg-secondary');
+      badge.textContent = on ? t('guard_badge_rules', rules) : t('guard_badge_off');
+    }
+    function guardRowHtml(row, idx) {
+      var blockSel = row.policy === 'allow' ? '' : ' selected';
+      var allowSel = row.policy === 'allow' ? ' selected' : '';
+      return '<div class="d-flex flex-wrap align-items-center gap-2 mb-2 guard-row" data-guard-idx="' + idx + '">' +
+        '<input type="text" class="form-control form-control-sm mono guard-domain" style="max-width:280px" ' +
+          'value="' + esc(row.domain || '') + '" placeholder="' + esc(t('guard_domain_ph')) + '" ' +
+          'aria-label="' + esc(t('guard_domain')) + '">' +
+        '<select class="form-select form-select-sm guard-policy" style="max-width:150px" ' +
+          'aria-label="' + esc(t('guard_policy')) + '">' +
+          '<option value="block"' + blockSel + '>' + esc(t('guard_block')) + '</option>' +
+          '<option value="allow"' + allowSel + '>' + esc(t('guard_allow')) + '</option>' +
+        '</select>' +
+        '<button type="button" class="btn btn-sm btn-outline-danger guard-remove" ' +
+          'title="' + esc(t('guard_remove_row')) + '" aria-label="' + esc(t('guard_remove_row')) + '">' +
+          '<i class="bi bi-trash"></i></button>' +
+      '</div>';
+    }
+    function renderGuard() {
+      var box = document.getElementById('guard-editor');
+      if (!box) return;
+      var busy = mutationInFlight();
+      var on = guardModeOn();
+      var rowsHtml = GUARD_MODEL.rows.length
+        ? GUARD_MODEL.rows.map(guardRowHtml).join('')
+        : '<div class="text-secondary ops mb-2">' + esc(t('guard_empty')) + '</div>';
+      box.innerHTML =
+        '<div class="d-flex flex-wrap align-items-center gap-3 mb-3">' +
+          '<div class="form-check form-switch">' +
+            '<input class="form-check-input" type="checkbox" role="switch" id="guard-mode-toggle"' +
+              (on ? ' checked' : '') + (busy ? ' disabled' : '') + '>' +
+            '<label class="form-check-label" for="guard-mode-toggle">' +
+              esc(t('guard_mode')) + ': ' + esc(on ? t('guard_mode_on') : t('guard_mode_off')) + '</label>' +
+          '</div>' +
+        '</div>' +
+        '<div class="guard-rows mb-2">' + rowsHtml + '</div>' +
+        '<div class="d-flex flex-wrap gap-2 mb-2">' +
+          '<button type="button" class="btn btn-sm btn-outline-secondary" id="guard-add"' + (busy ? ' disabled' : '') + '>' +
+            '<i class="bi bi-plus-lg"></i> ' + esc(t('guard_add_row')) + '</button>' +
+          '<button type="button" class="btn btn-sm btn-primary act" id="guard-save"' + (busy ? ' disabled' : '') + '>' +
+            '<span class="lbl"><i class="bi bi-save"></i> ' + esc(t('guard_save')) + '</span></button>' +
+        '</div>' +
+        '<div class="sub text-secondary">' + esc(t('guard_help')) + '</div>';
+      updateGuardBadge();
+    }
+    function readGuardRowsFromDom() {
+      /* Синхронизировать модель с текущими значениями input'ов перед мутацией. */
+      var box = document.getElementById('guard-editor');
+      if (!box) return;
+      var rows = [];
+      box.querySelectorAll('.guard-row').forEach(function (el) {
+        var domain = el.querySelector('.guard-domain');
+        var policy = el.querySelector('.guard-policy');
+        rows.push({
+          domain: domain ? domain.value : '',
+          policy: (policy && policy.value === 'allow') ? 'allow' : 'block'
+        });
+      });
+      GUARD_MODEL.rows = rows;
+    }
+    function saveGuard(btn) {
+      readGuardRowsFromDom();
+      var domains = guardRowsToDomains();
+      var payload = { mode: GUARD_MODEL.mode, domains: domains };
+      if (!tryBeginMutation('guard-save')) return;
+      var lbl = btn.querySelector('.lbl');
+      var orig = lbl ? lbl.innerHTML : '';
+      if (lbl) lbl.innerHTML = '<span class="spinner-border spinner-border-sm"></span>';
+      renderGuard();  // перерисовать в disabled-состоянии
+
+      fetch('/api/guard', {
+        method: 'POST',
+        headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      })
+        .then(function (r) {
+          return r.json().catch(function () { return { ok: false, errors: ['HTTP ' + r.status] }; })
+            .then(function (res) { res._status = r.status; return res; });
+        })
+        .then(function (res) {
+          if (res && res.ok) {
+            GUARD_DIRTY = false;
+            var probe = res.guard || {};
+            toast(t('guard_saved'), 'ok');
+            updateGuardBadge(probe);
+          } else {
+            var errs = (res && Array.isArray(res.errors) && res.errors.length)
+              ? res.errors.join('; ') : ('HTTP ' + (res && res._status ? res._status : 500));
+            var conflict = /conflict/i.test(errs);
+            toast(t('guard_invalid', errs.slice(0, 220)), 'err');
+            if (conflict) toast(t('guard_conflict_hint'), 'warn');
+          }
+        })
+        .catch(function (e) { toast(t('guard_save_failed', e.message), 'err'); })
+        .finally(function () {
+          finishMutation();
+          if (lbl) lbl.innerHTML = orig;
+          renderGuard();
+          // Подтянуть канонические counts/правила после записи.
+          loadGuard();
+        });
+    }
+    function loadGuard() {
+      return fetchJson('/api/guard')
+        .then(function (payload) { syncGuardFromServer(payload); })
+        .catch(function () { /* тихо: редактор просто останется в текущем состоянии */ });
+    }
+
     function render(d, ranking) {
       LAST_STATUS = d;
       LAST_RANKING = ranking || {};
@@ -709,6 +907,10 @@
       document.getElementById('cards').innerHTML = html;
       renderFlow(d);
       renderNodeSelector(d, LAST_RANKING);
+      // Badge Traffic Guard освежаем каждым поллингом из probe (сам редактор не трогаем,
+      // если пользователь редактирует — синк правил идёт отдельно через loadGuard).
+      updateGuardBadge(d.traffic_guard);
+      if (!GUARD_LOADED && !GUARD_DIRTY) loadGuard();
       if (mutationInFlight()) setMutationControlsDisabled(true);
 
       var ts = d.ts ? new Date(d.ts * 1000) : new Date();
@@ -769,6 +971,11 @@
       if (nb) {
         nb.className = 'ms-auto badge bg-secondary ops';
         nb.textContent = '—';
+      }
+      var gb = document.getElementById('guard-badge');
+      if (gb) {
+        gb.className = 'ms-auto badge bg-secondary ops';
+        gb.textContent = '—';
       }
     }
 
@@ -873,11 +1080,52 @@
         });
     }
 
+    /* ---------- Traffic Guard: клики по строкам/кнопкам редактора ---------- */
+    document.addEventListener('click', function (ev) {
+      var addBtn = ev.target.closest('#guard-add');
+      if (addBtn) {
+        if (mutationInFlight()) { toast(t('action_in_progress'), 'warn'); return; }
+        readGuardRowsFromDom();
+        GUARD_MODEL.rows.push({ domain: '', policy: 'block' });
+        GUARD_DIRTY = true;
+        renderGuard();
+        return;
+      }
+      var rmBtn = ev.target.closest('.guard-remove');
+      if (rmBtn) {
+        if (mutationInFlight()) { toast(t('action_in_progress'), 'warn'); return; }
+        var rowEl = rmBtn.closest('.guard-row');
+        var idx = rowEl ? parseInt(rowEl.getAttribute('data-guard-idx'), 10) : -1;
+        readGuardRowsFromDom();
+        if (idx >= 0 && idx < GUARD_MODEL.rows.length) GUARD_MODEL.rows.splice(idx, 1);
+        GUARD_DIRTY = true;
+        renderGuard();
+        return;
+      }
+    });
+
+    /* Правки полей редактора → dirty (защита от перезаписи поллингом). */
+    document.addEventListener('input', function (ev) {
+      if (ev.target.closest('#guard-editor') && ev.target.closest('.guard-row')) GUARD_DIRTY = true;
+    });
+    document.addEventListener('change', function (ev) {
+      if (ev.target.id === 'guard-mode-toggle') {
+        readGuardRowsFromDom();
+        GUARD_MODEL.mode = ev.target.checked ? 'on' : 'off';
+        GUARD_DIRTY = true;
+        renderGuard();
+      }
+    });
+
     document.addEventListener('click', function (ev) {
       var btn = ev.target.closest('.act');
       if (!btn) return;
       if (btn.classList.contains('node-select')) {
         handleNodeSelect(btn);
+        return;
+      }
+      if (btn.id === 'guard-save') {
+        saveGuard(btn);
         return;
       }
       if (!tryBeginMutation('action', ev)) return;
@@ -916,6 +1164,9 @@
       LANG = langSel.value;
       localStorage.setItem('lang', LANG);
       applyStaticI18n();
+      // Сохранить несохранённые правки редактора и перерисовать его с новыми переводами.
+      readGuardRowsFromDom();
+      renderGuard();
       poll(true);
     });
     applyStaticI18n();
@@ -935,6 +1186,8 @@
     applyMode();
 
     /* ============================ Boot ============================ */
+    renderGuard();   // пустой каркас редактора сразу, до первого ответа сервера
+    loadGuard();     // подтянуть текущие block/allow правила из /api/guard
     poll(true);
     setInterval(poll, 5000);
   })();

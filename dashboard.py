@@ -152,6 +152,20 @@ def _host_route_action():
     return {"add": "add", "remove": "remove", "del": "remove"}.get(action, "")
 
 
+def _guard_payload():
+    """Достать {mode, domains} из тела запроса Traffic Guard. Defensive: не бросает.
+
+    Возвращает dict как есть (валидацию делает local_state.validate_traffic_guard);
+    None означает не-объектное/битое тело — роут отдаёт 400.
+    """
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return None
+    # Берём только известные v1-ключи: mode + domains. Всё остальное игнорируем,
+    # чтобы клиент не мог протащить служебные поля state в секцию traffic_guard.
+    return {"mode": body.get("mode", "off"), "domains": body.get("domains", {})}
+
+
 # ============================ non-privileged: сервисы ============================
 def service_control(name, action):
     return sys_probe.run([BREW, "services", action, name], timeout=20)
@@ -222,6 +236,49 @@ def api_service(name, action):
         return jsonify({"ok": False, "err": "not allowed"}), 400
     r = service_control(name, action)
     return jsonify({"ok": r["rc"] == 0, **r})
+
+
+@app.get("/api/guard")
+def api_guard_get():
+    """Текущая секция Traffic Guard для UI-редактора: {mode, domains, counts}.
+
+    Возвращает нормализованные block/allow правила из unified state. auto-режим
+    (#23) в v1-редакторе не показываем — деградируем в off с пустой картой,
+    чтобы UI-таблица не пыталась рисовать channel-семантику.
+    """
+    guard = local_state.traffic_guard_config()
+    mode = guard.get("mode") if guard.get("mode") in ("on", "off") else "off"
+    domains = guard.get("domains") if isinstance(guard.get("domains"), dict) else {}
+    return jsonify({"mode": mode, "domains": domains, "guard": probe_traffic_guard()})
+
+
+@app.post("/api/guard")
+def api_guard():
+    """Редактор Traffic Guard (#15): записать {mode, domains} в unified state.
+
+    mode только on/off, policy только block/allow — auto/throttle/parent-child
+    конфликты отклоняет local_state.validate_traffic_guard. Пишем через atomic
+    save_state; при невалидном/битом вводе state не перезаписывается.
+    """
+    guard = _guard_payload()
+    if guard is None:
+        return jsonify({"ok": False, "errors": ["traffic_guard payload must be an object"]}), 400
+
+    errors = local_state.validate_traffic_guard(guard)
+    if errors:
+        return jsonify({"ok": False, "errors": errors}), 400
+
+    # Читаем текущий state и не трогаем файл, если его нельзя безопасно перезаписать.
+    state, readable = local_state.load_state_checked()
+    if not readable:
+        return jsonify({"ok": False, "errors": ["local state is not safely writable"]}), 409
+
+    state["traffic_guard"] = guard
+    if local_state.save_state(state) is None:
+        return jsonify({"ok": False, "errors": ["failed to persist traffic_guard"]}), 500
+
+    # Свежий probe для UI: обновлённый rule/blocked count из только что записанного state.
+    return jsonify({"ok": True, "errors": [], "guard": probe_traffic_guard()})
 
 
 @app.get("/")
