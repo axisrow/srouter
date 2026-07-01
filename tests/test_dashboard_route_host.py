@@ -59,6 +59,17 @@ def _install_runner(monkeypatch, result=None):
     return calls
 
 
+def test_ip_literal_accepts_only_canonical_unscoped_addresses(monkeypatch):
+    dashboard = _fresh_dashboard(monkeypatch)
+
+    assert dashboard._ip_literal("203.0.113.44") is True
+    assert dashboard._ip_literal("2001:db8::1") is True
+    assert dashboard._ip_literal("fe80::1%en0;touch x") is False
+    assert dashboard._ip_literal("fe80::1%en0") is False
+    assert dashboard._ip_literal("2001:DB8::1") is False
+    assert dashboard._ip_literal("2001:db8:0:0:0:0:0:1") is False
+
+
 def test_api_route_host_add_uses_resolved_route_ip_and_osascript_argv(monkeypatch):
     dashboard = _fresh_dashboard(monkeypatch)
     seen = _install_active_route(monkeypatch, dashboard, route_ip="203.0.113.44")
@@ -140,7 +151,10 @@ def test_api_route_host_rejects_bad_action_before_mutation(monkeypatch, request_
     assert run_calls == []
 
 
-@pytest.mark.parametrize("route_ip", ["", "node.example.test", "203.0.113.44; rm -rf /"])
+@pytest.mark.parametrize(
+    "route_ip",
+    ["", "node.example.test", "203.0.113.44; rm -rf /", "fe80::1%en0;touch x"],
+)
 def test_api_route_host_rejects_missing_or_non_literal_route_ip_fail_closed(monkeypatch, route_ip):
     dashboard = _fresh_dashboard(monkeypatch)
     _install_active_route(monkeypatch, dashboard, route_ip=route_ip)
@@ -156,6 +170,22 @@ def test_api_route_host_rejects_missing_or_non_literal_route_ip_fail_closed(monk
     assert body["route_ip"] == ""
     assert "active route_ip" in body["err"]
     assert calls == []
+
+
+def test_api_route_host_allows_canonical_ipv6_without_scope_id(monkeypatch):
+    dashboard = _fresh_dashboard(monkeypatch)
+    _install_active_route(monkeypatch, dashboard, route_ip="2001:db8::1")
+    calls = _install_runner(monkeypatch)
+
+    response = dashboard.app.test_client().post("/api/route/host", json={"action": "add"})
+
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["ok"] is True
+    assert body["route_ip"] == "2001:db8::1"
+    assert len(calls) == 1
+    script = calls[0][0][2]
+    assert f"{dashboard.ROUTE} -n add -host 2001:db8::1 {dashboard.GATEWAY}" in script
 
 
 def test_api_route_host_osascript_cancel_is_structured(monkeypatch):
