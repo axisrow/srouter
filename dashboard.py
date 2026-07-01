@@ -20,42 +20,15 @@ from dashboard_common import *
 import node_selector
 from sys_probe import run, port_open
 
-# --- захардкоженные факты окружения (проверены) ---
-BREW = "/opt/homebrew/bin/brew"          # абсолютный путь: launchd/GUI PATH его не содержит
-CURL = "/usr/bin/curl"
-ROUTE = "/sbin/route"
-IFCONFIG = "/sbin/ifconfig"
-OSASCRIPT = "/usr/bin/osascript"
-PING = "/sbin/ping"
-SCUTIL = "/usr/sbin/scutil"
-NETWORKSETUP = "/usr/sbin/networksetup"
-CHANNEL_TARGETS = ("wifi", "usb")
-CHANNEL_SERVICE_KEYS = {"wifi": "wifi_service", "usb": "usb_tether_service"}
-
-# Адреса инфраструктуры — из локального srouter_config.py (не в репозитории).
-# Скопируй шаблон: cp srouter_config.example.py srouter_config.py
-try:
-    import srouter_config as _cfg
-    GATEWAY = _cfg.GATEWAY
-    VPN_SERVER = _cfg.VPN_SERVER
-    VPN_EXIT_IP = _cfg.VPN_EXIT_IP
-except ImportError:
-    raise SystemExit("Нет srouter_config.py — скопируй: cp srouter_config.example.py srouter_config.py")
-
 # Активный узел нельзя замораживать на import: #8 меняет srouter.local.json в рантайме.
 # Эти имена оставлены только для совместимости старых импорт-тестов; рабочий код ниже
 # каждый раз вызывает _active_route_ip().
 ACTIVE_ENDPOINT = ""
 VPS_IP = ""
 
-PRIVOXY = ("127.0.0.1", 8118)
-XRAY_SOCKS = ("127.0.0.1", 10808)
-HTTP_PROXY_URL = "http://127.0.0.1:8118"
-PROBE_SOCKS_HOST = "127.0.0.1"
 PORT = 8787
 STATUS_CACHE_TTL_SEC = 1.5
 STATUS_PROBE_BUDGET_SEC = 12
-NODE_PROBE_TTL_SEC = 300
 
 app = Flask(__name__)
 

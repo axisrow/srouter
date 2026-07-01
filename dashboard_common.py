@@ -3,7 +3,53 @@ import re
 
 import local_state
 
+# --- захардкоженные факты окружения (проверены) ---
+BREW = "/opt/homebrew/bin/brew"          # абсолютный путь: launchd/GUI PATH его не содержит
+CURL = "/usr/bin/curl"
+ROUTE = "/sbin/route"
+IFCONFIG = "/sbin/ifconfig"
+OSASCRIPT = "/usr/bin/osascript"
+PING = "/sbin/ping"
+SCUTIL = "/usr/sbin/scutil"
+NETWORKSETUP = "/usr/sbin/networksetup"
+CHANNEL_TARGETS = ("wifi", "usb")
+CHANNEL_SERVICE_KEYS = {"wifi": "wifi_service", "usb": "usb_tether_service"}
+
+# Адреса инфраструктуры — из локального srouter_config.py (не в репозитории).
+# Скопируй шаблон: cp srouter_config.example.py srouter_config.py
+try:
+    import srouter_config as _cfg
+    GATEWAY = _cfg.GATEWAY
+    VPN_SERVER = _cfg.VPN_SERVER
+    VPN_EXIT_IP = _cfg.VPN_EXIT_IP
+except ImportError:
+    raise SystemExit("Нет srouter_config.py — скопируй: cp srouter_config.example.py srouter_config.py")
+
+PRIVOXY = ("127.0.0.1", 8118)
+XRAY_SOCKS = ("127.0.0.1", 10808)
+HTTP_PROXY_URL = "http://127.0.0.1:8118"
+PROBE_SOCKS_HOST = "127.0.0.1"
+NODE_PROBE_TTL_SEC = 300
+
 __all__ = [
+    "BREW",
+    "CURL",
+    "ROUTE",
+    "IFCONFIG",
+    "OSASCRIPT",
+    "PING",
+    "SCUTIL",
+    "NETWORKSETUP",
+    "CHANNEL_TARGETS",
+    "CHANNEL_SERVICE_KEYS",
+    "GATEWAY",
+    "VPN_SERVER",
+    "VPN_EXIT_IP",
+    "PRIVOXY",
+    "XRAY_SOCKS",
+    "HTTP_PROXY_URL",
+    "PROBE_SOCKS_HOST",
+    "NODE_PROBE_TTL_SEC",
     "_first",
     "_http_url",
     "_safe_seconds",
