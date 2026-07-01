@@ -156,11 +156,16 @@ def _probe_options(state_path=None):
 def _ip_literal(value):
     if not isinstance(value, str) or not value:
         return False
+    if "%" in value:
+        return False
     try:
-        ipaddress.ip_address(value)
-        return True
+        parsed = ipaddress.ip_address(value)
     except ValueError:
         return False
+    # Privileged route-команды интерполируют принятое значение в shell text.
+    # Принимаем только canonical literals: scoped IPv6 zone-id и альтернативные
+    # написания не должны обходить границу через ipaddress.ip_address().
+    return str(parsed) == value
 
 
 def _active_route_context():
