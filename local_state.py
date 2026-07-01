@@ -18,6 +18,7 @@ _HOST_RE = re.compile(r"^[A-Za-z0-9.:_-]+\Z")
 _TRAFFIC_GUARD_MODES = {"on", "off", "auto"}
 _TRAFFIC_GUARD_POLICIES = {"block", "allow"}
 _TRAFFIC_GUARD_CHANNELS = {"wifi", "usb_tether", "metered"}
+_TRAFFIC_GUARD_AUTO_DOMAINS_ERROR = "traffic_guard.domains must define channel policies for auto mode"
 
 
 def _is_valid_host(host):
@@ -114,7 +115,12 @@ def _validate_traffic_guard_channel_domains(domains, errors):
         if not isinstance(channel_domains, dict):
             errors.append(f"{context} must be an object")
             continue
-        normalized[channel_norm] = _validate_traffic_guard_domain_map(channel_domains, errors, context)
+        before_error_count = len(errors)
+        channel_map = _validate_traffic_guard_domain_map(channel_domains, errors, context)
+        if not channel_map and len(errors) == before_error_count:
+            errors.append(f"{context} must define at least one policy")
+            continue
+        normalized[channel_norm] = channel_map
     return normalized
 
 
@@ -189,12 +195,16 @@ def validate_traffic_guard(guard):
     if not isinstance(mode, str) or mode not in _TRAFFIC_GUARD_MODES:
         errors.append('traffic_guard.mode must be "on", "off", or "auto"')
 
-    domains = guard.get("domains", {})
-    if domains is None:
-        return errors
     if mode == "auto":
+        domains = guard.get("domains")
+        if domains is None or domains == {}:
+            errors.append(_TRAFFIC_GUARD_AUTO_DOMAINS_ERROR)
+            return errors
         _validate_traffic_guard_channel_domains(domains, errors)
     else:
+        domains = guard.get("domains", {})
+        if domains is None:
+            return errors
         _validate_traffic_guard_domain_map(domains, errors, "traffic_guard.domains")
     return errors
 

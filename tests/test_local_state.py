@@ -1,5 +1,4 @@
 import json
-import re
 from pathlib import Path
 
 import local_state
@@ -336,8 +335,28 @@ def test_traffic_guard_validation_rejects_null_auto_channel_domains():
     assert errors == ["traffic_guard.domains.wifi must be an object"]
 
 
+def test_traffic_guard_validation_rejects_empty_auto_channel_policy_map():
+    errors = local_state.validate_traffic_guard({"mode": "auto", "domains": {"wifi": {}}})
+
+    assert errors == ["traffic_guard.domains.wifi must define at least one policy"]
+
+
+def test_traffic_guard_validation_rejects_empty_auto_domains():
+    cases = [
+        {"mode": "auto"},
+        {"mode": "auto", "domains": None},
+        {"mode": "auto", "domains": {}},
+    ]
+
+    for guard in cases:
+        errors = local_state.validate_traffic_guard(guard)
+        assert errors == ["traffic_guard.domains must define channel policies for auto mode"]
+
+
 def test_traffic_guard_validation_allows_legacy_missing_or_null_domains():
     assert local_state.validate_traffic_guard({"mode": "on"}) == []
+    assert local_state.validate_traffic_guard({"mode": "on", "domains": None}) == []
+    assert local_state.validate_traffic_guard({"mode": "off"}) == []
     assert local_state.validate_traffic_guard({"mode": "off", "domains": None}) == []
 
     cfg = local_state.traffic_guard_config(state={"traffic_guard": {"mode": "on", "domains": None}})
