@@ -330,6 +330,22 @@ def test_traffic_guard_validation_rejects_invalid_auto_channel_domains():
     assert any("channel" in error and "bluetooth" in error for error in errors)
 
 
+def test_traffic_guard_validation_rejects_null_auto_channel_domains():
+    errors = local_state.validate_traffic_guard({"mode": "auto", "domains": {"wifi": None}})
+
+    assert errors == ["traffic_guard.domains.wifi must be an object"]
+
+
+def test_traffic_guard_validation_allows_legacy_missing_or_null_domains():
+    assert local_state.validate_traffic_guard({"mode": "on"}) == []
+    assert local_state.validate_traffic_guard({"mode": "off", "domains": None}) == []
+
+    cfg = local_state.traffic_guard_config(state={"traffic_guard": {"mode": "on", "domains": None}})
+
+    assert cfg["valid"] is True
+    assert cfg["domains"] == {}
+
+
 def test_traffic_guard_validation_rejects_auto_parent_child_conflict_per_channel():
     errors = local_state.validate_traffic_guard(
         {

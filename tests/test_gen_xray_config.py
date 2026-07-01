@@ -171,6 +171,25 @@ def test_generate_config_auto_requires_channel_for_generation(tmp_path):
     assert not output.exists()
 
 
+def test_generate_config_auto_rejects_null_channel_domains(tmp_path):
+    state = json.loads(EXAMPLE.read_text(encoding="utf-8"))
+    state["traffic_guard"] = {
+        "mode": "auto",
+        "domains": {
+            "wifi": None,
+        },
+    }
+    path = _dump_state(tmp_path, state)
+    output = tmp_path / "config.json"
+
+    with pytest.raises(gen_xray_config.TrafficGuardValidationError) as exc:
+        gen_xray_config.generate_config(state_path=path, traffic_guard_channel="wifi")
+
+    assert any("traffic_guard.domains.wifi must be an object" in error for error in exc.value.errors)
+    assert gen_xray_config.write_config(output, state_path=path, traffic_guard_channel="wifi") is False
+    assert not output.exists()
+
+
 def test_generate_config_auto_uses_state_default_channel(tmp_path):
     state = json.loads(EXAMPLE.read_text(encoding="utf-8"))
     state["traffic_guard"] = {

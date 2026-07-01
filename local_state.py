@@ -111,6 +111,9 @@ def _validate_traffic_guard_channel_domains(domains, errors):
             errors.append(f"duplicate traffic_guard channel: {channel_norm}")
             continue
         context = f"traffic_guard.domains.{channel_norm}"
+        if not isinstance(channel_domains, dict):
+            errors.append(f"{context} must be an object")
+            continue
         normalized[channel_norm] = _validate_traffic_guard_domain_map(channel_domains, errors, context)
     return normalized
 
