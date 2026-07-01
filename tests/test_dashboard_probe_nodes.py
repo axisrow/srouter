@@ -47,6 +47,7 @@ def test_parse_throughput_output_direct(monkeypatch):
 
 def test_probe_nodes_reads_enabled_nodes_and_state_targets_read_only(monkeypatch, tmp_path):
     dashboard = _fresh_dashboard(monkeypatch)
+    dashboard_geo = importlib.import_module("dashboard_geo")
     state_path = tmp_path / "srouter.local.json"
     state = {
         "nodes": [
@@ -104,7 +105,7 @@ def test_probe_nodes_reads_enabled_nodes_and_state_targets_read_only(monkeypatch
 
     monkeypatch.setattr(sys_probe, "run", fake_run)
     monkeypatch.setattr(sys_probe, "port_open", lambda host, port, timeout=0.5: True)
-    monkeypatch.setattr(dashboard, "_geo_lookup", lambda ip: {"country_code": "SG", "flag": "SG"})
+    monkeypatch.setattr(dashboard_geo, "_geo_lookup", lambda ip: {"country_code": "SG", "flag": "SG"})
     monkeypatch.setattr(
         dashboard.local_state,
         "save_state",
@@ -135,6 +136,7 @@ def test_probe_nodes_reads_enabled_nodes_and_state_targets_read_only(monkeypatch
 
 def test_probe_nodes_missing_or_invalid_socks_degrades_without_curl(monkeypatch, tmp_path):
     dashboard = _fresh_dashboard(monkeypatch)
+    dashboard_geo = importlib.import_module("dashboard_geo")
     state_path = tmp_path / "srouter.local.json"
     _write_state(
         state_path,
@@ -160,7 +162,7 @@ def test_probe_nodes_missing_or_invalid_socks_degrades_without_curl(monkeypatch,
         raise AssertionError("curl must not run without valid per-node socks_port")
 
     monkeypatch.setattr(sys_probe, "run", fake_run)
-    monkeypatch.setattr(dashboard, "_geo_lookup", lambda ip: {})
+    monkeypatch.setattr(dashboard_geo, "_geo_lookup", lambda ip: {})
 
     out = dashboard.probe_nodes(state_path=state_path)
 
