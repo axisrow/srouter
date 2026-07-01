@@ -157,6 +157,71 @@ def service_control(name, action):
     return sys_probe.run([BREW, "services", action, name], timeout=20)
 
 
+# ============================ CSRF/Origin-guard (issue #42) ============================
+# Сервис слушает только loopback, но loopback НЕ защищает от browser-origin CSRF:
+# любой сайт, открытый в браузере, может сделать form-POST/fetch на 127.0.0.1:8787
+# и триггерить привилегированное действие (osascript admin-prompt, route add/del,
+# brew services). Поэтому все POST-мутации проходят через общий guard ДО handler.
+#
+# Подход: Fetch-Metadata (Sec-Fetch-Site) как основной сигнал + Origin same-origin
+# как fallback. Sec-Fetch-Site браузер выставляет сам и его нельзя подделать из JS
+# (forbidden header), поэтому он надёжнее Origin для отличия cross-site.
+#
+# Правило: блокируем ТОЛЬКО явно cross-origin браузерный POST.
+#   - Sec-Fetch-Site in {cross-site, same-site} -> 403 (браузер сказал: другой origin).
+#   - иначе если есть Origin и он не наш loopback-origin -> 403.
+#   - отсутствуют оба (curl/non-browser, прямой ввод адреса) -> пропускаем.
+# Легитимные origin: http(s)://127.0.0.1:8787 и http(s)://localhost:8787.
+
+# Хосты сервиса (loopback). Порт добавляется динамически из PORT ниже.
+_GUARD_HOSTS = ("127.0.0.1", "localhost")
+
+
+def _allowed_origins():
+    """Легитимные same-origin значения Origin-заголовка (http/https, оба хоста)."""
+    origins = set()
+    for scheme in ("http", "https"):
+        for host in _GUARD_HOSTS:
+            origins.add(f"{scheme}://{host}:{PORT}")
+            origins.add(f"{scheme}://{host}")  # на случай origin без явного порта
+    return origins
+
+
+def _is_cross_origin_post():
+    """True только для ЯВНО cross-origin браузерного POST.
+
+    Defensive: не бросает, при любой неоднозначности НЕ блокирует (чтобы не сломать
+    curl/non-browser). Блокируем лишь то, что браузер сам пометил как чужой origin.
+    """
+    # 1) Fetch-Metadata — приоритетный сигнал, JS его подделать не может.
+    site = request.headers.get("Sec-Fetch-Site")
+    if site in ("cross-site", "same-site"):
+        return True
+    if site in ("same-origin", "none"):
+        return False  # браузер явно подтвердил свой origin
+
+    # 2) Fallback на Origin (старые браузеры без Fetch-Metadata).
+    origin = request.headers.get("Origin")
+    if origin and origin not in _allowed_origins():
+        return True
+
+    # 3) Ни Sec-Fetch-Site, ни чужого Origin — curl/non-browser/same-origin: пропускаем.
+    return False
+
+
+@app.before_request
+def _csrf_origin_guard():
+    """Режет cross-origin браузерные мутации до привилегированного handler.
+
+    Гардим только POST (все мутации — POST); GET read-only роуты не трогаем.
+    """
+    if request.method != "POST":
+        return None
+    if _is_cross_origin_post():
+        return jsonify({"ok": False, "err": "cross-origin request rejected"}), 403
+    return None
+
+
 # ============================ Flask-роуты ============================
 @app.get("/api/status")
 def api_status():
