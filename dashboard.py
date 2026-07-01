@@ -8,7 +8,7 @@ import threading
 import time
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, wait
-from flask import Flask, jsonify, Response
+from flask import Flask, jsonify, Response, request
 
 import local_state
 from dashboard_common import *
@@ -98,9 +98,24 @@ def gather_status():
 
 
 # ============================ privileged: osascript-мост ============================
-def sudo_route(action):
-    route_ip = _active_route_ip()
-    if not route_ip:
+def _route_result(r):
+    r = r or {}
+    rc = r.get("rc")
+    err = r.get("err") or ""
+    timeout = bool(r.get("timeout"))
+    cancelled = rc == -128 or (rc not in (0, None) and "-128" in err)
+    return {
+        "ok": rc == 0 and not timeout,
+        "cancelled": cancelled,
+        "rc": rc,
+        "out": r.get("out") or "",
+        "err": err,
+        "timeout": timeout,
+    }
+
+
+def _sudo_route_ip(action, route_ip):
+    if not _ip_literal(route_ip):
         return {"rc": None, "out": "", "err": "Нет active route_ip: настрой srouter.local.json", "timeout": False}
     if action == "add":
         shell_cmd = f"{ROUTE} -n add -host {route_ip} {GATEWAY}"
@@ -112,6 +127,29 @@ def sudo_route(action):
     # Если кто-то добавит динамическую команду — обязан добавить вайтлист + экранирование.
     applescript = f'do shell script "{shell_cmd}" with administrator privileges'
     return sys_probe.run([OSASCRIPT, "-e", applescript], timeout=60)
+
+
+def sudo_route(action):
+    return _sudo_route_ip(action, _active_route_ip())
+
+
+def _active_host_route_ip():
+    """Manual route endpoint может резолвить DNS; status hot path это не делает."""
+    try:
+        active = local_state.active_node() or {}
+        route_ip = local_state.resolve_route_ip(active)
+    except Exception:
+        route_ip = ""
+    return route_ip if _ip_literal(route_ip) else ""
+
+
+def _host_route_action():
+    body = request.get_json(silent=True)
+    action = body.get("action", "") if isinstance(body, dict) else ""
+    action = action or request.form.get("action", "") or request.args.get("action", "")
+    if not isinstance(action, str):
+        return ""
+    return {"add": "add", "remove": "remove", "del": "remove"}.get(action, "")
 
 
 # ============================ non-privileged: сервисы ============================
@@ -146,13 +184,22 @@ def api_node_select(name):
     return jsonify(result), (200 if result.get("ok") else 500)
 
 
+@app.post("/api/route/host")
+def api_route_host():
+    action = _host_route_action()
+    if action not in ("add", "remove"):
+        return jsonify({"ok": False, "err": "bad action"}), 400
+    route_ip = _active_host_route_ip()
+    r = _sudo_route_ip(action, route_ip)
+    return jsonify({"action": action, "route_ip": route_ip, **_route_result(r)})
+
+
 @app.post("/api/route/<action>")
 def api_route(action):
     if action not in ("add", "remove"):
         return jsonify({"ok": False, "err": "bad action"}), 400
     r = sudo_route(action)
-    cancelled = r["rc"] not in (0, None) and "-128" in (r["err"] or "")
-    return jsonify({"ok": r["rc"] == 0, "cancelled": cancelled, **r})
+    return jsonify(_route_result(r))
 
 
 @app.post("/api/channel")
