@@ -3,6 +3,8 @@ import sys
 import types
 from pathlib import Path
 
+import sys_probe
+
 
 def _fresh_dashboard_without_legacy_vps(monkeypatch):
     monkeypatch.delitem(sys.modules, "dashboard", raising=False)
@@ -28,7 +30,7 @@ def test_dashboard_import_uses_local_state_without_legacy_vps(monkeypatch):
 
 def test_dashboard_empty_state_treats_empty_exit_as_down(monkeypatch):
     dashboard = _fresh_dashboard_without_legacy_vps(monkeypatch)
-    monkeypatch.setattr(dashboard, "run", lambda cmd, timeout: {"rc": 0, "out": "", "err": "", "timeout": False})
+    monkeypatch.setattr(sys_probe, "run", lambda cmd, timeout: {"rc": 0, "out": "", "err": "", "timeout": False})
     assert dashboard.probe_exit_ip()["status"] == "down"
 
 
@@ -40,7 +42,7 @@ def test_dashboard_empty_state_does_not_probe_route_without_route_ip(monkeypatch
         calls.append(cmd)
         return {"rc": 0, "out": "", "err": "", "timeout": False}
 
-    monkeypatch.setattr(dashboard, "run", fake_run)
+    monkeypatch.setattr(sys_probe, "run", fake_run)
     assert dashboard.probe_route_to_vps() == {"interface": "", "gateway": "", "split_active": False, "status": "down"}
     assert calls == []
 
@@ -51,7 +53,7 @@ def test_dashboard_sudo_route_rejects_empty_active_route(monkeypatch):
     def fail_run(cmd, timeout):
         raise AssertionError("sudo route must not run without active route_ip")
 
-    monkeypatch.setattr(dashboard, "run", fail_run)
+    monkeypatch.setattr(sys_probe, "run", fail_run)
     out = dashboard.sudo_route("add")
     assert out["rc"] is None
     assert "active route_ip" in out["err"]

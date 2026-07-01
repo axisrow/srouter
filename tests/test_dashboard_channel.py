@@ -3,6 +3,7 @@ import sys
 import types
 
 import pytest
+import sys_probe
 
 
 NETWORK_SERVICES = """An asterisk (*) denotes that a network service is disabled.
@@ -62,7 +63,7 @@ def _install_channel_runner(monkeypatch, dashboard, osascript_result=None, servi
             return osascript_result or _ok()
         raise AssertionError(f"unexpected command: {cmd}")
 
-    monkeypatch.setattr(dashboard, "run", fake_run)
+    monkeypatch.setattr(sys_probe, "run", fake_run)
     return calls
 
 
@@ -139,7 +140,7 @@ def test_switch_channel_rejects_non_whitelisted_targets_before_mutation(monkeypa
         calls.append(cmd)
         raise AssertionError("invalid channel target must not call runner")
 
-    monkeypatch.setattr(dashboard, "run", fail_run)
+    monkeypatch.setattr(sys_probe, "run", fail_run)
 
     out = dashboard.switch_channel(target)
 
@@ -338,7 +339,7 @@ def test_security_rejects_injected_target_without_runner_call(monkeypatch):
         calls.append(cmd)
         raise AssertionError("injected target must not reach runner")
 
-    monkeypatch.setattr(dashboard, "run", fail_run)
+    monkeypatch.setattr(sys_probe, "run", fail_run)
 
     out = dashboard.switch_channel("wifi; rm -rf /")
 

@@ -8,6 +8,7 @@ import pytest
 
 import gen_xray_config
 import local_state
+import sys_probe
 
 
 def _write_state(path, state):
@@ -414,14 +415,14 @@ def test_api_node_select_rejects_disabled_before_mutation(monkeypatch):
     assert response.get_json() == {"ok": False, "err": "node not enabled or unknown"}
 
 
-def test_api_node_select_success_uses_dashboard_runner(monkeypatch):
+def test_api_node_select_success_uses_sys_probe_runner(monkeypatch):
     dashboard = _fresh_dashboard(monkeypatch)
     monkeypatch.setattr(dashboard.local_state, "enabled_nodes", lambda path=None: [{"name": "hk-1"}])
 
     def fake_select(name, *, enabled_names, runner, state_path):
         assert name == "hk-1"
         assert enabled_names == {"hk-1"}
-        assert runner is dashboard.run
+        assert runner is sys_probe.run
         assert state_path is None
         return {"ok": True, "active": "hk-1", "step": "done"}
 
