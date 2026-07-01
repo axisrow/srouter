@@ -4,8 +4,6 @@
 Запуск:  python3 dashboard.py   →   http://127.0.0.1:8787
 Только loopback, debug=False. Privileged-действия (route) спрашивают пароль macOS через osascript.
 """
-import socket
-import subprocess
 import threading
 import time
 import re
@@ -19,6 +17,7 @@ from flask import Flask, jsonify, Response
 
 import local_state
 import node_selector
+from sys_probe import run, port_open
 
 # --- захардкоженные факты окружения (проверены) ---
 BREW = "/opt/homebrew/bin/brew"          # абсолютный путь: launchd/GUI PATH его не содержит
@@ -58,27 +57,6 @@ STATUS_PROBE_BUDGET_SEC = 12
 NODE_PROBE_TTL_SEC = 300
 
 app = Flask(__name__)
-
-
-# ============================ базовые помощники ============================
-def run(cmd_list, timeout):
-    """Всегда список аргументов, НИКОГДА shell=True. Возвращает dict, не бросает."""
-    try:
-        p = subprocess.run(cmd_list, capture_output=True, text=True, timeout=timeout)
-        return {"rc": p.returncode, "out": p.stdout.strip(),
-                "err": p.stderr.strip(), "timeout": False}
-    except subprocess.TimeoutExpired:
-        return {"rc": None, "out": "", "err": "timeout", "timeout": True}
-    except Exception as e:
-        return {"rc": None, "out": "", "err": str(e), "timeout": True}
-
-
-def port_open(host, port, timeout=0.5):
-    try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
-    except OSError:
-        return False
 
 
 def _first(pattern, text):
