@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CLI-точка входа srouter: управление LaunchAgent дашборда (apply/uninstall-apply),
+"""CLI-точка входа srouter: управление LaunchAgent дашборда (apply/stop),
 foreground-запуск (run) и статус демона (status).
 
 CLI строит отдельный интерфейс поверх библиотечных функций install_lib — НЕ дублирует
@@ -43,7 +43,7 @@ def cmd_apply(args) -> int:
     return 2
 
 
-def cmd_uninstall_apply(args) -> int:
+def cmd_stop(args) -> int:
     """Выгрузить и удалить srouter-managed LaunchAgent."""
     env = _env_from_args(args)
     result = apply_uninstall(env=env, confirmations={"launchagent": True}, runner=run)
@@ -51,7 +51,7 @@ def cmd_uninstall_apply(args) -> int:
         print(f"LaunchAgent {LAUNCHAGENT_LABEL} выгружен и удалён.")
         return 0
     blocked = ", ".join(result.get("blocked") or ["unknown"])
-    print(f"uninstall-apply остановлен: {blocked}", file=sys.stderr)
+    print(f"stop остановлен: {blocked}", file=sys.stderr)
     return 2
 
 
@@ -109,17 +109,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     for name, help_text, fn in [
         ("apply", "Установить и загрузить LaunchAgent дашборда.", cmd_apply),
-        ("uninstall-apply", "Выгрузить и удалить srouter-managed LaunchAgent.", cmd_uninstall_apply),
+        ("stop", "Выгрузить и удалить srouter-managed LaunchAgent.", cmd_stop),
         ("status", "Показать статус LaunchAgent дашборда.", cmd_status),
     ]:
         p = sub.add_parser(name, help=help_text)
         add_env_flags(p)
         p.set_defaults(func=fn)
-
-    # `stop` — синоним uninstall-apply: выгрузить демон и убрать plist.
-    p_stop = sub.add_parser("stop", help="Синоним uninstall-apply: выгрузить и удалить LaunchAgent.")
-    add_env_flags(p_stop)
-    p_stop.set_defaults(func=cmd_uninstall_apply)
 
     # `run` и `start` — синонимы: foreground-запуск дашборда (НЕ демон).
     for name in ("run", "start"):
