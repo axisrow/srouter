@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "srouter"
-version = "1.0.0"
+version = "0.1.0"
 description = "Локальный дашборд и установщик srouter: мониторинг и управление цепочкой privoxy→xray→Reality."
 readme = "README.md"
 requires-python = ">=3.8"
