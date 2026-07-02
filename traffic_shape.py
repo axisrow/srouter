@@ -41,8 +41,11 @@ rc отражает ПЕРВЫЙ сбой; частичный успех не м
 
 Владение dummynet pipe (issue #61): id pipe глобален и НЕ скоупится pf-anchor'ом.
 Наш id нестандартно высокий (PIPE_NUM), apply начинает privileged-цепочку с
-fail-closed busy-проверки: pipe уже существует -> отказ (exit 71 + маркер) ДО
-pfctl -E и до config — чужой шейпинг не перезаписывается и не удаляется.
+fail-closed busy-probe: вывод `dnctl pipe show N` захватывается (exit-код у него
+НЕ предикат существования — см. комментарий у PIPE_BUSY_MARKER); сбой probe ->
+отказ «владение неизвестно» (exit 72 + маркер), строка `^0*N:` в выводе -> отказ
+«pipe занят» (exit 71 + маркер) — оба ДО pfctl -E и до config, чужой шейпинг не
+перезаписывается и не удаляется.
 
 Cleanup (clear) — attempt-all: обязан попытаться выполнить ВСЕ шаги, даже если
 один упал, но rc отражает любой сбой. Паттерн `... || rc=1; ...; exit $rc`
@@ -74,6 +77,7 @@ import sys_probe
 PFCTL = "/sbin/pfctl"
 DNCTL = "/usr/sbin/dnctl"
 OSASCRIPT = "/usr/bin/osascript"
+GREP = "/usr/bin/grep"
 
 # Под-anchor внутри com.apple/* — этот anchor point УЖЕ объявлен в /etc/pf.conf
 # (dummynet-anchor/anchor "com.apple/*"), поэтому pf вычисляет наш под-anchor без
@@ -86,10 +90,17 @@ ANCHOR = "com.apple/srouter_throttle"
 # Нестандартно высокий id + fail-closed busy-проверка в apply (см. PIPE_BUSY_MARKER).
 PIPE_NUM = 4127
 
-# Маркер отказа busy-проверки: pipe PIPE_NUM уже существует (чужой шейпинг).
-# Печатается в stderr цепочки ДО pfctl -E (токен не создаётся) и детектится
-# Python-стороной в err (rc при этом exit 71). Только [a-z_] — идёт в shell.
-PIPE_BUSY_MARKER = "srouter_pipe_busy"
+# Маркеры отказа busy-probe (оба печатаются в stderr цепочки ДО pfctl -E — токен
+# не создаётся — и детектятся Python-стороной ТОЛЬКО по подстроке в err: реальный
+# osascript возвращает rc=1, числа exit-кодов остаются лишь в тексте ошибки).
+# Только [a-z_] — идут в shell.
+# ВАЖНО (Apple dnctl.c, list_pipes): `dnctl pipe show N` — ФИЛЬТР листинга, его
+# exit-код НЕ предикат существования pipe: отсутствующий pipe => пустой вывод и
+# rc=0, а rc!=0 значит лишь сбой самого dnctl (socket/getsockopt). Секция queues
+# печатается БЕЗ фильтра по номеру, поэтому существование проверяется якорным
+# матчем строки pipe (`%05d:` => `^0*N:`), не exit-кодом и не «вывод непуст».
+PIPE_BUSY_MARKER = "srouter_pipe_busy"            # pipe существует (чужой шейпинг), exit 71
+PIPE_PROBE_FAILED_MARKER = "srouter_pipe_probe_failed"  # probe упал — владение неизвестно, exit 72
 
 # Таймаут osascript-моста: как у switch_channel/sudo_route (пароль + выполнение pf).
 _TIMEOUT_SEC = 60
@@ -223,8 +234,10 @@ def _admin_run(shell_cmd):
 def apply_throttle(domain, rate):
     """Включить throttle для domain на скорости rate (Kbit/s).
 
-    Одна privileged-инвокация: busy-проверка pipe (fail-closed владение: id
-    глобален — существующий pipe чужой, отказ exit 71 + PIPE_BUSY_MARKER до -E) ->
+    Одна privileged-инвокация: busy-probe pipe (fail-closed владение: id глобален —
+    существующий pipe чужой; probe по захваченному выводу, сбой probe => отказ
+    exit 72 + PIPE_PROBE_FAILED_MARKER, строка pipe в выводе => отказ exit 71 +
+    PIPE_BUSY_MARKER — всё до -E) ->
     `pfctl -E` (включить pf + получить enable-token, сбой самого -E обрывает
     цепочку через `|| exit $?`) -> дубль токена в stdout И stderr (stderr
     переживает сбой цепочки — реальная семантика osascript, см. модульную
@@ -258,8 +271,13 @@ def apply_throttle(domain, rate):
         # Fail-closed владение pipe: id глобален, существующий pipe = чужой шейпинг.
         # dnctl-чтение требует root => проверка ПЕРВОЙ командой privileged-цепочки:
         # до -E (токен не создаётся) и до config (чужой pipe не перезаписывается).
+        # Exit-код `pipe show` — НЕ предикат существования (см. PIPE_BUSY_MARKER):
+        # захватываем вывод; сбой probe => fail-closed отказ (владение неизвестно);
+        # существование => якорная строка `^0*N:` (формат %05d:, queues не матчатся).
         busy_check = (
-            f"if {DNCTL} pipe show {PIPE_NUM} >/dev/null 2>&1; "
+            f"p=$({DNCTL} pipe show {PIPE_NUM} 2>&1) || "
+            f"{{ printf '%s\\n' \"$p\" 1>&2; echo {PIPE_PROBE_FAILED_MARKER} 1>&2; exit 72; }}; "
+            f"if printf '%s\\n' \"$p\" | {GREP} -q '^0*{PIPE_NUM}:'; "
             f"then echo {PIPE_BUSY_MARKER} 1>&2; exit 71; fi"
         )
         # `-E 2>&1` сливает stderr -E в захват: строка 'Token : <N>' целиком в $t.
@@ -277,6 +295,16 @@ def apply_throttle(domain, rate):
         # Токен напечатан в оба потока — парсим из out (успех) ИЛИ err (сбой цепочки).
         token = _parse_token(res.get("out")) or _parse_token(res.get("err"))
         res["token"] = token
+
+        if PIPE_PROBE_FAILED_MARKER in (res.get("err") or ""):
+            # Probe упал (socket/getsockopt): владение pipe проверить нельзя =>
+            # fail-closed отказ ДО -E — ничего не создано и не изменено.
+            res["ok"] = False
+            res["err"] = (
+                f"не удалось проверить владение dummynet pipe {PIPE_NUM} "
+                "(dnctl pipe show упал) — отказ, конфигурация не изменена"
+            )
+            return res
 
         if PIPE_BUSY_MARKER in (res.get("err") or ""):
             # Чужой pipe: отказ ДО -E и до config — ничего не создано и не изменено.
