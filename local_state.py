@@ -310,6 +310,11 @@ def _valid_active_throttle(entry):
     applied_at = entry.get("applied_at")
     if applied_at is not None and not isinstance(applied_at, (int, float, str)):
         return False
+    # needs_cleanup — опциональный булев маркер cleanup-lease (token жив на pf, но
+    # throttle не активен как политика — ждёт освобождения). При наличии обязан быть bool.
+    needs_cleanup = entry.get("needs_cleanup")
+    if needs_cleanup is not None and not isinstance(needs_cleanup, bool):
+        return False
     return True
 
 
@@ -327,13 +332,15 @@ def load_active_throttle(path=None):
     return entry if _valid_active_throttle(entry) else None
 
 
-def save_active_throttle(entry, path=None):
+def save_active_throttle(entry, path=None, needs_cleanup=False):
     """Записать активный throttle-lease в runtime.active_throttle. Возвращает entry|None.
 
     Валидирует entry (fail-closed: невалидное НЕ пишем — иначе clear получит мусорный
     token). Остальной state сохраняется (read-modify-write через save_state, atomic).
     readable=False (битый существующий файл) -> не перезаписываем вслепую, вернём None.
-    Не бросает.
+    needs_cleanup=True маркирует cleanup-lease: pf-токен ЖИВ на pf, но throttle не
+    активирован как политика (apply упал post--E, либо rollback не подтверждён) — lease
+    нужен, чтобы token был recoverable для последующего clear. Не бросает.
     """
     if not _valid_active_throttle(entry):
         return None
@@ -349,6 +356,7 @@ def save_active_throttle(entry, path=None):
         "rate": _valid_throttle_rate(entry.get("rate")),
         "token": str(entry.get("token")),
         "applied_at": entry.get("applied_at"),
+        "needs_cleanup": bool(needs_cleanup),
     }
     state["runtime"] = runtime
     return None if save_state(state, path) is None else runtime["active_throttle"]

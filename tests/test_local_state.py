@@ -446,7 +446,11 @@ def test_save_and_load_active_throttle_roundtrip(tmp_path):
     saved = local_state.save_active_throttle(entry, path=p)
     assert saved is not None
     loaded = local_state.load_active_throttle(path=p)
-    assert loaded == {"domain": "video.example.com", "rate": 512, "token": "5", "applied_at": 1000}
+    # needs_cleanup=False по умолчанию (активный lease, не cleanup-lease).
+    assert loaded == {
+        "domain": "video.example.com", "rate": 512, "token": "5",
+        "applied_at": 1000, "needs_cleanup": False,
+    }
 
 
 def test_save_active_throttle_preserves_other_sections(tmp_path):

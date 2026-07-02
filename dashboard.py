@@ -508,13 +508,31 @@ def api_guard_throttle():
 
 
 def _throttle_apply(payload):
-    """apply-ветка /api/guard/throttle: валидация -> lease-guard -> движок -> персист."""
+    """apply-ветка /api/guard/throttle: валидация -> preflight -> lease-guard -> движок -> персист.
+
+    Privileged-граница (pf enable-ref, cycle-2 review): token pf переживает сбой только
+    если он durably recoverable в state. Поэтому:
+    - preflight writability ДО apply_throttle: state неперезаписываем -> отказ ДО того,
+      как движок создаст enable-ref (token ещё не родился, нечего терять);
+    - при apply ok:False С распарсенным token (post--E failure): проверяем внутренний
+      rollback движка. rollback.ok:True -> enable-ref уже свободен, token персистить НЕ
+      надо (мусорный lease для уже-освобождённого ref). rollback отсутствует/ok:False ->
+      persist cleanup-lease (token recoverable) + needs_cleanup для оператора/UI.
+    """
     # Валидация входа В РОУТЕ: невалидный domain/rate -> 400, движок не зовём.
     domain, rate = local_state.validate_throttle_request(payload.get("domain"), payload.get("rate"))
     if domain is None:
         return jsonify(
             {"ok": False, "err": "domain must be a valid host and rate a positive integer (Kbit/s)"}
         ), 400
+
+    # Preflight writability (cycle-2 FIX): если state неперезаписываем, apply создал бы
+    # enable-ref, который потом не во что персистить -> утечка. Отказ ДО движка.
+    _state, readable = local_state.load_state_checked()
+    if not readable:
+        return jsonify(
+            {"ok": False, "err": "local state is not safely writable; cannot manage throttle lease"}
+        ), 409
 
     # Один активный throttle за раз (движок одно-pipe'овый). Активный lease -> 409,
     # без скрытого авто-clear (fail-closed: не рискуем потерять токен при сбое clear).
@@ -530,52 +548,115 @@ def _throttle_apply(payload):
 
     result = traffic_shape.apply_throttle(domain, rate)
     body = {"action": "apply", "domain": domain, "rate": rate, **_throttle_result(result)}
+    token = (result or {}).get("token")
 
     if body.get("cancelled"):
         # Отмена пароля osascript: не ошибка сервера, движок ничего не включил.
         return jsonify(body), 200
 
     if body.get("ok"):
-        # token читаем ИЗ result (наружу он не отдаётся). apply с ok:true ГАРАНТИРУЕТ
-        # токен (движок fail-closed: rc=0 без токена -> ok=false). Но на привилегированной
-        # границе не доверяем контракту движка как инварианту этого слоя: ok БЕЗ token
-        # -> fail-closed 500 (clear_throttle(None) НЕ зовёт pfctl -X, enable-ref бы тёк,
-        # а маскировать утечку под 'rolled back' нельзя — тот же корень, что #61).
-        token = (result or {}).get("token")
+        # apply с ok:true. На привилегированной границе не доверяем контракту движка как
+        # инварианту этого слоя: ok БЕЗ token -> fail-closed 500 (clear_throttle(None) НЕ
+        # зовёт pfctl -X, enable-ref бы тёк, маскировать под 'rolled back' нельзя — #61).
         if not token:
             body["ok"] = False
             body["err"] = "throttle applied but pf release-token missing — cannot persist lease"
             return jsonify(body), 500
-        saved = local_state.save_active_throttle(
-            {"domain": domain, "rate": rate, "token": token, "applied_at": int(time.time())}
-        )
-        if saved is None:
-            # Токен не удалось персистить — критично: clear его больше не найдёт.
-            # Тут же снимаем throttle ВАЛИДНЫМ токеном, чтобы не течь enable-ref.
-            rollback = traffic_shape.clear_throttle(token)
+        return _persist_active_or_cleanup(body, domain, rate, token)
+
+    # apply ok:False С распарсенным token (post--E failure): pf включён, enable-ref жив.
+    # Проверяем внутренний rollback движка — он уже мог освободить enable-ref.
+    if token:
+        rollback = (result or {}).get("rollback")
+        if isinstance(rollback, dict) and rollback.get("ok"):
+            # Движок сам подтвердил cleanup ok -> enable-ref свободен, token освобождён.
+            # Честно рапортуем 'rolled back', cleanup-lease НЕ нужен (мусорный был бы).
             body["ok"] = False
-            body["err"] = "throttle applied but token persist failed; rolled back"
+            body["err"] = (body.get("err") + "; " if body.get("err") else "") + "rolled back by engine"
             body["rollback"] = _throttle_result(rollback)
             return jsonify(body), 500
-        # Публичную проекцию строим из ТОЛЬКО ЧТО сохранённого lease (save уже вернул
-        # нормализованные domain/rate/applied_at) — без третьего чтения state-файла.
+        # Внутреннего rollback не было ИЛИ он не ok (fail/cancel/timeout) — token жив на
+        # pf, не освобождён. Persist cleanup-lease, чтобы он был recoverable после рестарта.
+        return _persist_cleanup_lease(body, domain, rate, token)
+
+    # apply ok:False без token (fail до -E, напр. busy pipe/probe-fail): pf не включён,
+    # enable-ref не создан -> нечего персистить. Структурированный 500.
+    return jsonify(body), 500
+
+
+def _persist_active_or_cleanup(body, domain, rate, token):
+    """apply ok:true: персист активный lease. При провале записи — откатываем throttle,
+    проверяя rollback.ok (cycle-2 FIX): rollback подтверждён -> 'rolled back'; rollback
+    cancel/fail -> cleanup-lease + needs_cleanup (token recoverable).
+    """
+    saved = local_state.save_active_throttle(
+        {"domain": domain, "rate": rate, "token": token, "applied_at": int(time.time())}
+    )
+    if saved is not None:
         body["throttle"] = _public_throttle(saved)
         return jsonify(body), 200
 
-    # Сбой движка (busy pipe, probe-fail, timeout и т.п.): структурированный ответ 500
-    # (серверная ошибка — движок не достиг результата), lease не пишем. Движок при сбое
-    # после -E уже сделал best-effort rollback внутри себя. 500 согласовано с другими
-    # apply-failure-путями выше; UI отличает только cancelled/ok, не статус-код.
+    # Токен не удалось персистить — критично: clear его больше не найдёт в обычном lease.
+    # Откатываем throttle ВАЛИДНЫМ токеном.
+    rollback = traffic_shape.clear_throttle(token)
+    body["ok"] = False
+    if isinstance(rollback, dict) and rollback.get("ok"):
+        # rollback подтверждён -> enable-ref освобождён, честно 'rolled back'.
+        body["err"] = "throttle applied but token persist failed; rolled back"
+        body["rollback"] = _throttle_result(rollback)
+    else:
+        # rollback cancel/fail -> enable-ref УТЁК. Token НЕ освобождён — persist cleanup-lease
+        # (token recoverable) и structured needs_cleanup для оператора. Не маскируем под успех.
+        body["err"] = "throttle applied, token persist failed AND rollback did not succeed"
+        body["rollback"] = _throttle_result(rollback)
+        cleanup = local_state.save_active_throttle(
+            {"domain": domain, "rate": rate, "token": token, "applied_at": int(time.time())},
+            needs_cleanup=True,
+        )
+        body["needs_cleanup"] = True
+        body["cleanup_persisted"] = cleanup is not None
+    return jsonify(body), 500
+
+
+def _persist_cleanup_lease(body, domain, rate, token):
+    """apply ok:False (post--E failure) без подтверждённого внутреннего rollback:
+    pf-токен ЖИВ, не освобождён. Persist cleanup-lease, чтобы token был recoverable
+    для последующего clear (cycle-2 FIX #2). Structured needs_cleanup.
+    """
+    cleanup = local_state.save_active_throttle(
+        {"domain": domain, "rate": rate, "token": token, "applied_at": int(time.time())},
+        needs_cleanup=True,
+    )
+    body["ok"] = False
+    body["err"] = (body.get("err") + "; " if body.get("err") else "") + (
+        "pf enable-ref is live (apply failed post--E); token persisted for cleanup"
+    )
+    body["needs_cleanup"] = True
+    body["cleanup_persisted"] = cleanup is not None
+    body["throttle"] = _public_throttle(cleanup) if cleanup else _public_throttle(
+        {"domain": domain, "rate": rate, "applied_at": int(time.time())}
+    )
     return jsonify(body), 500
 
 
 def _throttle_clear():
-    """clear-ветка /api/guard/throttle: снять активный throttle сохранённым токеном."""
-    active = local_state.load_active_throttle()
-    # Токен из lease обязателен для pfctl -X (issue #61). Нет lease -> нечего снимать,
-    # но всё равно зовём движок с token=None (идемпотентный cleanup pipe/anchor).
-    token = active.get("token") if active else None
+    """clear-ветка /api/guard/throttle: снять активный throttle сохранённым токеном.
 
+    cycle-2 FIX #1: нет активного lease -> NO-OP (409), движок НЕ зовётся ВООБЩЕ.
+    clear_throttle(None) всё равно flush'ит throttle-anchor + удаляет PIPE_NUM без
+    доказательства владения -> разрушил бы ЧУЖОЙ pipe при stale/corrupt/missing lease
+    или Clear на неактивном дашборде. Orphan-repair (если нужен) — отдельный action.
+    """
+    active = local_state.load_active_throttle()
+    if active is None:
+        # Нечего снимать, И нельзя звать движок с token=None (деструктивный cleanup
+        # чужого pipe). Честный no-op без privileged-вызова.
+        return jsonify(
+            {"ok": False, "err": "no active throttle to clear", "action": "clear"}
+        ), 409
+
+    # Токен из lease обязателен для pfctl -X (issue #61).
+    token = active.get("token")
     result = traffic_shape.clear_throttle(token)
     body = {"action": "clear", **_throttle_result(result)}
 
