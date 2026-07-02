@@ -1,6 +1,5 @@
 import importlib
 import sys
-import types
 from pathlib import Path
 
 import sys_probe
@@ -8,12 +7,13 @@ import sys_probe
 
 def _fresh_dashboard_without_legacy_vps(monkeypatch):
     monkeypatch.delitem(sys.modules, "dashboard", raising=False)
-    cfg = types.ModuleType("srouter_config")
-    cfg.GATEWAY = "192.0.2.1"
-    cfg.VPN_SERVER = "198.51.100.20"
-    cfg.VPN_EXIT_IP = "198.51.100.20"
-    monkeypatch.setitem(sys.modules, "srouter_config", cfg)
-    return importlib.import_module("dashboard")
+    dashboard = importlib.import_module("dashboard")
+    # Пустое состояние: нет активного узла -> route_ip == "". Раньше helper подменял
+    # sys.modules["srouter_config"], но активный узел всё равно шёл из srouter.local.json
+    # (там активный sg-1 с route_ip). Изолируем источник — каноничный паттерн из
+    # test_dashboard_mutation_lock (dashboard.local_state.active_node).
+    monkeypatch.setattr(dashboard.local_state, "active_node", lambda: {})
+    return dashboard
 
 
 def test_dashboard_source_has_no_legacy_vps_config_lookup():
