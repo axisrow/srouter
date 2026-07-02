@@ -240,16 +240,20 @@ def api_service(name, action):
 
 @app.get("/api/guard")
 def api_guard_get():
-    """Текущая секция Traffic Guard для UI-редактора: {mode, domains, counts}.
+    """Текущая секция Traffic Guard для UI-редактора: {mode, editable, domains, counts}.
 
-    Возвращает нормализованные block/allow правила из unified state. auto-режим
-    (#23) в v1-редакторе не показываем — деградируем в off с пустой картой,
-    чтобы UI-таблица не пыталась рисовать channel-семантику.
+    Возвращает ЧЕСТНЫЙ mode (on|off|auto). auto (#23, channel-семантика) v1-редактор
+    не редактирует, поэтому editable=false и domains={} — плоскую проекцию активного
+    канала НЕ отдаём: иначе пользователь сохранил бы её обратно легальным on/off-POST
+    и затёр channel-map (round-trip потеря). fail-closed зеркалится в POST → 409.
     """
     guard = local_state.traffic_guard_config()
-    mode = guard.get("mode") if guard.get("mode") in ("on", "off") else "off"
-    domains = guard.get("domains") if isinstance(guard.get("domains"), dict) else {}
-    return jsonify({"mode": mode, "domains": domains, "guard": probe_traffic_guard()})
+    raw_mode = guard.get("mode")
+    mode = raw_mode if raw_mode in ("on", "off", "auto") else "off"
+    editable = mode in ("on", "off")
+    # Для редактируемых режимов отдаём реальные block/allow правила; для auto — пусто.
+    domains = guard.get("domains") if (editable and isinstance(guard.get("domains"), dict)) else {}
+    return jsonify({"mode": mode, "editable": editable, "domains": domains, "guard": probe_traffic_guard()})
 
 
 @app.post("/api/guard")
@@ -282,6 +286,15 @@ def api_guard():
     state, readable = local_state.load_state_checked()
     if not readable:
         return jsonify({"ok": False, "errors": ["local state is not safely writable"]}), 409
+
+    # Round-trip fail-closed: если ТЕКУЩИЙ state в auto (#23, channel-map), v1-редактор
+    # его не перезаписывает даже легальным on/off — иначе затрёт channel-семантику,
+    # которую редактор не умеет представлять. Это отдельная граница от payload-mode выше.
+    current = state.get("traffic_guard")
+    if isinstance(current, dict) and current.get("mode") == "auto":
+        return jsonify(
+            {"ok": False, "errors": ["traffic_guard is in auto mode; v1 editor cannot overwrite it"]}
+        ), 409
 
     state["traffic_guard"] = guard
     if local_state.save_state(state) is None:

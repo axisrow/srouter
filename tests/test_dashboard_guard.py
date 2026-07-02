@@ -249,23 +249,82 @@ def test_api_guard_get_returns_current_rules_for_editor(monkeypatch):
     assert response.status_code == 200
     body = response.get_json()
     assert body["mode"] == "on"
+    assert body["editable"] is True
     assert body["domains"] == {"ads.example.com": "block"}
     assert body["guard"]["rule_count"] == 1
 
 
-def test_api_guard_get_auto_mode_degrades_to_off_for_v1_editor(monkeypatch):
-    """auto-режим (#23) в v1-редакторе не показываем: деградируем в off/пусто."""
+def test_api_guard_get_auto_mode_reports_honest_mode_not_editable(monkeypatch):
+    """auto-режим (#23) в v1-редакторе не редактируется, но GET сообщает ЧЕСТНЫЙ mode.
+
+    Раньше GET деградировал auto→off — это ложь о состоянии: пользователь жал save
+    и легальный {mode:on/off} затирал channel-map (round-trip потеря). Теперь GET
+    отдаёт mode:"auto" + editable:false + domains:{} (плоскую ложь не отдаём).
+    """
     dashboard = _fresh_dashboard(monkeypatch)
     monkeypatch.setattr(
         dashboard.local_state,
         "traffic_guard_config",
-        lambda **kw: {"mode": "auto", "domains": {}, "channels": {}, "valid": True, "errors": []},
+        lambda **kw: {
+            "mode": "auto",
+            "domains": {"example.com": "block"},  # плоская проекция активного канала — НЕ отдаём в редактор
+            "channels": {"wifi": {"example.com": "block"}},
+            "valid": True,
+            "errors": [],
+        },
     )
-    monkeypatch.setattr(dashboard, "probe_traffic_guard", lambda **kw: {"status": "ok", "rule_count": 0})
+    monkeypatch.setattr(dashboard, "probe_traffic_guard", lambda **kw: {"status": "ok", "rule_count": 1})
 
     response = dashboard.app.test_client().get("/api/guard")
 
     assert response.status_code == 200
     body = response.get_json()
-    assert body["mode"] == "off"
+    assert body["mode"] == "auto"
+    assert body["editable"] is False
+    # Плоскую проекцию канала не отдаём: редактор её не сохраняет обратно.
     assert body["domains"] == {}
+
+
+def test_api_guard_post_blocked_when_existing_state_is_auto(monkeypatch):
+    """Round-trip fail-closed: если ТЕКУЩИЙ state в auto — легальный on/off POST его
+    не перезаписывает (409), channel-map остаётся цел."""
+    dashboard = _fresh_dashboard(monkeypatch)
+    auto_state = {
+        "schema_version": 1,
+        "traffic_guard": {
+            "mode": "auto",
+            "domains": {"wifi": {"example.com": "block"}, "metered": {"cdn.example.net": "allow"}},
+            "channel": "wifi",
+        },
+    }
+    saved = _install_state(monkeypatch, dashboard, state=auto_state)
+
+    # Полностью легальный payload редактора — и mode-чек, и validate_traffic_guard он бы прошёл.
+    response = dashboard.app.test_client().post(
+        "/api/guard", json={"mode": "on", "domains": {"ads.example.com": "block"}}
+    )
+
+    assert response.status_code == 409
+    body = response.get_json()
+    assert body["ok"] is False
+    assert body["errors"]
+    assert any("auto" in e.lower() for e in body["errors"])
+    # State НЕ тронут — channel-map цел.
+    assert saved == []
+
+
+def test_api_guard_post_allows_write_when_existing_state_is_off(monkeypatch):
+    """Штатный round-trip: существующий state on/off → редактор пишет нормально."""
+    dashboard = _fresh_dashboard(monkeypatch)
+    off_state = {"schema_version": 1, "traffic_guard": {"mode": "off", "domains": {}}}
+    saved = _install_state(monkeypatch, dashboard, state=off_state)
+    monkeypatch.setattr(dashboard, "probe_traffic_guard", lambda **kw: {"status": "ok", "rule_count": 1})
+
+    response = dashboard.app.test_client().post(
+        "/api/guard", json={"mode": "on", "domains": {"ads.example.com": "block"}}
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["ok"] is True
+    assert len(saved) == 1
+    assert saved[0]["traffic_guard"]["mode"] == "on"
