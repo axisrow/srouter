@@ -175,6 +175,7 @@ pip install -e .
 srouter apply          # загрузить LaunchAgent дашборда (демон, loopback 127.0.0.1:8787)
 srouter status         # статус демона и PID
 srouter run            # foreground-запуск (без launchd) — http://127.0.0.1:8787
+                       #   run/start — синонимы; uninstall-apply/stop — выгрузить демон
 
 # Либо напрямую (legacy/foreground):
 python3 dashboard.py                        # http://127.0.0.1:8787
@@ -264,6 +265,7 @@ pip install -e .
 srouter apply          # load the dashboard LaunchAgent (daemon, loopback 127.0.0.1:8787)
 srouter status         # daemon status and PID
 srouter run            # foreground run (without launchd) — http://127.0.0.1:8787
+                       #   run/start are aliases; uninstall-apply/stop unload the daemon
 
 # Or directly (legacy/foreground):
 python3 dashboard.py                         # http://127.0.0.1:8787
