@@ -19,13 +19,33 @@ rc отражает ПЕРВЫЙ сбой; частичный успех не м
 Управление pf enable-reference и его lifecycle:
 `pfctl -E` включает pf и инкрементит enable-reference-count, печатая release-token
 (`Token : <N>`). Токен обязателен к освобождению через `pfctl -X <token>`, иначе pf
-остаётся включён системно и счётчик течёт при повторных apply. Инварианты:
-- Токен парсится из объединённого вывода НЕЗАВИСИМО от rc (`-E` печатает его до
-  сбоя последующих команд). Если -E успел — токен ВСЕГДА в возвращаемом dict.
-- При сбое ПОСЛЕ -E (rc != 0, токен распарсен) apply делает best-effort rollback
-  (clear_throttle(token) — второй промпт только в failure-path), результат кладёт
-  в ответ (`rollback`), исходную ошибку не теряет.
+остаётся включён системно и счётчик течёт при повторных apply.
+
+РЕАЛЬНАЯ семантика osascript (issue #61, доказано экспериментом): при rc != 0
+любой команды цепочки `do shell script` ОТБРАСЫВАЕТ stdout, error message (-> err)
+аккумулирует только stderr цепочки. Поэтому токен, напечатанный лишь в stdout,
+при сбое dnctl/pfctl -a был бы потерян. Инварианты:
+- Токен захватывается в переменную (`t=$(pfctl -E 2>&1) || exit $?` — сбой самого
+  -E обрывает цепочку, токен не создан, утечки нет) и дублируется в ОБА потока:
+  stdout (success-путь) и stderr (переживает сбой цепочки).
+- Парсинг: `_parse_token(out) or _parse_token(err)` — независимо от rc.
+- rc=0 БЕЗ распарсенного токена — СБОЙ (fail-closed): pf включён, release-token
+  неизвестен, enable-ref может течь. Явная ошибка + best-effort cleanup
+  (clear_throttle(None) — без -X, токена нет), результат в `rollback`.
+- При сбое ПОСЛЕ -E (rc != 0, токен распарсен из err) apply делает best-effort
+  rollback (clear_throttle(token) — второй промпт только в failure-path),
+  результат кладёт в ответ (`rollback`), исходную ошибку не теряет.
+- Timeout osascript: out/err пусты, токен потерян, состояние pf неизвестно —
+  явная ошибка про возможную утечку enable-ref (rollback невозможен).
 - Широкий except (defensive) тоже сохраняет уже распарсенный токен.
+
+Владение dummynet pipe (issue #61): id pipe глобален и НЕ скоупится pf-anchor'ом.
+Наш id нестандартно высокий (PIPE_NUM), apply начинает privileged-цепочку с
+fail-closed busy-probe: вывод `dnctl pipe show N` захватывается (exit-код у него
+НЕ предикат существования — см. комментарий у PIPE_BUSY_MARKER); сбой probe ->
+отказ «владение неизвестно» (exit 72 + маркер), строка `^0*N:` в выводе -> отказ
+«pipe занят» (exit 71 + маркер) — оба ДО pfctl -E и до config, чужой шейпинг не
+перезаписывается и не удаляется.
 
 Cleanup (clear) — attempt-all: обязан попытаться выполнить ВСЕ шаги, даже если
 один упал, но rc отражает любой сбой. Паттерн `... || rc=1; ...; exit $rc`
@@ -57,12 +77,30 @@ import sys_probe
 PFCTL = "/sbin/pfctl"
 DNCTL = "/usr/sbin/dnctl"
 OSASCRIPT = "/usr/bin/osascript"
+GREP = "/usr/bin/grep"
 
 # Под-anchor внутри com.apple/* — этот anchor point УЖЕ объявлен в /etc/pf.conf
 # (dummynet-anchor/anchor "com.apple/*"), поэтому pf вычисляет наш под-anchor без
 # правки main ruleset. Имя — константа, не пользовательский ввод.
 ANCHOR = "com.apple/srouter_throttle"
-PIPE_NUM = 1
+
+# Id dummynet pipe ГЛОБАЛЕН (не скоупится pf-anchor'ом): низкие id (1-10) типичны
+# для чужого шейпинга (Network Link Conditioner конфигурирует pipe 1-2 и т.п.) —
+# `dnctl pipe N config` молча перезаписал бы чужой pipe, а clear его удалил бы.
+# Нестандартно высокий id + fail-closed busy-проверка в apply (см. PIPE_BUSY_MARKER).
+PIPE_NUM = 4127
+
+# Маркеры отказа busy-probe (оба печатаются в stderr цепочки ДО pfctl -E — токен
+# не создаётся — и детектятся Python-стороной ТОЛЬКО по подстроке в err: реальный
+# osascript возвращает rc=1, числа exit-кодов остаются лишь в тексте ошибки).
+# Только [a-z_] — идут в shell.
+# ВАЖНО (Apple dnctl.c, list_pipes): `dnctl pipe show N` — ФИЛЬТР листинга, его
+# exit-код НЕ предикат существования pipe: отсутствующий pipe => пустой вывод и
+# rc=0, а rc!=0 значит лишь сбой самого dnctl (socket/getsockopt). Секция queues
+# печатается БЕЗ фильтра по номеру, поэтому существование проверяется якорным
+# матчем строки pipe (`%05d:` => `^0*N:`), не exit-кодом и не «вывод непуст».
+PIPE_BUSY_MARKER = "srouter_pipe_busy"            # pipe существует (чужой шейпинг), exit 71
+PIPE_PROBE_FAILED_MARKER = "srouter_pipe_probe_failed"  # probe упал — владение неизвестно, exit 72
 
 # Таймаут osascript-моста: как у switch_channel/sudo_route (пароль + выполнение pf).
 _TIMEOUT_SEC = 60
@@ -196,14 +234,23 @@ def _admin_run(shell_cmd):
 def apply_throttle(domain, rate):
     """Включить throttle для domain на скорости rate (Kbit/s).
 
-    Одна privileged-инвокация (fail-fast `&&`): `pfctl -E` (включить pf + получить
-    enable-token) -> `dnctl pipe config` -> загрузка правил в под-anchor через stdin.
-    main pf ruleset НЕ трогается (под-anchor com.apple/* уже вычисляется системой).
+    Одна privileged-инвокация: busy-probe pipe (fail-closed владение: id глобален —
+    существующий pipe чужой; probe по захваченному выводу, сбой probe => отказ
+    exit 72 + PIPE_PROBE_FAILED_MARKER, строка pipe в выводе => отказ exit 71 +
+    PIPE_BUSY_MARKER — всё до -E) ->
+    `pfctl -E` (включить pf + получить enable-token, сбой самого -E обрывает
+    цепочку через `|| exit $?`) -> дубль токена в stdout И stderr (stderr
+    переживает сбой цепочки — реальная семантика osascript, см. модульную
+    docstring) -> `dnctl pipe config` -> загрузка правил в под-anchor через stdin
+    (fail-fast `&&`). main pf ruleset НЕ трогается (под-anchor com.apple/* уже
+    вычисляется системой).
 
     Возвращает dict как _shape_result + ключ `token` (release-token pf enable-ref;
     None если -E не дошёл/не распарсился). Токен ОБЯЗАН быть передан позже в
-    clear_throttle(token=...) для освобождения. При сбое ПОСЛЕ -E с распарсенным
-    токеном — best-effort rollback (ключ `rollback`). Функция не бросает.
+    clear_throttle(token=...) для освобождения. Fail-closed: rc=0 без распарсенного
+    токена — сбой с best-effort cleanup (`rollback`, clear без -X). При сбое ПОСЛЕ
+    -E с распарсенным токеном — best-effort rollback (ключ `rollback`).
+    Функция не бросает.
     """
     ip = resolve_domain_ip(domain)
     if not ip:
@@ -216,22 +263,87 @@ def apply_throttle(domain, rate):
     try:
         # Всё ниже — из констант + validated (ip canonical, rate_spec числовой,
         # ANCHOR/PIPE_NUM константы). Правило dummynet заворачивает трафик к целевому
-        # IP в pipe с ограниченной полосой. `-E 2>&1` сливает stderr в stdout, чтобы
-        # osascript отдал строку 'Token : <N>'.
+        # IP в pipe с ограниченной полосой.
         pf_rule = (
             f"dummynet out proto tcp from any to {ip} pipe {PIPE_NUM}\\n"
             f"dummynet in proto tcp from {ip} to any pipe {PIPE_NUM}"
         )
-        enable = f"{PFCTL} -E 2>&1"
+        # Fail-closed владение pipe: id глобален, существующий pipe = чужой шейпинг.
+        # dnctl-чтение требует root => проверка ПЕРВОЙ командой privileged-цепочки:
+        # до -E (токен не создаётся) и до config (чужой pipe не перезаписывается).
+        # Exit-код `pipe show` — НЕ предикат существования (см. PIPE_BUSY_MARKER):
+        # захватываем вывод; сбой probe => fail-closed отказ (владение неизвестно);
+        # существование => якорная строка `^0*N:` (формат %05d:, queues не матчатся).
+        # Разбор rc grep через case: 0 -> busy, 1 -> свободен, >=2 (сбой самого
+        # grep) -> fail-closed probe-failed — симметрично сбою dnctl-половины.
+        busy_check = (
+            f"p=$({DNCTL} pipe show {PIPE_NUM} 2>&1) || "
+            f"{{ printf '%s\\n' \"$p\" 1>&2; echo {PIPE_PROBE_FAILED_MARKER} 1>&2; exit 72; }}; "
+            f"printf '%s\\n' \"$p\" | {GREP} -q '^0*{PIPE_NUM}:'; "
+            f"case $? in 0) echo {PIPE_BUSY_MARKER} 1>&2; exit 71;; 1) ;; "
+            f"*) echo {PIPE_PROBE_FAILED_MARKER} 1>&2; exit 72;; esac"
+        )
+        # `-E 2>&1` сливает stderr -E в захват: строка 'Token : <N>' целиком в $t.
+        # `|| exit $?` — fail-fast: -E упал => токена нет => утечки нет.
+        enable = f"t=$({PFCTL} -E 2>&1) || exit $?"
+        # Дубль токена в оба потока СРАЗУ после -E: stdout — success-путь; stderr —
+        # переживает сбой dnctl/pfctl -a (osascript при rc!=0 отбрасывает stdout).
+        emit_token = "printf '%s\\n' \"$t\"; printf '%s\\n' \"$t\" 1>&2"
         pipe_cfg = f"{DNCTL} pipe {PIPE_NUM} config bw {rate_spec}"
         load_anchor = f"printf '{pf_rule}' | {PFCTL} -a \"{ANCHOR}\" -f -"
-        # fail-fast: первый сбой обрывает цепочку, rc его и отражает.
-        shell_cmd = f"{enable} && {pipe_cfg} && {load_anchor}"
+        # fail-fast: busy-check/-E обрывают через exit, сбой config не даёт грузить anchor.
+        shell_cmd = f"{busy_check}; {enable}; {emit_token}; {pipe_cfg} && {load_anchor}"
 
         res = _admin_run(shell_cmd)
-        # Токен печатает -E ДО возможного сбоя последующих команд — парсим независимо от rc.
-        token = _parse_token(res.get("out"))
+        # Токен напечатан в оба потока — парсим из out (успех) ИЛИ err (сбой цепочки).
+        token = _parse_token(res.get("out")) or _parse_token(res.get("err"))
         res["token"] = token
+
+        if PIPE_PROBE_FAILED_MARKER in (res.get("err") or ""):
+            # Probe упал (socket/getsockopt/grep): владение pipe проверить нельзя =>
+            # fail-closed отказ ДО -E — ничего не создано и не изменено. Исходную
+            # диагностику ($p форварднут в stderr цепочки) не выбрасываем.
+            res["ok"] = False
+            res["err"] = (
+                f"не удалось проверить владение dummynet pipe {PIPE_NUM} "
+                "(dnctl pipe show упал) — отказ, конфигурация не изменена; "
+                + (res["err"] or "")
+            ).rstrip("; ")
+            return res
+
+        if PIPE_BUSY_MARKER in (res.get("err") or ""):
+            # Занятый pipe (чужой шейпинг ИЛИ наш незавершённый throttle): отказ
+            # ДО -E и до config — ничего не создано и не изменено.
+            # Fail-closed: маркер = отказ безусловно, независимо от rc.
+            res["ok"] = False
+            res["err"] = (
+                f"dummynet pipe {PIPE_NUM} уже существует (чужой шейпинг или наш "
+                "незавершённый throttle — сначала clear_throttle) — "
+                "отказ, конфигурация не изменена"
+            )
+            return res
+
+        if res["timeout"] and not token:
+            # osascript не завершился: состояние pf неизвестно, токен потерян.
+            # Формулировка «timeout или сбой запуска»: sys_probe.run помечает
+            # timeout=True и для generic-исключений запуска, не только TimeoutExpired.
+            res["err"] = (
+                "osascript не завершился (timeout или сбой запуска): состояние pf "
+                "неизвестно, release-token потерян — enable-ref может течь; "
+                + (res["err"] or "")
+            ).rstrip("; ")
+            return res
+
+        if res["ok"] and not token:
+            # Fail-closed: rc=0, но release-token не распарсен. Считаем сбоем —
+            # pf включён, освободить enable-ref нечем. Cleanup без -X (токена нет).
+            res["ok"] = False
+            res["err"] = (
+                "pf включён, но release-token не получен — enable-ref может течь; "
+                + (res["err"] or "")
+            ).rstrip("; ")
+            res["rollback"] = clear_throttle(None)
+            return res
 
         if not res["ok"] and token:
             # Сбой после включения pf: pf остался с инкрементированным enable-ref.
@@ -249,6 +361,16 @@ def clear_throttle(token=None):
     должен обрываться на первом сбое), но rc отражает любой сбой (`|| rc=1; exit $rc`).
     `pfctl -X <token>` — только при валидном (числовом) токене из apply_throttle.
     Без токена enable-ref не трогает (нечего/неизвестно что освобождать). Идемпотентно.
+
+    Инвариант владения pipe: удаляется ТОЛЬКО pipe нашего id (PIPE_NUM) — apply
+    создаёт его лишь после fail-closed busy-probe, поэтому pipe PIPE_NUM
+    принадлежит нам; чужие id не перечисляются и не трогаются никогда.
+    Ограничение (осознанное, ревью PR #63): dummynet не хранит владельца pipe,
+    доказать владение в момент clear невозможно в принципе — коллизия с чужим
+    шейпингом минимизирована нестандартным id + busy-probe в apply; гарантия
+    «clear зовётся только для своего активного throttle» (session-lease) —
+    ответственность роут-слоя (issue #13).
+
     Всё — из констант + validated токен. Функция не бросает.
     """
     try:
