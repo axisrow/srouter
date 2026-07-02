@@ -11,6 +11,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 import hot_routes
 
 
@@ -66,52 +68,62 @@ def test_parse_extracts_host_from_absolute_url(tmp_path):
     assert counts == {"example.com": 1}
 
 
-def test_parse_non_connect_token_is_skipped(tmp_path):
-    """Privacy: scheme-less target при не-CONNECT методе НЕ считается доменом.
+# --- RFC-7230 target-парсер: полная matrix (issue #69) ---
+# Каждый кейс — реальная строка лога "<method> <target> HTTP/1.1", гоняется через
+# parse_access_log (end-to-end, не только _extract_host). Граница «только hostname»:
+# absolute-form и CONNECT authority-form host:port с ЧИСЛОВЫМ портом принимаются;
+# origin/asterisk/голый-токен/без-порта/нечисловой-порт/userinfo — REJECT.
+_MATRIX_REJECT = [
+    ("GET", "http://[::1"),                 # битый IPv6 URL (urlsplit ValueError)
+    ("GET", "http://a℀b/"),                 # не-ASCII netloc под NFKC (ValueError)
+    ("GET", "SECRET123"),                   # голый токен, не URL
+    ("GET", "/relative"),                   # origin-form, hostname не несёт
+    ("GET", "*"),                           # asterisk-form (OPTIONS *)
+    ("CONNECT", "SECRET123"),               # authority без порта
+    ("CONNECT", "SECRET123:abc"),           # нечисловой порт
+    ("CONNECT", "user:pass"),               # userinfo-токен (не host:port)
+    ("CONNECT", "host"),                    # без порта
+    ("CONNECT", "http://host"),             # absolute URL в CONNECT — malformed
+    ("CONNECT", "user:pass@host:443"),      # userinfo в authority
+]
+_MATRIX_ACCEPT = [
+    ("GET", "http://good.example/x", "good.example"),
+    ("GET", "http://good.example:8080/p?q=1", "good.example"),
+    ("CONNECT", "host:443", "host"),
+    ("CONNECT", "192.0.2.1:443", "192.0.2.1"),
+    ("CONNECT", "[::1]:443", "::1"),
+    ("CONNECT", "[2001:db8::1]:443", "2001:db8::1"),
+]
 
-    'GET SECRET123 HTTP/1.1' — безопасный токен фильтра/origin-form без hostname.
-    Раньше принималось по _HOST_RE и попадало в counts (attacker-influenced мусор
-    в кэше). Теперь authority-form допустима только для CONNECT."""
+
+@pytest.mark.parametrize("method,target", _MATRIX_REJECT)
+def test_parse_target_matrix_reject(tmp_path, method, target):
+    """REJECT-кейсы: ни один не должен дать домен (privacy-граница)."""
     log = tmp_path / "privoxy.log"
     log.write_text(
-        "\n".join(
-            [
-                '127.0.0.1 - - [ts] "GET SECRET123 HTTP/1.1" 200 0',
-                '127.0.0.1 - - [ts] "GET /relative/path HTTP/1.1" 200 0',
-                _privoxy_url_line("http://good.example/x"),
-            ]
-        ),
-        encoding="utf-8",
+        f'127.0.0.1 - - [ts] "{method} {target} HTTP/1.1" 200 0', encoding="utf-8"
     )
-    counts = hot_routes.parse_access_log(str(log))
-    assert counts == {"good.example": 1}
-    assert "secret123" not in counts
+    assert hot_routes.parse_access_log(str(log)) == {}
 
 
-def test_parse_connect_authority_still_works(tmp_path):
-    """CONNECT host:port (authority-form) по-прежнему считается — regression guard."""
-    log = tmp_path / "privoxy.log"
-    log.write_text(_privoxy_line("tunnel.example"), encoding="utf-8")
-    assert hot_routes.parse_access_log(str(log)) == {"tunnel.example": 1}
-
-
-def test_parse_malformed_url_does_not_raise(tmp_path):
-    """Битый URL (urlsplit ValueError: невалидный IPv6 / не-ASCII netloc под NFKC)
-    трактуется как пропуск строки, не роняет весь parse_access_log. Валидная
-    строка в том же логе при этом считается."""
+@pytest.mark.parametrize("method,target,host", _MATRIX_ACCEPT)
+def test_parse_target_matrix_accept(tmp_path, method, target, host):
+    """ACCEPT-кейсы: считается ровно hostname (без порта/пути/query)."""
     log = tmp_path / "privoxy.log"
     log.write_text(
-        "\n".join(
-            [
-                _privoxy_url_line("http://[::1"),  # Invalid IPv6 URL
-                _privoxy_url_line("http://a℀b/"),  # ℀ — invalid netloc под NFKC
-                _privoxy_url_line("http://good.example/x"),
-            ]
-        ),
-        encoding="utf-8",
+        f'127.0.0.1 - - [ts] "{method} {target} HTTP/1.1" 200 0', encoding="utf-8"
     )
-    counts = hot_routes.parse_access_log(str(log))
-    assert counts == {"good.example": 1}
+    assert hot_routes.parse_access_log(str(log)) == {host: 1}
+
+
+def test_parse_matrix_reject_does_not_poison_valid(tmp_path):
+    """REJECT-строки в одном логе с валидной: считается только валидная (одна битая
+    строка не роняет parse_access_log и не подмешивает мусор)."""
+    lines = [f'127.0.0.1 - - [ts] "{m} {t} HTTP/1.1" 200 0' for m, t in _MATRIX_REJECT]
+    lines.append(_privoxy_url_line("http://good.example/x"))
+    log = tmp_path / "privoxy.log"
+    log.write_text("\n".join(lines), encoding="utf-8")
+    assert hot_routes.parse_access_log(str(log)) == {"good.example": 1}
 
 
 def test_parse_userinfo_token_never_leaks(tmp_path):

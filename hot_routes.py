@@ -45,13 +45,31 @@ DEFAULT_TTL_SECONDS = 7 * 24 * 60 * 60  # неделя
 _DEFAULT_MAX_LINES = 20000
 _DEFAULT_MAX_BYTES = 4 * 1024 * 1024  # 4 MiB хвоста
 
-# Валидный hostname: только безопасные символы (буквы/цифры/.-_ и IPv6-двоеточие).
-# Совпадает по духу с _HOST_RE из local_state — мусорные токены отсекаются.
-_HOST_RE = re.compile(r"^[A-Za-z0-9._:-]+\Z")
+# reg-name hostname (RFC 3986): буквы/цифры/`.`/`-`/`_`, БЕЗ двоеточия. Двоеточие
+# в authority значит только разделитель порта или IPv6 — их разбираем явно, а не
+# пропускаем в host. Так `SECRET123`/`user`/`a:b` не могут притвориться доменом.
+_REGNAME_RE = re.compile(r"^[A-Za-z0-9._-]+\Z")
+# IPv6-литерал внутри скобок: только hex-группы и двоеточия (canonical `[...]`).
+_IPV6_INNER_RE = re.compile(r"^[0-9A-Fa-f:]+\Z")
+# Порт authority-form: непустой, строго числовой (RFC 3986 port = *DIGIT, но для
+# CONNECT-цели пустой порт бессмысленен — требуем ≥1 цифру).
+_PORT_RE = re.compile(r"^[0-9]+\Z")
+
+
+def _is_hostname(value):
+    """Единый предикат «это hostname»: reg-name ИЛИ IPv6-литерал (`::1`).
+
+    Одна граница на весь модуль — и парсер (_extract_host), и валидация ключей
+    кэша (_load_cache/update_cache) используют ЭТОТ предикат, чтобы IPv6-домены
+    не выпадали при чтении (иначе write/read-асимметрия -> тихая потеря домена).
+    """
+    return isinstance(value, str) and bool(
+        _REGNAME_RE.match(value) or _IPV6_INNER_RE.match(value)
+    )
 
 # Запрос в кавычках privoxy-лога: "<method> <target> HTTP/x.x".
-# Захватываем method — от него зависит, как трактовать scheme-less target
-# (authority-form допустим ТОЛЬКО для CONNECT, см. _extract_host).
+# Захватываем method — от него зависит, как трактовать target (authority-form
+# host:port допустим ТОЛЬКО для CONNECT, см. _extract_host).
 _REQUEST_RE = re.compile(r'"([A-Z]+)\s+(\S+)\s+HTTP/[0-9.]+"')
 
 
@@ -72,50 +90,77 @@ def _now(now):
     return time.time()
 
 
+def _connect_authority_host(target):
+    """Строгий разбор CONNECT authority-form `host:port` -> hostname или None.
+
+    По RFC 7230 §5.3.3 CONNECT-цель — ТОЛЬКО authority-form с ОБЯЗАТЕЛЬНЫМ портом.
+    Reject всего, что не является строгим host:port с числовым портом:
+    - reg-name host:port  -> host, порт обязателен и числовой;
+    - IPv6 `[addr]:port`  -> addr (скобки сняты), порт числовой;
+    - reject: без порта / нечисловой порт / userinfo `@` / path `/` / query `?` /
+      absolute URL (`://`) / голый токен / лишние `:` вне IPv6-скобок.
+    Это privacy-граница: attacker-controlled мусор (`SECRET123`, `SECRET123:abc`,
+    `user:pass`) НЕ должен пройти как hostname.
+    """
+    # userinfo / path / query / fragment / scheme в authority недопустимы —
+    # любой из этих символов значит, что это не чистый host:port.
+    if any(c in target for c in "@/?#") or "://" in target:
+        return None
+
+    if target.startswith("["):
+        # IPv6-литерал: строго `[addr]:port`.
+        end = target.find("]")
+        if end == -1:
+            return None
+        inner = target[1:end]
+        rest = target[end + 1:]
+        if not inner or not _IPV6_INNER_RE.match(inner):
+            return None
+        if not rest.startswith(":"):
+            return None  # порт обязателен
+        port = rest[1:]
+        host = inner
+    else:
+        # reg-name: РОВНО один ':' разделяет host и port (лишние ':' -> reject).
+        if target.count(":") != 1:
+            return None
+        host, port = target.split(":", 1)
+        if not host or not _REGNAME_RE.match(host):
+            return None
+
+    if not _PORT_RE.match(port):
+        return None  # порт обязателен и строго числовой
+    return host.lower()
+
+
 def _extract_host(target, method=None):
     """Из request-target privoxy-лога вернуть чистый hostname или None.
 
-    По RFC 7230 request-target бывает четырёх форм; нас интересуют только те, что
-    несут hostname (privacy-граница «только hostnames»):
-    - absolute-form `scheme://host[:port]/path?query` — обычные методы (GET/…),
-      берём ТОЛЬКО hostname (urlsplit снимает и userinfo/query/path).
-    - authority-form `host:port` — допустимо ТОЛЬКО для CONNECT; для прочих методов
-      scheme-less target это либо origin-form `/path` (без hostname), либо мусорный
-      токен (напр. безопасное слово фильтра) — такой target НЕ принимаем, иначе
-      attacker-influenced мусор попадает в counts/кэш.
-    Возврат None для мусора/отсутствия hostname — вызывающий пропускает строку.
+    ОДИН код-путь, строгий RFC 7230. Privacy-граница «только hostname» — здесь:
+    - CONNECT: ТОЛЬКО authority-form host:port с числовым портом (см.
+      _connect_authority_host). Absolute URL в CONNECT — malformed, reject.
+    - не-CONNECT: ТОЛЬКО absolute-form `scheme://authority/...` -> hostname
+      (urlsplit под try/except ValueError). origin-form (`/path`), asterisk-form
+      (`*`), голый токен и authority-form hostname не несут -> skip.
+
+    Возврат None для всего, что не несёт валидный hostname — вызывающий пропускает
+    строку. urlsplit может бросить ValueError (битый IPv6, не-ASCII netloc под
+    NFKC) — ловим, чтобы одна кривая строка не роняла parse_access_log.
     """
     if not target:
         return None
-    if "://" in target:
-        # Абсолютный URL: hostname без порта/пути/query (urlsplit снимает и userinfo).
-        # urlsplit бросает ValueError на битом URL ('http://[::1', не-ASCII netloc
-        # под NFKC) — мусорный target трактуем как пропуск строки, а не как краш
-        # всего parse_access_log (контракт «не бросает»).
-        try:
-            host = urlsplit(target).hostname
-        except ValueError:
-            return None
-    elif (method or "").upper() == "CONNECT":
-        # authority-form host:port — легитимен только для CONNECT. Любой '@'
-        # значит мусорная/чужая строка, где rsplit(':') отрезал бы username-токен
-        # (`user:pass@host` -> `user`, privacy-утечка). Reject такой target целиком.
-        if "@" in target:
-            return None
-        # Отделяем порт (rsplit — минимальная защита голого IPv6 без скобок).
-        host = target.rsplit(":", 1)[0]
-        # Снимаем возможные скобки IPv6-литерала [::1] -> ::1.
-        host = host.strip("[]")
-    else:
-        # Scheme-less target при не-CONNECT методе: origin-form (/path) или токен —
-        # hostname не несёт. Не принимаем (privacy: «только hostnames»).
+    if (method or "").upper() == "CONNECT":
+        return _connect_authority_host(target)
+    # Не-CONNECT: hostname несёт только absolute-form (scheme://...).
+    if "://" not in target:
         return None
-    if not host:
+    try:
+        host = urlsplit(target).hostname
+    except ValueError:
         return None
-    host = host.lower()
-    if not _HOST_RE.match(host):
+    if not host or not _is_hostname(host):
         return None
-    return host
+    return host.lower()
 
 
 def _read_tail(path, max_lines, max_bytes):
@@ -191,7 +236,7 @@ def _load_cache(path):
         domain = e.get("domain")
         count = e.get("count")
         last_seen = e.get("last_seen")
-        if not isinstance(domain, str) or not _HOST_RE.match(domain):
+        if not _is_hostname(domain):
             continue
         if not isinstance(count, (int, float)) or isinstance(count, bool):
             continue
@@ -264,7 +309,7 @@ def update_cache(counts, path=None, ttl=None, top_n=None, now=None):
     cache = _load_cache(path)
     if isinstance(counts, dict):
         for domain, inc in counts.items():
-            if not isinstance(domain, str) or not _HOST_RE.match(domain):
+            if not _is_hostname(domain):
                 continue
             # inc валидируем ТЕМ ЖЕ предикатом, что _load_cache — иначе, например,
             # bool записался бы на диск, но при следующем чтении был бы отброшен
