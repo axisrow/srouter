@@ -163,6 +163,27 @@ def test_sequential_posts_do_not_conflict(monkeypatch):
         assert response.status_code == 400
 
 
+def test_unroutable_post_gets_honest_404_405_not_409(monkeypatch):
+    """POST на несуществующий URL / GET-only роут — не мутация: honest 404/405 даже
+    при занятом локе (не 409), и лок такой запрос вообще не трогает."""
+    dashboard = _fresh_dashboard(monkeypatch)
+
+    assert dashboard._MUTATION_LOCK.acquire(blocking=False)
+    try:
+        missing = dashboard.app.test_client().post("/no/such/route")
+        assert missing.status_code == 404
+        get_only = dashboard.app.test_client().post("/api/status")
+        assert get_only.status_code == 405
+        assert dashboard._MUTATION_LOCK.locked()
+    finally:
+        dashboard._MUTATION_LOCK.release()
+
+    # При свободном локе — тоже honest 404, и лок не остаётся взятым.
+    after = dashboard.app.test_client().post("/no/such/route")
+    assert after.status_code == 404
+    assert not dashboard._MUTATION_LOCK.locked()
+
+
 # --- GET read-only не под локом ---
 def test_get_status_not_blocked_while_mutation_holds_lock(monkeypatch):
     dashboard = _fresh_dashboard(monkeypatch)

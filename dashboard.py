@@ -269,6 +269,10 @@ def _mutation_lock_guard():
     """
     if request.method != "POST":
         return None
+    # URL не маршрутизируется (404/405): мутации не будет — лок не трогаем,
+    # пусть Flask отдаст честный код, а не 409 занятого лока (local review PR #62).
+    if request.routing_exception is not None:
+        return None
     if not _MUTATION_LOCK.acquire(blocking=False):
         return jsonify({"ok": False, "err": "another mutation is in progress"}), 409
     g.mutation_lock_owned = True
