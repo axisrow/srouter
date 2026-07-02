@@ -128,6 +128,8 @@
       </div>
       <div class="card-body">
         <div id="guard-editor"></div>
+        <hr class="my-3">
+        <div id="throttle-editor"></div>
       </div>
     </div>
 
@@ -217,6 +219,17 @@
         guard_dup_domain: "Duplicate domain: {0}", guard_no_domain: "Enter a domain first.",
         guard_auto_banner: "Traffic Guard is managed by auto mode (per network channel). Editing is not available in v1.",
         guard_mode_auto: "Auto (per-channel)",
+        throttle_title: "Throttle (experimental)", throttle_experimental: "Experimental",
+        throttle_help: "Slow one domain to a bandwidth cap via pf/dummynet (needs admin password). Only one domain can be throttled at a time.",
+        throttle_domain_ph: "video.example.com", throttle_rate_ph: "512",
+        throttle_domain: "Domain", throttle_rate: "Rate (Kbit/s)",
+        throttle_apply: "Apply throttle", throttle_clear: "Clear throttle",
+        throttle_active: "Active: {0} at {1} Kbit/s", throttle_inactive: "No active throttle.",
+        throttle_need_domain: "Enter a domain first.", throttle_need_rate: "Enter a positive rate (Kbit/s).",
+        throttle_applied: "Throttle applied: {0}", throttle_cleared: "Throttle cleared",
+        throttle_cancelled: "Cancelled (admin password dismissed)",
+        throttle_conflict: "A throttle is already active — clear it first.",
+        throttle_failed: "Throttle failed: {0}",
         channel_title: "Network channel", channel_active: "Active channel",
         channel_wifi: "Wi-Fi", channel_usb: "USB tether",
         channel_other: "Other", channel_unknown: "Unknown",
@@ -276,6 +289,17 @@
         guard_dup_domain: "Домен повторяется: {0}", guard_no_domain: "Сначала введите домен.",
         guard_auto_banner: "Traffic Guard управляется авто-режимом (по сетевым каналам). Редактирование недоступно в v1.",
         guard_mode_auto: "Авто (по каналам)",
+        throttle_title: "Замедление (эксперим.)", throttle_experimental: "Эксперимент",
+        throttle_help: "Замедлить один домен до лимита полосы через pf/dummynet (нужен пароль администратора). Одновременно можно замедлять только один домен.",
+        throttle_domain_ph: "video.example.com", throttle_rate_ph: "512",
+        throttle_domain: "Домен", throttle_rate: "Скорость (Kbit/s)",
+        throttle_apply: "Включить замедление", throttle_clear: "Снять замедление",
+        throttle_active: "Активно: {0} на {1} Kbit/s", throttle_inactive: "Замедление не активно.",
+        throttle_need_domain: "Сначала введите домен.", throttle_need_rate: "Введите положительную скорость (Kbit/s).",
+        throttle_applied: "Замедление включено: {0}", throttle_cleared: "Замедление снято",
+        throttle_cancelled: "Отменено (пароль администратора не введён)",
+        throttle_conflict: "Замедление уже активно — сначала снимите его.",
+        throttle_failed: "Ошибка замедления: {0}",
         channel_title: "Сетевой канал", channel_active: "Активный канал",
         channel_wifi: "Wi-Fi", channel_usb: "USB-модем",
         channel_other: "Другой", channel_unknown: "Неизвестен",
@@ -335,6 +359,17 @@
         guard_dup_domain: "域名重复：{0}", guard_no_domain: "请先输入域名。",
         guard_auto_banner: "流量守卫由自动模式管理（按网络通道）。v1 不支持编辑。",
         guard_mode_auto: "自动（按通道）",
+        throttle_title: "限速（实验性）", throttle_experimental: "实验性",
+        throttle_help: "通过 pf/dummynet 将单个域名限制到带宽上限（需要管理员密码）。同一时间只能限速一个域名。",
+        throttle_domain_ph: "video.example.com", throttle_rate_ph: "512",
+        throttle_domain: "域名", throttle_rate: "速率（Kbit/s）",
+        throttle_apply: "启用限速", throttle_clear: "清除限速",
+        throttle_active: "已启用：{0}，{1} Kbit/s", throttle_inactive: "未启用限速。",
+        throttle_need_domain: "请先输入域名。", throttle_need_rate: "请输入正的速率（Kbit/s）。",
+        throttle_applied: "限速已启用：{0}", throttle_cleared: "限速已清除",
+        throttle_cancelled: "已取消（未输入管理员密码）",
+        throttle_conflict: "已有限速在运行 — 请先清除。",
+        throttle_failed: "限速失败：{0}",
         channel_title: "网络通道", channel_active: "当前通道",
         channel_wifi: "Wi-Fi", channel_usb: "USB 网络共享",
         channel_other: "其他", channel_unknown: "未知",
@@ -946,8 +981,122 @@
     }
     function loadGuard() {
       return fetchJson('/api/guard')
-        .then(function (payload) { syncGuardFromServer(payload); })
+        .then(function (payload) {
+          syncGuardFromServer(payload);
+          // Активный throttle приходит вместе с /api/guard (без токена) — синхронизируем.
+          if (payload) syncThrottleFromServer(payload.throttle);
+        })
         .catch(function () { /* тихо: редактор просто останется в текущем состоянии */ });
+    }
+
+    /* ============================ Traffic Guard throttle (EXPERIMENTAL, #13/#22) ============================
+       Отдельный runtime-механизм поверх guard: замедление ОДНОГО домена через pf/dummynet.
+       Движок ещё не валидирован на реальном pf (automation ladder) — помечен experimental.
+       THROTTLE_ACTIVE — активный lease {domain, rate} (без токена: сервер держит его сам). */
+    var THROTTLE_ACTIVE = null;
+    var THROTTLE_INPUT = { domain: '', rate: '' };  // черновик полей до apply
+    function syncThrottleFromServer(active) {
+      THROTTLE_ACTIVE = (active && active.domain) ? { domain: active.domain, rate: active.rate } : null;
+      renderThrottle();
+    }
+    function readThrottleInputFromDom() {
+      var box = document.getElementById('throttle-editor');
+      if (!box) return;
+      var d = box.querySelector('#throttle-domain');
+      var r = box.querySelector('#throttle-rate');
+      THROTTLE_INPUT = { domain: d ? d.value : '', rate: r ? r.value : '' };
+    }
+    function renderThrottle() {
+      var box = document.getElementById('throttle-editor');
+      if (!box) return;
+      var busy = mutationInFlight();
+      var active = THROTTLE_ACTIVE;
+      var activeHtml = active
+        ? '<div class="alert alert-info py-2 mb-2" role="status">' +
+            '<i class="bi bi-hourglass-split me-1"></i>' +
+            esc(t('throttle_active', active.domain, fmtNumber(active.rate))) + '</div>'
+        : '<div class="text-secondary ops mb-2">' + esc(t('throttle_inactive')) + '</div>';
+      // Поля apply отключаем, пока активен throttle (одно-pipe движок: сначала clear).
+      var inputsDisabled = (busy || !!active) ? ' disabled' : '';
+      box.innerHTML =
+        '<div class="d-flex align-items-center gap-2 mb-2">' +
+          '<span class="fw-semibold">' + esc(t('throttle_title')) + '</span>' +
+          '<span class="badge text-bg-warning">' + esc(t('throttle_experimental')) + '</span>' +
+        '</div>' +
+        activeHtml +
+        '<div class="d-flex flex-wrap align-items-center gap-2 mb-2">' +
+          '<input type="text" class="form-control form-control-sm mono" id="throttle-domain" style="max-width:280px" ' +
+            'value="' + esc(THROTTLE_INPUT.domain) + '" placeholder="' + esc(t('throttle_domain_ph')) + '" ' +
+            'aria-label="' + esc(t('throttle_domain')) + '"' + inputsDisabled + '>' +
+          '<input type="number" min="1" step="1" class="form-control form-control-sm mono" id="throttle-rate" style="max-width:140px" ' +
+            'value="' + esc(THROTTLE_INPUT.rate) + '" placeholder="' + esc(t('throttle_rate_ph')) + '" ' +
+            'aria-label="' + esc(t('throttle_rate')) + '"' + inputsDisabled + '>' +
+        '</div>' +
+        '<div class="d-flex flex-wrap gap-2 mb-2">' +
+          '<button type="button" class="btn btn-sm btn-primary act" id="throttle-apply"' +
+            ((busy || !!active) ? ' disabled' : '') + '>' +
+            '<span class="lbl"><i class="bi bi-hourglass"></i> ' + esc(t('throttle_apply')) + '</span></button>' +
+          '<button type="button" class="btn btn-sm btn-outline-danger act" id="throttle-clear"' +
+            ((busy || !active) ? ' disabled' : '') + '>' +
+            '<span class="lbl"><i class="bi bi-x-octagon"></i> ' + esc(t('throttle_clear')) + '</span></button>' +
+        '</div>' +
+        '<div class="sub text-secondary">' + esc(t('throttle_help')) + '</div>';
+    }
+    function throttleRequest(payload, btn, okKey) {
+      /* Общий apply/clear-запрос: MUTATION-лок, спиннер, toast для 400/403/409/cancelled. */
+      if (!tryBeginMutation('throttle')) return;
+      var lbl = btn ? btn.querySelector('.lbl') : null;
+      var orig = lbl ? lbl.innerHTML : '';
+      if (lbl) lbl.innerHTML = '<span class="spinner-border spinner-border-sm"></span>';
+      renderThrottle();  // перерисовать в disabled-состоянии
+      fetch('/api/guard/throttle', {
+        method: 'POST',
+        headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      })
+        .then(function (r) {
+          return r.json().catch(function () { return { ok: false, err: 'HTTP ' + r.status }; })
+            .then(function (res) { res._status = r.status; return res; });
+        })
+        .then(function (res) {
+          if (res && res.cancelled) {
+            toast(t('throttle_cancelled'), 'warn');
+          } else if (res && res.ok) {
+            // Сервер шлёт актуальный throttle (apply -> объект, clear -> null).
+            THROTTLE_ACTIVE = (res.throttle && res.throttle.domain)
+              ? { domain: res.throttle.domain, rate: res.throttle.rate } : null;
+            if (payload.action === 'apply') THROTTLE_INPUT = { domain: '', rate: '' };
+            toast(okKey === 'throttle_applied'
+              ? t('throttle_applied', payload.domain) : t(okKey), 'ok');
+          } else {
+            var status = res && res._status;
+            if (status === 409) { toast(t('throttle_conflict'), 'warn'); }
+            else {
+              var msg = (res && res.err) ? String(res.err).slice(0, 220)
+                : ('HTTP ' + (status || 500));
+              toast(t('throttle_failed', msg), 'err');
+            }
+          }
+        })
+        .catch(function (e) { toast(t('throttle_failed', e.message), 'err'); })
+        .finally(function () {
+          finishMutation();
+          if (lbl) lbl.innerHTML = orig;
+          renderThrottle();
+        });
+    }
+    function applyThrottle(btn) {
+      readThrottleInputFromDom();
+      var domain = (THROTTLE_INPUT.domain || '').trim().toLowerCase();
+      var rate = (THROTTLE_INPUT.rate || '').trim();
+      if (!domain) { toast(t('throttle_need_domain'), 'warn'); return; }
+      // Клиентская проверка rate: положительное целое (сервер тоже валидирует — fail-closed).
+      var n = num(rate);
+      if (n === null || n <= 0 || Math.floor(n) !== n) { toast(t('throttle_need_rate'), 'warn'); return; }
+      throttleRequest({ action: 'apply', domain: domain, rate: n }, btn, 'throttle_applied');
+    }
+    function clearThrottle(btn) {
+      throttleRequest({ action: 'clear' }, btn, 'throttle_cleared');
     }
 
     function render(d, ranking) {
@@ -1351,6 +1500,11 @@
     /* Правки полей редактора → dirty (защита от перезаписи поллингом). */
     document.addEventListener('input', function (ev) {
       if (ev.target.closest('#guard-editor') && ev.target.closest('.guard-row')) GUARD_DIRTY = true;
+      // throttle-поля: держим черновик в модели, чтобы re-render (язык/поллинг) его не терял.
+      if (ev.target.closest('#throttle-editor') &&
+          (ev.target.id === 'throttle-domain' || ev.target.id === 'throttle-rate')) {
+        readThrottleInputFromDom();
+      }
     });
     document.addEventListener('change', function (ev) {
       if (ev.target.id === 'guard-mode-toggle') {
@@ -1374,6 +1528,14 @@
       }
       if (btn.id === 'guard-save') {
         saveGuard(btn);
+        return;
+      }
+      if (btn.id === 'throttle-apply') {
+        applyThrottle(btn);
+        return;
+      }
+      if (btn.id === 'throttle-clear') {
+        clearThrottle(btn);
         return;
       }
       if (!tryBeginMutation('action', ev)) return;
@@ -1415,6 +1577,8 @@
       // Сохранить несохранённые правки редактора и перерисовать его с новыми переводами.
       readGuardRowsFromDom();
       renderGuard();
+      readThrottleInputFromDom();
+      renderThrottle();
       poll(true);
     });
     applyStaticI18n();
@@ -1434,8 +1598,9 @@
     applyMode();
 
     /* ============================ Boot ============================ */
-    renderGuard();   // пустой каркас редактора сразу, до первого ответа сервера
-    loadGuard();     // подтянуть текущие block/allow правила из /api/guard
+    renderGuard();     // пустой каркас редактора сразу, до первого ответа сервера
+    renderThrottle();  // каркас throttle-контрола (inactive) до ответа сервера
+    loadGuard();       // подтянуть block/allow правила + активный throttle из /api/guard
     poll(true);
     setInterval(poll, 5000);
   })();

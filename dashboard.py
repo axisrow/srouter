@@ -19,6 +19,7 @@ from dashboard_nodes import *
 from dashboard_traffic import *
 import node_selector
 import sys_probe
+import traffic_shape  # throttle-движок (#13): зовём через атрибут (traffic_shape.apply_throttle)
 
 # Активный узел нельзя замораживать на import: #8 меняет srouter.local.json в рантайме.
 # Эти имена оставлены только для совместимости старых импорт-тестов; рабочий код ниже
@@ -164,6 +165,34 @@ def _guard_payload():
     # Берём только известные v1-ключи: mode + domains. Всё остальное игнорируем,
     # чтобы клиент не мог протащить служебные поля state в секцию traffic_guard.
     return {"mode": body.get("mode", "off"), "domains": body.get("domains", {})}
+
+
+def _throttle_payload():
+    """Достать {action, domain, rate} из тела запроса throttle. Defensive: не бросает.
+
+    Возвращает dict с сырыми значениями (валидацию делает роут через
+    local_state.validate_throttle_request); None означает не-объектное/битое тело.
+    """
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return None
+    return {"action": body.get("action"), "domain": body.get("domain"), "rate": body.get("rate")}
+
+
+def _throttle_result(r):
+    """Свести dict от traffic_shape.{apply,clear}_throttle к ПУБЛИЧНОЙ форме для UI.
+
+    Движок возвращает {ok, cancelled, rc, out, err, timeout, token?, rollback?}.
+    token (pf enable-ref) наружу НЕ отдаём — он нужен только серверу для pfctl -X;
+    роут читает его напрямую из result. Наружу — только статус/диагностика.
+    """
+    r = r or {}
+    return {
+        "ok": bool(r.get("ok")),
+        "cancelled": bool(r.get("cancelled")),
+        "rc": r.get("rc"),
+        "err": r.get("err") or "",
+    }
 
 
 # ============================ non-privileged: сервисы ============================
@@ -368,7 +397,25 @@ def api_guard_get():
     editable = mode in ("on", "off")
     # Для редактируемых режимов отдаём реальные block/allow правила; для auto — пусто.
     domains = guard.get("domains") if (editable and isinstance(guard.get("domains"), dict)) else {}
-    return jsonify({"mode": mode, "editable": editable, "domains": domains, "guard": probe_traffic_guard()})
+    return jsonify(
+        {
+            "mode": mode,
+            "editable": editable,
+            "domains": domains,
+            "guard": probe_traffic_guard(),
+            # Активный throttle-lease для UI после перезагрузки страницы. token наружу
+            # НЕ отдаём (он нужен только серверу для pfctl -X) — лишь domain+rate.
+            "throttle": _public_active_throttle(),
+        }
+    )
+
+
+def _public_active_throttle():
+    """Публичная (без token) проекция активного throttle-lease или None для UI."""
+    active = local_state.load_active_throttle()
+    if not active:
+        return None
+    return {"domain": active.get("domain"), "rate": active.get("rate"), "applied_at": active.get("applied_at")}
 
 
 @app.post("/api/guard")
@@ -417,6 +464,114 @@ def api_guard():
 
     # Свежий probe для UI: обновлённый rule/blocked count из только что записанного state.
     return jsonify({"ok": True, "errors": [], "guard": probe_traffic_guard()})
+
+
+@app.post("/api/guard/throttle")
+def api_guard_throttle():
+    """Traffic Guard throttle (#13/#22): apply/clear per-domain шейпинга через traffic_shape.
+
+    EXPERIMENTAL: движок ещё не валидирован вручную на реальном pf (automation ladder
+    issue #22) — UI помечает throttle experimental.
+
+    Тело: {action:"apply", domain, rate} | {action:"clear"}. Валидация ВХОДА — ПРЯМО
+    в роуте (fail-closed, канон #60): невалидный domain/rate -> 400, движок НЕ зван.
+
+    Одно-pipe'овый движок (PIPE_NUM один -> один активный throttle за раз). Повторный
+    apply при активном lease -> 409 (НЕ скрытый auto-clear+apply: тот при сбое clear
+    потерял бы токен/оставил pipe — магия на privileged-границе; канон no-hidden-magic).
+    Пользователь сначала явно clear.
+
+    Токен pf enable-ref из apply ОБЯЗАН персиститься (issue #61): без него clear после
+    рестарта дашборда не отдаст токен в pfctl -X и enable-ref потечёт. Session-lease
+    (кого clear'ить) — ответственность роута (traffic_shape.clear_throttle docstring).
+
+    cancelled (rc -128, отмена пароля osascript) -> структурированный ответ, НЕ 500.
+    """
+    payload = _throttle_payload()
+    if payload is None:
+        return jsonify({"ok": False, "err": "throttle payload must be an object"}), 400
+
+    action = payload.get("action")
+    if action == "clear":
+        return _throttle_clear()
+    if action == "apply":
+        return _throttle_apply(payload)
+    return jsonify({"ok": False, "err": 'action must be "apply" or "clear"'}), 400
+
+
+def _throttle_apply(payload):
+    """apply-ветка /api/guard/throttle: валидация -> lease-guard -> движок -> персист."""
+    # Валидация входа В РОУТЕ: невалидный domain/rate -> 400, движок не зовём.
+    domain, rate = local_state.validate_throttle_request(payload.get("domain"), payload.get("rate"))
+    if domain is None:
+        return jsonify(
+            {"ok": False, "err": "domain must be a valid host and rate a positive integer (Kbit/s)"}
+        ), 400
+
+    # Один активный throttle за раз (движок одно-pipe'овый). Активный lease -> 409,
+    # без скрытого авто-clear (fail-closed: не рискуем потерять токен при сбое clear).
+    active = local_state.load_active_throttle()
+    if active is not None:
+        return jsonify(
+            {
+                "ok": False,
+                "err": "throttle already active for '%s'; clear it first" % active.get("domain"),
+                "active": {"domain": active.get("domain"), "rate": active.get("rate")},
+            }
+        ), 409
+
+    result = traffic_shape.apply_throttle(domain, rate)
+    body = {"action": "apply", "domain": domain, "rate": rate, **_throttle_result(result)}
+
+    if body.get("cancelled"):
+        # Отмена пароля osascript: не ошибка сервера, движок ничего не включил.
+        return jsonify(body), 200
+
+    if body.get("ok"):
+        # token читаем ИЗ result (наружу он не отдаётся): apply с ok:true ГАРАНТИРУЕТ
+        # токен (движок fail-closed: rc=0 без токена -> ok=false).
+        token = (result or {}).get("token")
+        saved = local_state.save_active_throttle(
+            {"domain": domain, "rate": rate, "token": token, "applied_at": int(time.time())}
+        )
+        if saved is None:
+            # Токен не удалось персистить — критично: clear его больше не найдёт.
+            # Тут же снимаем throttle сохранённым токеном, чтобы не течь enable-ref.
+            rollback = traffic_shape.clear_throttle(token)
+            body["ok"] = False
+            body["err"] = "throttle applied but token persist failed; rolled back"
+            body["rollback"] = _throttle_result(rollback)
+            return jsonify(body), 500
+        body["throttle"] = _public_active_throttle()
+        return jsonify(body), 200
+
+    # Сбой движка (busy pipe, probe-fail, timeout и т.п.): структурированный ответ.
+    # Движок при сбое после -E уже сделал best-effort rollback внутри себя, lease не пишем.
+    return jsonify(body), 200
+
+
+def _throttle_clear():
+    """clear-ветка /api/guard/throttle: снять активный throttle сохранённым токеном."""
+    active = local_state.load_active_throttle()
+    # Токен из lease обязателен для pfctl -X (issue #61). Нет lease -> нечего снимать,
+    # но всё равно зовём движок с token=None (идемпотентный cleanup pipe/anchor).
+    token = active.get("token") if active else None
+
+    result = traffic_shape.clear_throttle(token)
+    body = {"action": "clear", **_throttle_result(result)}
+
+    if body.get("cancelled"):
+        # Отмена пароля: lease НЕ трогаем (throttle всё ещё активен на pf).
+        return jsonify(body), 200
+
+    if body.get("ok"):
+        # Снято успешно (enable-ref освобождён) — сбрасываем lease.
+        local_state.clear_active_throttle()
+        body["throttle"] = None
+        return jsonify(body), 200
+
+    # Сбой clear: lease оставляем (throttle мог остаться частично) — пользователь повторит.
+    return jsonify(body), 200
 
 
 @app.get("/")

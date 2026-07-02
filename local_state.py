@@ -247,6 +247,125 @@ def traffic_guard_config(path=None, state=None, channel=None):
     }
 
 
+# ============================ Traffic Guard throttle runtime (#13/#22) ============================
+# Throttle — плоский v1 (без auto-каналов) поверх одно-pipe'ового движка traffic_shape.
+# Валидация ВХОДА (domain/rate) — не policy-конфиг, а параметры privileged-вызова:
+# держим её здесь, чтобы роут и любой другой вызывающий резали невалидное одинаково
+# (fail-closed) ДО того, как значения дойдут до shell traffic_shape.
+
+
+def _valid_throttle_rate(rate):
+    """Положительное целое (int или строка из одних цифр) -> int, иначе None.
+
+    Согласовано с traffic_shape._valid_rate (Kbit/s), но без импорта движка (иначе
+    цикл import). bool отсекаем явно: True/False — не rate. Ноль/отрицательное — None.
+    """
+    if isinstance(rate, bool):
+        return None
+    if isinstance(rate, int):
+        n = rate
+    elif isinstance(rate, str) and rate.isdigit():
+        n = int(rate)
+    else:
+        return None
+    return n if n > 0 else None
+
+
+def validate_throttle_request(domain, rate):
+    """Свести пользовательский (domain, rate) к (domain_norm, rate_int) или (None, None).
+
+    Единый fail-closed валидатор для apply-запроса throttle: domain нормализуется тем
+    же _normalize_traffic_guard_domain (exact+subdomain семантика, shell-небезопасное
+    режется), rate — положительное целое. Любая невалидность -> (None, None), чтобы
+    вызывающий не звал движок. Не бросает.
+    """
+    domain_norm = _normalize_traffic_guard_domain(domain)
+    rate_int = _valid_throttle_rate(rate)
+    if not domain_norm or rate_int is None:
+        return None, None
+    return domain_norm, rate_int
+
+
+def _valid_active_throttle(entry):
+    """True если entry — валидная запись активного throttle-lease.
+
+    Требуем ровно те поля, что нужны clear после рестарта: domain (нормализуемый),
+    rate (положит. целое), token (числовой — идёт в pfctl -X). applied_at
+    необязателен по типу (метка времени), но при наличии обязан быть числом/строкой.
+    """
+    if not isinstance(entry, dict):
+        return False
+    if not _normalize_traffic_guard_domain(entry.get("domain")):
+        return False
+    if _valid_throttle_rate(entry.get("rate")) is None:
+        return False
+    token = entry.get("token")
+    # Токен pf enable-ref: только цифры (или int>=0) — он попадёт в shell (pfctl -X).
+    if isinstance(token, bool) or not (
+        (isinstance(token, int) and token >= 0) or (isinstance(token, str) and token.isdigit())
+    ):
+        return False
+    return True
+
+
+def load_active_throttle(path=None):
+    """Активный throttle-lease ({domain, rate, token, applied_at}) или None.
+
+    None когда throttle не активен ИЛИ запись битая/невалидная (fail-safe: лучше
+    считать «нет активного», чем отдать мусорный token в pfctl -X). Не бросает.
+    """
+    state = load_state(path)
+    runtime = state.get("runtime") if isinstance(state, dict) else {}
+    if not isinstance(runtime, dict):
+        return None
+    entry = runtime.get("active_throttle")
+    return entry if _valid_active_throttle(entry) else None
+
+
+def save_active_throttle(entry, path=None):
+    """Записать активный throttle-lease в runtime.active_throttle. Возвращает entry|None.
+
+    Валидирует entry (fail-closed: невалидное НЕ пишем — иначе clear получит мусорный
+    token). Остальной state сохраняется (read-modify-write через save_state, atomic).
+    readable=False (битый существующий файл) -> не перезаписываем вслепую, вернём None.
+    Не бросает.
+    """
+    if not _valid_active_throttle(entry):
+        return None
+    state, readable = _load_state_checked(path)
+    if not readable:
+        return None
+    runtime = state.get("runtime")
+    if not isinstance(runtime, dict):
+        runtime = {}
+    # Нормализуем на запись: те же поля, никакого лишнего пользовательского мусора.
+    runtime["active_throttle"] = {
+        "domain": _normalize_traffic_guard_domain(entry.get("domain")),
+        "rate": _valid_throttle_rate(entry.get("rate")),
+        "token": str(entry.get("token")),
+        "applied_at": entry.get("applied_at"),
+    }
+    state["runtime"] = runtime
+    return None if save_state(state, path) is None else runtime["active_throttle"]
+
+
+def clear_active_throttle(path=None):
+    """Сбросить runtime.active_throttle в None (после успешного clear_throttle).
+
+    Возвращает True при успешной записи, False при сбое/неперезаписываемом файле.
+    Идемпотентно: уже None -> просто перезапишет None. Не бросает.
+    """
+    state, readable = _load_state_checked(path)
+    if not readable:
+        return False
+    runtime = state.get("runtime")
+    if not isinstance(runtime, dict):
+        runtime = {}
+    runtime["active_throttle"] = None
+    state["runtime"] = runtime
+    return save_state(state, path) is not None
+
+
 # Safe-default state: секции v1 (#2). probes — эталонные defaults (G3);
 # реальную запись делает #5 setup/check на реальной машине.
 _DEFAULT_STATE = {
@@ -269,7 +388,13 @@ _DEFAULT_STATE = {
         "dnsmasq": None,
         "launchagent": None,
     },
-    "runtime": {"last_apply": None, "last_error": None},
+    # active_throttle — runtime-lease активного Traffic Guard throttle (#13/#22).
+    # None когда throttle не активен. При активном: {domain, rate, token, applied_at}.
+    # Персист именно token обязателен — без него clear_throttle не освободит pf
+    # enable-ref (pfctl -X) после рестарта дашборда (issue #61). Это чистый runtime,
+    # НЕ policy: держим отдельно от traffic_guard.domains (одно-pipe'овый движок,
+    # один активный throttle за раз). Секретов нет; Reality-ключи/конфиги не трогаем.
+    "runtime": {"last_apply": None, "last_error": None, "active_throttle": None},
 }
 
 
