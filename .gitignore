@@ -2,6 +2,10 @@
 srouter_config.py
 srouter.local.json
 
+# Opt-in локальный кэш hot_routes (домены+счётчики, privacy) — НИКОГДА не коммитить
+srouter.hot_routes.json
+srouter.hot_routes.json.tmp
+
 # Секреты окружения
 .env
 .env.*
