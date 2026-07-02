@@ -198,8 +198,11 @@ def test_pipe_num_is_nonstandard_high():
 def test_apply_throttle_pipe_busy_check_runs_first(monkeypatch):
     # Fail-closed владение: ПЕРВАЯ команда privileged-цепочки — проверка, что pipe
     # ещё не существует (dnctl-чтение требует root => проверка внутри цепочки).
-    # Существует -> маркер в stderr + exit 71 ДО pfctl -E (токен не создаётся)
-    # и ДО dnctl config (чужой pipe не перезаписывается).
+    # ВАЖНО (Apple dnctl.c, list_pipes): `pipe show N` — ФИЛЬТР листинга, exit-код
+    # НЕ предикат существования (отсутствующий pipe -> пустой вывод, rc=0; queues
+    # печатаются без фильтра). Поэтому: захват вывода; rc!=0 -> fail-closed
+    # probe-failed (exit 72); якорная строка `^0*N:` в выводе -> busy (exit 71) —
+    # всё ДО pfctl -E (токен не создаётся) и ДО config (чужой pipe не трогается).
     calls = []
     monkeypatch.setattr(socket, "gethostbyname", lambda h: "203.0.113.10")
     monkeypatch.setattr(sys_probe, "run", _apply_ok_run(calls))
@@ -207,23 +210,27 @@ def test_apply_throttle_pipe_busy_check_runs_first(monkeypatch):
     traffic_shape.apply_throttle("example.com", 512)
 
     script = calls[0][2]
-    busy_check = (
-        f"if {traffic_shape.DNCTL} pipe show {traffic_shape.PIPE_NUM} >/dev/null 2>&1; "
-        f"then echo {traffic_shape.PIPE_BUSY_MARKER} 1>&2; exit 71; fi"
-    )
-    assert busy_check in script, "проверка занятости pipe — первой командой цепочки"
+    assert f"p=$({traffic_shape.DNCTL} pipe show {traffic_shape.PIPE_NUM} 2>&1)" in script, \
+        "вывод probe захватывается (exit-код dnctl не предикат существования)"
+    assert f"echo {traffic_shape.PIPE_PROBE_FAILED_MARKER} 1>&2; exit 72" in script, \
+        "сбой probe -> fail-closed отказ, не молчаливое продолжение"
+    assert f"{traffic_shape.GREP} -q '^0*{traffic_shape.PIPE_NUM}:'" in script, \
+        "существование pipe — якорный матч строки %05d: (не exit-код, не substring)"
+    assert f"then echo {traffic_shape.PIPE_BUSY_MARKER} 1>&2; exit 71; fi" in script
     assert script.index("pipe show") < script.index("t=$("), "проверка ДО pfctl -E"
     assert script.index("pipe show") < script.index("config"), "проверка ДО dnctl config"
 
 
 def test_apply_throttle_rejects_busy_pipe(monkeypatch):
     # Pipe уже существует (чужой шейпинг): exit 71, маркер в stderr-аккумуляторе.
-    # ok:false + понятная ошибка, БЕЗ config, БЕЗ rollback (токен не создавался).
+    # Реальный osascript возвращает rc=1 (код "(71)" только в тексте err) — детект
+    # обязан быть по маркеру, не по rc. ok:false + понятная ошибка, БЕЗ config,
+    # БЕЗ rollback (токен не создавался).
     calls = []
     monkeypatch.setattr(socket, "gethostbyname", lambda h: "203.0.113.10")
     monkeypatch.setattr(
         sys_probe, "run",
-        _spy_run(calls, rc=71, out="",
+        _spy_run(calls, rc=1, out="",
                  err=f"0:45: execution error: {traffic_shape.PIPE_BUSY_MARKER} (71)"),
     )
 
@@ -234,6 +241,28 @@ def test_apply_throttle_rejects_busy_pipe(monkeypatch):
     assert res.get("token") is None
     assert "rollback" not in res, "до -E не дошли — откатывать нечего"
     assert len(calls) == 1, "никакого config/cleanup после отказа"
+
+
+def test_apply_throttle_rejects_when_pipe_probe_fails(monkeypatch):
+    # Сбой самого probe (`dnctl pipe show` упал: socket/getsockopt) — владение
+    # проверить нельзя => fail-closed отказ (exit 72 + маркер), НЕ молчаливое
+    # «свободно». Токен не создавался — rollback не зван.
+    calls = []
+    monkeypatch.setattr(socket, "gethostbyname", lambda h: "203.0.113.10")
+    monkeypatch.setattr(
+        sys_probe, "run",
+        _spy_run(calls, rc=1, out="",
+                 err="0:45: execution error: dnctl: socket: Operation not permitted\n"
+                     f"{traffic_shape.PIPE_PROBE_FAILED_MARKER} (72)"),
+    )
+
+    res = traffic_shape.apply_throttle("example.com", 512)
+
+    assert res["ok"] is False
+    assert "не удалось проверить" in res["err"], "понятная ошибка про сбой probe"
+    assert res.get("token") is None
+    assert "rollback" not in res, "до -E не дошли — откатывать нечего"
+    assert len(calls) == 1, "fail-closed: ничего после отказа"
 
 
 def test_clear_throttle_deletes_only_own_pipe(monkeypatch):
