@@ -111,6 +111,17 @@
 
     <div class="card mt-3">
       <div class="card-header d-flex align-items-center">
+        <i class="bi bi-wifi me-2"></i>
+        <span data-i18n="channel_title">Network channel</span>
+        <span class="ms-auto badge bg-secondary ops" id="channel-badge">—</span>
+      </div>
+      <div class="card-body">
+        <div id="channel-panel"></div>
+      </div>
+    </div>
+
+    <div class="card mt-3">
+      <div class="card-header d-flex align-items-center">
         <i class="bi bi-shield-check me-2"></i>
         <span data-i18n="guard_title">Traffic Guard</span>
         <span class="ms-auto badge bg-secondary ops" id="guard-badge">—</span>
@@ -205,7 +216,16 @@
         guard_invalid: "Traffic Guard rejected: {0}", guard_conflict_hint: "Fix conflicting block/allow rules and retry.",
         guard_dup_domain: "Duplicate domain: {0}", guard_no_domain: "Enter a domain first.",
         guard_auto_banner: "Traffic Guard is managed by auto mode (per network channel). Editing is not available in v1.",
-        guard_mode_auto: "Auto (per-channel)"
+        guard_mode_auto: "Auto (per-channel)",
+        channel_title: "Network channel", channel_active: "Active channel",
+        channel_wifi: "Wi-Fi", channel_usb: "USB tether",
+        channel_other: "Other", channel_unknown: "Unknown",
+        channel_switch_to: "Switch to {0}",
+        channel_switch_ok: "Switched to {0}", channel_switch_err: "Failed to switch to {0}: {1}",
+        channel_switch_cancelled: "Channel switch cancelled",
+        channel_link_down: "no link — interface is down", channel_metered: "metered",
+        channel_last_error: "Last switch failed: {0}",
+        channel_manual_hint: "Manual failover only — the dashboard never switches channels automatically."
       },
       ru: {
         brand: "Tunnel Dashboard", theme_title: "Тема", theme_auto: "Авто",
@@ -255,7 +275,16 @@
         guard_invalid: "Traffic Guard отклонён: {0}", guard_conflict_hint: "Исправьте конфликт block/allow и повторите.",
         guard_dup_domain: "Домен повторяется: {0}", guard_no_domain: "Сначала введите домен.",
         guard_auto_banner: "Traffic Guard управляется авто-режимом (по сетевым каналам). Редактирование недоступно в v1.",
-        guard_mode_auto: "Авто (по каналам)"
+        guard_mode_auto: "Авто (по каналам)",
+        channel_title: "Сетевой канал", channel_active: "Активный канал",
+        channel_wifi: "Wi-Fi", channel_usb: "USB-модем",
+        channel_other: "Другой", channel_unknown: "Неизвестен",
+        channel_switch_to: "Переключить на {0}",
+        channel_switch_ok: "Канал переключён на {0}", channel_switch_err: "Не удалось переключить на {0}: {1}",
+        channel_switch_cancelled: "Переключение канала отменено",
+        channel_link_down: "нет линка — интерфейс не поднят", channel_metered: "лимитный трафик",
+        channel_last_error: "Последнее переключение не удалось: {0}",
+        channel_manual_hint: "Только ручной failover — дашборд никогда не переключает канал автоматически."
       },
       zh: {
         brand: "隧道仪表盘", theme_title: "主题", theme_auto: "自动",
@@ -305,7 +334,16 @@
         guard_invalid: "流量守卫被拒绝：{0}", guard_conflict_hint: "请修复冲突的拦截/放行规则后重试。",
         guard_dup_domain: "域名重复：{0}", guard_no_domain: "请先输入域名。",
         guard_auto_banner: "流量守卫由自动模式管理（按网络通道）。v1 不支持编辑。",
-        guard_mode_auto: "自动（按通道）"
+        guard_mode_auto: "自动（按通道）",
+        channel_title: "网络通道", channel_active: "当前通道",
+        channel_wifi: "Wi-Fi", channel_usb: "USB 网络共享",
+        channel_other: "其他", channel_unknown: "未知",
+        channel_switch_to: "切换到 {0}",
+        channel_switch_ok: "已切换到 {0}", channel_switch_err: "切换到 {0} 失败：{1}",
+        channel_switch_cancelled: "通道切换已取消",
+        channel_link_down: "无链路 — 接口未连接", channel_metered: "按流量计费",
+        channel_last_error: "上次切换失败：{0}",
+        channel_manual_hint: "仅手动故障转移 — 仪表盘不会自动切换通道。"
       }
     };
 
@@ -475,6 +513,11 @@
     var LAST_STATUS = null;
     var LAST_RANKING = null;
     var NODE_APPLY = null;
+    // Последняя попытка ручного переключения канала (pending/failed), как NODE_APPLY.
+    var CHANNEL_APPLY = null;
+    // true после renderFetchFailed: панели показывают «нет связи с сервером»,
+    // и перерисовки из stale LAST_STATUS должны молчать до успешного поллинга.
+    var FETCH_FAILED = false;
     var MUTATION = null;
     /* Модель редактора Traffic Guard. GUARD_DIRTY защищает несохранённые правки
        от перезаписи фоновым поллингом /api/guard. */
@@ -530,6 +573,11 @@
       MUTATION = null;
       paused = false;
       setMutationControlsDisabled(false);
+      // Blanket-enable выше снимает disabled и с кнопок, заглушённых гейтингом
+      // доступности канала — переприменяем гейтинг перерисовкой панели
+      // (канон: saveGuard так же перерисовывает редактор после finishMutation).
+      // При упавшем поллинге панель показывает no_server — не затираем её stale-данными.
+      if (!FETCH_FAILED) renderChannel(LAST_STATUS || {});
     }
     function nodeGeoText(node) {
       var geo = node && typeof node.geo === 'object' && node.geo ? node.geo : {};
@@ -639,6 +687,102 @@
         '</div>';
       }).join('');
       box.innerHTML = summary + html;
+    }
+
+    /* ============================ Channel failover (Wi-Fi / USB) ============================ */
+    /* Наблюдение + ручное переключение (issue #16). Никакого фонового авто-переключения:
+       канал меняется ТОЛЬКО по клику пользователя через POST /api/channel/<target>. */
+    var CHANNEL_TARGETS = ['wifi', 'usb'];
+    function channelKeyForTarget(target) {
+      // target API (wifi|usb) -> классификация канала из probe_connectivity/probe_ifaces.
+      return target === 'usb' ? 'usb_tether' : 'wifi';
+    }
+    function channelLabel(channel) {
+      if (channel === 'wifi') return t('channel_wifi');
+      if (channel === 'usb_tether') return t('channel_usb');
+      if (channel === 'other') return t('channel_other');
+      return t('channel_unknown');
+    }
+    function channelTargetLabel(target) {
+      return channelLabel(channelKeyForTarget(target));
+    }
+    function channelLinkAvailable(d, target) {
+      /* Цель доступна = у неё есть поднятый интерфейс с адресом (probe_ifaces).
+         Реальный reachability-пробник есть только для активного канала, поэтому
+         для standby-цели link-up — лучший доступный сигнал. */
+      var wanted = channelKeyForTarget(target);
+      var list = (d && d.ifaces && Array.isArray(d.ifaces.ifaces)) ? d.ifaces.ifaces : [];
+      return list.some(function (i) { return i && i.channel === wanted; });
+    }
+    function channelSwitchAllowed(d, conn, target) {
+      /* Fail-open гейтинг (ревью PR #64): блокируем standby-цель ТОЛЬКО когда
+         данные пробы здоровы И активный канал подтверждённо работает — штатный
+         кейс «кабель не воткнут». В аварийном/деградированном состоянии кнопка
+         остаётся активной: ручной failover — это recovery-путь, а авторитет
+         доступности — backend switch_channel (сам включает выключенный сервис
+         и вернёт структурную ошибку, если цели действительно нет). */
+      if (channelLinkAvailable(d, target)) return true;
+      var ifd = d && d.ifaces;
+      var ifacesHealthy = !!(ifd && ifd.status === 'ok' &&
+        Array.isArray(ifd.ifaces) && ifd.ifaces.length);
+      if (!ifacesHealthy) return true;            // нет данных ≠ цели нет
+      if (!conn || conn.reachable !== true) return true;  // активный канал не подтверждён — не блокируем recovery
+      return false;
+    }
+    function channelReachText(conn) {
+      var reach = (conn && typeof conn.reachability === 'object' && conn.reachability) ? conn.reachability : {};
+      if (conn && conn.reachable === true) {
+        var bits = [t('reachable')];
+        if (reach.code && reach.code !== '000') bits.push('HTTP ' + reach.code);
+        if (typeof reach.ms === 'number' && isFinite(reach.ms)) bits.push(reach.ms + ' ' + t('ms'));
+        return bits.join(' · ');
+      }
+      if (conn && conn.reachable === false) return t('unreachable');
+      return t('no_data');
+    }
+    function channelButtonHtml(d, target, conn) {
+      var label = channelTargetLabel(target);
+      var icon = target === 'wifi' ? 'bi-wifi' : 'bi-usb-symbol';
+      var isActive = conn && conn.channel === channelKeyForTarget(target);
+      if (isActive) {
+        return '<button class="btn btn-sm btn-outline-success" type="button" disabled>' +
+          '<i class="bi bi-check2"></i> ' + esc(label) + ' · ' + esc(t('active')) + '</button>';
+      }
+      var allowed = channelSwitchAllowed(d, conn, target);
+      var busy = mutationInFlight() || !!(CHANNEL_APPLY && CHANNEL_APPLY.state === 'pending');
+      var title = allowed ? t('channel_switch_to', label) : t('channel_link_down');
+      return '<button class="btn btn-sm btn-outline-primary act channel-switch" type="button" ' +
+        'data-channel-target="' + esc(target) + '"' + ((busy || !allowed) ? ' disabled' : '') +
+        ' title="' + esc(title) + '" aria-label="' + esc(title) + '">' +
+        '<span class="lbl"><i class="bi ' + icon + '"></i> ' + esc(t('channel_switch_to', label)) + '</span></button>';
+    }
+    function renderChannel(d) {
+      var box = document.getElementById('channel-panel');
+      var badge = document.getElementById('channel-badge');
+      if (!box) return;
+      var conn = (d && typeof d.connectivity === 'object' && d.connectivity) ? d.connectivity : {};
+      if (badge) {
+        badge.className = 'ms-auto badge ops ' + badgeClass(conn.status);
+        badge.textContent = badgeText(conn.status);
+      }
+      var summary = '<div class="d-flex flex-wrap gap-2 mb-3 ops">' +
+        '<span class="badge text-bg-light">' + esc(t('channel_active')) + ': ' +
+          esc(channelLabel(conn.channel)) + '</span>' +
+        '<span class="badge text-bg-light">' + esc(t('iface')) + ' ' +
+          esc(conn.active_iface || '—') + (conn.addr ? ' · ' + esc(conn.addr) : '') + '</span>' +
+        '<span class="badge text-bg-light">' + esc(channelReachText(conn)) + '</span>' +
+        (conn.hardware_port ? '<span class="badge text-bg-light">' + esc(conn.hardware_port) + '</span>' : '') +
+        (conn.metered === true ? '<span class="badge text-bg-warning">' + esc(t('channel_metered')) + '</span>' : '') +
+        '</div>';
+      var buttons = '<div class="d-flex flex-wrap gap-2 mb-2">' +
+        CHANNEL_TARGETS.map(function (target) { return channelButtonHtml(d, target, conn); }).join('') +
+        '</div>';
+      var failed = (CHANNEL_APPLY && CHANNEL_APPLY.state === 'failed')
+        ? '<div class="sub text-danger mb-2">' +
+            esc(t('channel_last_error', String(CHANNEL_APPLY.error || '').slice(0, 200))) + '</div>'
+        : '';
+      box.innerHTML = summary + buttons + failed +
+        '<div class="sub text-secondary">' + esc(t('channel_manual_hint')) + '</div>';
     }
 
     /* ============================ Traffic Guard editor ============================ */
@@ -809,6 +953,7 @@
     function render(d, ranking) {
       LAST_STATUS = d;
       LAST_RANKING = ranking || {};
+      FETCH_FAILED = false;
       var tun = d.tunnel || {};
       var an = tun.anthropic || {}, oa = tun.openai || {};
       pushHistory('anthropic', an.ms);
@@ -928,6 +1073,7 @@
       document.getElementById('cards').innerHTML = html;
       renderFlow(d);
       renderNodeSelector(d, LAST_RANKING);
+      renderChannel(d);
       // Badge Traffic Guard освежаем каждым поллингом из probe (сам редактор не трогаем,
       // если пользователь редактирует — синк правил идёт отдельно через loadGuard).
       updateGuardBadge(d.traffic_guard);
@@ -970,6 +1116,7 @@
     }
 
     function renderFetchFailed() {
+      FETCH_FAILED = true;
       var keys = [
         ['bi-reception-4', 'card_anthropic'],
         ['bi-reception-4', 'card_openai'],
@@ -997,6 +1144,13 @@
       if (gb) {
         gb.className = 'ms-auto badge bg-secondary ops';
         gb.textContent = '—';
+      }
+      var cp = document.getElementById('channel-panel');
+      if (cp) cp.innerHTML = '<div class="text-secondary ops">' + esc(t('no_server')) + '</div>';
+      var cb = document.getElementById('channel-badge');
+      if (cb) {
+        cb.className = 'ms-auto badge bg-secondary ops';
+        cb.textContent = '—';
       }
     }
 
@@ -1101,6 +1255,60 @@
         });
     }
 
+    function handleChannelSwitch(btn) {
+      var target = btn.getAttribute('data-channel-target') || '';
+      if (CHANNEL_TARGETS.indexOf(target) === -1) return;
+      if (!tryBeginMutation('channel-switch')) return;
+      var nextApply = null;
+      CHANNEL_APPLY = { target: target, state: 'pending' };
+      renderChannel(LAST_STATUS || {});
+      setMutationControlsDisabled(true);
+      // renderChannel пересоздал DOM — ищем кнопку цели заново, чтобы показать спиннер в ней.
+      var buttons = document.querySelectorAll('.channel-switch');
+      btn = Array.prototype.filter.call(buttons, function (b) {
+        return b.getAttribute('data-channel-target') === target;
+      })[0] || btn;
+      var lbl = btn ? btn.querySelector('.lbl') : null;
+      var orig = lbl ? lbl.innerHTML : '';
+      buttons.forEach(function (b) { b.disabled = true; });
+      if (lbl) lbl.innerHTML = '<span class="spinner-border spinner-border-sm"></span>';
+
+      fetch('/api/channel/' + encodeURIComponent(target), { method: 'POST', headers: { 'Accept': 'application/json' } })
+        .then(function (r) {
+          // 403 (CSRF-guard) / 409 / 5xx могут прийти без JSON-тела — не роняем цепочку.
+          return r.json().catch(function () { return { ok: false, err: 'HTTP ' + r.status }; })
+            .then(function (res) { res._status = r.status; return res; });
+        })
+        .then(function (res) {
+          if (res && res.cancelled) {
+            nextApply = null;
+            toast(t('channel_switch_cancelled'), 'warn');
+          } else if (res && res.ok) {
+            nextApply = null;
+            var okMsg = t('channel_switch_ok', channelTargetLabel(target));
+            if (res.service) okMsg += ' · ' + String(res.service).slice(0, 80);
+            toast(okMsg, 'ok');
+          } else {
+            var detail = (res && (res.err || res.error || res.out)) ? String(res.err || res.error || res.out)
+              : ('HTTP ' + (res && res._status ? res._status : 500));
+            nextApply = { target: target, state: 'failed', error: detail };
+            toast(t('channel_switch_err', channelTargetLabel(target), detail.slice(0, 200)), 'err');
+          }
+        })
+        .catch(function (e) {
+          nextApply = { target: target, state: 'failed', error: e.message };
+          toast(t('channel_switch_err', channelTargetLabel(target), e.message), 'err');
+        })
+        .finally(function () {
+          return poll(true).finally(function () {
+            if (lbl) lbl.innerHTML = orig;
+            CHANNEL_APPLY = nextApply;
+            renderChannel(LAST_STATUS || {});
+            finishMutation();
+          });
+        });
+    }
+
     /* ---------- Traffic Guard: клики по строкам/кнопкам редактора ---------- */
     document.addEventListener('click', function (ev) {
       var addBtn = ev.target.closest('#guard-add');
@@ -1158,6 +1366,10 @@
       if (!btn) return;
       if (btn.classList.contains('node-select')) {
         handleNodeSelect(btn);
+        return;
+      }
+      if (btn.classList.contains('channel-switch')) {
+        handleChannelSwitch(btn);
         return;
       }
       if (btn.id === 'guard-save') {
