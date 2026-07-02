@@ -61,14 +61,19 @@ def _is_ipv6_literal(value):
     hex+`:`-regex принимал бы мусор (`dead:beef`, `::::`, `deadbeef` — невалидны
     по стандарту, но попадали бы в counts/кэш). Единственный IPv6-гейт в модуле —
     ipaddress.IPv6Address под try/except, чтобы битый литерал не притворялся host.
+
+    Канон проекта (dashboard_common._ip_literal): scoped zone-id reject'им — `%`
+    в литерале значит произвольную строку из лога (`fe80::1%SECRET123`), не
+    интерфейс, и не должна попасть в кэш. Плюс canonical round-trip (str(parsed)
+    == value): альтернативные написания того же адреса не обходят границу.
     """
-    if not isinstance(value, str):
+    if not isinstance(value, str) or "%" in value:
         return False
     try:
-        ipaddress.IPv6Address(value)
-        return True
+        parsed = ipaddress.IPv6Address(value)
     except ValueError:
         return False
+    return str(parsed) == value
 
 
 def _is_hostname(value):
@@ -174,7 +179,13 @@ def _extract_host(target, method=None):
     if "://" not in target:
         return None
     try:
-        host = urlsplit(target).hostname
+        parts = urlsplit(target)
+        # .hostname НЕ валидирует порт — невалидный порт (`user:pass`,
+        # `SECRET123:abc`, `dead:beef`) бросает ValueError только при доступе к
+        # .port. Трогаем .port в ТОМ ЖЕ try: битый authority -> reject весь target
+        # ДО принятия hostname (иначе токен из userinfo/битого порта утёк бы).
+        parts.port
+        host = parts.hostname
     except ValueError:
         return None
     if not host or not _is_hostname(host):

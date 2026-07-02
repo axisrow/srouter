@@ -89,6 +89,11 @@ _MATRIX_REJECT = [
     ("CONNECT", "[abc:def]:443"),           # не-hex вне диапазона -> невалиден
     ("CONNECT", "[::::]:443"),              # лишние ':' -> невалидный IPv6
     ("CONNECT", "[deadbeef]:443"),          # без ':' -> не IPv6-литерал
+    ("GET", "http://user:pass/path"),       # невалидный порт (.port ValueError)
+    ("GET", "http://SECRET123:abc/path"),   # нечисловой порт в absolute-URL
+    ("GET", "http://dead:beef/path"),       # 'beef' как порт -> ValueError на .port
+    ("CONNECT", "[fe80::1%SECRET123]:443"),  # scoped zone-id (произвольная строка)
+    ("GET", "http://[fe80::1%25SECRET123]/x"),  # scoped zone-id в absolute-URL
 ]
 _MATRIX_ACCEPT = [
     ("GET", "http://good.example/x", "good.example"),
@@ -166,6 +171,33 @@ def test_ipv6_garbage_key_rejected_on_read(tmp_path):
         ),
         encoding="utf-8",
     )
+    assert hot_routes.hot_domains(path=str(cache), now=1000.0) == ["good.example"]
+
+
+def test_bad_port_and_scoped_ipv6_never_reach_cache(tmp_path):
+    """End-to-end (parse_access_log + update_cache): невалидный порт в absolute-URL
+    (urlsplit.hostname не валидирует порт) и scoped IPv6 zone-id (произвольная
+    строка из лога) не должны просочиться в counts/кэш. Canonical сохраняется."""
+    bad = [
+        ("GET", "http://user:pass/path"),        # 'pass' как порт -> ValueError
+        ("GET", "http://SECRET123:abc/path"),    # 'abc' как порт
+        ("GET", "http://dead:beef/path"),        # 'beef' как порт
+        ("CONNECT", "[fe80::1%SECRET123]:443"),  # scoped zone-id
+        ("GET", "http://[fe80::1%25SECRET123]/x"),  # scoped zone-id в URL
+    ]
+    lines = [f'127.0.0.1 - - [ts] "{m} {t} HTTP/1.1" 200 0' for m, t in bad]
+    lines.append('127.0.0.1 - - [ts] "GET http://good.example:8080/x HTTP/1.1" 200 0')
+    log = tmp_path / "privoxy.log"
+    log.write_text("\n".join(lines), encoding="utf-8")
+
+    counts = hot_routes.parse_access_log(str(log))
+    assert counts == {"good.example": 1}
+
+    cache = tmp_path / "hot.json"
+    hot_routes.update_cache(counts, path=str(cache), now=1000.0)
+    raw = cache.read_text(encoding="utf-8")
+    for token in ("SECRET123", "secret123", "user", "dead", "fe80"):
+        assert token not in raw
     assert hot_routes.hot_domains(path=str(cache), now=1000.0) == ["good.example"]
 
 
