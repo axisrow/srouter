@@ -157,6 +157,78 @@ def service_control(name, action):
     return sys_probe.run([BREW, "services", action, name], timeout=20)
 
 
+# ============================ CSRF/Origin-guard (issue #42) ============================
+# Сервис слушает только loopback, но loopback НЕ защищает от browser-origin CSRF:
+# любой сайт, открытый в браузере, может сделать form-POST/fetch на 127.0.0.1:8787
+# и триггерить привилегированное действие (osascript admin-prompt, route add/del,
+# brew services). Поэтому все POST-мутации проходят через общий guard ДО handler.
+#
+# Подход: defense-in-depth из двух сигналов. Явно чужой Origin — это сигнал атаки,
+# и на привилегированной границе он должен резаться БЕЗУСЛОВНО (fail-closed), а не
+# перекрываться доверием к Sec-Fetch-Site. Поэтому порядок проверок такой:
+#   1) Origin ПРИСУТСТВУЕТ и НЕ в _allowed_origins() -> 403 (чужой origin бьёт первым,
+#      независимо от Sec-Fetch-Site — иначе атакующий выставил бы Sec-Fetch-Site: none
+#      и обошёл guard; см. cycle-review PR #58).
+#   2) Origin отсутствует ИЛИ разрешён -> решает Fetch-Metadata: Sec-Fetch-Site
+#      cross-site/same-site -> 403; same-origin/none/отсутствует -> пропускаем.
+# Sec-Fetch-Site браузер выставляет сам и подделать из JS нельзя (forbidden header),
+# поэтому он надёжен для отличия cross-site КОГДА Origin не изобличает атаку.
+#
+# Итог: browser cross-origin POST -> 403; same-origin UI и curl/non-browser -> проходят.
+# Легитимные origin: http(s)://127.0.0.1:8787 и http(s)://localhost:8787.
+
+# Хосты сервиса (loopback). Порт добавляется динамически из PORT ниже.
+_GUARD_HOSTS = ("127.0.0.1", "localhost")
+
+
+def _allowed_origins():
+    """Легитимные same-origin значения Origin-заголовка (http/https, оба хоста, порт PORT).
+
+    ТОЛЬКО с портом PORT: порт — часть origin (http://localhost != http://localhost:8787),
+    сервис слушает лишь :PORT, а браузер всегда шлёт порт в Origin. Беспортовые записи
+    (порт 80/443) соответствовали бы чужому loopback-приложению атакующего и открывали бы
+    bypass на привилегированные роуты (cycle-review PR #58) — поэтому их тут нет.
+    """
+    return {f"{scheme}://{host}:{PORT}" for scheme in ("http", "https") for host in _GUARD_HOSTS}
+
+
+def _is_cross_origin_post():
+    """True только для ЯВНО cross-origin браузерного POST.
+
+    Defensive: не бросает, при любой неоднозначности НЕ блокирует (чтобы не сломать
+    curl/non-browser). Блокируем лишь то, что явно изобличает чужой origin.
+    """
+    # 1) Origin ПРИСУТСТВУЕТ — он и решает, безусловно (fail-closed на привилегированной
+    #    границе). Чужой -> 403 (не даём Sec-Fetch-Site: none перекрыть атаку); наш
+    #    loopback-origin -> pass (доказанно same-origin, противоречивый Sec-Fetch-Site
+    #    не ломает легит).
+    origin = request.headers.get("Origin")
+    if origin:
+        return origin not in _allowed_origins()
+
+    # 2) Origin отсутствует (curl, прямой ввод, старый браузер) — решает Fetch-Metadata.
+    #    Sec-Fetch-Site браузер выставляет сам, JS его подделать не может.
+    site = request.headers.get("Sec-Fetch-Site")
+    if site in ("cross-site", "same-site"):
+        return True
+
+    # 3) Нет Origin и Sec-Fetch-Site same-origin/none/отсутствует — curl/non-browser: pass.
+    return False
+
+
+@app.before_request
+def _csrf_origin_guard():
+    """Режет cross-origin браузерные мутации до привилегированного handler.
+
+    Гардим только POST (все мутации — POST); GET read-only роуты не трогаем.
+    """
+    if request.method != "POST":
+        return None
+    if _is_cross_origin_post():
+        return jsonify({"ok": False, "err": "cross-origin request rejected"}), 403
+    return None
+
+
 # ============================ Flask-роуты ============================
 @app.get("/api/status")
 def api_status():
