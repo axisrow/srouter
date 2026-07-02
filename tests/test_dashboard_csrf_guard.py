@@ -95,6 +95,67 @@ def test_cross_site_fetch_metadata_rejected(monkeypatch, path):
     assert response.get_json() == {"ok": False, "err": "cross-origin request rejected"}
 
 
+# --- defense-in-depth: явно враждебный Origin бьёт РАНЬШЕ Fetch-Metadata ---
+# Regression на Origin-bypass (cycle-review PR #58, Codex): атакующий не может
+# обойти guard, выставив Sec-Fetch-Site: none/same-origin при чужом Origin.
+# На привилегированной границе present-hostile-Origin -> 403 БЕЗУСЛОВНО.
+@pytest.mark.parametrize("sec_fetch_site", ["none", "same-origin", "cross-site"])
+@pytest.mark.parametrize("path", MUTATION_POSTS)
+def test_hostile_origin_rejected_regardless_of_fetch_metadata(monkeypatch, path, sec_fetch_site):
+    dashboard = _fresh_dashboard(monkeypatch)
+    _guard_all_mutations(monkeypatch, dashboard)
+
+    response = dashboard.app.test_client().post(
+        path,
+        headers={"Origin": "http://evil.com", "Sec-Fetch-Site": sec_fetch_site},
+    )
+
+    assert response.status_code == 403
+    assert response.get_json() == {"ok": False, "err": "cross-origin request rejected"}
+
+
+@pytest.mark.parametrize("sec_fetch_site", ["none", "same-origin", "cross-site"])
+def test_allowed_origin_passes_regardless_of_fetch_metadata(monkeypatch, sec_fetch_site):
+    """Легитимный Origin (127.0.0.1:8787) проходит при ЛЮБОМ Sec-Fetch-Site —
+    не сломать легит из-за нового порядка проверок."""
+    dashboard = _fresh_dashboard(monkeypatch)
+
+    response = dashboard.app.test_client().post(
+        "/api/route/host",
+        headers={"Origin": "http://127.0.0.1:8787", "Sec-Fetch-Site": sec_fetch_site},
+        json={"action": "bogus"},
+    )
+
+    assert response.status_code == 400  # дошёл до валидации handler (bad action), не отбит guard'ом
+
+
+@pytest.mark.parametrize("sec_fetch_site", ["none", "same-origin"])
+def test_missing_origin_with_benign_fetch_metadata_passes(monkeypatch, sec_fetch_site):
+    """Origin отсутствует (curl/навигация) + Sec-Fetch-Site none/same-origin → pass."""
+    dashboard = _fresh_dashboard(monkeypatch)
+
+    response = dashboard.app.test_client().post(
+        "/api/route/host",
+        headers={"Sec-Fetch-Site": sec_fetch_site},
+        json={"action": "bogus"},
+    )
+
+    assert response.status_code == 400
+
+
+def test_missing_origin_with_cross_site_fetch_metadata_rejected(monkeypatch):
+    """Origin отсутствует, но Sec-Fetch-Site: cross-site → 403 (браузер пометил чужим)."""
+    dashboard = _fresh_dashboard(monkeypatch)
+    _guard_all_mutations(monkeypatch, dashboard)
+
+    response = dashboard.app.test_client().post(
+        "/api/route/host", headers={"Sec-Fetch-Site": "cross-site"}
+    )
+
+    assert response.status_code == 403
+    assert response.get_json() == {"ok": False, "err": "cross-origin request rejected"}
+
+
 @pytest.mark.parametrize(
     "origin",
     ["http://127.0.0.1:8787", "http://localhost:8787"],
@@ -109,7 +170,9 @@ def test_same_origin_post_passes_guard(monkeypatch, origin):
         "/api/route/host", headers={"Origin": origin}, json={"action": "bogus"}
     )
 
-    assert response.status_code != 403
+    # == 400 (bad action) доказывает, что запрос ДОШЁЛ до валидации handler,
+    # а не просто "не 403": != 403 было бы ложно-зелёным (500/краш тоже не 403).
+    assert response.status_code == 400
 
 
 def test_same_origin_fetch_metadata_passes_guard(monkeypatch):
@@ -121,7 +184,7 @@ def test_same_origin_fetch_metadata_passes_guard(monkeypatch):
         json={"action": "bogus"},
     )
 
-    assert response.status_code != 403
+    assert response.status_code == 400
 
 
 def test_fetch_metadata_none_passes_guard(monkeypatch):
@@ -134,7 +197,7 @@ def test_fetch_metadata_none_passes_guard(monkeypatch):
         json={"action": "bogus"},
     )
 
-    assert response.status_code != 403
+    assert response.status_code == 400
 
 
 def test_missing_origin_and_fetch_metadata_passes_guard(monkeypatch):
@@ -144,7 +207,7 @@ def test_missing_origin_and_fetch_metadata_passes_guard(monkeypatch):
 
     response = dashboard.app.test_client().post("/api/route/host", json={"action": "bogus"})
 
-    assert response.status_code != 403
+    assert response.status_code == 400
 
 
 def test_get_routes_not_guarded(monkeypatch):

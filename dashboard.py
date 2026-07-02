@@ -163,14 +163,18 @@ def service_control(name, action):
 # и триггерить привилегированное действие (osascript admin-prompt, route add/del,
 # brew services). Поэтому все POST-мутации проходят через общий guard ДО handler.
 #
-# Подход: Fetch-Metadata (Sec-Fetch-Site) как основной сигнал + Origin same-origin
-# как fallback. Sec-Fetch-Site браузер выставляет сам и его нельзя подделать из JS
-# (forbidden header), поэтому он надёжнее Origin для отличия cross-site.
+# Подход: defense-in-depth из двух сигналов. Явно чужой Origin — это сигнал атаки,
+# и на привилегированной границе он должен резаться БЕЗУСЛОВНО (fail-closed), а не
+# перекрываться доверием к Sec-Fetch-Site. Поэтому порядок проверок такой:
+#   1) Origin ПРИСУТСТВУЕТ и НЕ в _allowed_origins() -> 403 (чужой origin бьёт первым,
+#      независимо от Sec-Fetch-Site — иначе атакующий выставил бы Sec-Fetch-Site: none
+#      и обошёл guard; см. cycle-review PR #58).
+#   2) Origin отсутствует ИЛИ разрешён -> решает Fetch-Metadata: Sec-Fetch-Site
+#      cross-site/same-site -> 403; same-origin/none/отсутствует -> пропускаем.
+# Sec-Fetch-Site браузер выставляет сам и подделать из JS нельзя (forbidden header),
+# поэтому он надёжен для отличия cross-site КОГДА Origin не изобличает атаку.
 #
-# Правило: блокируем ТОЛЬКО явно cross-origin браузерный POST.
-#   - Sec-Fetch-Site in {cross-site, same-site} -> 403 (браузер сказал: другой origin).
-#   - иначе если есть Origin и он не наш loopback-origin -> 403.
-#   - отсутствуют оба (curl/non-browser, прямой ввод адреса) -> пропускаем.
+# Итог: browser cross-origin POST -> 403; same-origin UI и curl/non-browser -> проходят.
 # Легитимные origin: http(s)://127.0.0.1:8787 и http(s)://localhost:8787.
 
 # Хосты сервиса (loopback). Порт добавляется динамически из PORT ниже.
@@ -191,21 +195,23 @@ def _is_cross_origin_post():
     """True только для ЯВНО cross-origin браузерного POST.
 
     Defensive: не бросает, при любой неоднозначности НЕ блокирует (чтобы не сломать
-    curl/non-browser). Блокируем лишь то, что браузер сам пометил как чужой origin.
+    curl/non-browser). Блокируем лишь то, что явно изобличает чужой origin.
     """
-    # 1) Fetch-Metadata — приоритетный сигнал, JS его подделать не может.
+    # 1) Origin ПРИСУТСТВУЕТ — он и решает, безусловно (fail-closed на привилегированной
+    #    границе). Чужой -> 403 (не даём Sec-Fetch-Site: none перекрыть атаку); наш
+    #    loopback-origin -> pass (доказанно same-origin, противоречивый Sec-Fetch-Site
+    #    не ломает легит).
+    origin = request.headers.get("Origin")
+    if origin:
+        return origin not in _allowed_origins()
+
+    # 2) Origin отсутствует (curl, прямой ввод, старый браузер) — решает Fetch-Metadata.
+    #    Sec-Fetch-Site браузер выставляет сам, JS его подделать не может.
     site = request.headers.get("Sec-Fetch-Site")
     if site in ("cross-site", "same-site"):
         return True
-    if site in ("same-origin", "none"):
-        return False  # браузер явно подтвердил свой origin
 
-    # 2) Fallback на Origin (старые браузеры без Fetch-Metadata).
-    origin = request.headers.get("Origin")
-    if origin and origin not in _allowed_origins():
-        return True
-
-    # 3) Ни Sec-Fetch-Site, ни чужого Origin — curl/non-browser/same-origin: пропускаем.
+    # 3) Нет Origin и Sec-Fetch-Site same-origin/none/отсутствует — curl/non-browser: pass.
     return False
 
 
