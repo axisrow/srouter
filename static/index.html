@@ -570,6 +570,10 @@
       MUTATION = null;
       paused = false;
       setMutationControlsDisabled(false);
+      // Blanket-enable выше снимает disabled и с кнопок, заглушённых гейтингом
+      // доступности канала — переприменяем гейтинг перерисовкой панели
+      // (канон: saveGuard так же перерисовывает редактор после finishMutation).
+      renderChannel(LAST_STATUS || {});
     }
     function nodeGeoText(node) {
       var geo = node && typeof node.geo === 'object' && node.geo ? node.geo : {};
@@ -706,6 +710,21 @@
       var list = (d && d.ifaces && Array.isArray(d.ifaces.ifaces)) ? d.ifaces.ifaces : [];
       return list.some(function (i) { return i && i.channel === wanted; });
     }
+    function channelSwitchAllowed(d, conn, target) {
+      /* Fail-open гейтинг (ревью PR #64): блокируем standby-цель ТОЛЬКО когда
+         данные пробы здоровы И активный канал подтверждённо работает — штатный
+         кейс «кабель не воткнут». В аварийном/деградированном состоянии кнопка
+         остаётся активной: ручной failover — это recovery-путь, а авторитет
+         доступности — backend switch_channel (сам включает выключенный сервис
+         и вернёт структурную ошибку, если цели действительно нет). */
+      if (channelLinkAvailable(d, target)) return true;
+      var ifd = d && d.ifaces;
+      var ifacesHealthy = !!(ifd && ifd.status === 'ok' &&
+        Array.isArray(ifd.ifaces) && ifd.ifaces.length);
+      if (!ifacesHealthy) return true;            // нет данных ≠ цели нет
+      if (!conn || conn.reachable !== true) return true;  // активный канал не подтверждён — не блокируем recovery
+      return false;
+    }
     function channelReachText(conn) {
       var reach = (conn && typeof conn.reachability === 'object' && conn.reachability) ? conn.reachability : {};
       if (conn && conn.reachable === true) {
@@ -725,11 +744,11 @@
         return '<button class="btn btn-sm btn-outline-success" type="button" disabled>' +
           '<i class="bi bi-check2"></i> ' + esc(label) + ' · ' + esc(t('active')) + '</button>';
       }
-      var available = channelLinkAvailable(d, target);
+      var allowed = channelSwitchAllowed(d, conn, target);
       var busy = mutationInFlight() || !!(CHANNEL_APPLY && CHANNEL_APPLY.state === 'pending');
-      var title = available ? t('channel_switch_to', label) : t('channel_link_down');
+      var title = allowed ? t('channel_switch_to', label) : t('channel_link_down');
       return '<button class="btn btn-sm btn-outline-primary act channel-switch" type="button" ' +
-        'data-channel-target="' + esc(target) + '"' + ((busy || !available) ? ' disabled' : '') +
+        'data-channel-target="' + esc(target) + '"' + ((busy || !allowed) ? ' disabled' : '') +
         ' title="' + esc(title) + '" aria-label="' + esc(title) + '">' +
         '<span class="lbl"><i class="bi ' + icon + '"></i> ' + esc(t('channel_switch_to', label)) + '</span></button>';
     }
