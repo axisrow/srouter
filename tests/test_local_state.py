@@ -413,3 +413,140 @@ def test_traffic_guard_validation_rejects_unsafe_domain():
     )
 
     assert any("domain" in error for error in errors)
+
+
+# ============================ throttle runtime-lease (#13/#22) ============================
+def test_validate_throttle_request_accepts_valid():
+    domain, rate = local_state.validate_throttle_request("Video.Example.com.", 512)
+    assert domain == "video.example.com"  # нормализован (lower, trailing dot снят)
+    assert rate == 512
+
+
+def test_validate_throttle_request_accepts_digit_string_rate():
+    domain, rate = local_state.validate_throttle_request("cdn.example.net", "1500")
+    assert domain == "cdn.example.net"
+    assert rate == 1500
+
+
+def test_validate_throttle_request_rejects_bad_rate():
+    for bad in (0, -1, 1.5, "abc", "10Kbit", True, False, None, "10.5"):
+        domain, rate = local_state.validate_throttle_request("example.com", bad)
+        assert (domain, rate) == (None, None), bad
+
+
+def test_validate_throttle_request_rejects_unsafe_domain():
+    for bad in ("bad;touch.example.com", "", "..x", ".leading", "host:port", None, 123):
+        domain, rate = local_state.validate_throttle_request(bad, 512)
+        assert (domain, rate) == (None, None), bad
+
+
+def test_save_and_load_active_throttle_roundtrip(tmp_path):
+    p = tmp_path / "srouter.local.json"
+    entry = {"domain": "video.example.com", "rate": 512, "token": "5", "applied_at": 1000}
+    saved = local_state.save_active_throttle(entry, path=p)
+    assert saved is not None
+    loaded = local_state.load_active_throttle(path=p)
+    # needs_cleanup=False по умолчанию (активный lease, не cleanup-lease).
+    assert loaded == {
+        "domain": "video.example.com", "rate": 512, "token": "5",
+        "applied_at": 1000, "needs_cleanup": False,
+    }
+
+
+def test_save_active_throttle_preserves_other_sections(tmp_path):
+    p = tmp_path / "srouter.local.json"
+    base = {"schema_version": 1, "nodes": [{"name": "n1"}], "traffic_guard": {"mode": "on", "domains": {}}}
+    p.write_text(json.dumps(base), encoding="utf-8")
+    local_state.save_active_throttle(
+        {"domain": "x.example.com", "rate": 256, "token": "9"}, path=p
+    )
+    state = json.loads(p.read_text(encoding="utf-8"))
+    # Другие секции не затёрты.
+    assert state["nodes"] == [{"name": "n1"}]
+    assert state["traffic_guard"] == {"mode": "on", "domains": {}}
+    assert state["runtime"]["active_throttle"]["token"] == "9"
+
+
+def test_save_active_throttle_normalizes_int_token_to_string(tmp_path):
+    p = tmp_path / "srouter.local.json"
+    local_state.save_active_throttle({"domain": "x.example.com", "rate": 256, "token": 7}, path=p)
+    loaded = local_state.load_active_throttle(path=p)
+    assert loaded["token"] == "7"  # token хранится строкой (идёт в pfctl -X)
+
+
+def test_save_active_throttle_rejects_invalid_entry(tmp_path):
+    p = tmp_path / "srouter.local.json"
+    # Битый token — не число: не пишем (иначе clear отдаст мусор в pfctl -X).
+    assert local_state.save_active_throttle(
+        {"domain": "x.example.com", "rate": 256, "token": "abc"}, path=p
+    ) is None
+    assert local_state.load_active_throttle(path=p) is None
+    # Отрицательный rate.
+    assert local_state.save_active_throttle(
+        {"domain": "x.example.com", "rate": -1, "token": "5"}, path=p
+    ) is None
+
+
+def test_load_active_throttle_none_when_absent(tmp_path):
+    p = tmp_path / "srouter.local.json"
+    assert local_state.load_active_throttle(path=p) is None  # missing file -> default runtime, None
+
+
+def test_load_active_throttle_none_for_corrupt_entry(tmp_path):
+    p = tmp_path / "srouter.local.json"
+    base = {"runtime": {"active_throttle": {"domain": "x.example.com", "token": "5"}}}  # нет rate
+    p.write_text(json.dumps(base), encoding="utf-8")
+    assert local_state.load_active_throttle(path=p) is None
+
+
+def test_clear_active_throttle_resets_to_none(tmp_path):
+    p = tmp_path / "srouter.local.json"
+    local_state.save_active_throttle({"domain": "x.example.com", "rate": 256, "token": "5"}, path=p)
+    assert local_state.load_active_throttle(path=p) is not None
+    assert local_state.clear_active_throttle(path=p) is True
+    assert local_state.load_active_throttle(path=p) is None
+    state = json.loads(p.read_text(encoding="utf-8"))
+    assert state["runtime"]["active_throttle"] is None
+
+
+def test_clear_active_throttle_idempotent_when_already_none(tmp_path):
+    p = tmp_path / "srouter.local.json"
+    assert local_state.clear_active_throttle(path=p) is True  # missing file readable -> writes None
+    assert local_state.load_active_throttle(path=p) is None
+
+
+def test_save_active_throttle_refuses_unreadable_state(tmp_path):
+    p = tmp_path / "srouter.local.json"
+    p.write_text("{ broken json", encoding="utf-8")  # существует, но битый -> readable=False
+    assert local_state.save_active_throttle(
+        {"domain": "x.example.com", "rate": 256, "token": "5"}, path=p
+    ) is None
+
+
+def test_save_active_throttle_applied_at_optional(tmp_path):
+    """applied_at отсутствует -> lease валиден (метка времени необязательна)."""
+    p = tmp_path / "srouter.local.json"
+    saved = local_state.save_active_throttle(
+        {"domain": "x.example.com", "rate": 256, "token": "5"}, path=p  # без applied_at
+    )
+    assert saved is not None
+    loaded = local_state.load_active_throttle(path=p)
+    assert loaded["applied_at"] is None
+
+
+def test_save_active_throttle_applied_at_must_be_scalar(tmp_path):
+    """applied_at при наличии обязан быть числом/строкой (не dict/list) — docstring↔код."""
+    p = tmp_path / "srouter.local.json"
+    for bad in ({"x": 1}, [1, 2]):
+        assert local_state.save_active_throttle(
+            {"domain": "x.example.com", "rate": 256, "token": "5", "applied_at": bad}, path=p
+        ) is None, bad
+        assert local_state.load_active_throttle(path=p) is None, bad
+
+
+def test_save_active_throttle_accepts_int_and_string_applied_at(tmp_path):
+    p = tmp_path / "srouter.local.json"
+    local_state.save_active_throttle(
+        {"domain": "x.example.com", "rate": 256, "token": "5", "applied_at": 1700000000}, path=p
+    )
+    assert local_state.load_active_throttle(path=p)["applied_at"] == 1700000000
