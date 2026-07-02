@@ -8,7 +8,7 @@ import threading
 import time
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, wait
-from flask import Flask, jsonify, Response, request
+from flask import Flask, g, jsonify, Response, request
 
 import local_state
 from dashboard_common import *
@@ -241,6 +241,49 @@ def _csrf_origin_guard():
     if _is_cross_origin_post():
         return jsonify({"ok": False, "err": "cross-origin request rejected"}), 403
     return None
+
+
+# ============================ mutation-лок (issue #57) ============================
+# app.run(threaded=True): каждый POST — отдельный поток. Клиентский MUTATION-лок (#14)
+# сериализует одну вкладку браузера, но multi-tab/прямые POST бьют в хендлеры
+# конкурентно: route-мутация может пересечься со сменой активного узла, guard-запись —
+# с channel-переключением. node_selector._SELECT_LOCK сериализует только select между
+# собой. Поэтому одно мутирующее действие за раз на весь сервер: общий non-blocking
+# лок для ВСЕХ POST (все POST в приложении — мутации; GET read-only не трогаем).
+#
+# Занято → структурированный 409 сразу, без ожидания (defensive, как остальные отказы).
+# Побочный (желанный) эффект: read-modify-write /api/guard (load_state_checked →
+# проверка mode==auto → save_state; TOCTOU, задокументирован в issue #57) целиком
+# выполняется под этим локом — окно check→save закрыто.
+_MUTATION_LOCK = threading.Lock()
+
+
+@app.before_request
+def _mutation_lock_guard():
+    """Берёт глобальный mutation-лок для POST; занято → 409, не ждём.
+
+    Зарегистрирован ПОСЛЕ _csrf_origin_guard: Flask зовёт before_request в порядке
+    регистрации и останавливается на первом же ответе, поэтому CSRF-403 никогда
+    не захватывает лок. Владение помечаем флагом в g — teardown отпускает ТОЛЬКО
+    лок, взятый этим запросом, и 409-отказ не освобождает чужой лок.
+    """
+    if request.method != "POST":
+        return None
+    # URL не маршрутизируется (404/405): мутации не будет — лок не трогаем,
+    # пусть Flask отдаст честный код, а не 409 занятого лока (local review PR #62).
+    if request.routing_exception is not None:
+        return None
+    if not _MUTATION_LOCK.acquire(blocking=False):
+        return jsonify({"ok": False, "err": "another mutation is in progress"}), 409
+    g.mutation_lock_owned = True
+    return None
+
+
+@app.teardown_request
+def _mutation_lock_release(exc):
+    """Гарантированно отпускает лок владельца — и при исключении в handler."""
+    if g.pop("mutation_lock_owned", False):
+        _MUTATION_LOCK.release()
 
 
 # ============================ Flask-роуты ============================
