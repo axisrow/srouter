@@ -33,6 +33,7 @@ def test_probe_hot_routes_disabled_does_not_touch_logs(monkeypatch, tmp_path):
         raise AssertionError("hot_routes must not be touched while disabled")
 
     monkeypatch.setattr(dashboard_hotroutes.hot_routes, "parse_access_log", boom)
+    monkeypatch.setattr(dashboard_hotroutes.hot_routes, "parse_new_access_log", boom)
     monkeypatch.setattr(dashboard_hotroutes.hot_routes, "update_cache", boom)
     monkeypatch.setattr(dashboard_hotroutes.hot_routes, "hot_domains", boom)
 
@@ -51,12 +52,26 @@ def test_probe_hot_routes_enabled_returns_ranked_domains_with_counts(monkeypatch
 
     calls = []
 
-    def fake_parse_access_log(path=None):
-        calls.append(("parse", path))
-        return {"b.example": 1, "a.example": 3}
+    def fake_parse_new_access_log(path=None, offset=None, inode=None, dev=None):
+        calls.append(("parse", path, offset, inode, dev))
+        return {"b.example": 1, "a.example": 3}, {
+            "log_offset": 12,
+            "log_inode": 34,
+            "log_dev": 56,
+            "log_size": 12,
+        }
 
-    def fake_update_cache(counts, path=None, ttl=None, top_n=None, now=None):
-        calls.append(("update", counts, path, top_n, now))
+    def fake_update_cache(
+        counts,
+        path=None,
+        ttl=None,
+        top_n=None,
+        now=None,
+        *,
+        bucket_size=None,
+        cursor=None,
+    ):
+        calls.append(("update", counts, path, top_n, now, bucket_size, cursor))
         return {
             "a.example": {"domain": "a.example", "count": 3, "last_seen": 1000.0},
             "b.example": {"domain": "b.example", "count": 1, "last_seen": 1000.0},
@@ -66,7 +81,11 @@ def test_probe_hot_routes_enabled_returns_ranked_domains_with_counts(monkeypatch
         calls.append(("hot_domains", path, top_n, now))
         return ["a.example", "b.example"]
 
-    monkeypatch.setattr(dashboard_hotroutes.hot_routes, "parse_access_log", fake_parse_access_log)
+    monkeypatch.setattr(
+        dashboard_hotroutes.hot_routes,
+        "parse_new_access_log",
+        fake_parse_new_access_log,
+    )
     monkeypatch.setattr(dashboard_hotroutes.hot_routes, "update_cache", fake_update_cache)
     monkeypatch.setattr(dashboard_hotroutes.hot_routes, "hot_domains", fake_hot_domains)
 
@@ -85,8 +104,14 @@ def test_probe_hot_routes_enabled_returns_ranked_domains_with_counts(monkeypatch
         {"domain": "b.example", "count": 1},
     ]
     assert all(set(entry) == {"domain", "count"} for entry in out["domains"])
-    assert ("parse", log_path) in calls
+    assert ("parse", log_path, None, None, None) in calls
     assert any(call[0] == "update" and call[3] == 2 for call in calls)
+    assert any(
+        call[0] == "update"
+        and call[5] == dashboard_hotroutes.hot_routes.DEFAULT_BUCKET_SECONDS
+        for call in calls
+    )
+    assert any(call[0] == "update" and call[6]["log_offset"] == 12 for call in calls)
     assert any(call[0] == "hot_domains" for call in calls)
 
 
@@ -133,14 +158,27 @@ def test_api_status_hot_routes_public_domains_exclude_timing_metadata(monkeypatc
 
     monkeypatch.setattr(
         dashboard_hotroutes.hot_routes,
-        "parse_access_log",
-        lambda path=None: {"a.example": 3},
+        "parse_new_access_log",
+        lambda path=None, offset=None, inode=None, dev=None: (
+            {"a.example": 3},
+            {"log_offset": 1, "log_inode": 2, "log_dev": 3, "log_size": 1},
+        ),
     )
     monkeypatch.setattr(
         dashboard_hotroutes.hot_routes,
         "update_cache",
-        lambda counts, path=None, ttl=None, top_n=None, now=None: {
-            "a.example": {"domain": "a.example", "count": 3, "last_seen": 1000.0}
+        lambda counts,
+        path=None,
+        ttl=None,
+        top_n=None,
+        now=None,
+        bucket_size=None,
+        cursor=None: {
+            "a.example": {
+                "domain": "a.example",
+                "count": 3,
+                "last_seen": 1000.0,
+            }
         },
     )
     monkeypatch.setattr(
@@ -164,3 +202,48 @@ def test_api_status_hot_routes_public_domains_exclude_timing_metadata(monkeypatc
     domains = response.get_json()["hot_routes"]["domains"]
     assert domains == [{"domain": "a.example", "count": 3}]
     assert all(set(entry) == {"domain", "count"} for entry in domains)
+
+
+def test_probe_hot_routes_bucket_seconds_configurable():
+    opts = dashboard_hotroutes._options(
+        {"hot_routes": {"enabled": True, "bucket_seconds": 30}}
+    )
+    assert opts["bucket_size"] == 30
+
+    opts = dashboard_hotroutes._options(
+        {"hot_routes": {"enabled": True, "bucket_seconds": 0}}
+    )
+    assert opts["bucket_size"] == dashboard_hotroutes.hot_routes.DEFAULT_BUCKET_SECONDS
+
+
+def test_probe_hot_routes_uses_file_cursor_after_restart(tmp_path):
+    state_path = tmp_path / "srouter.local.json"
+    cache_path = tmp_path / "srouter.hot_routes.json"
+    log_path = tmp_path / "privoxy.log"
+    _write_state(state_path, {"enabled": True, "update_interval_sec": 0})
+    log_path.write_text(
+        '127.0.0.1 - - [Jul 02 14:00:00.000] "CONNECT a.example:443 HTTP/1.1" 200 0\n',
+        encoding="utf-8",
+    )
+
+    first = dashboard_hotroutes.probe_hot_routes(
+        state_path=state_path,
+        cache_path=cache_path,
+        log_path=log_path,
+        now=1000.0,
+    )
+    assert first["domains"] == [{"domain": "a.example", "count": 1}]
+
+    with dashboard_hotroutes._lock:
+        dashboard_hotroutes._probe_cache.update(
+            key=None, updated_at=0.0, entries={}, error=""
+        )
+
+    second = dashboard_hotroutes.probe_hot_routes(
+        state_path=state_path,
+        cache_path=cache_path,
+        log_path=log_path,
+        now=1001.0,
+    )
+
+    assert second["domains"] == [{"domain": "a.example", "count": 1}]
