@@ -182,13 +182,14 @@ _GUARD_HOSTS = ("127.0.0.1", "localhost")
 
 
 def _allowed_origins():
-    """Легитимные same-origin значения Origin-заголовка (http/https, оба хоста)."""
-    origins = set()
-    for scheme in ("http", "https"):
-        for host in _GUARD_HOSTS:
-            origins.add(f"{scheme}://{host}:{PORT}")
-            origins.add(f"{scheme}://{host}")  # на случай origin без явного порта
-    return origins
+    """Легитимные same-origin значения Origin-заголовка (http/https, оба хоста, порт PORT).
+
+    ТОЛЬКО с портом PORT: порт — часть origin (http://localhost != http://localhost:8787),
+    сервис слушает лишь :PORT, а браузер всегда шлёт порт в Origin. Беспортовые записи
+    (порт 80/443) соответствовали бы чужому loopback-приложению атакующего и открывали бы
+    bypass на привилегированные роуты (cycle-review PR #58) — поэтому их тут нет.
+    """
+    return {f"{scheme}://{host}:{PORT}" for scheme in ("http", "https") for host in _GUARD_HOSTS}
 
 
 def _is_cross_origin_post():

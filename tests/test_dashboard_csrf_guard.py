@@ -114,15 +114,45 @@ def test_hostile_origin_rejected_regardless_of_fetch_metadata(monkeypatch, path,
     assert response.get_json() == {"ok": False, "err": "cross-origin request rejected"}
 
 
+# --- allow-list привязан к фактическому PORT (cycle-review PR #58, Codex) ---
+# Порт — часть origin: http://localhost (80) != http://localhost:8787. Dashboard
+# слушает ТОЛЬКО :8787, легит-браузер всегда шлёт порт. Беспортовые origin
+# (порт 80/443) — это чужое loopback-приложение атакующего, должны reject-иться.
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "http://localhost",       # порт 80 — не наш :8787
+        "http://127.0.0.1",       # порт 80
+        "https://localhost",      # порт 443
+        "https://127.0.0.1",      # порт 443
+        "http://127.0.0.1:9999",  # чужой порт
+        "http://localhost:80",    # явный дефолтный порт
+    ],
+)
 @pytest.mark.parametrize("sec_fetch_site", ["none", "same-origin", "cross-site"])
-def test_allowed_origin_passes_regardless_of_fetch_metadata(monkeypatch, sec_fetch_site):
-    """Легитимный Origin (127.0.0.1:8787) проходит при ЛЮБОМ Sec-Fetch-Site —
-    не сломать легит из-за нового порядка проверок."""
+def test_wrong_port_loopback_origin_rejected(monkeypatch, origin, sec_fetch_site):
+    dashboard = _fresh_dashboard(monkeypatch)
+    _guard_all_mutations(monkeypatch, dashboard)
+
+    response = dashboard.app.test_client().post(
+        "/api/route/host",
+        headers={"Origin": origin, "Sec-Fetch-Site": sec_fetch_site},
+    )
+
+    assert response.status_code == 403
+    assert response.get_json() == {"ok": False, "err": "cross-origin request rejected"}
+
+
+@pytest.mark.parametrize("origin", ["http://127.0.0.1:8787", "http://localhost:8787"])
+@pytest.mark.parametrize("sec_fetch_site", ["none", "same-origin", "cross-site"])
+def test_allowed_origin_passes_regardless_of_fetch_metadata(monkeypatch, origin, sec_fetch_site):
+    """Легитимный Origin с портом :8787 проходит при ЛЮБОМ Sec-Fetch-Site —
+    не сломать легит ни новым порядком проверок, ни привязкой allow-list к PORT."""
     dashboard = _fresh_dashboard(monkeypatch)
 
     response = dashboard.app.test_client().post(
         "/api/route/host",
-        headers={"Origin": "http://127.0.0.1:8787", "Sec-Fetch-Site": sec_fetch_site},
+        headers={"Origin": origin, "Sec-Fetch-Site": sec_fetch_site},
         json={"action": "bogus"},
     )
 
