@@ -93,11 +93,7 @@ def _public_entry(entry):
         count = int(entry.get("count", 0))
     except (TypeError, ValueError):
         count = 0
-    try:
-        last_seen = float(entry.get("last_seen", 0.0))
-    except (TypeError, ValueError):
-        last_seen = 0.0
-    return {"domain": domain, "count": count, "last_seen": last_seen}
+    return {"domain": domain, "count": count}
 
 
 def _ranked_entries(names, cache_entries):
@@ -106,7 +102,7 @@ def _ranked_entries(names, cache_entries):
     for name in names if isinstance(names, list) else []:
         entry = _public_entry(entries.get(name))
         if entry is None and isinstance(name, str) and name:
-            entry = {"domain": name, "count": 0, "last_seen": 0.0}
+            entry = {"domain": name, "count": 0}
         if entry is not None:
             out.append(entry)
     return out

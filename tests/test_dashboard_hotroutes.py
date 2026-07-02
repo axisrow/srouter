@@ -81,9 +81,10 @@ def test_probe_hot_routes_enabled_returns_ranked_domains_with_counts(monkeypatch
     assert out["status"] == "ok"
     assert out["updated"] is True
     assert out["domains"] == [
-        {"domain": "a.example", "count": 3, "last_seen": 1000.0},
-        {"domain": "b.example", "count": 1, "last_seen": 1000.0},
+        {"domain": "a.example", "count": 3},
+        {"domain": "b.example", "count": 1},
     ]
+    assert all(set(entry) == {"domain", "count"} for entry in out["domains"])
     assert ("parse", log_path) in calls
     assert any(call[0] == "update" and call[3] == 2 for call in calls)
     assert any(call[0] == "hot_domains" for call in calls)
@@ -123,3 +124,43 @@ def test_api_status_contains_hot_routes_section(monkeypatch, tmp_path):
     assert response.status_code == 200
     assert "hot_routes" in seen
     assert response.get_json()["hot_routes"] == {"status": "ok"}
+
+
+def test_api_status_hot_routes_public_domains_exclude_timing_metadata(monkeypatch, tmp_path):
+    state_path = tmp_path / "srouter.local.json"
+    _write_state(state_path, {"enabled": True})
+    dashboard = _fresh_dashboard(monkeypatch, state_path)
+
+    monkeypatch.setattr(
+        dashboard_hotroutes.hot_routes,
+        "parse_access_log",
+        lambda path=None: {"a.example": 3},
+    )
+    monkeypatch.setattr(
+        dashboard_hotroutes.hot_routes,
+        "update_cache",
+        lambda counts, path=None, ttl=None, top_n=None, now=None: {
+            "a.example": {"domain": "a.example", "count": 3, "last_seen": 1000.0}
+        },
+    )
+    monkeypatch.setattr(
+        dashboard_hotroutes.hot_routes,
+        "hot_domains",
+        lambda path=None, top_n=None, ttl=None, now=None: ["a.example"],
+    )
+
+    def fake_run_probe_set(probes, budget_sec):
+        return {
+            name: fn() if name == "hot_routes" else {"status": "ok"}
+            for name, fn in probes.items()
+        }
+
+    monkeypatch.setattr(dashboard, "_run_status_probe_set", fake_run_probe_set)
+    monkeypatch.setattr(dashboard, "probe_nodes_snapshot", lambda: [])
+
+    response = dashboard.app.test_client().get("/api/status")
+
+    assert response.status_code == 200
+    domains = response.get_json()["hot_routes"]["domains"]
+    assert domains == [{"domain": "a.example", "count": 3}]
+    assert all(set(entry) == {"domain", "count"} for entry in domains)
