@@ -186,6 +186,70 @@ def test_apply_throttle_builds_validated_argv(monkeypatch):
     assert "example.com" not in joined
 
 
+# ============================ владение dummynet pipe (issue #61 фикс 2) ============================
+def test_pipe_num_is_nonstandard_high():
+    # PIPE_NUM — глобальный id dummynet (НЕ скоупится pf-anchor'ом). Низкие id
+    # (1-10) типичны для чужого шейпинга (Network Link Conditioner и т.п.) —
+    # наш id обязан быть нестандартно высоким, чтобы не столкнуться.
+    assert traffic_shape.PIPE_NUM == 4127
+    assert traffic_shape.PIPE_NUM not in range(1, 11)
+
+
+def test_apply_throttle_pipe_busy_check_runs_first(monkeypatch):
+    # Fail-closed владение: ПЕРВАЯ команда privileged-цепочки — проверка, что pipe
+    # ещё не существует (dnctl-чтение требует root => проверка внутри цепочки).
+    # Существует -> маркер в stderr + exit 71 ДО pfctl -E (токен не создаётся)
+    # и ДО dnctl config (чужой pipe не перезаписывается).
+    calls = []
+    monkeypatch.setattr(socket, "gethostbyname", lambda h: "203.0.113.10")
+    monkeypatch.setattr(sys_probe, "run", _apply_ok_run(calls))
+
+    traffic_shape.apply_throttle("example.com", 512)
+
+    script = calls[0][2]
+    busy_check = (
+        f"if {traffic_shape.DNCTL} pipe show {traffic_shape.PIPE_NUM} >/dev/null 2>&1; "
+        f"then echo {traffic_shape.PIPE_BUSY_MARKER} 1>&2; exit 71; fi"
+    )
+    assert busy_check in script, "проверка занятости pipe — первой командой цепочки"
+    assert script.index("pipe show") < script.index("t=$("), "проверка ДО pfctl -E"
+    assert script.index("pipe show") < script.index("config"), "проверка ДО dnctl config"
+
+
+def test_apply_throttle_rejects_busy_pipe(monkeypatch):
+    # Pipe уже существует (чужой шейпинг): exit 71, маркер в stderr-аккумуляторе.
+    # ok:false + понятная ошибка, БЕЗ config, БЕЗ rollback (токен не создавался).
+    calls = []
+    monkeypatch.setattr(socket, "gethostbyname", lambda h: "203.0.113.10")
+    monkeypatch.setattr(
+        sys_probe, "run",
+        _spy_run(calls, rc=71, out="",
+                 err=f"0:45: execution error: {traffic_shape.PIPE_BUSY_MARKER} (71)"),
+    )
+
+    res = traffic_shape.apply_throttle("example.com", 512)
+
+    assert res["ok"] is False
+    assert "уже существует" in res["err"], "понятная ошибка про чужой pipe"
+    assert res.get("token") is None
+    assert "rollback" not in res, "до -E не дошли — откатывать нечего"
+    assert len(calls) == 1, "никакого config/cleanup после отказа"
+
+
+def test_clear_throttle_deletes_only_own_pipe(monkeypatch):
+    # Инвариант владения: clear удаляет ТОЛЬКО pipe нашего id (создан после
+    # busy-проверки apply) — чужие pipe не трогаются.
+    calls = []
+    monkeypatch.setattr(sys_probe, "run", _spy_run(calls, rc=0))
+
+    traffic_shape.clear_throttle(token="5")
+
+    script = calls[0][2]
+    assert f"{traffic_shape.DNCTL} pipe {traffic_shape.PIPE_NUM} delete" in script
+    # Ровно одно удаление pipe — только наш id.
+    assert script.count("pipe") == script.count(f"pipe {traffic_shape.PIPE_NUM}")
+
+
 # ============================ token lifecycle (баг 2 + issue #61 фикс 1) ============================
 def test_apply_throttle_rollback_on_post_enable_failure(monkeypatch):
     # Issue #61: -E успел, но dnctl упал (rc!=0). РЕАЛЬНЫЙ osascript отбрасывает
