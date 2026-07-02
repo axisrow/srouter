@@ -19,12 +19,24 @@ rc отражает ПЕРВЫЙ сбой; частичный успех не м
 Управление pf enable-reference и его lifecycle:
 `pfctl -E` включает pf и инкрементит enable-reference-count, печатая release-token
 (`Token : <N>`). Токен обязателен к освобождению через `pfctl -X <token>`, иначе pf
-остаётся включён системно и счётчик течёт при повторных apply. Инварианты:
-- Токен парсится из объединённого вывода НЕЗАВИСИМО от rc (`-E` печатает его до
-  сбоя последующих команд). Если -E успел — токен ВСЕГДА в возвращаемом dict.
-- При сбое ПОСЛЕ -E (rc != 0, токен распарсен) apply делает best-effort rollback
-  (clear_throttle(token) — второй промпт только в failure-path), результат кладёт
-  в ответ (`rollback`), исходную ошибку не теряет.
+остаётся включён системно и счётчик течёт при повторных apply.
+
+РЕАЛЬНАЯ семантика osascript (issue #61, доказано экспериментом): при rc != 0
+любой команды цепочки `do shell script` ОТБРАСЫВАЕТ stdout, error message (-> err)
+аккумулирует только stderr цепочки. Поэтому токен, напечатанный лишь в stdout,
+при сбое dnctl/pfctl -a был бы потерян. Инварианты:
+- Токен захватывается в переменную (`t=$(pfctl -E 2>&1) || exit $?` — сбой самого
+  -E обрывает цепочку, токен не создан, утечки нет) и дублируется в ОБА потока:
+  stdout (success-путь) и stderr (переживает сбой цепочки).
+- Парсинг: `_parse_token(out) or _parse_token(err)` — независимо от rc.
+- rc=0 БЕЗ распарсенного токена — СБОЙ (fail-closed): pf включён, release-token
+  неизвестен, enable-ref может течь. Явная ошибка + best-effort cleanup
+  (clear_throttle(None) — без -X, токена нет), результат в `rollback`.
+- При сбое ПОСЛЕ -E (rc != 0, токен распарсен из err) apply делает best-effort
+  rollback (clear_throttle(token) — второй промпт только в failure-path),
+  результат кладёт в ответ (`rollback`), исходную ошибку не теряет.
+- Timeout osascript: out/err пусты, токен потерян, состояние pf неизвестно —
+  явная ошибка про возможную утечку enable-ref (rollback невозможен).
 - Широкий except (defensive) тоже сохраняет уже распарсенный токен.
 
 Cleanup (clear) — attempt-all: обязан попытаться выполнить ВСЕ шаги, даже если
@@ -196,14 +208,19 @@ def _admin_run(shell_cmd):
 def apply_throttle(domain, rate):
     """Включить throttle для domain на скорости rate (Kbit/s).
 
-    Одна privileged-инвокация (fail-fast `&&`): `pfctl -E` (включить pf + получить
-    enable-token) -> `dnctl pipe config` -> загрузка правил в под-anchor через stdin.
-    main pf ruleset НЕ трогается (под-anchor com.apple/* уже вычисляется системой).
+    Одна privileged-инвокация: `pfctl -E` (включить pf + получить enable-token,
+    сбой самого -E обрывает цепочку через `|| exit $?`) -> дубль токена в
+    stdout И stderr (stderr переживает сбой цепочки — реальная семантика osascript,
+    см. модульную docstring) -> `dnctl pipe config` -> загрузка правил в под-anchor
+    через stdin (fail-fast `&&`). main pf ruleset НЕ трогается (под-anchor
+    com.apple/* уже вычисляется системой).
 
     Возвращает dict как _shape_result + ключ `token` (release-token pf enable-ref;
     None если -E не дошёл/не распарсился). Токен ОБЯЗАН быть передан позже в
-    clear_throttle(token=...) для освобождения. При сбое ПОСЛЕ -E с распарсенным
-    токеном — best-effort rollback (ключ `rollback`). Функция не бросает.
+    clear_throttle(token=...) для освобождения. Fail-closed: rc=0 без распарсенного
+    токена — сбой с best-effort cleanup (`rollback`, clear без -X). При сбое ПОСЛЕ
+    -E с распарсенным токеном — best-effort rollback (ключ `rollback`).
+    Функция не бросает.
     """
     ip = resolve_domain_ip(domain)
     if not ip:
@@ -216,22 +233,45 @@ def apply_throttle(domain, rate):
     try:
         # Всё ниже — из констант + validated (ip canonical, rate_spec числовой,
         # ANCHOR/PIPE_NUM константы). Правило dummynet заворачивает трафик к целевому
-        # IP в pipe с ограниченной полосой. `-E 2>&1` сливает stderr в stdout, чтобы
-        # osascript отдал строку 'Token : <N>'.
+        # IP в pipe с ограниченной полосой.
         pf_rule = (
             f"dummynet out proto tcp from any to {ip} pipe {PIPE_NUM}\\n"
             f"dummynet in proto tcp from {ip} to any pipe {PIPE_NUM}"
         )
-        enable = f"{PFCTL} -E 2>&1"
+        # `-E 2>&1` сливает stderr -E в захват: строка 'Token : <N>' целиком в $t.
+        # `|| exit $?` — fail-fast: -E упал => токена нет => утечки нет.
+        enable = f"t=$({PFCTL} -E 2>&1) || exit $?"
+        # Дубль токена в оба потока СРАЗУ после -E: stdout — success-путь; stderr —
+        # переживает сбой dnctl/pfctl -a (osascript при rc!=0 отбрасывает stdout).
+        emit_token = "printf '%s\\n' \"$t\"; printf '%s\\n' \"$t\" 1>&2"
         pipe_cfg = f"{DNCTL} pipe {PIPE_NUM} config bw {rate_spec}"
         load_anchor = f"printf '{pf_rule}' | {PFCTL} -a \"{ANCHOR}\" -f -"
-        # fail-fast: первый сбой обрывает цепочку, rc его и отражает.
-        shell_cmd = f"{enable} && {pipe_cfg} && {load_anchor}"
+        # fail-fast: сбой -E обрывает через exit, сбой config не даёт грузить anchor.
+        shell_cmd = f"{enable}; {emit_token}; {pipe_cfg} && {load_anchor}"
 
         res = _admin_run(shell_cmd)
-        # Токен печатает -E ДО возможного сбоя последующих команд — парсим независимо от rc.
-        token = _parse_token(res.get("out"))
+        # Токен напечатан в оба потока — парсим из out (успех) ИЛИ err (сбой цепочки).
+        token = _parse_token(res.get("out")) or _parse_token(res.get("err"))
         res["token"] = token
+
+        if res["timeout"] and not token:
+            # osascript не завершился: состояние pf неизвестно, токен потерян.
+            res["err"] = (
+                "osascript timeout: состояние pf неизвестно, release-token потерян — "
+                "enable-ref может течь; " + (res["err"] or "")
+            ).rstrip("; ")
+            return res
+
+        if res["ok"] and not token:
+            # Fail-closed: rc=0, но release-token не распарсен. Считаем сбоем —
+            # pf включён, освободить enable-ref нечем. Cleanup без -X (токена нет).
+            res["ok"] = False
+            res["err"] = (
+                "pf включён, но release-token не получен — enable-ref может течь; "
+                + (res["err"] or "")
+            ).rstrip("; ")
+            res["rollback"] = clear_throttle(None)
+            return res
 
         if not res["ok"] and token:
             # Сбой после включения pf: pf остался с инкрементированным enable-ref.
