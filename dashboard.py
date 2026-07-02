@@ -410,12 +410,20 @@ def api_guard_get():
     )
 
 
-def _public_active_throttle():
-    """Публичная (без token) проекция активного throttle-lease или None для UI."""
-    active = local_state.load_active_throttle()
-    if not active:
+def _public_throttle(entry):
+    """Публичная (без token) проекция throttle-lease или None.
+
+    token наружу НЕ отдаём (он нужен только серверу для pfctl -X) — лишь
+    domain/rate/applied_at. entry=None -> None.
+    """
+    if not entry:
         return None
-    return {"domain": active.get("domain"), "rate": active.get("rate"), "applied_at": active.get("applied_at")}
+    return {"domain": entry.get("domain"), "rate": entry.get("rate"), "applied_at": entry.get("applied_at")}
+
+
+def _public_active_throttle():
+    """Публичная проекция ТЕКУЩЕГО активного lease из state (re-read) — для GET-роута."""
+    return _public_throttle(local_state.load_active_throttle())
 
 
 @app.post("/api/guard")
@@ -528,26 +536,37 @@ def _throttle_apply(payload):
         return jsonify(body), 200
 
     if body.get("ok"):
-        # token читаем ИЗ result (наружу он не отдаётся): apply с ok:true ГАРАНТИРУЕТ
-        # токен (движок fail-closed: rc=0 без токена -> ok=false).
+        # token читаем ИЗ result (наружу он не отдаётся). apply с ok:true ГАРАНТИРУЕТ
+        # токен (движок fail-closed: rc=0 без токена -> ok=false). Но на привилегированной
+        # границе не доверяем контракту движка как инварианту этого слоя: ok БЕЗ token
+        # -> fail-closed 500 (clear_throttle(None) НЕ зовёт pfctl -X, enable-ref бы тёк,
+        # а маскировать утечку под 'rolled back' нельзя — тот же корень, что #61).
         token = (result or {}).get("token")
+        if not token:
+            body["ok"] = False
+            body["err"] = "throttle applied but pf release-token missing — cannot persist lease"
+            return jsonify(body), 500
         saved = local_state.save_active_throttle(
             {"domain": domain, "rate": rate, "token": token, "applied_at": int(time.time())}
         )
         if saved is None:
             # Токен не удалось персистить — критично: clear его больше не найдёт.
-            # Тут же снимаем throttle сохранённым токеном, чтобы не течь enable-ref.
+            # Тут же снимаем throttle ВАЛИДНЫМ токеном, чтобы не течь enable-ref.
             rollback = traffic_shape.clear_throttle(token)
             body["ok"] = False
             body["err"] = "throttle applied but token persist failed; rolled back"
             body["rollback"] = _throttle_result(rollback)
             return jsonify(body), 500
-        body["throttle"] = _public_active_throttle()
+        # Публичную проекцию строим из ТОЛЬКО ЧТО сохранённого lease (save уже вернул
+        # нормализованные domain/rate/applied_at) — без третьего чтения state-файла.
+        body["throttle"] = _public_throttle(saved)
         return jsonify(body), 200
 
-    # Сбой движка (busy pipe, probe-fail, timeout и т.п.): структурированный ответ.
-    # Движок при сбое после -E уже сделал best-effort rollback внутри себя, lease не пишем.
-    return jsonify(body), 200
+    # Сбой движка (busy pipe, probe-fail, timeout и т.п.): структурированный ответ 500
+    # (серверная ошибка — движок не достиг результата), lease не пишем. Движок при сбое
+    # после -E уже сделал best-effort rollback внутри себя. 500 согласовано с другими
+    # apply-failure-путями выше; UI отличает только cancelled/ok, не статус-код.
+    return jsonify(body), 500
 
 
 def _throttle_clear():
@@ -565,13 +584,24 @@ def _throttle_clear():
         return jsonify(body), 200
 
     if body.get("ok"):
-        # Снято успешно (enable-ref освобождён) — сбрасываем lease.
-        local_state.clear_active_throttle()
-        body["throttle"] = None
+        # Снято успешно (enable-ref освобождён) — сбрасываем lease. Если персист None
+        # провалился (битый/неперезаписываемый state), lease остаётся — честно сообщаем
+        # partial (throttle снят, но state рассинхрон; не маскируем под чистый успех).
+        cleared = local_state.clear_active_throttle()
+        if cleared:
+            body["throttle"] = None
+        else:
+            body["err"] = (body.get("err") + "; " if body.get("err") else "") + (
+                "throttle cleared on pf, but active-lease state could not be persisted — "
+                "it may reappear after restart"
+            )
         return jsonify(body), 200
 
-    # Сбой clear: lease оставляем (throttle мог остаться частично) — пользователь повторит.
-    return jsonify(body), 200
+    # Сбой clear: lease оставляем (throttle всё ещё активен на pf) — явный сигнал для UI,
+    # чтобы пользователь понял, что нужно повторить. ok:false, status 500 (серверная ошибка).
+    body["still_active"] = True
+    body["throttle"] = _public_throttle(active)
+    return jsonify(body), 500
 
 
 @app.get("/")

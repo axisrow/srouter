@@ -517,3 +517,32 @@ def test_save_active_throttle_refuses_unreadable_state(tmp_path):
     assert local_state.save_active_throttle(
         {"domain": "x.example.com", "rate": 256, "token": "5"}, path=p
     ) is None
+
+
+def test_save_active_throttle_applied_at_optional(tmp_path):
+    """applied_at отсутствует -> lease валиден (метка времени необязательна)."""
+    p = tmp_path / "srouter.local.json"
+    saved = local_state.save_active_throttle(
+        {"domain": "x.example.com", "rate": 256, "token": "5"}, path=p  # без applied_at
+    )
+    assert saved is not None
+    loaded = local_state.load_active_throttle(path=p)
+    assert loaded["applied_at"] is None
+
+
+def test_save_active_throttle_applied_at_must_be_scalar(tmp_path):
+    """applied_at при наличии обязан быть числом/строкой (не dict/list) — docstring↔код."""
+    p = tmp_path / "srouter.local.json"
+    for bad in ({"x": 1}, [1, 2]):
+        assert local_state.save_active_throttle(
+            {"domain": "x.example.com", "rate": 256, "token": "5", "applied_at": bad}, path=p
+        ) is None, bad
+        assert local_state.load_active_throttle(path=p) is None, bad
+
+
+def test_save_active_throttle_accepts_int_and_string_applied_at(tmp_path):
+    p = tmp_path / "srouter.local.json"
+    local_state.save_active_throttle(
+        {"domain": "x.example.com", "rate": 256, "token": "5", "applied_at": 1700000000}, path=p
+    )
+    assert local_state.load_active_throttle(path=p)["applied_at"] == 1700000000

@@ -305,6 +305,11 @@ def _valid_active_throttle(entry):
         (isinstance(token, int) and token >= 0) or (isinstance(token, str) and token.isdigit())
     ):
         return False
+    # applied_at — метка времени; необязателен (None), но при наличии обязан быть
+    # числом/строкой, иначе мусорное значение попадёт в публичный GET-ответ.
+    applied_at = entry.get("applied_at")
+    if applied_at is not None and not isinstance(applied_at, (int, float, str)):
+        return False
     return True
 
 

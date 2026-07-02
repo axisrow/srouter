@@ -229,6 +229,7 @@
         throttle_applied: "Throttle applied: {0}", throttle_cleared: "Throttle cleared",
         throttle_cancelled: "Cancelled (admin password dismissed)",
         throttle_conflict: "A throttle is already active — clear it first.",
+        throttle_clear_failed_active: "Clear failed — throttle is still active on pf. Retry.",
         throttle_failed: "Throttle failed: {0}",
         channel_title: "Network channel", channel_active: "Active channel",
         channel_wifi: "Wi-Fi", channel_usb: "USB tether",
@@ -299,6 +300,7 @@
         throttle_applied: "Замедление включено: {0}", throttle_cleared: "Замедление снято",
         throttle_cancelled: "Отменено (пароль администратора не введён)",
         throttle_conflict: "Замедление уже активно — сначала снимите его.",
+        throttle_clear_failed_active: "Снять не удалось — замедление всё ещё активно на pf. Повторите.",
         throttle_failed: "Ошибка замедления: {0}",
         channel_title: "Сетевой канал", channel_active: "Активный канал",
         channel_wifi: "Wi-Fi", channel_usb: "USB-модем",
@@ -369,6 +371,7 @@
         throttle_applied: "限速已启用：{0}", throttle_cleared: "限速已清除",
         throttle_cancelled: "已取消（未输入管理员密码）",
         throttle_conflict: "已有限速在运行 — 请先清除。",
+        throttle_clear_failed_active: "清除失败 — 限速仍在 pf 上运行。请重试。",
         throttle_failed: "限速失败：{0}",
         channel_title: "网络通道", channel_active: "当前通道",
         channel_wifi: "Wi-Fi", channel_usb: "USB 网络共享",
@@ -1071,6 +1074,10 @@
           } else {
             var status = res && res._status;
             if (status === 409) { toast(t('throttle_conflict'), 'warn'); }
+            else if (res && res.still_active) {
+              // clear провалился: throttle всё ещё активен на pf — явный сигнал повторить.
+              toast(t('throttle_clear_failed_active'), 'err');
+            }
             else {
               var msg = (res && res.err) ? String(res.err).slice(0, 220)
                 : ('HTTP ' + (status || 500));
@@ -1090,10 +1097,10 @@
       var domain = (THROTTLE_INPUT.domain || '').trim().toLowerCase();
       var rate = (THROTTLE_INPUT.rate || '').trim();
       if (!domain) { toast(t('throttle_need_domain'), 'warn'); return; }
-      // Клиентская проверка rate: положительное целое (сервер тоже валидирует — fail-closed).
-      var n = num(rate);
-      if (n === null || n <= 0 || Math.floor(n) !== n) { toast(t('throttle_need_rate'), 'warn'); return; }
-      throttleRequest({ action: 'apply', domain: domain, rate: n }, btn, 'throttle_applied');
+      // Клиентская проверка rate: только положительное ЦЕЛОЕ в десятичной записи
+      // (согласовано с сервером _valid_throttle_rate/isdigit; Number() пропускал бы 5e3/0x10).
+      if (!/^[1-9][0-9]*$/.test(rate)) { toast(t('throttle_need_rate'), 'warn'); return; }
+      throttleRequest({ action: 'apply', domain: domain, rate: parseInt(rate, 10) }, btn, 'throttle_applied');
     }
     function clearThrottle(btn) {
       throttleRequest({ action: 'clear' }, btn, 'throttle_cleared');

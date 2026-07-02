@@ -204,7 +204,7 @@ def test_apply_engine_failure_is_structured_no_lease(monkeypatch):
         "/api/guard/throttle", json={"action": "apply", "domain": "x.example.com", "rate": 512}
     )
 
-    assert resp.status_code == 200
+    assert resp.status_code == 500  # серверная ошибка (движок не достиг результата)
     body = resp.get_json()
     assert body["ok"] is False
     assert "pipe" in body["err"]
@@ -212,8 +212,34 @@ def test_apply_engine_failure_is_structured_no_lease(monkeypatch):
     assert lease["saved"] == []
 
 
+def test_apply_ok_without_token_is_fail_closed_not_enable_ref_leak(monkeypatch):
+    """Регресс #61: apply ok:true БЕЗ token -> fail-closed 500, НЕ 'rollback через
+    clear_throttle(None)' (тот не зовёт pfctl -X — enable-ref бы тёк, замаскировано под
+    'rolled back'). Контракт ok->token доказан лишь для текущего движка, слой не доверяет.
+    """
+    dashboard = _fresh_dashboard(monkeypatch)
+    calls = _spy_engine(
+        dashboard, monkeypatch,
+        apply_result={"ok": True, "cancelled": False, "rc": 0, "out": "", "err": "", "timeout": False, "token": None},
+    )
+    lease = _install_lease(dashboard, monkeypatch)
+
+    resp = dashboard.app.test_client().post(
+        "/api/guard/throttle", json={"action": "apply", "domain": "x.example.com", "rate": 512}
+    )
+
+    assert resp.status_code == 500
+    body = resp.get_json()
+    assert body["ok"] is False
+    assert "token" in body["err"].lower() or "missing" in body["err"].lower()
+    # Никакого rollback — clear_throttle вообще не зван (неclear_throttle(None)-утечка).
+    assert calls["clear"] == []
+    # lease НЕ пишем.
+    assert lease["saved"] == []
+
+
 def test_apply_token_persist_failure_rolls_back(monkeypatch):
-    """Токен получен, но персист упал -> роут откатывает throttle (иначе enable-ref течёт)."""
+    """Токен получен, но персист упал -> роут откатывает throttle ВАЛИДНЫМ токеном."""
     dashboard = _fresh_dashboard(monkeypatch)
     calls = _spy_engine(dashboard, monkeypatch)  # apply ok token=5, clear ok
     _install_lease(dashboard, monkeypatch)
@@ -228,7 +254,7 @@ def test_apply_token_persist_failure_rolls_back(monkeypatch):
     body = resp.get_json()
     assert body["ok"] is False
     assert "persist" in body["err"]
-    # Откат сохранённым токеном, чтобы enable-ref не тёк.
+    # Откат ВАЛИДНЫМ токеном, чтобы enable-ref не тёк.
     assert calls["clear"] == ["5"]
 
 
@@ -281,7 +307,7 @@ def test_clear_cancelled_keeps_lease(monkeypatch):
     assert lease["cleared"] == 0
 
 
-def test_clear_engine_failure_keeps_lease(monkeypatch):
+def test_clear_engine_failure_keeps_lease_and_signals_still_active(monkeypatch):
     dashboard = _fresh_dashboard(monkeypatch)
     failure = {"ok": False, "cancelled": False, "rc": 1, "out": "", "err": "boom", "timeout": False}
     _spy_engine(dashboard, monkeypatch, clear_result=failure)
@@ -291,10 +317,34 @@ def test_clear_engine_failure_keeps_lease(monkeypatch):
 
     resp = dashboard.app.test_client().post("/api/guard/throttle", json={"action": "clear"})
 
-    assert resp.status_code == 200
-    assert resp.get_json()["ok"] is False
-    # Сбой clear -> lease оставляем (throttle мог остаться частично), пользователь повторит.
+    assert resp.status_code == 500  # серверная ошибка: clear не достигнут
+    body = resp.get_json()
+    assert body["ok"] is False
+    # Явный сигнал UI: throttle всё ещё активен на pf — пользователь повторит.
+    assert body["still_active"] is True
+    assert body["throttle"]["domain"] == "x.example.com"
+    # Сбой clear -> lease оставляем (throttle активен), clear_active_throttle НЕ зван.
     assert lease["cleared"] == 0
+
+
+def test_clear_ok_but_state_unwritable_reports_partial(monkeypatch):
+    """pf снят (engine ok), но clear_active_throttle вернул False (unreadable state):
+    throttle реально снят, но lease остался в файле — честный partial, не маскируем
+    под чистый ok:throttle:null (иначе UI/state рассинхрон после рестарта).
+    """
+    dashboard = _fresh_dashboard(monkeypatch)
+    _spy_engine(dashboard, monkeypatch)  # clear ok
+    _install_lease(
+        dashboard, monkeypatch, active={"domain": "x.example.com", "rate": 512, "token": "9"}
+    )
+    monkeypatch.setattr(dashboard.local_state, "clear_active_throttle", lambda path=None: False)
+
+    resp = dashboard.app.test_client().post("/api/guard/throttle", json={"action": "clear"})
+
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["ok"] is True
+    assert "could not be persisted" in body["err"]
 
 
 # ============================ payload / action guard ============================
