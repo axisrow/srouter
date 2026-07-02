@@ -49,6 +49,8 @@
     .node-row.failed { border-color:rgba(var(--bs-danger-rgb), .55); }
     .node-metrics { display:grid; grid-template-columns:repeat(auto-fit,minmax(130px,1fr)); gap:.35rem .75rem; }
     .node-metric .k { display:block; font-size:.72rem; color:var(--bs-secondary-color); }
+    .hot-route-list { display:grid; gap:.25rem; max-height:9rem; overflow:auto; }
+    .hot-route-row { display:flex; justify-content:space-between; gap:.75rem; }
   </style>
 </head>
 <body>
@@ -242,7 +244,10 @@
         channel_switch_cancelled: "Channel switch cancelled",
         channel_link_down: "no link — interface is down", channel_metered: "metered",
         channel_last_error: "Last switch failed: {0}",
-        channel_manual_hint: "Manual failover only — the dashboard never switches channels automatically."
+        channel_manual_hint: "Manual failover only — the dashboard never switches channels automatically.",
+        card_hot_routes: "Popular domains", hot_routes_disabled: "disabled in local state",
+        hot_routes_empty: "no cached domains yet", hot_routes_count: "count",
+        hot_routes_help: "Observe-only: the cache stays local and is not uploaded."
       },
       ru: {
         brand: "Tunnel Dashboard", theme_title: "Тема", theme_auto: "Авто",
@@ -316,7 +321,10 @@
         channel_switch_cancelled: "Переключение канала отменено",
         channel_link_down: "нет линка — интерфейс не поднят", channel_metered: "лимитный трафик",
         channel_last_error: "Последнее переключение не удалось: {0}",
-        channel_manual_hint: "Только ручной failover — дашборд никогда не переключает канал автоматически."
+        channel_manual_hint: "Только ручной failover — дашборд никогда не переключает канал автоматически.",
+        card_hot_routes: "Популярные домены", hot_routes_disabled: "отключено в local state",
+        hot_routes_empty: "в кэше пока нет доменов", hot_routes_count: "счётчик",
+        hot_routes_help: "Только наблюдение: кэш остаётся локальным и не загружается наружу."
       },
       zh: {
         brand: "隧道仪表盘", theme_title: "主题", theme_auto: "自动",
@@ -390,7 +398,10 @@
         channel_switch_cancelled: "通道切换已取消",
         channel_link_down: "无链路 — 接口未连接", channel_metered: "按流量计费",
         channel_last_error: "上次切换失败：{0}",
-        channel_manual_hint: "仅手动故障转移 — 仪表盘不会自动切换通道。"
+        channel_manual_hint: "仅手动故障转移 — 仪表盘不会自动切换通道。",
+        card_hot_routes: "热门域名", hot_routes_disabled: "已在本地状态中关闭",
+        hot_routes_empty: "缓存中暂无域名", hot_routes_count: "计数",
+        hot_routes_help: "仅观察：缓存保留在本机，不会上传。"
       }
     };
 
@@ -595,6 +606,25 @@
     function fmtThroughput(v) {
       var n = num(v);
       return n === null ? '—' : Math.round(n).toLocaleString() + ' ' + t('kbps');
+    }
+    function hotRoutesSub(hr) {
+      var help = '<div class="sub text-secondary mt-2">' + esc(t('hot_routes_help')) + '</div>';
+      if (!hr || hr.enabled !== true) return esc(t('hot_routes_disabled')) + help;
+      var domains = Array.isArray(hr.domains) ? hr.domains : [];
+      if (!domains.length) return esc(t('hot_routes_empty')) + help;
+      var rows = '<div class="hot-route-row text-secondary small">' +
+        '<span>' + esc(t('guard_domain')) + '</span>' +
+        '<span>' + esc(t('hot_routes_count')) + '</span>' +
+      '</div>' + domains.map(function (entry) {
+        var domain = entry && entry.domain ? entry.domain : '';
+        var count = entry && entry.count != null ? fmtNumber(entry.count) : '—';
+        return '<div class="hot-route-row">' +
+          '<span class="mono text-truncate">' + esc(domain || '—') + '</span>' +
+          '<span class="mono text-secondary">' + esc(count) + '</span>' +
+        '</div>';
+      }).join('');
+      return '<div class="hot-route-list" aria-label="' + esc(t('card_hot_routes')) + '">' +
+        rows + '</div>' + help;
     }
     function nodeApplyPending() {
       return !!(NODE_APPLY && NODE_APPLY.state === 'pending');
@@ -1214,6 +1244,15 @@
         value: badgeText(xr.status),
         sub: svcLine(xr),
         status: xr.status
+      });
+
+      var hr = d.hot_routes || {};
+      var hotDomains = Array.isArray(hr.domains) ? hr.domains : [];
+      html += card({
+        icon: 'bi-fire', title: t('card_hot_routes'),
+        value: hr.enabled === true ? (hotDomains.length + '/' + (hr.top_n || '—')) : t('off'),
+        sub: hotRoutesSub(hr),
+        status: hr.enabled === true ? (hr.status || 'ok') : 'disabled'
       });
 
       /* ---------- киношные карточки (класс cine → скрываются в Simple) ---------- */
