@@ -34,8 +34,9 @@ def _spy_run(calls, rc=0, out="", err="", timed_out=False):
 def _apply_ok_run(calls, token="5"):
     """Фейк успешного apply: единственная osascript-инвокация возвращает 'Token : N'.
 
-    apply теперь делает ОДИН privileged-вызов (одна цепочка `&&`). Токен pf
-    печатает `pfctl -E` в объединённый stdout — фейк отдаёт его в out.
+    apply делает ОДИН privileged-вызов (busy-probe; захват -E в $t; дубль токена в
+    stdout+stderr; config && загрузка anchor). На success-пути osascript отдаёт
+    stdout цепочки — туда токен печатает emit_token-дубль, фейк кладёт его в out.
     """
     def fake_run(cmd_list, timeout=None):
         calls.append(cmd_list)
@@ -216,7 +217,10 @@ def test_apply_throttle_pipe_busy_check_runs_first(monkeypatch):
         "сбой probe -> fail-closed отказ, не молчаливое продолжение"
     assert f"{traffic_shape.GREP} -q '^0*{traffic_shape.PIPE_NUM}:'" in script, \
         "существование pipe — якорный матч строки %05d: (не exit-код, не substring)"
-    assert f"then echo {traffic_shape.PIPE_BUSY_MARKER} 1>&2; exit 71; fi" in script
+    # Разбор rc grep через case: 0 -> busy, 1 -> свободен, >=2 (сбой самого grep,
+    # включая 127) -> fail-closed probe-failed, НЕ молчаливое «свободно».
+    assert f"case $? in 0) echo {traffic_shape.PIPE_BUSY_MARKER} 1>&2; exit 71;;" in script
+    assert f"*) echo {traffic_shape.PIPE_PROBE_FAILED_MARKER} 1>&2; exit 72;; esac" in script
     assert script.index("pipe show") < script.index("t=$("), "проверка ДО pfctl -E"
     assert script.index("pipe show") < script.index("config"), "проверка ДО dnctl config"
 
@@ -260,6 +264,8 @@ def test_apply_throttle_rejects_when_pipe_probe_fails(monkeypatch):
 
     assert res["ok"] is False
     assert "не удалось проверить" in res["err"], "понятная ошибка про сбой probe"
+    # Форварднутая диагностика dnctl ($p в stderr цепочки) не выбрасывается.
+    assert "Operation not permitted" in res["err"], "исходная ошибка dnctl сохранена"
     assert res.get("token") is None
     assert "rollback" not in res, "до -E не дошли — откатывать нечего"
     assert len(calls) == 1, "fail-closed: ничего после отказа"

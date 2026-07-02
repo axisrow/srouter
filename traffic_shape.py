@@ -274,11 +274,14 @@ def apply_throttle(domain, rate):
         # Exit-код `pipe show` — НЕ предикат существования (см. PIPE_BUSY_MARKER):
         # захватываем вывод; сбой probe => fail-closed отказ (владение неизвестно);
         # существование => якорная строка `^0*N:` (формат %05d:, queues не матчатся).
+        # Разбор rc grep через case: 0 -> busy, 1 -> свободен, >=2 (сбой самого
+        # grep) -> fail-closed probe-failed — симметрично сбою dnctl-половины.
         busy_check = (
             f"p=$({DNCTL} pipe show {PIPE_NUM} 2>&1) || "
             f"{{ printf '%s\\n' \"$p\" 1>&2; echo {PIPE_PROBE_FAILED_MARKER} 1>&2; exit 72; }}; "
-            f"if printf '%s\\n' \"$p\" | {GREP} -q '^0*{PIPE_NUM}:'; "
-            f"then echo {PIPE_BUSY_MARKER} 1>&2; exit 71; fi"
+            f"printf '%s\\n' \"$p\" | {GREP} -q '^0*{PIPE_NUM}:'; "
+            f"case $? in 0) echo {PIPE_BUSY_MARKER} 1>&2; exit 71;; 1) ;; "
+            f"*) echo {PIPE_PROBE_FAILED_MARKER} 1>&2; exit 72;; esac"
         )
         # `-E 2>&1` сливает stderr -E в захват: строка 'Token : <N>' целиком в $t.
         # `|| exit $?` — fail-fast: -E упал => токена нет => утечки нет.
@@ -297,30 +300,37 @@ def apply_throttle(domain, rate):
         res["token"] = token
 
         if PIPE_PROBE_FAILED_MARKER in (res.get("err") or ""):
-            # Probe упал (socket/getsockopt): владение pipe проверить нельзя =>
-            # fail-closed отказ ДО -E — ничего не создано и не изменено.
+            # Probe упал (socket/getsockopt/grep): владение pipe проверить нельзя =>
+            # fail-closed отказ ДО -E — ничего не создано и не изменено. Исходную
+            # диагностику ($p форварднут в stderr цепочки) не выбрасываем.
             res["ok"] = False
             res["err"] = (
                 f"не удалось проверить владение dummynet pipe {PIPE_NUM} "
-                "(dnctl pipe show упал) — отказ, конфигурация не изменена"
-            )
+                "(dnctl pipe show упал) — отказ, конфигурация не изменена; "
+                + (res["err"] or "")
+            ).rstrip("; ")
             return res
 
         if PIPE_BUSY_MARKER in (res.get("err") or ""):
-            # Чужой pipe: отказ ДО -E и до config — ничего не создано и не изменено.
+            # Занятый pipe (чужой шейпинг ИЛИ наш незавершённый throttle): отказ
+            # ДО -E и до config — ничего не создано и не изменено.
             # Fail-closed: маркер = отказ безусловно, независимо от rc.
             res["ok"] = False
             res["err"] = (
-                f"dummynet pipe {PIPE_NUM} уже существует (чужой шейпинг?) — "
+                f"dummynet pipe {PIPE_NUM} уже существует (чужой шейпинг или наш "
+                "незавершённый throttle — сначала clear_throttle) — "
                 "отказ, конфигурация не изменена"
             )
             return res
 
         if res["timeout"] and not token:
             # osascript не завершился: состояние pf неизвестно, токен потерян.
+            # Формулировка «timeout или сбой запуска»: sys_probe.run помечает
+            # timeout=True и для generic-исключений запуска, не только TimeoutExpired.
             res["err"] = (
-                "osascript timeout: состояние pf неизвестно, release-token потерян — "
-                "enable-ref может течь; " + (res["err"] or "")
+                "osascript не завершился (timeout или сбой запуска): состояние pf "
+                "неизвестно, release-token потерян — enable-ref может течь; "
+                + (res["err"] or "")
             ).rstrip("; ")
             return res
 
@@ -353,8 +363,13 @@ def clear_throttle(token=None):
     Без токена enable-ref не трогает (нечего/неизвестно что освобождать). Идемпотентно.
 
     Инвариант владения pipe: удаляется ТОЛЬКО pipe нашего id (PIPE_NUM) — apply
-    создаёт его лишь после fail-closed busy-проверки, поэтому pipe PIPE_NUM
+    создаёт его лишь после fail-closed busy-probe, поэтому pipe PIPE_NUM
     принадлежит нам; чужие id не перечисляются и не трогаются никогда.
+    Ограничение (осознанное, ревью PR #63): dummynet не хранит владельца pipe,
+    доказать владение в момент clear невозможно в принципе — коллизия с чужим
+    шейпингом минимизирована нестандартным id + busy-probe в apply; гарантия
+    «clear зовётся только для своего активного throttle» (session-lease) —
+    ответственность роут-слоя (issue #13).
 
     Всё — из констант + validated токен. Функция не бросает.
     """
