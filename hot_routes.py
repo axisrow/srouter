@@ -84,7 +84,13 @@ def _extract_host(target):
         return None
     if "://" in target:
         # Абсолютный URL: hostname без порта/пути/query (urlsplit снимает и userinfo).
-        host = urlsplit(target).hostname
+        # urlsplit бросает ValueError на битом URL ('http://[::1', не-ASCII netloc
+        # под NFKC) — мусорный target трактуем как пропуск строки, а не как краш
+        # всего parse_access_log (контракт «не бросает»).
+        try:
+            host = urlsplit(target).hostname
+        except ValueError:
+            return None
     else:
         # host:port (CONNECT). Легитимный CONNECT userinfo НЕ содержит — любой '@'
         # значит мусорная/чужая строка, где rsplit(':') отрезал бы username-токен

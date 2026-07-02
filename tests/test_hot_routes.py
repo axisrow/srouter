@@ -66,6 +66,25 @@ def test_parse_extracts_host_from_absolute_url(tmp_path):
     assert counts == {"example.com": 1}
 
 
+def test_parse_malformed_url_does_not_raise(tmp_path):
+    """Битый URL (urlsplit ValueError: невалидный IPv6 / не-ASCII netloc под NFKC)
+    трактуется как пропуск строки, не роняет весь parse_access_log. Валидная
+    строка в том же логе при этом считается."""
+    log = tmp_path / "privoxy.log"
+    log.write_text(
+        "\n".join(
+            [
+                _privoxy_url_line("http://[::1"),  # Invalid IPv6 URL
+                _privoxy_url_line("http://a℀b/"),  # ℀ — invalid netloc под NFKC
+                _privoxy_url_line("http://good.example/x"),
+            ]
+        ),
+        encoding="utf-8",
+    )
+    counts = hot_routes.parse_access_log(str(log))
+    assert counts == {"good.example": 1}
+
+
 def test_parse_userinfo_token_never_leaks(tmp_path):
     """Privacy: мусорный CONNECT-target с userinfo не должен отдать username-токен.
 
