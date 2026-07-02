@@ -7,6 +7,7 @@ Mocked — реальный pf/dnctl/root НЕ зовётся: traffic_shape.{ap
 cancelled -> структурированный ответ (не 500), clear с сохранённым токеном.
 """
 import importlib
+import json
 import sys
 import types
 
@@ -68,6 +69,7 @@ def _install_lease(dashboard, monkeypatch, active=None):
     monkeypatch.setattr(dashboard.local_state, "load_active_throttle", fake_load)
     monkeypatch.setattr(dashboard.local_state, "save_active_throttle", fake_save)
     monkeypatch.setattr(dashboard.local_state, "clear_active_throttle", fake_clear)
+    monkeypatch.setattr(dashboard.local_state, "preflight_state_write", lambda path=None: True, raising=False)
     return log
 
 
@@ -213,6 +215,42 @@ def test_apply_engine_failure_is_structured_no_lease(monkeypatch):
     assert "pipe" in body["err"]
     # Сбой движка -> lease НЕ пишем (нечего снимать позже).
     assert lease["saved"] == []
+
+
+def test_apply_engine_public_response_redacts_pf_tokens(monkeypatch):
+    """Issue #68: pf release-token не должен уходить ни в err/out, ни в rollback."""
+    dashboard = _fresh_dashboard(monkeypatch)
+    _spy_engine(
+        dashboard, monkeypatch,
+        apply_result={
+            "ok": False,
+            "cancelled": False,
+            "rc": 1,
+            "out": "Token : 7",
+            "err": "dnctl failed after Token : 7; run pfctl -X 7",
+            "timeout": False,
+            "token": "7",
+            "rollback": {
+                "ok": True,
+                "cancelled": False,
+                "rc": 0,
+                "out": "cleanup used -X 7",
+                "err": "released Token : 7",
+                "timeout": False,
+            },
+        },
+    )
+    _install_lease(dashboard, monkeypatch)
+
+    resp = dashboard.app.test_client().post(
+        "/api/guard/throttle", json={"action": "apply", "domain": "x.example.com", "rate": 512}
+    )
+
+    assert resp.status_code == 500
+    public_json = json.dumps(resp.get_json(), ensure_ascii=False)
+    assert "Token : 7" not in public_json
+    assert "-X 7" not in public_json
+    assert "token" not in resp.get_json()
 
 
 def test_apply_ok_without_token_is_fail_closed_not_enable_ref_leak(monkeypatch):
@@ -423,6 +461,11 @@ def test_apply_save_fail_rollback_cancel_persists_cleanup_lease(monkeypatch):
     assert body["ok"] is False
     assert body.get("needs_cleanup") is True
     assert "rollback" in body["err"].lower() or "cancel" in body["err"].lower()
+    assert body["throttle"]["domain"] == "x.example.com"
+    assert body["throttle"]["rate"] == 512
+    assert body["throttle"]["needs_cleanup"] is True
+    assert body["throttle"]["cleanup_persisted"] is True
+    assert "token" not in body["throttle"]
     # rollback зван с token, но cancel — token НЕ освобождён.
     assert calls["clear"] == ["5"]
     # Token recoverable: cleanup-lease персистится повторной попыткой.
@@ -437,6 +480,7 @@ def test_apply_preflights_state_writability_before_engine(monkeypatch):
     calls = _spy_engine(dashboard, monkeypatch)
     _install_lease(dashboard, monkeypatch)
     monkeypatch.setattr(dashboard.local_state, "load_state_checked", lambda path=None: ({}, False))
+    monkeypatch.setattr(dashboard.local_state, "preflight_state_write", lambda path=None: False, raising=False)
 
     resp = dashboard.app.test_client().post(
         "/api/guard/throttle", json={"action": "apply", "domain": "x.example.com", "rate": 512}
@@ -445,6 +489,23 @@ def test_apply_preflights_state_writability_before_engine(monkeypatch):
     assert resp.status_code == 409
     assert resp.get_json()["ok"] is False
     assert calls["apply"] == []  # движок НЕ зван
+
+
+def test_apply_preflight_real_write_failure_blocks_before_engine(monkeypatch):
+    """Issue #68: readable state != writable state; save-path failure blocks before apply."""
+    dashboard = _fresh_dashboard(monkeypatch)
+    calls = _spy_engine(dashboard, monkeypatch)
+    _install_lease(dashboard, monkeypatch)
+    monkeypatch.setattr(dashboard.local_state, "load_state_checked", lambda path=None: ({}, True))
+    monkeypatch.setattr(dashboard.local_state, "preflight_state_write", lambda path=None: False, raising=False)
+
+    resp = dashboard.app.test_client().post(
+        "/api/guard/throttle", json={"action": "apply", "domain": "x.example.com", "rate": 512}
+    )
+
+    assert resp.status_code == 409
+    assert resp.get_json()["ok"] is False
+    assert calls["apply"] == []
 
 
 def test_clear_cancelled_keeps_lease(monkeypatch):
@@ -558,8 +619,44 @@ def test_get_guard_exposes_active_throttle_without_token(monkeypatch):
 
     body = dashboard.app.test_client().get("/api/guard").get_json()
 
-    assert body["throttle"] == {"domain": "x.example.com", "rate": 512, "applied_at": 1000}
+    assert body["throttle"] == {
+        "domain": "x.example.com",
+        "rate": 512,
+        "applied_at": 1000,
+        "needs_cleanup": False,
+        "cleanup_persisted": False,
+    }
     # Токен pf enable-ref наружу НЕ отдаётся.
+    assert "token" not in body["throttle"]
+
+
+def test_get_guard_exposes_cleanup_lease_as_cleanup_required(monkeypatch):
+    dashboard = _fresh_dashboard(monkeypatch)
+    monkeypatch.setattr(
+        dashboard.local_state, "traffic_guard_config",
+        lambda **kw: {"mode": "off", "domains": {}, "valid": True, "errors": []},
+    )
+    monkeypatch.setattr(dashboard, "probe_traffic_guard", lambda **kw: {"status": "ok", "rule_count": 0})
+    monkeypatch.setattr(
+        dashboard.local_state, "load_active_throttle",
+        lambda path=None: {
+            "domain": "x.example.com",
+            "rate": 512,
+            "token": "9",
+            "applied_at": 1000,
+            "needs_cleanup": True,
+        },
+    )
+
+    body = dashboard.app.test_client().get("/api/guard").get_json()
+
+    assert body["throttle"] == {
+        "domain": "x.example.com",
+        "rate": 512,
+        "applied_at": 1000,
+        "needs_cleanup": True,
+        "cleanup_persisted": True,
+    }
     assert "token" not in body["throttle"]
 
 
@@ -591,3 +688,26 @@ def test_apply_success_returns_public_throttle_without_token(monkeypatch):
     assert "token" not in body["throttle"]
     # token движка наружу не течёт и в самом ответе apply.
     assert "token" not in body
+
+
+def test_apply_cleanup_lease_persist_failure_returns_no_synthetic_throttle(monkeypatch):
+    dashboard = _fresh_dashboard(monkeypatch)
+    _spy_engine(
+        dashboard, monkeypatch,
+        apply_result={"ok": False, "cancelled": False, "rc": 1, "out": "", "err": "boom",
+                      "timeout": False, "token": "7"},
+    )
+    _install_lease(dashboard, monkeypatch)
+    monkeypatch.setattr(
+        dashboard.local_state, "save_active_throttle", lambda entry, path=None, needs_cleanup=False: None
+    )
+
+    resp = dashboard.app.test_client().post(
+        "/api/guard/throttle", json={"action": "apply", "domain": "x.example.com", "rate": 512}
+    )
+
+    body = resp.get_json()
+    assert resp.status_code == 500
+    assert body["needs_cleanup"] is True
+    assert body["cleanup_persisted"] is False
+    assert body["throttle"] is None

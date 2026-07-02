@@ -5,6 +5,7 @@ Path по умолчанию — рядом с модулем (не cwd), что
 Каждая public функция принимает path= для тестов (tmp_path fixture).
 """
 import json
+import os
 import re
 import socket
 from pathlib import Path
@@ -458,7 +459,10 @@ def save_state(state, path=None):
         p.parent.mkdir(parents=True, exist_ok=True)
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
         tmp.replace(p)  # atomic rename
+        _fsync_parent_dir(p)
     except (OSError, TypeError, ValueError):
         try:
             tmp.unlink(missing_ok=True)
@@ -466,6 +470,34 @@ def save_state(state, path=None):
             pass
         return None
     return state
+
+
+def _fsync_parent_dir(path):
+    """Best-effort fsync каталога после atomic rename; не все FS это поддерживают."""
+    try:
+        fd = os.open(path.parent, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def preflight_state_write(path=None):
+    """Проверить реальный atomic-write путь для state до privileged throttle apply.
+
+    load_state_checked() доказывает только parse/read. Для throttle этого мало:
+    pf enable-ref нельзя создавать, пока не доказано, что тот же save_state path
+    способен записать recoverable lease. Под dashboard mutation-lock делаем no-op
+    rewrite текущего state через точный save_state.
+    """
+    state, readable = load_state_checked(path)
+    if not readable:
+        return False
+    return save_state(state, path) is not None
 
 
 def _copy_default():
