@@ -201,7 +201,6 @@
         guard_empty: "No domain rules yet — add one below.",
         guard_domain_ph: "example.com",
         guard_help: "Exact domain plus its subdomains are matched (example.com also covers www.example.com). Only block and allow are available in v1.",
-        guard_counts: "{0} blocked · {1} allowed · {2} rules",
         guard_saved: "Traffic Guard saved", guard_save_failed: "Failed to save Traffic Guard: {0}",
         guard_invalid: "Traffic Guard rejected: {0}", guard_conflict_hint: "Fix conflicting block/allow rules and retry.",
         guard_dup_domain: "Duplicate domain: {0}", guard_no_domain: "Enter a domain first.",
@@ -252,7 +251,6 @@
         guard_empty: "Правил ещё нет — добавьте домен ниже.",
         guard_domain_ph: "example.com",
         guard_help: "Совпадает точный домен и его поддомены (example.com покрывает и www.example.com). В v1 доступны только block и allow.",
-        guard_counts: "блок: {0} · разрешено: {1} · правил: {2}",
         guard_saved: "Traffic Guard сохранён", guard_save_failed: "Не удалось сохранить Traffic Guard: {0}",
         guard_invalid: "Traffic Guard отклонён: {0}", guard_conflict_hint: "Исправьте конфликт block/allow и повторите.",
         guard_dup_domain: "Домен повторяется: {0}", guard_no_domain: "Сначала введите домен.",
@@ -303,7 +301,6 @@
         guard_empty: "暂无域名规则 — 在下方添加。",
         guard_domain_ph: "example.com",
         guard_help: "匹配精确域名及其子域名（example.com 也涵盖 www.example.com）。v1 仅支持拦截与放行。",
-        guard_counts: "拦截 {0} · 放行 {1} · 规则 {2}",
         guard_saved: "流量守卫已保存", guard_save_failed: "保存流量守卫失败：{0}",
         guard_invalid: "流量守卫被拒绝：{0}", guard_conflict_hint: "请修复冲突的拦截/放行规则后重试。",
         guard_dup_domain: "域名重复：{0}", guard_no_domain: "请先输入域名。",
@@ -1110,6 +1107,21 @@
       if (addBtn) {
         if (mutationInFlight()) { toast(t('action_in_progress'), 'warn'); return; }
         readGuardRowsFromDom();
+        // Не плодим пустые строки: если последняя ещё не заполнена — подсказать, а не добавлять.
+        var last = GUARD_MODEL.rows[GUARD_MODEL.rows.length - 1];
+        if (last && !(last.domain || '').trim()) {
+          toast(t('guard_no_domain'), 'warn');
+          return;
+        }
+        // Предупредить о дубликате домена: при save он молча схлопнется (последняя политика победит).
+        var seen = {}, dup = '';
+        GUARD_MODEL.rows.forEach(function (row) {
+          var d = (row.domain || '').trim().toLowerCase();
+          if (!d) return;
+          if (seen[d]) dup = dup || d;
+          seen[d] = true;
+        });
+        if (dup) toast(t('guard_dup_domain', dup), 'warn');
         GUARD_MODEL.rows.push({ domain: '', policy: 'block' });
         GUARD_DIRTY = true;
         renderGuard();
