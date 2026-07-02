@@ -12,6 +12,9 @@ import local_state
 
 
 HOT_ROUTES_UPDATE_THROTTLE_SEC = 60.0
+# Ниже секунды reserve-then-parse/write окно может стать due до записи cursor.
+# Для observe-only probe это не нужно: 1s закрывает ручные subsecond misconfig.
+HOT_ROUTES_MIN_UPDATE_INTERVAL_SEC = 1.0
 
 __all__ = [
     "probe_hot_routes",
@@ -59,6 +62,9 @@ def _options(state):
     raw = state.get("hot_routes") if isinstance(state, dict) else {}
     if not isinstance(raw, dict):
         raw = {}
+    update_interval = _safe_positive_float(
+        raw.get("update_interval_sec"), HOT_ROUTES_UPDATE_THROTTLE_SEC
+    )
     return {
         "enabled": raw.get("enabled") is True,
         "top_n": _safe_positive_int(raw.get("top_n"), hot_routes.DEFAULT_TOP_N),
@@ -66,8 +72,8 @@ def _options(state):
         "bucket_size": _safe_positive_int(
             raw.get("bucket_seconds"), hot_routes.DEFAULT_BUCKET_SECONDS
         ),
-        "update_interval": _safe_positive_float(
-            raw.get("update_interval_sec"), HOT_ROUTES_UPDATE_THROTTLE_SEC
+        "update_interval": max(
+            update_interval, HOT_ROUTES_MIN_UPDATE_INTERVAL_SEC
         ),
     }
 
