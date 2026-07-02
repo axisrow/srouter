@@ -449,6 +449,254 @@ def test_api_node_select_apply_failure_returns_500(monkeypatch):
     assert response.get_json() == {"ok": False, "active": "sg-1", "step": "restart"}
 
 
+# ============================ split-route auto-sync (issue #21) ============================
+# Реальный route/osascript НЕ зовётся: sys_probe.run замокан, argv проверяется на константы.
+
+
+def _install_gateway(monkeypatch, gateway="192.0.2.1"):
+    """Фейковый srouter_config для ленивого import в node_selector._gateway_literal."""
+    cfg = types.ModuleType("srouter_config")
+    cfg.GATEWAY = gateway
+    monkeypatch.setitem(sys.modules, "srouter_config", cfg)
+    return cfg
+
+
+def _install_route_runner(monkeypatch, result=None):
+    """Замокать sys_probe.run; вернуть список вызванных (argv, timeout)."""
+    calls = []
+
+    def fake_run(cmd, timeout):
+        calls.append((list(cmd), timeout))
+        return result if result is not None else {"rc": 0, "out": "", "err": "", "timeout": False}
+
+    monkeypatch.setattr(sys_probe, "run", fake_run)
+    return calls
+
+
+def _apply_switch(monkeypatch, state_path, tmp_path, *, name="hk-1"):
+    """Прогнать успешный two-phase switch (write_config/restart замоканы на success)."""
+    monkeypatch.setattr(gen_xray_config, "write_config", lambda *args, **kwargs: True)
+    import node_selector
+
+    return node_selector.select_node(
+        name,
+        enabled_names={"sg-1", "hk-1"},
+        runner=lambda cmd, timeout: {"rc": 0, "out": "", "err": "", "timeout": False},
+        state_path=state_path,
+        config_path=tmp_path / "config.json",
+    )
+
+
+def _route_argv_fragments(calls):
+    """Собрать shell-фрагменты (третий элемент osascript-argv) всех route-вызовов."""
+    return [cmd[2] for cmd, _timeout in calls]
+
+
+def test_route_sync_flag_absent_makes_zero_privileged_calls(tmp_path, monkeypatch):
+    """Флаг отсутствует -> route-sync не зван вообще; поведение как раньше."""
+    import node_selector
+
+    state_path = tmp_path / "srouter.local.json"
+    _write_state(state_path, _state())  # без auto_route_sync
+    _install_gateway(monkeypatch)
+    calls = _install_route_runner(monkeypatch)
+
+    out = _apply_switch(monkeypatch, state_path, tmp_path)
+
+    assert out["ok"] is True
+    assert out["step"] == "done"
+    assert out["active"] == "hk-1"
+    assert "route_sync" not in out
+    assert calls == []
+
+
+@pytest.mark.parametrize("flag", [False, "true", 1, None, "yes"])
+def test_route_sync_only_explicit_true_enables(tmp_path, monkeypatch, flag):
+    """Только строгий boolean True включает sync; truthy-суррогаты не считаются."""
+    import node_selector
+
+    state_path = tmp_path / "srouter.local.json"
+    state = _state()
+    state["auto_route_sync"] = flag
+    _write_state(state_path, state)
+    _install_gateway(monkeypatch)
+    calls = _install_route_runner(monkeypatch)
+
+    out = _apply_switch(monkeypatch, state_path, tmp_path)
+
+    assert out["ok"] is True
+    assert "route_sync" not in out
+    assert calls == []
+
+
+def test_route_sync_enabled_adds_new_and_deletes_old_from_constants(tmp_path, monkeypatch):
+    """Флаг включён: commit узла -> delete старого route + add нового, argv из констант+IP."""
+    import node_selector
+
+    state_path = tmp_path / "srouter.local.json"
+    state = _state(active="sg-1")
+    state["auto_route_sync"] = True
+    _write_state(state_path, state)
+    _install_gateway(monkeypatch, gateway="192.0.2.1")
+    calls = _install_route_runner(monkeypatch)
+
+    out = _apply_switch(monkeypatch, state_path, tmp_path, name="hk-1")
+
+    assert out["ok"] is True
+    assert out["active"] == "hk-1"
+    sync = out["route_sync"]
+    assert sync["enabled"] is True
+    assert sync["removed"]["ok"] is True
+    assert sync["added"]["ok"] is True
+
+    # delete прежнего (sg-1: 203.0.113.10) ДО add нового (hk-1: 203.0.113.20).
+    assert len(calls) == 2
+    delete_cmd, delete_timeout = calls[0]
+    add_cmd, add_timeout = calls[1]
+    assert delete_timeout == 60 and add_timeout == 60
+    assert delete_cmd[:2] == [node_selector.OSASCRIPT, "-e"]
+    assert add_cmd[:2] == [node_selector.OSASCRIPT, "-e"]
+    assert f"{node_selector.ROUTE} -n delete -host 203.0.113.10" in delete_cmd[2]
+    assert f"{node_selector.ROUTE} -n add -host 203.0.113.20 192.0.2.1" in add_cmd[2]
+    # do shell script + admin privileges — точный канон моста.
+    for cmd, _timeout in calls:
+        assert cmd[2].startswith('do shell script "')
+        assert "with administrator privileges" in cmd[2]
+
+
+def test_route_sync_reports_but_never_makes_switch_fail_on_invalid_new_ip(tmp_path, monkeypatch):
+    """Невалидный/пустой route_ip нового узла -> add reject, node-switch всё равно успешен."""
+    import node_selector
+
+    state_path = tmp_path / "srouter.local.json"
+    state = _state(active="sg-1")
+    state["auto_route_sync"] = True
+    _write_state(state_path, state)
+    _install_gateway(monkeypatch)
+    calls = _install_route_runner(monkeypatch)
+
+    # hk-1 не даёт валидного IP (детерминированно, без реального DNS): resolve -> hostname.
+    real_resolve = local_state.resolve_route_ip
+
+    def fake_resolve(node, path=None):
+        if isinstance(node, dict) and node.get("name") == "hk-1":
+            return "node.example.test"  # не IP -> _ip_literal reject
+        return real_resolve(node, path=path)
+
+    monkeypatch.setattr(local_state, "resolve_route_ip", fake_resolve)
+
+    out = _apply_switch(monkeypatch, state_path, tmp_path, name="hk-1")
+
+    assert out["ok"] is True  # node-switch успешен несмотря на route-sync reject
+    assert out["active"] == "hk-1"
+    sync = out["route_sync"]
+    assert sync["added"] is None
+    assert "route_ip" in sync["error"]
+    # add нового не вызывался; мог быть только delete прежнего (валидный sg-1) — но не add.
+    assert all("-n add -host" not in frag for frag in _route_argv_fragments(calls))
+
+
+def test_route_sync_cancelled_reports_but_switch_succeeds(tmp_path, monkeypatch):
+    """osascript отмена (-128) route-синка -> node-switch успешен, route_sync с cancelled."""
+    import node_selector
+
+    state_path = tmp_path / "srouter.local.json"
+    state = _state(active="sg-1")
+    state["auto_route_sync"] = True
+    _write_state(state_path, state)
+    _install_gateway(monkeypatch)
+    _install_route_runner(monkeypatch, {"rc": -128, "out": "", "err": "User canceled.", "timeout": False})
+
+    out = _apply_switch(monkeypatch, state_path, tmp_path, name="hk-1")
+
+    assert out["ok"] is True
+    assert out["active"] == "hk-1"
+    sync = out["route_sync"]
+    assert sync["removed"]["cancelled"] is True
+    assert sync["added"]["cancelled"] is True
+    assert sync["added"]["ok"] is False
+
+
+def test_route_sync_same_old_and_new_ip_skips_delete(tmp_path, monkeypatch):
+    """old_ip == new_ip -> без delete дубликата; только add нового route."""
+    import node_selector
+
+    state_path = tmp_path / "srouter.local.json"
+    state = _state(active="sg-1")
+    state["auto_route_sync"] = True
+    # hk-1 делим route_ip с sg-1 (оба 203.0.113.10) — delete прежнего сносил бы новый маршрут.
+    state["nodes"][1]["route_ip"] = "203.0.113.10"
+    _write_state(state_path, state)
+    _install_gateway(monkeypatch)
+    calls = _install_route_runner(monkeypatch)
+
+    out = _apply_switch(monkeypatch, state_path, tmp_path, name="hk-1")
+
+    assert out["ok"] is True
+    sync = out["route_sync"]
+    assert sync["removed"] is None  # delete пропущен: old == new
+    assert sync["added"]["ok"] is True
+    assert len(calls) == 1
+    assert f"{node_selector.ROUTE} -n add -host 203.0.113.10 192.0.2.1" in calls[0][0][2]
+
+
+def test_route_sync_defensive_when_runner_raises(tmp_path, monkeypatch):
+    """sys_probe.run бросает -> route-sync ловит, node-switch остаётся успешным."""
+    import node_selector
+
+    state_path = tmp_path / "srouter.local.json"
+    state = _state(active="sg-1")
+    state["auto_route_sync"] = True
+    _write_state(state_path, state)
+    _install_gateway(monkeypatch)
+
+    def boom(cmd, timeout):
+        raise RuntimeError("osascript exploded")
+
+    monkeypatch.setattr(sys_probe, "run", boom)
+
+    out = _apply_switch(monkeypatch, state_path, tmp_path, name="hk-1")
+
+    assert out["ok"] is True
+    assert out["active"] == "hk-1"
+    assert out["route_sync"]["error"] == "osascript exploded"
+
+
+def test_route_sync_missing_gateway_rejects_add_switch_succeeds(tmp_path, monkeypatch):
+    """srouter_config недоступен/битый GATEWAY -> add reject, node-switch успешен."""
+    import node_selector
+
+    state_path = tmp_path / "srouter.local.json"
+    state = _state(active="sg-1")
+    state["auto_route_sync"] = True
+    _write_state(state_path, state)
+    monkeypatch.delitem(sys.modules, "srouter_config", raising=False)
+    _install_gateway(monkeypatch, gateway="not-an-ip")  # невалидный -> _gateway_literal вернёт ""
+    calls = _install_route_runner(monkeypatch)
+
+    out = _apply_switch(monkeypatch, state_path, tmp_path, name="hk-1")
+
+    assert out["ok"] is True
+    sync = out["route_sync"]
+    assert sync["added"] is None
+    assert "GATEWAY" in sync["error"]
+    assert all("-n add -host" not in frag for frag in _route_argv_fragments(calls))
+
+
+def test_route_sync_ip_literal_rejects_scoped_and_noncanonical():
+    """_ip_literal (канон dashboard_common) режет scoped-zone и non-canonical формы."""
+    import node_selector
+
+    assert node_selector._ip_literal("203.0.113.44") is True
+    assert node_selector._ip_literal("2001:db8::1") is True
+    assert node_selector._ip_literal("fe80::1%en0") is False
+    assert node_selector._ip_literal("fe80::1%en0;touch x") is False
+    assert node_selector._ip_literal("2001:DB8::1") is False
+    assert node_selector._ip_literal("2001:db8:0:0:0:0:0:1") is False
+    assert node_selector._ip_literal("") is False
+    assert node_selector._ip_literal(None) is False
+
+
 def test_api_nodes_ranking_returns_recommendation_from_snapshot(monkeypatch):
     dashboard = _fresh_dashboard(monkeypatch)
     monkeypatch.setattr(dashboard, "probe_nodes_snapshot", lambda: _metrics())

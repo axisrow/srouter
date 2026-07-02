@@ -7,16 +7,25 @@ render-pending + restart gate.
 from __future__ import annotations
 
 import copy
+import ipaddress
 import subprocess
 import threading
 
 import gen_xray_config
 import local_state
+import sys_probe
 
 
 BREW = "/opt/homebrew/bin/brew"
 XRAY_CONFIG_PATH = "/opt/homebrew/etc/xray/config.json"
 XRAY_RESTART_CMD = [BREW, "services", "restart", "xray"]
+
+# Privileged split-route мост (issue #21). Пути — захардкоженные факты окружения,
+# как ROUTE/OSASCRIPT в dashboard_common: launchd/GUI PATH их не содержит. Дублируем
+# литералы вместо import dashboard (цикл node_selector<->dashboard запрещён каноном).
+ROUTE = "/sbin/route"
+OSASCRIPT = "/usr/bin/osascript"
+_ROUTE_SYNC_TIMEOUT_SEC = 60
 
 W_TPUT, W_LAT, W_LOSS = 0.45, 0.35, 0.20
 SWITCH_MARGIN = 0.05
@@ -220,6 +229,131 @@ def _pending_active_hook(pending_name, state_path):
     return hook
 
 
+# ============================ split-route auto-sync (issue #21) ============================
+# Opt-in: при commit нового active node добавить route до нового узла и снять route
+# прежнего, чтобы трафик до самого узла шёл мимо VPN. ПО УМОЛЧАНИЮ ВЫКЛЮЧЕНО —
+# включается флагом "auto_route_sync": true в srouter.local.json (читаем через
+# load_state, БЕЗ правок local_state). Флаг off/отсутствует -> ноль privileged-вызовов.
+#
+# Privileged-мост — точная копия канона dashboard._sudo_route_ip: shell_cmd ТОЛЬКО из
+# констант (ROUTE/GATEWAY/флаги) + validated IP (_ip_literal-семантика), а исполнение —
+# do shell script ... with administrator privileges через osascript-argv. User-controlled
+# фрагмент в shell не попадает никогда. Импорт dashboard запрещён (цикл), поэтому мост
+# воспроизведён здесь. GATEWAY читается лениво из srouter_config (единственный источник
+# истины физического шлюза, как в dashboard), чтобы import node_selector не тянул его.
+
+
+def _auto_route_sync_enabled(state_path):
+    """True только при явном "auto_route_sync": true в state. Defensive: не бросает."""
+    try:
+        state = local_state.load_state(path=state_path)
+    except Exception:
+        return False
+    return isinstance(state, dict) and state.get("auto_route_sync") is True
+
+
+def _ip_literal(value):
+    """Канон _ip_literal из dashboard_common: только canonical unscoped IP-литералы.
+
+    Значение интерполируется в shell text privileged-команды, поэтому принимаем лишь
+    round-trip-канон: scoped IPv6 zone-id (%) и альтернативные написания reject.
+    """
+    if not isinstance(value, str) or not value:
+        return False
+    if "%" in value:
+        return False
+    try:
+        parsed = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return str(parsed) == value
+
+
+def _route_node_ip(name, state_path):
+    """Валидный route_ip узла по имени или "" (невалидный/пустой/битый). Не бросает."""
+    try:
+        node = local_state.get_node(name, path=state_path)
+        route_ip = local_state.resolve_route_ip(node, path=state_path)
+    except Exception:
+        return ""
+    return route_ip if _ip_literal(route_ip) else ""
+
+
+def _gateway_literal():
+    """Физический шлюз из srouter_config (канон dashboard). Ленивый import: без него
+    import node_selector не должен падать. Возвращает "" если недоступен/невалиден."""
+    try:
+        import srouter_config
+
+        gateway = srouter_config.GATEWAY
+    except Exception:
+        return ""
+    return gateway if _ip_literal(gateway) else ""
+
+
+def _sudo_route_ip(action, route_ip, gateway):
+    """Канон dashboard._sudo_route_ip: shell_cmd из констант + validated IP, osascript-argv.
+
+    ВАЖНО: shell_cmd собран ТОЛЬКО из констант (ROUTE/флаги) и уже-validated route_ip/gateway.
+    User-controlled ввод сюда не попадает. Динамическую команду добавлять только с вайтлистом.
+    """
+    if action == "add":
+        shell_cmd = f"{ROUTE} -n add -host {route_ip} {gateway}"
+    elif action == "remove":
+        shell_cmd = f"{ROUTE} -n delete -host {route_ip}"
+    else:
+        raise ValueError("bad action")  # глубокая защита
+    applescript = f'do shell script "{shell_cmd}" with administrator privileges'
+    return sys_probe.run([OSASCRIPT, "-e", applescript], timeout=_ROUTE_SYNC_TIMEOUT_SEC)
+
+
+def _route_result(r):
+    """Канон dashboard._route_result: нормализовать osascript-результат; -128 => cancelled."""
+    r = r or {}
+    rc = r.get("rc")
+    err = r.get("err") or ""
+    timeout = bool(r.get("timeout"))
+    cancelled = rc == -128 or (rc not in (0, None) and "-128" in err)
+    return {
+        "ok": rc == 0 and not timeout,
+        "cancelled": cancelled,
+        "rc": rc,
+        "out": r.get("out") or "",
+        "err": err,
+        "timeout": timeout,
+    }
+
+
+def _sync_split_route(previous, name, state_path):
+    """Синхронизировать split-route при смене active node. Fail-safe: НИКОГДА не бросает,
+    сбой/отмена НЕ ломают уже применённый node-switch — отчёт возвращается вызывающему.
+
+    Порядок: delete прежнего route -> add нового. Delete первым, чтобы при add==remove
+    (одинаковый route_ip) не снести только что добавленный маршрут; при разных IP порядок
+    не критичен, но delete-then-add убирает окно двойного host-route на один gateway.
+    Прежний route снимается только если он валиден и ОТЛИЧАЕТСЯ от нового (без дублей).
+    """
+    result = {"enabled": True, "removed": None, "added": None}
+    try:
+        gateway = _gateway_literal()
+        new_ip = _route_node_ip(name, state_path)
+        old_ip = _route_node_ip(previous, state_path)
+
+        if old_ip and old_ip != new_ip:
+            result["removed"] = _route_result(_sudo_route_ip("remove", old_ip, gateway))
+
+        if not new_ip:
+            result["error"] = "нет валидного route_ip нового узла"
+            return result
+        if not gateway:
+            result["error"] = "нет валидного GATEWAY в srouter_config"
+            return result
+        result["added"] = _route_result(_sudo_route_ip("add", new_ip, gateway))
+    except Exception as exc:
+        result["error"] = str(exc)
+    return result
+
+
 def select_node(name, *, enabled_names, runner=None, state_path=None, config_path=XRAY_CONFIG_PATH):
     """Безопасно применить ручной active-node выбор. Функция никогда не бросает наружу."""
     with _SELECT_LOCK:
@@ -289,7 +423,14 @@ def _select_node_locked(name, *, enabled_names, runner=None, state_path=None, co
             if not rollback.get("ok"):
                 return _rollback_failed(previous, "commit", rollback, error="active node was not committed")
             return {"ok": False, "active": previous, "step": "commit", "error": "active node was not committed"}
-        return {"ok": True, "active": current, "step": "done"}
+
+        result = {"ok": True, "active": current, "step": "done"}
+        # Opt-in split-route sync ПОСЛЕ успешного commit. Fail-safe: сбой route-синка не
+        # трогает уже применённый node-switch (ok/active/step остаются). Флаг off/отсутствует
+        # -> _sync_split_route не зовётся вовсе (ноль privileged-вызовов) — главная регрессия.
+        if _auto_route_sync_enabled(state_path):
+            result["route_sync"] = _sync_split_route(previous, name, state_path)
+        return result
     except Exception as exc:
         if begun:
             rollback = _rollback(state_path, config_path, runner)
