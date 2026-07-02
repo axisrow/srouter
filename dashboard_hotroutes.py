@@ -141,9 +141,12 @@ def _store_entries(key, updated_at, entries, error=""):
 
 def _update_due(key, now_ts, update_interval):
     with _lock:
-        return _probe_cache.get("key") != key or (
+        due = _probe_cache.get("key") != key or (
             now_ts - float(_probe_cache.get("updated_at") or 0.0) >= update_interval
         )
+        if due:
+            _probe_cache.update(key=key, updated_at=now_ts)
+        return due
 
 
 def probe_hot_routes(state_path=None, cache_path=None, log_path=None, now=None):

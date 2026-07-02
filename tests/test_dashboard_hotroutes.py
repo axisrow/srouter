@@ -1,6 +1,8 @@
 import importlib
 import json
 import sys
+import threading
+import time
 import types
 
 import dashboard_hotroutes
@@ -247,3 +249,85 @@ def test_probe_hot_routes_uses_file_cursor_after_restart(tmp_path):
     )
 
     assert second["domains"] == [{"domain": "a.example", "count": 1}]
+
+
+def test_probe_hot_routes_concurrent_poll_reserves_update_slot(monkeypatch, tmp_path):
+    state_path = tmp_path / "srouter.local.json"
+    cache_path = tmp_path / "srouter.hot_routes.json"
+    log_path = tmp_path / "privoxy.log"
+    _write_state(state_path, {"enabled": True, "update_interval_sec": 60})
+
+    with dashboard_hotroutes._lock:
+        dashboard_hotroutes._probe_cache.update(
+            key=None, updated_at=0.0, entries={}, error=""
+        )
+
+    real_update_cache = dashboard_hotroutes.hot_routes.update_cache
+    parse_entered = threading.Event()
+    release_parse = threading.Event()
+    start = threading.Barrier(3)
+    calls = {"parse": 0, "update": 0}
+    calls_lock = threading.Lock()
+    results = []
+    errors = []
+
+    def fake_parse_new_access_log(path=None, offset=None, inode=None, dev=None):
+        with calls_lock:
+            calls["parse"] += 1
+        parse_entered.set()
+        assert release_parse.wait(timeout=2.0)
+        return {"race.example": 1}, {
+            "log_offset": 1,
+            "log_inode": 2,
+            "log_dev": 3,
+            "log_size": 1,
+        }
+
+    def counting_update_cache(*args, **kwargs):
+        with calls_lock:
+            calls["update"] += 1
+        return real_update_cache(*args, **kwargs)
+
+    monkeypatch.setattr(
+        dashboard_hotroutes.hot_routes,
+        "parse_new_access_log",
+        fake_parse_new_access_log,
+    )
+    monkeypatch.setattr(
+        dashboard_hotroutes.hot_routes,
+        "update_cache",
+        counting_update_cache,
+    )
+
+    def run_probe():
+        try:
+            start.wait(timeout=2.0)
+            results.append(
+                dashboard_hotroutes.probe_hot_routes(
+                    state_path=state_path,
+                    cache_path=cache_path,
+                    log_path=log_path,
+                    now=1000.0,
+                )
+            )
+        except Exception as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=run_probe) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    start.wait(timeout=2.0)
+    assert parse_entered.wait(timeout=2.0)
+    time.sleep(0.05)
+    release_parse.set()
+    for thread in threads:
+        thread.join(timeout=2.0)
+
+    assert errors == []
+    assert len(results) == 2
+    assert calls == {"parse": 1, "update": 1}
+
+    data = json.loads(cache_path.read_text(encoding="utf-8"))
+    assert data["domains"] == [
+        {"domain": "race.example", "count": 1, "last_seen": 1000.0}
+    ]
