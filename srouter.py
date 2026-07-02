@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+from importlib.metadata import PackageNotFoundError, version
 
 from install_lib import (
     LAUNCHAGENT_LABEL,
@@ -88,8 +89,17 @@ def cmd_status(args) -> int:
     return 1
 
 
+def _version_string() -> str:
+    """Версия из метаданных пакета (единственный источник — pyproject.toml)."""
+    try:
+        return version("srouter")
+    except PackageNotFoundError:
+        return "0.0.0+unknown"  # пакет не установлен (запуск из исходников без install)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="srouter", description="Управление локальным дашбордом srouter.")
+    parser.add_argument("--version", action="version", version=f"srouter {_version_string()}")
     sub = parser.add_subparsers(dest="command", required=True)
 
     def add_env_flags(p: argparse.ArgumentParser) -> None:
@@ -106,8 +116,15 @@ def build_parser() -> argparse.ArgumentParser:
         add_env_flags(p)
         p.set_defaults(func=fn)
 
-    p_run = sub.add_parser("run", help="Запустить дашборд в foreground (НЕ демон).")
-    p_run.set_defaults(func=cmd_run)
+    # `stop` — синоним uninstall-apply: выгрузить демон и убрать plist.
+    p_stop = sub.add_parser("stop", help="Синоним uninstall-apply: выгрузить и удалить LaunchAgent.")
+    add_env_flags(p_stop)
+    p_stop.set_defaults(func=cmd_uninstall_apply)
+
+    # `run` и `start` — синонимы: foreground-запуск дашборда (НЕ демон).
+    for name in ("run", "start"):
+        p_run = sub.add_parser(name, help="Запустить дашборд в foreground (НЕ демон).")
+        p_run.set_defaults(func=cmd_run)
     return parser
 
 
