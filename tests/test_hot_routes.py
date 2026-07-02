@@ -9,6 +9,8 @@
 - Privacy: в кэше только hostname + счётчик + timestamp, никаких полных URL/путей.
 """
 import json
+import random
+import string
 from pathlib import Path
 
 import hot_routes
@@ -28,6 +30,11 @@ def _privoxy_line(host, port=443, method="CONNECT", ts="Jul 02 14:00:00.123"):
 def _privoxy_url_line(url, method="GET"):
     """Строка privoxy для не-CONNECT запроса: во втором поле — абсолютный URL."""
     return f'127.0.0.1 - - [Jul 02 14:00:00.000] "{method} {url} HTTP/1.1" 200 1234'
+
+
+def _request_line(method, target):
+    """Строка с произвольным request-target для privacy/security matrix."""
+    return f'127.0.0.1 - - [Jul 02 14:00:00.000] "{method} {target} HTTP/1.1" 200 0'
 
 
 # ============================ parse_access_log ============================
@@ -199,6 +206,106 @@ def test_parse_tail_limits_bytes(tmp_path):
     assert 0 < counts.get("x.example", 0) < 1000
 
 
+def test_target_parser_accept_only_good_matrix_via_cache(tmp_path):
+    """Полная matrix из issue #69: reject не появляется ни в counts, ни в кэше."""
+    rejects = [
+        ("GET", "http://[::1"),
+        ("GET", "http://a℀b/"),
+        ("GET", "SECRET123"),
+        ("GET", "/relative"),
+        ("GET", "*"),
+        ("CONNECT", "SECRET123"),
+        ("CONNECT", "SECRET123:abc"),
+        ("CONNECT", "user:pass"),
+        ("CONNECT", "host"),
+        ("CONNECT", "http://host"),
+        ("CONNECT", "user:pass@host:443"),
+        ("CONNECT", "[dead:beef]:443"),
+        ("CONNECT", "[::::]:443"),
+        ("CONNECT", "[deadbeef]:443"),
+        ("GET", "http://user:pass/path"),
+        ("GET", "http://SECRET123:abc/path"),
+        ("CONNECT", "[fe80::1%X]:443"),
+        ("GET", "http://[fe80::1%25X]/x"),
+        ("GET", "http://[v1.SECRET123]/x"),
+        ("CONNECT", "[v1.SECRET123]:443"),
+    ]
+    accepts = [
+        ("GET", "http://good.example/x"),
+        ("GET", "http://good.example:8080/p?q=1"),
+        ("CONNECT", "host:443"),
+        ("CONNECT", "192.0.2.1:443"),
+        ("CONNECT", "[::1]:443"),
+        ("CONNECT", "[2001:db8::1]:443"),
+    ]
+    log = tmp_path / "privoxy.log"
+    log.write_text(
+        "\n".join(_request_line(method, target) for method, target in rejects + accepts),
+        encoding="utf-8",
+    )
+
+    counts = hot_routes.parse_access_log(str(log))
+    assert counts == {
+        "good.example": 2,
+        "host": 1,
+        "192.0.2.1": 1,
+        "::1": 1,
+        "2001:db8::1": 1,
+    }
+
+    cache = tmp_path / "hot.json"
+    result = hot_routes.update_cache(counts, path=str(cache), now=1000.0)
+    assert result is not None
+    raw = cache.read_text(encoding="utf-8").lower()
+    names = {entry["domain"] for entry in json.loads(raw)["domains"]}
+    assert names == set(counts)
+    for leaked in [
+        "secret123",
+        "user",
+        "pass",
+        "dead:beef",
+        "deadbeef",
+        "fe80",
+        "v1.secret123",
+        "relative",
+    ]:
+        assert leaked not in raw
+
+
+def test_target_parser_fuzz_never_raises_and_outputs_whitelisted(tmp_path):
+    """50k deterministic fuzz: public parse/update не бросают, выход whitelist-only."""
+    rng = random.Random(69)
+    alphabet = string.ascii_letters + string.digits + "-._:@[]/%?#*" + "℀"
+    lines = []
+    for _ in range(50000):
+        method = rng.choice(["GET", "POST", "CONNECT"])
+        token = "".join(rng.choice(alphabet) for _ in range(rng.randint(1, 40)))
+        shape = rng.randrange(5)
+        if shape == 0:
+            target = f"http://{token}/x"
+        elif shape == 1:
+            target = f"http://{token}:443/p?q=1"
+        elif shape == 2 and method == "CONNECT":
+            target = f"{token}:443"
+        elif shape == 3 and method == "CONNECT":
+            target = f"[{token}]:443"
+        else:
+            target = token
+        lines.append(_request_line(method, target))
+
+    log = tmp_path / "privoxy.log"
+    log.write_text("\n".join(lines), encoding="utf-8")
+    counts = hot_routes.parse_access_log(
+        str(log), max_lines=60000, max_bytes=16 * 1024 * 1024
+    )
+    assert all(hot_routes._is_hostname(domain) for domain in counts)
+
+    cache = tmp_path / "hot.json"
+    result = hot_routes.update_cache(counts, path=str(cache), now=1000.0)
+    assert result is not None
+    assert all(hot_routes._is_hostname(entry["domain"]) for entry in result.values())
+
+
 # ============================ update_cache ============================
 def test_update_cache_roundtrip(tmp_path):
     cache = tmp_path / "hot.json"
@@ -260,6 +367,49 @@ def test_update_cache_ignores_non_numeric_count(tmp_path):
     data = json.loads(cache.read_text(encoding="utf-8"))
     names = {e["domain"] for e in data["domains"]}
     assert names == {"a.example"}
+
+
+def test_update_cache_ignores_non_finite_input_counts(tmp_path):
+    """NaN/Infinity на write-boundary отбрасываются до json.dumps."""
+    cache = tmp_path / "hot.json"
+    result = hot_routes.update_cache(
+        {
+            "nan.example": float("nan"),
+            "inf.example": float("inf"),
+            "neg-inf.example": float("-inf"),
+            "good.example": 2,
+        },
+        path=str(cache),
+        now=1000.0,
+    )
+    assert result is not None
+    assert set(result) == {"good.example"}
+    raw = cache.read_text(encoding="utf-8")
+    assert "NaN" not in raw
+    assert "Infinity" not in raw
+
+
+def test_update_cache_ignores_non_finite_crafted_cache_counts(tmp_path):
+    """json.load принимает NaN/Infinity; _load_cache обязан молча отфильтровать."""
+    cache = tmp_path / "hot.json"
+    cache.write_text(
+        """{
+  "domains": [
+    {"domain": "nan.example", "count": NaN, "last_seen": 1000.0},
+    {"domain": "inf.example", "count": Infinity, "last_seen": 1000.0},
+    {"domain": "neg-inf.example", "count": -Infinity, "last_seen": 1000.0},
+    {"domain": "bad_key", "count": 5, "last_seen": 1000.0},
+    {"domain": "good.example", "count": 2, "last_seen": 1000.0}
+  ]
+}""",
+        encoding="utf-8",
+    )
+    result = hot_routes.update_cache({"fresh.example": 1}, path=str(cache), now=2000.0)
+    assert result is not None
+    assert set(result) == {"good.example", "fresh.example"}
+    raw = cache.read_text(encoding="utf-8")
+    assert "NaN" not in raw
+    assert "Infinity" not in raw
 
 
 def test_update_cache_broken_existing_is_replaced(tmp_path):
