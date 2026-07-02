@@ -339,7 +339,151 @@ def test_target_parser_fuzz_never_raises_and_outputs_whitelisted(tmp_path):
     assert all(hot_routes._is_hostname(entry["domain"]) for entry in result.values())
 
 
+# ============================ parse_new_access_log ============================
+def test_parse_new_access_log_reads_only_new_lines(tmp_path):
+    log = tmp_path / "privoxy.log"
+    log.write_text(_privoxy_line("old.example") + "\n", encoding="utf-8")
+
+    counts, cursor = hot_routes.parse_new_access_log(str(log), None, None, None)
+    assert counts == {"old.example": 1}
+
+    with open(log, "a", encoding="utf-8") as f:
+        f.write(_privoxy_line("new.example") + "\n")
+
+    counts, cursor = hot_routes.parse_new_access_log(
+        str(log),
+        cursor["log_offset"],
+        cursor["log_inode"],
+        cursor["log_dev"],
+    )
+    assert counts == {"new.example": 1}
+    assert cursor["log_offset"] == log.stat().st_size
+
+
+def test_parse_new_access_log_size_equal_offset_noop(tmp_path):
+    log = tmp_path / "privoxy.log"
+    log.write_text(_privoxy_line("a.example") + "\n", encoding="utf-8")
+    st = log.stat()
+
+    counts, cursor = hot_routes.parse_new_access_log(
+        str(log), st.st_size, st.st_ino, st.st_dev
+    )
+
+    assert counts == {}
+    assert cursor == {
+        "log_offset": st.st_size,
+        "log_inode": st.st_ino,
+        "log_dev": st.st_dev,
+        "log_size": st.st_size,
+    }
+
+
+def test_parse_new_access_log_rotation_inode_reset(tmp_path):
+    log = tmp_path / "privoxy.log"
+    log.write_text(_privoxy_line("after-rotate.example") + "\n", encoding="utf-8")
+    st = log.stat()
+
+    counts, cursor = hot_routes.parse_new_access_log(
+        str(log), st.st_size, st.st_ino + 1000, st.st_dev
+    )
+
+    assert counts == {"after-rotate.example": 1}
+    assert cursor["log_offset"] == st.st_size
+    assert cursor["log_inode"] == st.st_ino
+
+
+def test_parse_new_access_log_truncate_reset(tmp_path):
+    log = tmp_path / "privoxy.log"
+    log.write_text(
+        _privoxy_line("old.example") + "\n" + _privoxy_line("old.example") + "\n",
+        encoding="utf-8",
+    )
+    old = log.stat()
+    log.write_text(_privoxy_line("after-truncate.example") + "\n", encoding="utf-8")
+    new = log.stat()
+
+    counts, cursor = hot_routes.parse_new_access_log(
+        str(log), old.st_size, new.st_ino, new.st_dev
+    )
+
+    assert counts == {"after-truncate.example": 1}
+    assert cursor["log_offset"] == new.st_size
+
+
+def test_parse_new_access_log_partial_line_no_double_count(tmp_path):
+    log = tmp_path / "privoxy.log"
+    complete = _privoxy_line("complete.example") + "\n"
+    partial = _privoxy_line("partial.example")
+    log.write_text(complete + partial, encoding="utf-8")
+
+    counts, cursor = hot_routes.parse_new_access_log(str(log), None, None, None)
+    assert counts == {"complete.example": 1}
+    assert cursor["log_offset"] == len(complete.encode("utf-8"))
+
+    with open(log, "a", encoding="utf-8") as f:
+        f.write("\n")
+    counts, cursor = hot_routes.parse_new_access_log(
+        str(log),
+        cursor["log_offset"],
+        cursor["log_inode"],
+        cursor["log_dev"],
+    )
+    assert counts == {"partial.example": 1}
+
+    counts, _cursor = hot_routes.parse_new_access_log(
+        str(log),
+        cursor["log_offset"],
+        cursor["log_inode"],
+        cursor["log_dev"],
+    )
+    assert counts == {}
+
+
+def test_parse_new_access_log_first_run_bounded_tail(tmp_path):
+    log = tmp_path / "privoxy.log"
+    old = [_privoxy_line(f"old{i}.example") for i in range(5)]
+    recent = [_privoxy_line("recent1.example"), _privoxy_line("recent2.example")]
+    log.write_text("\n".join(old + recent) + "\n", encoding="utf-8")
+    tail_bytes = len(("\n".join(recent) + "\n").encode("utf-8")) + 1
+
+    counts, cursor = hot_routes.parse_new_access_log(
+        str(log), None, None, None, max_bytes=tail_bytes
+    )
+
+    assert counts == {"recent1.example": 1, "recent2.example": 1}
+    assert cursor["log_offset"] == log.stat().st_size
+    assert all(not name.startswith("old") for name in counts)
+
+
 # ============================ update_cache ============================
+def test_ttl_refresh_loop_regression_static_log_evicts(tmp_path):
+    """Статичный лог не должен освежать last_seen и раздувать count на каждом poll."""
+    log = tmp_path / "privoxy.log"
+    cache = tmp_path / "hot.json"
+    log.write_text(_privoxy_line("stale.example") + "\n", encoding="utf-8")
+
+    counts, cursor = hot_routes.parse_new_access_log(str(log), None, None, None)
+    assert counts == {"stale.example": 1}
+    hot_routes.update_cache(
+        counts, path=str(cache), ttl=100.0, now=1000.0, cursor=cursor
+    )
+
+    counts, cursor = hot_routes.parse_new_access_log(
+        str(log),
+        cursor["log_offset"],
+        cursor["log_inode"],
+        cursor["log_dev"],
+    )
+    assert counts == {}
+    hot_routes.update_cache(
+        counts, path=str(cache), ttl=100.0, now=1201.0, cursor=cursor
+    )
+
+    data = json.loads(cache.read_text(encoding="utf-8"))
+    assert data["domains"] == []
+    assert hot_routes.hot_domains(path=str(cache), ttl=100.0, now=1201.0) == []
+
+
 def test_update_cache_roundtrip(tmp_path):
     cache = tmp_path / "hot.json"
     hot_routes.update_cache({"a.example": 3, "b.example": 1}, path=str(cache), now=1000.0)
@@ -348,16 +492,116 @@ def test_update_cache_roundtrip(tmp_path):
     assert domains["a.example"]["count"] == 3
     assert domains["b.example"]["count"] == 1
     assert domains["a.example"]["last_seen"] == 1000.0
+    assert data["meta"]["schema"] == 2
+    assert data["meta"]["bucket_size"] == hot_routes.DEFAULT_BUCKET_SECONDS
+    assert data["buckets"]["a.example"] == {"0": 3}
 
 
-def test_update_cache_accumulates_counts(tmp_path):
+def test_update_cache_windowed_accumulation(tmp_path):
     cache = tmp_path / "hot.json"
-    hot_routes.update_cache({"a.example": 2}, path=str(cache), now=1000.0)
-    hot_routes.update_cache({"a.example": 3}, path=str(cache), now=2000.0)
+    hot_routes.update_cache(
+        {"a.example": 2}, path=str(cache), ttl=100.0, now=1000.0, bucket_size=10
+    )
+    hot_routes.update_cache(
+        {"a.example": 3}, path=str(cache), ttl=100.0, now=1040.0, bucket_size=10
+    )
     data = json.loads(cache.read_text(encoding="utf-8"))
     domains = {e["domain"]: e for e in data["domains"]}
     assert domains["a.example"]["count"] == 5
-    assert domains["a.example"]["last_seen"] == 2000.0
+    assert domains["a.example"]["last_seen"] == 1040.0
+
+    hot_routes.update_cache(
+        {"a.example": 4}, path=str(cache), ttl=100.0, now=1120.0, bucket_size=10
+    )
+    data = json.loads(cache.read_text(encoding="utf-8"))
+    domains = {e["domain"]: e for e in data["domains"]}
+    assert domains["a.example"]["count"] == 7
+    assert data["buckets"]["a.example"] == {"1040": 3, "1120": 4}
+
+
+def test_update_cache_sliding_window_forgets_old(tmp_path):
+    cache = tmp_path / "hot.json"
+    hot_routes.update_cache(
+        {"old.example": 2}, path=str(cache), ttl=50.0, now=1000.0, bucket_size=10
+    )
+    hot_routes.update_cache({}, path=str(cache), ttl=50.0, now=1061.0, bucket_size=10)
+
+    data = json.loads(cache.read_text(encoding="utf-8"))
+    assert data["domains"] == []
+    assert data["buckets"] == {}
+
+
+def test_update_cache_sliding_window_keeps_fresh_bucket(tmp_path):
+    cache = tmp_path / "hot.json"
+    hot_routes.update_cache(
+        {"a.example": 2}, path=str(cache), ttl=50.0, now=1000.0, bucket_size=10
+    )
+    hot_routes.update_cache(
+        {"a.example": 3}, path=str(cache), ttl=50.0, now=1040.0, bucket_size=10
+    )
+    hot_routes.update_cache({}, path=str(cache), ttl=50.0, now=1051.0, bucket_size=10)
+
+    data = json.loads(cache.read_text(encoding="utf-8"))
+    domains = {e["domain"]: e for e in data["domains"]}
+    assert domains["a.example"]["count"] == 3
+    assert data["buckets"]["a.example"] == {"1040": 3}
+
+
+def test_update_cache_migrates_legacy_flat_cache(tmp_path):
+    cache = tmp_path / "hot.json"
+    cache.write_text(
+        json.dumps(
+            {
+                "domains": [
+                    {"domain": "legacy.example", "count": 5, "last_seen": 1000.0}
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = hot_routes.update_cache(
+        {}, path=str(cache), ttl=100.0, now=1050.0, bucket_size=10
+    )
+
+    assert result is not None
+    data = json.loads(cache.read_text(encoding="utf-8"))
+    assert data["meta"]["schema"] == 2
+    assert data["domains"] == [
+        {"domain": "legacy.example", "count": 5, "last_seen": 1000.0}
+    ]
+    assert data["buckets"] == {"legacy.example": {"1000": 5}}
+
+
+def test_update_cache_meta_roundtrip_from_cursor(tmp_path):
+    log = tmp_path / "privoxy.log"
+    cache = tmp_path / "hot.json"
+    log.write_text(_privoxy_line("meta.example") + "\n", encoding="utf-8")
+    counts, cursor = hot_routes.parse_new_access_log(str(log), None, None, None)
+
+    hot_routes.update_cache(
+        counts,
+        path=str(cache),
+        now=1000.0,
+        bucket_size=60,
+        cursor=cursor,
+    )
+
+    data = json.loads(cache.read_text(encoding="utf-8"))
+    assert data["meta"] == {
+        "log_offset": cursor["log_offset"],
+        "log_inode": cursor["log_inode"],
+        "log_dev": cursor["log_dev"],
+        "log_size": cursor["log_size"],
+        "bucket_size": 60,
+        "schema": 2,
+    }
+    assert hot_routes.load_cursor(str(cache)) == {
+        "log_offset": cursor["log_offset"],
+        "log_inode": cursor["log_inode"],
+        "log_dev": cursor["log_dev"],
+        "log_size": cursor["log_size"],
+    }
 
 
 def test_update_cache_ttl_eviction(tmp_path):
@@ -476,8 +720,18 @@ def test_update_cache_non_numeric_ttl_top_n_does_not_raise(tmp_path):
     cache = tmp_path / "hot.json"
     hot_routes.update_cache({"a.example": 1}, path=str(cache), now=1000.0)
     # существующий кэш есть -> путь ts-ttl / срез реально исполняется
-    assert hot_routes.update_cache({"b.example": 1}, path=str(cache), ttl="week", now=2000.0) is None
-    assert hot_routes.update_cache({"b.example": 1}, path=str(cache), top_n="ten", now=2000.0) is None
+    assert (
+        hot_routes.update_cache(
+            {"b.example": 1}, path=str(cache), ttl="week", now=2000.0
+        )
+        is None
+    )
+    assert (
+        hot_routes.update_cache(
+            {"b.example": 1}, path=str(cache), top_n="ten", now=2000.0
+        )
+        is None
+    )
 
 
 # ============================ hot_domains ============================
@@ -536,12 +790,17 @@ def test_cache_contains_only_hostnames(tmp_path):
     data = json.loads(raw)
     for entry in data["domains"]:
         assert set(entry.keys()) == {"domain", "count", "last_seen"}
+    assert set(data["buckets"]) == {"example.com"}
+    assert "SECRET123" not in json.dumps(data["buckets"])
+    assert "/secret/path" not in json.dumps(data["buckets"])
 
 
 def test_default_constants_present():
     """Публичные дефолты существуют (TTL/top-N/пути) — контракт для интеграции."""
     assert isinstance(hot_routes.DEFAULT_TTL_SECONDS, (int, float))
     assert isinstance(hot_routes.DEFAULT_TOP_N, int)
+    assert isinstance(hot_routes.DEFAULT_BUCKET_SECONDS, int)
     assert hot_routes.DEFAULT_TOP_N > 0
+    assert hot_routes.DEFAULT_BUCKET_SECONDS > 0
     assert isinstance(hot_routes._DEFAULT_CACHE_PATH, Path)
     assert isinstance(hot_routes._DEFAULT_LOG_PATH, Path)
