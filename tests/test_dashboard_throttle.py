@@ -461,6 +461,11 @@ def test_apply_save_fail_rollback_cancel_persists_cleanup_lease(monkeypatch):
     assert body["ok"] is False
     assert body.get("needs_cleanup") is True
     assert "rollback" in body["err"].lower() or "cancel" in body["err"].lower()
+    assert body["throttle"]["domain"] == "x.example.com"
+    assert body["throttle"]["rate"] == 512
+    assert body["throttle"]["needs_cleanup"] is True
+    assert body["throttle"]["cleanup_persisted"] is True
+    assert "token" not in body["throttle"]
     # rollback зван с token, но cancel — token НЕ освобождён.
     assert calls["clear"] == ["5"]
     # Token recoverable: cleanup-lease персистится повторной попыткой.

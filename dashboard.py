@@ -649,6 +649,7 @@ def _persist_active_or_cleanup(body, domain, rate, token):
         )
         body["needs_cleanup"] = True
         body["cleanup_persisted"] = cleanup is not None
+        body["throttle"] = _public_throttle(cleanup) if cleanup else None
     return jsonify(body), 500
 
 
