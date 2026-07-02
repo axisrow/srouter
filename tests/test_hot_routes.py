@@ -85,6 +85,10 @@ _MATRIX_REJECT = [
     ("CONNECT", "host"),                    # без порта
     ("CONNECT", "http://host"),             # absolute URL в CONNECT — malformed
     ("CONNECT", "user:pass@host:443"),      # userinfo в authority
+    ("CONNECT", "[dead:beef]:443"),         # мусорный IPv6 (loose-regex пропускал)
+    ("CONNECT", "[abc:def]:443"),           # не-hex вне диапазона -> невалиден
+    ("CONNECT", "[::::]:443"),              # лишние ':' -> невалидный IPv6
+    ("CONNECT", "[deadbeef]:443"),          # без ':' -> не IPv6-литерал
 ]
 _MATRIX_ACCEPT = [
     ("GET", "http://good.example/x", "good.example"),
@@ -124,6 +128,45 @@ def test_parse_matrix_reject_does_not_poison_valid(tmp_path):
     log = tmp_path / "privoxy.log"
     log.write_text("\n".join(lines), encoding="utf-8")
     assert hot_routes.parse_access_log(str(log)) == {"good.example": 1}
+
+
+def test_ipv6_garbage_never_reaches_cache(tmp_path):
+    """End-to-end через ПУБЛИЧНЫЕ parse_access_log + update_cache: мусорный
+    IPv6-литерал не попадает в кэш (loose-regex его пропускал бы как host).
+    Валидный canonical IPv6 при этом сохраняется."""
+    garbage = ["[dead:beef]:443", "[abc:def]:443", "[::::]:443", "[deadbeef]:443"]
+    lines = [f'127.0.0.1 - - [ts] "CONNECT {t} HTTP/1.1" 200 0' for t in garbage]
+    lines.append('127.0.0.1 - - [ts] "CONNECT [2001:db8::1]:443 HTTP/1.1" 200 0')
+    log = tmp_path / "privoxy.log"
+    log.write_text("\n".join(lines), encoding="utf-8")
+
+    counts = hot_routes.parse_access_log(str(log))
+    assert counts == {"2001:db8::1": 1}
+
+    cache = tmp_path / "hot.json"
+    hot_routes.update_cache(counts, path=str(cache), now=1000.0)
+    raw = cache.read_text(encoding="utf-8")
+    for bad in ("dead:beef", "::::", "deadbeef", "abc:def"):
+        assert bad not in raw
+    assert hot_routes.hot_domains(path=str(cache), now=1000.0) == ["2001:db8::1"]
+
+
+def test_ipv6_garbage_key_rejected_on_read(tmp_path):
+    """Write/read симметрия на СТРОГОЙ проверке: битый IPv6-ключ, даже если он уже
+    в файле кэша, отвергается при чтении (_is_hostname через ipaddress)."""
+    cache = tmp_path / "hot.json"
+    cache.write_text(
+        json.dumps(
+            {
+                "domains": [
+                    {"domain": "::::", "count": 9, "last_seen": 1000.0},
+                    {"domain": "good.example", "count": 1, "last_seen": 1000.0},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert hot_routes.hot_domains(path=str(cache), now=1000.0) == ["good.example"]
 
 
 def test_parse_userinfo_token_never_leaks(tmp_path):

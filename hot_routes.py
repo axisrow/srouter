@@ -25,6 +25,7 @@ xray в проекте по умолчанию access-лог не пишет (lo
 temp-файл рядом + `os.replace` (atomic rename); при сбое tmp подчищается, а уже
 существующий валидный кэш остаётся нетронутым.
 """
+import ipaddress
 import json
 import re
 from pathlib import Path
@@ -49,22 +50,38 @@ _DEFAULT_MAX_BYTES = 4 * 1024 * 1024  # 4 MiB хвоста
 # в authority значит только разделитель порта или IPv6 — их разбираем явно, а не
 # пропускаем в host. Так `SECRET123`/`user`/`a:b` не могут притвориться доменом.
 _REGNAME_RE = re.compile(r"^[A-Za-z0-9._-]+\Z")
-# IPv6-литерал внутри скобок: только hex-группы и двоеточия (canonical `[...]`).
-_IPV6_INNER_RE = re.compile(r"^[0-9A-Fa-f:]+\Z")
 # Порт authority-form: непустой, строго числовой (RFC 3986 port = *DIGIT, но для
 # CONNECT-цели пустой порт бессмысленен — требуем ≥1 цифру).
 _PORT_RE = re.compile(r"^[0-9]+\Z")
 
 
+def _is_ipv6_literal(value):
+    """РЕАЛЬНАЯ проверка IPv6-литерала через ipaddress, не loose-regex.
+
+    hex+`:`-regex принимал бы мусор (`dead:beef`, `::::`, `deadbeef` — невалидны
+    по стандарту, но попадали бы в counts/кэш). Единственный IPv6-гейт в модуле —
+    ipaddress.IPv6Address под try/except, чтобы битый литерал не притворялся host.
+    """
+    if not isinstance(value, str):
+        return False
+    try:
+        ipaddress.IPv6Address(value)
+        return True
+    except ValueError:
+        return False
+
+
 def _is_hostname(value):
-    """Единый предикат «это hostname»: reg-name ИЛИ IPv6-литерал (`::1`).
+    """Единый предикат «это hostname»: reg-name ИЛИ ВАЛИДНЫЙ IPv6-литерал (`::1`).
 
     Одна граница на весь модуль — и парсер (_extract_host), и валидация ключей
     кэша (_load_cache/update_cache) используют ЭТОТ предикат, чтобы IPv6-домены
     не выпадали при чтении (иначе write/read-асимметрия -> тихая потеря домена).
+    IPv6 валидируется строго (ipaddress), а не regex — write/read симметрия держится
+    на СТРОГОЙ проверке: битый IPv6-ключ отвергается и на write, и на read.
     """
-    return isinstance(value, str) and bool(
-        _REGNAME_RE.match(value) or _IPV6_INNER_RE.match(value)
+    return isinstance(value, str) and (
+        bool(_REGNAME_RE.match(value)) or _is_ipv6_literal(value)
     )
 
 # Запрос в кавычках privoxy-лога: "<method> <target> HTTP/x.x".
@@ -114,7 +131,9 @@ def _connect_authority_host(target):
             return None
         inner = target[1:end]
         rest = target[end + 1:]
-        if not inner or not _IPV6_INNER_RE.match(inner):
+        # СТРОГАЯ IPv6-валидация (ipaddress), не loose-regex: `[dead:beef]`,
+        # `[::::]`, `[deadbeef]` — невалидны по стандарту и должны быть reject.
+        if not _is_ipv6_literal(inner):
             return None
         if not rest.startswith(":"):
             return None  # порт обязателен
