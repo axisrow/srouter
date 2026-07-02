@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "srouter"
+version = "1.0.0"
+description = "Локальный дашборд и установщик srouter: мониторинг и управление цепочкой privoxy→xray→Reality."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "Proprietary" }
+authors = [{ name = "srouter" }]
+dependencies = ["flask>=2.0"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Operating System :: MacOS",
+    "Private :: Do Not Upload",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+srouter = "srouter:main"
+
+[tool.setuptools]
+py-modules = [
+    "dashboard",
+    "srouter",
+    "install_lib",
+    "local_state",
+    "dashboard_common",
+    "dashboard_connectivity",
+    "dashboard_geo",
+    "dashboard_network",
+    "dashboard_nodes",
+    "dashboard_traffic",
+    "dashboard_hotroutes",
+    "hot_routes",
+    "node_selector",
+    "sys_probe",
+    "traffic_shape",
+    "gen_xray_config",
+]
+
+[tool.setuptools.package-data]
+"*" = ["launchagents/*.plist", "static/*", "templates/*"]
