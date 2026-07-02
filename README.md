@@ -169,8 +169,20 @@ brew services start privoxy
 sudo brew services start dnsmasq            # порт 53 → root
 sudo networksetup -setdnsservers "Wi-Fi" 127.0.0.1
 
+# Консольная точка входа srouter (установка в системный Python):
+pip install -e .
+
+srouter apply          # загрузить LaunchAgent дашборда (демон, loopback 127.0.0.1:8787)
+srouter status         # статус демона и PID
+srouter run            # foreground-запуск (без launchd) — http://127.0.0.1:8787
+
+# Либо напрямую (legacy/foreground):
 python3 dashboard.py                        # http://127.0.0.1:8787
 ```
+
+`srouter` — устанавливаемый Python-пакет (`pyproject.toml`). `apply` ставит LaunchAgent (автозапуск
+при загрузке мака, перезапуск при падении), `status` проверяет демон, `run` запускает дашборд в окне.
+Полная установка brew-стека (конфиги/сервисы/DNS) — через `./install.sh apply` (см. `install_lib.py`).
 
 ## Интеграции
 
@@ -245,8 +257,21 @@ brew services start xray
 brew services start privoxy
 sudo brew services start dnsmasq            # port 53 → root
 sudo networksetup -setdnsservers "Wi-Fi" 127.0.0.1
+
+# Console entry point srouter (installed into system Python):
+pip install -e .
+
+srouter apply          # load the dashboard LaunchAgent (daemon, loopback 127.0.0.1:8787)
+srouter status         # daemon status and PID
+srouter run            # foreground run (without launchd) — http://127.0.0.1:8787
+
+# Or directly (legacy/foreground):
 python3 dashboard.py                         # http://127.0.0.1:8787
 ```
+
+`srouter` is an installable Python package (`pyproject.toml`). `apply` installs the LaunchAgent
+(autostart at login, restart on crash), `status` checks the daemon, `run` starts the dashboard in a
+window. Full brew-stack install (configs/services/DNS) is via `./install.sh apply` (see `install_lib.py`).
 
 ## Integrations
 

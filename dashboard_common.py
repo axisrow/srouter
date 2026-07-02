@@ -1,5 +1,7 @@
+import importlib.util
 import ipaddress
 import re
+from pathlib import Path
 
 import local_state
 
@@ -17,13 +19,20 @@ CHANNEL_SERVICE_KEYS = {"wifi": "wifi_service", "usb": "usb_tether_service"}
 
 # Адреса инфраструктуры — из локального srouter_config.py (не в репозитории).
 # Скопируй шаблон: cp srouter_config.example.py srouter_config.py
+# Загружаем файл рядом с модулем (не из cwd), чтобы работало под launchd и при запуске
+# команды `srouter` из произвольного каталога — тот же паттерн, что в local_state/hot_routes.
+_CFG_PATH = Path(__file__).resolve().parent / "srouter_config.py"
 try:
-    import srouter_config as _cfg
+    _spec = importlib.util.spec_from_file_location("_srouter_config", _CFG_PATH)
+    _cfg = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_cfg)
     GATEWAY = _cfg.GATEWAY
     VPN_SERVER = _cfg.VPN_SERVER
     VPN_EXIT_IP = _cfg.VPN_EXIT_IP
-except ImportError:
+except FileNotFoundError:
     raise SystemExit("Нет srouter_config.py — скопируй: cp srouter_config.example.py srouter_config.py")
+except Exception as _exc:
+    raise SystemExit(f"srouter_config.py повреждён или неполон: {_exc}")
 
 PRIVOXY = ("127.0.0.1", 8118)
 XRAY_SOCKS = ("127.0.0.1", 10808)

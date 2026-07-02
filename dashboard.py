@@ -730,6 +730,11 @@ INDEX_HTML = (Path(__file__).parent / "static" / "index.html").read_text(encodin
 
 
 # ============================ запуск ============================
-if __name__ == "__main__":
+def main():
+    """Точка входа: loopback, debug=False, threaded. Используется srouter run и -m."""
     print(f"Dashboard: http://127.0.0.1:{PORT}")
     app.run(host="127.0.0.1", port=PORT, threaded=True, debug=False)  # loopback, debug OFF!
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
