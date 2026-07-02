@@ -1,33 +1,43 @@
 """Traffic Guard throttle: per-domain замедление через root-only macOS shaping.
 
-Модуль строит правила pf (`pfctl` anchor) + dummynet pipe (`dnctl`) и выполняет
-их привилегированно через тот же osascript admin-мост, что и dashboard.sudo_route:
-`do shell script "<из констант+validated>" with administrator privileges`, запуск
-через `sys_probe.run([OSASCRIPT, "-e", applescript], timeout=)`.
+Модуль строит правила pf + dummynet pipe (`dnctl`) и выполняет их привилегированно
+через тот же osascript admin-мост, что и dashboard.switch_channel/sudo_route:
+`do shell script "<из констант+validated, экранированный>" with administrator privileges`,
+запуск через `sys_probe.run([OSASCRIPT, "-e", applescript], timeout=)`.
 
-Как throttle реально enforce-ится (важно про pf на macOS):
-main pf ruleset НЕ обходит произвольный top-level anchor автоматически — чтобы pf
-прогонял пакеты через наш anchor, в main ruleset обязана стоять ссылка
-`dummynet-anchor "<name>"` + `anchor "<name>"`. Поэтому модуль владеет собственным
-main-ruleset файлом (MAIN_CONF_PATH) с этими ссылками и грузит его через
-`pfctl -f <file>`, ЗАТЕМ загружает per-domain правила в sub-anchor через
-`pfctl -a <name> -f -`. Без ссылки anchor не вычисляется -> тихий fail-open.
-ВНИМАНИЕ: `pfctl -f` заменяет активный main ruleset — модуль осознанно берёт
-main pf ruleset под свой контроль (для изолированной throttle-функции это цена
-корректного enforce; интеграция включается только осознанно, issue #13 low/future).
+Как throttle enforce-ится (важно про pf на macOS):
+main pf ruleset НЕ трогаем. /etc/pf.conf (macOS default) уже содержит
+`dummynet-anchor "com.apple/*"` и `anchor "com.apple/*"`, поэтому под-anchor с
+именем `com.apple/srouter_throttle` УЖЕ вычисляется системой. Правила грузятся в
+этот под-anchor через stdin (`pfctl -a "com.apple/srouter_throttle" -f -`) —
+никаких временных файлов и никакой замены активного main ruleset пользователя.
 
-Управление pf enable-reference (важно про побочные эффекты):
-`pfctl -E` включает pf и инкрементит enable-reference-count, возвращая release-
-token (`Token : <N>`). Токен нужно освободить через `pfctl -X <token>`, иначе pf
-остаётся включён системно и счётчик течёт при повторных apply. Поэтому apply
-парсит токен из вывода -E и ВОЗВРАЩАЕТ его вызывающему; clear_throttle(token)
-освобождает ссылку через `-X`. Fail-closed: если -E не дал токен — reject.
+Fail-fast (apply): все шаги — ОДНА osascript-инвокация (один пароль-промпт),
+команды соединены через `&&` (канон — dashboard_connectivity.switch_channel).
+rc отражает ПЕРВЫЙ сбой; частичный успех не может вернуть ok:true.
+
+Управление pf enable-reference и его lifecycle:
+`pfctl -E` включает pf и инкрементит enable-reference-count, печатая release-token
+(`Token : <N>`). Токен обязателен к освобождению через `pfctl -X <token>`, иначе pf
+остаётся включён системно и счётчик течёт при повторных apply. Инварианты:
+- Токен парсится из объединённого вывода НЕЗАВИСИМО от rc (`-E` печатает его до
+  сбоя последующих команд). Если -E успел — токен ВСЕГДА в возвращаемом dict.
+- При сбое ПОСЛЕ -E (rc != 0, токен распарсен) apply делает best-effort rollback
+  (clear_throttle(token) — второй промпт только в failure-path), результат кладёт
+  в ответ (`rollback`), исходную ошибку не теряет.
+- Широкий except (defensive) тоже сохраняет уже распарсенный токен.
+
+Cleanup (clear) — attempt-all: обязан попытаться выполнить ВСЕ шаги, даже если
+один упал, но rc отражает любой сбой. Паттерн `... || rc=1; ...; exit $rc`
+(`&&` тут НЕ подходит — маскирует остаток cleanup).
 
 Границы безопасности (privileged root pf — строго!):
 - shell-текст собирается ТОЛЬКО из констант (абсолютные пути бинарей + флаги) и
   из ВАЛИДИРОВАННЫХ значений: canonical IP-литерал (round-trip через ipaddress,
   reject scoped `%`), целочисленный rate, whitelist-имя anchor, числовой токен.
   Ни domain, ни сырой пользовательский ввод в shell не попадают никогда.
+- shell_cmd экранируется для applescript (_applescript_text) перед вставкой в
+  `do shell script "..."` — anchor-имя содержит кавычки/слэш.
 - Функции НЕ бросают: при любом сбое возвращают структурированный dict.
   Отмена пароля osascript (rc -128) -> cancelled, не ошибка.
 
@@ -48,15 +58,13 @@ PFCTL = "/sbin/pfctl"
 DNCTL = "/usr/sbin/dnctl"
 OSASCRIPT = "/usr/bin/osascript"
 
-# Whitelist-имя anchor и номер pipe — константы, НЕ пользовательский ввод.
-ANCHOR = "srouter_throttle"
+# Под-anchor внутри com.apple/* — этот anchor point УЖЕ объявлен в /etc/pf.conf
+# (dummynet-anchor/anchor "com.apple/*"), поэтому pf вычисляет наш под-anchor без
+# правки main ruleset. Имя — константа, не пользовательский ввод.
+ANCHOR = "com.apple/srouter_throttle"
 PIPE_NUM = 1
 
-# Собственный main-ruleset файл модуля: содержит ссылки на наш anchor, чтобы pf
-# реально вычислял его. Путь фиксирован (не пользовательский ввод).
-MAIN_CONF_PATH = "/tmp/srouter_throttle.pf.conf"
-
-# Таймаут osascript-моста: как у sudo_route (пароль + выполнение pf).
+# Таймаут osascript-моста: как у switch_channel/sudo_route (пароль + выполнение pf).
 _TIMEOUT_SEC = 60
 
 # 'Token : <N>' из вывода `pfctl -E`. Только цифры — токен идёт в shell (-X).
@@ -163,6 +171,16 @@ def _reject(msg):
     return {"ok": False, "cancelled": False, "rc": None, "out": "", "err": msg, "timeout": False}
 
 
+def _applescript_text(text):
+    """Экранировать shell-строку для вставки в `do shell script "..."`.
+
+    Канон dashboard_connectivity._applescript_text: сначала бэкслэши, потом кавычки.
+    Anchor-имя содержит кавычки (`-a "com.apple/..."`), без экранирования applescript
+    оборвёт строку.
+    """
+    return str(text).replace("\\", "\\\\").replace('"', '\\"')
+
+
 def _admin_run(shell_cmd):
     """Выполнить shell_cmd привилегированно через osascript admin-мост.
 
@@ -170,33 +188,22 @@ def _admin_run(shell_cmd):
     (см. модульную docstring). Динамический/пользовательский фрагмент здесь —
     ошибка, требующая whitelist + экранирования.
     """
-    applescript = f'do shell script "{shell_cmd}" with administrator privileges'
+    applescript = f'do shell script "{_applescript_text(shell_cmd)}" with administrator privileges'
     return _shape_result(sys_probe.run([OSASCRIPT, "-e", applescript], timeout=_TIMEOUT_SEC))
-
-
-def _main_ruleset_text():
-    """Статичный main pf ruleset модуля: ссылки на наш anchor (без validated-ввода).
-
-    dummynet-anchor вычисляет dummynet-правила sub-anchor'а, anchor — filter-часть.
-    Имя anchor — константа ANCHOR, не пользовательский ввод.
-    """
-    return (
-        f'dummynet-anchor "{ANCHOR}"\n'
-        f'anchor "{ANCHOR}"\n'
-    )
 
 
 # ============================ публичный API ============================
 def apply_throttle(domain, rate):
     """Включить throttle для domain на скорости rate (Kbit/s).
 
-    Шаги: резолв domain->canonical IP, валидация rate, `pfctl -E` (ловим enable-
-    token, fail-closed без него), настройка dummynet pipe, установка main-ruleset
-    со ссылкой на anchor и загрузка per-domain правил в sub-anchor.
+    Одна privileged-инвокация (fail-fast `&&`): `pfctl -E` (включить pf + получить
+    enable-token) -> `dnctl pipe config` -> загрузка правил в под-anchor через stdin.
+    main pf ruleset НЕ трогается (под-anchor com.apple/* уже вычисляется системой).
 
-    Возвращает dict как _shape_result + ключ `token` (release-token pf enable-ref).
-    Токен ОБЯЗАН быть передан позже в clear_throttle(token=...) для освобождения.
-    Функция не бросает: любой невалидный вход -> reject без запуска pf.
+    Возвращает dict как _shape_result + ключ `token` (release-token pf enable-ref;
+    None если -E не дошёл/не распарсился). Токен ОБЯЗАН быть передан позже в
+    clear_throttle(token=...) для освобождения. При сбое ПОСЛЕ -E с распарсенным
+    токеном — best-effort rollback (ключ `rollback`). Функция не бросает.
     """
     ip = resolve_domain_ip(domain)
     if not ip:
@@ -205,60 +212,56 @@ def apply_throttle(domain, rate):
     if not rate_spec:
         return _reject("rate должен быть положительным целым числом (Kbit/s)")
 
+    token = None
     try:
-        # 1) Включаем pf с инкрементом enable-ref и ловим release-token.
-        #    stderr сливаем в stdout (osascript отдаёт stdout) — там 'Token : <N>'.
-        enable = _admin_run(f"{PFCTL} -E 2>&1")
-        if not enable["ok"]:
-            enable["token"] = None
-            return enable  # cancelled/timeout/ошибка -128 и т.п. — прокидываем как есть
-        token = _parse_token(enable["out"])
-        if not token:
-            # fail-closed: без токена мы не сможем освободить enable-ref -> не продолжаем.
-            return {**_reject("pfctl -E не вернул release-token; throttle не применён"),
-                    "token": None}
-
-        # 2) main ruleset со ссылкой на anchor пишем на диск (статичный контент,
-        #    без validated-ввода) и грузим — иначе pf не вычисляет наш anchor.
-        with open(MAIN_CONF_PATH, "w", encoding="utf-8") as fh:
-            fh.write(_main_ruleset_text())
-
-        # 3) Всё ниже — из констант + validated (ip canonical, rate_spec числовой,
-        #    ANCHOR/PIPE_NUM/MAIN_CONF_PATH константы). Правило dummynet заворачивает
-        #    трафик к целевому IP в pipe с ограниченной полосой.
-        pipe_cfg = f"{DNCTL} pipe {PIPE_NUM} config bw {rate_spec}"
+        # Всё ниже — из констант + validated (ip canonical, rate_spec числовой,
+        # ANCHOR/PIPE_NUM константы). Правило dummynet заворачивает трафик к целевому
+        # IP в pipe с ограниченной полосой. `-E 2>&1` сливает stderr в stdout, чтобы
+        # osascript отдал строку 'Token : <N>'.
         pf_rule = (
             f"dummynet out proto tcp from any to {ip} pipe {PIPE_NUM}\\n"
             f"dummynet in proto tcp from {ip} to any pipe {PIPE_NUM}"
         )
-        load_main = f"{PFCTL} -f {MAIN_CONF_PATH}"
-        load_anchor = f"echo '{pf_rule}' | {PFCTL} -a {ANCHOR} -f -"
-        shell_cmd = f"{pipe_cfg}; {load_main}; {load_anchor}"
+        enable = f"{PFCTL} -E 2>&1"
+        pipe_cfg = f"{DNCTL} pipe {PIPE_NUM} config bw {rate_spec}"
+        load_anchor = f"printf '{pf_rule}' | {PFCTL} -a \"{ANCHOR}\" -f -"
+        # fail-fast: первый сбой обрывает цепочку, rc его и отражает.
+        shell_cmd = f"{enable} && {pipe_cfg} && {load_anchor}"
+
         res = _admin_run(shell_cmd)
+        # Токен печатает -E ДО возможного сбоя последующих команд — парсим независимо от rc.
+        token = _parse_token(res.get("out"))
         res["token"] = token
+
+        if not res["ok"] and token:
+            # Сбой после включения pf: pf остался с инкрементированным enable-ref.
+            # best-effort rollback (второй промпт только здесь), ошибку не теряем.
+            res["rollback"] = clear_throttle(token)
         return res
-    except Exception as exc:  # глубокая защита: функция не бросает
-        return {**_reject(f"throttle failed: {exc}"), "token": None}
+    except Exception as exc:  # глубокая защита: функция не бросает, токен не теряем
+        return {**_reject(f"throttle failed: {exc}"), "token": token}
 
 
 def clear_throttle(token=None):
-    """Снять throttle: очистить anchor, удалить dummynet pipe, освободить enable-ref.
+    """Снять throttle: очистить под-anchor, удалить dummynet pipe, освободить enable-ref.
 
-    Если передан валидный (числовой) token из apply_throttle — вызывает
-    `pfctl -X <token>` для декремента pf enable-reference-count. Без токена
-    чистит anchor+pipe best-effort (enable-ref не трогает — освобождать нечего/
-    неизвестно что). Идемпотентно и безопасно к повторному вызову. Всё — из
-    констант + validated токен.
+    attempt-all: пытается выполнить ВСЕ шаги, даже если предыдущий упал (cleanup не
+    должен обрываться на первом сбое), но rc отражает любой сбой (`|| rc=1; exit $rc`).
+    `pfctl -X <token>` — только при валидном (числовом) токене из apply_throttle.
+    Без токена enable-ref не трогает (нечего/неизвестно что освобождать). Идемпотентно.
+    Всё — из констант + validated токен. Функция не бросает.
     """
     try:
-        parts = [
-            f"{PFCTL} -a {ANCHOR} -F all",   # сброс правил нашего sub-anchor
-            f"{DNCTL} pipe {PIPE_NUM} delete",  # удаление dummynet pipe
+        steps = [
+            f'{PFCTL} -a "{ANCHOR}" -F all',    # сброс правил нашего под-anchor
+            f"{DNCTL} pipe {PIPE_NUM} delete",   # удаление dummynet pipe
         ]
         tok = _valid_token(token)
         if tok is not None:
-            parts.append(f"{PFCTL} -X {tok}")   # освободить enable-reference
-        shell_cmd = "; ".join(parts)
+            steps.append(f"{PFCTL} -X {tok}")    # освободить enable-reference
+        # attempt-all: каждый шаг помечает rc при сбое, но не обрывает cleanup.
+        body = "; ".join(f"{step} || rc=1" for step in steps)
+        shell_cmd = f"rc=0; {body}; exit $rc"
         return _admin_run(shell_cmd)
     except Exception as exc:  # глубокая защита: функция не бросает
         return _reject(f"clear failed: {exc}")

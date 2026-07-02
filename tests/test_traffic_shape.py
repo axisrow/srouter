@@ -1,8 +1,10 @@
 """Тесты traffic_shape: mocked, БЕЗ реальных pf/dnctl/root вызовов.
 
 Проверяем: domain->IP резолв, argv команд (список + абсолютные пути + только
-validated IP/rate), security (scoped IPv6 / non-canonical / спецсимволы rate ->
-reject, sys_probe.run НЕ зван), -128 cancel, функции не бросают.
+validated IP/rate), архитектуру под-anchor com.apple/srouter_throttle (без замены
+main ruleset), fail-fast `&&`, token lifecycle с rollback, clear attempt-all
+(`|| rc=1`), security (scoped IPv6 / non-canonical / спецсимволы rate -> reject,
+sys_probe.run НЕ зван), -128 cancel, функции не бросают.
 """
 import socket
 
@@ -23,18 +25,15 @@ def _spy_run(calls, rc=0, out="", err="", timed_out=False):
     return fake_run
 
 
-def _spy_apply_run(calls, token="5"):
-    """Фейк для apply_throttle: `pfctl -E` возвращает 'Token : <N>', остальное ok.
+def _apply_ok_run(calls, token="5"):
+    """Фейк успешного apply: единственная osascript-инвокация возвращает 'Token : N'.
 
-    apply делает два privileged-вызова: enable (-E, ловим токен из out) и
-    настройку shaping. Различаем по вхождению '-E' в applescript-тексте.
+    apply теперь делает ОДИН privileged-вызов (одна цепочка `&&`). Токен pf
+    печатает `pfctl -E` в объединённый stdout — фейк отдаёт его в out.
     """
     def fake_run(cmd_list, timeout=None):
         calls.append(cmd_list)
-        script = cmd_list[2] if len(cmd_list) >= 3 else ""
-        if "-E" in script:
-            return {"rc": 0, "out": f"Token : {token}", "err": "", "timeout": False}
-        return {"rc": 0, "out": "", "err": "", "timeout": False}
+        return {"rc": 0, "out": f"Token : {token}", "err": "", "timeout": False}
     return fake_run
 
 
@@ -102,13 +101,39 @@ def test_resolve_domain_ip_resolver_failure(monkeypatch):
     assert traffic_shape.resolve_domain_ip("example.com") == ""
 
 
-# ============================ apply_throttle: argv ============================
-def test_apply_throttle_builds_validated_argv(monkeypatch, tmp_path):
+# ============================ архитектура: под-anchor com.apple/* ============================
+def test_anchor_is_under_com_apple():
+    # Баг 3: под-anchor com.apple/* УЖЕ evaluated /etc/pf.conf — main ruleset не трогаем.
+    assert traffic_shape.ANCHOR == "com.apple/srouter_throttle"
+
+
+def test_apply_throttle_single_invocation_fail_fast(monkeypatch):
+    # Баг 1: одна osascript-инвокация (один пароль), команды через `&&` (fail-fast),
+    # НЕ `;`-склейка (маскирует частичный сбой). Баг 3: НЕТ замены main ruleset.
     calls = []
-    monkeypatch.setattr(traffic_shape, "MAIN_CONF_PATH", str(tmp_path / "srouter_pf.conf"))
     monkeypatch.setattr(socket, "gethostbyname", lambda h: "203.0.113.10")
-    # apply двухшаговый: -E отдаёт 'Token : 5', затем настройка shaping.
-    monkeypatch.setattr(sys_probe, "run", _spy_apply_run(calls))
+    monkeypatch.setattr(sys_probe, "run", _apply_ok_run(calls))
+
+    res = traffic_shape.apply_throttle("example.com", 512)
+
+    assert res["ok"] is True
+    assert len(calls) == 1, "apply — одна privileged-инвокация (один пароль-промпт)"
+    script = calls[0][2]
+    assert "&&" in script, "fail-fast через &&"
+    # `;`-склейки команд быть не должно (маскирует частичные сбои).
+    assert ";" not in script
+    # Баг 3: НЕТ управления main ruleset — ни pfctl -f <путь>, ни временного файла.
+    assert not hasattr(traffic_shape, "MAIN_CONF_PATH")
+    assert "pfctl -f /" not in script and "-f /tmp" not in script
+    # Правила грузятся в под-anchor через stdin (`-f -`), не через файл.
+    # (кавычки anchor-имени экранированы для applescript -> сверяем экранированную форму).
+    assert f'-a \\"{traffic_shape.ANCHOR}\\" -f -' in script
+
+
+def test_apply_throttle_builds_validated_argv(monkeypatch):
+    calls = []
+    monkeypatch.setattr(socket, "gethostbyname", lambda h: "203.0.113.10")
+    monkeypatch.setattr(sys_probe, "run", _apply_ok_run(calls))
 
     res = traffic_shape.apply_throttle("example.com", 512)
 
@@ -116,14 +141,13 @@ def test_apply_throttle_builds_validated_argv(monkeypatch, tmp_path):
     assert res["cancelled"] is False
     # Токен pf enable-ref распарсен из 'Token : 5' и возвращён вызывающему.
     assert res["token"] == "5"
-    # Все вызовы — список argv, первый элемент абсолютный путь до osascript.
+    # Единственный вызов — список argv с абсолютным osascript.
     assert calls, "sys_probe.run должен быть вызван"
     for cmd in calls:
         assert isinstance(cmd, list)
         assert cmd[0] == traffic_shape.OSASCRIPT
         assert cmd[1] == "-e"
-    # В applescript-тексте фигурируют абсолютные пути бинарей + validated IP + rate.
-    joined = " ".join(cmd[2] for cmd in calls)
+    joined = calls[0][2]
     assert traffic_shape.DNCTL in joined
     assert traffic_shape.PFCTL in joined
     assert "203.0.113.10" in joined
@@ -133,45 +157,62 @@ def test_apply_throttle_builds_validated_argv(monkeypatch, tmp_path):
     assert "example.com" not in joined
 
 
-def test_apply_throttle_installs_anchor_reference_in_main_ruleset(monkeypatch, tmp_path):
-    # Баг #1: без dummynet-anchor/anchor ссылки в main ruleset pf не вычисляет
-    # наш anchor и throttle не enforce-ится. Проверяем, что модуль ставит ссылку.
-    calls = []
-    conf = tmp_path / "srouter_pf.conf"
-    monkeypatch.setattr(traffic_shape, "MAIN_CONF_PATH", str(conf))
-    monkeypatch.setattr(socket, "gethostbyname", lambda h: "203.0.113.10")
-    monkeypatch.setattr(sys_probe, "run", _spy_apply_run(calls))
-
-    res = traffic_shape.apply_throttle("example.com", 512)
-
-    assert res["ok"] is True
-    # main-ruleset файл содержит ОБЕ ссылки на наш anchor (dummynet + filter).
-    written = conf.read_text()
-    assert f'dummynet-anchor "{traffic_shape.ANCHOR}"' in written
-    assert f'anchor "{traffic_shape.ANCHOR}"' in written
-    # И этот main-ruleset реально грузится через pfctl -f <path>.
-    joined = " ".join(cmd[2] for cmd in calls)
-    assert f"{traffic_shape.PFCTL} -f {conf}" in joined
-
-
-def test_apply_throttle_fail_closed_without_token(monkeypatch):
-    # Баг #2 fail-closed: если pfctl -E не вернул 'Token : N' — reject,
-    # shaping не настраивается (иначе enable-ref утечёт без возможности освободить).
+# ============================ token lifecycle (баг 2) ============================
+def test_apply_throttle_rollback_on_post_enable_failure(monkeypatch):
+    # Баг 2: -E успел (в out есть 'Token : 5'), но последующая команда упала (rc!=0).
+    # Токен ОБЯЗАН вернуться + запуститься best-effort rollback (clear -> pfctl -X 5).
     calls = []
     monkeypatch.setattr(socket, "gethostbyname", lambda h: "203.0.113.10")
 
-    def no_token_run(cmd_list, timeout=None):
+    def fail_after_enable(cmd_list, timeout=None):
         calls.append(cmd_list)
-        return {"rc": 0, "out": "pf enabled", "err": "", "timeout": False}  # без Token
+        # apply-инвокация падает, но токен уже напечатан в out; rollback (clear) — ok.
+        if len(calls) == 1:
+            return {"rc": 1, "out": "Token : 5\npfctl: some error", "err": "", "timeout": False}
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
 
-    monkeypatch.setattr(sys_probe, "run", no_token_run)
+    monkeypatch.setattr(sys_probe, "run", fail_after_enable)
 
     res = traffic_shape.apply_throttle("example.com", 512)
 
     assert res["ok"] is False
-    assert res.get("token") in (None, "")
-    # После неудачного -E больше ничего privileged не запускаем (только сам -E).
-    assert len(calls) == 1, "fail-closed: shaping не строится без токена"
+    assert res["token"] == "5", "токен не теряется при сбое после -E"
+    assert "rollback" in res, "best-effort rollback приложен к ответу"
+    assert len(calls) == 2, "второй вызов — rollback (только в failure-path)"
+    rollback_script = calls[1][2]
+    assert f"{traffic_shape.PFCTL} -X 5" in rollback_script, "rollback освобождает enable-ref"
+
+
+def test_apply_throttle_no_token_no_rollback(monkeypatch):
+    # Сбой ДО -E (out без 'Token') -> token:None, rollback НЕ зван.
+    calls = []
+    monkeypatch.setattr(socket, "gethostbyname", lambda h: "203.0.113.10")
+    monkeypatch.setattr(sys_probe, "run", _spy_run(calls, rc=1, out="pf: permission denied"))
+
+    res = traffic_shape.apply_throttle("example.com", 512)
+
+    assert res["ok"] is False
+    assert res.get("token") is None
+    assert "rollback" not in res
+    assert len(calls) == 1, "без токена rollback не запускается"
+
+
+def test_apply_throttle_exception_preserves_token(monkeypatch):
+    # Широкий except (defensive): -E успел (token распарсен), но rollback бросил
+    # исключение -> apply не бросает наружу И не теряет токен (token:"9").
+    state = {"n": 0}
+    monkeypatch.setattr(socket, "gethostbyname", lambda h: "203.0.113.10")
+
+    def enable_then_boom(cmd_list, timeout=None):
+        state["n"] += 1
+        if state["n"] == 1:
+            return {"rc": 1, "out": "Token : 9", "err": "", "timeout": False}  # apply упал, токен есть
+        raise RuntimeError("kaboom во время rollback")
+
+    monkeypatch.setattr(sys_probe, "run", enable_then_boom)
+    res = traffic_shape.apply_throttle("example.com", 512)
+    assert res["ok"] is False
+    assert res.get("token") == "9", "токен сохранён даже при исключении в rollback"
 
 
 # ============================ apply_throttle: security reject ============================
@@ -211,15 +252,35 @@ def test_apply_throttle_rejects_bad_domain_without_running(monkeypatch):
 def test_apply_throttle_cancel_maps_to_cancelled(monkeypatch):
     calls = []
     monkeypatch.setattr(socket, "gethostbyname", lambda h: "203.0.113.10")
+    # Отмена пароля до появления токена: -128, out пустой.
     monkeypatch.setattr(sys_probe, "run", _spy_run(calls, rc=-128, err="User canceled. (-128)"))
 
     res = traffic_shape.apply_throttle("example.com", 512)
 
     assert res["cancelled"] is True
     assert res["ok"] is False
+    assert res.get("token") is None
+    assert "rollback" not in res, "нет токена — нечего откатывать"
 
 
 # ============================ clear_throttle ============================
+def test_clear_throttle_attempt_all_pattern(monkeypatch):
+    # Баг 1 (clear): attempt-all — ВСЕ шаги в одной shell-строке через `|| rc=1`,
+    # rc отражает любой сбой; `&&` тут НЕ подходит (маскирует остаток cleanup).
+    calls = []
+    monkeypatch.setattr(sys_probe, "run", _spy_run(calls, rc=0))
+
+    res = traffic_shape.clear_throttle(token="5")
+
+    assert res["ok"] is True
+    assert len(calls) == 1, "clear — одна privileged-инвокация"
+    script = calls[0][2]
+    assert "|| rc=1" in script, "attempt-all: каждый шаг с || rc=1"
+    assert "exit $rc" in script, "честный rc в конце"
+    assert traffic_shape.ANCHOR in script
+    assert f"{traffic_shape.PFCTL} -X 5" in script
+
+
 def test_clear_throttle_builds_validated_argv(monkeypatch):
     calls = []
     monkeypatch.setattr(sys_probe, "run", _spy_run(calls, rc=0))
@@ -228,14 +289,14 @@ def test_clear_throttle_builds_validated_argv(monkeypatch):
 
     assert res["ok"] is True
     assert calls, "clear должен вызывать sys_probe.run"
-    joined = " ".join(cmd[2] for cmd in calls)
+    joined = calls[0][2]
     assert traffic_shape.ANCHOR in joined
     for cmd in calls:
         assert cmd[0] == traffic_shape.OSASCRIPT
 
 
 def test_clear_throttle_releases_enable_token(monkeypatch):
-    # Баг #2: clear с токеном должен вызвать pfctl -X <token> для декремента
+    # Баг 2: clear с токеном должен вызвать pfctl -X <token> для декремента
     # pf enable-reference-count (иначе pf остаётся включён системно).
     calls = []
     monkeypatch.setattr(sys_probe, "run", _spy_run(calls, rc=0))
@@ -243,7 +304,7 @@ def test_clear_throttle_releases_enable_token(monkeypatch):
     res = traffic_shape.clear_throttle(token="5")
 
     assert res["ok"] is True
-    joined = " ".join(cmd[2] for cmd in calls)
+    joined = calls[0][2]
     assert f"{traffic_shape.PFCTL} -X 5" in joined
 
 
@@ -254,20 +315,20 @@ def test_clear_throttle_rejects_non_numeric_token(monkeypatch):
 
     res = traffic_shape.clear_throttle(token="5; rm -rf /")
 
-    joined = " ".join(cmd[2] for cmd in calls)
+    joined = calls[0][2]
     assert "rm -rf" not in joined
     assert "-X" not in joined  # невалидный токен не превращается в -X
 
 
 def test_clear_throttle_without_token_still_flushes(monkeypatch):
-    # Без токена clear всё равно чистит anchor+pipe (best-effort), но не зовёт -X.
+    # Без токена clear всё равно чистит anchor+pipe (attempt-all), но не зовёт -X.
     calls = []
     monkeypatch.setattr(sys_probe, "run", _spy_run(calls, rc=0))
 
     res = traffic_shape.clear_throttle()
 
     assert res["ok"] is True
-    joined = " ".join(cmd[2] for cmd in calls)
+    joined = calls[0][2]
     assert traffic_shape.ANCHOR in joined
     assert "-X" not in joined
 
@@ -278,6 +339,23 @@ def test_clear_throttle_cancel(monkeypatch):
     res = traffic_shape.clear_throttle()
     assert res["cancelled"] is True
     assert res["ok"] is False
+
+
+# ============================ applescript-экранирование ============================
+def test_applescript_escaping_of_quotes_and_backslashes(monkeypatch):
+    # anchor-имя содержит `/` и кавычки в shell-строке; внутри `do shell script "..."`
+    # кавычки/бэкслэши обязаны быть экранированы (канон _applescript_text).
+    calls = []
+    monkeypatch.setattr(socket, "gethostbyname", lambda h: "203.0.113.10")
+    monkeypatch.setattr(sys_probe, "run", _apply_ok_run(calls))
+
+    traffic_shape.apply_throttle("example.com", 512)
+
+    # applescript-текст (весь argv[2]) обрамлён `do shell script "..."`; внутренние
+    # кавычки из `-a "com.apple/..."` должны прийти как \" (экранированные).
+    script = calls[0][2]
+    assert script.startswith('do shell script "')
+    assert '\\"' in script, "внутренние кавычки экранированы для applescript"
 
 
 # ============================ функции не бросают ============================
