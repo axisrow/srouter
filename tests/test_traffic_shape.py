@@ -5,6 +5,12 @@ validated IP/rate), архитектуру под-anchor com.apple/srouter_throt
 main ruleset), fail-fast `&&`, token lifecycle с rollback, clear attempt-all
 (`|| rc=1`), security (scoped IPv6 / non-canonical / спецсимволы rate -> reject,
 sys_probe.run НЕ зван), -128 cancel, функции не бросают.
+
+РЕАЛЬНАЯ семантика osascript (issue #61, доказано экспериментом): при rc != 0
+любой команды цепочки `do shell script` ОТБРАСЫВАЕТ stdout (out == ""), error
+message (-> err) аккумулирует только stderr цепочки. Моки failure-путей обязаны
+кодировать именно это (out="", токен только в err) — мок с токеном в out при
+rc != 0 кодирует невозможное состояние и пропускает регрессию зелёной.
 """
 import socket
 
@@ -28,8 +34,9 @@ def _spy_run(calls, rc=0, out="", err="", timed_out=False):
 def _apply_ok_run(calls, token="5"):
     """Фейк успешного apply: единственная osascript-инвокация возвращает 'Token : N'.
 
-    apply теперь делает ОДИН privileged-вызов (одна цепочка `&&`). Токен pf
-    печатает `pfctl -E` в объединённый stdout — фейк отдаёт его в out.
+    apply делает ОДИН privileged-вызов (busy-probe; захват -E в $t; дубль токена в
+    stdout+stderr; config && загрузка anchor). На success-пути osascript отдаёт
+    stdout цепочки — туда токен печатает emit_token-дубль, фейк кладёт его в out.
     """
     def fake_run(cmd_list, timeout=None):
         calls.append(cmd_list)
@@ -108,8 +115,9 @@ def test_anchor_is_under_com_apple():
 
 
 def test_apply_throttle_single_invocation_fail_fast(monkeypatch):
-    # Баг 1: одна osascript-инвокация (один пароль), команды через `&&` (fail-fast),
-    # НЕ `;`-склейка (маскирует частичный сбой). Баг 3: НЕТ замены main ruleset.
+    # Баг 1: одна osascript-инвокация (один пароль). Fail-fast: сбой самого -E
+    # обрывает цепочку через `|| exit $?` (токен не создан — утечки нет), остальные
+    # шаги соединены `&&`. Баг 3: НЕТ замены main ruleset.
     calls = []
     monkeypatch.setattr(socket, "gethostbyname", lambda h: "203.0.113.10")
     monkeypatch.setattr(sys_probe, "run", _apply_ok_run(calls))
@@ -119,15 +127,37 @@ def test_apply_throttle_single_invocation_fail_fast(monkeypatch):
     assert res["ok"] is True
     assert len(calls) == 1, "apply — одна privileged-инвокация (один пароль-промпт)"
     script = calls[0][2]
-    assert "&&" in script, "fail-fast через &&"
-    # `;`-склейки команд быть не должно (маскирует частичные сбои).
-    assert ";" not in script
+    # fail-fast самого -E: упал — выходим с его rc, токена нет, утечки нет.
+    assert f"t=$({traffic_shape.PFCTL} -E 2>&1) || exit $?" in script
+    # config и загрузка anchor — fail-fast связка (сбой dnctl не даёт грузить правила).
+    assert "&&" in script, "fail-fast через && между config и загрузкой anchor"
     # Баг 3: НЕТ управления main ruleset — ни pfctl -f <путь>, ни временного файла.
     assert not hasattr(traffic_shape, "MAIN_CONF_PATH")
     assert "pfctl -f /" not in script and "-f /tmp" not in script
     # Правила грузятся в под-anchor через stdin (`-f -`), не через файл.
     # (кавычки anchor-имени экранированы для applescript -> сверяем экранированную форму).
     assert f'-a \\"{traffic_shape.ANCHOR}\\" -f -' in script
+
+
+def test_apply_throttle_duplicates_token_to_stderr(monkeypatch):
+    # Issue #61 фикс 1: реальный osascript при rc != 0 отбрасывает stdout, поэтому
+    # токен обязан дублироваться в stderr СРАЗУ после -E — иначе при сбое
+    # dnctl/pfctl -a токен потерян и rollback мёртв.
+    calls = []
+    monkeypatch.setattr(socket, "gethostbyname", lambda h: "203.0.113.10")
+    monkeypatch.setattr(sys_probe, "run", _apply_ok_run(calls))
+
+    traffic_shape.apply_throttle("example.com", 512)
+
+    script = calls[0][2]
+    # Экранированные для applescript формы: `\n` -> `\\n`, `"` -> `\"`.
+    dup = "printf '%s\\\\n' \\\"$t\\\""              # stdout — success-путь
+    dup_err = "printf '%s\\\\n' \\\"$t\\\" 1>&2"     # stderr — переживает сбой цепочки
+    # Ровно два printf-дубля: stdout (префикс dup_err — потому count, не `in`).
+    assert script.count(dup) == 2, "токен печатается и в stdout, и в stderr"
+    assert dup_err in script, "токен дублируется в stderr (failure-путь)"
+    # Дубли идут ДО config/загрузки anchor — до первого возможного сбоя после -E.
+    assert script.index(dup_err) < script.index("config"), "stderr-дубль до dnctl config"
 
 
 def test_apply_throttle_builds_validated_argv(monkeypatch):
@@ -157,18 +187,123 @@ def test_apply_throttle_builds_validated_argv(monkeypatch):
     assert "example.com" not in joined
 
 
-# ============================ token lifecycle (баг 2) ============================
+# ============================ владение dummynet pipe (issue #61 фикс 2) ============================
+def test_pipe_num_is_nonstandard_high():
+    # PIPE_NUM — глобальный id dummynet (НЕ скоупится pf-anchor'ом). Низкие id
+    # (1-10) типичны для чужого шейпинга (Network Link Conditioner и т.п.) —
+    # наш id обязан быть нестандартно высоким, чтобы не столкнуться.
+    assert traffic_shape.PIPE_NUM == 4127
+    assert traffic_shape.PIPE_NUM not in range(1, 11)
+
+
+def test_apply_throttle_pipe_busy_check_runs_first(monkeypatch):
+    # Fail-closed владение: ПЕРВАЯ команда privileged-цепочки — проверка, что pipe
+    # ещё не существует (dnctl-чтение требует root => проверка внутри цепочки).
+    # ВАЖНО (Apple dnctl.c, list_pipes): `pipe show N` — ФИЛЬТР листинга, exit-код
+    # НЕ предикат существования (отсутствующий pipe -> пустой вывод, rc=0; queues
+    # печатаются без фильтра). Поэтому: захват вывода; rc!=0 -> fail-closed
+    # probe-failed (exit 72); якорная строка `^0*N:` в выводе -> busy (exit 71) —
+    # всё ДО pfctl -E (токен не создаётся) и ДО config (чужой pipe не трогается).
+    calls = []
+    monkeypatch.setattr(socket, "gethostbyname", lambda h: "203.0.113.10")
+    monkeypatch.setattr(sys_probe, "run", _apply_ok_run(calls))
+
+    traffic_shape.apply_throttle("example.com", 512)
+
+    script = calls[0][2]
+    assert f"p=$({traffic_shape.DNCTL} pipe show {traffic_shape.PIPE_NUM} 2>&1)" in script, \
+        "вывод probe захватывается (exit-код dnctl не предикат существования)"
+    assert f"echo {traffic_shape.PIPE_PROBE_FAILED_MARKER} 1>&2; exit 72" in script, \
+        "сбой probe -> fail-closed отказ, не молчаливое продолжение"
+    assert f"{traffic_shape.GREP} -q '^0*{traffic_shape.PIPE_NUM}:'" in script, \
+        "существование pipe — якорный матч строки %05d: (не exit-код, не substring)"
+    # Разбор rc grep через case: 0 -> busy, 1 -> свободен, >=2 (сбой самого grep,
+    # включая 127) -> fail-closed probe-failed, НЕ молчаливое «свободно».
+    assert f"case $? in 0) echo {traffic_shape.PIPE_BUSY_MARKER} 1>&2; exit 71;;" in script
+    assert f"*) echo {traffic_shape.PIPE_PROBE_FAILED_MARKER} 1>&2; exit 72;; esac" in script
+    assert script.index("pipe show") < script.index("t=$("), "проверка ДО pfctl -E"
+    assert script.index("pipe show") < script.index("config"), "проверка ДО dnctl config"
+
+
+def test_apply_throttle_rejects_busy_pipe(monkeypatch):
+    # Pipe уже существует (чужой шейпинг): exit 71, маркер в stderr-аккумуляторе.
+    # Реальный osascript возвращает rc=1 (код "(71)" только в тексте err) — детект
+    # обязан быть по маркеру, не по rc. ok:false + понятная ошибка, БЕЗ config,
+    # БЕЗ rollback (токен не создавался).
+    calls = []
+    monkeypatch.setattr(socket, "gethostbyname", lambda h: "203.0.113.10")
+    monkeypatch.setattr(
+        sys_probe, "run",
+        _spy_run(calls, rc=1, out="",
+                 err=f"0:45: execution error: {traffic_shape.PIPE_BUSY_MARKER} (71)"),
+    )
+
+    res = traffic_shape.apply_throttle("example.com", 512)
+
+    assert res["ok"] is False
+    assert "уже существует" in res["err"], "понятная ошибка про чужой pipe"
+    assert res.get("token") is None
+    assert "rollback" not in res, "до -E не дошли — откатывать нечего"
+    assert len(calls) == 1, "никакого config/cleanup после отказа"
+
+
+def test_apply_throttle_rejects_when_pipe_probe_fails(monkeypatch):
+    # Сбой самого probe (`dnctl pipe show` упал: socket/getsockopt) — владение
+    # проверить нельзя => fail-closed отказ (exit 72 + маркер), НЕ молчаливое
+    # «свободно». Токен не создавался — rollback не зван.
+    calls = []
+    monkeypatch.setattr(socket, "gethostbyname", lambda h: "203.0.113.10")
+    monkeypatch.setattr(
+        sys_probe, "run",
+        _spy_run(calls, rc=1, out="",
+                 err="0:45: execution error: dnctl: socket: Operation not permitted\n"
+                     f"{traffic_shape.PIPE_PROBE_FAILED_MARKER} (72)"),
+    )
+
+    res = traffic_shape.apply_throttle("example.com", 512)
+
+    assert res["ok"] is False
+    assert "не удалось проверить" in res["err"], "понятная ошибка про сбой probe"
+    # Форварднутая диагностика dnctl ($p в stderr цепочки) не выбрасывается.
+    assert "Operation not permitted" in res["err"], "исходная ошибка dnctl сохранена"
+    assert res.get("token") is None
+    assert "rollback" not in res, "до -E не дошли — откатывать нечего"
+    assert len(calls) == 1, "fail-closed: ничего после отказа"
+
+
+def test_clear_throttle_deletes_only_own_pipe(monkeypatch):
+    # Инвариант владения: clear удаляет ТОЛЬКО pipe нашего id (создан после
+    # busy-проверки apply) — чужие pipe не трогаются.
+    calls = []
+    monkeypatch.setattr(sys_probe, "run", _spy_run(calls, rc=0))
+
+    traffic_shape.clear_throttle(token="5")
+
+    script = calls[0][2]
+    assert f"{traffic_shape.DNCTL} pipe {traffic_shape.PIPE_NUM} delete" in script
+    # Ровно одно удаление pipe — только наш id.
+    assert script.count("pipe") == script.count(f"pipe {traffic_shape.PIPE_NUM}")
+
+
+# ============================ token lifecycle (баг 2 + issue #61 фикс 1) ============================
 def test_apply_throttle_rollback_on_post_enable_failure(monkeypatch):
-    # Баг 2: -E успел (в out есть 'Token : 5'), но последующая команда упала (rc!=0).
-    # Токен ОБЯЗАН вернуться + запуститься best-effort rollback (clear -> pfctl -X 5).
+    # Issue #61: -E успел, но dnctl упал (rc!=0). РЕАЛЬНЫЙ osascript отбрасывает
+    # stdout (out=""), токен доступен ТОЛЬКО из stderr (stderr-дубль цепочки).
+    # Токен ОБЯЗАН распарситься из err + запуститься rollback (clear -> pfctl -X 5).
     calls = []
     monkeypatch.setattr(socket, "gethostbyname", lambda h: "203.0.113.10")
 
     def fail_after_enable(cmd_list, timeout=None):
         calls.append(cmd_list)
-        # apply-инвокация падает, но токен уже напечатан в out; rollback (clear) — ok.
+        # apply-инвокация падает: out пуст (реальная семантика), stderr цепочки
+        # (stderr-дубль токена + ошибка dnctl) аккумулирован в error message.
         if len(calls) == 1:
-            return {"rc": 1, "out": "Token : 5\npfctl: some error", "err": "", "timeout": False}
+            return {
+                "rc": 1,
+                "out": "",
+                "err": "0:123: execution error: Token : 5\ndnctl: setsockopt(IP_DUMMYNET_CONFIGURE): Operation not permitted (1)",
+                "timeout": False,
+            }
         return {"rc": 0, "out": "", "err": "", "timeout": False}
 
     monkeypatch.setattr(sys_probe, "run", fail_after_enable)
@@ -176,7 +311,7 @@ def test_apply_throttle_rollback_on_post_enable_failure(monkeypatch):
     res = traffic_shape.apply_throttle("example.com", 512)
 
     assert res["ok"] is False
-    assert res["token"] == "5", "токен не теряется при сбое после -E"
+    assert res["token"] == "5", "токен парсится из err при сбое после -E"
     assert "rollback" in res, "best-effort rollback приложен к ответу"
     assert len(calls) == 2, "второй вызов — rollback (только в failure-path)"
     rollback_script = calls[1][2]
@@ -184,10 +319,14 @@ def test_apply_throttle_rollback_on_post_enable_failure(monkeypatch):
 
 
 def test_apply_throttle_no_token_no_rollback(monkeypatch):
-    # Сбой ДО -E (out без 'Token') -> token:None, rollback НЕ зван.
+    # Сбой самого -E (`|| exit $?`): out пуст (реальная семантика), токена нет
+    # нигде -> token:None, rollback НЕ зван (нечего освобождать — утечки нет).
     calls = []
     monkeypatch.setattr(socket, "gethostbyname", lambda h: "203.0.113.10")
-    monkeypatch.setattr(sys_probe, "run", _spy_run(calls, rc=1, out="pf: permission denied"))
+    monkeypatch.setattr(
+        sys_probe, "run",
+        _spy_run(calls, rc=1, out="", err="0:99: execution error: pfctl: pf not enabled (1)"),
+    )
 
     res = traffic_shape.apply_throttle("example.com", 512)
 
@@ -197,16 +336,58 @@ def test_apply_throttle_no_token_no_rollback(monkeypatch):
     assert len(calls) == 1, "без токена rollback не запускается"
 
 
+def test_apply_throttle_ok_without_token_fail_closed(monkeypatch):
+    # Issue #61 фикс 1 (fail-closed): rc=0, но токен не распарсен -> это СБОЙ
+    # (pf включён, release-token неизвестен, enable-ref может течь), не ok:true.
+    # Обязателен best-effort cleanup БЕЗ -X (токена нет): flush anchor + pipe delete.
+    calls = []
+    monkeypatch.setattr(socket, "gethostbyname", lambda h: "203.0.113.10")
+    monkeypatch.setattr(sys_probe, "run", _spy_run(calls, rc=0, out="", err=""))
+
+    res = traffic_shape.apply_throttle("example.com", 512)
+
+    assert res["ok"] is False, "rc=0 без токена — fail-closed, не успех"
+    assert res.get("token") is None
+    assert "enable-ref" in res["err"], "явная ошибка про возможную утечку enable-ref"
+    assert "rollback" in res, "best-effort cleanup приложен к ответу"
+    assert len(calls) == 2, "второй вызов — cleanup"
+    cleanup_script = calls[1][2]
+    assert "-X" not in cleanup_script, "токена нет — enable-ref не трогаем"
+    assert traffic_shape.ANCHOR in cleanup_script, "cleanup чистит наш под-anchor"
+    assert f"pipe {traffic_shape.PIPE_NUM} delete" in cleanup_script, "cleanup удаляет наш pipe"
+
+
+def test_apply_throttle_timeout_token_lost(monkeypatch):
+    # Timeout osascript (sys_probe: rc=None, out="", err="timeout"): состояние pf
+    # неизвестно, токен потерян -> явная ошибка в результате, rollback невозможен.
+    calls = []
+    monkeypatch.setattr(socket, "gethostbyname", lambda h: "203.0.113.10")
+    monkeypatch.setattr(
+        sys_probe, "run",
+        _spy_run(calls, rc=None, out="", err="timeout", timed_out=True),
+    )
+
+    res = traffic_shape.apply_throttle("example.com", 512)
+
+    assert res["ok"] is False
+    assert res["timeout"] is True
+    assert res.get("token") is None
+    assert "rollback" not in res, "без токена откатывать нечего"
+    assert "enable-ref" in res["err"], "явная ошибка: состояние pf неизвестно, возможна утечка"
+
+
 def test_apply_throttle_exception_preserves_token(monkeypatch):
-    # Широкий except (defensive): -E успел (token распарсен), но rollback бросил
-    # исключение -> apply не бросает наружу И не теряет токен (token:"9").
+    # Широкий except (defensive): -E успел (token распарсен из err — реальная
+    # семантика), но rollback бросил исключение -> apply не бросает наружу И не
+    # теряет токен (token:"9").
     state = {"n": 0}
     monkeypatch.setattr(socket, "gethostbyname", lambda h: "203.0.113.10")
 
     def enable_then_boom(cmd_list, timeout=None):
         state["n"] += 1
         if state["n"] == 1:
-            return {"rc": 1, "out": "Token : 9", "err": "", "timeout": False}  # apply упал, токен есть
+            # apply упал: out пуст, токен только в stderr-аккумуляторе.
+            return {"rc": 1, "out": "", "err": "0:88: execution error: Token : 9\nboom (1)", "timeout": False}
         raise RuntimeError("kaboom во время rollback")
 
     monkeypatch.setattr(sys_probe, "run", enable_then_boom)
