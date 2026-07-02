@@ -343,7 +343,10 @@ def _sync_split_route(previous, name, state_path):
          останемся без route к узлу вообще (провал midway хуже, чем «ничего не делать»);
       3) delete ПРЕЖНЕГО route — только после УСПЕШНОГО add, только если старый валиден и
          отличается от нового (без дублей). Сбой/отмена add -> старый route не трогаем;
-      4) «File exists» (route уже есть) толерируется как успех add — idempotent.
+      4) «File exists» (route уже есть) — успех ТОЛЬКО после read-back (issue #70):
+         фактический gateway существующего route обязан совпасть с нашим validated
+         gateway. Read-back упал или gateway чужой -> fail-closed: старый route не
+         трогаем и возвращаем error — иначе delete снёс бы единственный рабочий bypass.
     """
     result = {"enabled": True, "removed": None, "added": None}
     try:
@@ -363,9 +366,21 @@ def _sync_split_route(previous, name, state_path):
         added = _route_result(_sudo_route_ip("add", new_ip, gateway))
         result["added"] = added
 
-        # 4) idempotent: «route already in table» / «File exists» — не ошибка, маршрут стоит.
-        if not added["ok"] and not _route_is_already_present(added):
-            return result  # add провалился (сбой/отмена) — старый route НЕ трогаем.
+        # 4) idempotent: «route already in table» / «File exists» — маршрут уже есть, НО
+        #    это чисто текстовый сигнал: существующая запись могла быть stale/ручной и
+        #    вести через ЧУЖОЙ gateway (issue #70). Успехом считаем ТОЛЬКО после
+        #    read-back: фактический gateway host-route обязан совпасть с validated
+        #    gateway ДО delete старого. Иначе fail-closed — старый route не трогаем.
+        if not added["ok"]:
+            if not _route_is_already_present(added):
+                return result  # add провалился (сбой/отмена) — старый route НЕ трогаем.
+            reported = _route_readback_gateway(new_ip)
+            if reported != gateway:
+                result["error"] = (
+                    "route уже в таблице, но read-back не подтвердил наш gateway "
+                    f"(получен {reported!r}, ожидался {gateway!r}) — старый route не тронут"
+                )
+                return result
 
         # 3) delete прежнего — только после успешного/idempotent add и только если он отличается.
         if old_ip and old_ip != new_ip:
@@ -376,13 +391,35 @@ def _sync_split_route(previous, name, state_path):
 
 
 def _route_is_already_present(added):
-    """Толерировать повторный add: route/host уже в таблице маршрутов — idempotent успех.
+    """Распознать повторный add: route/host уже в таблице маршрутов.
 
     macOS route add при существующей записи отвечает ненулевым rc и сообщением вида
-    'add host: gateway ... File exists' / 'already in table'. Это не ошибка применения.
+    'add host: gateway ... File exists' / 'already in table'. ВАЖНО (issue #70): это
+    чисто текстовый сигнал «запись есть», он НЕ гарантирует правильный gateway —
+    успехом считается только после read-back (_route_readback_gateway) в вызывающем.
     """
     msg = ((added.get("err") or "") + " " + (added.get("out") or "")).lower()
     return "file exists" in msg or "already in table" in msg or "already exists" in msg
+
+
+def _route_readback_gateway(route_ip):
+    """Фактический gateway host-route по `route -n get -host <ip>` или "" при сбое.
+
+    Непривилегированное чтение routing socket: argv-список (канон sys_probe, без
+    shell/osascript). Возвращает значение строки `gateway:` из вывода; сбой, timeout,
+    пустой вывод или отсутствие строки gateway -> "" — fail-closed решение принимает
+    вызывающий сравнением с validated gateway. Не бросает.
+    """
+    probe = sys_probe.run([ROUTE, "-n", "get", "-host", route_ip], timeout=_ROUTE_SYNC_TIMEOUT_SEC) or {}
+    if probe.get("rc") != 0 or probe.get("timeout"):
+        return ""
+    for line in (probe.get("out") or "").splitlines():
+        # Формат route(8): выровненные строки "  gateway: 192.0.2.1"; у IPv6 в значении
+        # есть свои ":", поэтому режем только по ПЕРВОМУ двоеточию.
+        key, sep, value = line.partition(":")
+        if sep and key.strip() == "gateway":
+            return value.strip()
+    return ""
 
 
 def select_node(name, *, enabled_names, runner=None, state_path=None, config_path=XRAY_CONFIG_PATH):
