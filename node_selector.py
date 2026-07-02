@@ -343,7 +343,8 @@ def _sync_split_route(previous, name, state_path):
          останемся без route к узлу вообще (провал midway хуже, чем «ничего не делать»);
       3) delete ПРЕЖНЕГО route — только после УСПЕШНОГО add, только если старый валиден и
          отличается от нового (без дублей). Сбой/отмена add -> старый route не трогаем;
-      4) «File exists» (route уже есть) толерируется как успех add — idempotent.
+      4) «File exists» (route уже есть) толерируется как успех add только после
+         read-back проверки: существующий route обязан идти через тот же gateway.
     """
     result = {"enabled": True, "removed": None, "added": None}
     try:
@@ -363,9 +364,22 @@ def _sync_split_route(previous, name, state_path):
         added = _route_result(_sudo_route_ip("add", new_ip, gateway))
         result["added"] = added
 
-        # 4) idempotent: «route already in table» / «File exists» — не ошибка, маршрут стоит.
-        if not added["ok"] and not _route_is_already_present(added):
-            return result  # add провалился (сбой/отмена) — старый route НЕ трогаем.
+        # 4) idempotent: «route already in table» / «File exists» — успех только
+        # если route get подтверждает ожидаемый gateway. Иначе stale/manual route
+        # через чужой gateway не должен разрешить delete старого рабочего route.
+        if not added["ok"]:
+            if not _route_is_already_present(added):
+                return result  # add провалился (сбой/отмена) — старый route НЕ трогаем.
+            readback = _route_get_gateway(new_ip)
+            result["readback"] = readback
+            if not readback["ok"]:
+                result["error"] = "route read-back failed"
+                return result
+            if readback["gateway"] != gateway:
+                result["error"] = (
+                    f"route read-back gateway mismatch: expected {gateway}, got {readback['gateway']}"
+                )
+                return result
 
         # 3) delete прежнего — только после успешного/idempotent add и только если он отличается.
         if old_ip and old_ip != new_ip:
@@ -383,6 +397,55 @@ def _route_is_already_present(added):
     """
     msg = ((added.get("err") or "") + " " + (added.get("out") or "")).lower()
     return "file exists" in msg or "already in table" in msg or "already exists" in msg
+
+
+def _route_get_gateway(route_ip):
+    """Read-back канон для File-exists: route get должен вернуть gateway в stdout."""
+    if not _ip_literal(route_ip):
+        return {
+            "ok": False,
+            "rc": None,
+            "out": "",
+            "err": "Нет валидного route_ip",
+            "timeout": False,
+            "gateway": "",
+        }
+    try:
+        raw = sys_probe.run(
+            [ROUTE, "-n", "get", "-host", route_ip],
+            timeout=_ROUTE_SYNC_TIMEOUT_SEC,
+        ) or {}
+    except Exception as exc:
+        return {
+            "ok": False,
+            "rc": None,
+            "out": "",
+            "err": str(exc),
+            "timeout": False,
+            "gateway": "",
+        }
+    out = raw.get("out") or ""
+    gateway = _route_gateway_from_output(out)
+    ok = raw.get("rc") == 0 and not bool(raw.get("timeout")) and bool(gateway)
+    return {
+        "ok": ok,
+        "rc": raw.get("rc"),
+        "out": out,
+        "err": raw.get("err") or "",
+        "timeout": bool(raw.get("timeout")),
+        "gateway": gateway,
+    }
+
+
+def _route_gateway_from_output(out):
+    """Достать значение строки 'gateway:' из вывода macOS route get."""
+    if not isinstance(out, str):
+        return ""
+    for line in out.splitlines():
+        key, sep, value = line.strip().partition(":")
+        if sep and key.strip().lower() == "gateway":
+            return (value.strip().split() or [""])[0]
+    return ""
 
 
 def select_node(name, *, enabled_names, runner=None, state_path=None, config_path=XRAY_CONFIG_PATH):
