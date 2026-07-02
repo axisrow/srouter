@@ -95,6 +95,22 @@ def test_save_state_unserializable_returns_none_and_cleans_tmp(tmp_path):
     assert not (tmp_path / "bad.json.tmp").exists()
 
 
+def test_preflight_state_write_uses_real_save_path(tmp_path, monkeypatch):
+    """Issue #68: readable JSON ещё не значит, что atomic-write/replace проходит."""
+    p = tmp_path / "srouter.local.json"
+    p.write_text(json.dumps({"nodes": []}), encoding="utf-8")
+    calls = []
+
+    def fake_save_state(state, path=None):
+        calls.append((state, path))
+        return None
+
+    monkeypatch.setattr(local_state, "save_state", fake_save_state)
+
+    assert local_state.preflight_state_write(path=p) is False
+    assert calls and calls[0][1] == p
+
+
 def test_load_nodes_drops_invalid(tmp_path):
     p = tmp_path / "n.json"
     p.write_text(
