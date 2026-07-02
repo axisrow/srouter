@@ -294,10 +294,19 @@ def _gateway_literal():
 def _sudo_route_ip(action, route_ip, gateway):
     """Канон dashboard._sudo_route_ip: shell_cmd из констант + validated IP, osascript-argv.
 
-    ВАЖНО: shell_cmd собран ТОЛЬКО из констант (ROUTE/флаги) и уже-validated route_ip/gateway.
-    User-controlled ввод сюда не попадает. Динамическую команду добавлять только с вайтлистом.
+    ВАЖНО: shell_cmd собран ТОЛЬКО из констант (ROUTE/флаги) и validated IP/gateway.
+    User-controlled ввод сюда не попадает никогда. Валидация IP живёт ВНУТРИ моста (как
+    dashboard.py:118) — defense-in-depth: даже если будущий вызов забудет pre-валидировать,
+    невалидный IP никогда не интерполируется в shell text. Динамическую команду добавлять
+    только с вайтлистом + экранированием.
     """
+    # Канон dashboard.py:118 — reject на границе моста, не в вызывающем коде.
+    if not _ip_literal(route_ip):
+        return {"rc": None, "out": "", "err": "Нет валидного route_ip", "timeout": False}
     if action == "add":
+        # gateway интерполируется в shell text только в add — обязан быть validated literal.
+        if not _ip_literal(gateway):
+            return {"rc": None, "out": "", "err": "Нет валидного GATEWAY", "timeout": False}
         shell_cmd = f"{ROUTE} -n add -host {route_ip} {gateway}"
     elif action == "remove":
         shell_cmd = f"{ROUTE} -n delete -host {route_ip}"
@@ -328,19 +337,20 @@ def _sync_split_route(previous, name, state_path):
     """Синхронизировать split-route при смене active node. Fail-safe: НИКОГДА не бросает,
     сбой/отмена НЕ ломают уже применённый node-switch — отчёт возвращается вызывающему.
 
-    Порядок: delete прежнего route -> add нового. Delete первым, чтобы при add==remove
-    (одинаковый route_ip) не снести только что добавленный маршрут; при разных IP порядок
-    не критичен, но delete-then-add убирает окно двойного host-route на один gateway.
-    Прежний route снимается только если он валиден и ОТЛИЧАЕТСЯ от нового (без дублей).
+    Транзакционный add-first порядок:
+      1) валидация new_ip + gateway ДО мутации (любой невалид -> отказ, route не трогаем);
+      2) add НОВОГО route первым — чтобы не снести старый, пока новый не стоит, иначе
+         останемся без route к узлу вообще (провал midway хуже, чем «ничего не делать»);
+      3) delete ПРЕЖНЕГО route — только после УСПЕШНОГО add, только если старый валиден и
+         отличается от нового (без дублей). Сбой/отмена add -> старый route не трогаем;
+      4) «File exists» (route уже есть) толерируется как успех add — idempotent.
     """
     result = {"enabled": True, "removed": None, "added": None}
     try:
-        gateway = _gateway_literal()
+        # 1) валидация до мутации: без валидного нового route_ip / GATEWAY — никаких shell-вызовов.
         new_ip = _route_node_ip(name, state_path)
+        gateway = _gateway_literal()
         old_ip = _route_node_ip(previous, state_path)
-
-        if old_ip and old_ip != new_ip:
-            result["removed"] = _route_result(_sudo_route_ip("remove", old_ip, gateway))
 
         if not new_ip:
             result["error"] = "нет валидного route_ip нового узла"
@@ -348,10 +358,31 @@ def _sync_split_route(previous, name, state_path):
         if not gateway:
             result["error"] = "нет валидного GATEWAY в srouter_config"
             return result
-        result["added"] = _route_result(_sudo_route_ip("add", new_ip, gateway))
+
+        # 2) add нового ПЕРВЫМ (fail-closed на gateway/ip уже внутри моста).
+        added = _route_result(_sudo_route_ip("add", new_ip, gateway))
+        result["added"] = added
+
+        # 4) idempotent: «route already in table» / «File exists» — не ошибка, маршрут стоит.
+        if not added["ok"] and not _route_is_already_present(added):
+            return result  # add провалился (сбой/отмена) — старый route НЕ трогаем.
+
+        # 3) delete прежнего — только после успешного/idempotent add и только если он отличается.
+        if old_ip and old_ip != new_ip:
+            result["removed"] = _route_result(_sudo_route_ip("remove", old_ip, gateway))
     except Exception as exc:
         result["error"] = str(exc)
     return result
+
+
+def _route_is_already_present(added):
+    """Толерировать повторный add: route/host уже в таблице маршрутов — idempotent успех.
+
+    macOS route add при существующей записи отвечает ненулевым rc и сообщением вида
+    'add host: gateway ... File exists' / 'already in table'. Это не ошибка применения.
+    """
+    msg = ((added.get("err") or "") + " " + (added.get("out") or "")).lower()
+    return "file exists" in msg or "already in table" in msg or "already exists" in msg
 
 
 def select_node(name, *, enabled_names, runner=None, state_path=None, config_path=XRAY_CONFIG_PATH):

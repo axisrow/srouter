@@ -529,8 +529,8 @@ def test_route_sync_only_explicit_true_enables(tmp_path, monkeypatch, flag):
     assert calls == []
 
 
-def test_route_sync_enabled_adds_new_and_deletes_old_from_constants(tmp_path, monkeypatch):
-    """Флаг включён: commit узла -> delete старого route + add нового, argv из констант+IP."""
+def test_route_sync_enabled_adds_new_first_then_deletes_old_from_constants(tmp_path, monkeypatch):
+    """Флаг включён: commit узла -> add нового ПЕРВЫМ, затем delete старого, argv из констант+IP."""
     import node_selector
 
     state_path = tmp_path / "srouter.local.json"
@@ -546,18 +546,18 @@ def test_route_sync_enabled_adds_new_and_deletes_old_from_constants(tmp_path, mo
     assert out["active"] == "hk-1"
     sync = out["route_sync"]
     assert sync["enabled"] is True
-    assert sync["removed"]["ok"] is True
     assert sync["added"]["ok"] is True
+    assert sync["removed"]["ok"] is True
 
-    # delete прежнего (sg-1: 203.0.113.10) ДО add нового (hk-1: 203.0.113.20).
+    # add нового (hk-1: 203.0.113.20) ПЕРВЫМ, delete прежнего (sg-1: 203.0.113.10) — после.
     assert len(calls) == 2
-    delete_cmd, delete_timeout = calls[0]
-    add_cmd, add_timeout = calls[1]
-    assert delete_timeout == 60 and add_timeout == 60
-    assert delete_cmd[:2] == [node_selector.OSASCRIPT, "-e"]
+    add_cmd, add_timeout = calls[0]
+    delete_cmd, delete_timeout = calls[1]
+    assert add_timeout == 60 and delete_timeout == 60
     assert add_cmd[:2] == [node_selector.OSASCRIPT, "-e"]
-    assert f"{node_selector.ROUTE} -n delete -host 203.0.113.10" in delete_cmd[2]
+    assert delete_cmd[:2] == [node_selector.OSASCRIPT, "-e"]
     assert f"{node_selector.ROUTE} -n add -host 203.0.113.20 192.0.2.1" in add_cmd[2]
+    assert f"{node_selector.ROUTE} -n delete -host 203.0.113.10" in delete_cmd[2]
     # do shell script + admin privileges — точный канон моста.
     for cmd, _timeout in calls:
         assert cmd[2].startswith('do shell script "')
@@ -591,13 +591,15 @@ def test_route_sync_reports_but_never_makes_switch_fail_on_invalid_new_ip(tmp_pa
     assert out["active"] == "hk-1"
     sync = out["route_sync"]
     assert sync["added"] is None
+    assert sync["removed"] is None  # валидация до мутации: ни add, ни delete
     assert "route_ip" in sync["error"]
-    # add нового не вызывался; мог быть только delete прежнего (валидный sg-1) — но не add.
-    assert all("-n add -host" not in frag for frag in _route_argv_fragments(calls))
+    # валидация провалилась до мутации — ни одной privileged-команды.
+    assert calls == []
 
 
-def test_route_sync_cancelled_reports_but_switch_succeeds(tmp_path, monkeypatch):
-    """osascript отмена (-128) route-синка -> node-switch успешен, route_sync с cancelled."""
+def test_route_sync_cancelled_add_leaves_old_route_intact_and_switch_succeeds(tmp_path, monkeypatch):
+    """Отмена (-128) add нового -> старый route НЕ трогается (removed is None),
+    node-switch успешен, route_sync.added = cancelled."""
     import node_selector
 
     state_path = tmp_path / "srouter.local.json"
@@ -605,16 +607,19 @@ def test_route_sync_cancelled_reports_but_switch_succeeds(tmp_path, monkeypatch)
     state["auto_route_sync"] = True
     _write_state(state_path, state)
     _install_gateway(monkeypatch)
-    _install_route_runner(monkeypatch, {"rc": -128, "out": "", "err": "User canceled.", "timeout": False})
+    calls = _install_route_runner(monkeypatch, {"rc": -128, "out": "", "err": "User canceled.", "timeout": False})
 
     out = _apply_switch(monkeypatch, state_path, tmp_path, name="hk-1")
 
     assert out["ok"] is True
     assert out["active"] == "hk-1"
     sync = out["route_sync"]
-    assert sync["removed"]["cancelled"] is True
     assert sync["added"]["cancelled"] is True
     assert sync["added"]["ok"] is False
+    assert sync["removed"] is None  # транзакционность: add провален -> delete не зван
+    # только одна попытка — add; delete прежнего не выполнялся.
+    assert len(calls) == 1
+    assert "-n add -host" in calls[0][0][2]
 
 
 def test_route_sync_same_old_and_new_ip_skips_delete(tmp_path, monkeypatch):
@@ -638,6 +643,115 @@ def test_route_sync_same_old_and_new_ip_skips_delete(tmp_path, monkeypatch):
     assert sync["added"]["ok"] is True
     assert len(calls) == 1
     assert f"{node_selector.ROUTE} -n add -host 203.0.113.10 192.0.2.1" in calls[0][0][2]
+
+
+def test_route_sync_add_failure_does_not_delete_old_route(tmp_path, monkeypatch):
+    """Сбой add (ненулевой rc, не File-exists) -> delete старого НЕ зовётся (транзакционность)."""
+    import node_selector
+
+    state_path = tmp_path / "srouter.local.json"
+    state = _state(active="sg-1")
+    state["auto_route_sync"] = True
+    _write_state(state_path, state)
+    _install_gateway(monkeypatch)
+
+    def runner(cmd, timeout):
+        # add возвращает ошибку; delete вообще не должен быть вызван — поэтому не готовим его ветку.
+        if "-n add" in cmd[2]:
+            return {"rc": 7, "out": "", "err": "route add boom", "timeout": False}
+        raise AssertionError("delete must not run after add failure: " + cmd[2])
+
+    monkeypatch.setattr(sys_probe, "run", runner)
+
+    out = _apply_switch(monkeypatch, state_path, tmp_path, name="hk-1")
+
+    assert out["ok"] is True
+    sync = out["route_sync"]
+    assert sync["added"]["ok"] is False
+    assert sync["removed"] is None  # старый route не тронут — провал midway не ухудшает состояние
+
+
+def test_route_sync_idempotent_file_exists_tolerated_as_success(tmp_path, monkeypatch):
+    """«File exists» на add — маршрут уже стоит; толерируется как успех add -> delete тоже зовётся."""
+    import node_selector
+
+    state_path = tmp_path / "srouter.local.json"
+    state = _state(active="sg-1")
+    state["auto_route_sync"] = True
+    _write_state(state_path, state)
+    _install_gateway(monkeypatch)
+
+    def runner(cmd, timeout):
+        if "-n add" in cmd[2]:
+            # macOS: повторный add того же host-route -> ненулевой rc + 'File exists'.
+            return {"rc": 17, "out": "add host: gateway 192.0.2.1 File exists", "err": "", "timeout": False}
+        return {"rc": 0, "out": "delete", "err": "", "timeout": False}
+
+    run_calls = []
+
+    def tracked(cmd, timeout):
+        run_calls.append((list(cmd), timeout))
+        return runner(cmd, timeout)
+
+    monkeypatch.setattr(sys_probe, "run", tracked)
+
+    out = _apply_switch(monkeypatch, state_path, tmp_path, name="hk-1")
+
+    assert out["ok"] is True
+    sync = out["route_sync"]
+    # add «провалился» по rc, но File-exists -> маршрут стоит -> считаем успехом -> delete зовётся.
+    assert sync["added"]["rc"] == 17  # исходный rc сохранён для диагностики
+    assert sync["removed"]["ok"] is True
+    assert "-n add -host" in run_calls[0][0][2]
+    assert "-n delete -host" in run_calls[1][0][2]
+
+
+def test_sudo_route_ip_rejects_invalid_ip_inside_bridge_without_shell(tmp_path, monkeypatch):
+    """In-bridge валидация (канон dashboard.py:118): невалидный route_ip -> reject без osascript."""
+    import node_selector
+
+    _install_gateway(monkeypatch)
+    run_calls = []
+
+    def boom(cmd, timeout):
+        run_calls.append(cmd)
+        raise AssertionError("bridge must reject before calling sys_probe.run")
+
+    monkeypatch.setattr(sys_probe, "run", boom)
+
+    # Невалидный scoped IPv6 и hostname не должны попасть в shell text.
+    for bad in ("fe80::1%en0", "node.example.test", ""):
+        r = node_selector._sudo_route_ip("add", bad, "192.0.2.1")
+        assert r["rc"] is None
+        assert r["timeout"] is False
+        assert run_calls == []
+
+
+def test_sudo_route_ip_rejects_invalid_gateway_on_add_without_shell(tmp_path, monkeypatch):
+    """В add gateway интерполируется в shell -> невалидный gateway reject на границе моста."""
+    import node_selector
+
+    monkeypatch.setattr(sys_probe, "run", lambda cmd, timeout: (_ for _ in ()).throw(
+        AssertionError("invalid gateway must not reach shell")
+    ))
+
+    r = node_selector._sudo_route_ip("add", "203.0.113.20", "not-a-gateway")
+    assert r["rc"] is None
+    assert "GATEWAY" in r["err"]
+
+
+def test_sudo_route_ip_remove_does_not_require_gateway(monkeypatch):
+    """remove не интерполирует gateway -> валидный IP + невалидный gateway проходит на remove."""
+    import node_selector
+
+    seen = []
+    monkeypatch.setattr(sys_probe, "run", lambda cmd, timeout: seen.append(cmd) or {"rc": 0, "out": "", "err": "", "timeout": False})
+
+    r = node_selector._sudo_route_ip("remove", "203.0.113.10", "not-a-gateway")
+    assert r["rc"] == 0
+    assert len(seen) == 1
+    assert "-n delete -host 203.0.113.10" in seen[0][2]
+    assert "not-a-gateway" not in seen[0][2]  # gateway не попал в shell-команду remove
 
 
 def test_route_sync_defensive_when_runner_raises(tmp_path, monkeypatch):
