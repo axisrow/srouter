@@ -6,6 +6,7 @@
 """
 import threading
 import time
+import re
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, wait
 from flask import Flask, g, jsonify, Response, request
@@ -179,6 +180,29 @@ def _throttle_payload():
     return {"action": body.get("action"), "domain": body.get("domain"), "rate": body.get("rate")}
 
 
+_THROTTLE_PUBLIC_REDACTIONS = (
+    (re.compile(r"Token\s*:\s*\d+"), "Token : [redacted]"),
+    (re.compile(r"-X\s+\d+"), "-X [redacted]"),
+)
+
+
+def _redact_throttle_text(value):
+    """Убрать pf release-token из публичной диагностики throttle.
+
+    Raw token остаётся только в server-side result["token"] и state lease; err/out/rollback
+    уходят в JSON/UI, поэтому чистим оба известных представления из traffic_shape (#68).
+    """
+    if value is None:
+        text = ""
+    elif isinstance(value, str):
+        text = value
+    else:
+        text = str(value)
+    for pattern, replacement in _THROTTLE_PUBLIC_REDACTIONS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
 def _throttle_result(r):
     """Свести dict от traffic_shape.{apply,clear}_throttle к ПУБЛИЧНОЙ форме для UI.
 
@@ -191,7 +215,8 @@ def _throttle_result(r):
         "ok": bool(r.get("ok")),
         "cancelled": bool(r.get("cancelled")),
         "rc": r.get("rc"),
-        "err": r.get("err") or "",
+        "out": _redact_throttle_text(r.get("out")),
+        "err": _redact_throttle_text(r.get("err")),
     }
 
 
@@ -414,11 +439,21 @@ def _public_throttle(entry):
     """Публичная (без token) проекция throttle-lease или None.
 
     token наружу НЕ отдаём (он нужен только серверу для pfctl -X) — лишь
-    domain/rate/applied_at. entry=None -> None.
+    domain/rate/applied_at + cleanup-маркеры. entry=None -> None.
     """
     if not entry:
         return None
-    return {"domain": entry.get("domain"), "rate": entry.get("rate"), "applied_at": entry.get("applied_at")}
+    needs_cleanup = bool(entry.get("needs_cleanup"))
+    cleanup_persisted = bool(entry.get("cleanup_persisted")) if "cleanup_persisted" in entry else needs_cleanup
+    if not needs_cleanup:
+        cleanup_persisted = False
+    return {
+        "domain": entry.get("domain"),
+        "rate": entry.get("rate"),
+        "applied_at": entry.get("applied_at"),
+        "needs_cleanup": needs_cleanup,
+        "cleanup_persisted": cleanup_persisted,
+    }
 
 
 def _public_active_throttle():
@@ -526,14 +561,6 @@ def _throttle_apply(payload):
             {"ok": False, "err": "domain must be a valid host and rate a positive integer (Kbit/s)"}
         ), 400
 
-    # Preflight writability (cycle-2 FIX): если state неперезаписываем, apply создал бы
-    # enable-ref, который потом не во что персистить -> утечка. Отказ ДО движка.
-    _state, readable = local_state.load_state_checked()
-    if not readable:
-        return jsonify(
-            {"ok": False, "err": "local state is not safely writable; cannot manage throttle lease"}
-        ), 409
-
     # Один активный throttle за раз (движок одно-pipe'овый). Активный lease -> 409,
     # без скрытого авто-clear (fail-closed: не рискуем потерять токен при сбое clear).
     active = local_state.load_active_throttle()
@@ -542,8 +569,15 @@ def _throttle_apply(payload):
             {
                 "ok": False,
                 "err": "throttle already active for '%s'; clear it first" % active.get("domain"),
-                "active": {"domain": active.get("domain"), "rate": active.get("rate")},
+                "active": _public_throttle(active),
             }
+        ), 409
+
+    # Preflight writability (#68): readable state ещё не доказывает, что atomic-write
+    # exact save-path работает. Под mutation-lock делаем no-op save ДО privileged apply.
+    if not local_state.preflight_state_write():
+        return jsonify(
+            {"ok": False, "err": "local state is not safely writable; cannot manage throttle lease"}
         ), 409
 
     result = traffic_shape.apply_throttle(domain, rate)
@@ -633,9 +667,7 @@ def _persist_cleanup_lease(body, domain, rate, token):
     )
     body["needs_cleanup"] = True
     body["cleanup_persisted"] = cleanup is not None
-    body["throttle"] = _public_throttle(cleanup) if cleanup else _public_throttle(
-        {"domain": domain, "rate": rate, "applied_at": int(time.time())}
-    )
+    body["throttle"] = _public_throttle(cleanup) if cleanup else None
     return jsonify(body), 500
 
 

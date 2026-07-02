@@ -225,11 +225,14 @@
         throttle_domain: "Domain", throttle_rate: "Rate (Kbit/s)",
         throttle_apply: "Apply throttle", throttle_clear: "Clear throttle",
         throttle_active: "Active: {0} at {1} Kbit/s", throttle_inactive: "No active throttle.",
+        throttle_cleanup_required: "Cleanup required: {0} at {1} Kbit/s",
+        throttle_cleanup_help: "New throttle is disabled until cleanup succeeds.",
         throttle_need_domain: "Enter a domain first.", throttle_need_rate: "Enter a positive rate (Kbit/s).",
         throttle_applied: "Throttle applied: {0}", throttle_cleared: "Throttle cleared",
         throttle_cancelled: "Cancelled (admin password dismissed)",
         throttle_conflict: "A throttle is already active — clear it first.",
         throttle_clear_failed_active: "Clear failed — throttle is still active on pf. Retry.",
+        throttle_cleanup_unrecoverable: "Cleanup token could not be persisted. Restart cannot recover this pf enable-ref.",
         throttle_failed: "Throttle failed: {0}",
         channel_title: "Network channel", channel_active: "Active channel",
         channel_wifi: "Wi-Fi", channel_usb: "USB tether",
@@ -296,11 +299,14 @@
         throttle_domain: "Домен", throttle_rate: "Скорость (Kbit/s)",
         throttle_apply: "Включить замедление", throttle_clear: "Снять замедление",
         throttle_active: "Активно: {0} на {1} Kbit/s", throttle_inactive: "Замедление не активно.",
+        throttle_cleanup_required: "Требуется очистка: {0} на {1} Kbit/s",
+        throttle_cleanup_help: "Новое замедление отключено, пока очистка не завершится.",
         throttle_need_domain: "Сначала введите домен.", throttle_need_rate: "Введите положительную скорость (Kbit/s).",
         throttle_applied: "Замедление включено: {0}", throttle_cleared: "Замедление снято",
         throttle_cancelled: "Отменено (пароль администратора не введён)",
         throttle_conflict: "Замедление уже активно — сначала снимите его.",
         throttle_clear_failed_active: "Снять не удалось — замедление всё ещё активно на pf. Повторите.",
+        throttle_cleanup_unrecoverable: "Токен очистки не удалось сохранить. После рестарта этот pf enable-ref не восстановить.",
         throttle_failed: "Ошибка замедления: {0}",
         channel_title: "Сетевой канал", channel_active: "Активный канал",
         channel_wifi: "Wi-Fi", channel_usb: "USB-модем",
@@ -367,11 +373,14 @@
         throttle_domain: "域名", throttle_rate: "速率（Kbit/s）",
         throttle_apply: "启用限速", throttle_clear: "清除限速",
         throttle_active: "已启用：{0}，{1} Kbit/s", throttle_inactive: "未启用限速。",
+        throttle_cleanup_required: "需要清理：{0}，{1} Kbit/s",
+        throttle_cleanup_help: "清理成功前不能启用新的限速。",
         throttle_need_domain: "请先输入域名。", throttle_need_rate: "请输入正的速率（Kbit/s）。",
         throttle_applied: "限速已启用：{0}", throttle_cleared: "限速已清除",
         throttle_cancelled: "已取消（未输入管理员密码）",
         throttle_conflict: "已有限速在运行 — 请先清除。",
         throttle_clear_failed_active: "清除失败 — 限速仍在 pf 上运行。请重试。",
+        throttle_cleanup_unrecoverable: "清理令牌未能持久化。重启后无法恢复此 pf enable-ref。",
         throttle_failed: "限速失败：{0}",
         channel_title: "网络通道", channel_active: "当前通道",
         channel_wifi: "Wi-Fi", channel_usb: "USB 网络共享",
@@ -995,11 +1004,21 @@
     /* ============================ Traffic Guard throttle (EXPERIMENTAL, #13/#22) ============================
        Отдельный runtime-механизм поверх guard: замедление ОДНОГО домена через pf/dummynet.
        Движок ещё не валидирован на реальном pf (automation ladder) — помечен experimental.
-       THROTTLE_ACTIVE — активный lease {domain, rate} (без токена: сервер держит его сам). */
+       THROTTLE_ACTIVE — public lease {domain, rate, needs_cleanup} без токена. */
     var THROTTLE_ACTIVE = null;
     var THROTTLE_INPUT = { domain: '', rate: '' };  // черновик полей до apply
+    function publicThrottleFromServer(active) {
+      return (active && active.domain)
+        ? {
+            domain: active.domain,
+            rate: active.rate,
+            needs_cleanup: !!active.needs_cleanup,
+            cleanup_persisted: active.cleanup_persisted === true
+          }
+        : null;
+    }
     function syncThrottleFromServer(active) {
-      THROTTLE_ACTIVE = (active && active.domain) ? { domain: active.domain, rate: active.rate } : null;
+      THROTTLE_ACTIVE = publicThrottleFromServer(active);
       renderThrottle();
     }
     function readThrottleInputFromDom() {
@@ -1014,12 +1033,18 @@
       if (!box) return;
       var busy = mutationInFlight();
       var active = THROTTLE_ACTIVE;
-      var activeHtml = active
+      var cleanupRequired = !!(active && active.needs_cleanup);
+      var activeHtml = cleanupRequired
+        ? '<div class="alert alert-warning py-2 mb-2" role="status">' +
+            '<i class="bi bi-exclamation-triangle me-1"></i>' +
+            esc(t('throttle_cleanup_required', active.domain, fmtNumber(active.rate))) +
+            '<div class="small mt-1">' + esc(t('throttle_cleanup_help')) + '</div></div>'
+        : active
         ? '<div class="alert alert-info py-2 mb-2" role="status">' +
             '<i class="bi bi-hourglass-split me-1"></i>' +
             esc(t('throttle_active', active.domain, fmtNumber(active.rate))) + '</div>'
         : '<div class="text-secondary ops mb-2">' + esc(t('throttle_inactive')) + '</div>';
-      // Поля apply отключаем, пока активен throttle (одно-pipe движок: сначала clear).
+      // Поля apply отключаем, пока есть active/cleanup lease (одно-pipe движок: сначала clear).
       var inputsDisabled = (busy || !!active) ? ' disabled' : '';
       box.innerHTML =
         '<div class="d-flex align-items-center gap-2 mb-2">' +
@@ -1062,18 +1087,23 @@
             .then(function (res) { res._status = r.status; return res; });
         })
         .then(function (res) {
+          if (res && Object.prototype.hasOwnProperty.call(res, 'throttle')) {
+            THROTTLE_ACTIVE = publicThrottleFromServer(res.throttle);
+          } else if (res && res.active && res.active.domain) {
+            THROTTLE_ACTIVE = publicThrottleFromServer(res.active);
+          }
           if (res && res.cancelled) {
             toast(t('throttle_cancelled'), 'warn');
           } else if (res && res.ok) {
-            // Сервер шлёт актуальный throttle (apply -> объект, clear -> null).
-            THROTTLE_ACTIVE = (res.throttle && res.throttle.domain)
-              ? { domain: res.throttle.domain, rate: res.throttle.rate } : null;
             if (payload.action === 'apply') THROTTLE_INPUT = { domain: '', rate: '' };
             toast(okKey === 'throttle_applied'
               ? t('throttle_applied', payload.domain) : t(okKey), 'ok');
           } else {
             var status = res && res._status;
-            if (status === 409) { toast(t('throttle_conflict'), 'warn'); }
+            if (res && res.needs_cleanup && res.cleanup_persisted === false) {
+              toast(t('throttle_cleanup_unrecoverable'), 'err');
+            }
+            else if (status === 409) { toast(t('throttle_conflict'), 'warn'); }
             else if (res && res.still_active) {
               // clear провалился: throttle всё ещё активен на pf — явный сигнал повторить.
               toast(t('throttle_clear_failed_active'), 'err');
