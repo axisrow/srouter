@@ -671,8 +671,8 @@ def test_route_sync_add_failure_does_not_delete_old_route(tmp_path, monkeypatch)
     assert sync["removed"] is None  # старый route не тронут — провал midway не ухудшает состояние
 
 
-def test_route_sync_idempotent_file_exists_tolerated_as_success(tmp_path, monkeypatch):
-    """«File exists» на add — маршрут уже стоит; толерируется как успех add -> delete тоже зовётся."""
+def test_route_sync_file_exists_with_matching_readback_gateway_deletes_old_route(tmp_path, monkeypatch):
+    """«File exists» на add — успех только если route get подтвердил тот же gateway."""
     import node_selector
 
     state_path = tmp_path / "srouter.local.json"
@@ -681,17 +681,18 @@ def test_route_sync_idempotent_file_exists_tolerated_as_success(tmp_path, monkey
     _write_state(state_path, state)
     _install_gateway(monkeypatch)
 
-    def runner(cmd, timeout):
-        if "-n add" in cmd[2]:
-            # macOS: повторный add того же host-route -> ненулевой rc + 'File exists'.
-            return {"rc": 17, "out": "add host: gateway 192.0.2.1 File exists", "err": "", "timeout": False}
-        return {"rc": 0, "out": "delete", "err": "", "timeout": False}
-
     run_calls = []
 
     def tracked(cmd, timeout):
         run_calls.append((list(cmd), timeout))
-        return runner(cmd, timeout)
+        if cmd == [node_selector.ROUTE, "-n", "get", "-host", "203.0.113.20"]:
+            return {"rc": 0, "out": "route to: 203.0.113.20\n    gateway: 192.0.2.1\n", "err": "", "timeout": False}
+        if "-n add" in cmd[2]:
+            # macOS: повторный add того же host-route -> ненулевой rc + 'File exists'.
+            return {"rc": 17, "out": "add host: gateway 192.0.2.1 File exists", "err": "", "timeout": False}
+        if "-n delete" in cmd[2]:
+            return {"rc": 0, "out": "delete", "err": "", "timeout": False}
+        raise AssertionError(f"unexpected route command: {cmd!r}")
 
     monkeypatch.setattr(sys_probe, "run", tracked)
 
@@ -699,11 +700,89 @@ def test_route_sync_idempotent_file_exists_tolerated_as_success(tmp_path, monkey
 
     assert out["ok"] is True
     sync = out["route_sync"]
-    # add «провалился» по rc, но File-exists -> маршрут стоит -> считаем успехом -> delete зовётся.
+    # add «провалился» по rc, но File-exists + read-back gateway совпал -> delete зовётся.
     assert sync["added"]["rc"] == 17  # исходный rc сохранён для диагностики
     assert sync["removed"]["ok"] is True
     assert "-n add -host" in run_calls[0][0][2]
-    assert "-n delete -host" in run_calls[1][0][2]
+    assert run_calls[1] == ([node_selector.ROUTE, "-n", "get", "-host", "203.0.113.20"], 60)
+    assert "-n delete -host" in run_calls[2][0][2]
+
+
+def test_route_sync_file_exists_with_wrong_readback_gateway_keeps_old_route(tmp_path, monkeypatch):
+    """Stale route через чужой gateway -> File exists НЕ успех; старый рабочий route не трогаем."""
+    import node_selector
+
+    state_path = tmp_path / "srouter.local.json"
+    state = _state(active="sg-1")
+    state["auto_route_sync"] = True
+    _write_state(state_path, state)
+    _install_gateway(monkeypatch, gateway="192.0.2.1")
+
+    run_calls = []
+
+    def tracked(cmd, timeout):
+        run_calls.append((list(cmd), timeout))
+        if cmd == [node_selector.ROUTE, "-n", "get", "-host", "203.0.113.20"]:
+            return {"rc": 0, "out": "route to: 203.0.113.20\n    gateway: 192.0.2.254\n", "err": "", "timeout": False}
+        if "-n add" in cmd[2]:
+            return {"rc": 17, "out": "", "err": "route: writing to routing socket: File exists", "timeout": False}
+        if "-n delete" in cmd[2]:
+            raise AssertionError("delete must not run when read-back gateway differs")
+        raise AssertionError(f"unexpected route command: {cmd!r}")
+
+    monkeypatch.setattr(sys_probe, "run", tracked)
+
+    out = _apply_switch(monkeypatch, state_path, tmp_path, name="hk-1")
+
+    assert out["ok"] is True
+    sync = out["route_sync"]
+    assert sync["added"]["rc"] == 17
+    assert sync["removed"] is None
+    assert "gateway" in sync["error"]
+    assert len(run_calls) == 2
+    assert "-n add -host" in run_calls[0][0][2]
+    assert run_calls[1] == ([node_selector.ROUTE, "-n", "get", "-host", "203.0.113.20"], 60)
+
+
+@pytest.mark.parametrize(
+    "readback",
+    [
+        {"rc": 1, "out": "", "err": "route get boom", "timeout": False},
+        {"rc": 0, "out": "", "err": "", "timeout": False},
+    ],
+)
+def test_route_sync_file_exists_with_failed_readback_keeps_old_route(tmp_path, monkeypatch, readback):
+    """Read-back упал или не вернул gateway -> fail-closed, delete старого route не зовётся."""
+    import node_selector
+
+    state_path = tmp_path / "srouter.local.json"
+    state = _state(active="sg-1")
+    state["auto_route_sync"] = True
+    _write_state(state_path, state)
+    _install_gateway(monkeypatch, gateway="192.0.2.1")
+
+    run_calls = []
+
+    def tracked(cmd, timeout):
+        run_calls.append((list(cmd), timeout))
+        if cmd == [node_selector.ROUTE, "-n", "get", "-host", "203.0.113.20"]:
+            return readback
+        if "-n add" in cmd[2]:
+            return {"rc": 17, "out": "add host: gateway 192.0.2.1 File exists", "err": "", "timeout": False}
+        if "-n delete" in cmd[2]:
+            raise AssertionError("delete must not run when read-back fails")
+        raise AssertionError(f"unexpected route command: {cmd!r}")
+
+    monkeypatch.setattr(sys_probe, "run", tracked)
+
+    out = _apply_switch(monkeypatch, state_path, tmp_path, name="hk-1")
+
+    assert out["ok"] is True
+    sync = out["route_sync"]
+    assert sync["added"]["rc"] == 17
+    assert sync["removed"] is None
+    assert "read-back" in sync["error"]
+    assert len(run_calls) == 2
 
 
 def test_sudo_route_ip_rejects_invalid_ip_inside_bridge_without_shell(tmp_path, monkeypatch):
