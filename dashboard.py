@@ -256,13 +256,23 @@ def api_guard_get():
 def api_guard():
     """Редактор Traffic Guard (#15): записать {mode, domains} в unified state.
 
-    mode только on/off, policy только block/allow — auto/throttle/parent-child
-    конфликты отклоняет local_state.validate_traffic_guard. Пишем через atomic
-    save_state; при невалидном/битом вводе state не перезаписывается.
+    Scope v1-редактора — только on/off + block/allow. auto (#23, channel-семантика)
+    и throttle (#13) здесь не поддерживаются и режутся ПРЯМО в роуте, до общего
+    валидатора: local_state.validate_traffic_guard эволюционирует (#56 разрешил
+    auto+channel-карты), поэтому scope роута нельзя привязывать к нему. Дальше
+    validate_traffic_guard ловит невалидные block/allow/parent-child. Пишем через
+    atomic save_state; при невалидном/битом вводе state не перезаписывается.
     """
     guard = _guard_payload()
     if guard is None:
         return jsonify({"ok": False, "errors": ["traffic_guard payload must be an object"]}), 400
+
+    # Жёсткая scope-граница редактора: mode строго on/off. auto/throttle/прочее reject
+    # здесь, независимо от того, что общий валидатор мог их начать принимать.
+    if guard.get("mode") not in ("on", "off"):
+        return jsonify(
+            {"ok": False, "errors": ['traffic_guard.mode must be "on" or "off" (auto/throttle not supported in editor)']}
+        ), 400
 
     errors = local_state.validate_traffic_guard(guard)
     if errors:

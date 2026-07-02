@@ -85,7 +85,30 @@ def test_api_guard_rejects_conflicting_parent_child(monkeypatch):
     assert saved == []
 
 
-def test_api_guard_rejects_auto_mode(monkeypatch):
+def test_api_guard_rejects_auto_mode_with_valid_channel_map(monkeypatch):
+    """Регрессия: auto с ВАЛИДНОЙ channel-картой (#56 расширил validate_traffic_guard,
+    чтобы её принимать) обязан резаться scope-границей роута v1-редактора → 400.
+
+    Раньше validate_traffic_guard возвращал [] на такой payload, роут писал mode:auto
+    в state (auto-bypass). Scope on/off теперь привязан к роуту, не к валидатору.
+    """
+    dashboard = _fresh_dashboard(monkeypatch)
+    saved = _install_state(monkeypatch, dashboard)
+
+    response = dashboard.app.test_client().post(
+        "/api/guard", json={"mode": "auto", "domains": {"wifi": {"example.com": "block"}}}
+    )
+
+    assert response.status_code == 400
+    body = response.get_json()
+    assert body["ok"] is False
+    assert body["errors"]
+    assert any("on" in e and "off" in e for e in body["errors"])
+    # State НЕ перезаписан — auto не должен просочиться в v1-редактор.
+    assert saved == []
+
+
+def test_api_guard_rejects_auto_mode_flat_domains(monkeypatch):
     dashboard = _fresh_dashboard(monkeypatch)
     saved = _install_state(monkeypatch, dashboard)
 
@@ -96,6 +119,35 @@ def test_api_guard_rejects_auto_mode(monkeypatch):
     assert body["ok"] is False
     assert body["errors"]
     assert saved == []
+
+
+def test_api_guard_rejects_throttle_mode(monkeypatch):
+    """throttle как mode (#13, вне scope v1) режется scope-границей роута → 400."""
+    dashboard = _fresh_dashboard(monkeypatch)
+    saved = _install_state(monkeypatch, dashboard)
+
+    response = dashboard.app.test_client().post("/api/guard", json={"mode": "throttle", "domains": {}})
+
+    assert response.status_code == 400
+    assert response.get_json()["ok"] is False
+    assert saved == []
+
+
+def test_api_guard_valid_on_with_block_domain_still_writes(monkeypatch):
+    """Легит on+block не должен сломаться scope-проверкой mode."""
+    dashboard = _fresh_dashboard(monkeypatch)
+    saved = _install_state(monkeypatch, dashboard)
+    monkeypatch.setattr(dashboard, "probe_traffic_guard", lambda **kw: {"status": "ok", "rule_count": 1})
+
+    response = dashboard.app.test_client().post(
+        "/api/guard", json={"mode": "on", "domains": {"ads.example.com": "block"}}
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["ok"] is True
+    assert len(saved) == 1
+    assert saved[0]["traffic_guard"]["mode"] == "on"
+    assert saved[0]["traffic_guard"]["domains"] == {"ads.example.com": "block"}
 
 
 def test_api_guard_rejects_throttle_policy(monkeypatch):
