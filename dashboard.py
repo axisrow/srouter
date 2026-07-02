@@ -18,6 +18,7 @@ from dashboard_geo import *
 from dashboard_network import *
 from dashboard_nodes import *
 from dashboard_traffic import *
+from dashboard_hotroutes import *
 import node_selector
 import sys_probe
 import traffic_shape  # throttle-движок (#13): зовём через атрибут (traffic_shape.apply_throttle)
@@ -83,6 +84,7 @@ def gather_status():
         "route": lambda: probe_route_to_vps(route_ip=active_route_ip),
         "direct": probe_direct,
         "traffic_guard": probe_traffic_guard,
+        "hot_routes": probe_hot_routes,
         "connectivity": probe_connectivity,
         # --- киношная телеметрия ---
         "ips": lambda: probe_ips(route_ip=active_route_ip),
