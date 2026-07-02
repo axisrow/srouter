@@ -418,3 +418,134 @@ def test_probe_hot_routes_clamps_subsecond_update_interval(monkeypatch, tmp_path
     assert data["domains"] == [
         {"domain": "slow.example", "count": 1, "last_seen": 1000.0}
     ]
+
+
+def test_probe_hot_routes_inflight_blocks_even_after_interval(monkeypatch, tmp_path):
+    state_path = tmp_path / "srouter.local.json"
+    cache_path = tmp_path / "srouter.hot_routes.json"
+    log_path = tmp_path / "privoxy.log"
+    _write_state(state_path, {"enabled": True, "update_interval_sec": 1.0})
+
+    with dashboard_hotroutes._lock:
+        dashboard_hotroutes._probe_cache.update(
+            key=None, updated_at=0.0, entries={}, error=""
+        )
+
+    real_update_cache = dashboard_hotroutes.hot_routes.update_cache
+    parse_entered = threading.Event()
+    release_parse = threading.Event()
+    calls = {"parse": 0, "update": 0}
+    calls_lock = threading.Lock()
+    errors = []
+
+    def fake_parse_new_access_log(path=None, offset=None, inode=None, dev=None):
+        with calls_lock:
+            calls["parse"] += 1
+            seq = calls["parse"]
+        if seq == 1:
+            parse_entered.set()
+            assert release_parse.wait(timeout=2.0)
+        return {"long.example": 1}, {
+            "log_offset": 1,
+            "log_inode": 2,
+            "log_dev": 3,
+            "log_size": 1,
+        }
+
+    def counting_update_cache(*args, **kwargs):
+        with calls_lock:
+            calls["update"] += 1
+        return real_update_cache(*args, **kwargs)
+
+    monkeypatch.setattr(
+        dashboard_hotroutes.hot_routes,
+        "parse_new_access_log",
+        fake_parse_new_access_log,
+    )
+    monkeypatch.setattr(
+        dashboard_hotroutes.hot_routes,
+        "update_cache",
+        counting_update_cache,
+    )
+
+    def first_probe():
+        try:
+            dashboard_hotroutes.probe_hot_routes(
+                state_path=state_path,
+                cache_path=cache_path,
+                log_path=log_path,
+                now=1000.0,
+            )
+        except Exception as e:
+            errors.append(e)
+
+    thread = threading.Thread(target=first_probe)
+    thread.start()
+    assert parse_entered.wait(timeout=2.0)
+
+    second = dashboard_hotroutes.probe_hot_routes(
+        state_path=state_path,
+        cache_path=cache_path,
+        log_path=log_path,
+        now=1002.0,
+    )
+    release_parse.set()
+    thread.join(timeout=2.0)
+
+    assert errors == []
+    assert calls == {"parse": 1, "update": 1}
+    assert second["updated"] is False
+
+    data = json.loads(cache_path.read_text(encoding="utf-8"))
+    assert data["domains"] == [
+        {"domain": "long.example", "count": 1, "last_seen": 1000.0}
+    ]
+
+
+def test_probe_hot_routes_parse_error_releases_inflight(monkeypatch, tmp_path):
+    state_path = tmp_path / "srouter.local.json"
+    cache_path = tmp_path / "srouter.hot_routes.json"
+    log_path = tmp_path / "privoxy.log"
+    _write_state(state_path, {"enabled": True, "update_interval_sec": 1.0})
+
+    with dashboard_hotroutes._lock:
+        dashboard_hotroutes._probe_cache.update(
+            key=None, updated_at=0.0, entries={}, error=""
+        )
+
+    calls = {"parse": 0}
+
+    def flaky_parse(path=None, offset=None, inode=None, dev=None):
+        calls["parse"] += 1
+        if calls["parse"] == 1:
+            raise RuntimeError("parse boom")
+        return {"retry.example": 1}, {
+            "log_offset": 1,
+            "log_inode": 2,
+            "log_dev": 3,
+            "log_size": 1,
+        }
+
+    monkeypatch.setattr(
+        dashboard_hotroutes.hot_routes,
+        "parse_new_access_log",
+        flaky_parse,
+    )
+
+    first = dashboard_hotroutes.probe_hot_routes(
+        state_path=state_path,
+        cache_path=cache_path,
+        log_path=log_path,
+        now=1000.0,
+    )
+    second = dashboard_hotroutes.probe_hot_routes(
+        state_path=state_path,
+        cache_path=cache_path,
+        log_path=log_path,
+        now=1002.0,
+    )
+
+    assert first["status"] == "warn"
+    assert second["status"] == "ok"
+    assert second["domains"] == [{"domain": "retry.example", "count": 1}]
+    assert calls["parse"] == 2

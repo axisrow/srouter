@@ -12,8 +12,8 @@ import local_state
 
 
 HOT_ROUTES_UPDATE_THROTTLE_SEC = 60.0
-# Ниже секунды reserve-then-parse/write окно может стать due до записи cursor.
-# Для observe-only probe это не нужно: 1s закрывает ручные subsecond misconfig.
+# In-flight guard отвечает за correctness; минимум здесь только режет ручной
+# subsecond busy-poll для observe-only probe.
 HOT_ROUTES_MIN_UPDATE_INTERVAL_SEC = 1.0
 
 __all__ = [
@@ -27,6 +27,7 @@ _probe_cache = {
     "entries": {},
     "error": "",
 }
+_in_progress_updates = set()
 
 
 def _safe_positive_int(value, default):
@@ -147,12 +148,19 @@ def _store_entries(key, updated_at, entries, error=""):
 
 def _update_due(key, now_ts, update_interval):
     with _lock:
+        if key in _in_progress_updates:
+            return False
         due = _probe_cache.get("key") != key or (
             now_ts - float(_probe_cache.get("updated_at") or 0.0) >= update_interval
         )
         if due:
-            _probe_cache.update(key=key, updated_at=now_ts)
+            _in_progress_updates.add(key)
         return due
+
+
+def _release_update(key):
+    with _lock:
+        _in_progress_updates.discard(key)
 
 
 def probe_hot_routes(state_path=None, cache_path=None, log_path=None, now=None):
@@ -181,37 +189,40 @@ def probe_hot_routes(state_path=None, cache_path=None, log_path=None, now=None):
 
         if _update_due(key, now_ts, opts["update_interval"]):
             try:
-                cursor = hot_routes.load_cursor(cache_path)
-                counts, cursor = hot_routes.parse_new_access_log(
-                    path=log_path,
-                    offset=cursor.get("log_offset"),
-                    inode=cursor.get("log_inode"),
-                    dev=cursor.get("log_dev"),
-                )
-                cache = hot_routes.update_cache(
-                    counts,
-                    path=cache_path,
-                    ttl=ttl,
-                    top_n=top_n,
-                    now=now_ts,
-                    bucket_size=opts["bucket_size"],
-                    cursor=cursor,
-                )
-            except Exception as e:
-                cache = None
-                error = str(e) or e.__class__.__name__
-            if isinstance(cache, dict):
-                _store_entries(key, now_ts, cache)
-                updated = True
-                error = ""
-            else:
-                _store_entries(
-                    key,
-                    now_ts,
-                    _last_entries(key),
-                    error=error or "cache_update_failed",
-                )
-                error = error or "cache_update_failed"
+                try:
+                    cursor = hot_routes.load_cursor(cache_path)
+                    counts, cursor = hot_routes.parse_new_access_log(
+                        path=log_path,
+                        offset=cursor.get("log_offset"),
+                        inode=cursor.get("log_inode"),
+                        dev=cursor.get("log_dev"),
+                    )
+                    cache = hot_routes.update_cache(
+                        counts,
+                        path=cache_path,
+                        ttl=ttl,
+                        top_n=top_n,
+                        now=now_ts,
+                        bucket_size=opts["bucket_size"],
+                        cursor=cursor,
+                    )
+                except Exception as e:
+                    cache = None
+                    error = str(e) or e.__class__.__name__
+                if isinstance(cache, dict):
+                    _store_entries(key, now_ts, cache)
+                    updated = True
+                    error = ""
+                else:
+                    _store_entries(
+                        key,
+                        now_ts,
+                        _last_entries(key),
+                        error=error or "cache_update_failed",
+                    )
+                    error = error or "cache_update_failed"
+            finally:
+                _release_update(key)
 
         try:
             names = hot_routes.hot_domains(path=cache_path, top_n=top_n, ttl=ttl, now=now_ts)
