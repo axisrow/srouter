@@ -515,6 +515,9 @@
     var NODE_APPLY = null;
     // Последняя попытка ручного переключения канала (pending/failed), как NODE_APPLY.
     var CHANNEL_APPLY = null;
+    // true после renderFetchFailed: панели показывают «нет связи с сервером»,
+    // и перерисовки из stale LAST_STATUS должны молчать до успешного поллинга.
+    var FETCH_FAILED = false;
     var MUTATION = null;
     /* Модель редактора Traffic Guard. GUARD_DIRTY защищает несохранённые правки
        от перезаписи фоновым поллингом /api/guard. */
@@ -573,7 +576,8 @@
       // Blanket-enable выше снимает disabled и с кнопок, заглушённых гейтингом
       // доступности канала — переприменяем гейтинг перерисовкой панели
       // (канон: saveGuard так же перерисовывает редактор после finishMutation).
-      renderChannel(LAST_STATUS || {});
+      // При упавшем поллинге панель показывает no_server — не затираем её stale-данными.
+      if (!FETCH_FAILED) renderChannel(LAST_STATUS || {});
     }
     function nodeGeoText(node) {
       var geo = node && typeof node.geo === 'object' && node.geo ? node.geo : {};
@@ -949,6 +953,7 @@
     function render(d, ranking) {
       LAST_STATUS = d;
       LAST_RANKING = ranking || {};
+      FETCH_FAILED = false;
       var tun = d.tunnel || {};
       var an = tun.anthropic || {}, oa = tun.openai || {};
       pushHistory('anthropic', an.ms);
@@ -1111,6 +1116,7 @@
     }
 
     function renderFetchFailed() {
+      FETCH_FAILED = true;
       var keys = [
         ['bi-reception-4', 'card_anthropic'],
         ['bi-reception-4', 'card_openai'],
