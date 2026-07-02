@@ -49,9 +49,10 @@ _DEFAULT_MAX_BYTES = 4 * 1024 * 1024  # 4 MiB хвоста
 # Совпадает по духу с _HOST_RE из local_state — мусорные токены отсекаются.
 _HOST_RE = re.compile(r"^[A-Za-z0-9._:-]+\Z")
 
-# Второе поле в кавычках privoxy-лога: "<method> <target> HTTP/x.x".
-# Берём именно target (host:port или абсолютный URL), остальное игнорируем.
-_REQUEST_RE = re.compile(r'"[A-Z]+\s+(\S+)\s+HTTP/[0-9.]+"')
+# Запрос в кавычках privoxy-лога: "<method> <target> HTTP/x.x".
+# Захватываем method — от него зависит, как трактовать scheme-less target
+# (authority-form допустим ТОЛЬКО для CONNECT, см. _extract_host).
+_REQUEST_RE = re.compile(r'"([A-Z]+)\s+(\S+)\s+HTTP/[0-9.]+"')
 
 
 def _now(now):
@@ -71,14 +72,18 @@ def _now(now):
     return time.time()
 
 
-def _extract_host(target):
-    """Из target privoxy-лога вернуть чистый hostname или None.
+def _extract_host(target, method=None):
+    """Из request-target privoxy-лога вернуть чистый hostname или None.
 
-    target бывает двух видов:
-    - `host:port` (CONNECT) — снимаем порт;
-    - `scheme://host[:port]/path?query` (GET/POST/…) — берём ТОЛЬКО hostname,
-      путь и query отбрасываются (privacy).
-    Возврат None для мусора/пустого хоста — вызывающий такие строки пропускает.
+    По RFC 7230 request-target бывает четырёх форм; нас интересуют только те, что
+    несут hostname (privacy-граница «только hostnames»):
+    - absolute-form `scheme://host[:port]/path?query` — обычные методы (GET/…),
+      берём ТОЛЬКО hostname (urlsplit снимает и userinfo/query/path).
+    - authority-form `host:port` — допустимо ТОЛЬКО для CONNECT; для прочих методов
+      scheme-less target это либо origin-form `/path` (без hostname), либо мусорный
+      токен (напр. безопасное слово фильтра) — такой target НЕ принимаем, иначе
+      attacker-influenced мусор попадает в counts/кэш.
+    Возврат None для мусора/отсутствия hostname — вызывающий пропускает строку.
     """
     if not target:
         return None
@@ -91,8 +96,8 @@ def _extract_host(target):
             host = urlsplit(target).hostname
         except ValueError:
             return None
-    else:
-        # host:port (CONNECT). Легитимный CONNECT userinfo НЕ содержит — любой '@'
+    elif (method or "").upper() == "CONNECT":
+        # authority-form host:port — легитимен только для CONNECT. Любой '@'
         # значит мусорная/чужая строка, где rsplit(':') отрезал бы username-токен
         # (`user:pass@host` -> `user`, privacy-утечка). Reject такой target целиком.
         if "@" in target:
@@ -101,6 +106,10 @@ def _extract_host(target):
         host = target.rsplit(":", 1)[0]
         # Снимаем возможные скобки IPv6-литерала [::1] -> ::1.
         host = host.strip("[]")
+    else:
+        # Scheme-less target при не-CONNECT методе: origin-form (/path) или токен —
+        # hostname не несёт. Не принимаем (privacy: «только hostnames»).
+        return None
     if not host:
         return None
     host = host.lower()
@@ -152,7 +161,8 @@ def parse_access_log(path=None, max_lines=None, max_bytes=None):
         m = _REQUEST_RE.search(line)
         if not m:
             continue
-        host = _extract_host(m.group(1))
+        method, target = m.group(1), m.group(2)
+        host = _extract_host(target, method)
         if host is None:
             continue
         counts[host] = counts.get(host, 0) + 1

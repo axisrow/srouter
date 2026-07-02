@@ -66,6 +66,35 @@ def test_parse_extracts_host_from_absolute_url(tmp_path):
     assert counts == {"example.com": 1}
 
 
+def test_parse_non_connect_token_is_skipped(tmp_path):
+    """Privacy: scheme-less target при не-CONNECT методе НЕ считается доменом.
+
+    'GET SECRET123 HTTP/1.1' — безопасный токен фильтра/origin-form без hostname.
+    Раньше принималось по _HOST_RE и попадало в counts (attacker-influenced мусор
+    в кэше). Теперь authority-form допустима только для CONNECT."""
+    log = tmp_path / "privoxy.log"
+    log.write_text(
+        "\n".join(
+            [
+                '127.0.0.1 - - [ts] "GET SECRET123 HTTP/1.1" 200 0',
+                '127.0.0.1 - - [ts] "GET /relative/path HTTP/1.1" 200 0',
+                _privoxy_url_line("http://good.example/x"),
+            ]
+        ),
+        encoding="utf-8",
+    )
+    counts = hot_routes.parse_access_log(str(log))
+    assert counts == {"good.example": 1}
+    assert "secret123" not in counts
+
+
+def test_parse_connect_authority_still_works(tmp_path):
+    """CONNECT host:port (authority-form) по-прежнему считается — regression guard."""
+    log = tmp_path / "privoxy.log"
+    log.write_text(_privoxy_line("tunnel.example"), encoding="utf-8")
+    assert hot_routes.parse_access_log(str(log)) == {"tunnel.example": 1}
+
+
 def test_parse_malformed_url_does_not_raise(tmp_path):
     """Битый URL (urlsplit ValueError: невалидный IPv6 / не-ASCII netloc под NFKC)
     трактуется как пропуск строки, не роняет весь parse_access_log. Валидная
