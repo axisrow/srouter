@@ -55,6 +55,8 @@ _REG_NAME_RE = re.compile(
 )
 _NUMERIC_DOTTED_RE = re.compile(r"^[0-9.]+\Z")
 _PORT_RE = re.compile(r"^[0-9]+\Z")
+_MAX_DNS_NAME_LENGTH = 253
+_MAX_DNS_LABEL_LENGTH = 63
 
 # Запрос в кавычках privoxy-лога: "<method> <target> HTTP/x.x".
 # Захватываем method — от него зависит, как трактовать scheme-less target
@@ -92,7 +94,14 @@ def _is_hostname(host):
     # это чаще артефакт target-парсинга, а не доменное имя из privoxy.
     if host.isdigit() or _NUMERIC_DOTTED_RE.match(host):
         return False
-    return _REG_NAME_RE.match(host) is not None
+    if _REG_NAME_RE.match(host) is None:
+        return False
+    # RFC 3986 reg-name задаёт символы/форму, но не DNS size limits. Для cache-key
+    # нам нужен именно hostname: имя до 253 octets, каждая label до 63.
+    name = host[:-1] if host.endswith(".") else host
+    if len(name) > _MAX_DNS_NAME_LENGTH:
+        return False
+    return all(0 < len(label) <= _MAX_DNS_LABEL_LENGTH for label in name.split("."))
 
 
 def _clean_hostname(host):

@@ -272,6 +272,39 @@ def test_target_parser_accept_only_good_matrix_via_cache(tmp_path):
         assert leaked not in raw
 
 
+def test_target_parser_rejects_overlong_dns_names_via_cache(tmp_path):
+    """DNS hostname limits: label <=63, full name <=253, через public API."""
+    max_label_host = f"{'a' * 63}.example"
+    overlong_label_host = f"{'a' * 64}.example"
+    overlong_name_host = ".".join(["a" * 63] * 4)  # 255 chars with dots.
+    log = tmp_path / "privoxy.log"
+    log.write_text(
+        "\n".join(
+            [
+                _request_line("GET", "http://good.example/x"),
+                _request_line("GET", f"http://{max_label_host}/x"),
+                _request_line("GET", f"http://{overlong_label_host}/x"),
+                _request_line("GET", f"http://{overlong_name_host}/x"),
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    counts = hot_routes.parse_access_log(str(log))
+    assert counts == {"good.example": 1, max_label_host: 1}
+    assert overlong_label_host not in counts
+    assert overlong_name_host not in counts
+
+    cache = tmp_path / "hot.json"
+    result = hot_routes.update_cache(counts, path=str(cache), now=1000.0)
+    assert result is not None
+    raw = cache.read_text(encoding="utf-8")
+    names = {entry["domain"] for entry in json.loads(raw)["domains"]}
+    assert names == {"good.example", max_label_host}
+    assert overlong_label_host not in raw
+    assert overlong_name_host not in raw
+
+
 def test_target_parser_fuzz_never_raises_and_outputs_whitelisted(tmp_path):
     """50k deterministic fuzz: public parse/update не бросают, выход whitelist-only."""
     rng = random.Random(69)
