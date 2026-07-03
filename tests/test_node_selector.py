@@ -1001,3 +1001,53 @@ def test_ensure_split_route_noop_when_route_via_gateway(monkeypatch, tmp_path):
     r = node_selector.ensure_split_route(state_path=state_path)
     assert r["enabled"] is True
     assert r.get("added") is False
+
+
+# ============================ root-aware ensure_split_route (Уровень 3) ============================
+def test_ensure_split_route_root_uses_direct_route_add(monkeypatch, tmp_path):
+    """os.geteuid()==0 (root, ppp-hook) → route add через [ROUTE, -n, add, ...] напрямую (НЕ osascript)."""
+    import node_selector
+    state_path = tmp_path / "srouter.local.json"
+    _write_state(state_path, _state())
+    _install_gateway(monkeypatch)
+
+    monkeypatch.setattr("os.geteuid", lambda: 0)  # root
+    calls = []
+    def fake_run(cmd, timeout):
+        calls.append((list(cmd), timeout))
+        if "get" in cmd and "-host" in cmd:
+            return {"rc": 0, "out": _route_get_out("ppp0", "10.0.0.1"), "err": "", "timeout": False}
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+    monkeypatch.setattr(sys_probe, "run", fake_run)
+
+    r = node_selector.ensure_split_route(state_path=state_path)
+    assert r["enabled"] is True
+    # под root — прямой route add, без osascript
+    add_calls = [c for c in calls if "add" in c[0] and "-host" in c[0] and "/sbin/route" in c[0]]
+    assert len(add_calls) == 1, f"root → прямой route add, есть {add_calls}"
+    # osascript НЕ должен зваться под root
+    osascript_calls = [c for c in calls if "osascript" in str(c[0]).lower()]
+    assert osascript_calls == [], "root → osascript не нужен"
+
+
+def test_ensure_split_route_user_uses_osascript(monkeypatch, tmp_path):
+    """os.geteuid()!=0 (user, watchdog poll) → osascript-мост (как раньше)."""
+    import node_selector
+    state_path = tmp_path / "srouter.local.json"
+    _write_state(state_path, _state())
+    _install_gateway(monkeypatch)
+
+    monkeypatch.setattr("os.geteuid", lambda: 501)  # обычный пользователь
+    calls = []
+    def fake_run(cmd, timeout):
+        calls.append((list(cmd), timeout))
+        if "get" in cmd and "-host" in cmd:
+            return {"rc": 0, "out": _route_get_out("ppp0", "10.0.0.1"), "err": "", "timeout": False}
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+    monkeypatch.setattr(sys_probe, "run", fake_run)
+
+    r = node_selector.ensure_split_route(state_path=state_path)
+    assert r["enabled"] is True
+    # под user — osascript-мост (route add внутри do shell script)
+    osascript_calls = [c for c in calls if "osascript" in str(c[0]).lower()]
+    assert len(osascript_calls) >= 1, "user → osascript-мост для route add"
