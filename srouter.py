@@ -44,6 +44,8 @@ from install_lib import (
 )
 from sys_probe import run
 
+import claude_proxy  # вкл/откл HTTPS_PROXY для Claude Code (~/.claude/settings.json)
+
 # OSASCRIPT отсутствует в install_lib — локальная константа (копия dashboard_common).
 OSASCRIPT = "/usr/bin/osascript"
 
@@ -221,7 +223,14 @@ def cmd_install(args) -> int:
         runner=runner, install_launchagent=True,
     )
     if result.get("ok"):
+        # Claude Code обязан ходить через прокси (изоляция режет api.anthropic.com напрямую).
+        # Best-effort: не критично для install, но удобно «из коробки».
+        cp = claude_proxy.enable()
+        cp_note = ("Claude Code: HTTPS_PROXY прописан в ~/.claude/settings.json."
+                   if cp.get("ok") else
+                   f"Claude Code: не удалось прописать HTTPS_PROXY ({cp.get('err', 'unknown')}).")
         print("Установка стека завершена: brew-сервисы, конфиги, DNS, LaunchAgent применены.\n"
+              f"{cp_note}\n"
               f"Дашборд: http://127.0.0.1:8787  (srouter status — проверить)")
         return 0
     blocked = ", ".join(result.get("blocked") or ["unknown"])
@@ -272,9 +281,14 @@ def cmd_uninstall(args) -> int:
     # 4) Удалить split-route (новое — install_lib про маршрут не знает).
     route_rc = _remove_active_split_route(state_path, runner)
 
+    # 5) Снять HTTPS_PROXY для Claude Code — privoxy больше не запущен, прокси бессмысленен.
+    cp = claude_proxy.disable()
+    cp_note = ". Claude Code HTTPS_PROXY снят." if cp.get("ok") else ""
+
     print("Откат завершён: brew-сервисы остановлены, конфиги восстановлены/оставлены, "
           "DNS сброшен, LaunchAgent удалён"
-          + (". split-route удалён." if route_rc == 0 else ", split-route не удалён — см. выше."))
+          + (". split-route удалён." if route_rc == 0 else ", split-route не удалён — см. выше.")
+          + cp_note)
     return 0
 
 

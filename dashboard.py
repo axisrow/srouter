@@ -25,6 +25,7 @@ import sys_probe
 import traffic_shape  # throttle-движок (#13): зовём через атрибут (traffic_shape.apply_throttle)
 import isolate_firewall  # PF-изоляция доменов: зовём через атрибут
 import git_proxy  # вкл/откл git-прокси для github (через git config --global)
+import claude_proxy  # вкл/откл HTTPS_PROXY для Claude Code (~/.claude/settings.json)
 
 # Активный узел нельзя замораживать на import: #8 меняет srouter.local.json в рантайме.
 # Эти имена оставлены только для совместимости старых импорт-тестов; рабочий код ниже
@@ -890,6 +891,25 @@ def api_git_proxy_enable():
 def api_git_proxy_disable():
     """Снять http.https://github.com.proxy (--unset). Идемпотентно."""
     return jsonify(git_proxy.disable()), 200
+
+
+# ============================ Claude Code proxy (/api/claude-proxy) ============================
+@app.get("/api/claude-proxy")
+def api_claude_proxy_get():
+    """Текущее состояние HTTPS_PROXY для Claude Code (читает ~/.claude/settings.json)."""
+    return jsonify(claude_proxy.status())
+
+
+@app.post("/api/claude-proxy/enable")
+def api_claude_proxy_enable():
+    """Прописать env.HTTPS_PROXY/HTTP_PROXY = privoxy в ~/.claude/settings.json."""
+    return jsonify(claude_proxy.enable()), 200
+
+
+@app.post("/api/claude-proxy/disable")
+def api_claude_proxy_disable():
+    """Удалить env proxy-ключи из ~/.claude/settings.json. Идемпотентно."""
+    return jsonify(claude_proxy.disable()), 200
 
 
 @app.get("/")

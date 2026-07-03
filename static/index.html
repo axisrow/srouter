@@ -185,6 +185,17 @@
     </div>
   </div>
 
+  <div class="card mt-3">
+    <div class="card-header d-flex align-items-center">
+      <i class="bi bi-robot me-2"></i>
+      <span data-i18n="cproxy_title">Claude Code proxy</span>
+      <span class="ms-auto badge bg-secondary ops" id="cproxy-badge">—</span>
+    </div>
+    <div class="card-body">
+      <div id="cproxy-editor"></div>
+    </div>
+  </div>
+
   <div class="toast-container position-fixed bottom-0 end-0 p-3"></div>
 
   <script src="/static/bootstrap.bundle.min.js"></script>
@@ -271,6 +282,10 @@
         gitproxy_on: "Enable", gitproxy_off: "Disable", gitproxy_enabled: "Enabled: git → github via {0}",
         gitproxy_disabled: "Disabled: git → github direct", gitproxy_applied: "Git proxy enabled",
         gitproxy_cleared: "Git proxy disabled", gitproxy_failed: "Git proxy failed: {0}",
+        cproxy_title: "Claude Code proxy", cproxy_help: "Route Claude Code CLI via privoxy — required when Anthropic isolation is on (CLI can't reach api.anthropic.com directly). Writes HTTPS_PROXY to ~/.claude/settings.json.",
+        cproxy_on: "Enable", cproxy_off: "Disable", cproxy_enabled: "Enabled: Claude Code → via {0}",
+        cproxy_disabled: "Disabled: Claude Code → direct", cproxy_applied: "Claude Code proxy enabled",
+        cproxy_cleared: "Claude Code proxy disabled", cproxy_failed: "Claude Code proxy failed: {0}",
         channel_title: "Network channel", channel_active: "Active channel",
         channel_wifi: "Wi-Fi", channel_usb: "USB tether",
         channel_other: "Other", channel_unknown: "Unknown",
@@ -361,6 +376,10 @@
         gitproxy_on: "Включить", gitproxy_off: "Выключить", gitproxy_enabled: "Включено: git → github через {0}",
         gitproxy_disabled: "Выключено: git → github напрямую", gitproxy_applied: "Git-прокси включён",
         gitproxy_cleared: "Git-прокси выключен", gitproxy_failed: "Ошибка git-прокси: {0}",
+        cproxy_title: "Прокси Claude Code", cproxy_help: "Пустить Claude Code CLI через privoxy — требуется при включённой изоляции Anthropic (CLI не достучится до api.anthropic.com напрямую). Пишет HTTPS_PROXY в ~/.claude/settings.json.",
+        cproxy_on: "Включить", cproxy_off: "Выключить", cproxy_enabled: "Включено: Claude Code → через {0}",
+        cproxy_disabled: "Выключено: Claude Code → напрямую", cproxy_applied: "Прокси Claude Code включён",
+        cproxy_cleared: "Прокси Claude Code выключен", cproxy_failed: "Ошибка прокси Claude Code: {0}",
         channel_title: "Сетевой канал", channel_active: "Активный канал",
         channel_wifi: "Wi-Fi", channel_usb: "USB-модем",
         channel_other: "Другой", channel_unknown: "Неизвестен",
@@ -451,6 +470,10 @@
         gitproxy_on: "启用", gitproxy_off: "禁用", gitproxy_enabled: "已启用：git → github 经由 {0}",
         gitproxy_disabled: "已禁用：git → github 直连", gitproxy_applied: "Git 代理已启用",
         gitproxy_cleared: "Git 代理已禁用", gitproxy_failed: "Git 代理失败：{0}",
+        cproxy_title: "Claude Code 代理", cproxy_help: "将 Claude Code CLI 流量经由 privoxy — 启用 Anthropic 隔离时必需（CLI 无法直连 api.anthropic.com）。向 ~/.claude/settings.json 写入 HTTPS_PROXY。",
+        cproxy_on: "启用", cproxy_off: "禁用", cproxy_enabled: "已启用：Claude Code → 经由 {0}",
+        cproxy_disabled: "已禁用：Claude Code → 直连", cproxy_applied: "Claude Code 代理已启用",
+        cproxy_cleared: "Claude Code 代理已禁用", cproxy_failed: "Claude Code 代理失败：{0}",
         channel_title: "网络通道", channel_active: "当前通道",
         channel_wifi: "Wi-Fi", channel_usb: "USB 网络共享",
         channel_other: "其他", channel_unknown: "未知",
@@ -1409,6 +1432,74 @@
         });
     }
 
+    /* ============================ Claude Code proxy ============================
+       Одна кнопка-тумблер: вкл/откл HTTPS_PROXY в ~/.claude/settings.json (env секция).
+       Требуется при включённой изоляции Anthropic — иначе CLI не достучится до api.anthropic.com. */
+    var CPROXY_ON = false;
+    var CPROXY_URL = '';
+    function renderCProxy() {
+      var box = document.getElementById('cproxy-editor');
+      if (!box) return;
+      var busy = mutationInFlight();
+      var on = CPROXY_ON;
+      var badge = document.getElementById('cproxy-badge');
+      if (badge) {
+        badge.className = 'ms-auto badge ops ' + (on ? 'bg-success' : 'bg-secondary');
+        badge.textContent = on ? 'ON' : 'OFF';
+      }
+      var statusHtml = on
+        ? '<div class="alert alert-success py-2 mb-2"><i class="bi bi-check-circle me-1"></i>' +
+          esc(t('cproxy_enabled', CPROXY_URL || 'privoxy')) + '</div>'
+        : '<div class="text-secondary ops mb-2">' + esc(t('cproxy_disabled')) + '</div>';
+      box.innerHTML =
+        '<div class="d-flex align-items-center gap-2 mb-2">' +
+          '<span class="fw-semibold">' + esc(t('cproxy_title')) + '</span>' +
+        '</div>' +
+        statusHtml +
+        '<div class="d-flex flex-wrap gap-2 mb-2">' +
+          '<button type="button" class="btn btn-sm ' + (on ? 'btn-outline-danger' : 'btn-primary') + ' act" id="claude-proxy-toggle"' +
+            (busy ? ' disabled' : '') + '>' +
+            '<span class="lbl"><i class="bi ' + (on ? 'bi-x-octagon' : 'bi-robot') + '"></i> ' +
+            esc(on ? t('cproxy_off') : t('cproxy_on')) + '</span></button>' +
+        '</div>' +
+        '<div class="sub text-secondary">' + esc(t('cproxy_help')) + '</div>';
+    }
+    function toggleCProxy(btn) {
+      if (!tryBeginMutation('cproxy')) return;
+      var lbl = btn ? btn.querySelector('.lbl') : null;
+      var orig = lbl ? lbl.innerHTML : '';
+      if (lbl) lbl.innerHTML = '<span class="spinner-border spinner-border-sm"></span>';
+      renderCProxy();
+      var action = CPROXY_ON ? 'disable' : 'enable';
+      fetch('/api/claude-proxy/' + action, {
+        method: 'POST',
+        headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
+        body: '{}'
+      })
+        .then(function (r) {
+          return r.json().catch(function () { return { ok: false, err: 'HTTP ' + r.status }; })
+            .then(function (res) { res._status = r.status; return res; });
+        })
+        .then(function (res) {
+          if (res && res.ok) {
+            toast(action === 'enable' ? t('cproxy_applied') : t('cproxy_cleared'), 'ok');
+          } else {
+            var msg = (res && res.err) ? String(res.err).slice(0, 220) : ('HTTP ' + ((res && res._status) || 500));
+            toast(t('cproxy_failed', msg), 'err');
+          }
+          return fetchJson('/api/claude-proxy').then(function (p) {
+            CPROXY_ON = !!(p && p.enabled);
+            CPROXY_URL = (p && p.proxy) || '';
+          }).catch(function () {});
+        })
+        .catch(function (e) { toast(t('cproxy_failed', e.message), 'err'); })
+        .finally(function () {
+          finishMutation();
+          if (lbl) lbl.innerHTML = orig;
+          renderCProxy();
+        });
+    }
+
     function render(d, ranking) {
       LAST_STATUS = d;
       LAST_RANKING = ranking || {};
@@ -1888,6 +1979,10 @@
         toggleGitProxy(btn);
         return;
       }
+      if (btn.id === 'claude-proxy-toggle') {
+        toggleCProxy(btn);
+        return;
+      }
       if (!tryBeginMutation('action', ev)) return;
       var url = btn.getAttribute('data-url');
       var lbl = btn.querySelector('.lbl');
@@ -1931,6 +2026,7 @@
       renderThrottle();
       renderIsolate();
       renderGitProxy();
+      renderCProxy();
       poll(true);
     });
     applyStaticI18n();
@@ -1954,11 +2050,17 @@
     renderThrottle();  // каркас throttle-контрола (inactive) до ответа сервера
     renderIsolate();   // каркас isolate-контрола (inactive) до ответа сервера
     renderGitProxy();  // каркас git-proxy (inactive) до ответа сервера
+    renderCProxy();    // каркас claude-proxy (inactive) до ответа сервера
     loadGuard();       // подтянуть block/allow правила + активный throttle из /api/guard
     fetchJson('/api/git-proxy').then(function (p) {
       GIT_PROXY_ON = !!(p && p.enabled);
       GIT_PROXY_URL = (p && p.proxy) || '';
       renderGitProxy();
+    }).catch(function () { /* тихо: останется каркас */ });
+    fetchJson('/api/claude-proxy').then(function (p) {
+      CPROXY_ON = !!(p && p.enabled);
+      CPROXY_URL = (p && p.proxy) || '';
+      renderCProxy();
     }).catch(function () { /* тихо: останется каркас */ });
     poll(true);
     setInterval(poll, 5000);
