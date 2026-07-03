@@ -174,6 +174,17 @@
     </div>
   </div>
 
+  <div class="card mt-3">
+    <div class="card-header d-flex align-items-center">
+      <i class="bi bi-git me-2"></i>
+      <span data-i18n="gitproxy_title">Git proxy (github)</span>
+      <span class="ms-auto badge bg-secondary ops" id="gitproxy-badge">—</span>
+    </div>
+    <div class="card-body">
+      <div id="gitproxy-editor"></div>
+    </div>
+  </div>
+
   <div class="toast-container position-fixed bottom-0 end-0 p-3"></div>
 
   <script src="/static/bootstrap.bundle.min.js"></script>
@@ -256,6 +267,10 @@
         isolate_inactive: "Isolation inactive", isolate_cleanup_unrecoverable: "Cleanup token could not be persisted.",
         isolate_unresolved: "Unresolved", isolate_applied: "Isolation enabled", isolate_cleared: "Isolation disabled",
         isolate_refreshed: "IPs refreshed", isolate_cancelled: "Cancelled (password dialog)", isolate_failed: "Isolation failed: {0}",
+        gitproxy_title: "Git proxy (github)", gitproxy_help: "Route git to github via privoxy — fixes broken direct IPv4 to github (github has no IPv6). Scoped to github.com only.",
+        gitproxy_on: "Enable", gitproxy_off: "Disable", gitproxy_enabled: "Enabled: git → github via {0}",
+        gitproxy_disabled: "Disabled: git → github direct", gitproxy_applied: "Git proxy enabled",
+        gitproxy_cleared: "Git proxy disabled", gitproxy_failed: "Git proxy failed: {0}",
         channel_title: "Network channel", channel_active: "Active channel",
         channel_wifi: "Wi-Fi", channel_usb: "USB tether",
         channel_other: "Other", channel_unknown: "Unknown",
@@ -342,6 +357,10 @@
         isolate_inactive: "Изоляция выключена", isolate_cleanup_unrecoverable: "Токен очистки не сохранён.",
         isolate_unresolved: "Не резолвятся", isolate_applied: "Изоляция включена", isolate_cleared: "Изоляция выключена",
         isolate_refreshed: "IP обновлены", isolate_cancelled: "Отменено (диалог пароля)", isolate_failed: "Ошибка изоляции: {0}",
+        gitproxy_title: "Git-прокси (github)", gitproxy_help: "Пустить git к github через privoxy — чинит сломанный прямой IPv4 к github (у github нет IPv6). Только для github.com.",
+        gitproxy_on: "Включить", gitproxy_off: "Выключить", gitproxy_enabled: "Включено: git → github через {0}",
+        gitproxy_disabled: "Выключено: git → github напрямую", gitproxy_applied: "Git-прокси включён",
+        gitproxy_cleared: "Git-прокси выключен", gitproxy_failed: "Ошибка git-прокси: {0}",
         channel_title: "Сетевой канал", channel_active: "Активный канал",
         channel_wifi: "Wi-Fi", channel_usb: "USB-модем",
         channel_other: "Другой", channel_unknown: "Неизвестен",
@@ -428,6 +447,10 @@
         isolate_inactive: "隔离未启用", isolate_cleanup_unrecoverable: "清理令牌未能持久化。",
         isolate_unresolved: "未解析", isolate_applied: "隔离已启用", isolate_cleared: "隔离已禁用",
         isolate_refreshed: "IP 已刷新", isolate_cancelled: "已取消（密码对话框）", isolate_failed: "隔离失败：{0}",
+        gitproxy_title: "Git 代理 (github)", gitproxy_help: "通过 privoxy 将 git 流量导向 github — 修复到 github 的直连 IPv4 故障（github 无 IPv6）。仅限 github.com。",
+        gitproxy_on: "启用", gitproxy_off: "禁用", gitproxy_enabled: "已启用：git → github 经由 {0}",
+        gitproxy_disabled: "已禁用：git → github 直连", gitproxy_applied: "Git 代理已启用",
+        gitproxy_cleared: "Git 代理已禁用", gitproxy_failed: "Git 代理失败：{0}",
         channel_title: "网络通道", channel_active: "当前通道",
         channel_wifi: "Wi-Fi", channel_usb: "USB 网络共享",
         channel_other: "其他", channel_unknown: "未知",
@@ -1317,6 +1340,75 @@
     function disableIsolate(btn) { isolateRequest({ action: 'disable' }, btn, 'isolate_cleared'); }
     function refreshIsolate(btn) { isolateRequest({ action: 'refresh' }, btn, 'isolate_refreshed'); }
 
+    /* ============================ Git proxy (github) ============================
+       Одна кнопка-тумблер: вкл/откл git config --global http.https://github.com.proxy.
+       Состояние читается из GET /api/git-proxy при загрузке (не из /api/status — это не телеметрия). */
+    var GIT_PROXY_ON = false;
+    var GIT_PROXY_URL = '';
+    function renderGitProxy() {
+      var box = document.getElementById('gitproxy-editor');
+      if (!box) return;
+      var busy = mutationInFlight();
+      var on = GIT_PROXY_ON;
+      var badge = document.getElementById('gitproxy-badge');
+      if (badge) {
+        badge.className = 'ms-auto badge ops ' + (on ? 'bg-success' : 'bg-secondary');
+        badge.textContent = on ? 'ON' : 'OFF';
+      }
+      var statusHtml = on
+        ? '<div class="alert alert-success py-2 mb-2"><i class="bi bi-check-circle me-1"></i>' +
+          esc(t('gitproxy_enabled', GIT_PROXY_URL || 'privoxy')) + '</div>'
+        : '<div class="text-secondary ops mb-2">' + esc(t('gitproxy_disabled')) + '</div>';
+      box.innerHTML =
+        '<div class="d-flex align-items-center gap-2 mb-2">' +
+          '<span class="fw-semibold">' + esc(t('gitproxy_title')) + '</span>' +
+        '</div>' +
+        statusHtml +
+        '<div class="d-flex flex-wrap gap-2 mb-2">' +
+          '<button type="button" class="btn btn-sm ' + (on ? 'btn-outline-danger' : 'btn-primary') + ' act" id="git-proxy-toggle"' +
+            (busy ? ' disabled' : '') + '>' +
+            '<span class="lbl"><i class="bi ' + (on ? 'bi-x-octagon' : 'bi-git') + '"></i> ' +
+            esc(on ? t('gitproxy_off') : t('gitproxy_on')) + '</span></button>' +
+        '</div>' +
+        '<div class="sub text-secondary">' + esc(t('gitproxy_help')) + '</div>';
+    }
+    function toggleGitProxy(btn) {
+      if (!tryBeginMutation('gitproxy')) return;
+      var lbl = btn ? btn.querySelector('.lbl') : null;
+      var orig = lbl ? lbl.innerHTML : '';
+      if (lbl) lbl.innerHTML = '<span class="spinner-border spinner-border-sm"></span>';
+      renderGitProxy();
+      var action = GIT_PROXY_ON ? 'disable' : 'enable';
+      fetch('/api/git-proxy/' + action, {
+        method: 'POST',
+        headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
+        body: '{}'
+      })
+        .then(function (r) {
+          return r.json().catch(function () { return { ok: false, err: 'HTTP ' + r.status }; })
+            .then(function (res) { res._status = r.status; return res; });
+        })
+        .then(function (res) {
+          if (res && res.ok) {
+            toast(action === 'enable' ? t('gitproxy_applied') : t('gitproxy_cleared'), 'ok');
+          } else {
+            var msg = (res && res.err) ? String(res.err).slice(0, 220) : ('HTTP ' + ((res && res._status) || 500));
+            toast(t('gitproxy_failed', msg), 'err');
+          }
+          // Перечитаем состояние с сервера (единый источник правды — ~/.gitconfig).
+          return fetchJson('/api/git-proxy').then(function (p) {
+            GIT_PROXY_ON = !!(p && p.enabled);
+            GIT_PROXY_URL = (p && p.proxy) || '';
+          }).catch(function () {});
+        })
+        .catch(function (e) { toast(t('gitproxy_failed', e.message), 'err'); })
+        .finally(function () {
+          finishMutation();
+          if (lbl) lbl.innerHTML = orig;
+          renderGitProxy();
+        });
+    }
+
     function render(d, ranking) {
       LAST_STATUS = d;
       LAST_RANKING = ranking || {};
@@ -1792,6 +1884,10 @@
         refreshIsolate(btn);
         return;
       }
+      if (btn.id === 'git-proxy-toggle') {
+        toggleGitProxy(btn);
+        return;
+      }
       if (!tryBeginMutation('action', ev)) return;
       var url = btn.getAttribute('data-url');
       var lbl = btn.querySelector('.lbl');
@@ -1834,6 +1930,7 @@
       readThrottleInputFromDom();
       renderThrottle();
       renderIsolate();
+      renderGitProxy();
       poll(true);
     });
     applyStaticI18n();
@@ -1856,7 +1953,13 @@
     renderGuard();     // пустой каркас редактора сразу, до первого ответа сервера
     renderThrottle();  // каркас throttle-контрола (inactive) до ответа сервера
     renderIsolate();   // каркас isolate-контрола (inactive) до ответа сервера
+    renderGitProxy();  // каркас git-proxy (inactive) до ответа сервера
     loadGuard();       // подтянуть block/allow правила + активный throttle из /api/guard
+    fetchJson('/api/git-proxy').then(function (p) {
+      GIT_PROXY_ON = !!(p && p.enabled);
+      GIT_PROXY_URL = (p && p.proxy) || '';
+      renderGitProxy();
+    }).catch(function () { /* тихо: останется каркас */ });
     poll(true);
     setInterval(poll, 5000);
   })();
