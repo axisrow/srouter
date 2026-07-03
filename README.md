@@ -218,10 +218,13 @@ python3 isolate_firewall.py status       # текущее состояние
 ```
 
 **Как это работает (механика «глаза и руки»):**
-- `dig @8.8.8.8 <domain>` — узнать IP домена («глаза»: домен → IP).
-- `pfctl -a com.apple/srouter_isolate -t srouter_proxy_ips -T replace <ips>` — положить IP в таблицу
-  файрвола («руки»: охранник PF в ядре + листок с номерами). Всё, что идёт на эти IP через en0/ppp0
-  по портам 80/443 — умирает. Через прокси (xray→VPS) — работает: xray шлёт на IP VPS, не на IP Claude.
+- `dig @8.8.8.8 <domain>` (A) и `dig @8.8.8.8 <domain> AAAA` — узнать IP домена **обоих семейств**
+  (IPv4 и IPv6). Без v6 изоляция бесполезна: программы предпочитают IPv6 при наличии AAAA, и трафик
+  уходит по v6 мимо v4-блока («глаза»: домен → IPv4 + IPv6).
+- `pfctl -a com.apple/srouter_isolate -t srouter_proxy_ips -T replace <ips>` — положить оба семейства
+  в таблицу файрвола («руки»: охранник PF в ядре + листок с номерами). PF mixed-таблица принимает
+  IPv4 и IPv6 вместе. Всё, что идёт на эти IP через en0/ppp0 по портам 80/443 — умирает. Через прокси
+  (xray→VPS) — работает: xray шлёт на IP VPS, не на IP Claude.
 
 **Двухфазная загрузка** закрывает стартовое окно (между бутом и `dig`+`pfctl`): при загрузке macOS
 сначала блокируются подсети Anthropic (`160.79.104.0/21`) — claude.ai отрезан с первой секунды,
@@ -355,11 +358,13 @@ python3 isolate_firewall.py status       # current state
 ```
 
 **How it works ("eyes and hands"):**
-- `dig @8.8.8.8 <domain>` — resolve the domain's IP ("eyes": domain → IP).
-- `pfctl -a com.apple/srouter_isolate -t srouter_proxy_ips -T replace <ips>` — put IPs into the
-  firewall table ("hands": PF guard in the kernel + a list of numbers). Anything to these IPs via
-  en0/ppp0 on ports 80/443 dies. Via the proxy (xray→VPS) it works: xray talks to the VPS IP, not the
-  Claude IP.
+- `dig @8.8.8.8 <domain>` (A) and `dig @8.8.8.8 <domain> AAAA` — resolve the domain's IPs in **both
+  families** (IPv4 and IPv6). Without v6 isolation is useless: apps prefer IPv6 when AAAA exists, and
+  traffic escapes via v6 past a v4-only block ("eyes": domain → IPv4 + IPv6).
+- `pfctl -a com.apple/srouter_isolate -t srouter_proxy_ips -T replace <ips>` — put both families into
+  the firewall table ("hands": PF guard in the kernel + a list of numbers). The PF table accepts IPv4
+  and IPv6 together. Anything to these IPs via en0/ppp0 on ports 80/443 dies. Via the proxy (xray→VPS)
+  it works: xray talks to the VPS IP, not the Claude IP.
 
 **Two-phase boot** closes the startup window (between boot and `dig`+`pfctl`): on macOS boot, Anthropic
 subnets (`160.79.104.0/21`) are blocked first — claude.ai is cut from second one, internet stays alive;
