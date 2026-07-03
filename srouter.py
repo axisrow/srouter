@@ -44,9 +44,15 @@ def _env_from_args(args) -> InstallEnv:
 def cmd_install(args) -> int:
     """Установить LaunchAgent (plist) и запустить демон. Одноразовая настройка."""
     env = _env_from_args(args)
+    plist = env.launchagent_path()
+    # Уже установлено (plist с нашим маркером) — не трогаем демон. Перезапуск = отдельная команда.
+    if plist.exists() and _has_launchagent_marker(plist):
+        print(f"Служба уже установлена: {plist}\n"
+              f"Для перезапуска демона: srouter restart")
+        return 0
     ok, error = _install_launchagent(env, runner=run)
     if ok:
-        print(f"LaunchAgent {LAUNCHAGENT_LABEL} установлен и запущен: {env.launchagent_path()}")
+        print(f"LaunchAgent {LAUNCHAGENT_LABEL} установлен и запущен: {plist}")
         return 0
     print(f"Не удалось установить LaunchAgent: {error}", file=sys.stderr)
     return 2
