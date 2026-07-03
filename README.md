@@ -154,8 +154,9 @@ macOS + активную проверку связности (не просто 
 
 ## Установка (локальная часть, macOS)
 
-> Нужен Homebrew. Часть действий (DNS на :53, маршруты) требует пароль администратора —
-> `srouter install` спросит его через GUI macOS (osascript), либо запустите под `sudo`.
+> Нужен Homebrew. Часть действий (DNS на :53, маршруты) требует пароль администратора.
+> Два пути: **sudo** (один пароль, потом ноль диалогов) или **osascript** (GUI-диалог при каждом
+> привилегированном действии). Выбирайте под свои условия.
 
 ```bash
 # 1. Поставить команду srouter (в активный python3 — в нём же лежит flask как зависимость):
@@ -163,6 +164,9 @@ python3 -m pip install --upgrade pip          # нужен pip ≥ 21.3 для P
 pip install -e .
 
 # 2. Полная установка стека одной командой:
+#    Сценарий A — sudo (один ввод пароля, потом ноль osascript-диалогов; для серверов/dev):
+sudo srouter install --python $(which python3) -y
+#    Сценарий B — osascript (GUI-диалог при каждом привилегированном действии; для user-mac):
 srouter install
 #   • ставит brew-сервисы xray/privoxy/dnsmasq и пишет их конфиги;
 #   • настраивает DNS (networksetup ... 127.0.0.1) и устанавливает LaunchAgent дашборда;
@@ -303,13 +307,20 @@ path and continuously optimizing it. Two parts:
 
 ## Install (local, macOS)
 
-> Requires Homebrew. Some steps (DNS on :53, routes) need an administrator password —
-> `srouter install` will prompt for it via the macOS GUI (osascript), or run under `sudo`.
+> Requires Homebrew. Some steps (DNS on :53, routes) need an administrator password.
+> Two paths: **sudo** (one password, then zero dialogs) or **osascript** (GUI prompt on each
+> privileged action). Choose what fits your setup.
 
 ```bash
 # 1. Install the srouter command (into the active python3 — it holds flask as a dependency):
 python3 -m pip install --upgrade pip          # needs pip >= 21.3 for PEP 660 editable install
 pip install -e .
+
+# 2. Install the full stack with one command:
+#    Scenario A — sudo (one password entry, then zero osascript dialogs; for servers/dev):
+sudo srouter install --python $(which python3) -y
+#    Scenario B — osascript (GUI dialog on each privileged action; for user mac):
+srouter install
 
 # 2. Install the full stack with one command:
 srouter install
