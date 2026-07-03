@@ -55,16 +55,21 @@ class InstallEnv:
     state_path: Path = ROOT / "srouter.local.json"
     launchagent_dir: Path = Path.home() / "Library" / "LaunchAgents"
     python_bin: str = "/usr/bin/python3"
+    log_out: Path = Path.home() / "Library/Logs/srouter-dashboard.out.log"
+    log_err: Path = Path.home() / "Library/Logs/srouter-dashboard.err.log"
     now: str = ""
 
     @classmethod
     def from_env(cls, *, state_path=None, prefix=None):
+        log_dir = Path(os.environ.get("SROUTER_LOG_DIR", Path.home() / "Library/Logs"))
         return cls(
             root=ROOT,
             prefix=Path(prefix or os.environ.get("SROUTER_PREFIX", "/opt/homebrew")),
             state_path=Path(state_path or os.environ.get("SROUTER_STATE_PATH", ROOT / "srouter.local.json")),
             launchagent_dir=Path(os.environ.get("SROUTER_LAUNCHAGENTS_DIR", Path.home() / "Library" / "LaunchAgents")),
             python_bin=os.environ.get("SROUTER_PYTHON", "/usr/bin/python3"),
+            log_out=log_dir / "srouter-dashboard.out.log",
+            log_err=log_dir / "srouter-dashboard.err.log",
             now=os.environ.get("SROUTER_NOW", "") or _now(),
         )
 
@@ -142,6 +147,8 @@ def _render_launchagent_plist(env):
         "__SROUTER_PYTHON_BIN__": env.python_bin,
         "__SROUTER_DASHBOARD_PATH__": str(env.root / "dashboard.py"),
         "__SROUTER_ROOT_DIR__": str(env.root),
+        "__SROUTER_LOG_OUT__": str(env.log_out),
+        "__SROUTER_LOG_ERR__": str(env.log_err),
     }
     for key, value in replacements.items():
         template = template.replace(key, escape(str(value)))

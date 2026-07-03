@@ -17,7 +17,9 @@ This repository is the v1 monorepo for `srouter`: the local macOS client, Flask 
 - `cp srouter_config.example.py srouter_config.py` is a temporary bootstrap path for the current dashboard implementation only.
 - `python3 dashboard.py` starts the loopback-only dashboard at `http://127.0.0.1:8787`.
 - `./diag-proxy.sh novpn` and `./diag-proxy.sh vpn` run comparable proxy diagnostics for no-VPN and VPN states.
-- `python3 -m py_compile dashboard.py srouter_config.example.py` is the current syntax check. There is no build system, package metadata, or test runner yet.
+- `python3 -m py_compile dashboard.py srouter_config.example.py` is the quick syntax check.
+- Build system / package metadata: `pyproject.toml` (setuptools backend, PEP 621). Install the console entry point with `python3 -m pip install --upgrade pip` (needs pip ≥ 21.3 for PEP 660 editable install), then `pip install -e .` — this exposes the `srouter` command.
+- Test runner: `pytest` (declared in `[project.optional-dependencies].dev`). Run the suite with `pytest` from the repo root after `pip install -e '.[dev]'`.
 
 ## Coding Style & Naming Conventions
 
@@ -35,7 +37,7 @@ For apply/restart flows, use two-phase state: write pending intent, generate/app
 
 ## Testing Guidelines
 
-No tests are currently committed. The first testing change should be a pytest harness stub, before feature-specific tests. For non-trivial changes today, run `python3 -m py_compile dashboard.py srouter_config.example.py` and manually open `/api/status` and `/` after starting the dashboard. If adding tests, place them under `tests/`, name files `test_*.py`, and prefer pytest-style tests around local-state helpers, probe helpers, route validation, and two-phase apply behavior.
+Tests live under `tests/` (pytest-style, `test_*.py`). Run `pytest` from the repo root; `tests/conftest.py` adds the repo root to `sys.path` so root-level modules import without installing the package. Existing coverage spans local-state helpers, probe helpers, route validation, two-phase apply behavior, and the launchd/uninstall flow. Prefer adding tests there for non-trivial changes.
 
 ## Commit & Pull Request Guidelines
 

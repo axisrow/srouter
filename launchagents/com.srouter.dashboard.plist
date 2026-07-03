@@ -25,5 +25,9 @@
     <key>PYTHONUNBUFFERED</key>
     <string>1</string>
   </dict>
+  <key>StandardOutPath</key>
+  <string>__SROUTER_LOG_OUT__</string>
+  <key>StandardErrorPath</key>
+  <string>__SROUTER_LOG_ERR__</string>
 </dict>
 </plist>
