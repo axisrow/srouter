@@ -566,3 +566,77 @@ def test_save_active_throttle_accepts_int_and_string_applied_at(tmp_path):
         {"domain": "x.example.com", "rate": 256, "token": "5", "applied_at": 1700000000}, path=p
     )
     assert local_state.load_active_throttle(path=p)["applied_at"] == 1700000000
+
+
+# ============================ sync route_ip из xray-конфига (Часть A) ============================
+def _write_xray_config(p, address):
+    """Минимальный xray-конфиг с vless-outbound на address (как gen_xray_config пишет)."""
+    p.write_text(json.dumps({
+        "outbounds": [
+            {"tag": "direct", "protocol": "freedom"},
+            {"tag": "proxy", "protocol": "vless", "settings": {"vnext": [{"address": address, "port": 443}]}},
+        ]
+    }), encoding="utf-8")
+
+
+def test_sync_route_ip_from_xray_updates_node(tmp_path):
+    """xray-конфиг держит реальный address (85.136.181.198), state — placeholder → sync обновляет route_ip."""
+    state_p = tmp_path / "srouter.local.json"
+    xray_p = tmp_path / "xray-config.json"
+    _write_xray_config(xray_p, "85.136.181.198")
+    _write(state_p, {"nodes": [{"name": "sg-1", "endpoint_host": "203.0.113.10",
+                                 "route_ip": "203.0.113.10", "enabled": True}]})
+    r = local_state.sync_route_ip_from_xray("sg-1", xray_config_path=str(xray_p), path=state_p)
+    assert r["ok"] is True
+    assert r["route_ip"] == "85.136.181.198"
+    # state обновлён:
+    node = local_state.get_node("sg-1", path=state_p)
+    assert node["route_ip"] == "85.136.181.198"
+
+
+def test_sync_route_ip_idempotent(tmp_path):
+    """route_ip уже = xray address → no-op (ok, unchanged)."""
+    state_p = tmp_path / "srouter.local.json"
+    xray_p = tmp_path / "xray-config.json"
+    _write_xray_config(xray_p, "85.136.181.198")
+    _write(state_p, {"nodes": [{"name": "sg-1", "endpoint_host": "85.136.181.198",
+                                 "route_ip": "85.136.181.198", "enabled": True}]})
+    r = local_state.sync_route_ip_from_xray("sg-1", xray_config_path=str(xray_p), path=state_p)
+    assert r["ok"] is True
+    assert r["route_ip"] == "85.136.181.198"
+
+
+def test_sync_route_ip_no_xray_config_returns_false(tmp_path):
+    """xray-конфига нет → ok:False (fail-soft), state не тронут."""
+    state_p = tmp_path / "srouter.local.json"
+    xray_p = tmp_path / "missing-config.json"
+    _write(state_p, {"nodes": [{"name": "sg-1", "endpoint_host": "203.0.113.10", "route_ip": "203.0.113.10", "enabled": True}]})
+    r = local_state.sync_route_ip_from_xray("sg-1", xray_config_path=str(xray_p), path=state_p)
+    assert r["ok"] is False
+    assert local_state.get_node("sg-1", path=state_p)["route_ip"] == "203.0.113.10"  # не изменился
+
+
+def test_sync_route_ip_unknown_node_returns_false(tmp_path):
+    """Узла с таким name нет → ok:False."""
+    state_p = tmp_path / "srouter.local.json"
+    xray_p = tmp_path / "xray-config.json"
+    _write_xray_config(xray_p, "85.136.181.198")
+    _write(state_p, {"nodes": [{"name": "sg-1", "endpoint_host": "203.0.113.10", "route_ip": "203.0.113.10", "enabled": True}]})
+    r = local_state.sync_route_ip_from_xray("other", xray_config_path=str(xray_p), path=state_p)
+    assert r["ok"] is False
+
+
+def test_sync_route_ip_broken_xray_config_returns_false(tmp_path):
+    """xray-конфиг битый (не JSON) → ok:False (fail-soft)."""
+    state_p = tmp_path / "srouter.local.json"
+    xray_p = tmp_path / "xray-config.json"
+    xray_p.write_text("{ not valid json", encoding="utf-8")
+    _write(state_p, {"nodes": [{"name": "sg-1", "endpoint_host": "203.0.113.10", "route_ip": "203.0.113.10", "enabled": True}]})
+    r = local_state.sync_route_ip_from_xray("sg-1", xray_config_path=str(xray_p), path=state_p)
+    assert r["ok"] is False
+
+
+# ============================ auto_route_sync в _DEFAULT_STATE (Часть B) ============================
+def test_default_state_has_auto_route_sync_true():
+    """auto_route_sync включён по умолчанию (новые инсталляции — с автосинком split-route)."""
+    assert local_state._DEFAULT_STATE.get("auto_route_sync") is True

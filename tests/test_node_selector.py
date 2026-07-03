@@ -493,11 +493,17 @@ def _route_argv_fragments(calls):
 
 
 def test_route_sync_flag_absent_makes_zero_privileged_calls(tmp_path, monkeypatch):
-    """Флаг отсутствует -> route-sync не зван вообще; поведение как раньше."""
+    """Флаг явно False -> route-sync не зван вообще; поведение как раньше.
+
+    Примечание: auto_route_sync теперь True в _DEFAULT_STATE (Часть B), поэтому «флаг отсутствует»
+    невозможен (merge добавит default True). Тест явно ставит False = «пользователь выключил».
+    """
     import node_selector
 
     state_path = tmp_path / "srouter.local.json"
-    _write_state(state_path, _state())  # без auto_route_sync
+    st = _state()
+    st["auto_route_sync"] = False  # явно выключено
+    _write_state(state_path, st)
     _install_gateway(monkeypatch)
     calls = _install_route_runner(monkeypatch)
 
