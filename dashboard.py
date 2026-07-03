@@ -24,6 +24,7 @@ import node_selector
 import sys_probe
 import traffic_shape  # throttle-движок (#13): зовём через атрибут (traffic_shape.apply_throttle)
 import isolate_firewall  # PF-изоляция доменов: зовём через атрибут
+import git_proxy  # вкл/откл git-прокси для github (через git config --global)
 
 # Активный узел нельзя замораживать на import: #8 меняет srouter.local.json в рантайме.
 # Эти имена оставлены только для совместимости старых импорт-тестов; рабочий код ниже
@@ -870,6 +871,25 @@ def api_isolate_refresh():
         body["isolate"] = _public_isolate(saved)
         return jsonify(body), 200
     return jsonify(body), 500
+
+
+# ============================ git-proxy для github (/api/git-proxy) ============================
+@app.get("/api/git-proxy")
+def api_git_proxy_get():
+    """Текущее состояние git-прокси для github (читает ~/.gitconfig)."""
+    return jsonify(git_proxy.status())
+
+
+@app.post("/api/git-proxy/enable")
+def api_git_proxy_enable():
+    """Прописать http.https://github.com.proxy = privoxy (scoped github.com)."""
+    return jsonify(git_proxy.enable()), 200
+
+
+@app.post("/api/git-proxy/disable")
+def api_git_proxy_disable():
+    """Снять http.https://github.com.proxy (--unset). Идемпотентно."""
+    return jsonify(git_proxy.disable()), 200
 
 
 @app.get("/")
