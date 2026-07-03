@@ -128,19 +128,15 @@ def _print_report(result):
 
 
 def cmd_watchdog():
-    """Один прогон watchdog'а (запускается launchd раз в ~90с).
+    """Один прогон watchdog'а (запускается launchd раз в ~20с).
 
     Нотификация только при ПЕРЕХОДЕ состояния (ok→down — громко, down→ok — тихо), не при каждом
     прогоне — чтобы не спамить. State в WATCHDOG_STATE (/tmp).
-    """
-    # Сначала гарантировать split-route (если VPN перехватил default) — «пофигу VPN».
-    # ensure_split_route добавит route до VPS через en0, и тогда check_all увидит живой туннель.
-    try:
-        import node_selector
-        node_selector.ensure_split_route()
-    except Exception:
-        pass  # split-route — best-effort, не роняет watchdog
 
+    Split-route НЕ делается тут — это ответственность ppp-hook (/etc/ppp/ip-up, мгновенно при VPN
+    up, от root без osascript). Watchdog только детектит падение туннеля и нотифицирует. Если
+    ppp-hook не сработал (utun-VPN) — пользователь видит нотификацию и手动но ensure-split-route-root.
+    """
     result = check_all()
     is_ok = result["status"] == "ok"
     try:
