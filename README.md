@@ -174,17 +174,19 @@ sudo networksetup -setdnsservers "Wi-Fi" 127.0.0.1
 python3 -m pip install --upgrade pip          # нужен pip ≥ 21.3 для PEP 660 editable-install
 pip install -e .
 
-srouter apply          # загрузить LaunchAgent дашборда (демон, loopback 127.0.0.1:8787)
+srouter install        # установить LaunchAgent и запустить демон (одноразово; автозапуск при входе)
+srouter start          # запустить демон (если plist уже установлен)
+srouter stop           # остановить демон (plist сохранён)
+srouter restart        # перезапустить демон (применить правки кода)
+srouter uninstall      # остановить демон и удалить plist
 srouter status         # статус демона и PID
-srouter run            # foreground-запуск (без launchd) — http://127.0.0.1:8787
-                       #   run/start — синонимы; stop — выгрузить демон
 
-# Либо напрямую (legacy/foreground):
+# Foreground-запуск для отладки (без launchd, блокирует терминал):
 python3 dashboard.py                        # http://127.0.0.1:8787
 ```
 
-`srouter` — устанавливаемый Python-пакет (`pyproject.toml`). `apply` ставит LaunchAgent (автозапуск
-при загрузке мака, перезапуск при падении), `status` проверяет демон, `run` запускает дашборд в окне.
+`srouter` — устанавливаемый Python-пакет (`pyproject.toml`). `install`/`uninstall` управляют службой
+(plist-файлом), `start`/`stop`/`restart` — запущенным процессом, `status` показывает состояние.
 Полная установка brew-стека (конфиги/сервисы/DNS) — через `./install.sh apply` (см. `install_lib.py`).
 
 ## Интеграции
@@ -266,18 +268,20 @@ sudo networksetup -setdnsservers "Wi-Fi" 127.0.0.1
 python3 -m pip install --upgrade pip          # needs pip >= 21.3 for PEP 660 editable install
 pip install -e .
 
-srouter apply          # load the dashboard LaunchAgent (daemon, loopback 127.0.0.1:8787)
+srouter install        # install the LaunchAgent and start the daemon (once; autostart at login)
+srouter start          # start the daemon (if the plist is already installed)
+srouter stop           # stop the daemon (the plist is kept)
+srouter restart        # restart the daemon (apply code changes)
+srouter uninstall      # stop the daemon and remove the plist
 srouter status         # daemon status and PID
-srouter run            # foreground run (without launchd) — http://127.0.0.1:8787
-                       #   run/start are aliases; stop unloads the daemon
 
-# Or directly (legacy/foreground):
+# Foreground run for debugging (without launchd, blocks the terminal):
 python3 dashboard.py                         # http://127.0.0.1:8787
 ```
 
-`srouter` is an installable Python package (`pyproject.toml`). `apply` installs the LaunchAgent
-(autostart at login, restart on crash), `status` checks the daemon, `run` starts the dashboard in a
-window. Full brew-stack install (configs/services/DNS) is via `./install.sh apply` (see `install_lib.py`).
+`srouter` is an installable Python package (`pyproject.toml`). `install`/`uninstall` manage the
+service (the plist file), `start`/`stop`/`restart` manage the running process, `status` reports state.
+Full brew-stack install (configs/services/DNS) is via `./install.sh apply` (see `install_lib.py`).
 
 ## Integrations
 
