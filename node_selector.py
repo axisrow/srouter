@@ -531,3 +531,67 @@ def _select_node_locked(name, *, enabled_names, runner=None, state_path=None, co
             if not rollback.get("ok"):
                 return _rollback_failed(previous, "internal", rollback, error=str(exc))
         return {"ok": False, "active": previous, "step": "internal", "error": str(exc)}
+
+
+# ============================ ensure_split_route (Часть C — «пофигу VPN») ============================
+def _route_iface_from_output(out):
+    """Достать значение строки 'interface:' из вывода macOS route get."""
+    if not isinstance(out, str):
+        return ""
+    for line in out.splitlines():
+        key, sep, value = line.strip().partition(":")
+        if sep and key.strip().lower() == "interface":
+            return (value.strip().split() or [""])[0]
+    return ""
+
+
+def _route_goes_via_gateway(route_ip, gateway):
+    """True если route до route_ip идёт через физический шлюз (iface en* или gw==gateway).
+
+    route -n get -host <ip> → парсим interface + gateway. split активен если iface начинается
+    с 'en' (физический) ИЛИ gateway совпадает с нашим физическим шлюзом. Не бросает.
+    """
+    if not _ip_literal(route_ip) or not _ip_literal(gateway):
+        return False
+    try:
+        raw = sys_probe.run([ROUTE, "-n", "get", "-host", route_ip], timeout=_ROUTE_SYNC_TIMEOUT_SEC) or {}
+    except Exception:
+        return False
+    if raw.get("timeout") or raw.get("rc") != 0:
+        return False
+    out = raw.get("out") or ""
+    iface = _route_iface_from_output(out)
+    gw = _route_gateway_from_output(out)
+    return iface.startswith("en") or gw == gateway
+
+
+def ensure_split_route(state_path=None):
+    """Гарантировать split-route до VPS через физический шлюз (en0), если VPN перехватил default.
+
+    Главный сценарий «пофигу VPN»: VPN (ppp0) перехватил default → route до VPS через ppp0 →
+    ensure_split_route видит (route get → ppp0, не en*/GATEWAY) → добавляет split-route через
+    физический шлюз. Idempotent: если route уже через en*/GATEWAY — ничего не делает.
+
+    Зовётся watchdog'ом (health.py) раз в ~90с. Не бросает, возвращает dict с состоянием.
+    """
+    try:
+        if not _auto_route_sync_enabled(state_path):
+            return {"enabled": False}
+        node = local_state.active_node(path=state_path) or {}
+        name = node.get("name")
+        if not name:
+            return {"enabled": True, "error": "no active node"}
+        route_ip = _route_node_ip(name, state_path)
+        if not route_ip:
+            return {"enabled": True, "error": "no valid route_ip"}
+        gateway = _gateway_literal()
+        if not gateway:
+            return {"enabled": True, "error": "no GATEWAY"}
+        # route уже через en*/GATEWAY → split активен, ничего не делаем.
+        if _route_goes_via_gateway(route_ip, gateway):
+            return {"enabled": True, "added": False, "reason": "already split"}
+        # route через ppp0/иной → добавить split через физический шлюз.
+        added = _sudo_route_ip("add", route_ip, gateway)
+        return {"enabled": True, "added": added}
+    except Exception as exc:
+        return {"enabled": True, "error": f"ensure_split_route failed: {exc}"}

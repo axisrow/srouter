@@ -909,3 +909,95 @@ def test_api_nodes_ranking_returns_recommendation_from_snapshot(monkeypatch):
     assert body["best"] == "hk-1"
     assert body["recommendation"] == "switch:hk-1"
     assert [item["name"] for item in body["score_window"]] == ["hk-1", "sg-1", "de-1"]
+
+
+# ============================ ensure_split_route (Часть C — «пофигу VPN») ============================
+def _route_get_out(iface, gateway=""):
+    """Вывод `route -n get -host <ip>` для mock: interface + gateway."""
+    return "route: bad command\n" + (f"interface: {iface}\n" if iface else "") + (f"gateway: {gateway}\n" if gateway else "")
+
+
+def test_ensure_split_route_noop_when_disabled(monkeypatch, tmp_path):
+    """auto_route_sync=False → ensure_split_route ничего не делает (enabled:False)."""
+    import node_selector
+    state_path = tmp_path / "srouter.local.json"
+    st = _state()
+    st["auto_route_sync"] = False
+    _write_state(state_path, st)
+    _install_gateway(monkeypatch)
+    calls = _install_route_runner(monkeypatch)
+
+    r = node_selector.ensure_split_route(state_path=state_path)
+    assert r["enabled"] is False
+    assert calls == []  # ноль priv-вызовов
+
+
+def test_ensure_split_route_adds_when_route_via_ppp0(monkeypatch, tmp_path):
+    """VPN перехватил default → route до VPS через ppp0 → ensure_split_route добавляет split через en0.
+
+    Главный сценарий «пофигу VPN»: route -n get возвращает ppp0 (VPN), ensure_split_route видит
+    что не через en*/GATEWAY → зовёт _sudo_route_ip('add').
+    """
+    import node_selector
+    state_path = tmp_path / "srouter.local.json"
+    _write_state(state_path, _state())  # auto_route_sync=True в default
+    _install_gateway(monkeypatch)
+
+    calls = []
+    def fake_run(cmd, timeout):
+        calls.append((list(cmd), timeout))
+        # route -n get -host → ppp0 (VPN); add → успех
+        if "get" in cmd and "-host" in cmd:
+            return {"rc": 0, "out": _route_get_out("ppp0", "10.0.0.1"), "err": "", "timeout": False}
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+    monkeypatch.setattr(sys_probe, "run", fake_run)
+
+    r = node_selector.ensure_split_route(state_path=state_path)
+    assert r["enabled"] is True
+    assert r.get("added") is not None
+    # был вызов add-host через osascript (cmd = [OSASCRIPT, "-e", "do shell script '... add -host ...'"])
+    add_calls = [c for c in calls if any("add" in str(a) and "-host" in str(a) for a in c[0])]
+    assert len(add_calls) == 1, f"должен быть 1 add, есть {add_calls}"
+
+
+def test_ensure_split_route_noop_when_route_via_en0(monkeypatch, tmp_path):
+    """Route уже через en0 (split активен) → ensure_split_route ничего не добавляет."""
+    import node_selector
+    state_path = tmp_path / "srouter.local.json"
+    _write_state(state_path, _state())
+    _install_gateway(monkeypatch)
+
+    calls = []
+    def fake_run(cmd, timeout):
+        calls.append((list(cmd), timeout))
+        if "get" in cmd and "-host" in cmd:
+            return {"rc": 0, "out": _route_get_out("en0", "192.0.2.1"), "err": "", "timeout": False}
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+    monkeypatch.setattr(sys_probe, "run", fake_run)
+
+    r = node_selector.ensure_split_route(state_path=state_path)
+    assert r["enabled"] is True
+    assert r.get("added") is False  # уже split, не добавляли
+    add_calls = [c for c in calls if "add" in c[0] and "-host" in c[0]]
+    assert add_calls == [], "route уже через en0 — add не должен зваться"
+
+
+def test_ensure_split_route_noop_when_route_via_gateway(monkeypatch, tmp_path):
+    """Route через en1 но gateway=GATEWAY → split активен (gw==GATEWAY), add не нужен."""
+    import node_selector
+    state_path = tmp_path / "srouter.local.json"
+    _write_state(state_path, _state())
+    _install_gateway(monkeypatch, gateway="192.0.2.1")
+
+    calls = []
+    def fake_run(cmd, timeout):
+        calls.append((list(cmd), timeout))
+        if "get" in cmd and "-host" in cmd:
+            # en1 (USB-tether), но gateway = наш GATEWAY → split активен
+            return {"rc": 0, "out": _route_get_out("en1", "192.0.2.1"), "err": "", "timeout": False}
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+    monkeypatch.setattr(sys_probe, "run", fake_run)
+
+    r = node_selector.ensure_split_route(state_path=state_path)
+    assert r["enabled"] is True
+    assert r.get("added") is False

@@ -117,7 +117,7 @@ def probe_route_to_vps(route_ip=None):
     r = sys_probe.run([ROUTE, "-n", "get", "-host", route_ip], timeout=3)
     iface = _first(r"interface:\s*(\S+)", r["out"]) if not r["timeout"] else ""
     gw = _first(r"gateway:\s*(\S+)", r["out"]) if not r["timeout"] else ""
-    bypass = (iface == "en0") or (gw == GATEWAY)
+    bypass = iface.startswith("en") or (gw == GATEWAY)
     return {"interface": iface, "gateway": gw, "split_active": bypass,
             "status": "ok" if bypass else "warn"}
 
