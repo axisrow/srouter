@@ -200,6 +200,56 @@ srouter uninstall      # полный откат к дефолту:
 #   сбрасывает DNS (networksetup ... Empty), удаляет LaunchAgent и split-route до VPS.
 ```
 
+## PF-изоляция доменов (опционально)
+
+**Цель:** пакеты к Proxy-доменам (`api.anthropic.com`, `console.anthropic.com`, `claude.ai`) физически
+не могут уйти через реальный интерфейс (en0/ppp0) — даже если Claude Code забудет `HTTPS_PROXY` или
+любая программа полезет напрямую. PF режет в ядре macOS. Если прокси упал — трафик в ниду
+(fail-closed), НЕ напрямую.
+
+Управление — через карточку «Изоляция доменов (PF)» в дашборде: кнопки **Включить / Выключить / Обновить IP**.
+Или через CLI:
+
+```bash
+python3 isolate_firewall.py enable       # dig домены → IP → блок в ядре
+python3 isolate_firewall.py disable      # снять блок
+python3 isolate_firewall.py refresh      # re-dig (IP меняются у CloudFront/Anthropic)
+python3 isolate_firewall.py status       # текущее состояние
+```
+
+**Как это работает (механика «глаза и руки»):**
+- `dig @8.8.8.8 <domain>` — узнать IP домена («глаза»: домен → IP).
+- `pfctl -a com.apple/srouter_isolate -t srouter_proxy_ips -T replace <ips>` — положить IP в таблицу
+  файрвола («руки»: охранник PF в ядре + листок с номерами). Всё, что идёт на эти IP через en0/ppp0
+  по портам 80/443 — умирает. Через прокси (xray→VPS) — работает: xray шлёт на IP VPS, не на IP Claude.
+
+**Двухфазная загрузка** закрывает стартовое окно (между бутом и `dig`+`pfctl`): при загрузке macOS
+сначала блокируются подсети Anthropic (`160.79.104.0/21`) — claude.ai отрезан с первой секунды,
+интернет жив; когда srouter собрал конкретные IP — блок сужается до точных адресов.
+
+### 🚨 Если интернет сломался
+
+PF-изоляция режет в ядре — если что-то пошло не так, **вернуть сеть одной командой**:
+
+```bash
+sudo pfctl -a "com.apple/srouter_isolate" -F all   # снять правила изоляции
+```
+
+Если не помогло (или anchor не виноват), **полностью выключить PF** (ядерный вариант, возвращает
+всю сеть, но отключает и Traffic Guard throttle):
+
+```bash
+sudo pfctl -d                                     # выключить PF целиком
+```
+
+После восстановления сети — разберитесь, что сломалось (`~/Library/Logs/srouter-dashboard.err.log`),
+почините, и включите PF обратно (`sudo pfctl -E`) перед повторной изоляцией.
+
+**Ограничения:** блок по IP (не SNI — SNI потребует TUN/Mihomo, отложено); подсети на старте режут
+чуть шире (соседние Anthropic-домены напрямую отрезаны, через прокси работают); IP меняются →
+обновление каждые 6 ч (устаревший IP в таблице безвреден — мы блокируем, не разрешаем).
+
+
 ---
 
 # srouter — smart router (English)
@@ -286,6 +336,57 @@ srouter uninstall      # full rollback to defaults:
 #   stops brew services, restores foreign configs from backups, resets DNS
 #   (networksetup ... Empty), removes the LaunchAgent and the split-route to the VPS.
 ```
+
+## PF domain isolation (optional)
+
+**Goal:** packets to Proxy domains (`api.anthropic.com`, `console.anthropic.com`, `claude.ai`)
+physically cannot leave via the real interface (en0/ppp0) — even if Claude Code forgets
+`HTTPS_PROXY` or any app goes direct. PF cuts at the macOS kernel. If the proxy is down, traffic
+goes nowhere (fail-closed), NOT direct.
+
+Manage via the "Domain isolation (PF)" card in the dashboard: **Enable / Disable / Refresh IPs** buttons.
+Or via CLI:
+
+```bash
+python3 isolate_firewall.py enable       # dig domains → IPs → kernel block
+python3 isolate_firewall.py disable      # remove the block
+python3 isolate_firewall.py refresh      # re-dig (IPs change at CloudFront/Anthropic)
+python3 isolate_firewall.py status       # current state
+```
+
+**How it works ("eyes and hands"):**
+- `dig @8.8.8.8 <domain>` — resolve the domain's IP ("eyes": domain → IP).
+- `pfctl -a com.apple/srouter_isolate -t srouter_proxy_ips -T replace <ips>` — put IPs into the
+  firewall table ("hands": PF guard in the kernel + a list of numbers). Anything to these IPs via
+  en0/ppp0 on ports 80/443 dies. Via the proxy (xray→VPS) it works: xray talks to the VPS IP, not the
+  Claude IP.
+
+**Two-phase boot** closes the startup window (between boot and `dig`+`pfctl`): on macOS boot, Anthropic
+subnets (`160.79.104.0/21`) are blocked first — claude.ai is cut from second one, internet stays alive;
+once srouter resolves concrete IPs, the block narrows to exact addresses.
+
+### 🚨 If the internet broke
+
+PF isolation cuts at the kernel — if something went wrong, **restore the network with one command**:
+
+```bash
+sudo pfctl -a "com.apple/srouter_isolate" -F all   # remove isolation rules
+```
+
+If that doesn't help (or the anchor isn't at fault), **disable PF entirely** (nuclear option, restores
+all network but also disables Traffic Guard throttle):
+
+```bash
+sudo pfctl -d                                     # turn PF off completely
+```
+
+After the network is back — figure out what broke (`~/Library/Logs/srouter-dashboard.err.log`), fix
+it, and re-enable PF (`sudo pfctl -E`) before isolating again.
+
+**Limitations:** blocks by IP (not SNI — SNI needs TUN/Mihomo, deferred); subnets at boot cut slightly
+wider (neighboring Anthropic domains are direct-blocked, but work via proxy); IPs change → refresh
+every 6 h (a stale IP in the table is harmless — we block, not permit).
+
 
 ## Integrations
 
