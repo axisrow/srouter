@@ -42,6 +42,10 @@ py-modules = [
     "sys_probe",
     "traffic_shape",
     "gen_xray_config",
+    "isolate_firewall",
+    "dashboard_isolate",
+    "git_proxy",
+    "claude_proxy",
 ]
 
 [tool.setuptools.package-data]
