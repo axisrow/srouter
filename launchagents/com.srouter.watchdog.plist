@@ -13,7 +13,7 @@
   <key>ProgramArguments</key>
   <array>
     <string>__SROUTER_PYTHON_BIN__</string>
-    <string>__SROUTER_HEALTH_PATH__</string>
+    <string>__SROUTER_WATCHDOG_PATH__</string>
     <string>watchdog</string>
   </array>
   <key>WorkingDirectory</key>

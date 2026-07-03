@@ -182,6 +182,67 @@ def _install_launchagent(env, runner):
     return True, ""
 
 
+# ============================ обобщённый рендер/загрузка plists (watchdog/isolate/...) ============================
+def _render_generic_launchagent(env, *, template_name, label, marker, script_path):
+    """Рендерить произвольный LaunchAgent из шаблона launchagents/<template_name>.
+
+    Обобщение _render_launchagent_plist: разные label/marker/script (health.py, isolate_firewall.py,
+    и т.д.). Подставляет __SROUTER_<LABEL>_LABEL__, __SROUTER_<X>_MARKER__, __SROUTER_<X>_PATH__,
+    плюс общие PYTHON_BIN/ROOT_DIR/LOG_*. escape — как в dashboard.
+    """
+    template = (env.root / "launchagents" / template_name).read_text(encoding="utf-8")
+    # Префикс для плейсхолдеров LABEL/MARKER/PATH — из label (напр. com.srouter.watchdog → WATCHDOG).
+    # Из label надёжнее, чем из marker (marker может иметь -v1 суффикс → WATCHDOG_V1 ≠ WATCHDOG).
+    prefix = label.rsplit(".", 1)[-1].upper()  # com.srouter.watchdog → WATCHDOG
+    replacements = {
+        f"__SROUTER_{prefix}_LABEL__": label,
+        f"__SROUTER_{prefix}_MARKER__": marker,
+        f"__SROUTER_{prefix}_PATH__": str(script_path),
+        "__SROUTER_PYTHON_BIN__": env.python_bin,
+        "__SROUTER_ROOT_DIR__": str(env.root),
+        "__SROUTER_LOG_OUT__": str(env.log_out),
+        "__SROUTER_LOG_ERR__": str(env.log_err),
+    }
+    for key, value in replacements.items():
+        template = template.replace(key, escape(str(value)))
+    return template
+
+
+def _install_generic_launchagent(env, runner, *, template_name, label, marker, script_path):
+    """Рендер + загрузка произвольного LaunchAgent (watchdog/isolate/...). Возвращает (ok, err).
+
+    Симметрично _install_launchagent, но с заданным label/marker/script. Путь plist =
+    launchagent_dir/<label>.plist. bootout (ignore) → bootstrap (fallback load -w). main ruleset НЕ
+    трогается (anchor com.apple/* уже в /etc/pf.conf — но это LaunchAgent, не PF; просто под-anchor).
+    """
+    plist_path = env.launchagent_dir / f"{label}.plist"
+    # Если чужой plist без нашего маркера — не трогаем.
+    if plist_path.exists():
+        try:
+            existing = plist_path.read_text(encoding="utf-8")
+            if marker not in existing:
+                return False, f"{label}_foreign"
+        except OSError:
+            return False, f"{label}_read_failed"
+    try:
+        rendered = _render_generic_launchagent(env, template_name=template_name, label=label,
+                                               marker=marker, script_path=script_path)
+    except OSError as exc:
+        return False, f"{label}_template_failed: {exc}"
+    if not _write_text_atomic(plist_path, rendered):
+        return False, f"{label}_write_failed"
+
+    domain = _launchd_domain()
+    runner([LAUNCHCTL, "bootout", f"{domain}/{label}"], 10)  # ignore если не загружен
+    bootstrap = runner([LAUNCHCTL, "bootstrap", domain, str(plist_path)], 15)
+    if not bootstrap.get("timeout") and bootstrap.get("rc") == 0:
+        return True, ""
+    fallback = runner([LAUNCHCTL, "load", "-w", str(plist_path)], 15)
+    if fallback.get("timeout") or fallback.get("rc") != 0:
+        return False, f"{label}_load_failed"
+    return True, ""
+
+
 def _port_owner(name, runner):
     proto, port = PORTS[name]
     if proto == "udp":
