@@ -32,7 +32,7 @@ def test_status_crashed(monkeypatch, capsys):
     assert rc == 1
     assert "крашнулся" in err
     assert "exit code=1" in err
-    assert "srouter stop && srouter apply" in err
+    assert "srouter restart" in err
 
 
 def test_status_not_loaded(monkeypatch, capsys):

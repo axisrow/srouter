@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
-"""CLI-точка входа srouter: управление LaunchAgent дашборда (apply/stop),
-foreground-запуск (run) и статус демона (status).
+"""CLI-точка входа srouter: управление демоном дашборда (LaunchAgent).
+
+Два уровня команд:
+  install/uninstall — постановка/снятие службы (plist-файл), одноразово;
+  start/stop/restart — управление запущенным процессом (plist не трогается);
+  status — состояние демона.
 
 CLI строит отдельный интерфейс поверх библиотечных функций install_lib — НЕ дублирует
 логику рендеринга plist/загрузки launchd. Полная установка brew-стека (xray/privoxy/dnsmasq,
@@ -37,33 +41,89 @@ def _env_from_args(args) -> InstallEnv:
     return env
 
 
-def cmd_apply(args) -> int:
-    """Установить и загрузить LaunchAgent дашборда (loopback)."""
+def cmd_install(args) -> int:
+    """Установить LaunchAgent (plist) и запустить демон. Одноразовая настройка."""
     env = _env_from_args(args)
     ok, error = _install_launchagent(env, runner=run)
     if ok:
-        print(f"LaunchAgent {LAUNCHAGENT_LABEL} загружен: {env.launchagent_path()}")
+        print(f"LaunchAgent {LAUNCHAGENT_LABEL} установлен и запущен: {env.launchagent_path()}")
         return 0
-    print(f"Не удалось загрузить LaunchAgent: {error}", file=sys.stderr)
+    print(f"Не удалось установить LaunchAgent: {error}", file=sys.stderr)
     return 2
 
 
-def cmd_stop(args) -> int:
-    """Выгрузить и удалить srouter-managed LaunchAgent."""
+def cmd_uninstall(args) -> int:
+    """Выгрузить демон и удалить srouter-managed LaunchAgent (plist)."""
     env = _env_from_args(args)
     result = apply_uninstall(env=env, confirmations={"launchagent": True}, runner=run)
     if result.get("ok"):
         print(f"LaunchAgent {LAUNCHAGENT_LABEL} выгружен и удалён.")
         return 0
     blocked = ", ".join(result.get("blocked") or ["unknown"])
-    print(f"stop остановлен: {blocked}", file=sys.stderr)
+    print(f"uninstall остановлен: {blocked}", file=sys.stderr)
     return 2
 
 
-def cmd_run(args) -> int:
-    """Foreground-запуск дашборда (НЕ демон)."""
-    import dashboard  # ленивый: без srouter_config.py поднимет SystemExit на старте
-    dashboard.main()  # блокирует до Ctrl-C
+def _launchd_domain() -> str:
+    """Домен launchd текущего пользователя: gui/<uid>."""
+    return f"gui/{os.getuid()}"
+
+
+def _is_loaded() -> bool | None:
+    """Загружен ли LaunchAgent в launchd (по launchctl list). None — не удалось узнать."""
+    r = run([LAUNCHCTL, "list"], 5)
+    if r.get("timeout"):
+        return None
+    return any(row.split() and row.split()[-1] == LAUNCHAGENT_LABEL
+               for row in (r.get("out") or "").splitlines())
+
+
+def cmd_start(args) -> int:
+    """Запустить демон (plist уже должен быть установлен через `install`)."""
+    env = _env_from_args(args)
+    plist = env.launchagent_path()
+    if not plist.exists():
+        print("Служба не установлена. Сначала выполните: srouter install", file=sys.stderr)
+        return 2
+    if _is_loaded():
+        print(f"Демон уже запущен: {LAUNCHAGENT_LABEL}")
+        return 0
+    r = run([LAUNCHCTL, "bootstrap", _launchd_domain(), str(plist)], 15)
+    if r.get("timeout") or r.get("rc") != 0:
+        print(f"Не удалось запустить демон: {r.get('err') or r.get('out') or 'unknown error'}",
+              file=sys.stderr)
+        return 2
+    print(f"Демон запущен: {LAUNCHAGENT_LABEL}")
+    return 0
+
+
+def cmd_stop(args) -> int:
+    """Остановить демон, сохранив plist (в отличие от uninstall)."""
+    loaded = _is_loaded()
+    if loaded is False:
+        print(f"Демон не запущен: {LAUNCHAGENT_LABEL}")
+        return 0
+    r = run([LAUNCHCTL, "bootout", f"{_launchd_domain()}/{LAUNCHAGENT_LABEL}"], 15)
+    # bootout возвращает ненулевой rc, если уже выгружен — это не ошибка для нас.
+    if r.get("timeout"):
+        print("timeout bootout", file=sys.stderr)
+        return 2
+    print(f"Демон остановлен: {LAUNCHAGENT_LABEL} (plist сохранён)")
+    return 0
+
+
+def cmd_restart(args) -> int:
+    """Перезапустить демон (применить правки кода). plist не трогается."""
+    env = _env_from_args(args)
+    plist = env.launchagent_path()
+    # bootout (игнорируем ошибку если не загружен) + bootstrap.
+    run([LAUNCHCTL, "bootout", f"{_launchd_domain()}/{LAUNCHAGENT_LABEL}"], 10)
+    r = run([LAUNCHCTL, "bootstrap", _launchd_domain(), str(plist)], 15)
+    if r.get("timeout") or (r.get("rc") != 0 and not _is_loaded()):
+        print(f"Не удалось перезапустить демон: {r.get('err') or r.get('out') or 'unknown error'}",
+              file=sys.stderr)
+        return 2
+    print(f"Демон перезапущен: {LAUNCHAGENT_LABEL}")
     return 0
 
 
@@ -108,7 +168,7 @@ def cmd_status(args) -> int:
         print(f"LaunchAgent {LAUNCHAGENT_LABEL}: загружен, но процесс крашнулся "
               f"(exit code={exit_code}); launchd попытается перезапустить (KeepAlive). "
               f"plist={plist_path} (marker={marker}){log_hint}\n"
-              f"  проверь ProgramArguments (Python с flask) и попробуй: srouter stop && srouter apply",
+              f"  проверь ProgramArguments (Python с flask) и попробуй: srouter restart",
               file=sys.stderr)
         return 1
     print(f"LaunchAgent {LAUNCHAGENT_LABEL}: загружен, но не запущен (exit code=0). "
@@ -135,18 +195,16 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--launchagents-dir", default=None, help="Каталог LaunchAgents")
 
     for name, help_text, fn in [
-        ("apply", "Установить и загрузить LaunchAgent дашборда.", cmd_apply),
-        ("stop", "Выгрузить и удалить srouter-managed LaunchAgent.", cmd_stop),
-        ("status", "Показать статус LaunchAgent дашборда.", cmd_status),
+        ("install", "Установить LaunchAgent и запустить демон (одноразово).", cmd_install),
+        ("uninstall", "Остановить демон и удалить LaunchAgent (plist).", cmd_uninstall),
+        ("start", "Запустить демон (plist уже установлен).", cmd_start),
+        ("stop", "Остановить демон (plist сохранён).", cmd_stop),
+        ("restart", "Перезапустить демон (применить правки кода).", cmd_restart),
+        ("status", "Показать статус демона.", cmd_status),
     ]:
         p = sub.add_parser(name, help=help_text)
         add_env_flags(p)
         p.set_defaults(func=fn)
-
-    # `run` и `start` — синонимы: foreground-запуск дашборда (НЕ демон).
-    for name in ("run", "start"):
-        p_run = sub.add_parser(name, help="Запустить дашборд в foreground (НЕ демон).")
-        p_run.set_defaults(func=cmd_run)
     return parser
 
 
