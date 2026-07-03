@@ -169,23 +169,39 @@ sudo srouter install --python $(which python3) -y
 #    Сценарий B — osascript (GUI-диалог при каждом привилегированном действии; для user-mac):
 srouter install
 #   • ставит brew-сервисы xray/privoxy/dnsmasq и пишет их конфиги;
-#   • настраивает DNS (networksetup ... 127.0.0.1) и устанавливает LaunchAgent дашборда;
-#   • показывает план и спрашивает подтверждение; при конфликте чужих конфигов — adopt/overwrite/skip;
-#   • под sudo привилегированные шаги идут напрямую, без sudo — через GUI-пароль macOS.
+#   • настраивает DNS, устанавливает LaunchAgent дашборда и watchdog;
+#   • ставит ppp-hook для мгновенного split-route при VPN;
+#   • настраивает прокси для Claude Code и git (github.com);
+#   • показывает план и спрашивает подтверждение.
 srouter status         # проверить, что демон работает (http://127.0.0.1:8787)
+srouter doctor         # диагностика: порты + туннель + Claude-proxy (✅/❌)
 
 # Управление демоном дашборда (стек не трогается):
 srouter start          # запустить демон (если LaunchAgent уже установлен)
 srouter stop           # остановить демон (plist сохранён)
 srouter restart        # перезапустить демон (применить правки кода)
-
-# Foreground-запуск дашборда для отладки (без launchd, блокирует терминал):
-python3 dashboard.py
 ```
 
-`srouter install` / `uninstall` управляют **всем стеком** (brew-сервисы, конфиги, DNS, LaunchAgent);
-`start`/`stop`/`restart` — только запущенным процессом дашборда. Конфиги и логика конфликтов живут в
-`install_lib.py`; неинтерактивный путь для CI/скриптов — `./install.sh apply` (см. `install_lib.py`).
+`srouter install` / `uninstall` управляют **всем стеком** (brew-сервисы, конфиги, DNS, LaunchAgent,
+watchdog, ppp-hook, Claude Code/git-прокси). `start`/`stop`/`restart` — только демоном дашборда.
+`doctor` — разовая диагностика здоровья. Watchdog (запускается автоматически) — нотификация при
+падении туннеля. Неинтерактивный путь для CI/скриптов — `./install.sh apply` (см. `install_lib.py`).
+
+## VPN и split-route
+
+Трафик к Reality-узлу VPS всегда идёт через физический интерфейс (en0), **не через VPN** — даже когда
+VPN (ppp0) перехватил default-маршрут. Мгновенно: `/etc/ppp/ip-up` hook срабатывает в момент поднятия
+VPN и добавляет split-route (от root, без osascript). Дашборд показывает статус маршрута (карточка
+«Схема соединения», split_active). Если VPN не через ppp0 (utun) — `srouter doctor` подскажет.
+
+## Здоровье и защита от «остался без ИИ»
+
+| Средство | Что делает |
+|---|---|
+| **`srouter doctor`** | Разовая диагностика: порты (privoxy/xray/дашборд) + реальный туннель через прокси + Claude-proxy. Отчёт ✅/❌ + подсказки. |
+| **`GET /health`** | Лёгкий HTTP-эндпоинт (`http://127.0.0.1:8787/health`). 200=ok, 503=degraded/down. Для uptime-мониторинга. |
+| **watchdog** (авто) | launchd-задача (раз в 20с): пинг туннеля. При падении — **macOS-нотификация** + звук. При восстановлении — тихое уведомление. Молчит, когда здоров. |
+| **PF-изоляция** | fail-closed: прокси упал → трафик в никуда, не напрямую. См. ниже. |
 
 ## Интеграции
 
@@ -201,7 +217,8 @@ python3 dashboard.py
 ```bash
 srouter uninstall      # полный откат к дефолту:
 #   останавливает brew-сервисы, восстанавливает чужие конфиги из бэкапов,
-#   сбрасывает DNS (networksetup ... Empty), удаляет LaunchAgent и split-route до VPS.
+#   сбрасывает DNS (networksetup ... Empty), удаляет LaunchAgent, watchdog, ppp-hook,
+#   split-route до VPS и Claude Code/git-прокси.
 ```
 
 ## PF-изоляция доменов (опционально)
@@ -321,34 +338,48 @@ pip install -e .
 sudo srouter install --python $(which python3) -y
 #    Scenario B — osascript (GUI dialog on each privileged action; for user mac):
 srouter install
-
-# 2. Install the full stack with one command:
-srouter install
 #   • installs brew services xray/privoxy/dnsmasq and writes their configs;
-#   • sets DNS (networksetup ... 127.0.0.1) and installs the dashboard LaunchAgent;
-#   • prints a plan and asks for confirmation; on a foreign-config conflict — adopt/overwrite/skip;
-#   • under sudo privileged steps run directly, otherwise via the macOS GUI password.
+#   • sets DNS, installs the dashboard LaunchAgent and watchdog;
+#   • sets up ppp-hook for instant split-route on VPN up;
+#   • configures proxy for Claude Code and git (github.com);
+#   • prints a plan and asks for confirmation.
 srouter status         # check the daemon is up (http://127.0.0.1:8787)
+srouter doctor         # diagnostics: ports + tunnel + Claude-proxy (✅/❌)
 
 # Dashboard daemon control (the stack is untouched):
 srouter start          # start the daemon (if the LaunchAgent is already installed)
 srouter stop           # stop the daemon (the plist is kept)
 srouter restart        # restart the daemon (apply code changes)
-
-# Foreground dashboard run for debugging (without launchd, blocks the terminal):
-python3 dashboard.py
 ```
 
-`srouter install` / `uninstall` manage the **entire stack** (brew services, configs, DNS, LaunchAgent);
-`start`/`stop`/`restart` — only the running dashboard process. Configs and conflict logic live in
-`install_lib.py`; the non-interactive path for CI/scripts is `./install.sh apply` (see `install_lib.py`).
+`srouter install` / `uninstall` manage the **entire stack** (brew services, configs, DNS, LaunchAgent,
+watchdog, ppp-hook, Claude Code/git proxy). `start`/`stop`/`restart` — only the dashboard daemon.
+`doctor` — one-shot health diagnostics. Watchdog (auto-loaded) — notification on tunnel drop.
+Non-interactive path for CI/scripts — `./install.sh apply` (see `install_lib.py`).
+
+## VPN and split-route
+
+Traffic to the Reality VPS node always goes via the physical interface (en0), **not via VPN** — even
+when VPN (ppp0) captures the default route. Instantly: the `/etc/ppp/ip-up` hook fires the moment VPN
+goes up and adds the split-route (as root, no osascript). The dashboard shows the route status
+(connection-flow card, split_active). For utun-based VPNs — `srouter doctor` will guide you.
+
+## Health and protection from "stuck without AI"
+
+| Tool | What it does |
+|---|---|
+| **`srouter doctor`** | One-shot diagnostics: ports (privoxy/xray/dashboard) + real tunnel via proxy + Claude-proxy. Report ✅/❌ + hints. |
+| **`GET /health`** | Lightweight HTTP endpoint (`http://127.0.0.1:8787/health`). 200=ok, 503=degraded/down. For uptime monitoring. |
+| **watchdog** (auto) | launchd job (every 20s): pings the tunnel. On drop — **macOS notification** + sound. On recovery — quiet notice. Silent when healthy. |
+| **PF isolation** | fail-closed: proxy down → traffic to nowhere, not direct. See below. |
 
 ## Rollback
 
 ```bash
 srouter uninstall      # full rollback to defaults:
 #   stops brew services, restores foreign configs from backups, resets DNS
-#   (networksetup ... Empty), removes the LaunchAgent and the split-route to the VPS.
+#   (networksetup ... Empty), removes the LaunchAgent, watchdog, ppp-hook,
+#   split-route to the VPS, and Claude Code/git proxy.
 ```
 
 ## PF domain isolation (optional)
