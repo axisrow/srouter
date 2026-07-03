@@ -63,7 +63,9 @@ DIRECT_IFACES = ("en0", "en1", "en2", "en3", "en4", "en5", "en6", "ppp0", "ppp1"
 # Подсети Anthropic для strict-фазы (страховка при буте, до dig). Это собственные
 # подсети Anthropic, PBC (не широкие CloudFront) — узко, минимум побочных эффектов.
 # IP всех Proxy-доменов (api/console.anthropic.com, claude.ai) живут здесь.
-ANTHROPIC_SUBNETS = ("160.79.104.0/21",)
+# ОБА семейства: IPv4 (160.79.104.0/21) и IPv6 (2607:6bc0::/32) — без v6 строгая фаза
+# бесполезна (curl/программы предпочитают v6 при наличии AAAA).
+ANTHROPIC_SUBNETS = ("160.79.104.0/21", "2607:6bc0::/32")
 
 # Публичные DNS для резолва (НЕ системный dnsmasq — он может отдать кэш/подмену ISP).
 PUBLIC_DNS = ("8.8.8.8", "1.1.1.1", "223.5.5.5", "119.29.29.29")
@@ -139,7 +141,11 @@ def _ifaces_spec():
 
 # ============================ резолв доменов → IPs ============================
 def resolve_domain_ips(domains, dns_servers=PUBLIC_DNS):
-    """domains → {domain: [canonical ip,...}. fail-soft per domain (пустой список при сбое).
+    """domains → {domain: [canonical ip,...]}. fail-soft per domain (пустой список при сбое).
+
+    Резолвит ОБА семейства: A (IPv4, dig без типа) и AAAA (IPv6). Без v6 изоляция
+    бесполезна — curl/программы предпочитают IPv6 при наличии AAAA (Happy Eyeballs),
+    и трафик уходит по v6 мимо v4-таблицы. PF mixed-таблица принимает v4+v6 вместе.
 
     dig вызывается через sys_probe.run как список аргументов (НЕ shell) — домен не
     интерполируется в shell-текст. Вывод валидируется _ip_literal (отбрасываем CNAME
@@ -153,14 +159,16 @@ def resolve_domain_ips(domains, dns_servers=PUBLIC_DNS):
         ips = []
         seen = set()
         for dns in dns_servers:
-            r = sys_probe.run([DIG, f"@{dns}", domain, "+short", "+time=3", "+tries=1"], timeout=6)
-            if r.get("timeout"):
-                continue
-            for line in (r.get("out") or "").splitlines():
-                line = line.strip()
-                if _ip_literal(line) and line not in seen:
-                    seen.add(line)
-                    ips.append(line)
+            # "" = default query (A/IPv4), "AAAA" = IPv6. Оба семейства обязательны для fail-closed.
+            for qtype in ("", "AAAA"):
+                r = sys_probe.run([DIG, f"@{dns}", domain, qtype, "+short", "+time=3", "+tries=1"], timeout=6)
+                if r.get("timeout"):
+                    continue
+                for line in (r.get("out") or "").splitlines():
+                    line = line.strip()
+                    if _ip_literal(line) and line not in seen:
+                        seen.add(line)
+                        ips.append(line)
         result[domain] = ips
     return result
 
