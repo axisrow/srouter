@@ -9,6 +9,7 @@ CLI строит отдельный интерфейс поверх библио
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 from importlib.metadata import PackageNotFoundError, version
@@ -29,6 +30,10 @@ def _env_from_args(args) -> InstallEnv:
     env = InstallEnv.from_env(state_path=args.state, prefix=args.prefix)
     if getattr(args, "launchagents_dir", None):
         env.launchagent_dir = Path(args.launchagents_dir)
+    # Python, из которого запущена команда srouter — в нём гарантированно стоит flask (зависимость
+    # пакета srouter). /usr/bin/python3 (default в install_lib) — системный Python Apple, flask'а нет,
+    # демон крашнется с ModuleNotFoundError. SROUTER_PYTHON остаётся ручным override (используется тестами).
+    env.python_bin = os.environ.get("SROUTER_PYTHON") or sys.executable
     return env
 
 
@@ -63,29 +68,51 @@ def cmd_run(args) -> int:
 
 
 def cmd_status(args) -> int:
-    """Статус LaunchAgent: загружен/нет, PID если есть."""
+    """Статус LaunchAgent: работает / крашнулся / не загружен.
+
+    Формат `launchctl list`: «PID  ExitCode  Label» (3 колонки). Ищем службу по последней
+    колонке (fields[-1] == label) — она устойчива к числу предшествующих полей.
+    """
     result = run([LAUNCHCTL, "list"], 5)
     if result.get("timeout"):
         print("Не удалось получить статус: timeout launchctl list.", file=sys.stderr)
         return 2
-    found = None
+    fields = None
     for line in (result.get("out") or "").splitlines():
-        fields = line.split()
-        if fields and fields[0] == LAUNCHAGENT_LABEL:
-            found = fields
+        row = line.split()
+        if row and row[-1] == LAUNCHAGENT_LABEL:
+            fields = row
             break
+
     env = InstallEnv.from_env()
     plist_path = env.launchagent_path()
     on_disk = plist_path.exists()
     marker_ok = on_disk and _has_launchagent_marker(plist_path)
-    if found:
-        pid = found[1] if len(found) > 1 else "-"
-        marker = "ok" if marker_ok else "MISSING"
-        print(f"LaunchAgent {LAUNCHAGENT_LABEL}: загружен (PID={pid}). plist={plist_path} (marker={marker})")
+    marker = "ok" if marker_ok else ("MISSING" if on_disk else "absent/foreign")
+
+    if not fields:
+        state = "plist на диске" if on_disk else "plist отсутствует"
+        print(f"LaunchAgent {LAUNCHAGENT_LABEL}: НЕ загружен. ({state}; marker={marker})")
+        return 1
+
+    # launchctl list: fields[0]=PID ('-' если не запущен), fields[1]=ExitCode последнего запуска.
+    pid = fields[0] if len(fields) > 0 else "-"
+    exit_code = fields[1] if len(fields) > 1 else "-"
+    if pid != "-":
+        print(f"LaunchAgent {LAUNCHAGENT_LABEL}: загружен и работает (PID={pid}). "
+              f"plist={plist_path} (marker={marker})")
         return 0
-    state = "plist на диске" if on_disk else "plist отсутствует"
-    marker = "ok" if marker_ok else "absent/foreign"
-    print(f"LaunchAgent {LAUNCHAGENT_LABEL}: НЕ загружен. ({state}; marker={marker})")
+    if exit_code not in ("-", "0"):
+        log_err = getattr(env, "log_err", None)
+        log_hint = f"\n  лог ошибки: {log_err}" if log_err else ""
+        print(f"LaunchAgent {LAUNCHAGENT_LABEL}: загружен, но процесс крашнулся "
+              f"(exit code={exit_code}); launchd попытается перезапустить (KeepAlive). "
+              f"plist={plist_path} (marker={marker}){log_hint}\n"
+              f"  проверь ProgramArguments (Python с flask) и попробуй: srouter stop && srouter apply",
+              file=sys.stderr)
+        return 1
+    print(f"LaunchAgent {LAUNCHAGENT_LABEL}: загружен, но не запущен (exit code=0). "
+          f"plist={plist_path} (marker={marker})")
     return 1
 
 

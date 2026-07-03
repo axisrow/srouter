@@ -169,7 +169,9 @@ brew services start privoxy
 sudo brew services start dnsmasq            # порт 53 → root
 sudo networksetup -setdnsservers "Wi-Fi" 127.0.0.1
 
-# Консольная точка входа srouter (установка в системный Python):
+# Консольная точка входа srouter (ставится в активный python3 — тот, откуда pip;
+# демон использует этот же интерпретатор, в нём же лежит flask как зависимость):
+python3 -m pip install --upgrade pip          # нужен pip ≥ 21.3 для PEP 660 editable-install
 pip install -e .
 
 srouter apply          # загрузить LaunchAgent дашборда (демон, loopback 127.0.0.1:8787)
@@ -259,7 +261,9 @@ brew services start privoxy
 sudo brew services start dnsmasq            # port 53 → root
 sudo networksetup -setdnsservers "Wi-Fi" 127.0.0.1
 
-# Console entry point srouter (installed into system Python):
+# Console entry point srouter (installed into the active python3 — the one pip runs from;
+# the daemon uses this same interpreter, which holds flask as a dependency):
+python3 -m pip install --upgrade pip          # needs pip >= 21.3 for PEP 660 editable install
 pip install -e .
 
 srouter apply          # load the dashboard LaunchAgent (daemon, loopback 127.0.0.1:8787)
