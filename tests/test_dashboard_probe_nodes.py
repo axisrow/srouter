@@ -189,6 +189,7 @@ def test_gather_status_returns_node_snapshot_without_running_heavy_probe(monkeyp
         "probe_ping",
         "probe_dns",
         "probe_ifaces",
+        "probe_exit_ips_per_iface",
         "probe_geo_distance",
     ):
         monkeypatch.setattr(dashboard, name, lambda *args, name=name, **kwargs: {"status": "ok", "probe": name})
@@ -247,6 +248,7 @@ def test_gather_status_timeout_does_not_wait_for_executor_shutdown(monkeypatch):
         "probe_ping",
         "probe_dns",
         "probe_ifaces",
+        "probe_exit_ips_per_iface",
         "probe_geo_distance",
     ):
         monkeypatch.setattr(

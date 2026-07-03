@@ -22,6 +22,7 @@ PROBE_NAMES = (
     "probe_ping",
     "probe_dns",
     "probe_ifaces",
+    "probe_exit_ips_per_iface",
     "probe_geo_distance",
 )
 

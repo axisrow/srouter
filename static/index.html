@@ -198,6 +198,8 @@
         card_ip_vps: "VPS endpoint", card_ping: "Ping → VPS", ping_sub: "loss {0}% · VPN {1}",
         card_distance: "Distance to VPS", km: "km", card_dns: "DNS resolvers", resolvers: "resolvers",
         card_dns_public: "Public DNS", card_ifaces: "Interfaces", active: "active",
+        card_exit_ips: "Exit IP per interface", exit_ips_active: "active now",
+        exit_ips_bypass: "bypass default route", exit_ip_unknown: "no exit",
         no_geo: "no geo data", mode_simple: "Simple mode", mode_cinematic: "Cinematic mode",
         node_selector_title: "Node selection", node_selector_empty: "no enabled nodes",
         node_selector_badge: "{0} nodes", node_recommend_label: "recommendation",
@@ -275,6 +277,8 @@
         card_ip_vps: "Точка VPS", card_ping: "Пинг → VPS", ping_sub: "потери {0}% · VPN {1}",
         card_distance: "Расстояние до VPS", km: "км", card_dns: "DNS-серверы", resolvers: "серверов",
         card_dns_public: "Публичные DNS", card_ifaces: "Интерфейсы", active: "активно",
+        card_exit_ips: "Выходной IP по интерфейсам", exit_ips_active: "активен сейчас",
+        exit_ips_bypass: "в обход маршрута", exit_ip_unknown: "нет выхода",
         no_geo: "нет гео-данных", mode_simple: "Простой режим", mode_cinematic: "Кинорежим",
         node_selector_title: "Выбор узла", node_selector_empty: "нет включённых узлов",
         node_selector_badge: "узлов: {0}", node_recommend_label: "рекомендация",
@@ -352,6 +356,8 @@
         card_ip_vps: "VPS 节点", card_ping: "延迟 → VPS", ping_sub: "丢包 {0}% · VPN {1}",
         card_distance: "到 VPS 距离", km: "公里", card_dns: "DNS 解析器", resolvers: "个解析器",
         card_dns_public: "公共 DNS", card_ifaces: "网络接口", active: "活动",
+        card_exit_ips: "各接口出口 IP", exit_ips_active: "当前活动",
+        exit_ips_bypass: "绕过默认路由", exit_ip_unknown: "无出口",
         no_geo: "无地理数据", mode_simple: "简洁模式", mode_cinematic: "影院模式",
         node_selector_title: "节点选择", node_selector_empty: "没有启用节点",
         node_selector_badge: "{0} 个节点", node_recommend_label: "建议",
@@ -1294,6 +1300,20 @@
       html += cineCard({ icon: 'bi-ethernet', title: t('card_ifaces'),
         value: (ifd.ifaces || []).length + ' ' + t('active'),
         sub: ifList || t('no_data'), status: ifd.status, col: 'col-12 col-md-6 col-xl-8' });
+
+      var eid = d.exit_ips || {};
+      var eiList = (eid.exits || []).map(function (e) {
+        var mark = e.is_default
+          ? '<i class="bi bi-star-fill text-warning"></i> <span class="badge bg-success k">' + esc(t('exit_ips_active')) + '</span> '
+          : '<span class="opacity-0">★</span> <span class="badge bg-secondary k">' + esc(t('exit_ips_bypass')) + '</span> ';
+        var ip = e.exit_ip ? esc(e.exit_ip) : '<span class="text-danger">' + esc(t('exit_ip_unknown')) + '</span>';
+        return '<div class="ops">' + mark +
+          '<span class="fw-semibold">' + esc(e.iface) + '</span> ' +
+          '<span class="k">' + esc(e.local_ip || '—') + '</span> → ' + ip + '</div>';
+      }).join('');
+      html += cineCard({ icon: 'bi-globe', title: t('card_exit_ips'),
+        value: (eid.exits || []).length + ' ' + t('active'),
+        sub: eiList || t('no_data'), status: eid.status, col: 'col-12 col-md-6 col-xl-8' });
 
       document.getElementById('cards').innerHTML = html;
       renderFlow(d);
