@@ -41,6 +41,7 @@ from install_lib import (
     build_uninstall_plan,
     format_plan,
     format_uninstall_plan,
+    _install_generic_launchagent,
 )
 from sys_probe import run
 
@@ -230,8 +231,21 @@ def cmd_install(args) -> int:
         cp_note = ("Claude Code: HTTPS_PROXY прописан в ~/.claude/settings.json."
                    if cp.get("ok") else
                    f"Claude Code: не удалось прописать HTTPS_PROXY ({cp.get('err', 'unknown')}).")
+        # Watchdog-plist: фоновый пинг туннеля раз в 90с + macOS-нотификация при падении.
+        # Best-effort (не критично для install), но удобно «из коробки» — защищает от «остался без ИИ».
+        wd_ok, wd_err = _install_generic_launchagent(
+            env, runner,
+            template_name="com.srouter.watchdog.plist",
+            label="com.srouter.watchdog",
+            marker="srouter-managed-watchdog-v1",
+            script_path=env.root / "health.py",
+        )
+        wd_note = ("Watchdog: установлен (нотификация при падении туннеля)."
+                   if wd_ok else
+                   f"Watchdog: не установлен ({wd_err}).")
         print("Установка стека завершена: brew-сервисы, конфиги, DNS, LaunchAgent применены.\n"
               f"{cp_note}\n"
+              f"{wd_note}\n"
               f"Дашборд: http://127.0.0.1:8787  (srouter status — проверить)")
         return 0
     blocked = ", ".join(result.get("blocked") or ["unknown"])
