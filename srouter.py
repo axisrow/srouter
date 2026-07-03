@@ -173,6 +173,62 @@ def _remove_active_split_route(state_path, runner) -> int:
     return 2
 
 
+PPP_HOOK_PATH = "/etc/ppp/ip-up"
+PPP_HOOK_MARKER = "# srouter: мгновенная реакция"
+
+
+def _install_ppp_hook(env, runner) -> str:
+    """Установить /etc/ppp/ip-up — мгновенный split-route при VPN up (от root, без osascript).
+
+    Шаблон launchagents/srouter-ppp-ip-up.sh рендерится (плейсхолдеры) и копируется в /etc/ppp/ip-up.
+    Требует root (osascript admin-мост, как _sudo_route_ip). Возвращает строку-статус для вывода.
+    """
+    try:
+        template = (env.root / "launchagents" / "srouter-ppp-ip-up.sh").read_text(encoding="utf-8")
+        rendered = (template
+                    .replace("__SROUTER_PYTHON_BIN__", env.python_bin)
+                    .replace("__SROUTER_ROOT_DIR__", str(env.root))
+                    .replace("__SROUTER_LOG_ERR__", str(env.log_err)))
+        # Копирование в /etc/ppp/ip-up через osascript (требует admin, /etc/ = root).
+        from traffic_shape import _applescript_text
+        # Записать во временный файл, потом cp + chmod + chown (всё под osascript admin).
+        tmp = f"/tmp/srouter-ppp-ip-up.{os.getpid()}"
+        # Defence: rendered идёт в файл через printf %s (не shell-интерполяция).
+        safe = rendered.replace("\\", "\\\\").replace("'", "'\\''")
+        full_cmd = (f"printf '%s' '{safe}' > {tmp} && /bin/cp {tmp} {PPP_HOOK_PATH} && "
+                    f"/bin/chmod 755 {PPP_HOOK_PATH} && /usr/sbin/chown root:wheel {PPP_HOOK_PATH} && "
+                    f"/bin/rm -f {tmp}")
+        applescript = f'do shell script "{_applescript_text(full_cmd)}" with administrator privileges'
+        r = runner([OSASCRIPT, "-e", applescript], 30)
+        if r.get("timeout") or (r.get("rc") not in (0, None) and r.get("rc") != 0 and "-128" not in (r.get("err") or "")):
+            return f"PPP-hook: не установлен ({(r.get('err') or 'ошибка')[:80]})."
+        if r.get("rc") == -128 or "-128" in (r.get("err") or ""):
+            return "PPP-hook: отменено (диалог пароля)."
+        return "PPP-hook: установлен (/etc/ppp/ip-up — мгновенный split-route при VPN up)."
+    except Exception as exc:
+        return f"PPP-hook: не установлен ({str(exc)[:80]})."
+
+
+def _remove_ppp_hook(runner) -> str:
+    """Удалить /etc/ppp/ip-up (если srouter-managed). Возвращает строку-статус."""
+    try:
+        from traffic_shape import _applescript_text
+        # Проверить маркер перед удалением (не трогать чужой скрипт).
+        check = runner(["/bin/cat", PPP_HOOK_PATH], 5)
+        if check.get("timeout") or check.get("rc") != 0:
+            return "PPP-hook: не был установлен (файла нет)."
+        if PPP_HOOK_MARKER not in (check.get("out") or ""):
+            return "PPP-hook: чужой скрипт в /etc/ppp/ip-up — не трогаем."
+        rm_cmd = f"/bin/rm -f {PPP_HOOK_PATH}"
+        applescript = f'do shell script "{_applescript_text(rm_cmd)}" with administrator privileges'
+        r = runner([OSASCRIPT, "-e", applescript], 15)
+        if r.get("rc") == -128 or "-128" in (r.get("err") or ""):
+            return "PPP-hook: удаление отменено (диалог пароля)."
+        return "PPP-hook: удалён." if r.get("rc") in (0, None) else f"PPP-hook: не удалён ({(r.get('err') or '')[:60]})."
+    except Exception as exc:
+        return f"PPP-hook: не удалён ({str(exc)[:60]})."
+
+
 def cmd_install(args) -> int:
     """Полная установка стека: brew-сервисы + конфиги + DNS + LaunchAgent.
 
@@ -240,12 +296,15 @@ def cmd_install(args) -> int:
             marker="srouter-managed-watchdog-v1",
             script_path=env.root / "health.py",
         )
-        wd_note = ("Watchdog: установлен (нотификация при падении туннеля)."
+        wd_note = ("Watchdog: установлен (нотификация при падении туннеля, poll 20с)."
                    if wd_ok else
                    f"Watchdog: не установлен ({wd_err}).")
+        # ppp-hook: мгновенный split-route при VPN up (/etc/ppp/ip-up, от root, без osascript).
+        ppp_note = _install_ppp_hook(env, runner)
         print("Установка стека завершена: brew-сервисы, конфиги, DNS, LaunchAgent применены.\n"
               f"{cp_note}\n"
               f"{wd_note}\n"
+              f"{ppp_note}\n"
               f"Дашборд: http://127.0.0.1:8787  (srouter status — проверить)")
         return 0
     blocked = ", ".join(result.get("blocked") or ["unknown"])
@@ -300,10 +359,14 @@ def cmd_uninstall(args) -> int:
     cp = claude_proxy.disable()
     cp_note = ". Claude Code HTTPS_PROXY снят." if cp.get("ok") else ""
 
+    # 6) Удалить ppp-hook (/etc/ppp/ip-up) — мгновенный split-route больше не нужен.
+    ppp_note = ". " + _remove_ppp_hook(runner)
+
     print("Откат завершён: brew-сервисы остановлены, конфиги восстановлены/оставлены, "
           "DNS сброшен, LaunchAgent удалён"
           + (". split-route удалён." if route_rc == 0 else ", split-route не удалён — см. выше.")
-          + cp_note)
+          + cp_note
+          + ppp_note)
     return 0
 
 

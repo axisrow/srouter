@@ -21,7 +21,7 @@
   <key>RunAtLoad</key>
   <true/>
   <key>StartInterval</key>
-  <integer>90</integer>
+  <integer>20</integer>
   <key>EnvironmentVariables</key>
   <dict>
     <key>PYTHONUNBUFFERED</key>

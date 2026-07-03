@@ -13,6 +13,7 @@ import threading
 
 import gen_xray_config
 import local_state
+import os
 import sys_probe
 
 
@@ -565,6 +566,17 @@ def _route_goes_via_gateway(route_ip, gateway):
     return iface.startswith("en") or gw == gateway
 
 
+def _route_add_direct(route_ip, gateway):
+    """route add напрямую через sys_probe.run (без osascript) — для root (ppp-hook).
+
+    ppp-hook (/etc/ppp/ip-up) запускается от root → route add не требует osascript-моста.
+    Валидация IP внутри (как в _sudo_route_ip). Не бросает.
+    """
+    if not _ip_literal(route_ip) or not _ip_literal(gateway):
+        return {"rc": None, "out": "", "err": "Нет валидного route_ip/gateway", "timeout": False}
+    return sys_probe.run([ROUTE, "-n", "add", "-host", route_ip, gateway], timeout=_ROUTE_SYNC_TIMEOUT_SEC)
+
+
 def ensure_split_route(state_path=None):
     """Гарантировать split-route до VPS через физический шлюз (en0), если VPN перехватил default.
 
@@ -591,7 +603,11 @@ def ensure_split_route(state_path=None):
         if _route_goes_via_gateway(route_ip, gateway):
             return {"enabled": True, "added": False, "reason": "already split"}
         # route через ppp0/иной → добавить split через физический шлюз.
-        added = _sudo_route_ip("add", route_ip, gateway)
+        # root (ppp-hook) → route add напрямую (без osascript); user → osascript-мост.
+        if os.geteuid() == 0:
+            added = _route_add_direct(route_ip, gateway)
+        else:
+            added = _sudo_route_ip("add", route_ip, gateway)
         return {"enabled": True, "added": added}
     except Exception as exc:
         return {"enabled": True, "error": f"ensure_split_route failed: {exc}"}

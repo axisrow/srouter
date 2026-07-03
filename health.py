@@ -171,10 +171,16 @@ def main(argv=None):
     sub = p.add_subparsers(dest="cmd")
     sub.add_parser("check", help="Разовый прогон проверок, отчёт ✅/❌.")
     sub.add_parser("watchdog", help="Один прогон watchdog'а (для launchd): нотификация при переходе.")
+    sub.add_parser("ensure-split-route-root", help="Split-route при VPN up (ppp-hook, от root).")
     args = p.parse_args(argv)
 
     if args.cmd == "watchdog":
         return cmd_watchdog()
+    if args.cmd == "ensure-split-route-root":
+        # ppp-hook (/etc/ppp/ip-up) — от root, route add напрямую (без osascript).
+        import node_selector
+        r = node_selector.ensure_split_route()
+        return 0 if r.get("enabled") else 1
     # default / "check"
     result = check_all()
     _print_report(result)
