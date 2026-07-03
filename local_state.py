@@ -544,6 +544,10 @@ _DEFAULT_STATE = {
     # один активный throttle за раз). Секретов нет; Reality-ключи/конфиги не трогаем.
     "runtime": {"last_apply": None, "last_error": None, "active_throttle": None,
                  "active_isolate": None},
+    # auto_route_sync — opt-in split-route до VPS через en0 (мимо VPN). Top-level ключ (читается
+    # node_selector._auto_route_sync_enabled строго is True). По умолчанию ON — «пофигу VPN»:
+    # watchdog (ensure_split_route) держит route через физический шлюз при любом состоянии VPN.
+    "auto_route_sync": True,
 }
 
 
@@ -779,3 +783,67 @@ def resolve_route_ip(node, path=None):
     except Exception:
         pass
     return host  # fallback на endpoint_host
+
+
+# Куда gen_xray_config пишет рабочий конфиг (источник истины address узла).
+XRAY_CONFIG_PATH = "/opt/homebrew/etc/xray/config.json"
+
+
+def _read_xray_vless_address(config_path=XRAY_CONFIG_PATH):
+    """Прочитать address Reality-узла из РЕАБОЧЕГО xray-конфига (outbounds → vless → vnext[0].address).
+
+    xray-конфиг = источник истины: gen_xray_config._vless_outbound пишет туда resolve_route_ip(node).
+    Если state рассинхронизирован (placeholder), xray держит реальный рабочий IP. Не бросает.
+    Возвращает address (строка) или '' при отсутствии/сбое/битом JSON.
+    """
+    try:
+        data = json.loads(Path(config_path).read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    for ob in data.get("outbounds") or []:
+        if not isinstance(ob, dict) or ob.get("protocol") != "vless":
+            continue
+        vnext = (ob.get("settings") or {}).get("vnext") or []
+        if vnext and isinstance(vnext[0], dict):
+            addr = vnext[0].get("address")
+            if isinstance(addr, str) and _is_valid_host(addr):
+                return addr
+    return ""
+
+
+def sync_route_ip_from_xray(name, xray_config_path=XRAY_CONFIG_PATH, path=None):
+    """Синхронизировать route_ip узла <name> из рабочего xray-конфига.
+
+    xray-конфиг — источник истины (туда gen_xray_config пишет resolve_route_ip). Если state держит
+    placeholder/rассинхрон — берём реальный address из xray и пишем в node.route_ip. После этого и
+    gen_xray, и node_selector._route_node_ip читают консистентный IP. Не бросает.
+
+    Возвращает {ok: bool, route_ip: str}. ok=False если xray-конфига нет / узел не найден / битый.
+    """
+    address = _read_xray_vless_address(xray_config_path)
+    if not address:
+        return {"ok": False, "route_ip": ""}
+    try:
+        state, readable = _load_state_checked(path)
+        if not readable:
+            return {"ok": False, "route_ip": ""}
+    except Exception:
+        return {"ok": False, "route_ip": ""}
+    nodes = _nodes_from_state(state)
+    updated = False
+    for n in nodes:
+        if isinstance(n, dict) and n.get("name") == name:
+            if n.get("route_ip") != address:
+                n["route_ip"] = address
+                updated = True
+            break
+    else:
+        return {"ok": False, "route_ip": ""}  # узел не найден
+    if updated:
+        try:
+            save_state(state, path)
+        except Exception:
+            return {"ok": False, "route_ip": ""}
+    return {"ok": True, "route_ip": address}
