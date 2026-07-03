@@ -15,6 +15,8 @@ from pathlib import Path
 
 import sys_probe
 
+import claude_proxy  # Claude Code HTTPS_PROXY в ~/.claude/settings.json — без него CLI «без ИИ»
+
 # Абсолютные пути: launchd/GUI PATH их не содержит (канон проекта).
 CURL = "/usr/bin/curl"
 LSOF = "/usr/sbin/lsof"
@@ -67,6 +69,15 @@ def _tunnel_up():
     return True, f"HTTP {code}"
 
 
+def _claude_proxy_on():
+    """Claude Code настроен ходить через прокси? (env.HTTPS_PROXY в ~/.claude/settings.json).
+
+    Без этого CLI идёт напрямую → при включённой PF-изоляции режется → «без ИИ». Это проверялось
+    в инциденте: туннель жив, но proxy слетел → doctor врал OK. Теперь doctor это видит.
+    """
+    return bool(claude_proxy.status().get("enabled", False))
+
+
 def check_all():
     """Все проверки стека. {status: ok|degraded|down, checks: [{name, ok, detail?}]}.
 
@@ -78,6 +89,8 @@ def check_all():
     checks.append({"name": f"dashboard ({DASHBOARD_PORT})", "ok": _port_up(DASHBOARD_PORT)})
     tun_ok, tun_detail = _tunnel_up()
     checks.append({"name": "туннель (api.anthropic.com через прокси)", "ok": tun_ok, "detail": tun_detail})
+    # Claude Code настроен использовать туннель? Без proxy CLI идёт напрямую → PF режёт → «без ИИ».
+    checks.append({"name": "claude-proxy (HTTPS_PROXY для CLI)", "ok": _claude_proxy_on()})
     all_ok = all(c["ok"] for c in checks)
     any_ok = any(c["ok"] for c in checks)
     status = "ok" if all_ok else ("degraded" if any_ok else "down")
@@ -110,6 +123,8 @@ def _print_report(result):
             print("  • туннель: проверь узел (srouter status / дашборд nodes), возможно узел недоступен")
         if "dashboard" in failed_names:
             print("  • дашборд: srouter restart")
+        if "claude-proxy" in failed_names:
+            print("  • Claude Code proxy: включи в дашборде (карточка Claude Code proxy) или srouter install")
 
 
 def cmd_watchdog():
@@ -118,6 +133,14 @@ def cmd_watchdog():
     Нотификация только при ПЕРЕХОДЕ состояния (ok→down — громко, down→ok — тихо), не при каждом
     прогоне — чтобы не спамить. State в WATCHDOG_STATE (/tmp).
     """
+    # Сначала гарантировать split-route (если VPN перехватил default) — «пофигу VPN».
+    # ensure_split_route добавит route до VPS через en0, и тогда check_all увидит живой туннель.
+    try:
+        import node_selector
+        node_selector.ensure_split_route()
+    except Exception:
+        pass  # split-route — best-effort, не роняет watchdog
+
     result = check_all()
     is_ok = result["status"] == "ok"
     try:
