@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- __SROUTER_ISOLATE_ESCAPE_MARKER__ -->
+<!-- Escape-hatch: если srouter сломался и не снял strict-ruleset за N секунд после бута
+     (StartInterval=120) — выгрузить strict, чтобы не остаться без сети. Срабатывает каждые
+     120 сек; isolate_firewall disable-strict идемпотентен (no-op если уже снят).
+     Аварийный ручной путь описан в README (sudo pfctl -a ... -F all). -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>__SROUTER_ISOLATE_ESCAPE_LABEL__</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__SROUTER_PYTHON_BIN__</string>
+    <string>__SROUTER_ISOLATE_PATH__</string>
+    <string>disable-strict</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__SROUTER_ROOT_DIR__</string>
+  <key>StartInterval</key>
+  <integer>120</integer>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>__SROUTER_LOG_OUT__</string>
+  <key>StandardErrorPath</key>
+  <string>__SROUTER_LOG_ERR__</string>
+</dict>
+</plist>

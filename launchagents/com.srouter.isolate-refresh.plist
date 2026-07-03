@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- __SROUTER_ISOLATE_REFRESH_MARKER__ -->
+<!-- Periodic refresh: re-dig Proxy-домены + pfctl -T replace (IP меняются у CloudFront/Anthropic).
+     Каждые 6 часов (StartInterval=21600). Требует, что изоляция уже включена (читает lease из state). -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>__SROUTER_ISOLATE_REFRESH_LABEL__</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__SROUTER_PYTHON_BIN__</string>
+    <string>__SROUTER_ISOLATE_PATH__</string>
+    <string>refresh</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__SROUTER_ROOT_DIR__</string>
+  <key>StartInterval</key>
+  <integer>21600</integer>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>__SROUTER_LOG_OUT__</string>
+  <key>StandardErrorPath</key>
+  <string>__SROUTER_LOG_ERR__</string>
+</dict>
+</plist>

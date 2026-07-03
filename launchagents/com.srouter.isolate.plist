@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- __SROUTER_ISOLATE_STRICT_MARKER__ -->
+<!-- ФАЗА 1 (strict): при загрузке macOS блокирует подсети Anthropic (claude.ai отрезан с первой
+     секунды, интернет жив). НЕ требует dig — подсети зашиты в isolate_firewall.ANTHROPIC_SUBNETS.
+     srouter переключает на working-фазу (конкретные IP), как только dig+pfctl готовы.
+     Escape-hatch (com.srouter.isolate-escape.plist) снимает этот ruleset, если srouter
+     не переключил за N секунд — чтобы не остаться без сети при падении srouter. -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>__SROUTER_ISOLATE_LABEL__</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__SROUTER_PYTHON_BIN__</string>
+    <string>__SROUTER_ISOLATE_PATH__</string>
+    <string>enable-strict</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__SROUTER_ROOT_DIR__</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>__SROUTER_LOG_OUT__</string>
+  <key>StandardErrorPath</key>
+  <string>__SROUTER_LOG_ERR__</string>
+</dict>
+</plist>
