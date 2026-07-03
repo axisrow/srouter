@@ -19,9 +19,11 @@ from dashboard_network import *
 from dashboard_nodes import *
 from dashboard_traffic import *
 from dashboard_hotroutes import *
+from dashboard_isolate import *
 import node_selector
 import sys_probe
 import traffic_shape  # throttle-движок (#13): зовём через атрибут (traffic_shape.apply_throttle)
+import isolate_firewall  # PF-изоляция доменов: зовём через атрибут
 
 # Активный узел нельзя замораживать на import: #8 меняет srouter.local.json в рантайме.
 # Эти имена оставлены только для совместимости старых импорт-тестов; рабочий код ниже
@@ -85,6 +87,7 @@ def gather_status():
         "direct": probe_direct,
         "traffic_guard": probe_traffic_guard,
         "hot_routes": probe_hot_routes,
+        "isolate": probe_isolate,
         "connectivity": probe_connectivity,
         # --- киношная телеметрия ---
         "ips": lambda: probe_ips(route_ip=active_route_ip),
@@ -718,6 +721,154 @@ def _throttle_clear():
     # чтобы пользователь понял, что нужно повторить. ok:false, status 500 (серверная ошибка).
     body["still_active"] = True
     body["throttle"] = _public_throttle(active)
+    return jsonify(body), 500
+
+
+# ============================ PF-изоляция доменов (/api/isolate/*) ============================
+def _isolate_result(r):
+    """Свести dict от isolate_firewall к публичной форме для UI (как _throttle_result)."""
+    r = r or {}
+    return {
+        "ok": bool(r.get("ok")),
+        "cancelled": bool(r.get("cancelled")),
+        "rc": r.get("rc"),
+        "err": r.get("err") or "",
+        "out": r.get("out") or "",
+        "timeout": bool(r.get("timeout")),
+    }
+
+
+def _public_isolate(lease):
+    """Публичный вид isolate-lease (БЕЗ token наружу — он идёт в pfctl -X)."""
+    if not isinstance(lease, dict):
+        return None
+    return {
+        "domains": lease.get("domains", []),
+        "ips": lease.get("ips", {}),
+        "unresolved": lease.get("unresolved", []),
+        "ports": lease.get("ports", [80, 443]),
+        "phase": lease.get("phase", "working"),
+        "applied_at": lease.get("applied_at"),
+    }
+
+
+@app.get("/api/isolate")
+def api_isolate_get():
+    """Текущий isolate-lease (публичный, без token) + config."""
+    active = local_state.load_active_isolate()
+    cfg = (local_state.load_state() or {}).get("isolate") or {}
+    return jsonify({"active": _public_isolate(active), "config": cfg})
+
+
+@app.post("/api/isolate/enable")
+def api_isolate_enable():
+    """Включить PF-изоляцию: dig домены → pfctl -T replace. Валидация → preflight → lease-guard → движок → персист.
+
+    Симметрично _throttle_apply, но проще: isolate_firewall.enable_isolation не делает внутренний
+    rollback (упрощён vs throttle), поэтому cleanup-lease только при ok:False С token. fail-closed:
+    ok без token = 500 (enable-ref бы тёк). cancelled = 200 (не ошибка сервера).
+    """
+    payload = request.get_json(silent=True) or {}
+    cfg = (local_state.load_state() or {}).get("isolate") or {}
+    domains = payload.get("domains") or cfg.get("domains") or isolate_firewall.DEFAULT_DOMAINS
+    ports = payload.get("ports") or cfg.get("ports") or list(isolate_firewall.DEFAULT_PORTS)
+
+    # Валидация В РОУТЕ: невалидные домены/порты → 400, движок не зовём.
+    norm, errs = local_state.validate_isolate({"enabled": True, "domains": list(domains), "ports": list(ports)})
+    if norm is None:
+        return jsonify({"ok": False, "err": "; ".join(errs)}), 400
+    domains, ports = norm["domains"], norm["ports"]
+
+    # Один активный isolate за раз. Активный lease → 409 без скрытого авто-disable.
+    active = local_state.load_active_isolate()
+    if active is not None:
+        return jsonify({"ok": False, "err": "isolate already active; disable it first",
+                        "active": _public_isolate(active)}), 409
+
+    # Preflight writability: state неперезаписываем → отказ ДО pf enable-ref.
+    if not local_state.preflight_state_write():
+        return jsonify({"ok": False, "err": "local state is not safely writable; cannot manage isolate lease"}), 409
+
+    result = isolate_firewall.enable_isolation(domains, ports=ports)
+    body = {"action": "enable", **_isolate_result(result),
+            "domains": result.get("domains", {}), "unresolved": result.get("unresolved", []),
+            "ports": result.get("ports", ports)}
+    token = (result or {}).get("token")
+
+    if body.get("cancelled"):
+        return jsonify(body), 200  # отмена пароля osascript — не ошибка сервера
+
+    if body.get("ok"):
+        if not token:
+            body["ok"] = False
+            body["err"] = "isolate enabled but pf release-token missing — cannot persist lease"
+            return jsonify(body), 500
+        saved = local_state.save_active_isolate(
+            {"domains": domains, "ips": result.get("domains", {}), "unresolved": result.get("unresolved", []),
+             "ports": ports, "token": token, "applied_at": int(time.time()), "phase": "working"}
+        )
+        if saved is None:
+            # token не персистился — критично. Cleanup валидным token, рапортуем partial.
+            isolate_firewall.disable_isolation(token=token)
+            body["ok"] = False
+            body["err"] = "isolate enabled on pf but lease could not be persisted; rolled back"
+            return jsonify(body), 500
+        body["isolate"] = _public_isolate(saved)
+        return jsonify(body), 200
+
+    # ok:False С token (post--E failure): enable-ref жив. Persist cleanup-lease (token recoverable).
+    if token:
+        local_state.save_active_isolate(
+            {"domains": domains, "ips": {}, "unresolved": result.get("unresolved", []),
+             "ports": ports, "token": token, "applied_at": int(time.time()), "phase": "working"}
+        )
+        body["err"] = (body.get("err") + "; " if body.get("err") else "") + "pf enable-ref live — cleanup-lease persisted"
+    return jsonify(body), 500
+
+
+@app.post("/api/isolate/disable")
+def api_isolate_disable():
+    """Снять PF-изоляцию. Нет активного lease → no-op 409 (движок не зовём — fail-closed)."""
+    active = local_state.load_active_isolate()
+    if active is None:
+        return jsonify({"ok": False, "err": "no active isolate to disable", "action": "disable"}), 409
+    token = active.get("token")
+    result = isolate_firewall.disable_isolation(token=token)
+    body = {"action": "disable", **_isolate_result(result)}
+    if body.get("cancelled"):
+        return jsonify(body), 200  # отмена пароля — lease НЕ трогаем (изоляция ещё активна)
+    if body.get("ok"):
+        cleared = local_state.clear_active_isolate()
+        body["isolate"] = None if cleared else _public_isolate(active)
+        if not cleared:
+            body["err"] = (body.get("err") + "; " if body.get("err") else "") + (
+                "isolate disabled on pf, but lease state could not be persisted — may reappear after restart")
+        return jsonify(body), 200
+    body["still_active"] = True
+    body["isolate"] = _public_isolate(active)
+    return jsonify(body), 500
+
+
+@app.post("/api/isolate/refresh")
+def api_isolate_refresh():
+    """Re-dig домены → pfctl -T replace (token из lease). IP меняются → обновление таблицы."""
+    active = local_state.load_active_isolate()
+    if active is None:
+        return jsonify({"ok": False, "err": "no active isolate to refresh", "action": "refresh"}), 409
+    domains = active.get("domains", [])
+    ports = active.get("ports", [80, 443])
+    token = active.get("token")
+    result = isolate_firewall.refresh_isolation_ips(domains, ports=ports, token=token)
+    body = {"action": "refresh", **_isolate_result(result),
+            "domains": result.get("domains", {}), "unresolved": result.get("unresolved", [])}
+    if body.get("ok"):
+        # Обновим IP-снимок в lease (token/phase сохраняются).
+        saved = local_state.save_active_isolate(
+            {"domains": domains, "ips": result.get("domains", {}), "unresolved": result.get("unresolved", []),
+             "ports": ports, "token": token, "applied_at": active.get("applied_at"), "phase": "working"}
+        )
+        body["isolate"] = _public_isolate(saved)
+        return jsonify(body), 200
     return jsonify(body), 500
 
 
