@@ -137,6 +137,17 @@
 
     <div class="card mt-3">
       <div class="card-header d-flex align-items-center">
+        <i class="bi bi-shield-lock me-2"></i>
+        <span data-i18n="isolate_title">Domain isolation (PF)</span>
+        <span class="ms-auto badge bg-secondary ops" id="isolate-badge">—</span>
+      </div>
+      <div class="card-body">
+        <div id="isolate-editor"></div>
+      </div>
+    </div>
+
+    <div class="card mt-3">
+      <div class="card-header d-flex align-items-center">
         <i class="bi bi-sliders me-2"></i> <span data-i18n="ctrl_title">Control</span>
       </div>
       <div class="card-body">
@@ -238,6 +249,13 @@
         throttle_clear_failed_active: "Clear failed — throttle is still active on pf. Retry.",
         throttle_cleanup_unrecoverable: "Cleanup token could not be persisted. Restart cannot recover this pf enable-ref.",
         throttle_failed: "Throttle failed: {0}",
+        isolate_title: "Domain isolation (PF)", isolate_experimental: "kernel-level PF block of direct path to Proxy domains",
+        isolate_help: "Cuts the direct path (en0/ppp0) to these domains at the kernel level — packets die, never leak. If the proxy is down — traffic goes nowhere (fail-closed), not direct.",
+        isolate_apply: "Enable", isolate_clear: "Disable", isolate_refresh: "Refresh IPs",
+        isolate_active: "Isolation active: {0} domains, {1} IPs ({2} unresolved)", isolate_phase_strict: "strict (Anthropic subnets)",
+        isolate_inactive: "Isolation inactive", isolate_cleanup_unrecoverable: "Cleanup token could not be persisted.",
+        isolate_unresolved: "Unresolved", isolate_applied: "Isolation enabled", isolate_cleared: "Isolation disabled",
+        isolate_refreshed: "IPs refreshed", isolate_cancelled: "Cancelled (password dialog)", isolate_failed: "Isolation failed: {0}",
         channel_title: "Network channel", channel_active: "Active channel",
         channel_wifi: "Wi-Fi", channel_usb: "USB tether",
         channel_other: "Other", channel_unknown: "Unknown",
@@ -317,6 +335,13 @@
         throttle_clear_failed_active: "Снять не удалось — замедление всё ещё активно на pf. Повторите.",
         throttle_cleanup_unrecoverable: "Токен очистки не удалось сохранить. После рестарта этот pf enable-ref не восстановить.",
         throttle_failed: "Ошибка замедления: {0}",
+        isolate_title: "Изоляция доменов (PF)", isolate_experimental: "блокировка PF на уровне ядра прямого пути к Proxy-доменам",
+        isolate_help: "Отрезает прямой путь (en0/ppp0) к этим доменам на уровне ядра — пакеты умирают, не утекают. Если прокси упал — трафик в никуда (fail-closed), не напрямую.",
+        isolate_apply: "Включить", isolate_clear: "Выключить", isolate_refresh: "Обновить IP",
+        isolate_active: "Изоляция активна: {0} доменов, {1} IP ({2} не резолвятся)", isolate_phase_strict: "строгая (подсети Anthropic)",
+        isolate_inactive: "Изоляция выключена", isolate_cleanup_unrecoverable: "Токен очистки не сохранён.",
+        isolate_unresolved: "Не резолвятся", isolate_applied: "Изоляция включена", isolate_cleared: "Изоляция выключена",
+        isolate_refreshed: "IP обновлены", isolate_cancelled: "Отменено (диалог пароля)", isolate_failed: "Ошибка изоляции: {0}",
         channel_title: "Сетевой канал", channel_active: "Активный канал",
         channel_wifi: "Wi-Fi", channel_usb: "USB-модем",
         channel_other: "Другой", channel_unknown: "Неизвестен",
@@ -396,6 +421,13 @@
         throttle_clear_failed_active: "清除失败 — 限速仍在 pf 上运行。请重试。",
         throttle_cleanup_unrecoverable: "清理令牌未能持久化。重启后无法恢复此 pf enable-ref。",
         throttle_failed: "限速失败：{0}",
+        isolate_title: "域名隔离 (PF)", isolate_experimental: "内核级 PF 阻断到代理域名的直连路径",
+        isolate_help: "在内核层面切断到这些域名的直连（en0/ppp0）—— 数据包被丢弃，永不泄露。代理不可用时流量进入黑洞（fail-closed），不走直连。",
+        isolate_apply: "启用", isolate_clear: "禁用", isolate_refresh: "刷新 IP",
+        isolate_active: "隔离已启用：{0} 个域名，{1} 个 IP（{2} 个未解析）", isolate_phase_strict: "严格模式（Anthropic 网段）",
+        isolate_inactive: "隔离未启用", isolate_cleanup_unrecoverable: "清理令牌未能持久化。",
+        isolate_unresolved: "未解析", isolate_applied: "隔离已启用", isolate_cleared: "隔离已禁用",
+        isolate_refreshed: "IP 已刷新", isolate_cancelled: "已取消（密码对话框）", isolate_failed: "隔离失败：{0}",
         channel_title: "网络通道", channel_active: "当前通道",
         channel_wifi: "Wi-Fi", channel_usb: "USB 网络共享",
         channel_other: "其他", channel_unknown: "未知",
@@ -1172,6 +1204,119 @@
       throttleRequest({ action: 'clear' }, btn, 'throttle_cleared');
     }
 
+    /* ============================ PF-изоляция доменов (isolate) ============================
+       Канонично throttle-блоку: runtime-состояние + render + POST-запросы. Изоляция читается
+       напрямую из /api/status (d.isolate), а не через отдельный эндпоинт (как throttle).
+       Домены берутся из config (не input-поле) — кнопки только enable/disable/refresh. */
+    var ISOLATE_ACTIVE = null;  // public lease {domains, ips, unresolved, ports, phase, applied_at}
+    function publicIsolateFromServer(active) {
+      return (active && active.domains && active.domains.length)
+        ? {
+            domains: active.domains || [],
+            ips: active.ips || {},
+            unresolved: active.unresolved || [],
+            ports: active.ports || [80, 443],
+            phase: active.phase || 'working',
+            applied_at: active.applied_at || null
+          }
+        : null;
+    }
+    function syncIsolateFromServer(isolate) {
+      ISOLATE_ACTIVE = publicIsolateFromServer(isolate);
+      renderIsolate();
+    }
+    function countIsolateIps(ips) {
+      var n = 0;
+      for (var k in ips) { if (ips.hasOwnProperty(k)) n += (ips[k] || []).length; }
+      return n;
+    }
+    function renderIsolate() {
+      var box = document.getElementById('isolate-editor');
+      if (!box) return;
+      var busy = mutationInFlight();
+      var active = ISOLATE_ACTIVE;
+      var badge = document.getElementById('isolate-badge');
+      var ipCount = active ? countIsolateIps(active.ips) : 0;
+      var phaseLabel = active && active.phase === 'strict' ? t('isolate_phase_strict') : '';
+      var activeHtml = active
+        ? '<div class="alert alert-info py-2 mb-2" role="status">' +
+            '<i class="bi bi-shield-lock me-1"></i>' +
+            esc(t('isolate_active', active.domains.length, ipCount, (active.unresolved || []).length)) +
+            (phaseLabel ? ' <span class="badge bg-warning text-dark ms-1">' + esc(phaseLabel) + '</span>' : '') +
+            '</div>' +
+            (active.unresolved && active.unresolved.length
+              ? '<div class="small text-warning ops mb-2">' + esc(t('isolate_unresolved')) + ': ' +
+                esc(active.unresolved.join(', ')) + '</div>' : '')
+        : '<div class="text-secondary ops mb-2">' + esc(t('isolate_inactive')) + '</div>';
+      if (badge) {
+        if (!active) { badge.className = 'ms-auto badge bg-secondary ops'; badge.textContent = '—'; }
+        else if (active.phase === 'strict') { badge.className = 'ms-auto badge bg-warning text-dark ops'; badge.textContent = 'STRICT'; }
+        else { badge.className = 'ms-auto badge bg-success ops'; badge.textContent = 'ON'; }
+      }
+      box.innerHTML =
+        '<div class="d-flex align-items-center gap-2 mb-2">' +
+          '<span class="fw-semibold">' + esc(t('isolate_title')) + '</span>' +
+          '<span class="badge text-bg-warning">' + esc(t('isolate_experimental')) + '</span>' +
+        '</div>' +
+        activeHtml +
+        '<div class="d-flex flex-wrap gap-2 mb-2">' +
+          '<button type="button" class="btn btn-sm btn-primary act" id="isolate-enable"' +
+            ((busy || !!active) ? ' disabled' : '') + '>' +
+            '<span class="lbl"><i class="bi bi-shield-lock"></i> ' + esc(t('isolate_apply')) + '</span></button>' +
+          '<button type="button" class="btn btn-sm btn-outline-danger act" id="isolate-disable"' +
+            ((busy || !active) ? ' disabled' : '') + '>' +
+            '<span class="lbl"><i class="bi bi-x-octagon"></i> ' + esc(t('isolate_clear')) + '</span></button>' +
+          '<button type="button" class="btn btn-sm btn-outline-secondary act" id="isolate-refresh"' +
+            ((busy || !active) ? ' disabled' : '') + '>' +
+            '<span class="lbl"><i class="bi bi-arrow-repeat"></i> ' + esc(t('isolate_refresh')) + '</span></button>' +
+        '</div>' +
+        '<div class="sub text-secondary">' + esc(t('isolate_help')) + '</div>';
+    }
+    function isolateRequest(payload, btn, okKey) {
+      if (!tryBeginMutation('isolate')) return;
+      var lbl = btn ? btn.querySelector('.lbl') : null;
+      var orig = lbl ? lbl.innerHTML : '';
+      if (lbl) lbl.innerHTML = '<span class="spinner-border spinner-border-sm"></span>';
+      renderIsolate();
+      var url = '/api/isolate/' + payload.action;  // enable | disable | refresh
+      fetch(url, {
+        method: 'POST',
+        headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      })
+        .then(function (r) {
+          return r.json().catch(function () { return { ok: false, err: 'HTTP ' + r.status }; })
+            .then(function (res) { res._status = r.status; return res; });
+        })
+        .then(function (res) {
+          if (res && Object.prototype.hasOwnProperty.call(res, 'isolate')) {
+            ISOLATE_ACTIVE = publicIsolateFromServer(res.isolate);
+          }
+          if (res && res.cancelled) {
+            toast(t('isolate_cancelled'), 'warn');
+          } else if (res && res.ok) {
+            toast(okKey === 'isolate_applied' ? t('isolate_applied') : t(okKey), 'ok');
+          } else {
+            var status = res && res._status;
+            if (status === 409) { toast((res && res.err) ? String(res.err).slice(0, 220) : 'conflict', 'warn'); }
+            else if (res && res.still_active) { toast('isolate still active — retry disable', 'err'); }
+            else {
+              var msg = (res && res.err) ? String(res.err).slice(0, 220) : ('HTTP ' + (status || 500));
+              toast(t('isolate_failed', msg), 'err');
+            }
+          }
+        })
+        .catch(function (e) { toast(t('isolate_failed', e.message), 'err'); })
+        .finally(function () {
+          finishMutation();
+          if (lbl) lbl.innerHTML = orig;
+          renderIsolate();
+        });
+    }
+    function enableIsolate(btn) { isolateRequest({ action: 'enable' }, btn, 'isolate_applied'); }
+    function disableIsolate(btn) { isolateRequest({ action: 'disable' }, btn, 'isolate_cleared'); }
+    function refreshIsolate(btn) { isolateRequest({ action: 'refresh' }, btn, 'isolate_refreshed'); }
+
     function render(d, ranking) {
       LAST_STATUS = d;
       LAST_RANKING = ranking || {};
@@ -1323,6 +1468,7 @@
       // если пользователь редактирует — синк правил идёт отдельно через loadGuard).
       updateGuardBadge(d.traffic_guard);
       if (!GUARD_LOADED && !GUARD_DIRTY) loadGuard();
+      if (d.isolate) syncIsolateFromServer(d.isolate);
       if (mutationInFlight()) setMutationControlsDisabled(true);
 
       var ts = d.ts ? new Date(d.ts * 1000) : new Date();
@@ -1634,6 +1780,18 @@
         clearThrottle(btn);
         return;
       }
+      if (btn.id === 'isolate-enable') {
+        enableIsolate(btn);
+        return;
+      }
+      if (btn.id === 'isolate-disable') {
+        disableIsolate(btn);
+        return;
+      }
+      if (btn.id === 'isolate-refresh') {
+        refreshIsolate(btn);
+        return;
+      }
       if (!tryBeginMutation('action', ev)) return;
       var url = btn.getAttribute('data-url');
       var lbl = btn.querySelector('.lbl');
@@ -1675,6 +1833,7 @@
       renderGuard();
       readThrottleInputFromDom();
       renderThrottle();
+      renderIsolate();
       poll(true);
     });
     applyStaticI18n();
@@ -1696,6 +1855,7 @@
     /* ============================ Boot ============================ */
     renderGuard();     // пустой каркас редактора сразу, до первого ответа сервера
     renderThrottle();  // каркас throttle-контрола (inactive) до ответа сервера
+    renderIsolate();   // каркас isolate-контрола (inactive) до ответа сервера
     loadGuard();       // подтянуть block/allow правила + активный throttle из /api/guard
     poll(true);
     setInterval(poll, 5000);
