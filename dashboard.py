@@ -91,6 +91,7 @@ def gather_status():
         "ping": lambda: probe_ping(route_ip=active_route_ip),
         "dns": probe_dns,
         "ifaces": probe_ifaces,
+        "exit_ips": probe_exit_ips_per_iface,
         "geo_distance": lambda: probe_geo_distance(route_ip=active_route_ip),
     }
     out = _run_status_probe_set(probes, STATUS_PROBE_BUDGET_SEC)

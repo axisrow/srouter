@@ -18,6 +18,8 @@ __all__ = [
     "_metered_guess",
     "probe_connectivity",
     "probe_ifaces",
+    "_exit_ip_via_iface",
+    "probe_exit_ips_per_iface",
     "_parse_network_services",
     "_known_service_name",
     "_configured_channel_service",
@@ -217,6 +219,42 @@ def probe_ifaces():
     ifaces = _parse_ifconfig_ifaces(r["out"] if not r["timeout"] else "", default_iface, hardware_ports)
     return {"ifaces": ifaces[:8], "default": default_iface,
             "status": "ok" if ifaces else "down"}
+
+
+def _exit_ip_via_iface(iface):
+    """Выходной IP при запросе, привязанном к конкретному интерфейсу (--interface iface).
+
+    `--interface` заставляет curl отправлять пакеты через заданный интерфейс, обходя
+    default-маршрут ОС. Так можно увидеть реальный выход КАЖДОГО канала (VPN vs прямой),
+    не отключая VPN и не меняя маршруты. Аналог _exit_ip из dashboard_geo, но с iface
+    и без прокси (нас интересует сам интерфейс, а не цепочка privoxy→xray).
+    """
+    r = sys_probe.run([CURL, "-sS", "--interface", iface, "--connect-timeout", "4",
+                       "--max-time", "8", "https://api.ip.sb/ip"], timeout=10)
+    ip = r["out"].strip() if not r["timeout"] else ""
+    return ip if (ip and len(ip) <= 45 and (":" in ip or ip.count(".") == 3)) else ""
+
+
+def probe_exit_ips_per_iface():
+    """Exit-IP для каждого активного интерфейса (en0/ppp0/...): показывает реальный выход
+    каждого канала — через VPN и прямой — одновременно, не отключая VPN.
+
+    Переиспользует probe_ifaces() для списка интерфейсов (фильтр en*/ppp*/utun*, без lo0).
+    """
+    ifaces_data = probe_ifaces()
+    default_iface = ifaces_data.get("default", "")
+    exits = []
+    for it in ifaces_data.get("ifaces", []):
+        name = it["name"]
+        # интерфейс без локального IP и не default — не опрашиваем (нет смысла)
+        if not it.get("addr") and name != default_iface:
+            continue
+        exits.append({"iface": name,
+                      "local_ip": it.get("addr", ""),
+                      "is_default": bool(it.get("is_default", name == default_iface)),
+                      "exit_ip": _exit_ip_via_iface(name)})
+    return {"exits": exits, "default_iface": default_iface,
+            "status": "ok" if any(e["exit_ip"] for e in exits) else "down"}
 
 
 def _parse_network_services(text):
