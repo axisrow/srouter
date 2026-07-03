@@ -59,8 +59,8 @@ def _env_from_args(args) -> InstallEnv:
         env.launchagent_dir = Path(args.launchagents_dir)
     # Python, из которого запущена команда srouter — в нём гарантированно стоит flask (зависимость
     # пакета srouter). /usr/bin/python3 (default в install_lib) — системный Python Apple, flask'а нет,
-    # демон крашнется с ModuleNotFoundError. SROUTER_PYTHON остаётся ручным override (используется тестами).
-    env.python_bin = os.environ.get("SROUTER_PYTHON") or sys.executable
+    # демон крашнется с ModuleNotFoundError. Приоритет: --python флаг (для sudo) → SROUTER_PYTHON env → sys.executable.
+    env.python_bin = getattr(args, "python", None) or os.environ.get("SROUTER_PYTHON") or sys.executable
     return env
 
 
@@ -506,6 +506,8 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--state", default=None, help="Путь к srouter.local.json")
         p.add_argument("--prefix", default=None, help="Homebrew prefix")
         p.add_argument("--launchagents-dir", default=None, help="Каталог LaunchAgents")
+        p.add_argument("--python", default=None,
+                       help="Явный путь к Python (для sudo: --python $(which python3))")
 
     for name, help_text, fn in [
         ("install", "Полная установка стека (brew-сервисы + конфиги + DNS + LaunchAgent).", cmd_install),
