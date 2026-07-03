@@ -45,6 +45,7 @@ from install_lib import (
 from sys_probe import run
 
 import claude_proxy  # вкл/откл HTTPS_PROXY для Claude Code (~/.claude/settings.json)
+import health  # doctor-проверки стека
 
 # OSASCRIPT отсутствует в install_lib — локальная константа (копия dashboard_common).
 OSASCRIPT = "/usr/bin/osascript"
@@ -404,6 +405,13 @@ def cmd_status(args) -> int:
     return 1
 
 
+def cmd_doctor(args) -> int:
+    """Проверить здоровье стека: порты + реальный туннель. Отчёт ✅/❌ + подсказки."""
+    result = health.check_all()
+    health._print_report(result)
+    return 0 if result["status"] == "ok" else 1
+
+
 def _version_string() -> str:
     """Версия из метаданных пакета (единственный источник — pyproject.toml)."""
     try:
@@ -429,6 +437,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("stop", "Остановить демон (plist сохранён).", cmd_stop),
         ("restart", "Перезапустить демон (применить правки кода).", cmd_restart),
         ("status", "Показать статус демона.", cmd_status),
+        ("doctor", "Проверить здоровье стека (порты + туннель).", cmd_doctor),
     ]:
         p = sub.add_parser(name, help=help_text)
         add_env_flags(p)

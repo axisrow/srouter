@@ -46,6 +46,7 @@ py-modules = [
     "dashboard_isolate",
     "git_proxy",
     "claude_proxy",
+    "health",
 ]
 
 [tool.setuptools.package-data]

@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- __SROUTER_WATCHDOG_MARKER__ -->
+<!-- Watchdog: раз в 90с пингует туннель (через прокси). При переходе ok→down — macOS-нотификация
+     + звук («туннель/стек упал»). При восстановлении — тихое уведомление. State в /tmp.
+     Нотификация только при ПЕРЕХОДЕ (не спамит каждый прогон).
+     CLI: python3 health.py watchdog (работает и без plist — autoload-подключение это follow-up). -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>__SROUTER_WATCHDOG_LABEL__</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__SROUTER_PYTHON_BIN__</string>
+    <string>__SROUTER_HEALTH_PATH__</string>
+    <string>watchdog</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__SROUTER_ROOT_DIR__</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartInterval</key>
+  <integer>90</integer>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>__SROUTER_LOG_OUT__</string>
+  <key>StandardErrorPath</key>
+  <string>__SROUTER_LOG_ERR__</string>
+</dict>
+</plist>
