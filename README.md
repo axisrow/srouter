@@ -154,40 +154,34 @@ macOS + активную проверку связности (не просто 
 
 ## Установка (локальная часть, macOS)
 
-> Нужен Homebrew. Часть действий (DNS на :53, маршруты) требует пароль администратора.
+> Нужен Homebrew. Часть действий (DNS на :53, маршруты) требует пароль администратора —
+> `srouter install` спросит его через GUI macOS (osascript), либо запустите под `sudo`.
 
 ```bash
-brew install xray privoxy dnsmasq
-
-# конфиги:
-#   /opt/homebrew/etc/xray/config.json      — узлы (реестр) + вайтлист‑роутинг
-#   /opt/homebrew/etc/privoxy/config        — forward-socks5t / 127.0.0.1:10808 .
-#   /opt/homebrew/etc/dnsmasq.conf          — all-servers + upstream
-
-brew services start xray
-brew services start privoxy
-sudo brew services start dnsmasq            # порт 53 → root
-sudo networksetup -setdnsservers "Wi-Fi" 127.0.0.1
-
-# Консольная точка входа srouter (ставится в активный python3 — тот, откуда pip;
-# демон использует этот же интерпретатор, в нём же лежит flask как зависимость):
+# 1. Поставить команду srouter (в активный python3 — в нём же лежит flask как зависимость):
 python3 -m pip install --upgrade pip          # нужен pip ≥ 21.3 для PEP 660 editable-install
 pip install -e .
 
-srouter install        # установить LaunchAgent и запустить демон (одноразово; автозапуск при входе)
-srouter start          # запустить демон (если plist уже установлен)
+# 2. Полная установка стека одной командой:
+srouter install
+#   • ставит brew-сервисы xray/privoxy/dnsmasq и пишет их конфиги;
+#   • настраивает DNS (networksetup ... 127.0.0.1) и устанавливает LaunchAgent дашборда;
+#   • показывает план и спрашивает подтверждение; при конфликте чужих конфигов — adopt/overwrite/skip;
+#   • под sudo привилегированные шаги идут напрямую, без sudo — через GUI-пароль macOS.
+srouter status         # проверить, что демон работает (http://127.0.0.1:8787)
+
+# Управление демоном дашборда (стек не трогается):
+srouter start          # запустить демон (если LaunchAgent уже установлен)
 srouter stop           # остановить демон (plist сохранён)
 srouter restart        # перезапустить демон (применить правки кода)
-srouter uninstall      # остановить демон и удалить plist
-srouter status         # статус демона и PID
 
-# Foreground-запуск для отладки (без launchd, блокирует терминал):
-python3 dashboard.py                        # http://127.0.0.1:8787
+# Foreground-запуск дашборда для отладки (без launchd, блокирует терминал):
+python3 dashboard.py
 ```
 
-`srouter` — устанавливаемый Python-пакет (`pyproject.toml`). `install`/`uninstall` управляют службой
-(plist-файлом), `start`/`stop`/`restart` — запущенным процессом, `status` показывает состояние.
-Полная установка brew-стека (конфиги/сервисы/DNS) — через `./install.sh apply` (см. `install_lib.py`).
+`srouter install` / `uninstall` управляют **всем стеком** (brew-сервисы, конфиги, DNS, LaunchAgent);
+`start`/`stop`/`restart` — только запущенным процессом дашборда. Конфиги и логика конфликтов живут в
+`install_lib.py`; неинтерактивный путь для CI/скриптов — `./install.sh apply` (см. `install_lib.py`).
 
 ## Интеграции
 
@@ -201,9 +195,9 @@ python3 dashboard.py                        # http://127.0.0.1:8787
 ## Откат
 
 ```bash
-sudo networksetup -setdnsservers "Wi-Fi" Empty
-sudo brew services stop dnsmasq
-brew services stop xray privoxy
+srouter uninstall      # полный откат к дефолту:
+#   останавливает brew-сервисы, восстанавливает чужие конфиги из бэкапов,
+#   сбрасывает DNS (networksetup ... Empty), удаляет LaunchAgent и split-route до VPS.
 ```
 
 ---
@@ -256,32 +250,42 @@ path and continuously optimizing it. Two parts:
 
 ## Install (local, macOS)
 
-```bash
-brew install xray privoxy dnsmasq
-brew services start xray
-brew services start privoxy
-sudo brew services start dnsmasq            # port 53 → root
-sudo networksetup -setdnsservers "Wi-Fi" 127.0.0.1
+> Requires Homebrew. Some steps (DNS on :53, routes) need an administrator password —
+> `srouter install` will prompt for it via the macOS GUI (osascript), or run under `sudo`.
 
-# Console entry point srouter (installed into the active python3 — the one pip runs from;
-# the daemon uses this same interpreter, which holds flask as a dependency):
+```bash
+# 1. Install the srouter command (into the active python3 — it holds flask as a dependency):
 python3 -m pip install --upgrade pip          # needs pip >= 21.3 for PEP 660 editable install
 pip install -e .
 
-srouter install        # install the LaunchAgent and start the daemon (once; autostart at login)
-srouter start          # start the daemon (if the plist is already installed)
+# 2. Install the full stack with one command:
+srouter install
+#   • installs brew services xray/privoxy/dnsmasq and writes their configs;
+#   • sets DNS (networksetup ... 127.0.0.1) and installs the dashboard LaunchAgent;
+#   • prints a plan and asks for confirmation; on a foreign-config conflict — adopt/overwrite/skip;
+#   • under sudo privileged steps run directly, otherwise via the macOS GUI password.
+srouter status         # check the daemon is up (http://127.0.0.1:8787)
+
+# Dashboard daemon control (the stack is untouched):
+srouter start          # start the daemon (if the LaunchAgent is already installed)
 srouter stop           # stop the daemon (the plist is kept)
 srouter restart        # restart the daemon (apply code changes)
-srouter uninstall      # stop the daemon and remove the plist
-srouter status         # daemon status and PID
 
-# Foreground run for debugging (without launchd, blocks the terminal):
-python3 dashboard.py                         # http://127.0.0.1:8787
+# Foreground dashboard run for debugging (without launchd, blocks the terminal):
+python3 dashboard.py
 ```
 
-`srouter` is an installable Python package (`pyproject.toml`). `install`/`uninstall` manage the
-service (the plist file), `start`/`stop`/`restart` manage the running process, `status` reports state.
-Full brew-stack install (configs/services/DNS) is via `./install.sh apply` (see `install_lib.py`).
+`srouter install` / `uninstall` manage the **entire stack** (brew services, configs, DNS, LaunchAgent);
+`start`/`stop`/`restart` — only the running dashboard process. Configs and conflict logic live in
+`install_lib.py`; the non-interactive path for CI/scripts is `./install.sh apply` (see `install_lib.py`).
+
+## Rollback
+
+```bash
+srouter uninstall      # full rollback to defaults:
+#   stops brew services, restores foreign configs from backups, resets DNS
+#   (networksetup ... Empty), removes the LaunchAgent and the split-route to the VPS.
+```
 
 ## Integrations
 

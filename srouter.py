@@ -1,32 +1,51 @@
 #!/usr/bin/env python3
-"""CLI-точка входа srouter: управление демоном дашборда (LaunchAgent).
+"""CLI srouter: управление локальным стеком (xray/privoxy/dnsmasq) и демоном дашборда.
 
-Два уровня команд:
-  install/uninstall — постановка/снятие службы (plist-файл), одноразово;
-  start/stop/restart — управление запущенным процессом (plist не трогается);
-  status — состояние демона.
+Команды:
+  install/uninstall — полная установка/откат стека (brew-сервисы, конфиги, DNS, LaunchAgent);
+                      uninstall дополнительно удаляет split-route до VPS.
+  start/stop/restart — управление демоном дашборда (plist не трогается после install).
+  status             — состояние демона.
 
-CLI строит отдельный интерфейс поверх библиотечных функций install_lib — НЕ дублирует
-логику рендеринга plist/загрузки launchd. Полная установка brew-стека (xray/privoxy/dnsmasq,
-конфиги, сервисы, DNS) остаётся за ./install.sh apply (см. install_lib.py).
+Привилегии — автодетект: под sudo (os.geteuid()==0) привилегированные шаги идут напрямую;
+иначе networksetup/route/sudo-brew-dnsmasq оборачиваются в osascript-мост с GUI-паролем macOS
+(канон: dashboard.py _sudo_route_ip).
+
+CLI — тонкий слой над install_lib.apply_install/apply_uninstall; рендеринг plist и логика
+конфликтов живут в install_lib.py (покрыты pytest без реальных привилегий).
 """
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import os
+import shlex
 import sys
 from pathlib import Path
 from importlib.metadata import PackageNotFoundError, version
 
+import local_state
 from install_lib import (
+    BREW,
+    NETWORKSETUP,
+    ROUTE,
+    SUDO,
+    CHOICES,
     LAUNCHAGENT_LABEL,
     LAUNCHCTL,
     InstallEnv,
     _has_launchagent_marker,
-    _install_launchagent,
+    apply_install,
     apply_uninstall,
+    build_plan,
+    build_uninstall_plan,
+    format_plan,
+    format_uninstall_plan,
 )
 from sys_probe import run
+
+# OSASCRIPT отсутствует в install_lib — локальная константа (копия dashboard_common).
+OSASCRIPT = "/usr/bin/osascript"
 
 
 def _env_from_args(args) -> InstallEnv:
@@ -41,33 +60,222 @@ def _env_from_args(args) -> InstallEnv:
     return env
 
 
+def _is_privileged_cmd(cmd) -> bool:
+    """Только эти сигнатуры install_lib требуют root. Остальное (brew/launchctl/lsof,
+    route -n get, networksetup -listallnetworkservices) работает без повышения."""
+    if not cmd:
+        return False
+    head = cmd[0]
+    # networksetup -setdnsservers — мутация DNS (НЕ -listallnetworkservices, это чтение).
+    if head == NETWORKSETUP and len(cmd) > 1 and cmd[1] == "-setdnsservers":
+        return True
+    # sudo brew services ... dnsmasq — dnsmasq на UDP:53. xray/privoxy идут БЕЗ sudo.
+    if head == SUDO and len(cmd) > 1 and cmd[1] == BREW:
+        return True
+    # route -n delete -host <ip> — удаление split-route (новое в uninstall). route get — чтение.
+    if head == ROUTE and len(cmd) > 2 and cmd[1] == "-n" and cmd[2] == "delete":
+        return True
+    return False
+
+
+def _to_osascript(cmd):
+    """Обернуть cmd в osascript-мост 'do shell script ... with administrator privileges'.
+
+    SUDO удаляется из cmd — osascript сам повышает привилегии (канон dashboard.py:122-134).
+    Без этого получилось бы sudo внутри уже-privileges-сессии (избыточно, потенциально ломается).
+    """
+    cleaned = list(cmd[1:] if cmd and cmd[0] == SUDO else cmd)
+    shell_cmd = " ".join(shlex.quote(str(a)) for a in cleaned)
+    applescript = f'do shell script "{shell_cmd}" with administrator privileges'
+    return [OSASCRIPT, "-e", applescript]
+
+
+def make_privileged_runner(underlying_run=run, *, osascript_timeout: int = 60):
+    """runner(cmd, timeout) с автодетектом привилегий.
+
+    Под sudo (os.geteuid()==0) все команды идут напрямую. Иначе привилегированные
+    (networksetup -setdnsservers / sudo brew ... dnsmasq / route delete) оборачиваются
+    в osascript-мост с GUI-паролем; остальные — напрямую.
+    """
+    am_root = os.geteuid() == 0
+
+    def runner(cmd, timeout):
+        if not _is_privileged_cmd(cmd) or am_root:
+            return underlying_run(cmd, timeout)
+        return underlying_run(_to_osascript(cmd), osascript_timeout)
+
+    return runner
+
+
+def _is_ip_literal(value) -> bool:
+    """Строгая проверка IP-литерала. Канон dashboard_common._ip_literal, но без импорта
+    dashboard_common (он тянет srouter_config через module-level код)."""
+    if not isinstance(value, str) or not value or "%" in value:
+        return False
+    try:
+        parsed = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return str(parsed) == value
+
+
+def _prompt_bool(label: str) -> bool:
+    return input(f"{label} [y/N]: ").strip().lower() in {"y", "yes", "д", "да"}
+
+
+def _prompt_choice(name: str) -> str:
+    """adopt | overwrite | skip (install_lib.CHOICES)."""
+    while True:
+        answer = input(f"Выбор для {name} [adopt/overwrite/skip]: ").strip().lower()
+        if answer in CHOICES:
+            return answer
+        print("Допустимо: adopt, overwrite, skip.")
+
+
+def _active_route_ip_for_removal(state_path) -> str:
+    """route_ip активного узла для route delete. '' если нет валидного IP/узла."""
+    try:
+        node = local_state.active_node(path=state_path) or {}
+        route_ip = local_state.resolve_route_ip(node, path=state_path)
+    except Exception:
+        return ""
+    return route_ip if _is_ip_literal(route_ip) else ""
+
+
+def _remove_active_split_route(state_path, runner) -> int:
+    """route -n delete -host <active_route_ip>. Idempotent: отсутствие маршрута = успех.
+
+    Возвращает 0 (ok/нечего удалять), 2 (отмена GUI/сбой).
+    """
+    route_ip = _active_route_ip_for_removal(state_path)
+    if not route_ip:
+        print("split-route: нет активного route_ip — пропуск удаления маршрута.")
+        return 0
+    print(f"split-route: удаляю маршрут до {route_ip} ...")
+    result = runner([ROUTE, "-n", "delete", "-host", route_ip], 60)
+    if result.get("timeout"):
+        print(f"split-route: timeout при удалении маршрута до {route_ip}.", file=sys.stderr)
+        return 2
+    rc = result.get("rc")
+    if rc == 0:
+        return 0
+    err = f"{result.get('err') or ''} {result.get('out') or ''}"
+    if rc == -128 or "-128" in err:
+        print("split-route: удаление маршрута отменено пользователем (диалог пароля).", file=sys.stderr)
+        return 2
+    if "not in table" in err.lower() or "no such process" in err.lower():
+        return 0  # маршрута уже нет — idempotent успех
+    print(f"split-route: не удалось удалить маршрут до {route_ip}: {err.strip()}", file=sys.stderr)
+    return 2
+
+
 def cmd_install(args) -> int:
-    """Установить LaunchAgent (plist) и запустить демон. Одноразовая настройка."""
+    """Полная установка стека: brew-сервисы + конфиги + DNS + LaunchAgent.
+
+    Показывает план, при конфликтах (чужие конфиги) спрашивает adopt/overwrite/skip,
+    подтверждает. Делегирует тяжёлую работу в install_lib.apply_install.
+    """
     env = _env_from_args(args)
-    plist = env.launchagent_path()
-    # Уже установлено (plist с нашим маркером) — не трогаем демон. Перезапуск = отдельная команда.
-    if plist.exists() and _has_launchagent_marker(plist):
-        print(f"Служба уже установлена: {plist}\n"
-              f"Для перезапуска демона: srouter restart")
+    runner = make_privileged_runner(run)
+
+    # 1) Discovery (ничего не пишет).
+    try:
+        plan = build_plan(env=env, runner=runner)
+    except Exception as exc:
+        print(f"install: сбой discovery: {exc}", file=sys.stderr)
+        return 2
+
+    # 2) Показать план.
+    print(format_plan(plan))
+    print()
+
+    # 3) Конфликты → интерактивный выбор per компонент.
+    choices = {}
+    conflicts = [(name, item) for name, item in (plan.get("components") or {}).items()
+                 if isinstance(item, dict) and item.get("conflict")]
+    if conflicts:
+        if not sys.stdin.isatty():
+            names = ", ".join(n for n, _ in conflicts)
+            print(f"install: обнаружены конфликты ({names}); разрешите вручную или удалите чужие "
+                  f"конфиги.", file=sys.stderr)
+            return 2
+        for name, item in conflicts:
+            reasons = ", ".join(item.get("conflicts") or [])
+            print(f"\nКонфликт по компоненту {name} ({reasons}):")
+            print(f"  config_path: {item.get('config_path')}")
+            print(f"  port_owner:  {item.get('port_owner') or '-'}")
+            choices[name] = _prompt_choice(name)
+        print()
+
+    # 4) Подтверждение.
+    if not sys.stdin.isatty():
+        print("install: подтверждение требует терминал (используйте -y/--yes).", file=sys.stderr)
+        return 2
+    if not getattr(args, "yes", False) and not _prompt_bool("Применить установку стека?"):
+        print("install отменён.")
+        return 1
+
+    # 5) apply: confirm=True, choices собраны, launchagent ставится тоже.
+    result = apply_install(
+        env=env, confirm=True, choices=choices,
+        runner=runner, install_launchagent=True,
+    )
+    if result.get("ok"):
+        print("Установка стека завершена: brew-сервисы, конфиги, DNS, LaunchAgent применены.\n"
+              f"Дашборд: http://127.0.0.1:8787  (srouter status — проверить)")
         return 0
-    ok, error = _install_launchagent(env, runner=run)
-    if ok:
-        print(f"LaunchAgent {LAUNCHAGENT_LABEL} установлен и запущен: {plist}")
-        return 0
-    print(f"Не удалось установить LaunchAgent: {error}", file=sys.stderr)
+    blocked = ", ".join(result.get("blocked") or ["unknown"])
+    print(f"install остановлен: {blocked}", file=sys.stderr)
+    if "plan" in result:
+        print(format_plan(result["plan"]), file=sys.stderr)
     return 2
 
 
 def cmd_uninstall(args) -> int:
-    """Выгрузить демон и удалить srouter-managed LaunchAgent (plist)."""
+    """Полный откат к дефолту: brew-сервисы, конфиги (restore из бэкапа), DNS, LaunchAgent.
+
+    apply_uninstall сам выгружает демон и останавливает сервисы. ДОПОЛНИТЕЛЬНО удаляет
+    split-route до VPS (install_lib про маршрут не знает).
+    """
     env = _env_from_args(args)
-    result = apply_uninstall(env=env, confirmations={"launchagent": True}, runner=run)
-    if result.get("ok"):
-        print(f"LaunchAgent {LAUNCHAGENT_LABEL} выгружен и удалён.")
-        return 0
-    blocked = ", ".join(result.get("blocked") or ["unknown"])
-    print(f"uninstall остановлен: {blocked}", file=sys.stderr)
-    return 2
+    runner = make_privileged_runner(run)
+    state_path = getattr(args, "state", None)
+
+    # 1) Discovery + показ плана.
+    try:
+        plan = build_uninstall_plan(env=env)
+    except Exception as exc:
+        print(f"uninstall: сбой discovery: {exc}", file=sys.stderr)
+        return 2
+    print(format_uninstall_plan(plan))
+    print()
+
+    # 2) Подтверждение (полный откат — серьёзный шаг).
+    if not sys.stdin.isatty():
+        print("uninstall: подтверждение требует терминал (используйте -y/--yes).", file=sys.stderr)
+        return 2
+    if not getattr(args, "yes", False) and not _prompt_bool("Полный откат стека к дефолту?"):
+        print("uninstall отменён.")
+        return 1
+
+    # 3) apply_uninstall: ВСЕ 4 категории. Сам остановит сервисы и выгрузит демон.
+    result = apply_uninstall(
+        env=env,
+        confirmations={"configs": True, "services": True, "dns": True, "launchagent": True},
+        runner=runner,
+    )
+    if not result.get("ok"):
+        blocked = ", ".join(result.get("blocked") or ["unknown"])
+        print(f"uninstall остановлен: {blocked}", file=sys.stderr)
+        return 2
+
+    # 4) Удалить split-route (новое — install_lib про маршрут не знает).
+    route_rc = _remove_active_split_route(state_path, runner)
+
+    print("Откат завершён: brew-сервисы остановлены, конфиги восстановлены/оставлены, "
+          "DNS сброшен, LaunchAgent удалён"
+          + (". split-route удалён." if route_rc == 0 else ", split-route не удалён — см. выше."))
+    return 0
 
 
 def _launchd_domain() -> str:
@@ -201,8 +409,8 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--launchagents-dir", default=None, help="Каталог LaunchAgents")
 
     for name, help_text, fn in [
-        ("install", "Установить LaunchAgent и запустить демон (одноразово).", cmd_install),
-        ("uninstall", "Остановить демон и удалить LaunchAgent (plist).", cmd_uninstall),
+        ("install", "Полная установка стека (brew-сервисы + конфиги + DNS + LaunchAgent).", cmd_install),
+        ("uninstall", "Полный откат стека + удаление split-route.", cmd_uninstall),
         ("start", "Запустить демон (plist уже установлен).", cmd_start),
         ("stop", "Остановить демон (plist сохранён).", cmd_stop),
         ("restart", "Перезапустить демон (применить правки кода).", cmd_restart),
@@ -210,6 +418,9 @@ def build_parser() -> argparse.ArgumentParser:
     ]:
         p = sub.add_parser(name, help=help_text)
         add_env_flags(p)
+        if name in ("install", "uninstall"):
+            p.add_argument("-y", "--yes", action="store_true",
+                           help="Подтвердить без интерактивного промпта (конфликты всё равно блокируют).")
         p.set_defaults(func=fn)
     return parser
 
