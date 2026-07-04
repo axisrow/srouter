@@ -240,9 +240,11 @@ def _remove_ppp_hook(runner) -> str:
 # plist, переживает ребут) + ~/bin в PATH; uninstall убирает. Канон — _install_ppp_hook
 # (best-effort, marker-gate, строка-статус).
 # URL SOCKS5 — из dashboard_common (SOCKS_PROXY_URL), единый источник правды для xray-порта.
+# except BaseException (не Exception): dashboard_common raise SystemExit при отсутствии
+# srouter_config.py, а SystemExit не ловится Exception — fallback должен сработать и для него.
 try:
     from dashboard_common import SOCKS_PROXY_URL as _CODEX_PROXY_URL
-except Exception:
+except BaseException:
     _CODEX_PROXY_URL = "socks5h://127.0.0.1:10808"
 CODEX_NO_PROXY = "localhost,127.0.0.1,::1"
 # (env-key, value) — единый список для install/setenv и uninstall/unsetenv (синхронны всегда).
@@ -255,9 +257,9 @@ CODEX_WRAPPERS = (
     ("codex", "srouter-codex-cli-wrapper.sh", "# srouter: codex CLI wrapper (managed)"),
     ("codex-app-proxy", "srouter-codex-app-proxy-wrapper.sh", "# srouter: codex-app-proxy wrapper (managed)"),
 )
-# LaunchAgent для глобального env (переживает ребут, в отличие от launchctl setenv).
-CODEX_ENV_LABEL = "com.srouter.codex-env"
-CODEX_ENV_PLIST = f"{CODEX_ENV_LABEL}.plist"
+# LaunchAgent для глобального env: launchctl setenv SOCKS5 в GUI-домен (переживает ребут).
+# Label = com.srouter.codenv → prefix CODENV для плейсхолдеров __SROUTER_CODENV_*__ в шаблоне plist.
+CODEX_ENV_LABEL = "com.srouter.codenv"
 CODEX_ENV_MARKER = "srouter-managed-codex-env-v1"
 ZSHRC_PATH_MARKER = "# srouter: ~/bin в PATH для codex wrapper"
 
@@ -329,56 +331,49 @@ def _remove_codex_wrappers() -> str:
                      for name, _, marker in CODEX_WRAPPERS)
 
 
-def _install_launchctl_env() -> str:
-    """Глобальный SOCKS5 env через LaunchAgent plist (EnvironmentVariables). Переживает ребут.
+def _install_launchctl_env(env, runner) -> str:
+    """Глобальный SOCKS5 env через LaunchAgent (RunAtLoad + launchctl setenv). Переживает ребут.
 
-    Раньше было 8 launchctl setenv (не переживают ребут). LaunchAgent с EnvironmentVariables = 1
-    bootstrap, ребут-стойкий. Эмпирически: Claude.app/ChatGPT.app на System Settings SOCKS,
-    global env их не ломает.
+    launchctl setenv кладёт переменные в GUI-домен launchd → все GUI-приложения их видят. Но setenv
+    сам по себе не переживает ребут — LaunchAgent com.srouter.codenv (RunAtLoad + StartInterval=300)
+    вызывает скрипт srouter-codex-env.sh, который делает setenv при загрузке и каждые 5мин.
+    Эмпирически: Claude.app/ChatGPT.app на System Settings SOCKS, global env их не ломает.
+
+    Через _install_generic_launchagent (как watchdog): marker-gate + atomic write + _launchd_reload
+    (bootout→poll→bootstrap-retry, решает гонку занятого домена — PR #80).
     """
     try:
-        from html import escape
-        plist_dir = Path.home() / "Library" / "LaunchAgents"
-        plist_dir.mkdir(parents=True, exist_ok=True)
-        plist_path = plist_dir / CODEX_ENV_PLIST
-        # Marker-gate: чужой plist без нашего маркера — не трогаем.
-        if plist_path.exists() and CODEX_ENV_MARKER not in plist_path.read_text(encoding="utf-8"):
-            return "Codex env: чужой LaunchAgent plist — не трогаем."
-        env_pairs = "".join(
-            f"\t\t<key>{escape(k)}</key><string>{escape(v)}</string>\n" for k, v in CODEX_LAUNCHCTL_ENV)
-        plist = (
-            f"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
-            f"<!-- {CODEX_ENV_MARKER} -->\n"
-            f"<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" "
-            f"\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
-            f"<plist version=\"1.0\">\n<dict>\n"
-            f"\t<key>Label</key><string>{CODEX_ENV_LABEL}</string>\n"
-            f"\t<key>EnvironmentVariables</key>\n<dict>\n{env_pairs}\t</dict>\n"
-            f"</dict>\n</plist>\n")
-        if not _write_text_atomic(plist_path, plist):
-            return "Codex env: не записан LaunchAgent plist (ошибка atomic write)."
-        # bootstrap в gui/<uid>. bootout (если уже загружен) игнорируем — bootstrap поднимет свежим.
-        domain = _launchd_domain()
-        run([LAUNCHCTL, "bootout", f"{domain}/{CODEX_ENV_LABEL}"], 5)
-        r = run([LAUNCHCTL, "bootstrap", domain, str(plist_path)], 10)
-        if r.get("timeout") or r.get("rc") not in (0, None):
-            return f"Codex env: не загружен LaunchAgent ({(r.get('err') or 'ошибка')[:60]})."
-        return f"Codex env: LaunchAgent {CODEX_ENV_LABEL} загружен (SOCKS5, переживает ребут)."
+        ok, err = _install_generic_launchagent(
+            env, runner,
+            template_name="com.srouter.codenv.plist",
+            label=CODEX_ENV_LABEL,
+            marker=CODEX_ENV_MARKER,
+            script_path=env.root / "launchagents" / "srouter-codex-env.sh",
+        )
+        if ok:
+            return f"Codex env: LaunchAgent {CODEX_ENV_LABEL} загружен (SOCKS5 в GUI-домен, переживает ребут)."
+        if err.endswith("_foreign"):
+            return f"Codex env: чужой LaunchAgent {CODEX_ENV_LABEL} — не трогаем."
+        return f"Codex env: не установлен ({err})."
     except Exception as exc:
         return f"Codex env: не установлен ({str(exc)[:80]})."
 
 
-def _remove_launchctl_env() -> str:
-    """Выгрузить LaunchAgent env + удалить plist."""
+def _remove_launchctl_env(runner) -> str:
+    """Выгрузить LaunchAgent env + снять переменные + удалить plist."""
     try:
-        plist_path = Path.home() / "Library" / "LaunchAgents" / CODEX_ENV_PLIST
+        plist_path = Path.home() / "Library" / "LaunchAgents" / f"{CODEX_ENV_LABEL}.plist"
         if not plist_path.exists():
             return "Codex env: не был установлен."
         if CODEX_ENV_MARKER not in plist_path.read_text(encoding="utf-8"):
-            return "Codex env: чужой LaunchAgent plist — не трогаем."
-        run([LAUNCHCTL, "bootout", f"{_launchd_domain()}/{CODEX_ENV_LABEL}"], 5)
+            return f"Codex env: чужой LaunchAgent {CODEX_ENV_LABEL} — не трогаем."
+        # bootout агента (через runner — симметрия с install). bootout на незагруженном = не ошибка.
+        runner([LAUNCHCTL, "bootout", f"{_launchd_domain()}/{CODEX_ENV_LABEL}"], 10)
         plist_path.unlink()
-        return "Codex env: снят (LaunchAgent выгружен, plist удалён)."
+        # Снять переменные из GUI-домена (setenv делал скрипт при загрузке).
+        for key, _ in CODEX_LAUNCHCTL_ENV:
+            runner([LAUNCHCTL, "unsetenv", key], 5)
+        return f"Codex env: снят (LaunchAgent {CODEX_ENV_LABEL} выгружен, env очищен, plist удалён)."
     except Exception as exc:
         return f"Codex env: не снят ({str(exc)[:80]})."
 
@@ -406,19 +401,30 @@ def _ensure_home_bin_in_path(env) -> str:
 
 
 def _remove_home_bin_from_path() -> str:
-    """Убрать srouter-блок ~/bin из ~/.zshrc (симметрично _ensure_home_bin_in_path). Marker-gate."""
+    """Убрать srouter-блок ~/bin из ~/.zshrc (симметрично _ensure_home_bin_in_path). Marker-gate.
+
+    Удаляет ТОЛЬКО наш управляемый блок: маркер + следующую за ним строку export. Чужой
+    `export PATH="$HOME/bin:$PATH"` в другом месте файла — НЕ трогаем (правило «чужое не трогать»).
+    """
     try:
         zshrc = _zshrc_path()
         if not zshrc.exists():
             return "PATH: не был изменён."
-        content = zshrc.read_text(encoding="utf-8")
-        if ZSHRC_PATH_MARKER not in content:
+        lines = zshrc.read_text(encoding="utf-8").splitlines()
+        if ZSHRC_PATH_MARKER not in lines:
             return "PATH: не был изменён."
-        # Убрать блок: marker + следующую строку export PATH="$HOME/bin:$PATH".
-        lines = content.splitlines()
-        kept = [ln for ln in lines if ZSHRC_PATH_MARKER not in ln
-                and ln.strip() != 'export PATH="$HOME/bin:$PATH"']
-        _write_text_atomic(zshrc, "\n".join(kept).rstrip() + "\n")
+        # Найти индекс маркера, удалить его + следующую строку (наш export PATH).
+        out = []
+        i = 0
+        while i < len(lines):
+            if lines[i] == ZSHRC_PATH_MARKER:
+                # Пропустить маркер и следующую строку (управляемый блок). Если следующая не наш
+                # export — всё равно пропускаем (мы её сами добавили после маркера при install).
+                i += 2
+                continue
+            out.append(lines[i])
+            i += 1
+        _write_text_atomic(zshrc, "\n".join(out).rstrip() + "\n")
         return "PATH: ~/bin убран из ~/.zshrc."
     except Exception as exc:
         return f"PATH: не убран ({str(exc)[:80]})."
@@ -499,7 +505,7 @@ def cmd_install(args) -> int:
         # Codex SOCKS5-wrappers (~/.local/bin wrappers через ~/bin) + launchctl env + PATH —
         # чтобы Codex (CLI и App) ходил напрямую в xray (10808), минуя privoxy (портит WS-стриминг).
         codex_note = _install_codex_wrappers(env)
-        env_note = _install_launchctl_env()
+        env_note = _install_launchctl_env(env, runner)
         path_note = _ensure_home_bin_in_path(env)
         print("Установка стека завершена: brew-сервисы, конфиги, DNS, LaunchAgent применены.\n"
               f"{cp_note}\n"
@@ -566,7 +572,7 @@ def cmd_uninstall(args) -> int:
     ppp_note = ". " + _remove_ppp_hook(runner)
     # 7) Удалить Codex SOCKS5-wrappers + снять launchctl env + убрать ~/bin из PATH (ставил install).
     codex_note = ". " + _remove_codex_wrappers()
-    env_note = ". " + _remove_launchctl_env()
+    env_note = ". " + _remove_launchctl_env(runner)
     path_note = ". " + _remove_home_bin_from_path()
 
     print("Откат завершён: brew-сервисы остановлены, конфиги восстановлены/оставлены, "

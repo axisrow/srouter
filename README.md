@@ -172,7 +172,7 @@ srouter install
 #   • настраивает DNS, устанавливает LaunchAgent дашборда и watchdog;
 #   • ставит ppp-hook для мгновенного split-route при VPN;
 #   • настраивает прокси для Claude Code и git (github.com);
-#   • ставит Codex SOCKS5-wrappers (~/.local/bin/codex + codex-app-proxy) + глобальный env через
+#   • ставит Codex SOCKS5-wrappers (~/bin/codex + codex-app-proxy) + глобальный env через
 #     LaunchAgent + ~/bin в PATH — чтобы Codex (CLI и App) ходил напрямую в xray, минуя privoxy;
 #   • показывает план и спрашивает подтверждение.
 srouter status         # проверить, что демон работает (http://127.0.0.1:8787)
@@ -217,7 +217,7 @@ privoxy — он SOCKS5 не умеет):
 - **`~/bin/codex-app-proxy`** — wrapper App: `open -na Codex.app --args --proxy-server=socks5://...`
   (Chromium flag; env не дублирует). **Codex.app запускать через него, а не иконку Dock**
   (Dock не передаёт `--proxy-server`).
-- **LaunchAgent `com.srouter.codex-env`** — глобальный env (`socks5h://...` + `NO_PROXY=loopback`)
+- **LaunchAgent `com.srouter.codenv`** — глобальный env (`socks5h://...` + `NO_PROXY=localhost,127.0.0.1,::1`)
   через plist с `EnvironmentVariables` (переживает ребут). Эмпирически: Claude.app/ChatGPT.app на
   System Settings SOCKS, global env их не ломает.
 - **`~/bin` в `~/.zshrc`** — чтобы wrapper был раньше системного codex в PATH.
@@ -235,7 +235,7 @@ privoxy — он SOCKS5 не умеет):
 | Инструмент | Подключение |
 |---|---|
 | **Claude Code** | `HTTPS_PROXY=http://127.0.0.1:8118` в `~/.claude/settings.json` (privoxy HTTP; SOCKS5 CC не умеет) |
-| **Codex CLI/App** | **напрямую SOCKS5 в xray** (`socks5h://127.0.0.1:10808`) через wrappers + LaunchAgent env, минуя privoxy. privoxy портит WS-стриминг Codex (`Reconnecting`/`request timed out`); `[network] proxy_url` в `~/.codex/config.toml` Codex игнорирует для WS — поэтому wrappers в `~/bin/codex` (CLI) + `~/bin/codex-app-proxy` (App, `--proxy-server` для Chromium) + глобальный env через `com.srouter.codex-env` LaunchAgent (переживает ребут). Запускать Codex **App** через `~/bin/codex-app-proxy`, а не иконку Dock (Dock не передаёт `--proxy-server`). |
+| **Codex CLI/App** | **напрямую SOCKS5 в xray** (`socks5h://127.0.0.1:10808`) через wrappers + LaunchAgent env, минуя privoxy. privoxy портит WS-стриминг Codex (`Reconnecting`/`request timed out`); `[network] proxy_url` в `~/.codex/config.toml` Codex игнорирует для WS — поэтому wrappers в `~/bin/codex` (CLI) + `~/bin/codex-app-proxy` (App, `--proxy-server` для Chromium) + глобальный env через `com.srouter.codenv` LaunchAgent (переживает ребут). Запускать Codex **App** через `~/bin/codex-app-proxy`, а не иконку Dock (Dock не передаёт `--proxy-server`). |
 | **git / gh** | домены GitHub в вайтлисте узла → резолв и трафик через ускоритель |
 | **Браузер** | системный SOCKS5 `127.0.0.1:10808` (вайтлист разруливает сам) |
 
@@ -369,7 +369,7 @@ srouter install
 #   • sets DNS, installs the dashboard LaunchAgent and watchdog;
 #   • sets up ppp-hook for instant split-route on VPN up;
 #   • configures proxy for Claude Code and git (github.com);
-#   • installs Codex SOCKS5-wrappers (~/.local/bin/codex + codex-app-proxy) + global env via
+#   • installs Codex SOCKS5-wrappers (~/bin/codex + codex-app-proxy) + global env via
 #     LaunchAgent + ~/bin in PATH — so Codex (CLI and App) goes straight to xray, bypassing privoxy;
 #   • prints a plan and asks for confirmation.
 srouter status         # check the daemon is up (http://127.0.0.1:8787)
@@ -414,7 +414,7 @@ stays on privoxy — it can't do SOCKS5):
 - **`~/bin/codex-app-proxy`** — App wrapper: `open -na Codex.app --args --proxy-server=socks5://...`
   (Chromium flag; no env duplication). **Launch Codex.app via this, not the Dock icon** (Dock doesn't
   pass `--proxy-server`).
-- **LaunchAgent `com.srouter.codex-env`** — global env (`socks5h://...` + `NO_PROXY=loopback`) via a
+- **LaunchAgent `com.srouter.codenv`** — global env (`socks5h://...` + `NO_PROXY=localhost,127.0.0.1,::1`) via a
   plist with `EnvironmentVariables` (survives reboot). Empirically: Claude.app/ChatGPT.app use System
   Settings SOCKS, so the global env doesn't break them.
 - **`~/bin` in `~/.zshrc`** — so the wrapper precedes the system codex in PATH.

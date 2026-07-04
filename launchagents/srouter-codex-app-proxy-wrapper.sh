@@ -3,7 +3,7 @@
 #
 # Codex.app (GUI из Dock/Spotlight) → Chromium через SOCKS5 (--proxy-server=socks5://127.0.0.1:10808),
 # минуя privoxy (портит WS-стриминг Codex). HTTP_PROXY env ставится srouter install глобально через
-# launchctl setenv — здесь НЕ дублируется (env уже в GUI-окружении).
+# LaunchAgent com.srouter.codenv (launchctl setenv в GUI-домен) — здесь НЕ дублируется.
 #
 # Запускать Codex.app ЧЕРЕЗ ЭТОТ WRAPPER, а не иконку Dock (Dock не передаёт --proxy-server).
 # Electron single-instance: сначала quit/pkill старого Codex, иначе аргументы уйдут в старый процесс.
@@ -35,5 +35,5 @@ sleep 1
 
 open -na "$APP_BUNDLE" --args "--proxy-server=$CHROMIUM_PROXY_URL" "$@"
 
-print -r -- "Started Codex.app through $CHROMIUM_PROXY_URL (env via srouter install launchctl setenv)"
+print -r -- "Started Codex.app through $CHROMIUM_PROXY_URL (env via srouter install LaunchAgent com.srouter.codenv)"
 print -r -- "Log: $LOG"

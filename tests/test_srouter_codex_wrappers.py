@@ -22,13 +22,16 @@ def _mock_home(monkeypatch, tmp_path):
 
 
 def _env(tmp_path):
-    """Минимальный InstallEnv: root=реальный репо (шаблоны launchagents/ оттуда)."""
+    """Минимальный InstallEnv: root=реальный репо (шаблоны launchagents/ оттуда).
+    launchagent_dir = home/Library/LaunchAgents (как прод) — _install_launchctl_env пишет туда,
+    _remove_launchctl_env ищет там же; путь должен совпадать."""
+    home = Path.home()  # monkeypatched _mock_home
     import install_lib
     return install_lib.InstallEnv(
         root=Path(__file__).resolve().parent.parent,
         prefix=tmp_path / "homebrew",
         state_path=tmp_path / "srouter.local.json",
-        launchagent_dir=tmp_path / "LaunchAgents",
+        launchagent_dir=home / "Library" / "LaunchAgents",
         python_bin="/usr/bin/python3",
         now="2026-07-04T00-00-00Z",
     )
@@ -114,49 +117,91 @@ def test_remove_marker_gate_foreign(monkeypatch, tmp_path):
     assert (home / "bin" / "codex").read_text(encoding="utf-8") == foreign
 
 
-# ============================ _install/_remove_launchctl_env (LaunchAgent plist) ============================
-def test_install_launchctl_env_writes_plist_and_bootstraps(monkeypatch, tmp_path):
-    """install пишет LaunchAgent plist с EnvironmentVariables (все proxy-ключи) + bootstrap его."""
-    home = _mock_home(monkeypatch, tmp_path)
+# ============================ _install/_remove_launchctl_env (LaunchAgent com.srouter.codenv) ============================
+def _fake_runner():
+    """Фейк runner (как make_privileged_runner) — собирает вызовы, всегда успех."""
     calls = []
-    monkeypatch.setattr(srouter, "run", lambda cmd, t: (calls.append(list(cmd)),
-                                                         {"rc": 0, "out": "", "err": "", "timeout": False})[1])
-    srouter._install_launchctl_env()
+    def runner(cmd, timeout):
+        calls.append(list(cmd))
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+    runner.calls = calls
+    return runner
 
-    plist = home / "Library" / "LaunchAgents" / srouter.CODEX_ENV_PLIST
-    assert plist.exists(), "LaunchAgent plist создан"
+
+def test_install_launchctl_env_writes_plist(monkeypatch, tmp_path):
+    """install пишет LaunchAgent com.srouter.codenv (через _install_generic_launchagent) + bootstrap."""
+    home = _mock_home(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    runner = _fake_runner()
+
+    note = srouter._install_launchctl_env(env, runner)
+
+    assert "загружен" in note, f"install должен éxito: {note}"
+    plist = home / "Library" / "LaunchAgents" / f"{srouter.CODEX_ENV_LABEL}.plist"
+    assert plist.exists(), "plist создан"
     plist_text = plist.read_text(encoding="utf-8")
     assert srouter.CODEX_ENV_MARKER in plist_text, "plist содержит srouter-маркер"
-    assert "EnvironmentVariables" in plist_text
-    for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "NO_PROXY"):
-        assert f"<key>{key}</key>" in plist_text, f"plist содержит env-ключ {key}"
-    assert "socks5h://" in plist_text, "plist содержит socks5h URL"
-    # bootstrap вызван (загрузка plist в launchd).
-    bootstraps = [c for c in calls if len(c) > 1 and c[1] == "bootstrap"]
-    assert bootstraps, "launchctl bootstrap вызван"
+    # Шаблон рендерит label + путь к скрипту setenv.
+    assert srouter.CODEX_ENV_LABEL in plist_text
+    assert "srouter-codex-env.sh" in plist_text
+    # bootstrap вызван (_launchd_reload).
+    assert any(len(c) > 1 and c[1] == "bootstrap" for c in runner.calls), "bootstrap вызван"
+
+
+def test_install_launchctl_env_marker_gate_foreign(monkeypatch, tmp_path):
+    """Чужой plist com.srouter.codenv (без маркера srouter) — НЕ перезаписывать."""
+    home = _mock_home(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    runner = _fake_runner()
+    plist = home / "Library" / "LaunchAgents" / f"{srouter.CODEX_ENV_LABEL}.plist"
+    plist.parent.mkdir(parents=True, exist_ok=True)
+    foreign = "<?xml version='1.0'?><plist version='1.0'><dict><key>Label</key><string>other</string></dict></plist>"
+    plist.write_text(foreign, encoding="utf-8")
+
+    note = srouter._install_launchctl_env(env, runner)
+
+    assert "чуж" in note.lower(), f"должен отказаться трогать чужой plist: {note}"
+    assert plist.read_text(encoding="utf-8") == foreign, "чужой plist не перезаписан"
 
 
 def test_remove_launchctl_env_bootouts_and_unlinks(monkeypatch, tmp_path):
-    """uninstall делает bootout + удаляет plist."""
+    """uninstall делает bootout + unsetenv + удаляет plist."""
     home = _mock_home(monkeypatch, tmp_path)
-    calls = []
-    monkeypatch.setattr(srouter, "run", lambda cmd, t: (calls.append(list(cmd)),
-                                                         {"rc": 0, "out": "", "err": "", "timeout": False})[1])
-    srouter._install_launchctl_env()  # ставим
-    plist = home / "Library" / "LaunchAgents" / srouter.CODEX_ENV_PLIST
+    env = _env(tmp_path)
+    runner = _fake_runner()
+    srouter._install_launchctl_env(env, runner)
+    plist = home / "Library" / "LaunchAgents" / f"{srouter.CODEX_ENV_LABEL}.plist"
     assert plist.exists()
 
-    srouter._remove_launchctl_env()
+    note = srouter._remove_launchctl_env(runner)
 
+    assert "снят" in note.lower()
     assert not plist.exists(), "plist удалён"
-    bootouts = [c for c in calls if len(c) > 1 and c[1] == "bootout"]
-    assert bootouts, "launchctl bootout вызван"
+    assert any(len(c) > 1 and c[1] == "bootout" for c in runner.calls), "bootout вызван"
+    # unsetenv для всех proxy-ключей (env ставил скрипт setenv при загрузке).
+    unsetenvs = {c[2] for c in runner.calls if len(c) > 1 and c[1] == "unsetenv"}
+    assert {"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"} <= unsetenvs
+
+
+def test_remove_launchctl_env_marker_gate_foreign(monkeypatch, tmp_path):
+    """Чужой plist (без маркера) — НЕ удалять."""
+    home = _mock_home(monkeypatch, tmp_path)
+    runner = _fake_runner()
+    plist = home / "Library" / "LaunchAgents" / f"{srouter.CODEX_ENV_LABEL}.plist"
+    plist.parent.mkdir(parents=True, exist_ok=True)
+    foreign = "<?xml version='1.0'?><plist version='1.0'><dict/>"
+    plist.write_text(foreign, encoding="utf-8")
+
+    note = srouter._remove_launchctl_env(runner)
+
+    assert "чуж" in note.lower()
+    assert plist.exists(), "чужой plist не удалён"
 
 
 def test_remove_launchctl_env_when_not_installed(monkeypatch, tmp_path):
     """Нечего удалять (plist нет) — мягкий статус, не ошибка."""
     _mock_home(monkeypatch, tmp_path)
-    note = srouter._remove_launchctl_env()
+    note = srouter._remove_launchctl_env(_fake_runner())
     assert "не был" in note.lower()
 
 
@@ -202,6 +247,29 @@ def test_remove_home_bin_from_path_removes_block(monkeypatch, tmp_path):
     assert srouter.ZSHRC_PATH_MARKER not in content, "маркер убран"
     assert 'export PATH="$HOME/bin:$PATH"' not in content, "srouter-строка PATH убрана"
     assert '/usr/local/bin' in content, "чужой export сохранён"
+
+
+def test_remove_home_bin_keeps_foreign_home_bin_export(monkeypatch, tmp_path):
+    """Regression (cycle-review): чужой `export PATH="$HOME/bin:..."` в ДРУГОМ месте файла — НЕ удалять.
+
+    Раньше _remove_home_bin_from_path удалял ВСЕ строки `export PATH="$HOME/bin:$PATH"`, даже чужие.
+    Теперь удаляет только управляемый блок (маркер + следующая строка).
+    """
+    home = _mock_home(monkeypatch, tmp_path)
+    zshrc = home / ".zshrc"
+    # Чужой export PATH="$HOME/bin:..." в начале + наш блок ниже.
+    zshrc.write_text(
+        'export PATH="$HOME/bin:$PATH"\n'  # ЧУЖОЙ — должен остаться
+        f'# user custom\n{srouter.ZSHRC_PATH_MARKER}\nexport PATH="$HOME/bin:$PATH"\n',
+        encoding="utf-8")
+
+    srouter._remove_home_bin_from_path()
+
+    content = zshrc.read_text(encoding="utf-8")
+    assert srouter.ZSHRC_PATH_MARKER not in content, "наш маркер убран"
+    # ЧУЖОЙ export в начале — остался (считаем количество: был 2, стал 1 — только чужой).
+    assert content.count('export PATH="$HOME/bin:$PATH"') == 1, \
+        "чужой export сохранён, наш убран"
 
 
 def test_remove_home_bin_when_not_modified(monkeypatch, tmp_path):
