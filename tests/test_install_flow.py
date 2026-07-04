@@ -252,7 +252,7 @@ def test_install_retries_bootstrap_when_domain_busy(monkeypatch, tmp_path):
         if sub == "bootstrap":
             n = sum(1 for c in calls if c[1] == "bootstrap")
             return {"rc": 5 if n == 1 else 0, "out": "", "err": "", "timeout": False}
-        # list (для _launchd_default_is_loaded / poll) → не загружен, выгрузился сразу.
+        # list (для _launchd_is_loaded / poll) → не загружен, выгрузился сразу.
         if sub == "list":
             return {"rc": 0, "out": "999\t0\tcom.other\n", "err": "", "timeout": False}
         return {"rc": 0, "out": "", "err": "", "timeout": False}

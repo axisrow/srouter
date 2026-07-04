@@ -117,6 +117,14 @@ def test_restart_waits_for_unload_after_bootout(monkeypatch):
 
     rc = srouter.cmd_restart(_args())
     assert rc == 0
+    bootstraps = _bootstraps(calls)
+    assert len(bootstraps) == 1, "bootstrap вызывается ровно один раз после выгрузки"
+    # bootstrap должен идти ПОСЛЕ list→False (полной выгрузки), а не до неё.
+    subs = [c[1] for c in calls if len(c) > 1]
+    first_bootstrap = subs.index("bootstrap")
+    # Все list-вызовы до bootstrap: последний из них должен вернуть выгрузку (loaded-чередование в _make_runner).
+    lists_before = [c for c in calls[:first_bootstrap] if len(c) > 1 and c[1] == "list"]
+    assert len(lists_before) >= 2, "poll должен увидеть и loaded=True, и последующий loaded=False до bootstrap"
 
 
 def test_start_idempotent_when_already_loaded(monkeypatch):

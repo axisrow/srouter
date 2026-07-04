@@ -386,11 +386,18 @@ def cmd_start(args) -> int:
     if not plist.exists():
         print("Служба не установлена. Сначала выполните: srouter install", file=sys.stderr)
         return 2
-    if _is_loaded():
+    loaded = _is_loaded()
+    if loaded is True:
         print(f"Демон уже запущен: {LAUNCHAGENT_LABEL}")
         return 0
-    # Надёжная загрузка через _launchd_reload (bootout — no-op для незагруженного; bootstrap с retry
-    # покрывает гонку, если кто-то только что сделал stop → start вручную с малой задержкой).
+    if loaded is None:
+        # launchctl list таймаутит — состояние неизвестно. Не делаем bootout (он убил бы работающий
+        # демон, если таймаут скрыл, что он загружен). Просим пользователя проверить status.
+        print("Не удалось узнать состояние демона (timeout launchctl). Проверьте: srouter status",
+              file=sys.stderr)
+        return 2
+    # loaded is False — демон точно не загружен, _launchd_reload безопасен (bootout = no-op).
+    # bootstrap с retry покрывает гонку, если кто-то только что сделал stop → start с малой задержкой.
     res = _launchd_reload(_launchd_domain(), plist, LAUNCHAGENT_LABEL, runner=run)
     if not res["ok"]:
         print(f"Не удалось запустить демон: {res.get('last_err') or 'unknown error'}", file=sys.stderr)

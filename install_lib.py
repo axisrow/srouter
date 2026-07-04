@@ -199,7 +199,9 @@ def _launchd_reload(domain, plist, label, *, runner=run):
     runner — функция cmd/timeout → dict (как _install_launchagent принимает; по умолчанию sys_probe.run).
              ВСЕ launchctl-вызовы (bootout, list, bootstrap) идут через него — единая точка для тестов.
     """
-    is_loaded = lambda: _launchd_is_loaded(label, runner=runner)
+
+    def is_loaded():
+        return _launchd_is_loaded(label, runner=runner)
 
     # 1. bootout (игнорируем rc — уже выгружен = не ошибка).
     runner([LAUNCHCTL, "bootout", f"{domain}/{label}"], 10)
@@ -215,12 +217,13 @@ def _launchd_reload(domain, plist, label, *, runner=run):
     for _ in range(_BOOTSTRAP_MAX_RETRIES):
         b = runner([LAUNCHCTL, "bootstrap", domain, str(plist)], 15)
         if b.get("timeout"):
+            # launchctl может таймаутить, но агента всё-таки поднять (медленный диск) — проверим.
             last_err = "timeout"
-            continue
-        if b.get("rc") == 0:
+        elif b.get("rc") == 0:
             return {"ok": True, "last_err": ""}
-        # soft-success: bootstrap вернул ненулевой rc, но агент всё-таки поднялся.
-        last_err = b.get("err") or b.get("out") or "bootstrap failed"
+        else:
+            last_err = b.get("err") or b.get("out") or "bootstrap failed"
+        # soft-success: bootstrap вернул ненулевой rc/timeout, но агент всё-таки поднялся.
         if is_loaded():
             return {"ok": True, "last_err": ""}
         time.sleep(_BOOTSTRAP_RETRY_DELAY)
