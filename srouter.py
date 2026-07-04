@@ -19,7 +19,9 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import os
+import time
 import shlex
+import shutil
 import sys
 from pathlib import Path
 from importlib.metadata import PackageNotFoundError, version
@@ -34,10 +36,13 @@ from install_lib import (
     LAUNCHAGENT_LABEL,
     LAUNCHCTL,
     InstallEnv,
+    _BOOTOUT_POLL_INTERVAL,
+    _BOOTOUT_SETTLE_MAX_WAIT,
     _has_launchagent_marker,
     _launchd_domain,
     _launchd_is_loaded,
     _launchd_reload,
+    _write_text_atomic,
     apply_install,
     apply_uninstall,
     build_plan,
@@ -232,6 +237,231 @@ def _remove_ppp_hook(runner) -> str:
         return f"PPP-hook: не удалён ({str(exc)[:60]})."
 
 
+# ============================ Codex SOCKS5-wrappers + launchctl env ============================
+# Codex (CLI + App) работает стабильно только через SOCKS5 (xray 10808) минуя privoxy (портит WS).
+# srouter install ставит ~/bin/codex + ~/bin/codex-app-proxy + launchctl env (через LaunchAgent
+# plist, переживает ребут) + ~/bin в PATH; uninstall убирает. Канон — _install_ppp_hook
+# (best-effort, marker-gate, строка-статус).
+# URL SOCKS5 — из dashboard_common (SOCKS_PROXY_URL), единый источник правды для xray-порта.
+# except BaseException (не Exception): dashboard_common raise SystemExit при отсутствии
+# srouter_config.py, а SystemExit не ловится Exception — fallback должен сработать и для него.
+try:
+    from dashboard_common import SOCKS_PROXY_URL as _CODEX_PROXY_URL
+except BaseException:
+    _CODEX_PROXY_URL = "socks5h://127.0.0.1:10808"
+CODEX_NO_PROXY = "localhost,127.0.0.1,::1"
+# (env-key, value) — единый список для install/setenv и uninstall/unsetenv (синхронны всегда).
+CODEX_LAUNCHCTL_ENV = tuple((k, _CODEX_PROXY_URL) for k in
+                            ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+                             "http_proxy", "https_proxy", "all_proxy")) \
+                      + (("NO_PROXY", CODEX_NO_PROXY), ("no_proxy", CODEX_NO_PROXY))
+# Wrappers: (name, template, marker). Цикл в install/remove — не два явных вызова.
+CODEX_WRAPPERS = (
+    ("codex", "srouter-codex-cli-wrapper.sh", "# srouter: codex CLI wrapper (managed)"),
+    ("codex-app-proxy", "srouter-codex-app-proxy-wrapper.sh", "# srouter: codex-app-proxy wrapper (managed)"),
+)
+# LaunchAgent для глобального env: launchctl setenv SOCKS5 в GUI-домен (переживает ребут).
+# Label = com.srouter.codenv → prefix CODENV для плейсхолдеров __SROUTER_CODENV_*__ в шаблоне plist.
+CODEX_ENV_LABEL = "com.srouter.codenv"
+CODEX_ENV_MARKER = "srouter-managed-codex-env-v1"
+ZSHRC_PATH_MARKER = "# srouter: ~/bin в PATH для codex wrapper"
+
+
+def _codex_wrapper_path(name: str) -> Path:
+    """Путь к wrapper в ~/bin (вычисляется динамически — дружелюбно к мокам Path.home в тестах)."""
+    return Path.home() / "bin" / name
+
+
+def _zshrc_path() -> Path:
+    """Путь к ~/.zshrc (динамически, для моков Path.home в тестах)."""
+    return Path.home() / ".zshrc"
+
+
+def _codex_bin_path() -> str:
+    """Абсолютный путь к реальному codex binary (не наш wrapper). shutil.which минуя ~/bin/codex,
+    fallback на homebrew-пути (Apple Silicon / Intel). None если не найден — wrapper будет WARN."""
+    wrapper = _codex_wrapper_path("codex")
+    found = shutil.which("codex")
+    if found and Path(found).resolve() != wrapper.resolve():
+        return found
+    for cand in (str(Path(BREW).parent / "codex"), "/opt/homebrew/bin/codex", "/usr/local/bin/codex"):
+        if Path(cand).exists():
+            return cand
+    return ""  # не найден — _install_one_wrapper покажет WARN
+
+
+def _install_one_wrapper(env, wrapper_path: Path, template_name: str, marker: str) -> str:
+    """Поставить один wrapper. Marker-gate (чужой — не трогаем) + atomic write + chmod +x."""
+    try:
+        if wrapper_path.exists() and marker not in wrapper_path.read_text(encoding="utf-8"):
+            return f"Codex {wrapper_path.name}: чужой {wrapper_path} — не трогаем."
+        codex_bin = _codex_bin_path()
+        if not codex_bin:
+            return f"Codex {wrapper_path.name}: codex binary не найден — wrapper не установлен (установи codex)."
+        template = (env.root / "launchagents" / template_name).read_text(encoding="utf-8")
+        rendered = template.replace("__SROUTER_CODEX_BIN__", codex_bin)
+        wrapper_path.parent.mkdir(parents=True, exist_ok=True)
+        if not _write_text_atomic(wrapper_path, rendered):
+            return f"Codex {wrapper_path.name}: не записан (ошибка atomic write)."
+        wrapper_path.chmod(0o755)
+        return f"Codex {wrapper_path.name}: установлен ({wrapper_path} — SOCKS5 минуя privoxy)."
+    except Exception as exc:
+        return f"Codex {wrapper_path.name}: не установлен ({str(exc)[:80]})."
+
+
+def _install_codex_wrappers(env) -> str:
+    """Поставить ~/bin/codex + ~/bin/codex-app-proxy. Best-effort, цикл по CODEX_WRAPPERS."""
+    return "\n".join(_install_one_wrapper(env, _codex_wrapper_path(name), tmpl, marker)
+                     for name, tmpl, marker in CODEX_WRAPPERS)
+
+
+def _remove_one_wrapper(wrapper_path: Path, marker: str) -> str:
+    """Удалить один wrapper (если srouter-managed). Marker-gate обязательный."""
+    try:
+        if not wrapper_path.exists():
+            return f"Codex {wrapper_path.name}: не был установлен."
+        if marker not in wrapper_path.read_text(encoding="utf-8"):
+            return f"Codex {wrapper_path.name}: чужой {wrapper_path} — не трогаем."
+        wrapper_path.unlink()
+        return f"Codex {wrapper_path.name}: удалён."
+    except Exception as exc:
+        return f"Codex {wrapper_path.name}: не удалён ({str(exc)[:60]})."
+
+
+def _remove_codex_wrappers() -> str:
+    """Удалить wrappers (если srouter-managed). Цикл по CODEX_WRAPPERS, единый разделитель с install."""
+    return "\n".join(_remove_one_wrapper(_codex_wrapper_path(name), marker)
+                     for name, _, marker in CODEX_WRAPPERS)
+
+
+def _install_launchctl_env(env, runner) -> str:
+    """Глобальный SOCKS5 env через LaunchAgent (RunAtLoad + launchctl setenv). Переживает ребут.
+
+    launchctl setenv кладёт переменные в GUI-домен launchd → все GUI-приложения их видят. Но setenv
+    сам по себе не переживает ребут — LaunchAgent com.srouter.codenv (RunAtLoad + StartInterval=300)
+    вызывает скрипт srouter-codex-env.sh, который делает setenv при загрузке и каждые 5мин.
+    Эмпирически: Claude.app/ChatGPT.app на System Settings SOCKS, global env их не ломает.
+
+    Через _install_generic_launchagent (как watchdog): marker-gate + atomic write + _launchd_reload
+    (bootout→poll→bootstrap-retry, решает гонку занятого домена — PR #80).
+    """
+    try:
+        # Предупредить, если в GUI-домене уже есть ЧУЖОЙ прокси (корпоративный/ручной) — setenv
+        # скрипта его перезапишет без восстановления. Не блокируем, но WARN в статусе.
+        warn = ""
+        existing = runner([LAUNCHCTL, "getenv", "HTTP_PROXY"], 5)
+        val = (existing.get("out") or "").strip()
+        if val and "127.0.0.1:10808" not in val:
+            warn = f" ВНИМАНИЕ: существующий GUI HTTP_PROXY={val[:40]} будет перезаписан (backup не делается)."
+        ok, err = _install_generic_launchagent(
+            env, runner,
+            template_name="com.srouter.codenv.plist",
+            label=CODEX_ENV_LABEL,
+            marker=CODEX_ENV_MARKER,
+            script_path=env.root / "launchagents" / "srouter-codex-env.sh",
+        )
+        if ok:
+            return (f"Codex env: LaunchAgent {CODEX_ENV_LABEL} загружен (SOCKS5 в GUI-домен, "
+                    f"переживает ребут).{warn}")
+        if err.endswith("_foreign"):
+            return f"Codex env: чужой LaunchAgent {CODEX_ENV_LABEL} — не трогаем."
+        return f"Codex env: не установлен ({err})."
+    except Exception as exc:
+        return f"Codex env: не установлен ({str(exc)[:80]})."
+
+
+def _remove_launchctl_env(runner) -> str:
+    """Выгрузить LaunchAgent env + снять переменные + удалить plist.
+
+    Порядок важен: bootout ПЕРЕД unlink. Если bootout не сработал, а агент всё ещё загружен
+    (_launchd_is_loaded), НЕ удаляем plist — иначе StartInterval-агент останется в памяти и будет
+    пере-применять мёртвый socks5 env каждые 5 мин (утечка нерабочего прокси в GUI-домен).
+    """
+    try:
+        plist_path = Path.home() / "Library" / "LaunchAgents" / f"{CODEX_ENV_LABEL}.plist"
+        if not plist_path.exists():
+            return "Codex env: не был установлен."
+        if CODEX_ENV_MARKER not in plist_path.read_text(encoding="utf-8"):
+            return f"Codex env: чужой LaunchAgent {CODEX_ENV_LABEL} — не трогаем."
+        # bootout агента (через runner — симметрия с install). bootout на незагруженном = не ошибка.
+        runner([LAUNCHCTL, "bootout", f"{_launchd_domain()}/{CODEX_ENV_LABEL}"], 10)
+        # Poll-wait: launchd не мгновенно отражает выгрузку (гонка, которую _launchd_reload чинил
+        # в PR #80). Без этого _launchd_is_loaded вернёт True в окне → ложный «ещё загружен» → plist
+        # оставлен + StartInterval-агент пере-применяет мёртвый env. Ждём как в _launchd_reload.
+        deadline = time.monotonic() + _BOOTOUT_SETTLE_MAX_WAIT
+        loaded = _launchd_is_loaded(CODEX_ENV_LABEL, runner=runner)
+        while loaded and time.monotonic() < deadline:
+            time.sleep(_BOOTOUT_POLL_INTERVAL)
+            loaded = _launchd_is_loaded(CODEX_ENV_LABEL, runner=runner)
+        # None = unknown (launchctl list timeout) — fail-safe: НЕ удаляем plist (оставить контроль).
+        # True = агент реально ещё загружен после settle — тоже не удаляем.
+        if loaded is not False:
+            return (f"Codex env: LaunchAgent {CODEX_ENV_LABEL} {'не подтверждена выгрузка' if loaded is None else 'всё ещё загружен'} "
+                    f"после bootout — plist оставлен (не удалять контроль). Проверь: launchctl list | grep {CODEX_ENV_LABEL}")
+        plist_path.unlink()
+        # Снять переменные из GUI-домена (setenv делал скрипт при загрузке).
+        for key, _ in CODEX_LAUNCHCTL_ENV:
+            runner([LAUNCHCTL, "unsetenv", key], 5)
+        return f"Codex env: снят (LaunchAgent {CODEX_ENV_LABEL} выгружен, env очищен, plist удалён)."
+    except Exception as exc:
+        return f"Codex env: не снят ({str(exc)[:80]})."
+
+
+def _ensure_home_bin_in_path(env) -> str:
+    """Добавить ~/bin в PATH через ~/.zshrc (marker-gate + backup через install_lib._backup + atomic write).
+
+    CLI wrapper требует ~/bin раньше системного codex в PATH.
+    """
+    try:
+        from install_lib import _backup
+        zshrc = _zshrc_path()
+        block = f'\n{ZSHRC_PATH_MARKER}\nexport PATH="$HOME/bin:$PATH"\n'
+        if not zshrc.exists():
+            # Тот же порядок, что и append (marker → export), чтобы _remove_home_bin_from_path
+            # (удаляет marker + следующую строку) корректно убирал блок. Не export→marker (иначе
+            # uninstall оставит висячий export).
+            _write_text_atomic(zshrc, f'{ZSHRC_PATH_MARKER}\nexport PATH="$HOME/bin:$PATH"\n')
+            return "PATH: создан ~/.zshrc с ~/bin (новый терминал подхватит codex wrapper)."
+        content = zshrc.read_text(encoding="utf-8")
+        if ZSHRC_PATH_MARKER in content or '$HOME/bin' in content or "${HOME}/bin" in content:
+            return "PATH: ~/bin уже в ~/.zshrc (idempotent)."
+        _backup(zshrc, env)  # timestamped backup через каноничный helper
+        _write_text_atomic(zshrc, content + block)
+        return "PATH: ~/bin добавлен в ~/.zshrc (backup: .zshrc.srouter-backup-*)."
+    except Exception as exc:
+        return f"PATH: не изменён ({str(exc)[:80]})."
+
+
+def _remove_home_bin_from_path() -> str:
+    """Убрать srouter-блок ~/bin из ~/.zshrc (симметрично _ensure_home_bin_in_path). Marker-gate.
+
+    Удаляет ТОЛЬКО наш управляемый блок: маркер + следующую за ним строку export. Чужой
+    `export PATH="$HOME/bin:$PATH"` в другом месте файла — НЕ трогаем (правило «чужое не трогать»).
+    """
+    try:
+        zshrc = _zshrc_path()
+        if not zshrc.exists():
+            return "PATH: не был изменён."
+        lines = zshrc.read_text(encoding="utf-8").splitlines()
+        if ZSHRC_PATH_MARKER not in lines:
+            return "PATH: не был изменён."
+        # Найти индекс маркера, удалить его + следующую строку (наш export PATH).
+        out = []
+        i = 0
+        while i < len(lines):
+            if lines[i] == ZSHRC_PATH_MARKER:
+                # Пропустить маркер и следующую строку (управляемый блок). Если следующая не наш
+                # export — всё равно пропускаем (мы её сами добавили после маркера при install).
+                i += 2
+                continue
+            out.append(lines[i])
+            i += 1
+        _write_text_atomic(zshrc, "\n".join(out).rstrip() + "\n")
+        return "PATH: ~/bin убран из ~/.zshrc."
+    except Exception as exc:
+        return f"PATH: не убран ({str(exc)[:80]})."
+
+
 def cmd_install(args) -> int:
     """Полная установка стека: brew-сервисы + конфиги + DNS + LaunchAgent.
 
@@ -304,10 +534,18 @@ def cmd_install(args) -> int:
                    f"Watchdog: не установлен ({wd_err}).")
         # ppp-hook: мгновенный split-route при VPN up (/etc/ppp/ip-up, от root, без osascript).
         ppp_note = _install_ppp_hook(env, runner)
+        # Codex SOCKS5-wrappers (~/.local/bin wrappers через ~/bin) + launchctl env + PATH —
+        # чтобы Codex (CLI и App) ходил напрямую в xray (10808), минуя privoxy (портит WS-стриминг).
+        codex_note = _install_codex_wrappers(env)
+        env_note = _install_launchctl_env(env, runner)
+        path_note = _ensure_home_bin_in_path(env)
         print("Установка стека завершена: brew-сервисы, конфиги, DNS, LaunchAgent применены.\n"
               f"{cp_note}\n"
               f"{wd_note}\n"
               f"{ppp_note}\n"
+              f"{codex_note}\n"
+              f"{env_note}\n"
+              f"{path_note}\n"
               f"Дашборд: http://127.0.0.1:8787  (srouter status — проверить)")
         return 0
     blocked = ", ".join(result.get("blocked") or ["unknown"])
@@ -364,12 +602,19 @@ def cmd_uninstall(args) -> int:
 
     # 6) Удалить ppp-hook (/etc/ppp/ip-up) — мгновенный split-route больше не нужен.
     ppp_note = ". " + _remove_ppp_hook(runner)
+    # 7) Удалить Codex SOCKS5-wrappers + снять launchctl env + убрать ~/bin из PATH (ставил install).
+    codex_note = ". " + _remove_codex_wrappers()
+    env_note = ". " + _remove_launchctl_env(runner)
+    path_note = ". " + _remove_home_bin_from_path()
 
     print("Откат завершён: brew-сервисы остановлены, конфиги восстановлены/оставлены, "
           "DNS сброшен, LaunchAgent удалён"
           + (". split-route удалён." if route_rc == 0 else ", split-route не удалён — см. выше.")
           + cp_note
-          + ppp_note)
+          + ppp_note
+          + codex_note
+          + env_note
+          + path_note)
     return 0
 
 

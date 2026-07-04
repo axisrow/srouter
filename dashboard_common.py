@@ -37,6 +37,10 @@ except Exception as _exc:
 PRIVOXY = ("127.0.0.1", 8118)
 XRAY_SOCKS = ("127.0.0.1", 10808)
 HTTP_PROXY_URL = "http://127.0.0.1:8118"
+# SOCKS5 напрямую в xray (минуя privoxy) — для клиентов, умеющих SOCKS нативно (Codex).
+# socks5h:// = DNS резолвится прокси (важно за GFW); socks5:// — для Chromium --proxy-server (не понимает socks5h).
+SOCKS_PROXY_URL = f"socks5h://{XRAY_SOCKS[0]}:{XRAY_SOCKS[1]}"
+SOCKS_PROXY_URL_CHROMIUM = f"socks5://{XRAY_SOCKS[0]}:{XRAY_SOCKS[1]}"
 PROBE_SOCKS_HOST = "127.0.0.1"
 NODE_PROBE_TTL_SEC = 300
 
@@ -57,6 +61,8 @@ __all__ = [
     "PRIVOXY",
     "XRAY_SOCKS",
     "HTTP_PROXY_URL",
+    "SOCKS_PROXY_URL",
+    "SOCKS_PROXY_URL_CHROMIUM",
     "PROBE_SOCKS_HOST",
     "NODE_PROBE_TTL_SEC",
     "_first",
