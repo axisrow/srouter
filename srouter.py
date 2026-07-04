@@ -35,6 +35,9 @@ from install_lib import (
     LAUNCHCTL,
     InstallEnv,
     _has_launchagent_marker,
+    _launchd_domain,
+    _launchd_is_loaded,
+    _launchd_reload,
     apply_install,
     apply_uninstall,
     build_plan,
@@ -370,18 +373,10 @@ def cmd_uninstall(args) -> int:
     return 0
 
 
-def _launchd_domain() -> str:
-    """Домен launchd текущего пользователя: gui/<uid>."""
-    return f"gui/{os.getuid()}"
-
-
-def _is_loaded() -> bool | None:
-    """Загружен ли LaunchAgent в launchd (по launchctl list). None — не удалось узнать."""
-    r = run([LAUNCHCTL, "list"], 5)
-    if r.get("timeout"):
-        return None
-    return any(row.split() and row.split()[-1] == LAUNCHAGENT_LABEL
-               for row in (r.get("out") or "").splitlines())
+def _is_loaded():
+    """Загружен ли демон в launchd. Делегирует к install_lib._launchd_is_loaded (канон: единый
+    источник правды о launchd — CLI не дублирует парсинг launchctl list)."""
+    return _launchd_is_loaded(LAUNCHAGENT_LABEL, runner=run)
 
 
 def cmd_start(args) -> int:
@@ -391,13 +386,21 @@ def cmd_start(args) -> int:
     if not plist.exists():
         print("Служба не установлена. Сначала выполните: srouter install", file=sys.stderr)
         return 2
-    if _is_loaded():
+    loaded = _is_loaded()
+    if loaded is True:
         print(f"Демон уже запущен: {LAUNCHAGENT_LABEL}")
         return 0
-    r = run([LAUNCHCTL, "bootstrap", _launchd_domain(), str(plist)], 15)
-    if r.get("timeout") or r.get("rc") != 0:
-        print(f"Не удалось запустить демон: {r.get('err') or r.get('out') or 'unknown error'}",
+    if loaded is None:
+        # launchctl list таймаутит — состояние неизвестно. Не делаем bootout (он убил бы работающий
+        # демон, если таймаут скрыл, что он загружен). Просим пользователя проверить status.
+        print("Не удалось узнать состояние демона (timeout launchctl). Проверьте: srouter status",
               file=sys.stderr)
+        return 2
+    # loaded is False — демон точно не загружен, _launchd_reload безопасен (bootout = no-op).
+    # bootstrap с retry покрывает гонку, если кто-то только что сделал stop → start с малой задержкой.
+    res = _launchd_reload(_launchd_domain(), plist, LAUNCHAGENT_LABEL, runner=run)
+    if not res["ok"]:
+        print(f"Не удалось запустить демон: {res.get('last_err') or 'unknown error'}", file=sys.stderr)
         return 2
     print(f"Демон запущен: {LAUNCHAGENT_LABEL}")
     return 0
@@ -419,14 +422,16 @@ def cmd_stop(args) -> int:
 
 
 def cmd_restart(args) -> int:
-    """Перезапустить демон (применить правки кода). plist не трогается."""
+    """Перезапустить демон (применить правки кода). plist не трогается.
+
+    Через _launchd_reload: bootout → poll-wait выгрузки → bootstrap(retry). Решает гонку
+    «Bootstrap failed: 5: Input/output error», когда launchd не успевает освободить домен.
+    """
     env = _env_from_args(args)
     plist = env.launchagent_path()
-    # bootout (игнорируем ошибку если не загружен) + bootstrap.
-    run([LAUNCHCTL, "bootout", f"{_launchd_domain()}/{LAUNCHAGENT_LABEL}"], 10)
-    r = run([LAUNCHCTL, "bootstrap", _launchd_domain(), str(plist)], 15)
-    if r.get("timeout") or (r.get("rc") != 0 and not _is_loaded()):
-        print(f"Не удалось перезапустить демон: {r.get('err') or r.get('out') or 'unknown error'}",
+    res = _launchd_reload(_launchd_domain(), plist, LAUNCHAGENT_LABEL, runner=run)
+    if not res["ok"]:
+        print(f"Не удалось перезапустить демон: {res.get('last_err') or 'unknown error'}",
               file=sys.stderr)
         return 2
     print(f"Демон перезапущен: {LAUNCHAGENT_LABEL}")
