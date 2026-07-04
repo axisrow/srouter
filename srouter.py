@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import os
+import time
 import shlex
 import shutil
 import sys
@@ -35,6 +36,8 @@ from install_lib import (
     LAUNCHAGENT_LABEL,
     LAUNCHCTL,
     InstallEnv,
+    _BOOTOUT_POLL_INTERVAL,
+    _BOOTOUT_SETTLE_MAX_WAIT,
     _has_launchagent_marker,
     _launchd_domain,
     _launchd_is_loaded,
@@ -382,11 +385,19 @@ def _remove_launchctl_env(runner) -> str:
             return f"Codex env: чужой LaunchAgent {CODEX_ENV_LABEL} — не трогаем."
         # bootout агента (через runner — симметрия с install). bootout на незагруженном = не ошибка.
         runner([LAUNCHCTL, "bootout", f"{_launchd_domain()}/{CODEX_ENV_LABEL}"], 10)
-        # Если агент всё ещё загружен после bootout — НЕ удалять plist (оставить контроль).
-        # Иначе StartInterval пере-применит мёртвый env. Пусть пользователь разберётся вручную.
-        if _launchd_is_loaded(CODEX_ENV_LABEL, runner=runner):
-            return (f"Codex env: LaunchAgent {CODEX_ENV_LABEL} всё ещё загружен после bootout — "
-                    f"plist оставлен (не удалять контроль). Проверь: launchctl list | grep {CODEX_ENV_LABEL}")
+        # Poll-wait: launchd не мгновенно отражает выгрузку (гонка, которую _launchd_reload чинил
+        # в PR #80). Без этого _launchd_is_loaded вернёт True в окне → ложный «ещё загружен» → plist
+        # оставлен + StartInterval-агент пере-применяет мёртвый env. Ждём как в _launchd_reload.
+        deadline = time.monotonic() + _BOOTOUT_SETTLE_MAX_WAIT
+        loaded = _launchd_is_loaded(CODEX_ENV_LABEL, runner=runner)
+        while loaded and time.monotonic() < deadline:
+            time.sleep(_BOOTOUT_POLL_INTERVAL)
+            loaded = _launchd_is_loaded(CODEX_ENV_LABEL, runner=runner)
+        # None = unknown (launchctl list timeout) — fail-safe: НЕ удаляем plist (оставить контроль).
+        # True = агент реально ещё загружен после settle — тоже не удаляем.
+        if loaded is not False:
+            return (f"Codex env: LaunchAgent {CODEX_ENV_LABEL} {'не подтверждена выгрузка' if loaded is None else 'всё ещё загружен'} "
+                    f"после bootout — plist оставлен (не удалять контроль). Проверь: launchctl list | grep {CODEX_ENV_LABEL}")
         plist_path.unlink()
         # Снять переменные из GUI-домена (setenv делал скрипт при загрузке).
         for key, _ in CODEX_LAUNCHCTL_ENV:
