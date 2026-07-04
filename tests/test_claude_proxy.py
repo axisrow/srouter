@@ -88,9 +88,10 @@ def test_enable_handles_broken_json(monkeypatch, tmp_path):
 
 # ============================ NO_PROXY для z.ai (glm идёт напрямую, мимо privoxy) ============================
 def test_enable_adds_zai_no_proxy_from_anthropic_base_url(monkeypatch, tmp_path):
-    """enable ставит NO_PROXY с хостами из ANTHROPIC_BASE_URL — чтобы glm/z.ai шёл напрямую.
+    """enable ставит NO_PROXY с хостом из ANTHROPIC_BASE_URL — чтобы glm/z.ai шёл напрямую.
 
-    Без этого z.ai (через privoxy → xray → VPS) = лишний хоп. NO_PROXY = хост + parent-домен (.z.ai).
+    Без этого z.ai (через privoxy → xray → VPS) = лишний хоп. NO_PROXY = только хост (без suffix —
+    parent-доменная эвристика ломалась на country-TLD вроде .co.uk).
     """
     settings = _setup(monkeypatch, tmp_path)
     settings.write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic"}}))
@@ -98,8 +99,7 @@ def test_enable_adds_zai_no_proxy_from_anthropic_base_url(monkeypatch, tmp_path)
     data = json.loads(settings.read_text())
     no_proxy = data["env"].get("NO_PROXY", "")
     assert "api.z.ai" in no_proxy, "NO_PROXY содержит хост из ANTHROPIC_BASE_URL"
-    assert ".z.ai" in no_proxy, "NO_PROXY содержит parent-домен (.z.ai суффикс-матч)"
-    assert data["env"].get("no_proxy", "") == no_proxy, "оба регистра NO_PROXY/no_proxy"
+    assert data["env"].get("no_proxy", "") == no_proxy, "оба регистра NO_PROXY/no_proxy синхронны"
 
 
 def test_enable_preserves_existing_no_proxy(monkeypatch, tmp_path):
@@ -133,13 +133,12 @@ def test_disable_removes_only_zai_hosts(monkeypatch, tmp_path):
     settings.write_text(json.dumps({"env": {
         "ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic",
         "HTTPS_PROXY": "http://127.0.0.1:8118",
-        "NO_PROXY": "corp.local,api.z.ai,.z.ai",
+        "NO_PROXY": "corp.local,api.z.ai",
     }}))
     claude_proxy.disable()
     data = json.loads(settings.read_text())
     no_proxy = data["env"].get("NO_PROXY", "")
-    assert "api.z.ai" not in no_proxy, "z.ai-хост убран"
-    assert ".z.ai" not in no_proxy, "z.ai-суффикс убран"
+    assert "api.z.ai" not in no_proxy, "provider-хост убран"
     assert "corp.local" in no_proxy, "чужой хост сохранён"
 
 
@@ -162,7 +161,7 @@ def test_status_reports_provider_direct(monkeypatch, tmp_path):
     settings.write_text(json.dumps({"env": {
         "ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic",
         "HTTPS_PROXY": claude_proxy._PROXY,
-        "NO_PROXY": "api.z.ai,.z.ai",
+        "NO_PROXY": "api.z.ai",
     }}))
     s = claude_proxy.status()
     assert s["enabled"] is True

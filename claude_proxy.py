@@ -30,32 +30,29 @@ NO_PROXY_KEYS = ("NO_PROXY", "no_proxy")
 
 
 def _base_url_hosts(data):
-    """Хосты для NO_PROXY из env.ANTHROPIC_BASE_URL. Пустая строка если URL нет.
+    """Хост для NO_PROXY из env.ANTHROPIC_BASE_URL. Пустая строка если URL нет.
 
-    Возвращает 'api.z.ai,.z.ai' (хост + parent-домен через '.', суффикс-матч NO_PROXY).
-    Хост извлекаем из ANTHROPIC_BASE_URL (urlparse), НЕ хардкодим — устойчиво к смене провайдера.
-    IP-адреса и localhost → без suffix (parts[-2:] для IP даёт мусор вроде .0.1).
+    Возвращает хост (напр. 'api.z.ai') — без parent-доменного suffix. Раньше добавлялся '.z.ai'
+    для поддоменов, но parts[-2:] ломается на country-TLD ('api.x.co.uk' → '.co.uk' обходит прокси
+    для ВСЕХ .co.uk). Provider = один хост, suffix не нужен. IP/localhost тоже без suffix.
     Если ANTHROPIC_BASE_URL нет (CC на дефолтном api.anthropic.com) → '', NO_PROXY не ставим (gate).
     """
     env = data.get("env") if isinstance(data, dict) else None
     base = env.get("ANTHROPIC_BASE_URL", "") if isinstance(env, dict) else ""
-    host = (urlparse(base).hostname or "").lower()
-    if not host:
-        return ""
-    # parent-домен только для доменов (не IP, не localhost) — иначе .0.1 / .localhost мусор.
-    parts = host.split(".")
-    is_domain = len(parts) >= 2 and not host.startswith("localhost") and not all(p.isdigit() for p in parts)
-    suffix = "." + ".".join(parts[-2:]) if is_domain else ""
-    return f"{host},{suffix}" if suffix else host
+    return (urlparse(base).hostname or "").lower()
 
 
 def _merge_no_proxy(existing, add):
-    """Объединить NO_PROXY-строки без дублей, сохраняя порядок (сначала existing, потом новые)."""
+    """Объединить NO_PROXY-строки без дублей, сохраняя порядок и регистр существующих хостов.
+
+    existing — как есть (чужой регистр не нормализуем). add — provider-хосты (уже lower).
+    Дедуп через lowercase set, но в вывод — оригинальный регистр.
+    """
     seen, out = set(), []
     for raw in f"{existing},{add}".split(","):
-        h = raw.strip().lower()
-        if h and h not in seen:
-            seen.add(h)
+        h = raw.strip()
+        if h and h.lower() not in seen:
+            seen.add(h.lower())
             out.append(h)
     return ",".join(out)
 
@@ -124,8 +121,11 @@ def enable():
         env[k] = _PROXY
     hosts = _base_url_hosts(data)
     if hosts:
+        # Синхронизировать оба регистра: если один пуст, инициализировать из другого (иначе merge
+        # каждой variant независимо создаст рассинхрон — NO_PROXY без corp.local, no_proxy с ним).
+        existing = env.get("NO_PROXY", "") or env.get("no_proxy", "")
         for k in NO_PROXY_KEYS:
-            env[k] = _merge_no_proxy(env.get(k, ""), hosts)
+            env[k] = _merge_no_proxy(existing, hosts)
     return _save(data)
 
 
