@@ -20,6 +20,7 @@ import argparse
 import ipaddress
 import os
 import shlex
+import shutil
 import sys
 from pathlib import Path
 from importlib.metadata import PackageNotFoundError, version
@@ -38,6 +39,7 @@ from install_lib import (
     _launchd_domain,
     _launchd_is_loaded,
     _launchd_reload,
+    _write_text_atomic,
     apply_install,
     apply_uninstall,
     build_plan,
@@ -232,6 +234,196 @@ def _remove_ppp_hook(runner) -> str:
         return f"PPP-hook: не удалён ({str(exc)[:60]})."
 
 
+# ============================ Codex SOCKS5-wrappers + launchctl env ============================
+# Codex (CLI + App) работает стабильно только через SOCKS5 (xray 10808) минуя privoxy (портит WS).
+# srouter install ставит ~/bin/codex + ~/bin/codex-app-proxy + launchctl env (через LaunchAgent
+# plist, переживает ребут) + ~/bin в PATH; uninstall убирает. Канон — _install_ppp_hook
+# (best-effort, marker-gate, строка-статус).
+# URL SOCKS5 — из dashboard_common (SOCKS_PROXY_URL), единый источник правды для xray-порта.
+try:
+    from dashboard_common import SOCKS_PROXY_URL as _CODEX_PROXY_URL
+except Exception:
+    _CODEX_PROXY_URL = "socks5h://127.0.0.1:10808"
+CODEX_NO_PROXY = "localhost,127.0.0.1,::1"
+# (env-key, value) — единый список для install/setenv и uninstall/unsetenv (синхронны всегда).
+CODEX_LAUNCHCTL_ENV = tuple((k, _CODEX_PROXY_URL) for k in
+                            ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+                             "http_proxy", "https_proxy", "all_proxy")) \
+                      + (("NO_PROXY", CODEX_NO_PROXY), ("no_proxy", CODEX_NO_PROXY))
+# Wrappers: (name, template, marker). Цикл в install/remove — не два явных вызова.
+CODEX_WRAPPERS = (
+    ("codex", "srouter-codex-cli-wrapper.sh", "# srouter: codex CLI wrapper (managed)"),
+    ("codex-app-proxy", "srouter-codex-app-proxy-wrapper.sh", "# srouter: codex-app-proxy wrapper (managed)"),
+)
+# LaunchAgent для глобального env (переживает ребут, в отличие от launchctl setenv).
+CODEX_ENV_LABEL = "com.srouter.codex-env"
+CODEX_ENV_PLIST = f"{CODEX_ENV_LABEL}.plist"
+CODEX_ENV_MARKER = "srouter-managed-codex-env-v1"
+ZSHRC_PATH_MARKER = "# srouter: ~/bin в PATH для codex wrapper"
+
+
+def _codex_wrapper_path(name: str) -> Path:
+    """Путь к wrapper в ~/bin (вычисляется динамически — дружелюбно к мокам Path.home в тестах)."""
+    return Path.home() / "bin" / name
+
+
+def _zshrc_path() -> Path:
+    """Путь к ~/.zshrc (динамически, для моков Path.home в тестах)."""
+    return Path.home() / ".zshrc"
+
+
+def _codex_bin_path() -> str:
+    """Абсолютный путь к реальному codex binary (не наш wrapper). shutil.which минуя ~/bin/codex,
+    fallback на homebrew-пути (Apple Silicon / Intel). None если не найден — wrapper будет WARN."""
+    wrapper = _codex_wrapper_path("codex")
+    found = shutil.which("codex")
+    if found and Path(found).resolve() != wrapper.resolve():
+        return found
+    for cand in (str(Path(BREW).parent / "codex"), "/opt/homebrew/bin/codex", "/usr/local/bin/codex"):
+        if Path(cand).exists():
+            return cand
+    return ""  # не найден — _install_one_wrapper покажет WARN
+
+
+def _install_one_wrapper(env, wrapper_path: Path, template_name: str, marker: str) -> str:
+    """Поставить один wrapper. Marker-gate (чужой — не трогаем) + atomic write + chmod +x."""
+    try:
+        if wrapper_path.exists() and marker not in wrapper_path.read_text(encoding="utf-8"):
+            return f"Codex {wrapper_path.name}: чужой {wrapper_path} — не трогаем."
+        codex_bin = _codex_bin_path()
+        if not codex_bin:
+            return f"Codex {wrapper_path.name}: codex binary не найден — wrapper не установлен (установи codex)."
+        template = (env.root / "launchagents" / template_name).read_text(encoding="utf-8")
+        rendered = template.replace("__SROUTER_CODEX_BIN__", codex_bin)
+        wrapper_path.parent.mkdir(parents=True, exist_ok=True)
+        if not _write_text_atomic(wrapper_path, rendered):
+            return f"Codex {wrapper_path.name}: не записан (ошибка atomic write)."
+        wrapper_path.chmod(0o755)
+        return f"Codex {wrapper_path.name}: установлен ({wrapper_path} — SOCKS5 минуя privoxy)."
+    except Exception as exc:
+        return f"Codex {wrapper_path.name}: не установлен ({str(exc)[:80]})."
+
+
+def _install_codex_wrappers(env) -> str:
+    """Поставить ~/bin/codex + ~/bin/codex-app-proxy. Best-effort, цикл по CODEX_WRAPPERS."""
+    return "\n".join(_install_one_wrapper(env, _codex_wrapper_path(name), tmpl, marker)
+                     for name, tmpl, marker in CODEX_WRAPPERS)
+
+
+def _remove_one_wrapper(wrapper_path: Path, marker: str) -> str:
+    """Удалить один wrapper (если srouter-managed). Marker-gate обязательный."""
+    try:
+        if not wrapper_path.exists():
+            return f"Codex {wrapper_path.name}: не был установлен."
+        if marker not in wrapper_path.read_text(encoding="utf-8"):
+            return f"Codex {wrapper_path.name}: чужой {wrapper_path} — не трогаем."
+        wrapper_path.unlink()
+        return f"Codex {wrapper_path.name}: удалён."
+    except Exception as exc:
+        return f"Codex {wrapper_path.name}: не удалён ({str(exc)[:60]})."
+
+
+def _remove_codex_wrappers() -> str:
+    """Удалить wrappers (если srouter-managed). Цикл по CODEX_WRAPPERS, единый разделитель с install."""
+    return "\n".join(_remove_one_wrapper(_codex_wrapper_path(name), marker)
+                     for name, _, marker in CODEX_WRAPPERS)
+
+
+def _install_launchctl_env() -> str:
+    """Глобальный SOCKS5 env через LaunchAgent plist (EnvironmentVariables). Переживает ребут.
+
+    Раньше было 8 launchctl setenv (не переживают ребут). LaunchAgent с EnvironmentVariables = 1
+    bootstrap, ребут-стойкий. Эмпирически: Claude.app/ChatGPT.app на System Settings SOCKS,
+    global env их не ломает.
+    """
+    try:
+        from html import escape
+        plist_dir = Path.home() / "Library" / "LaunchAgents"
+        plist_dir.mkdir(parents=True, exist_ok=True)
+        plist_path = plist_dir / CODEX_ENV_PLIST
+        # Marker-gate: чужой plist без нашего маркера — не трогаем.
+        if plist_path.exists() and CODEX_ENV_MARKER not in plist_path.read_text(encoding="utf-8"):
+            return "Codex env: чужой LaunchAgent plist — не трогаем."
+        env_pairs = "".join(
+            f"\t\t<key>{escape(k)}</key><string>{escape(v)}</string>\n" for k, v in CODEX_LAUNCHCTL_ENV)
+        plist = (
+            f"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+            f"<!-- {CODEX_ENV_MARKER} -->\n"
+            f"<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" "
+            f"\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+            f"<plist version=\"1.0\">\n<dict>\n"
+            f"\t<key>Label</key><string>{CODEX_ENV_LABEL}</string>\n"
+            f"\t<key>EnvironmentVariables</key>\n<dict>\n{env_pairs}\t</dict>\n"
+            f"</dict>\n</plist>\n")
+        if not _write_text_atomic(plist_path, plist):
+            return "Codex env: не записан LaunchAgent plist (ошибка atomic write)."
+        # bootstrap в gui/<uid>. bootout (если уже загружен) игнорируем — bootstrap поднимет свежим.
+        domain = _launchd_domain()
+        run([LAUNCHCTL, "bootout", f"{domain}/{CODEX_ENV_LABEL}"], 5)
+        r = run([LAUNCHCTL, "bootstrap", domain, str(plist_path)], 10)
+        if r.get("timeout") or r.get("rc") not in (0, None):
+            return f"Codex env: не загружен LaunchAgent ({(r.get('err') or 'ошибка')[:60]})."
+        return f"Codex env: LaunchAgent {CODEX_ENV_LABEL} загружен (SOCKS5, переживает ребут)."
+    except Exception as exc:
+        return f"Codex env: не установлен ({str(exc)[:80]})."
+
+
+def _remove_launchctl_env() -> str:
+    """Выгрузить LaunchAgent env + удалить plist."""
+    try:
+        plist_path = Path.home() / "Library" / "LaunchAgents" / CODEX_ENV_PLIST
+        if not plist_path.exists():
+            return "Codex env: не был установлен."
+        if CODEX_ENV_MARKER not in plist_path.read_text(encoding="utf-8"):
+            return "Codex env: чужой LaunchAgent plist — не трогаем."
+        run([LAUNCHCTL, "bootout", f"{_launchd_domain()}/{CODEX_ENV_LABEL}"], 5)
+        plist_path.unlink()
+        return "Codex env: снят (LaunchAgent выгружен, plist удалён)."
+    except Exception as exc:
+        return f"Codex env: не снят ({str(exc)[:80]})."
+
+
+def _ensure_home_bin_in_path(env) -> str:
+    """Добавить ~/bin в PATH через ~/.zshrc (marker-gate + backup через install_lib._backup + atomic write).
+
+    CLI wrapper требует ~/bin раньше системного codex в PATH.
+    """
+    try:
+        from install_lib import _backup
+        zshrc = _zshrc_path()
+        block = f'\n{ZSHRC_PATH_MARKER}\nexport PATH="$HOME/bin:$PATH"\n'
+        if not zshrc.exists():
+            _write_text_atomic(zshrc, f'export PATH="$HOME/bin:$PATH"\n{ZSHRC_PATH_MARKER}\n')
+            return "PATH: создан ~/.zshrc с ~/bin (новый терминал подхватит codex wrapper)."
+        content = zshrc.read_text(encoding="utf-8")
+        if ZSHRC_PATH_MARKER in content or '$HOME/bin' in content or "${HOME}/bin" in content:
+            return "PATH: ~/bin уже в ~/.zshrc (idempotent)."
+        _backup(zshrc, env)  # timestamped backup через каноничный helper
+        _write_text_atomic(zshrc, content + block)
+        return "PATH: ~/bin добавлен в ~/.zshrc (backup: .zshrc.srouter-backup-*)."
+    except Exception as exc:
+        return f"PATH: не изменён ({str(exc)[:80]})."
+
+
+def _remove_home_bin_from_path() -> str:
+    """Убрать srouter-блок ~/bin из ~/.zshrc (симметрично _ensure_home_bin_in_path). Marker-gate."""
+    try:
+        zshrc = _zshrc_path()
+        if not zshrc.exists():
+            return "PATH: не был изменён."
+        content = zshrc.read_text(encoding="utf-8")
+        if ZSHRC_PATH_MARKER not in content:
+            return "PATH: не был изменён."
+        # Убрать блок: marker + следующую строку export PATH="$HOME/bin:$PATH".
+        lines = content.splitlines()
+        kept = [ln for ln in lines if ZSHRC_PATH_MARKER not in ln
+                and ln.strip() != 'export PATH="$HOME/bin:$PATH"']
+        _write_text_atomic(zshrc, "\n".join(kept).rstrip() + "\n")
+        return "PATH: ~/bin убран из ~/.zshrc."
+    except Exception as exc:
+        return f"PATH: не убран ({str(exc)[:80]})."
+
+
 def cmd_install(args) -> int:
     """Полная установка стека: brew-сервисы + конфиги + DNS + LaunchAgent.
 
@@ -304,10 +496,18 @@ def cmd_install(args) -> int:
                    f"Watchdog: не установлен ({wd_err}).")
         # ppp-hook: мгновенный split-route при VPN up (/etc/ppp/ip-up, от root, без osascript).
         ppp_note = _install_ppp_hook(env, runner)
+        # Codex SOCKS5-wrappers (~/.local/bin wrappers через ~/bin) + launchctl env + PATH —
+        # чтобы Codex (CLI и App) ходил напрямую в xray (10808), минуя privoxy (портит WS-стриминг).
+        codex_note = _install_codex_wrappers(env)
+        env_note = _install_launchctl_env()
+        path_note = _ensure_home_bin_in_path(env)
         print("Установка стека завершена: brew-сервисы, конфиги, DNS, LaunchAgent применены.\n"
               f"{cp_note}\n"
               f"{wd_note}\n"
               f"{ppp_note}\n"
+              f"{codex_note}\n"
+              f"{env_note}\n"
+              f"{path_note}\n"
               f"Дашборд: http://127.0.0.1:8787  (srouter status — проверить)")
         return 0
     blocked = ", ".join(result.get("blocked") or ["unknown"])
@@ -364,12 +564,19 @@ def cmd_uninstall(args) -> int:
 
     # 6) Удалить ppp-hook (/etc/ppp/ip-up) — мгновенный split-route больше не нужен.
     ppp_note = ". " + _remove_ppp_hook(runner)
+    # 7) Удалить Codex SOCKS5-wrappers + снять launchctl env + убрать ~/bin из PATH (ставил install).
+    codex_note = ". " + _remove_codex_wrappers()
+    env_note = ". " + _remove_launchctl_env()
+    path_note = ". " + _remove_home_bin_from_path()
 
     print("Откат завершён: brew-сервисы остановлены, конфиги восстановлены/оставлены, "
           "DNS сброшен, LaunchAgent удалён"
           + (". split-route удалён." if route_rc == 0 else ", split-route не удалён — см. выше.")
           + cp_note
-          + ppp_note)
+          + ppp_note
+          + codex_note
+          + env_note
+          + path_note)
     return 0
 
 
