@@ -81,6 +81,25 @@ def test_probe_down_when_cc_without_proxy_connection(monkeypatch):
     assert res["status"] == "down"
 
 
+def test_probe_unknown_when_lsof_times_out(monkeypatch):
+    """Regression: lsof timed out → status=unknown (НЕ down). Симметрично с ps-timeout.
+
+    Раньше lsof-timeout падал в `down` → пользователь получал ложный degraded + совет «перезапусти CC»,
+    хотя коннект мог быть жив (lsof просто не успел под нагрузкой).
+    """
+    def fake_run(cmd, timeout):
+        if cmd and cmd[0] == "/bin/ps":
+            return {"rc": 0, "out": f"12345 {CLI_COMM}\n", "err": "", "timeout": False}
+        if cmd and cmd[0] == "/usr/sbin/lsof":
+            return {"rc": None, "out": "", "err": "timeout", "timeout": True}
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+
+    monkeypatch.setattr(health.sys_probe, "run", fake_run)
+    res = health._claude_proxy_probe()
+    assert res["status"] == "unknown", "lsof-timeout → unknown (не наградить ложным down)"
+
+
+
 def test_probe_unknown_when_cc_not_running(monkeypatch):
     """CC не запущен (ps не нашёл claude) → status=unknown (НЕ down, НЕ ok)."""
     def fake_run(cmd, timeout):

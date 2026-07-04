@@ -125,11 +125,14 @@ def _claude_proxy_probe():
     #    privoxy для всех процессов → ложный позитив. Фильтруем по "->127.0.0.1:PORT" тут.
     needle = f"->127.0.0.1:{PRIVOXY_PORT}"
     lr = sys_probe.run([LSOF, "-nP", "-p", ",".join(pids)], timeout=3)
-    if not lr.get("timeout"):
-        for line in (lr.get("out") or "").splitlines():
-            if "TCP" in line and needle in line:
-                return {"status": "ok", "source": "runtime",
-                        "detail": "runtime: Claude Code держит коннект к privoxy"}
+    if lr.get("timeout"):
+        # lsof не успел — состояние неизвестно (как при ps-timeout). НЕ «down»: иначе пользователь
+        # получит ложный degraded + неверный совет «перезапусти CC», хотя коннект может быть жив.
+        return {"status": "unknown", "source": "n/a", "detail": "timeout lsof"}
+    for line in (lr.get("out") or "").splitlines():
+        if "TCP" in line and needle in line:
+            return {"status": "ok", "source": "runtime",
+                    "detail": "runtime: Claude Code держит коннект к privoxy"}
     return {"status": "down", "source": "runtime",
             "detail": "runtime: Claude Code запущен, но без коннекта к privoxy (перезапусти CC)"}
 
@@ -183,7 +186,7 @@ def _print_report(result):
         print(f"  {mark} {c['name']}{detail}")
     if result["status"] != "ok":
         print("\nЧто проверить:")
-        failed_names = " ".join(c["name"] for c in result["checks"] if not c["ok"])
+        failed_names = " ".join(c["name"] for c in result["checks"] if not c["ok"] and not c.get("info"))
         if "privoxy" in failed_names or "xray" in failed_names:
             print("  • brew services restart xray privoxy  (или srouter install)")
         if "туннель" in failed_names:
@@ -213,7 +216,7 @@ def cmd_watchdog():
 
     if not is_ok and was_ok:
         # Переход ok→down — кричим громко.
-        failed = ", ".join(c["name"] for c in result["checks"] if not c["ok"])
+        failed = ", ".join(c["name"] for c in result["checks"] if not c["ok"] and not c.get("info"))
         _notify(f"туннель/стек упал ({failed})", "Basso")
     elif is_ok and not was_ok:
         # Восстановление — тихое уведомление.
