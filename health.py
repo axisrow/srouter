@@ -12,6 +12,7 @@
 Не бросает, всегда dict со status (probe-канон).
 """
 from pathlib import Path
+import os
 
 import sys_probe
 
@@ -68,6 +69,22 @@ def _tunnel_up():
     return True, f"HTTP {code}"
 
 
+def _is_claude_code_comm(comm):
+    """Является ли comm (из `ps comm=`) процессом Claude Code?
+
+    `ps comm=` на macOS отдаёт полный путь. Реальные CC-варианты:
+      - basename "claude": CLI (~/.local/bin/claude), GUI pty-host (ClaudeCode.app/.../claude), bare "claude";
+      - version-runner: путь содержит "/claude/versions/" (basename = номер версии, не "claude") — это
+        основной движок CC, который реально держит коннект к privoxy.
+    Отбрасывает desktop Claude.app helpers, codex, сторонние claude*-wrappers.
+    """
+    if not comm:
+        return False
+    if os.path.basename(comm) == "claude":
+        return True
+    return "/claude/versions/" in comm
+
+
 def _claude_proxy_probe():
     """Реально запущенный Claude Code использует прокси? Поведенческий proof (lsof), не файл.
 
@@ -82,9 +99,14 @@ def _claude_proxy_probe():
       status="down"    — CC запущен, но БЕЗ коннекта (идёт напрямую → PF режет → «без ИИ»);
       status="unknown" — CC не запущен (проверять нечего; check_all НЕ агрегирует этот check).
     """
-    # 1. PID'ы процессов claude. ps comm= отдаёт basename бинаря (усечён до 15 символов ядром macOS),
-    #    поэтому матчим по точному basename из whitelist, а не по substring пути — robust против
-    #    ложных срабатываний (любой claude*-скрипт) и пропусков (Codex.app). Whitelist имён CC-бинаря.
+    # 1. PID'ы процессов Claude Code. `ps comm=` на macOS отдаёт ПОЛНЫЙ ПУТЬ к бинарю (не basename,
+    #    не усечённый — эмпирически проверено на Darwin 25.5.0). Реальные CC-варианты:
+    #      ~/.local/bin/claude                                    (CLI, basename="claude")
+    #      ~/.local/share/claude/ClaudeCode.app/.../claude        (GUI pty-host, basename="claude")
+    #      ~/.local/share/claude/versions/X.Y.Z                   (version-runner — основной движок,
+    #                                                              basename=версия, НЕ "claude")
+    #    Поэтому матчим по basename=="claude" ИЛИ path под ~/.local/share/claude/versions/ — это ловит
+    #    все 3 варианта и отбрасывает desktop Claude.app helpers, codex, claude*-wrappers.
     r = sys_probe.run([PS, "-axo", "pid=,comm="], timeout=3)
     if r.get("timeout"):
         return {"status": "unknown", "source": "n/a", "detail": "timeout ps"}
@@ -94,8 +116,7 @@ def _claude_proxy_probe():
         if len(parts) < 2:
             continue
         pid_s, comm = parts[0].strip(), parts[1].strip()
-        # CC бинарь: ~/.local/bin/claude (comm="claude") или ClaudeCode.app (comm="Claude").
-        if pid_s.isdigit() and comm in ("claude", "Claude"):
+        if pid_s.isdigit() and _is_claude_code_comm(comm):
             pids.append(pid_s)
     if not pids:
         return {"status": "unknown", "source": "n/a", "detail": "Claude Code не запущен"}
@@ -155,7 +176,9 @@ def _print_report(result):
     """Человекочитаемый отчёт check_all (для doctor). Вывод в stdout."""
     print(f"srouter health: {result['status'].upper()}\n")
     for c in result["checks"]:
-        mark = "✅" if c["ok"] else "❌"
+        # info-only check (например claude-proxy когда CC не запущен) — ℹ️, не ❌: он не роняет
+        # вердикт и не означает сбой, просто «не применимо сейчас».
+        mark = "ℹ️" if c.get("info") else ("✅" if c["ok"] else "❌")
         detail = f" ({c['detail']})" if c.get("detail") else ""
         print(f"  {mark} {c['name']}{detail}")
     if result["status"] != "ok":

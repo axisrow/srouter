@@ -23,11 +23,21 @@ def _all_up_monkey(monkeypatch, *, probe_status="ok", probe_detail="runtime: к�
 
 
 # ============================ _claude_proxy_probe (детект lsof) ============================
+# Реальный формат `ps comm=` на macOS — ПОЛНЫЕ ПУТИ (не basename, не усечённые):
+#   /Users/x/.local/bin/claude                                    (CLI)
+#   /Users/x/.local/share/claude/ClaudeCode.app/Contents/MacOS/claude  (GUI pty-host)
+#   /Users/x/.local/share/claude/versions/2.1.201                 (version-runner — основной движок)
+# Тесты используют именно эти форматы, чтобы ловить regression в фильтре детекции CC.
+CLI_COMM = "/Users/me/.local/bin/claude"
+GUI_COMM = "/Users/me/.local/share/claude/ClaudeCode.app/Contents/MacOS/claude"
+VERSION_RUNNER_COMM = "/Users/me/.local/share/claude/versions/2.1.201"
+
+
 def test_probe_ok_when_cc_connected_to_proxy(monkeypatch):
-    """lsof показал исходящий TCP к 127.0.0.1:PRIVOXY_PORT → status=ok."""
+    """CLI CC (полный путь в comm) + lsof показал TCP к privoxy → status=ok."""
     def fake_run(cmd, timeout):
         if cmd and cmd[0] == "/bin/ps":
-            return {"rc": 0, "out": "12345 claude\n", "err": "", "timeout": False}
+            return {"rc": 0, "out": f"12345 {CLI_COMM}\n", "err": "", "timeout": False}
         if cmd and cmd[0] == "/usr/sbin/lsof":
             return {"rc": 0, "out": f"claude 12345 axisrow 7u IPv4 ... TCP 127.0.0.1:51234->127.0.0.1:{health.PRIVOXY_PORT} (ESTABLISHED)\n", "err": "", "timeout": False}
         return {"rc": 0, "out": "", "err": "", "timeout": False}
@@ -39,11 +49,29 @@ def test_probe_ok_when_cc_connected_to_proxy(monkeypatch):
     assert res["detail"]
 
 
-def test_probe_down_when_cc_without_proxy_connection(monkeypatch):
-    """CC запущен, но lsof НЕ показал коннект к privoxy → status=down. Сценарий инцидента «без ИИ»."""
+def test_probe_detects_version_runner_cc(monkeypatch):
+    """Regression: version-runner comm=`.../claude/versions/X.Y.Z` (basename=версия) — это тоже CC.
+
+    Раньше whitelist `comm in ('claude','Claude')` пропускал его (basename='2.1.201'). Это основной
+    движок CC, который реально держит коннект к privoxy. Фильтр должен его узнавать.
+    """
     def fake_run(cmd, timeout):
         if cmd and cmd[0] == "/bin/ps":
-            return {"rc": 0, "out": "12345 claude\n", "err": "", "timeout": False}
+            return {"rc": 0, "out": f"48008 {VERSION_RUNNER_COMM}\n", "err": "", "timeout": False}
+        if cmd and cmd[0] == "/usr/sbin/lsof":
+            return {"rc": 0, "out": f"2.1.201 48008 axisrow 7u IPv4 ... TCP 127.0.0.1:51234->127.0.0.1:{health.PRIVOXY_PORT} (ESTABLISHED)\n", "err": "", "timeout": False}
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+
+    monkeypatch.setattr(health.sys_probe, "run", fake_run)
+    res = health._claude_proxy_probe()
+    assert res["status"] == "ok", "version-runner CC должен детектиться (он держит коннект к privoxy)"
+
+
+def test_probe_down_when_cc_without_proxy_connection(monkeypatch):
+    """CC запущен (GUI comm=полный путь), но lsof НЕ показал коннект → status=down (инцидент «без ИИ»)."""
+    def fake_run(cmd, timeout):
+        if cmd and cmd[0] == "/bin/ps":
+            return {"rc": 0, "out": f"12345 {GUI_COMM}\n", "err": "", "timeout": False}
         if cmd and cmd[0] == "/usr/sbin/lsof":
             return {"rc": 0, "out": "claude 12345 axisrow 7u IPv4 ... TCP 127.0.0.1:51234->22 (ESTABLISHED)\n", "err": "", "timeout": False}
         return {"rc": 0, "out": "", "err": "", "timeout": False}
@@ -65,20 +93,21 @@ def test_probe_unknown_when_cc_not_running(monkeypatch):
     assert res["status"] == "unknown", "CC не запущен → unknown (триггерит info-only в check_all)"
 
 
-def test_probe_ignores_non_claude_processes(monkeypatch):
-    """Whitelist имён: comm= не 'claude'/'Claude' не считается CC (robust против claude*-скриптов)."""
+def test_probe_ignores_non_cc_processes(monkeypatch):
+    """Не-CC процессы не детектятся: desktop Claude.app helper, codex, claude*-wrapper.
+
+    Regression: раньше substring 'claude' в comm ловил desktop Claude.app и wrappers; whitelist basename
+    + path-filter пропускает только реальный Claude Code (CLI/GUI/version-runner).
+    """
     def fake_run(cmd, timeout):
         if cmd and cmd[0] == "/bin/ps":
-            # 'my-claude-wrapper' и 'codex' НЕ должны пройти; 'claude' — да
-            return {"rc": 0, "out": "111 my-claude-wrapper\n222 codex\n333 claude\n", "err": "", "timeout": False}
-        if cmd and cmd[0] == "/usr/sbin/lsof":
-            # lsof по PID 333 (единственный валидный) — без коннекта к privoxy
-            return {"rc": 0, "out": "claude 333 axisrow 7u IPv4 TCP 1.2.3.4->5.6.7.8:443\n", "err": "", "timeout": False}
+            # desktop Claude.app helper (НЕ CC), codex, сторонний wrapper — ни один не CC
+            return {"rc": 0, "out": "111 /Applications/Claude.app/Contents/Helpers/chrome-native-host\n222 /usr/local/bin/codex\n333 my-claude-wrapper\n", "err": "", "timeout": False}
         return {"rc": 0, "out": "", "err": "", "timeout": False}
 
     monkeypatch.setattr(health.sys_probe, "run", fake_run)
     res = health._claude_proxy_probe()
-    assert res["status"] == "down", "только валидный claude-PID проверяется, и у него нет прокси"
+    assert res["status"] == "unknown", "desktop Claude.app / codex / wrapper — НЕ Claude Code"
 
 
 # ============================ check_all (агрегация с info-only unknown) ============================
