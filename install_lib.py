@@ -11,6 +11,7 @@ import json
 import os
 import shutil
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from html import escape
@@ -42,6 +43,15 @@ LAUNCHAGENT_LABEL = "com.srouter.dashboard"
 LAUNCHAGENT_FILE = f"{LAUNCHAGENT_LABEL}.plist"
 LAUNCHAGENT_MARKER = "srouter-managed-launchagent-v1"
 UNINSTALL_CATEGORIES = ("configs", "services", "dns", "launchagent")
+
+# Надёжная перезагрузка launchd-агента: bootout асинхронен, домен gui/<uid>/<label> освобождается
+# не сразу → `bootstrap` подряд падает `Bootstrap failed: 5: Input/output error`. Поэтому после
+# bootout poll-ждём выгрузки, а bootstrap ретраим. Константы — уровня модуля, чтобы тесты могли
+# занулить интервалы (мгновенные тесты без реального launchd). Канон: всегда-тдд.
+_BOOTOUT_SETTLE_MAX_WAIT = 2.0   # суммарный потолок ожидания выгрузки после bootout (сек)
+_BOOTOUT_POLL_INTERVAL = 0.5     # шаг poll «демон выгрузился?» (сек); 0.5 = 4 вызова вместо 10 при потолке 2.0
+_BOOTSTRAP_MAX_RETRIES = 3       # попыток bootstrap, если домен ещё занят
+_BOOTSTRAP_RETRY_DELAY = 0.5     # пауза между попытками bootstrap (сек)
 
 
 def _now():
@@ -163,6 +173,63 @@ def _write_launchagent(env):
     return _write_text_atomic(env.launchagent_path(), rendered)
 
 
+def _launchd_is_loaded(label, *, runner=run):
+    """Загружен ли launchd-агент (по `launchctl list`, последняя колонка == label).
+
+    Единственный источник правды для «агент загружен» — факт о launchd, живёт в lib (канон слоёв:
+    CLI — тонкий слой над install_lib). True/False — да/нет, None — не удалось узнать (timeout).
+
+    runner — чтобы ВСЕ launchctl-вызовы (включая эту проверку) шли через одну точку: в тестах
+    через фейк, иначе poll-loop внутри _launchd_reload дёргал бы реальный launchctl.
+    """
+    r = runner([LAUNCHCTL, "list"], 5)
+    if r.get("timeout"):
+        return None
+    return any(row.split() and row.split()[-1] == label
+               for row in (r.get("out") or "").splitlines())
+
+
+def _launchd_reload(domain, plist, label, *, runner=run):
+    """Перезагрузить launchd-агента надёжно: bootout → poll-wait выгрузки → bootstrap(retry).
+
+    Решает гонку «Bootstrap failed: 5: Input/output error»: launchd не успевает освободить слот
+    домена между bootout и bootstrap. Поэтому после bootout ждём фактической выгрузки (через
+    _launchd_is_loaded), а bootstrap ретраим с паузой. Возвращает {ok: bool, last_err: str}, не бросает.
+
+    runner — функция cmd/timeout → dict (как _install_launchagent принимает; по умолчанию sys_probe.run).
+             ВСЕ launchctl-вызовы (bootout, list, bootstrap) идут через него — единая точка для тестов.
+    """
+
+    def is_loaded():
+        return _launchd_is_loaded(label, runner=runner)
+
+    # 1. bootout (игнорируем rc — уже выгружен = не ошибка).
+    runner([LAUNCHCTL, "bootout", f"{domain}/{label}"], 10)
+
+    # 2. poll-wait: ждём, пока launchd РЕАЛЬНО выгрузит агента. Время считаем по часам (а не
+    # накоплением interval) — иначе при interval=0 (тесты) цикл стал бы бесконечным.
+    deadline = time.monotonic() + _BOOTOUT_SETTLE_MAX_WAIT
+    while is_loaded() and time.monotonic() < deadline:
+        time.sleep(_BOOTOUT_POLL_INTERVAL)
+
+    # 3. bootstrap с retry: домен может быть ещё занят.
+    last_err = ""
+    for _ in range(_BOOTSTRAP_MAX_RETRIES):
+        b = runner([LAUNCHCTL, "bootstrap", domain, str(plist)], 15)
+        if b.get("timeout"):
+            # launchctl может таймаутить, но агента всё-таки поднять (медленный диск) — проверим.
+            last_err = "timeout"
+        elif b.get("rc") == 0:
+            return {"ok": True, "last_err": ""}
+        else:
+            last_err = b.get("err") or b.get("out") or "bootstrap failed"
+        # soft-success: bootstrap вернул ненулевой rc/timeout, но агент всё-таки поднялся.
+        if is_loaded():
+            return {"ok": True, "last_err": ""}
+        time.sleep(_BOOTSTRAP_RETRY_DELAY)
+    return {"ok": False, "last_err": last_err}
+
+
 def _install_launchagent(env, runner):
     plist_path = env.launchagent_path()
     if plist_path.exists() and not _has_launchagent_marker(plist_path):
@@ -171,11 +238,11 @@ def _install_launchagent(env, runner):
         return False, "launchagent_write_failed"
 
     domain = _launchd_domain()
-    # bootout может вернуть ошибку, если агент ещё не загружен; это не blocker.
-    runner([LAUNCHCTL, "bootout", domain, str(plist_path)], 10)
-    bootstrap = runner([LAUNCHCTL, "bootstrap", domain, str(plist_path)], 15)
-    if not bootstrap.get("timeout") and bootstrap.get("rc") == 0:
+    # Надёжная перезагрузка: bootout → poll-wait → bootstrap(retry). Решает гонку занятого домена.
+    res = _launchd_reload(domain, plist_path, LAUNCHAGENT_LABEL, runner=runner)
+    if res["ok"]:
         return True, ""
+    # Fallback для старого launchd без bootstrap/bootout: load -w.
     fallback = runner([LAUNCHCTL, "load", "-w", str(plist_path)], 15)
     if fallback.get("timeout") or fallback.get("rc") != 0:
         return False, "launchagent_load_failed"
@@ -233,10 +300,11 @@ def _install_generic_launchagent(env, runner, *, template_name, label, marker, s
         return False, f"{label}_write_failed"
 
     domain = _launchd_domain()
-    runner([LAUNCHCTL, "bootout", f"{domain}/{label}"], 10)  # ignore если не загружен
-    bootstrap = runner([LAUNCHCTL, "bootstrap", domain, str(plist_path)], 15)
-    if not bootstrap.get("timeout") and bootstrap.get("rc") == 0:
+    # Надёжная перезагрузка: bootout → poll-wait → bootstrap(retry). Решает гонку занятого домена.
+    res = _launchd_reload(domain, plist_path, label, runner=runner)
+    if res["ok"]:
         return True, ""
+    # Fallback для старого launchd без bootstrap/bootout: load -w.
     fallback = runner([LAUNCHCTL, "load", "-w", str(plist_path)], 15)
     if fallback.get("timeout") or fallback.get("rc") != 0:
         return False, f"{label}_load_failed"

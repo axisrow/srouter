@@ -231,3 +231,39 @@ def test_real_text_templates_have_exact_managed_marker():
 
     assert install_lib._has_marker(root / "templates" / "privoxy.config") is True
     assert install_lib._has_marker(root / "templates" / "dnsmasq.conf") is True
+
+
+def test_install_retries_bootstrap_when_domain_busy(monkeypatch, tmp_path):
+    """apply_install выживает при гонке занятого домена: первый bootstrap rc=5, второй rc=0 → ok.
+
+    Без _launchd_reload install падал бы: один bootstrap rc=5 → fallback load -w (или ошибка).
+    Теперь retry доводит до успеха. Канон always-tdd.
+    """
+    # Зануляем интервалы — мгновенный тест без реальных слипов.
+    monkeypatch.setattr(install_lib, "_BOOTSTRAP_RETRY_DELAY", 0)
+    monkeypatch.setattr(install_lib, "_BOOTOUT_POLL_INTERVAL", 0)
+    env = _env(tmp_path)
+
+    calls = []
+
+    def runner(cmd, timeout):
+        calls.append(list(cmd))
+        sub = cmd[1] if len(cmd) > 1 else ""
+        if sub == "bootstrap":
+            n = sum(1 for c in calls if c[1] == "bootstrap")
+            return {"rc": 5 if n == 1 else 0, "out": "", "err": "", "timeout": False}
+        # list (для _launchd_is_loaded / poll) → не загружен, выгрузился сразу.
+        if sub == "list":
+            return {"rc": 0, "out": "999\t0\tcom.other\n", "err": "", "timeout": False}
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+
+    result = install_lib.apply_install(
+        env=env,
+        confirm=True,
+        choices={"xray": "skip", "dnsmasq": "skip"},
+        runner=runner,
+        port_checker=lambda *_: False,
+    )
+    bootstraps = [c for c in calls if c[1] == "bootstrap"]
+    assert result["ok"] is True, f"apply должен выстоять при гонке: {result}"
+    assert len(bootstraps) >= 2, "первый bootstrap rc=5 → нужна retry-попытка"
