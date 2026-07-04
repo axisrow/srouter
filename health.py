@@ -15,11 +15,10 @@ from pathlib import Path
 
 import sys_probe
 
-import claude_proxy  # Claude Code HTTPS_PROXY в ~/.claude/settings.json — без него CLI «без ИИ»
-
 # Абсолютные пути: launchd/GUI PATH их не содержит (канон проекта).
 CURL = "/usr/bin/curl"
 LSOF = "/usr/sbin/lsof"
+PS = "/bin/ps"
 OSASCRIPT = "/usr/bin/osascript"
 
 # Прокси = privoxy (8118). Берём из dashboard_common если доступен; fallback на хардкод,
@@ -69,19 +68,57 @@ def _tunnel_up():
     return True, f"HTTP {code}"
 
 
-def _claude_proxy_on():
-    """Claude Code настроен ходить через прокси? (env.HTTPS_PROXY в ~/.claude/settings.json).
+def _claude_proxy_probe():
+    """Реально запущенный Claude Code использует прокси? Поведенческий proof (lsof), не файл.
 
-    Без этого CLI идёт напрямую → при включённой PF-изоляции режется → «без ИИ». Это проверялось
-    в инциденте: туннель жив, но proxy слетел → doctor врал OK. Теперь doctor это видит.
+    Решает дыру Codex review + инцидента «без ИИ»: claude_proxy.status() читает только ФАЙЛ
+    settings.json, а не реальный CC. enable()/disable() пишут файл, но не перезапускают CC → окно
+    рассинхрона файл↔процесс. Здесь — runtime-proof из ядерной таблицы сокетов: CC держит
+    established TCP к privoxy (127.0.0.1:PRIVOXY_PORT). Надёжно для всех типов CC-сессий (daemon,
+    GUI pty-host, orchestrator-обёртки) — ps eww/launchctl procinfo слепы для обёрток (измерено).
+
+    Возвращает {status, source, detail} — ОДИН вызов, один срез (нет TOCTOU ok/detail):
+      status="ok"      — CC запущен и держит коннект к privoxy (реально юзает прокси);
+      status="down"    — CC запущен, но БЕЗ коннекта (идёт напрямую → PF режет → «без ИИ»);
+      status="unknown" — CC не запущен (проверять нечего; check_all НЕ агрегирует этот check).
     """
-    return bool(claude_proxy.status().get("enabled", False))
+    # 1. PID'ы процессов claude. ps comm= отдаёт basename бинаря (усечён до 15 символов ядром macOS),
+    #    поэтому матчим по точному basename из whitelist, а не по substring пути — robust против
+    #    ложных срабатываний (любой claude*-скрипт) и пропусков (Codex.app). Whitelist имён CC-бинаря.
+    r = sys_probe.run([PS, "-axo", "pid=,comm="], timeout=3)
+    if r.get("timeout"):
+        return {"status": "unknown", "source": "n/a", "detail": "timeout ps"}
+    pids = []
+    for line in (r.get("out") or "").splitlines():
+        parts = line.split(None, 1)
+        if len(parts) < 2:
+            continue
+        pid_s, comm = parts[0].strip(), parts[1].strip()
+        # CC бинарь: ~/.local/bin/claude (comm="claude") или ClaudeCode.app (comm="Claude").
+        if pid_s.isdigit() and comm in ("claude", "Claude"):
+            pids.append(pid_s)
+    if not pids:
+        return {"status": "unknown", "source": "n/a", "detail": "Claude Code не запущен"}
+
+    # 2. Один lsof на ВСЕ PID'ы (батч, не N вызовов). БЕЗ -iTCP: с -iTCP macOS тащит общий LISTEN-сокет
+    #    privoxy для всех процессов → ложный позитив. Фильтруем по "->127.0.0.1:PORT" тут.
+    needle = f"->127.0.0.1:{PRIVOXY_PORT}"
+    lr = sys_probe.run([LSOF, "-nP", "-p", ",".join(pids)], timeout=3)
+    if not lr.get("timeout"):
+        for line in (lr.get("out") or "").splitlines():
+            if "TCP" in line and needle in line:
+                return {"status": "ok", "source": "runtime",
+                        "detail": "runtime: Claude Code держит коннект к privoxy"}
+    return {"status": "down", "source": "runtime",
+            "detail": "runtime: Claude Code запущен, но без коннекта к privoxy (перезапусти CC)"}
 
 
 def check_all():
-    """Все проверки стека. {status: ok|degraded|down, checks: [{name, ok, detail?}]}.
+    """Все проверки стека. {status: ok|degraded|down, checks: [{name, ok, detail?, info?}]}.
 
     status: ok (всё живо) / degraded (часть жива) / down (всё мертво). Не бросает.
+    claude-proxy check имеет смысл только когда CC запущен: если unknown (CC не работает) — он
+    добавляется в checks как info (не driver), чтобы не ронять вердикт без причины.
     """
     checks = []
     checks.append({"name": f"privoxy ({PRIVOXY_PORT})", "ok": _port_up(PRIVOXY_PORT)})
@@ -89,10 +126,17 @@ def check_all():
     checks.append({"name": f"dashboard ({DASHBOARD_PORT})", "ok": _port_up(DASHBOARD_PORT)})
     tun_ok, tun_detail = _tunnel_up()
     checks.append({"name": "туннель (api.anthropic.com через прокси)", "ok": tun_ok, "detail": tun_detail})
-    # Claude Code настроен использовать туннель? Без proxy CLI идёт напрямую → PF режёт → «без ИИ».
-    checks.append({"name": "claude-proxy (HTTPS_PROXY для CLI)", "ok": _claude_proxy_on()})
-    all_ok = all(c["ok"] for c in checks)
-    any_ok = any(c["ok"] for c in checks)
+    # Claude Code РЕАЛЬНО использует прокси? runtime (lsof), не файл. unknown (CC не запущен) →
+    # info-only, не driver: проверять «CC юзает прокси» бессмысленно, если CC не работает.
+    cp = _claude_proxy_probe()
+    cp_check = {"name": "claude-proxy (HTTPS_PROXY для CLI)",
+                "ok": cp["status"] == "ok", "detail": cp["detail"]}
+    if cp["status"] == "unknown":
+        cp_check["info"] = True  # не участвует в агрегации (drivers ниже фильтруют info)
+    checks.append(cp_check)
+    drivers = [c for c in checks if not c.get("info")]
+    all_ok = all(c["ok"] for c in drivers)
+    any_ok = any(c["ok"] for c in drivers)
     status = "ok" if all_ok else ("degraded" if any_ok else "down")
     return {"status": status, "checks": checks}
 
@@ -124,7 +168,7 @@ def _print_report(result):
         if "dashboard" in failed_names:
             print("  • дашборд: srouter restart")
         if "claude-proxy" in failed_names:
-            print("  • Claude Code proxy: включи в дашборде (карточка Claude Code proxy) или srouter install")
+            print("  • Claude Code proxy: включи в дашборде (карточка Claude Code proxy) и ПЕРЕЗАПУСТИ Claude Code")
 
 
 def cmd_watchdog():
