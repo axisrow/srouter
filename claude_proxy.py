@@ -121,9 +121,10 @@ def enable():
         env[k] = _PROXY
     hosts = _base_url_hosts(data)
     if hosts:
-        # Синхронизировать оба регистра: если один пуст, инициализировать из другого (иначе merge
-        # каждой variant независимо создаст рассинхрон — NO_PROXY без corp.local, no_proxy с ним).
-        existing = env.get("NO_PROXY", "") or env.get("no_proxy", "")
+        # Merge обе variant (NO_PROXY + no_proxy) + provider-хосты. Если брать только одну variant
+        # (NO_PROXY or no_proxy), при рассинхронных значениях вторая теряется (a.com vs b.com).
+        # Union обеих → provider-хост добавляется к полному множеству, обе variant синхронны.
+        existing = _merge_no_proxy(env.get("NO_PROXY", ""), env.get("no_proxy", ""))
         for k in NO_PROXY_KEYS:
             env[k] = _merge_no_proxy(existing, hosts)
     return _save(data)

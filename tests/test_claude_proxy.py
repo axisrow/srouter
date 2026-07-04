@@ -168,3 +168,25 @@ def test_status_reports_provider_direct(monkeypatch, tmp_path):
     assert s["provider_direct"] is True, "хост провайдера в NO_PROXY → provider_direct=True"
     assert "z.ai" in s.get("no_proxy", "")
 
+
+def test_enable_merges_divergent_no_proxy_variants(monkeypatch, tmp_path):
+    """Regression (cycle 2): рассинхронные NO_PROXY/no_proxy — enable сохраняет хосты из ОБОИХ.
+
+    Раньше enable брал `NO_PROXY or no_proxy` (только одну variant) → при NO_PROXY=a.com,
+    no_proxy=b.com вторая терялась. Теперь merge обеих → provider-хост добавляется к полному множеству.
+    """
+    settings = _setup(monkeypatch, tmp_path)
+    settings.write_text(json.dumps({"env": {
+        "ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic",
+        "NO_PROXY": "a.com",
+        "no_proxy": "b.com",
+    }}))
+    claude_proxy.enable()
+    data = json.loads(settings.read_text())
+    # Оба ключа синхронны и содержат хосты из обеих variant + provider.
+    for k in ("NO_PROXY", "no_proxy"):
+        np = data["env"][k]
+        assert "a.com" in np, f"{k}: a.com (из NO_PROXY) сохранён"
+        assert "b.com" in np, f"{k}: b.com (из no_proxy) сохранён"
+        assert "api.z.ai" in np, f"{k}: provider-хост добавлен"
+
