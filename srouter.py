@@ -343,6 +343,13 @@ def _install_launchctl_env(env, runner) -> str:
     (bootout→poll→bootstrap-retry, решает гонку занятого домена — PR #80).
     """
     try:
+        # Предупредить, если в GUI-домене уже есть ЧУЖОЙ прокси (корпоративный/ручной) — setenv
+        # скрипта его перезапишет без восстановления. Не блокируем, но WARN в статусе.
+        warn = ""
+        existing = runner([LAUNCHCTL, "getenv", "HTTP_PROXY"], 5)
+        val = (existing.get("out") or "").strip()
+        if val and "127.0.0.1:10808" not in val:
+            warn = f" ВНИМАНИЕ: существующий GUI HTTP_PROXY={val[:40]} будет перезаписан (backup не делается)."
         ok, err = _install_generic_launchagent(
             env, runner,
             template_name="com.srouter.codenv.plist",
@@ -351,7 +358,8 @@ def _install_launchctl_env(env, runner) -> str:
             script_path=env.root / "launchagents" / "srouter-codex-env.sh",
         )
         if ok:
-            return f"Codex env: LaunchAgent {CODEX_ENV_LABEL} загружен (SOCKS5 в GUI-домен, переживает ребут)."
+            return (f"Codex env: LaunchAgent {CODEX_ENV_LABEL} загружен (SOCKS5 в GUI-домен, "
+                    f"переживает ребут).{warn}")
         if err.endswith("_foreign"):
             return f"Codex env: чужой LaunchAgent {CODEX_ENV_LABEL} — не трогаем."
         return f"Codex env: не установлен ({err})."
@@ -360,7 +368,12 @@ def _install_launchctl_env(env, runner) -> str:
 
 
 def _remove_launchctl_env(runner) -> str:
-    """Выгрузить LaunchAgent env + снять переменные + удалить plist."""
+    """Выгрузить LaunchAgent env + снять переменные + удалить plist.
+
+    Порядок важен: bootout ПЕРЕД unlink. Если bootout не сработал, а агент всё ещё загружен
+    (_launchd_is_loaded), НЕ удаляем plist — иначе StartInterval-агент останется в памяти и будет
+    пере-применять мёртвый socks5 env каждые 5 мин (утечка нерабочего прокси в GUI-домен).
+    """
     try:
         plist_path = Path.home() / "Library" / "LaunchAgents" / f"{CODEX_ENV_LABEL}.plist"
         if not plist_path.exists():
@@ -369,6 +382,11 @@ def _remove_launchctl_env(runner) -> str:
             return f"Codex env: чужой LaunchAgent {CODEX_ENV_LABEL} — не трогаем."
         # bootout агента (через runner — симметрия с install). bootout на незагруженном = не ошибка.
         runner([LAUNCHCTL, "bootout", f"{_launchd_domain()}/{CODEX_ENV_LABEL}"], 10)
+        # Если агент всё ещё загружен после bootout — НЕ удалять plist (оставить контроль).
+        # Иначе StartInterval пере-применит мёртвый env. Пусть пользователь разберётся вручную.
+        if _launchd_is_loaded(CODEX_ENV_LABEL, runner=runner):
+            return (f"Codex env: LaunchAgent {CODEX_ENV_LABEL} всё ещё загружен после bootout — "
+                    f"plist оставлен (не удалять контроль). Проверь: launchctl list | grep {CODEX_ENV_LABEL}")
         plist_path.unlink()
         # Снять переменные из GUI-домена (setenv делал скрипт при загрузке).
         for key, _ in CODEX_LAUNCHCTL_ENV:
@@ -388,7 +406,10 @@ def _ensure_home_bin_in_path(env) -> str:
         zshrc = _zshrc_path()
         block = f'\n{ZSHRC_PATH_MARKER}\nexport PATH="$HOME/bin:$PATH"\n'
         if not zshrc.exists():
-            _write_text_atomic(zshrc, f'export PATH="$HOME/bin:$PATH"\n{ZSHRC_PATH_MARKER}\n')
+            # Тот же порядок, что и append (marker → export), чтобы _remove_home_bin_from_path
+            # (удаляет marker + следующую строку) корректно убирал блок. Не export→marker (иначе
+            # uninstall оставит висячий export).
+            _write_text_atomic(zshrc, f'{ZSHRC_PATH_MARKER}\nexport PATH="$HOME/bin:$PATH"\n')
             return "PATH: создан ~/.zshrc с ~/bin (новый терминал подхватит codex wrapper)."
         content = zshrc.read_text(encoding="utf-8")
         if ZSHRC_PATH_MARKER in content or '$HOME/bin' in content or "${HOME}/bin" in content:

@@ -220,6 +220,28 @@ def test_ensure_home_bin_in_path_adds(monkeypatch, tmp_path):
     assert srouter.ZSHRC_PATH_MARKER in content, "маркер srouter рядом с правкой"
 
 
+def test_ensure_then_remove_no_dangling_export_new_zshrc(monkeypatch, tmp_path):
+    """Regression (cycle 2): ~/.zshrc НЕ существовал → install создал → uninstall убрал блок.
+
+    Раньше new-file путь писал export ПЕРЕД marker (инвертировано vs append) → _remove_home_bin_from_path
+    (удаляет marker + следующую строку) оставлял висячий export PATH="$HOME/bin:$PATH". Чистая установка
+    без .zshrc — частый случай. Теперь порядок marker→export на обоих путях.
+    """
+    home = _mock_home(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    zshrc = home / ".zshrc"
+    assert not zshrc.exists()
+
+    srouter._ensure_home_bin_in_path(env)  # создаёт .zshrc с нуля
+    assert zshrc.exists()
+    srouter._remove_home_bin_from_path()   # должен убрать блок полностью
+
+    content = zshrc.read_text(encoding="utf-8")
+    assert srouter.ZSHRC_PATH_MARKER not in content, "маркер убран"
+    assert 'export PATH="$HOME/bin:$PATH"' not in content, "висячий export НЕ остался (regression)"
+    assert content.strip() == "", "чистая установка → пустой .zshrc после uninstall"
+
+
 def test_ensure_home_bin_in_path_idempotent(monkeypatch, tmp_path):
     """Повторный install — НЕ дублирует."""
     home = _mock_home(monkeypatch, tmp_path)
