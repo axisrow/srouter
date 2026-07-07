@@ -14,9 +14,13 @@ import health
 
 
 def _all_up_monkey(monkeypatch, *, probe_status="ok", probe_detail="runtime: коннект"):
-    """Мок: все порты+туннель живы; _claude_proxy_probe отдаёт заданный status."""
+    """Мок: все порты+туннель живы; _claude_proxy_probe отдаёт заданный status.
+
+    Заглушка «туннель здоров» = (True, HTTP 200): недвусмысленно живой канал. Прежнее
+    (True, HTTP 404) полагалось на «любой не-000 = жив» — после фикса #82 семантика строгая
+    (5xx=down, 2xx/3xx/4xx=up), 404 остаётся up, но 200 читается однозначнее как здоровый."""
     monkeypatch.setattr(health, "_port_up", lambda port: True)
-    monkeypatch.setattr(health, "_tunnel_up", lambda: (True, "HTTP 404"))
+    monkeypatch.setattr(health, "_tunnel_up", lambda: (True, "HTTP 200"))
     monkeypatch.setattr(health, "_claude_proxy_probe",
                         lambda: {"status": probe_status, "source": "runtime" if probe_status != "unknown" else "n/a",
                                  "detail": probe_detail})
@@ -182,3 +186,58 @@ def test_check_all_down_when_everything_dead(monkeypatch):
 
     result = health.check_all()
     assert result["status"] == "down"
+
+
+# ============================ _tunnel_up HTTP semantics (issue #82, класс #3) ============================
+def _tunnel_curl_returning(code_out):
+    """Мок sys_probe.run для _tunnel_up: curl -w %{http_code} печатает заданный код."""
+    return lambda cmd, timeout: {"rc": 0, "out": code_out, "err": "", "timeout": False}
+
+
+def test_tunnel_up_5xx_is_down(monkeypatch):
+    """503 от мёртвого/сбойного upstream за прокси → туннель НЕ жив. ДЫРА: watchdog слепнет,
+    считая 5xx за 'жив' (code != '000')."""
+    monkeypatch.setattr(health.sys_probe, "run", _tunnel_curl_returning("503"))
+    ok, detail = health._tunnel_up()
+    assert ok is False, f"5xx = мёртвый upstream за туннелем, а не 'жив', detail={detail}"
+    assert "503" in detail
+
+
+def test_tunnel_up_502_is_down(monkeypatch):
+    """502 Bad Gateway (типовой ответ сбойного прокси/upstream) → down."""
+    monkeypatch.setattr(health.sys_probe, "run", _tunnel_curl_returning("502"))
+    ok, _ = health._tunnel_up()
+    assert ok is False
+
+
+def test_tunnel_up_404_is_up(monkeypatch):
+    """404 (реальный ответ api.anthropic.com/ на '/') = канал жив: сервер ответил через туннель.
+    Легит-случай, не ломаем: watchdog не должен ложно паниковать на 404."""
+    monkeypatch.setattr(health.sys_probe, "run", _tunnel_curl_returning("404"))
+    ok, detail = health._tunnel_up()
+    assert ok is True, f"404 от живого сервера = туннель жив, detail={detail}"
+    assert "404" in detail
+
+
+def test_tunnel_up_200_is_up(monkeypatch):
+    """200 — очевидно жив (не ломаем)."""
+    monkeypatch.setattr(health.sys_probe, "run", _tunnel_curl_returning("200"))
+    ok, _ = health._tunnel_up()
+    assert ok is True
+
+
+def test_tunnel_up_000_is_down(monkeypatch):
+    """000 — соединения нет (не ломаем существующее)."""
+    monkeypatch.setattr(health.sys_probe, "run", _tunnel_curl_returning("000"))
+    ok, detail = health._tunnel_up()
+    assert ok is False
+    assert detail == "connection-failed"
+
+
+def test_tunnel_up_timeout_is_down(monkeypatch):
+    """timeout → down (не ломаем)."""
+    monkeypatch.setattr(health.sys_probe, "run",
+                        lambda cmd, timeout: {"rc": None, "out": "", "err": "timeout", "timeout": True})
+    ok, detail = health._tunnel_up()
+    assert ok is False
+    assert detail == "timeout"

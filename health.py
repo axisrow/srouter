@@ -66,6 +66,15 @@ def _tunnel_up():
         return False, "no-response"
     if code == "000":
         return False, "connection-failed"
+    # Единая семантика с probe_tunnel (sys_probe.tunnel_code_up): 5xx — сбой прокси/upstream за
+    # туннелем, а не живой канал. Иначе 503 от мёртвого upstream watchdog принял бы за «жив» и
+    # ослеп бы к падению (issue #82, класс #3). 4xx (api.anthropic.com/ → 404) = канал жив.
+    try:
+        code_int = int(code)
+    except ValueError:
+        return False, f"bad-code {code}"
+    if not sys_probe.tunnel_code_up(code_int):
+        return False, f"upstream-error HTTP {code}"
     return True, f"HTTP {code}"
 
 
