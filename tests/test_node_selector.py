@@ -1,6 +1,7 @@
 import copy
 import importlib
 import json
+import subprocess
 import sys
 import types
 
@@ -1051,3 +1052,131 @@ def test_ensure_split_route_user_uses_osascript(monkeypatch, tmp_path):
     # под user — osascript-мост (route add внутри do shell script)
     osascript_calls = [c for c in calls if "osascript" in str(c[0]).lower()]
     assert len(osascript_calls) >= 1, "user → osascript-мост для route add"
+
+
+# ============================ #9: _default_runner timeout semantics (issue #82) ============================
+def test_default_runner_file_not_found_is_not_timeout(monkeypatch):
+    """node_selector._default_runner: FileNotFoundError ≠ timeout. ДЫРА: сейчас любой Exception → timeout=True."""
+    import node_selector
+
+    def fake_run(*_args, **_kwargs):
+        raise FileNotFoundError(2, "No such file or directory", "/no/such/brew")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    r = node_selector._default_runner(["/no/such/brew", "restart"], 10)
+    assert r["timeout"] is False, f"отсутствие бинаря ≠ timeout, получили {r}"
+    assert r["rc"] is None
+    assert "such" in r["err"].lower()
+
+
+def test_default_runner_permission_error_is_not_timeout(monkeypatch):
+    """PermissionError → не timeout, err с причиной."""
+    import node_selector
+
+    def fake_run(*_args, **_kwargs):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    r = node_selector._default_runner(["/opt/homebrew/bin/brew"], 10)
+    assert r["timeout"] is False
+    assert "Permission denied" in r["err"]
+
+
+def test_default_runner_timeout_expired_stays_timeout(monkeypatch):
+    """TimeoutExpired — единственный случай timeout=True (не ломаем существующее)."""
+    import node_selector
+
+    def fake_run(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired(cmd=["slow"], timeout=1)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    r = node_selector._default_runner(["slow"], 1)
+    assert r["timeout"] is True
+    assert r["err"] == "timeout"
+
+
+def test_default_runner_cmd_not_list_stays_typed_error(monkeypatch):
+    """Не список → typed err, timeout=True (существующий контракт guard-а)."""
+    import node_selector
+
+    r = node_selector._default_runner("brew restart", 10)
+    assert r["err"] == "cmd must be list"
+
+
+# ============================ #15: физ-интерфейс из config, не baked-in prefix 'en' (issue #82) ============================
+def _install_physical_prefixes(monkeypatch, prefixes, gateway="192.0.2.1"):
+    """Фейковый srouter_config с PHYSICAL_IFACE_PREFIXES для ленивого import в node_selector."""
+    cfg = types.ModuleType("srouter_config")
+    cfg.GATEWAY = gateway
+    cfg.PHYSICAL_IFACE_PREFIXES = prefixes
+    monkeypatch.setitem(sys.modules, "srouter_config", cfg)
+    return cfg
+
+
+def test_ensure_split_route_respects_config_physical_prefixes(monkeypatch, tmp_path):
+    """Пользователь сузил физ-интерфейсы до ('en0',): route через en5 с чужим gateway больше НЕ
+    считается split — должен добавиться split. ДЫРА: зашитый 'en'-prefix всегда зеленит en5."""
+    import node_selector
+    state_path = tmp_path / "srouter.local.json"
+    _write_state(state_path, _state())  # auto_route_sync=True
+    _install_physical_prefixes(monkeypatch, ("en0",))
+
+    calls = []
+    def fake_run(cmd, timeout):
+        calls.append((list(cmd), timeout))
+        if "get" in cmd and "-host" in cmd:
+            # en5 (iPhone USB), gateway НЕ наш GATEWAY → по config ('en0',) НЕ физический
+            return {"rc": 0, "out": _route_get_out("en5", "172.20.10.1"), "err": "", "timeout": False}
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+    monkeypatch.setattr(sys_probe, "run", fake_run)
+
+    r = node_selector.ensure_split_route(state_path=state_path)
+    assert r["enabled"] is True
+    add_calls = [c for c in calls if any("add" in str(a) and "-host" in str(a) for a in c[0])]
+    assert len(add_calls) == 1, f"en5 не в config-префиксах и gw≠GATEWAY → split надо добавить, calls={calls}"
+
+
+def test_ensure_split_route_config_prefix_matches_keeps_split(monkeypatch, tmp_path):
+    """Тот же en5, но config расширен до ('en',) → en5 физический → split уже активен, add не нужен."""
+    import node_selector
+    state_path = tmp_path / "srouter.local.json"
+    _write_state(state_path, _state())
+    _install_physical_prefixes(monkeypatch, ("en",))
+
+    calls = []
+    def fake_run(cmd, timeout):
+        calls.append((list(cmd), timeout))
+        if "get" in cmd and "-host" in cmd:
+            return {"rc": 0, "out": _route_get_out("en5", "172.20.10.1"), "err": "", "timeout": False}
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+    monkeypatch.setattr(sys_probe, "run", fake_run)
+
+    r = node_selector.ensure_split_route(state_path=state_path)
+    assert r["enabled"] is True
+    add_calls = [c for c in calls if any("add" in str(a) and "-host" in str(a) for a in c[0])]
+    assert add_calls == [], f"en5 в config-префиксах ('en',) → split активен, add не нужен, calls={calls}"
+
+
+def test_ensure_split_route_gateway_signal_overrides_prefix(monkeypatch, tmp_path):
+    """Строгий сигнал gw==GATEWAY остаётся: даже если iface не в префиксах, route через наш
+    GATEWAY = split активен (fail-safe не ломаем)."""
+    import node_selector
+    state_path = tmp_path / "srouter.local.json"
+    _write_state(state_path, _state())
+    _install_physical_prefixes(monkeypatch, (), gateway="192.0.2.1")  # префиксы пусты
+
+    calls = []
+    def fake_run(cmd, timeout):
+        calls.append((list(cmd), timeout))
+        if "get" in cmd and "-host" in cmd:
+            # неизвестный iface, но gateway = наш GATEWAY → split активен по строгому сигналу
+            return {"rc": 0, "out": _route_get_out("bridge100", "192.0.2.1"), "err": "", "timeout": False}
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+    monkeypatch.setattr(sys_probe, "run", fake_run)
+
+    r = node_selector.ensure_split_route(state_path=state_path)
+    add_calls = [c for c in calls if any("add" in str(a) and "-host" in str(a) for a in c[0])]
+    assert add_calls == [], f"gw==GATEWAY = split активен независимо от iface, calls={calls}"

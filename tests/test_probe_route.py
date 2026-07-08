@@ -56,3 +56,33 @@ def test_probe_route_to_vps_down_on_empty_route_ip(monkeypatch):
     r = dashboard_network.probe_route_to_vps(route_ip="")
     assert r["status"] == "down"
     assert r["split_active"] is False
+
+
+def test_probe_route_to_vps_utun_without_gateway_is_not_split(monkeypatch):
+    """utun0 (VPN-туннель), gateway != GATEWAY → split_active=False (VPN перехватил, не физический)."""
+    monkeypatch.setattr(dashboard_network.sys_probe, "run",
+                        lambda cmd, timeout: {"rc": 0, "out": _route_get_resp("utun0", "10.0.0.1"), "err": "", "timeout": False})
+    r = dashboard_network.probe_route_to_vps(route_ip="1.2.3.4")
+    assert r["split_active"] is False, f"utun0 = VPN-туннель, не физический канал, получили {r}"
+    assert r["status"] == "warn"
+
+
+def test_probe_route_to_vps_physical_prefixes_from_config(monkeypatch):
+    """Источник истины физ-интерфейсов — config PHYSICAL_IFACE_PREFIXES, не зашитый 'en'.
+
+    Пользователь сузил до ('en0',): route через en5 с чужим gateway больше НЕ split.
+    ДЫРА: зашитый 'en'-prefix всегда зеленит en5 как физический."""
+    monkeypatch.setattr(dashboard_network, "_physical_iface_prefixes", lambda: ("en0",))
+    monkeypatch.setattr(dashboard_network.sys_probe, "run",
+                        lambda cmd, timeout: {"rc": 0, "out": _route_get_resp("en5", "172.20.10.1"), "err": "", "timeout": False})
+    r = dashboard_network.probe_route_to_vps(route_ip="1.2.3.4")
+    assert r["split_active"] is False, f"en5 не в config-префиксах ('en0',) и gw≠GATEWAY, получили {r}"
+
+
+def test_probe_route_to_vps_config_prefix_matches(monkeypatch):
+    """Тот же en5, но config расширен до ('en',) → en5 физический → split активен."""
+    monkeypatch.setattr(dashboard_network, "_physical_iface_prefixes", lambda: ("en",))
+    monkeypatch.setattr(dashboard_network.sys_probe, "run",
+                        lambda cmd, timeout: {"rc": 0, "out": _route_get_resp("en5", "172.20.10.1"), "err": "", "timeout": False})
+    r = dashboard_network.probe_route_to_vps(route_ip="1.2.3.4")
+    assert r["split_active"] is True

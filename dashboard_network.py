@@ -7,6 +7,7 @@ from dashboard_common import (
     GATEWAY,
     HTTP_PROXY_URL,
     IFCONFIG,
+    PHYSICAL_IFACE_PREFIXES,
     PING,
     PRIVOXY,
     ROUTE,
@@ -15,6 +16,7 @@ from dashboard_common import (
     XRAY_SOCKS,
     _active_route_ip,
     _first,
+    _iface_is_physical,
 )
 
 
@@ -64,11 +66,19 @@ def _curl_through(url, proxy=True):
     r = sys_probe.run(cmd, timeout=10)
     if r["timeout"] or not r["out"]:
         return {"code": "000", "ms": None, "up": False}
-    try:
-        code, t = r["out"].split()
-        return {"code": code, "ms": round(float(t) * 1000), "up": code != "000"}
-    except ValueError:
+    parts = r["out"].split()
+    if len(parts) < 2:
         return {"code": "000", "ms": None, "up": False}
+    code, t = parts[0], parts[1]
+    try:
+        code_int = int(code)
+    except (TypeError, ValueError):
+        return {"code": "000", "ms": None, "up": False}
+    try:
+        ms = round(float(t) * 1000)
+    except (TypeError, ValueError):
+        ms = None
+    return {"code": code, "ms": ms, "up": sys_probe.tunnel_code_up(code_int)}
 
 
 def probe_tunnel():
@@ -109,6 +119,11 @@ def probe_vpn():
             "status": "warn" if iface == "ppp0" else "ok"}
 
 
+def _physical_iface_prefixes():
+    """Префиксы физических интерфейсов — источник истины из config (мокабельно в тестах)."""
+    return PHYSICAL_IFACE_PREFIXES
+
+
 def probe_route_to_vps(route_ip=None):
     if route_ip is None:
         route_ip = _active_route_ip()
@@ -117,7 +132,9 @@ def probe_route_to_vps(route_ip=None):
     r = sys_probe.run([ROUTE, "-n", "get", "-host", route_ip], timeout=3)
     iface = _first(r"interface:\s*(\S+)", r["out"]) if not r["timeout"] else ""
     gw = _first(r"gateway:\s*(\S+)", r["out"]) if not r["timeout"] else ""
-    bypass = iface.startswith("en") or (gw == GATEWAY)
+    # split активен если route идёт через физический интерфейс (config-префиксы, не литерал 'en')
+    # ЛИБО через наш физический шлюз (строгий сигнал gw==GATEWAY).
+    bypass = _iface_is_physical(iface, _physical_iface_prefixes()) or (gw == GATEWAY)
     return {"interface": iface, "gateway": gw, "split_active": bypass,
             "status": "ok" if bypass else "warn"}
 
@@ -148,12 +165,31 @@ def _ping_avg(host):
     return _parse_ping_stats(r["out"])
 
 
+# Пороги packet loss (первоисточник — ping summary '% packet loss'). 100% = канал мёртв
+# даже при просочившемся avg; заметная частичная потеря деградирует до warn. Ниже LOSS_WARN
+# — шум (единичные пропуски), не сигналим.
+_LOSS_WARN_PCT = 20.0
+_LOSS_DOWN_PCT = 100.0
+
+
+def _ping_status(ms, loss):
+    """Статус канала по RTT И packet loss. Нет данных RTT или 100% потерь → down;
+    заметная частичная потеря или высокий RTT → warn; иначе ok."""
+    if ms is None:
+        return "down"
+    if loss is not None and loss >= _LOSS_DOWN_PCT:
+        return "down"
+    if loss is not None and loss >= _LOSS_WARN_PCT:
+        return "warn"
+    return "ok" if ms < 120 else "warn"
+
+
 def probe_ping(route_ip=None):
     """avg RTT до VPS и VPN-сервера + потери."""
     if route_ip is None:
         route_ip = _active_route_ip()
     vps_ms, vps_loss = _ping_avg(route_ip)
     vpn_ms, vpn_loss = _ping_avg(VPN_SERVER)
-    st = "down" if vps_ms is None else ("ok" if vps_ms < 120 else "warn")
+    st = _ping_status(vps_ms, vps_loss)
     return {"vps_ms": vps_ms, "vps_loss": vps_loss, "vpn_ms": vpn_ms,
             "vpn_loss": vpn_loss, "status": st}
