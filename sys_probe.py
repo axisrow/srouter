@@ -8,15 +8,34 @@ import subprocess
 BREW_COMPONENTS = ("xray", "privoxy", "dnsmasq")
 
 
+def tunnel_code_up(code):
+    """Единый предикат «канал/туннель до сервера жив» по HTTP-коду curl (issue #82, класс #3).
+
+    Назначение probe туннеля/прямого доступа — доказать, что ТРАФИК ДОХОДИТ до сервера через
+    канал, а не что конкретный URL отдаёт 200. Реальные endpoint'ы отвечают 4xx на '/'
+    (api.anthropic.com → 404, api.openai.com → 421) — это ЖИВОЙ канал: сервер ответил HTTP.
+    Мёртвым каналом считаем только:
+      - 000 / нет кода — соединение не установлено (curl не достучался);
+      - 5xx — сбой самого прокси-/upstream-слоя (мёртвый туннель за прокси).
+    Живой = сервер вернул валидный HTTP-статус ниже 500. Держим предикат в sys_probe (базовый
+    слой без config), чтобы dashboard_network и health.py делили ОДНУ семантику, а не расходились."""
+    return isinstance(code, int) and 100 <= code < 500
+
+
 def run(cmd_list, timeout):
-    """Всегда список аргументов, без shell=True. Возвращает dict и не бросает."""
+    """Всегда список аргументов, без shell=True. Возвращает dict и не бросает.
+
+    timeout=True ТОЛЬКО при реальном истечении срока (TimeoutExpired). Прочие сбои запуска
+    (нет бинаря — FileNotFoundError, нет прав — PermissionError, иной OSError) — это НЕ таймаут:
+    возвращаем timeout=False с типизированной причиной в err, иначе вызывающий код принял бы
+    отсутствие /usr/bin/curl за «медленную сеть» (issue #82)."""
     try:
         proc = subprocess.run(cmd_list, capture_output=True, text=True, timeout=timeout)
         return {"rc": proc.returncode, "out": proc.stdout.strip(), "err": proc.stderr.strip(), "timeout": False}
     except subprocess.TimeoutExpired:
         return {"rc": None, "out": "", "err": "timeout", "timeout": True}
     except Exception as exc:
-        return {"rc": None, "out": "", "err": str(exc), "timeout": True}
+        return {"rc": None, "out": "", "err": f"{type(exc).__name__}: {exc}", "timeout": False}
 
 
 def port_open(host, port, timeout=0.5):

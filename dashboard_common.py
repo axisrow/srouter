@@ -29,10 +29,21 @@ try:
     GATEWAY = _cfg.GATEWAY
     VPN_SERVER = _cfg.VPN_SERVER
     VPN_EXIT_IP = _cfg.VPN_EXIT_IP
+    # Опциональное поле: префиксы имён физических интерфейсов (split-route идёт через
+    # физический канал, не через VPN/utun). Источник истины — config, а не baked-in литерал
+    # 'en' в probe-коде: у пользователя физический канал может называться иначе (см. issue #82).
+    # Дефолт ("en",) сохраняет поведение macOS Wi-Fi/USB-tether (en0/en1/en5…).
+    _raw_prefixes = getattr(_cfg, "PHYSICAL_IFACE_PREFIXES", ("en",))
 except FileNotFoundError:
     raise SystemExit("Нет srouter_config.py — скопируй: cp srouter_config.example.py srouter_config.py")
 except Exception as _exc:
     raise SystemExit(f"srouter_config.py повреждён или неполон: {_exc}")
+
+# Нормализуем: только непустые строки-префиксы; битое значение → безопасный дефолт.
+if isinstance(_raw_prefixes, (list, tuple)):
+    PHYSICAL_IFACE_PREFIXES = tuple(p for p in _raw_prefixes if isinstance(p, str) and p)
+else:
+    PHYSICAL_IFACE_PREFIXES = ("en",)
 
 PRIVOXY = ("127.0.0.1", 8118)
 XRAY_SOCKS = ("127.0.0.1", 10808)
@@ -58,6 +69,7 @@ __all__ = [
     "GATEWAY",
     "VPN_SERVER",
     "VPN_EXIT_IP",
+    "PHYSICAL_IFACE_PREFIXES",
     "PRIVOXY",
     "XRAY_SOCKS",
     "HTTP_PROXY_URL",
@@ -75,6 +87,7 @@ __all__ = [
     "_normalize_throughput_targets",
     "_probe_options",
     "_ip_literal",
+    "_iface_is_physical",
     "_active_route_context",
     "_active_route_ip",
 ]
@@ -181,6 +194,15 @@ def _ip_literal(value):
     # Принимаем только canonical literals: scoped IPv6 zone-id и альтернативные
     # написания не должны обходить границу через ipaddress.ip_address().
     return str(parsed) == value
+
+
+def _iface_is_physical(iface, prefixes):
+    """True если имя интерфейса начинается с одного из физических префиксов (источник истины —
+    config PHYSICAL_IFACE_PREFIXES, НЕ зашитый литерал 'en'). VPN/туннели (ppp/utun) в дефолтный
+    набор не входят и физическими не считаются. Строгий сигнал gw==GATEWAY проверяется отдельно."""
+    if not isinstance(iface, str) or not iface:
+        return False
+    return any(iface.startswith(p) for p in prefixes if isinstance(p, str) and p)
 
 
 def _active_route_context():

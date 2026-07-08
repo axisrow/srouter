@@ -38,6 +38,56 @@ def test_run_maps_timeout_to_existing_shape(monkeypatch):
     assert sys_probe.run(["slow"], 1) == {"rc": None, "out": "", "err": "timeout", "timeout": True}
 
 
+def test_run_file_not_found_is_not_timeout(monkeypatch):
+    """FileNotFoundError (нет бинаря) — это НЕ timeout. ДЫРА: сейчас любой Exception → timeout=True."""
+    def fake_run(*_args, **_kwargs):
+        raise FileNotFoundError(2, "No such file or directory", "/no/such/binary")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    r = sys_probe.run(["/no/such/binary"], 3)
+    assert r["timeout"] is False, f"отсутствие бинаря ≠ timeout, получили {r}"
+    assert r["rc"] is None
+    assert r["err"], "err должен содержать причину (не пустой)"
+    assert "No such file" in r["err"] or "such" in r["err"]
+
+
+def test_run_permission_error_is_not_timeout(monkeypatch):
+    """PermissionError — не timeout, err с причиной."""
+    def fake_run(*_args, **_kwargs):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    r = sys_probe.run(["/usr/bin/whatever"], 3)
+    assert r["timeout"] is False
+    assert "Permission denied" in r["err"]
+
+
+def test_run_os_error_is_not_timeout(monkeypatch):
+    """Общий OSError (например ENOMEM/EMFILE) — не timeout, err с причиной."""
+    def fake_run(*_args, **_kwargs):
+        raise OSError("Too many open files")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    r = sys_probe.run(["/bin/echo"], 3)
+    assert r["timeout"] is False
+    assert "Too many open files" in r["err"]
+
+
+def test_run_timeout_expired_stays_timeout(monkeypatch):
+    """TimeoutExpired — единственный случай timeout=True (не ломаем существующее)."""
+    def fake_run(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired(cmd=["slow"], timeout=1)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    r = sys_probe.run(["slow"], 1)
+    assert r["timeout"] is True
+    assert r["err"] == "timeout"
+
+
 def test_port_open_uses_socket_connection(monkeypatch):
     calls = []
 

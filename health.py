@@ -34,8 +34,9 @@ PRIVOXY_PORT = 8118
 XRAY_PORT = 10808
 DASHBOARD_PORT = 8787
 
-# Эндпоинт туннеля для проверки (как probe_tunnel).
-TUNNEL_TARGET = "https://api.anthropic.com/"
+# Эндпоинты туннеля для проверки — ДВА таргета, как probe_tunnel (dashboard_network): origin-5xx
+# одного вендора (Anthropic лежит, но канал жив) не должен читаться как «туннель упал».
+TUNNEL_TARGETS = ("https://api.anthropic.com/", "https://api.openai.com/")
 
 # State watchdog'а (переход ok→down, чтобы не спамить). /tmp не переживает ребут — приемлемо:
 # после ребута fresh state, первый прогон без нотификации если уже down.
@@ -50,15 +51,12 @@ def _port_up(port):
     return bool((r.get("out") or "").strip())
 
 
-def _tunnel_up():
-    """Реальный туннель жив? curl через прокси к TUNNEL_TARGET (как probe_tunnel).
-
-    НЕ блокируется PF — прокси-трафик через loopback, PF режет только en*/ppp*.
-    Возвращает (ok: bool, detail: str — http-код или причина).
-    """
+def _tunnel_target_up(url):
+    """Один таргет через прокси: (ok, detail). Живой = сервер ответил HTTP < 500
+    (sys_probe.tunnel_code_up). 000/timeout/5xx — не жив. Не бросает."""
     r = sys_probe.run([CURL, "-sS", "-o", "/dev/null", "-x", _PROXY,
                        "--connect-timeout", "4", "--max-time", "8",
-                       "-w", "%{http_code}", TUNNEL_TARGET], timeout=10)
+                       "-w", "%{http_code}", url], timeout=10)
     if r.get("timeout"):
         return False, "timeout"
     code = (r.get("out") or "").strip()
@@ -66,7 +64,33 @@ def _tunnel_up():
         return False, "no-response"
     if code == "000":
         return False, "connection-failed"
+    try:
+        code_int = int(code)
+    except ValueError:
+        return False, f"bad-code {code}"
+    if not sys_probe.tunnel_code_up(code_int):
+        return False, f"upstream-error HTTP {code}"
     return True, f"HTTP {code}"
+
+
+def _tunnel_up():
+    """Реальный туннель жив? curl через прокси к TUNNEL_TARGETS (ровно как probe_tunnel).
+
+    Бьём ДВА таргета (Anthropic + OpenAI), up = первый OR второй — та же избыточность, что у
+    probe_tunnel: origin-5xx одного вендора (сам вендор лежит, но канал жив) НЕ читается как
+    «туннель упал», иначе watchdog поднимет ложную тревогу (issue #82). Единая семантика 5xx=down
+    сохраняется, но применяется per-target, а решение — по обоим.
+    НЕ блокируется PF — прокси-трафик через loopback, PF режет только en*/ppp*.
+    Возвращает (ok: bool, detail: str — http-код живого таргета или причины провалов).
+    """
+    details = []
+    for url in TUNNEL_TARGETS:
+        ok, detail = _tunnel_target_up(url)
+        if ok:
+            return True, detail  # любой живой таргет = туннель жив (как up = a OR o)
+        details.append(detail)
+    # ни один таргет не ответил живым HTTP < 500 → туннель/прокси down (не origin одного вендора)
+    return False, "; ".join(details)
 
 
 def _is_claude_code_comm(comm):

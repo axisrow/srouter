@@ -139,7 +139,11 @@ def recommendation(metrics_list, active_name):
 
 
 def _default_runner(cmd_list, timeout):
-    """Локальный runner в формате dashboard.run: список аргументов, shell не используется."""
+    """Локальный runner в формате dashboard.run: список аргументов, shell не используется.
+
+    timeout=True ТОЛЬКО при TimeoutExpired (та же семантика, что sys_probe.run: issue #82).
+    Сбои запуска (нет бинаря/прав) — timeout=False + typed err, чтобы _restart_failed не путал
+    отсутствие brew с зависшим рестартом."""
     if not isinstance(cmd_list, list):
         return {"rc": None, "out": "", "err": "cmd must be list", "timeout": True}
     try:
@@ -148,7 +152,7 @@ def _default_runner(cmd_list, timeout):
     except subprocess.TimeoutExpired:
         return {"rc": None, "out": "", "err": "timeout", "timeout": True}
     except Exception as exc:
-        return {"rc": None, "out": "", "err": str(exc), "timeout": True}
+        return {"rc": None, "out": "", "err": f"{type(exc).__name__}: {exc}", "timeout": False}
 
 
 def _active_name(state_path=None):
@@ -290,6 +294,22 @@ def _gateway_literal():
     except Exception:
         return ""
     return gateway if _ip_literal(gateway) else ""
+
+
+def _physical_iface_prefixes():
+    """Префиксы физических интерфейсов из srouter_config (issue #82): источник истины для
+    «интерфейс физический», а не зашитый литерал 'en' в split-route проверке. Ленивый import
+    (как _gateway_literal). Дефолт/битое значение → ("en",) — поведение macOS Wi-Fi/USB-tether."""
+    try:
+        import srouter_config
+
+        raw = getattr(srouter_config, "PHYSICAL_IFACE_PREFIXES", ("en",))
+    except Exception:
+        return ("en",)
+    if isinstance(raw, (list, tuple)):
+        prefixes = tuple(p for p in raw if isinstance(p, str) and p)
+        return prefixes
+    return ("en",)
 
 
 def _sudo_route_ip(action, route_ip, gateway):
@@ -547,10 +567,14 @@ def _route_iface_from_output(out):
 
 
 def _route_goes_via_gateway(route_ip, gateway):
-    """True если route до route_ip идёт через физический шлюз (iface en* или gw==gateway).
+    """True если route до route_ip идёт через физический канал (split активен).
 
-    route -n get -host <ip> → парсим interface + gateway. split активен если iface начинается
-    с 'en' (физический) ИЛИ gateway совпадает с нашим физическим шлюзом. Не бросает.
+    route -n get -host <ip> → парсим interface + gateway. split активен если iface — физический
+    (по config-префиксам PHYSICAL_IFACE_PREFIXES, не по зашитому литералу 'en': issue #82) ИЛИ
+    gateway совпадает с нашим физическим шлюзом (строгий сигнал gw==gateway). Не бросает.
+
+    Fail-closed: если iface ошибочно счесть физическим, split НЕ добавится и трафик к VPS уйдёт
+    в VPN — поэтому источник истины конфигурируем, а VPN/utun/ppp в дефолтный набор не входят.
     """
     if not _ip_literal(route_ip) or not _ip_literal(gateway):
         return False
@@ -563,7 +587,9 @@ def _route_goes_via_gateway(route_ip, gateway):
     out = raw.get("out") or ""
     iface = _route_iface_from_output(out)
     gw = _route_gateway_from_output(out)
-    return iface.startswith("en") or gw == gateway
+    prefixes = _physical_iface_prefixes()
+    is_physical = bool(iface) and any(iface.startswith(p) for p in prefixes if isinstance(p, str) and p)
+    return is_physical or gw == gateway
 
 
 def _route_add_direct(route_ip, gateway):
@@ -578,11 +604,12 @@ def _route_add_direct(route_ip, gateway):
 
 
 def ensure_split_route(state_path=None):
-    """Гарантировать split-route до VPS через физический шлюз (en0), если VPN перехватил default.
+    """Гарантировать split-route до VPS через физический шлюз, если VPN перехватил default.
 
     Главный сценарий «пофигу VPN»: VPN (ppp0) перехватил default → route до VPS через ppp0 →
-    ensure_split_route видит (route get → ppp0, не en*/GATEWAY) → добавляет split-route через
-    физический шлюз. Idempotent: если route уже через en*/GATEWAY — ничего не делает.
+    ensure_split_route видит (route get → ppp0, не физический-iface/GATEWAY) → добавляет split-route
+    через физический шлюз. «Физический» определяется config-префиксами PHYSICAL_IFACE_PREFIXES
+    (issue #82), не литералом 'en'. Idempotent: если route уже через физ-iface/GATEWAY — no-op.
 
     Зовётся watchdog'ом (health.py) раз в ~90с. Не бросает, возвращает dict с состоянием.
     """
@@ -599,7 +626,7 @@ def ensure_split_route(state_path=None):
         gateway = _gateway_literal()
         if not gateway:
             return {"enabled": True, "error": "no GATEWAY"}
-        # route уже через en*/GATEWAY → split активен, ничего не делаем.
+        # route уже через физ-iface/GATEWAY → split активен, ничего не делаем.
         if _route_goes_via_gateway(route_ip, gateway):
             return {"enabled": True, "added": False, "reason": "already split"}
         # route через ppp0/иной → добавить split через физический шлюз.
