@@ -190,8 +190,22 @@ def test_check_all_down_when_everything_dead(monkeypatch):
 
 # ============================ _tunnel_up HTTP semantics (issue #82, класс #3) ============================
 def _tunnel_curl_returning(code_out):
-    """Мок sys_probe.run для _tunnel_up: curl -w %{http_code} печатает заданный код."""
+    """Мок sys_probe.run для _tunnel_up: curl -w %{http_code} печатает заданный код (любой URL)."""
     return lambda cmd, timeout: {"rc": 0, "out": code_out, "err": "", "timeout": False}
+
+
+def _tunnel_curl_per_target(codes):
+    """Мок sys_probe.run с ответом per-URL: {'anthropic': '503', 'openai': '421'}.
+
+    Таргет распознаётся по подстроке в последнем аргументе curl (URL). Неизвестный → '000'.
+    Позволяет проверить избыточность двух таргетов, как в probe_tunnel."""
+    def fake_run(cmd, timeout):
+        url = cmd[-1] if cmd else ""
+        for key, code in codes.items():
+            if key in url:
+                return {"rc": 0, "out": code, "err": "", "timeout": False}
+        return {"rc": 0, "out": "000", "err": "", "timeout": False}
+    return fake_run
 
 
 def test_tunnel_up_5xx_is_down(monkeypatch):
@@ -227,17 +241,62 @@ def test_tunnel_up_200_is_up(monkeypatch):
 
 
 def test_tunnel_up_000_is_down(monkeypatch):
-    """000 — соединения нет (не ломаем существующее)."""
+    """000 на всех таргетах — соединения нет (не ломаем существующее)."""
     monkeypatch.setattr(health.sys_probe, "run", _tunnel_curl_returning("000"))
     ok, detail = health._tunnel_up()
     assert ok is False
-    assert detail == "connection-failed"
+    assert "connection-failed" in detail
 
 
 def test_tunnel_up_timeout_is_down(monkeypatch):
-    """timeout → down (не ломаем)."""
+    """timeout на всех таргетах → down (не ломаем)."""
     monkeypatch.setattr(health.sys_probe, "run",
                         lambda cmd, timeout: {"rc": None, "out": "", "err": "timeout", "timeout": True})
     ok, detail = health._tunnel_up()
     assert ok is False
-    assert detail == "timeout"
+    assert "timeout" in detail
+
+
+# --- избыточность двух таргетов (как probe_tunnel): origin-5xx одного вендора ≠ туннель упал ---
+def test_tunnel_up_origin_5xx_one_vendor_stays_up(monkeypatch):
+    """РЕГРЕСС: Anthropic origin-503 (сам вендор лежит), но OpenAI отвечает 421 → туннель ЖИВ.
+
+    ДЫРА: single-target _tunnel_up бьёт только api.anthropic.com — при origin-outage Anthropic
+    watchdog ложно крикнет 'туннель упал', хотя канал жив. probe_tunnel устойчив (два таргета,
+    up = a OR o) — health обязан вести себя так же."""
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _tunnel_curl_per_target({"anthropic": "503", "openai": "421"}))
+    ok, detail = health._tunnel_up()
+    assert ok is True, f"origin-503 одного вендора при живом втором = туннель жив, detail={detail}"
+
+
+def test_tunnel_up_origin_5xx_other_vendor_stays_up(monkeypatch):
+    """Симметрично: OpenAI 500, Anthropic 200 → жив (второй таргет спасает)."""
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _tunnel_curl_per_target({"anthropic": "200", "openai": "500"}))
+    ok, _ = health._tunnel_up()
+    assert ok is True
+
+
+def test_tunnel_up_both_5xx_is_down(monkeypatch):
+    """Оба таргета 5xx → down: это уже не origin одного вендора, а сбой прокси/туннеля."""
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _tunnel_curl_per_target({"anthropic": "503", "openai": "502"}))
+    ok, detail = health._tunnel_up()
+    assert ok is False, f"оба 5xx = сбой канала, не origin, detail={detail}"
+
+
+def test_tunnel_up_both_000_is_down(monkeypatch):
+    """Оба таргета 000 (нет соединения ни к кому) → down."""
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _tunnel_curl_per_target({"anthropic": "000", "openai": "000"}))
+    ok, detail = health._tunnel_up()
+    assert ok is False
+
+
+def test_tunnel_up_first_target_down_second_up(monkeypatch):
+    """Первый таргет не отвечает (000), второй жив (200) → туннель жив (фолбэк работает)."""
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _tunnel_curl_per_target({"anthropic": "000", "openai": "200"}))
+    ok, _ = health._tunnel_up()
+    assert ok is True
