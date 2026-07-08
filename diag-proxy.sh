@@ -7,6 +7,11 @@ LABEL="${1:-?}"
 BRIDGE="http://127.0.0.1:8118"
 SOCKS="socks5h://USER:PASS@YOUR_VPS_IP:1080"
 
+# Бинарники параметризуемы через env — тот же канон подмены, что в srouter-diag.sh
+# (shell-тесты подставляют fake curl/dig, чтобы гонять скрипт без реальной сети).
+CURL_BIN="${SROUTER_CURL:-curl}"
+DIG_BIN="${SROUTER_DIG:-dig}"
+
 HOSTS=(api.anthropic.com claude.ai platform.claude.com downloads.claude.ai \
        storage.googleapis.com bridge.claudeusercontent.com raw.githubusercontent.com \
        statsig.anthropic.com api.statsig.com)
@@ -24,23 +29,28 @@ echo
 probe() { # $1=host  $2..=доп.аргументы curl
   local host="$1"; shift
   local out
-  out=$(curl "$@" -s -o /dev/null --max-time 12 \
+  out=$("$CURL_BIN" "$@" -s -o /dev/null --max-time 12 \
         -w "%{http_code}/%{time_total}s" "https://$host/" 2>/dev/null)
   local rc=$?
   if [ $rc -ne 0 ]; then echo "FAIL($rc)"; else echo "$out"; fi
 }
 
 # DIRECT: принудительно БЕЗ прокси (сбрасываем env и --noproxy), чтобы тест был реально прямым.
+# rc ловим отдельно (как в probe()): при провале curl -w печатает частичный write-out
+# ('000/...') в stdout, а '|| echo FAIL' его бы приклеил — колонка DIRECT исказилась бы.
 probe_direct() {
-  env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY \
-    curl --noproxy '*' -s -o /dev/null --max-time 12 \
-    -w "%{http_code}/%{time_total}s" "https://$1/" 2>/dev/null || echo "FAIL($?)"
+  local out
+  out=$(env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY \
+        "$CURL_BIN" --noproxy '*' -s -o /dev/null --max-time 12 \
+        -w "%{http_code}/%{time_total}s" "https://$1/" 2>/dev/null)
+  local rc=$?
+  if [ $rc -ne 0 ]; then echo "FAIL($rc)"; else echo "$out"; fi
 }
 
 printf "%-30s | %-15s | %-10s | %-10s | %-10s\n" "HOST" "DNS" "DIRECT" "BRIDGE" "SOCKS5"
 printf -- "-------------------------------+-----------------+------------+------------+-----------\n"
 for h in "${HOSTS[@]}"; do
-  dns=$(dig +short +time=3 +tries=1 "$h" 2>/dev/null | grep -E '^[0-9]' | head -1)
+  dns=$("$DIG_BIN" +short +time=3 +tries=1 "$h" 2>/dev/null | grep -E '^[0-9]' | head -1)
   [ -z "$dns" ] && dns="NXDOMAIN"
   direct=$(probe_direct "$h")
   bridge=$(probe "$h" -x "$BRIDGE")

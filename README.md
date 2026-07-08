@@ -1,13 +1,12 @@
 # srouter — smart router
 
-> **Умное ускорение доступа.** srouter **автоматически восстанавливает пропущенные узлы сети** и
-> находит более быстрые маршруты прохождения трафика вместо стандартных, когда те демонстрируют
-> повышенные задержки или нестабильность. Это **адаптивная маршрутизация**: запросы к ресурсам со
-> сниженной скоростью доступа направляются по оптимизированному пути через зарубежный
-> узел‑ретранслятор, остальной трафик идёт напрямую.
+> **Умное ускорение доступа.** srouter **находит более быстрые маршруты** прохождения трафика
+> вместо стандартных, когда те демонстрируют повышенные задержки или нестабильность. Это
+> **адаптивная маршрутизация**: запросы к ресурсам со сниженной скоростью доступа направляются по
+> оптимизированному пути через зарубежный узел‑ретранслятор, остальной трафик идёт напрямую.
 >
-> *Если «замедление» — это избирательная фильтрация маршрутов, то «ускорение» — это автоматический
-> подбор быстрых маршрутов и восстановление пропущенных узлов сети. Закон надо чтить.* 🎩
+> *Если «замедление» — это избирательная фильтрация маршрутов, то «ускорение» — это подбор быстрых
+> маршрутов и приоритизация «горячих» путей. Закон надо чтить.* 🎩
 
 *(English version below — [jump to English](#srouter--smart-router-english))*
 
@@ -17,13 +16,14 @@
 
 srouter — тулкит **адаптивной маршрутизации трафика** и **обхода замедлений**. Он делает так,
 чтобы доступ к ресурсам, которые «замедлены» на стандартном маршруте, был быстрым и стабильным —
-за счёт автоматического выбора лучшего пути и постоянной оптимизации.
+за счёт приоритизации «горячих» маршрутов и рекомендации самого быстрого узла (переключение —
+вручную, кнопкой в дашборде).
 
 Тулкит состоит из **двух частей**:
 
 1. **Серверная часть — Docker‑контейнеры узлов‑ускорителей.** Разворачивается на VPS за пределами
    региона ограничений. Можно поднять **несколько** узлов в разных локациях и подключить их все —
-   srouter сам выберет самый быстрый.
+   srouter ранжирует их по скорости и рекомендует лучший (переключение — вручную).
 2. **Локальная часть — установщик клиента.** Ставится на рабочую машину (macOS): клиент
    маршрутизации, быстрый DNS и веб‑дашборд мониторинга/управления.
 
@@ -33,9 +33,9 @@ srouter адаптируется к состоянию сети на трёх у
 
 | Уровень | Что выбирается/оптимизируется | Как |
 |---|---|---|
-| **Узел‑ускоритель** | самый быстрый из подключённых Docker‑узлов | непрерывный замер задержки и пропускной способности до каждого, выбор лучшего |
+| **Узел‑ускоритель** | самый быстрый из подключённых Docker‑узлов | непрерывный замер задержки и пропускной способности до каждого, ранжирование + рекомендация лучшего (переключение вручную) |
 | **Маршрут** | оптимальный путь для конкретного ресурса | автоопределение «горячих» (популярных) маршрутов, их кэш и приоритезация |
-| **Физический канал** | рабочий сетевой интерфейс | Wi‑Fi → мобильный (USB / Wi‑Fi‑hotspot / **Bluetooth‑tethering**) при недоступности |
+| **Физический канал** | рабочий сетевой интерфейс | Wi‑Fi → мобильный (USB / Wi‑Fi‑hotspot) при недоступности |
 
 То есть: «замедлили» маршрут — srouter уводит трафик через быстрый узел; маршрут часто
 используется — он закэширован и выбирается мгновенно; пропал Wi‑Fi — переключился на мобильный
@@ -43,29 +43,32 @@ srouter адаптируется к состоянию сети на трёх у
 
 ## Самооптимизация (что система делает сама)
 
-srouter не статичен — он **постоянно учится и подстраивается**:
+srouter не статичен — он **постоянно измеряет сеть и подстраивает маршруты**. Сбор метрик, кэш
+маршрутов и ранжирование узлов идут автоматически; смена активного узла — по рекомендации, вручную:
 
 - **Автоопределение популярных маршрутов.** Система отслеживает, к каким ресурсам обращаются чаще
   всего, и держит для них заранее выбранный оптимальный путь — это сокращает время нахождения
   маршрута (не нужно каждый раз решать заново).
 - **Оптимизация скорости нахождения маршрута.** «Горячие» маршруты кэшируются; решение о пути
   принимается по предвычисленной таблице, а не на лету.
-- **Оптимизация пропускной способности.** Узлы оцениваются не только по задержке (ping), но и по
-  реальной пропускной способности; трафик балансируется на узел с лучшим сочетанием latency +
-  throughput.
-- **Health‑check и авто‑переключение.** Каждый узел периодически проверяется; при деградации
-  (рост задержки, падение скорости, потери) трафик автоматически уходит на следующий лучший узел.
+- **Оценка по пропускной способности.** Узлы оцениваются не только по задержке (ping), но и по
+  реальной пропускной способности; дашборд ранжирует их по сочетанию latency + throughput и
+  **рекомендует** лучший (переключение — вручную).
+- **Health‑check и рекомендация лучшего узла.** Каждый узел периодически проверяется; при
+  деградации (рост задержки, падение скорости, потери) дашборд ранжирует узлы и **рекомендует**
+  переключиться на лучший. Переключение — ручное (кнопкой в дашборде): в v1 автопереключения нет,
+  чтобы смена активного узла всегда была осознанной. *(Авто‑failover — в планах.)*
 
 ## Архитектура
 
 ```
    ФИЗИЧЕСКИЕ КАНАЛЫ (failover по приоритету)
-   ┌──────────┐  ┌──────────┐  ┌──────────────┐
-   │ Wi-Fi    │  │ USB-тел. │  │ Bluetooth-тел.│
-   │ (en0)    │  │(Personal │  │ (PAN)         │
-   └────┬─────┘  │ Hotspot) │  └──────┬───────┘
-        │        └────┬─────┘         │
-        └─────────────┴───────────────┘
+   ┌──────────┐  ┌──────────┐
+   │ Wi-Fi    │  │ USB-тел. │
+   │ (en0)    │  │(Personal │
+   └────┬─────┘  │ Hotspot) │
+        │        └────┬─────┘
+        └─────────────┘
                       │  ← srouter держит активным быстрейший доступный канал
    ┌──────────────────┴──────────────────────────────────────────┐
    │                  ЛОКАЛЬНАЯ ЧАСТЬ (macOS)                       │
@@ -73,7 +76,7 @@ srouter не статичен — он **постоянно учится и по
    │                                          │                    │
    │   АДАПТИВНАЯ МАРШРУТИЗАЦИЯ + САМООПТИМИЗАЦИЯ:                  │
    │   ┌──────────────────────────────────────┴────────────────┐  │
-   │   │ замедленные/популярные домены → лучший узел (кэш путей) │  │
+   │   │ замедленные/популярные домены → активный узел (кэш пути)│  │
    │   │ остальное                     → напрямую                │  │
    │   └───────────────────┬──────────────────────────────────-─┘  │
    │   dnsmasq (быстрый DNS)│   dashboard (замер узлов, выбор, метрики)│
@@ -85,7 +88,7 @@ srouter не статичен — он **постоянно учится и по
  │ Узел A 🇧🇬│       │ Узел B 🇩🇪│         │ Узел C 🇸🇬│   ...   │ Узел N   │
  │Docker:443│       │Docker:443│         │Docker:443│         │          │
  └────┬─────┘       └────┬─────┘         └────┬─────┘         └────┬─────┘
-      │  ◄── srouter ранжирует по latency + throughput, шлёт на лучший ──►│
+      │  ◄── srouter ранжирует по latency + throughput, шлёт на выбранный ─►│
       └─────────────────────────── интернет ──────────────────────────────┘
 ```
 
@@ -110,14 +113,14 @@ srouter не статичен — он **постоянно учится и по
 ### 2. Локальная часть — клиент маршрутизации
 
 ```
-приложение → privoxy (127.0.0.1:8118, HTTP) → xray (127.0.0.1:10808, SOCKS5) → лучший узел
+приложение → privoxy (127.0.0.1:8118, HTTP) → xray (127.0.0.1:10808, SOCKS5) → выбранный активный узел
 ```
 
 - **xray‑клиент** — локальный SOCKS5 с **вайтлист‑роутингом**: замедленные/популярные домены идут
   в туннель к узлу, остальное — `direct` (напрямую, с реального IP, быстро).
 - **privoxy** — HTTP‑мост поверх SOCKS5 (многие инструменты понимают только HTTP‑прокси, не SOCKS).
-- **Выбор узла** — дашборд ранжирует узлы по latency + throughput и маршрутизирует через лучший,
-  переключаясь при деградации.
+- **Выбор узла** — дашборд ранжирует узлы по latency + throughput и **рекомендует** лучший;
+  активный узел переключается вручную (кнопкой). Автопереключения в v1 нет.
 
 ### 3. DNS — быстрый резолвинг без зависаний
 
@@ -146,9 +149,10 @@ cache-size=1000
 ### 5. Канальный фоллбэк (Wi‑Fi → мобильный)
 
 srouter следит за связностью активного интерфейса и при пропаже интернета на Wi‑Fi (`en0`)
-переключается на любой доступный канал по приоритету: **USB‑телефон** (Personal Hotspot),
-**Bluetooth‑tethering** (PAN), другая Wi‑Fi‑сеть. Реализуется через приоритет сетевых сервисов
-macOS + активную проверку связности (не просто «линк есть», а «интернет реально доступен»).
+переключается на доступный мобильный канал по приоритету: **USB‑телефон** (Personal Hotspot),
+затем другая Wi‑Fi‑сеть. Реализуется через приоритет сетевых сервисов macOS + активную проверку
+связности (не просто «линк есть», а «интернет реально доступен»). *(Bluetooth‑tethering/PAN — в
+планах; сейчас каналы — только Wi‑Fi и USB.)*
 
 ---
 
@@ -163,7 +167,12 @@ macOS + активную проверку связности (не просто 
 python3 -m pip install --upgrade pip          # нужен pip ≥ 21.3 для PEP 660 editable-install
 pip install -e .
 
-# 2. Полная установка стека одной командой:
+# 2. Создать локальный конфиг из шаблона и вписать свои адреса (иначе дашборд упадёт
+#    с понятной ошибкой — srouter_config.py не в репозитории):
+cp srouter_config.example.py srouter_config.py
+#    → открыть srouter_config.py и заполнить GATEWAY / VPN_SERVER / VPN_EXIT_IP.
+
+# 3. Полная установка стека одной командой:
 #    Сценарий A — sudo (один ввод пароля, потом ноль osascript-диалогов; для серверов/dev):
 sudo srouter install --python $(which python3) -y
 #    Сценарий B — osascript (GUI-диалог при каждом привилегированном действии; для user-mac):
@@ -305,11 +314,10 @@ sudo pfctl -d                                     # выключить PF цел
 
 # srouter — smart router (English)
 
-> **Smart access acceleration.** srouter **restores network nodes missing from the path** and
-> automatically discovers faster routes instead of the standard ones whenever the latter show
-> increased latency or instability. This is **adaptive routing**: requests to resources with
-> reduced access speed are sent over an optimized path through an overseas relay node, while all
-> other traffic goes directly.
+> **Smart access acceleration.** srouter **finds faster routes** instead of the standard ones
+> whenever the latter show increased latency or instability. This is **adaptive routing**: requests
+> to resources with reduced access speed are sent over an optimized path through an overseas relay
+> node, while all other traffic goes directly.
 
 ## What it is
 
@@ -317,7 +325,8 @@ A toolkit for **adaptive traffic routing** that bypasses throttling by always ch
 path and continuously optimizing it. Two parts:
 
 1. **Server side — Docker accelerator nodes.** Deploy on a VPS outside the restricted region. Run
-   **multiple** nodes and connect them all — srouter picks the fastest.
+   **multiple** nodes and connect them all — srouter ranks them by speed and recommends the fastest
+   (switching is manual).
 2. **Local side — client installer.** Routing client, fast DNS, and a monitoring/control dashboard
    (macOS).
 
@@ -325,29 +334,34 @@ path and continuously optimizing it. Two parts:
 
 | Level | Chosen / optimized | How |
 |---|---|---|
-| **Accelerator node** | fastest connected Docker node | continuous latency + throughput probing |
+| **Accelerator node** | ranked by speed, fastest recommended | continuous latency + throughput probing; manual switch |
 | **Route** | optimal path per resource | auto‑detected hot (popular) routes, cached & prioritized |
-| **Physical link** | working interface | Wi‑Fi → mobile (USB / hotspot / **Bluetooth tethering**) on failure |
+| **Physical link** | working interface | Wi‑Fi → mobile (USB / hotspot) on failure |
 
 ## Self‑optimization (what it does on its own)
+
+Metric collection, route caching and node ranking are automatic; changing the active node is manual,
+on the dashboard's recommendation.
 
 - **Auto‑detects popular routes** and keeps a pre‑selected optimal path for them — cutting
   path‑selection time.
 - **Optimizes path‑selection speed** via a hot‑route cache (decisions from a precomputed table).
-- **Optimizes throughput** — nodes ranked by latency *and* real bandwidth; traffic goes to the best
-  combination.
-- **Health‑checks & auto‑failover** — degraded node (latency/throughput/loss) → traffic shifts to
-  the next best automatically.
+- **Scores by throughput** — nodes ranked by latency *and* real bandwidth; the dashboard
+  **recommends** the best combination (switching is manual).
+- **Health‑checks & best‑node recommendation** — a degraded node (latency/throughput/loss) makes
+  the dashboard rank nodes and **recommend** the best; switching the active node is manual (a button).
+  v1 has no auto‑failover — node changes stay deliberate. *(Auto‑failover is on the roadmap.)*
 
 ## Components
 
 - **Accelerator nodes (Docker):** Xray **VLESS + Reality** on :443, masqueraded as a real TLS site.
   Scalable via `docker compose up`.
-- **Routing client:** `app → privoxy (HTTP) → xray (SOCKS5) → best node`, with **whitelist routing**.
+- **Routing client:** `app → privoxy (HTTP) → xray (SOCKS5) → selected active node`, with **whitelist routing**.
 - **Fast DNS:** local `dnsmasq` with `all-servers` (parallel queries, first answer wins).
 - **Dashboard** (`dashboard.py`): connection‑flow, geo/IP/latency/throughput monitoring, DNS health,
   interfaces, node selection. Simple/Cinematic modes, i18n EN/RU/ZH.
-- **Link failover:** Wi‑Fi → mobile (USB / hotspot / Bluetooth) by priority on connectivity loss.
+- **Link failover:** Wi‑Fi → mobile (USB / hotspot) by priority on connectivity loss. *(Bluetooth/PAN
+  is on the roadmap; channels today are Wi‑Fi and USB only.)*
 
 ## Install (local, macOS)
 
@@ -360,7 +374,12 @@ path and continuously optimizing it. Two parts:
 python3 -m pip install --upgrade pip          # needs pip >= 21.3 for PEP 660 editable install
 pip install -e .
 
-# 2. Install the full stack with one command:
+# 2. Create the local config from the template and fill in your addresses (otherwise the
+#    dashboard exits with a friendly error — srouter_config.py is not in the repo):
+cp srouter_config.example.py srouter_config.py
+#    → open srouter_config.py and fill GATEWAY / VPN_SERVER / VPN_EXIT_IP.
+
+# 3. Install the full stack with one command:
 #    Scenario A — sudo (one password entry, then zero osascript dialogs; for servers/dev):
 sudo srouter install --python $(which python3) -y
 #    Scenario B — osascript (GUI dialog on each privileged action; for user mac):
