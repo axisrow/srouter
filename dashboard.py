@@ -316,6 +316,9 @@ def _is_cross_origin_post():
 # Любой loopback не подвержен DNS-rebinding, поэтому его наличие в allow-list безопасно и не
 # расширяет поверхность атаки. (Путь `localhost`, резолвящийся в IPv6, покрыт записью `localhost`:
 # браузер шлёт в Host саму строку `localhost`, а не адрес.)
+# ВАЖНО: это allow-list только для Host-rebinding guard (GET-доступ). CSRF-origin allow-list
+# (`_allowed_origins()` / `_GUARD_HOSTS`) намеренно уже — только 127.0.0.1/localhost, поэтому
+# мутации (POST) с `Origin: http://[::1]:8787` по-прежнему отклоняются 403 (fail-closed by design).
 _ALLOWED_HOSTNAMES = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
