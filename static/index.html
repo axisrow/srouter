@@ -35,6 +35,11 @@
       background:linear-gradient(90deg,transparent,var(--bs-primary),transparent);
       animation:scan 2.2s linear infinite; }
     @keyframes scan { 0%{transform:translateX(-100%);} 100%{transform:translateX(100%);} }
+    /* leak: выход цепочки совпал с прямым выходом — реальный IP утёк мимо цепочки. */
+    .flow-node.leak { border-color:var(--bs-danger); box-shadow:0 0 0 1px var(--bs-danger) inset; }
+    .flow-node .leak-badge { display:inline-block; font-size:.6rem; font-weight:700; letter-spacing:.06em;
+      text-transform:uppercase; color:#fff; background:var(--bs-danger); border-radius:.3rem;
+      padding:0 .3rem; margin-left:.35rem; vertical-align:middle; }
     .ops { font-family:var(--bs-font-monospace); font-size:.82rem; }
     .ops .k { opacity:.6; }
     .dns-pill { font-family:var(--bs-font-monospace); font-size:.75rem; }
@@ -226,6 +231,7 @@
         err_req: "Error {0}: {1}", req_failed: "Request failed {0}: {1}",
         spark_empty: "no data", spark_label: "{0} samples, last {1} ms",
         flow_title: "Connection flow", node_vpn_exit: "VPN / direct exit", node_vps: "VPS relay",
+        node_chain: "Chain exit", flow_leak: "leak",
         node_internet: "Internet", node_world: "world", node_world_sub: "AI endpoints",
         card_ip_direct: "Direct / VPN exit IP", card_ip_chain: "Chain exit IP",
         card_ip_vps: "VPS endpoint", card_ping: "Ping → VPS", ping_sub: "loss {0}% · VPN {1}",
@@ -320,6 +326,7 @@
         err_req: "Ошибка {0}: {1}", req_failed: "Сбой запроса {0}: {1}",
         spark_empty: "нет данных", spark_label: "{0} замеров, последний {1} мс",
         flow_title: "Схема соединения", node_vpn_exit: "VPN / прямой выход", node_vps: "VPS-ретранслятор",
+        node_chain: "Выход цепочки", flow_leak: "утечка",
         node_internet: "Интернет", node_world: "мир", node_world_sub: "AI-сервисы",
         card_ip_direct: "IP прямого / VPN-выхода", card_ip_chain: "IP выхода цепочки",
         card_ip_vps: "Точка VPS", card_ping: "Пинг → VPS", ping_sub: "потери {0}% · VPN {1}",
@@ -414,6 +421,7 @@
         err_req: "错误 {0}：{1}", req_failed: "请求失败 {0}：{1}",
         spark_empty: "无数据", spark_label: "{0} 次采样，最近 {1} 毫秒",
         flow_title: "连接链路", node_vpn_exit: "VPN / 直连出口", node_vps: "VPS 中继",
+        node_chain: "链路出口", flow_leak: "泄露",
         node_internet: "互联网", node_world: "世界", node_world_sub: "AI 服务",
         card_ip_direct: "直连 / VPN 出口 IP", card_ip_chain: "链路出口 IP",
         card_ip_vps: "VPS 节点", card_ping: "延迟 → VPS", ping_sub: "丢包 {0}% · VPN {1}",
@@ -505,7 +513,9 @@
       if (s == null) return key;
       if (arguments.length > 1) {
         for (var i = 1; i < arguments.length; i++) {
-          s = s.replace('{' + (i - 1) + '}', String(arguments[i]));
+          // split/join, а не String.replace: replacementString трактует $&, $`, $', $n
+          // как спец-паттерны, искажая server error и URL в подставляемом тексте (#12).
+          s = s.split('{' + (i - 1) + '}').join(String(arguments[i]));
         }
       }
       return s;
@@ -562,6 +572,17 @@
       var isp = n.isp ? esc(n.isp) : '';
       var asn = n.asn ? ('AS' + esc(String(n.asn).replace(/^AS/i, ''))) : '';
       return [loc, isp, asn].filter(Boolean).join(' · ') || t('no_geo');
+    }
+    // Badge карточки Public DNS считаем из public reachability (dns.public), а НЕ из
+    // dns.status (тот отражает системный scutil-resolver, находка #6). Не смешиваем
+    // системный resolver и достижимость публичных DNS.
+    function dnsCardStatus(dns) {
+      var pub = (dns && dns.public) || [];
+      if (!pub.length) return 'unknown';
+      var up = pub.filter(function (s) { return s && s.up; }).length;
+      if (up === 0) return 'down';
+      if (up < pub.length) return 'warn';
+      return 'ok';
     }
 
     /* ============================ Sparkline ============================ */
@@ -1616,7 +1637,7 @@
       html += cineCard({ icon: 'bi-globe-americas', title: t('card_dns_public'),
         value: (dns.public || []).filter(function (s) { return s.up; }).length + '/' +
                (dns.public || []).length,
-        sub: dnsList || t('no_data'), status: dns.status, col: 'col-12 col-md-6 col-xl-4' });
+        sub: dnsList || t('no_data'), status: dnsCardStatus(dns), col: 'col-12 col-md-6 col-xl-4' });
 
       var ifd = d.ifaces || {};
       var ifList = (ifd.ifaces || []).map(function (i) {
@@ -1658,14 +1679,18 @@
       document.getElementById('updated').textContent = t('updated_at', ts.toLocaleTimeString());
     }
 
-    function flowNode(n, roleLabel, live) {
+    function flowNode(n, roleLabel, live, opts) {
+      opts = opts || {};
       var fl = n && n.country_code ? flag(n.country_code) : '';
-      return '<div class="flow-node' + (live ? ' live' : '') + '">' +
-               '<div class="role">' + esc(roleLabel) + '</div>' +
+      var cls = 'flow-node' + (live ? ' live' : '') + (opts.extraClass ? ' ' + opts.extraClass : '');
+      var badge = opts.badge ? '<span class="leak-badge">' + esc(opts.badge) + '</span>' : '';
+      var sub = opts.sub ? '<div class="meta">' + esc(opts.sub) + '</div>' : '';
+      return '<div class="' + cls + '">' +
+               '<div class="role">' + esc(roleLabel) + badge + '</div>' +
                '<div class="d-flex align-items-center gap-2">' +
                  '<span class="flag">' + (fl || '🌐') + '</span>' +
                  '<span class="ip mono">' + esc((n && n.ip) || '—') + '</span>' +
-               '</div><div class="meta">' + geoLine(n) + '</div></div>';
+               '</div><div class="meta">' + geoLine(n) + '</div>' + sub + '</div>';
     }
     function flowArrow(rttMs) {
       var r = (typeof rttMs === 'number') ? (rttMs + ' ' + t('ms')) : '';
@@ -1674,11 +1699,25 @@
     }
     function renderFlow(d) {
       var ips = d.ips || {}, ping = d.ping || {};
+      var direct = ips.direct || {}, chain = ips.chain || {}, vps = ips.vps || {};
+      // leak: выход цепочки == прямой выход => реальный IP наружу мимо цепочки.
+      // НО chain == route(vps) — честный выход через VPS: бэк (probe_ips) даёт этому
+      // приоритет над chain==direct и отдаёт status='ok'. Воспроизводим приоритет,
+      // иначе красная рамка противоречит зелёному flow-badge (ips.status).
+      var leak = !!(chain.ip && direct.ip && chain.ip === direct.ip && chain.ip !== vps.ip);
+      // RTT честно (находка #5): vps_ms = local→VPS (route_ip) — ребро, входящее в VPS;
+      // vpn_ms = local→VPN-сервер — свойство узла прямого/VPN-выхода, не ребро цепочки;
+      // сегмент VPS→Internet мы не измеряем, RTT там не ставим.
+      var vpnSub = (typeof ping.vpn_ms === 'number')
+        ? 'VPN ' + ping.vpn_ms + ' ' + t('ms') : '';
       var strip =
-        flowNode(ips.direct, t('node_vpn_exit'), true) +
-        flowArrow(ping.vpn_ms) +
-        flowNode(ips.vps, t('node_vps'), true) +
+        flowNode(direct, t('node_vpn_exit'), true, { sub: vpnSub }) +
+        flowArrow(null) +
+        flowNode(chain, t('node_chain'), true,
+                 leak ? { extraClass: 'leak', badge: t('flow_leak') } : {}) +
         flowArrow(ping.vps_ms) +
+        flowNode(vps, t('node_vps'), true) +
+        flowArrow(null) +
         '<div class="flow-node"><div class="role">' + esc(t('node_internet')) +
           '</div><div class="d-flex align-items-center gap-2"><span class="flag">🌍</span>' +
           '<span class="ip">' + esc(t('node_world')) + '</span></div>' +
