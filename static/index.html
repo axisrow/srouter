@@ -512,11 +512,15 @@
       if (s == null) s = I18N.en[key];
       if (s == null) return key;
       if (arguments.length > 1) {
-        for (var i = 1; i < arguments.length; i++) {
-          // split/join, а не String.replace: replacementString трактует $&, $`, $', $n
-          // как спец-паттерны, искажая server error и URL в подставляемом тексте (#12).
-          s = s.split('{' + (i - 1) + '}').join(String(arguments[i]));
-        }
+        // Single-pass замена всех {N} за один проход: подставленное значение НЕ участвует
+        // в дальнейших заменах, поэтому value с литералом {M} не переэкспандится следующей
+        // итерацией (был класс #88 при итеративном split/join). Callback-форма replace не
+        // трактует $&, $`, $', $n в возвращаемом значении как спец-паттерны — #12 не регрессирует.
+        var argv = arguments;
+        s = s.replace(/\{(\d+)\}/g, function (m, n) {
+          var idx = Number(n) + 1;
+          return idx < argv.length ? String(argv[idx]) : m;  // нет аргумента — оставляем {N} как есть
+        });
       }
       return s;
     }
