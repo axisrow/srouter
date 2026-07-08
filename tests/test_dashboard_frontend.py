@@ -134,6 +134,32 @@ def test_render_flow_marks_leak_when_chain_equals_direct():
     assert "leak" in strip.lower(), "leak-сценарий chain==direct не подсвечен"
 
 
+def test_render_flow_no_leak_when_chain_equals_vps():
+    """#4: chain == route(vps) — цепочка честно выходит через VPS, это НЕ утечка.
+
+    Контракт dashboard_geo.probe_ips: приоритет 1 (chain==route_ip -> status='ok')
+    перекрывает приоритет 2 (chain==direct -> 'warn'). Значит при
+    chain == direct == vps бэк отдаёт 'ok'. Фронт не должен рисовать leak-рамку,
+    иначе красная 'утечка' противоречит зелёному flow-badge (ips.status='ok').
+    Сценарий: прямой выход численно равен IP VPS-узла (direct == vps).
+    """
+    same = "198.51.100.7"
+    d = {
+        "ips": {
+            "direct": {"ip": same, "country_code": "SG"},
+            "chain": {"ip": same, "country_code": "SG"},
+            "vps": {"ip": same, "country_code": "SG"},
+            "status": "ok",
+        },
+        "ping": {"vps_ms": 40, "vpn_ms": 30},
+    }
+    strip = _render_flow(d)
+    assert "leak" not in strip.lower(), (
+        "ложная leak-рамка при chain==route (бэк отдаёт status='ok') — "
+        "UI противоречит flow-badge"
+    )
+
+
 def test_render_flow_rtt_labels_match_segments():
     """#5: vps_ms относится к пути до VPS, vpn_ms — до VPN-сервера. Не перепутать.
 

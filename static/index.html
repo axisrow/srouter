@@ -1701,7 +1701,10 @@
       var ips = d.ips || {}, ping = d.ping || {};
       var direct = ips.direct || {}, chain = ips.chain || {}, vps = ips.vps || {};
       // leak: выход цепочки == прямой выход => реальный IP наружу мимо цепочки.
-      var leak = !!(chain.ip && direct.ip && chain.ip === direct.ip);
+      // НО chain == route(vps) — честный выход через VPS: бэк (probe_ips) даёт этому
+      // приоритет над chain==direct и отдаёт status='ok'. Воспроизводим приоритет,
+      // иначе красная рамка противоречит зелёному flow-badge (ips.status).
+      var leak = !!(chain.ip && direct.ip && chain.ip === direct.ip && chain.ip !== vps.ip);
       // RTT честно (находка #5): vps_ms = local→VPS (route_ip) — ребро, входящее в VPS;
       // vpn_ms = local→VPN-сервер — свойство узла прямого/VPN-выхода, не ребро цепочки;
       // сегмент VPS→Internet мы не измеряем, RTT там не ставим.
