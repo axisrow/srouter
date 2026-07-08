@@ -8,6 +8,7 @@ import threading
 import time
 import re
 from pathlib import Path
+from urllib.parse import urlsplit
 from concurrent.futures import ThreadPoolExecutor, wait
 from flask import Flask, g, jsonify, Response, request
 
@@ -291,6 +292,63 @@ def _is_cross_origin_post():
 
     # 3) Нет Origin и Sec-Fetch-Site same-origin/none/отсутствует — curl/non-browser: pass.
     return False
+
+
+# ============================ DNS-rebinding guard (issue #82, находка #2) ============================
+# Сервис слушает loopback, но DNS-rebinding обходит Same-Origin Policy: атакующий резолвит
+# evil.com → 127.0.0.1, страница на его домене делает fetch('/api/status') как СВОЙ same-origin
+# (браузер шлёт Host: evil.com:8787), и читает статус/IP/гео пользователя. CSRF/Origin-guard тут
+# бесполезен — он режет только POST и только по Origin; при rebinding Origin атакующего "легитимен"
+# для его же страницы, а GET read-only не гардится вовсе.
+#
+# Единственная защита — сервер знает СВОЙ Host: обращаться к нему легитимно лишь по loopback-hostname
+# (127.0.0.1/localhost/::1). Чужой hostname в Host → 403 БЕЗУСЛОВНО (привилегированная граница,
+# fail-closed); неоднозначный/непарсимый Host → тоже 403.
+#
+# Порт в Host НЕ валидируем: атакующий всё равно бьёт в :8787 (там сервис), поэтому его rebinding-Host
+# будет ".:8787" — сигнал даёт hostname, не порт. К тому же легит-клиенты шлют голый hostname без порта
+# (curl 127.0.0.1:8787 → Host: 127.0.0.1:8787, прямой ввод/закладка → разные формы), а werkzeug
+# в тестах по умолчанию ставит Host: localhost без порта. Привязка к порту сломала бы легит, не добавив
+# защиты от rebinding.
+_ALLOWED_HOSTNAMES = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def _is_allowed_host(raw_host):
+    """True только если Host однозначно указывает на loopback-hostname сервиса.
+
+    Fail-closed: при ЛЮБОЙ неоднозначности парсинга → False (reject). Не полагаемся на
+    "доброту" urlsplit (он прощает userinfo `@`, path `/`, query `?` — формы, которых в
+    легитимном Host-заголовке не бывает и которыми маскируют обход): такие символы режем
+    ДО парсинга, иначе `127.0.0.1@evil.com` дал бы hostname=evil.com в обход allow-list.
+    """
+    if not raw_host:
+        return False
+    # Символы, которых в валидном host[:port] быть не может — явная аномалия/обход.
+    # (пробел/таб/перевод строки, userinfo, path, query, fragment, обратный слэш).
+    if any(c in raw_host for c in " \t\r\n@/?#\\"):
+        return False
+    try:
+        parts = urlsplit("//" + raw_host)
+        hostname = parts.hostname  # нормализован (lowercase, IPv6 без скобок), userinfo отброшен
+        _ = parts.port  # доступ форсит валидацию порта: непарсимый/вне диапазона → ValueError
+    except ValueError:
+        return False
+    if hostname is None:
+        return False
+    return hostname in _ALLOWED_HOSTNAMES
+
+
+@app.before_request
+def _host_rebinding_guard():
+    """Режет DNS-rebinding: любой запрос с не-loopback/неоднозначным Host → 403.
+
+    Общий для ВСЕХ роутов и методов (GET+POST) и зарегистрирован ПЕРВЫМ среди before_request —
+    Flask зовёт хуки в порядке регистрации и останавливается на первом ответе, поэтому Host-guard
+    отбивает чужой Host раньше, чем CSRF- или mutation-lock-guard что-либо сделают.
+    """
+    if not _is_allowed_host(request.headers.get("Host")):
+        return jsonify({"ok": False, "err": "host not allowed"}), 403
+    return None
 
 
 @app.before_request
