@@ -49,6 +49,24 @@ DEFAULT_BUCKET_SECONDS = 3600
 _DEFAULT_MAX_LINES = 20000
 _DEFAULT_MAX_BYTES = 4 * 1024 * 1024  # 4 MiB хвоста
 
+# Content-free детект copytruncate (issue #79). При copytruncate лог усекается
+# in-place (тот же inode/dev) и дорастает ЗА старый offset до следующего poll —
+# (inode,dev)/size-эвристика ротацию не видит и reader seek'ает в середину нового
+# контента, теряя начальные строки. Курсор ВСЕГДА ставится сразу после '\n'
+# (new_offset = start+last_newline+1), поэтому байт на позиции offset-1 в целом
+# файле обязан быть '\n'. Перед seek проверяем это: если новый контент разной длины
+# со старым, байт на старой границе — середина строки, не '\n' -> mismatch -> resync.
+#
+# Best-effort limit (НЕ строгая гарантия): если новые строки РОВНО той же длины, что
+# старые (напр. повторяющиеся CONNECT к одному хосту — частый случай), граница снова
+# совпадает с '\n', детект НЕ срабатывает -> начальные строки пропускаются (undercount).
+# Это сознательный трейд-офф в пользу privacy #76: строгая гарантия требовала бы
+# писать производное контента лога на диск. Fail-направление безопасное: undercount
+# (observe-only, наблюдаемость занижена), НЕ inflation, НЕ privacy-leak — direction
+# из issue #79. Ключевое: на диск НЕ идёт ничего производного от контента лога (ни
+# хеша, ни байт) — privacy-схема #76 нетронута (санкция оркестратора, PR #92).
+_NEWLINE = 0x0A
+
 # Строгий RFC 3986 reg-name: LDH labels, без '_' / ':' / '@' / '[' / ']' / '%'.
 # IPv4/IPv6 проходят отдельными canonical-ветками в _is_hostname.
 _REG_NAME_RE = re.compile(
@@ -310,12 +328,50 @@ def _safe_positive_int(value, default=None):
     return n if n > 0 else default
 
 
+def _boundary_intact(path, boundary_offset):
+    """Content-free проверка границы курсора (issue #79). Best-effort, НЕ гарантия.
+
+    Курсор всегда стоит сразу после '\\n', поэтому байт на позиции boundary_offset-1
+    в целом файле обязан быть '\\n'. Возвращает True, если это так. copytruncate +
+    regrowth подменяет контент под тем же inode: при контенте РАЗНОЙ длины со старым
+    байт на старой границе — середина строки, не '\\n' -> False -> resync. Предел: при
+    equal-length контенте (напр. повторяющиеся CONNECT к одному хосту) граница снова
+    '\\n' -> True -> подмена НЕ детектится -> undercount (сознательный трейд-офф в
+    пользу privacy #76, см. константу _NEWLINE). boundary_offset<=0 (курсор честно на
+    0) границы не имеет — считаем её intact (нет свидетельства подмены; НЕ ложный
+    resync, см. находку про offset==0). Ошибка чтения -> считаем intact: консервативно,
+    чтобы не сломать happy-path на транзиентном I/O-сбое (fail безопасен — направление
+    модуля undercount, а не потеря на ровном месте).
+    """
+    if boundary_offset <= 0:
+        return True
+    try:
+        with open(path, "rb") as f:
+            f.seek(boundary_offset - 1)
+            b = f.read(1)
+    except (OSError, ValueError):
+        return True
+    if not b:
+        # Файл короче offset — это уже поймано size<offset выше; сюда обычно не
+        # доходим. Нет байта на границе -> подтвердить целостность нечем -> resync.
+        return False
+    return b[0] == _NEWLINE
+
+
 def _read_new_lines(path, offset, inode, dev, max_bytes, max_lines):
     """Прочитать только новые полные строки с сохранённого cursor.
 
-    Cursor защищён от rotation/truncate через `(inode, dev)` и размер. Первый
-    запуск без meta читает bounded tail, а не весь лог: старый гигабайтный файл не
-    превращается в долгую bootstrap-операцию. Функция никогда не бросает.
+    Cursor защищён от rotation/truncate через `(inode, dev)` и размер. От
+    copytruncate+regrowth (issue #79, same-inode усечение с доростом за старый
+    offset) — best-effort content-free boundary-newline check: курсор всегда стоит
+    сразу после '\\n', поэтому байт на позиции offset-1 обязан быть '\\n'; если нет
+    (контент подменён и разной длины) — resync (offset=0). Это НЕ строгая гарантия:
+    equal-length подмена (напр. повторяющиеся CONNECT к одному хосту) даёт '\\n' на
+    границе и НЕ детектится -> undercount (принятый трейд-офф в пользу privacy #76,
+    см. _boundary_intact). На диск НЕ идёт ничего производного от контента лога
+    (privacy-схема #76). Первый запуск без meta читает bounded tail, а не весь лог:
+    старый гигабайтный файл не превращается в долгую bootstrap-операцию. Функция
+    никогда не бросает.
     """
     saved_offset = _safe_non_negative_int(offset)
     saved_inode = _safe_non_negative_int(inode)
@@ -336,13 +392,29 @@ def _read_new_lines(path, offset, inode, dev, max_bytes, max_lines):
         not first_run
         and (cur_inode != saved_inode or cur_dev != saved_dev)
     )
+    # resynced отделяет НАСТОЯЩИЙ сброс курсора в 0 (ротация / усечение / подмена
+    # границы — тут tail-bound реально нужен, чтобы не читать гигабайт) от честного
+    # курсора, стоящего на offset=0 (poll пустого лога). Только настоящий resync
+    # уходит в tail_mode; легитимный 0 читает с начала все строки (находка про
+    # offset==0). Флаг ставится ровно там, где read_offset обнуляется.
+    resynced = False
     if rotated or cur_size < read_offset:
         read_offset = 0
+        resynced = True
+
+    # Content-free детект copytruncate: курсор указывает внутрь файла, ротации нет,
+    # но байт на границе offset-1 больше не '\n' -> контент подменён под тем же inode
+    # -> resync к 0, чтобы не seek'нуть в середину нового контента. Курсор честно на
+    # 0 границы не имеет и сюда не попадает (read_offset > 0).
+    if read_offset > 0 and not first_run and not rotated:
+        if not _boundary_intact(path, read_offset):
+            read_offset = 0
+            resynced = True
 
     if cur_size == read_offset:
         return [], read_offset, cur_inode, cur_dev, cur_size
 
-    tail_mode = (first_run or rotated) and cur_size > max_bytes
+    tail_mode = (first_run or resynced) and cur_size > max_bytes
     try:
         with open(path, "rb") as f:
             if tail_mode:
@@ -455,6 +527,8 @@ def _prune_buckets(buckets, ttl, now):
 
 
 def _cursor_meta(meta):
+    # Курсор на диске — ТОЛЬКО эти числа. Никакого производного от контента лога
+    # (privacy-схема #76): детект copytruncate content-free, см. _boundary_intact.
     out = {}
     if not isinstance(meta, dict):
         return out

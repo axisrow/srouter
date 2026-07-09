@@ -370,6 +370,8 @@ def test_parse_new_access_log_size_equal_offset_noop(tmp_path):
     )
 
     assert counts == {}
+    # Курсор — только числа (offset/inode/dev/size). Никакого производного контента
+    # на диске: content-free механизм не добавляет полей в курсор (privacy-схема #76).
     assert cursor == {
         "log_offset": st.st_size,
         "log_inode": st.st_ino,
@@ -408,6 +410,212 @@ def test_parse_new_access_log_truncate_reset(tmp_path):
 
     assert counts == {"after-truncate.example": 1}
     assert cursor["log_offset"] == new.st_size
+
+
+def test_parse_new_access_log_copytruncate_regrowth_counts_all(tmp_path):
+    """copytruncate (усечение in-place: тот же inode/dev) + дорост ЗА старый offset
+    до следующего poll не должен пропускать начальные строки нового файла.
+
+    Баг #79: inode/dev совпадают и cur_size >= saved_offset, поэтому старая
+    (inode,dev)/size-эвристика не детектила ротацию и reader seek'ал в середину
+    нового контента, теряя NEW1/NEW2. Content-free boundary-newline check ловит
+    подмену границы, когда новый контент РАЗНОЙ длины со старым (байт [offset-1] —
+    середина строки, не '\\n'), и делает resync (offset=0), считая все три новые
+    строки ровно один раз. Equal-length предел покрыт отдельным тестом
+    (see test_..._newline_aligned_undercounts): там граница совпадает -> undercount.
+    """
+    log = tmp_path / "privoxy.log"
+    # Реальные privoxy-строки переменной длины (хосты разной длины) -> новый контент
+    # не выравнен по старому offset, байт на границе offset-1 не '\\n' -> сигнал ловит.
+    log.write_text(
+        _privoxy_line("o1.example") + "\n" + _privoxy_line("o2.example") + "\n",
+        encoding="utf-8",
+    )
+
+    counts, cursor = hot_routes.parse_new_access_log(str(log), None, None, None)
+    assert counts == {"o1.example": 1, "o2.example": 1}
+    saved_offset = cursor["log_offset"]
+
+    # copytruncate: open('w') усекает тот же inode/dev, затем пишет 3 НОВЫЕ строки.
+    inode_before = log.stat().st_ino
+    with open(log, "w", encoding="utf-8") as f:
+        f.write(_privoxy_line("new-long-host-1.example") + "\n")
+        f.write(_privoxy_line("new-long-host-2.example") + "\n")
+        f.write(_privoxy_line("new-long-host-3.example") + "\n")
+    # Sanity: репро валиден только если inode тот же, файл дорос за старый offset,
+    # и байт на старой границе больше НЕ '\\n' (иначе content-free сигнал не сработал
+    # бы — это equal-length undercount-предел, покрыт отдельным тестом).
+    assert log.stat().st_ino == inode_before
+    assert log.stat().st_size > saved_offset
+    assert log.read_bytes()[saved_offset - 1 : saved_offset] != b"\n"
+
+    counts, cursor2 = hot_routes.parse_new_access_log(
+        str(log),
+        cursor["log_offset"],
+        cursor["log_inode"],
+        cursor["log_dev"],
+    )
+    assert counts == {
+        "new-long-host-1.example": 1,
+        "new-long-host-2.example": 1,
+        "new-long-host-3.example": 1,
+    }
+    assert cursor2["log_offset"] == log.stat().st_size
+
+    # Идемпотентность: повторный poll без новых строк ничего не досчитывает.
+    counts, _cursor3 = hot_routes.parse_new_access_log(
+        str(log),
+        cursor2["log_offset"],
+        cursor2["log_inode"],
+        cursor2["log_dev"],
+    )
+    assert counts == {}
+
+
+def test_parse_new_access_log_copytruncate_regrowth_stays_bounded(tmp_path):
+    """Resync по newline-mismatch на большом файле читает bounded tail, не весь файл.
+
+    copytruncate может подменить содержимое под тем же inode и дорастить его далеко
+    за max_bytes ещё до следующего poll. resync (offset=0) не должен превращаться в
+    чтение гигабайта: newline-mismatch попадает в тот же tail-режим, что и ротация.
+    Проверяем, что первая (обрезанная) строка окна не считается.
+    """
+    log = tmp_path / "privoxy.log"
+    log.write_text(_privoxy_line("old.example") + "\n", encoding="utf-8")
+    counts, cursor = hot_routes.parse_new_access_log(str(log), None, None, None)
+    assert counts == {"old.example": 1}
+    saved_offset = cursor["log_offset"]
+
+    # copytruncate + дорост за пределы окна max_bytes.
+    lines = [_privoxy_line(f"win{i}.example") for i in range(6)]
+    with open(log, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    # Граница подменена -> сработает newline-mismatch resync.
+    assert log.read_bytes()[saved_offset - 1 : saved_offset] != b"\n"
+    # Окно вмещает только 2 последние строки + байт (первая обрезается и не считается).
+    tail_bytes = len(("\n".join(lines[-2:]) + "\n").encode("utf-8")) + 1
+
+    counts, _cursor = hot_routes.parse_new_access_log(
+        str(log),
+        cursor["log_offset"],
+        cursor["log_inode"],
+        cursor["log_dev"],
+        max_bytes=tail_bytes,
+    )
+    # resync -> tail_mode: считаны только 2 последние строки, начало окна отброшено.
+    assert counts == {"win4.example": 1, "win5.example": 1}
+
+
+def test_parse_new_access_log_copytruncate_newline_aligned_undercounts(tmp_path):
+    """Known accepted best-effort limit content-free детекта (issue #79).
+
+    Если новые строки РОВНО той же длины, что старые (напр. повторяющиеся CONNECT к
+    одному хосту — частый реальный случай, НЕ патология), байт на границе offset-1 в
+    новом файле снова оказывается '\\n'. _boundary_intact -> True, resync НЕ
+    происходит, начальные новые строки пропускаются -> undercount. Это сознательный
+    трейд-офф в пользу privacy #76: строгая гарантия детекта потребовала бы писать
+    производное контента лога на диск, что нарушает privacy-инвариант.
+
+    Направление отказа БЕЗОПАСНО: undercount (наблюдаемость занижена), НЕ overcount —
+    данные не портятся, реальный IP/URL не текут. Тест фиксирует это как принятое
+    поведение; если кто-то в будущем сломает механизм в сторону double-count, тест
+    упадёт (counts станет > ожидаемого undercount).
+    """
+    log = tmp_path / "privoxy.log"
+    # Повторяющийся CONNECT к одному хосту -> строки равной длины.
+    log.write_text(
+        _privoxy_line("repeat.example") + "\n" + _privoxy_line("repeat.example") + "\n",
+        encoding="utf-8",
+    )
+    counts, cursor = hot_routes.parse_new_access_log(str(log), None, None, None)
+    assert counts == {"repeat.example": 2}
+    saved_offset = cursor["log_offset"]
+
+    # copytruncate + 3 НОВЫЕ строки той же длины (три захода к тому же хосту).
+    with open(log, "w", encoding="utf-8") as f:
+        for _ in range(3):
+            f.write(_privoxy_line("repeat.example") + "\n")
+    assert log.stat().st_size > saved_offset
+    # Предусловие бага: граница equal-length совпала с '\\n' -> детект НЕ сработает.
+    assert log.read_bytes()[saved_offset - 1 : saved_offset] == b"\n"
+
+    counts, _cursor = hot_routes.parse_new_access_log(
+        str(log), cursor["log_offset"], cursor["log_inode"], cursor["log_dev"]
+    )
+    # UNDERCOUNT (принято): начальные новые строки пропущены, посчитана только
+    # последняя (та, что после старого offset). НЕ double-count, НЕ overcount.
+    assert counts == {"repeat.example": 1}
+
+
+def test_parse_new_access_log_legit_offset_zero_reads_all_lines(tmp_path):
+    """Легитимный persisted-курсор offset=0 с ВАЛИДНЫМ inode/dev на большом файле
+    читает ВСЕ строки, а не только tail-хвост.
+
+    Регресс на находку code-review: `read_offset == 0` в предикате tail_mode смешивал
+    два разных нуля — resync-к-нулю (нужен tail-bound) и честный курсор на 0 (poll
+    пустого лога отдаёт {log_offset:0, log_inode:<valid>, log_dev:<valid>}). Второй
+    случай ошибочно уходил в tail-режим и терял ранние строки. tail-bound должен
+    применяться только к НАСТОЯЩЕМУ resync (флаг resynced), не к saved_offset==0.
+    """
+    log = tmp_path / "privoxy.log"
+    # Пустой лог -> курсор честно стоит на offset=0 с валидным inode/dev.
+    log.write_text("", encoding="utf-8")
+    counts, cursor = hot_routes.parse_new_access_log(str(log), None, None, None)
+    assert counts == {}
+    assert cursor["log_offset"] == 0
+
+    # Лог наполняется многими строками сразу, файл перерастает max_bytes.
+    hosts = [f"h{i:02d}.example" for i in range(30)]
+    log.write_text("\n".join(_privoxy_line(h) for h in hosts) + "\n", encoding="utf-8")
+    max_bytes = 400
+    assert log.stat().st_size > max_bytes
+
+    # Курсор честно стоял на 0 (не resync) -> читаем С НАЧАЛА (bounded по max_bytes),
+    # а НЕ хвост. Первый poll обязан вернуть ранние строки (h00...), не поздние (h29).
+    counts, cursor = hot_routes.parse_new_access_log(
+        str(log),
+        cursor["log_offset"],
+        cursor["log_inode"],
+        cursor["log_dev"],
+        max_bytes=max_bytes,
+    )
+    assert "h00.example" in counts  # читаем с начала
+    assert "h29.example" not in counts  # не tail-режим (хвост НЕ пропущен вперёд)
+
+    # Инкрементальные poll'ы дочитывают ОСТАТОК без потерь: курсор двигается вперёд,
+    # каждая строка посчитана ровно раз. На баге (tail-режим) h00..h27 были бы утеряны.
+    seen = dict(counts)
+    for _ in range(30):
+        counts, cursor = hot_routes.parse_new_access_log(
+            str(log),
+            cursor["log_offset"],
+            cursor["log_inode"],
+            cursor["log_dev"],
+            max_bytes=max_bytes,
+        )
+        if not counts:
+            break
+        for h, c in counts.items():
+            seen[h] = seen.get(h, 0) + c
+    assert seen == {h: 1 for h in hosts}
+
+
+def test_parse_new_access_log_append_does_not_false_resync(tmp_path):
+    """Обычный append не триггерит newline-resync: байт на границе offset — '\\n',
+    поэтому старые строки не пересчитываются (happy-path курсора цел)."""
+    log = tmp_path / "privoxy.log"
+    log.write_text(_privoxy_line("a.example") + "\n", encoding="utf-8")
+    counts, cursor = hot_routes.parse_new_access_log(str(log), None, None, None)
+    assert counts == {"a.example": 1}
+
+    with open(log, "a", encoding="utf-8") as f:
+        f.write(_privoxy_line("b.example") + "\n")
+    counts, cursor2 = hot_routes.parse_new_access_log(
+        str(log), cursor["log_offset"], cursor["log_inode"], cursor["log_dev"]
+    )
+    # Граница цела -> считаем только новую строку, a.example НЕ пересчитан.
+    assert counts == {"b.example": 1}
+    assert cursor2["log_offset"] == log.stat().st_size
 
 
 def test_parse_new_access_log_partial_line_no_double_count(tmp_path):
@@ -602,6 +810,86 @@ def test_update_cache_meta_roundtrip_from_cursor(tmp_path):
         "log_dev": cursor["log_dev"],
         "log_size": cursor["log_size"],
     }
+
+
+def test_copytruncate_regrowth_survives_cache_roundtrip(tmp_path):
+    """Content-free детект #79 работает через реальный кэш-round-trip (после рестарта).
+
+    Прод-путь (dashboard_hotroutes) на каждом poll читает курсор из кэша через
+    load_cursor, а не держит его в памяти. Курсор — только числа (offset/inode/dev/
+    size), поэтому детект copytruncate НЕ зависит от персиста контента: newline на
+    границе проверяется в текущем файле. Здесь: poll1 -> update_cache; затем
+    copytruncate+regrowth; poll2 читает курсор ИЗ КЭША (эмулируем рестарт) и обязан
+    посчитать все новые строки, не seek'нув в середину нового контента.
+    """
+    log = tmp_path / "privoxy.log"
+    cache = tmp_path / "hot.json"
+    log.write_text(
+        _privoxy_line("o1.example") + "\n" + _privoxy_line("o2.example") + "\n",
+        encoding="utf-8",
+    )
+
+    cursor0 = hot_routes.load_cursor(str(cache))  # пустой кэш -> {}
+    counts, cursor = hot_routes.parse_new_access_log(
+        str(log),
+        cursor0.get("log_offset"),
+        cursor0.get("log_inode"),
+        cursor0.get("log_dev"),
+    )
+    assert counts == {"o1.example": 1, "o2.example": 1}
+    hot_routes.update_cache(counts, path=str(cache), now=1000.0, cursor=cursor)
+
+    # copytruncate + regrowth за старый offset (строки переменной длины -> граница
+    # offset-1 попадает в середину нового контента, не '\\n').
+    with open(log, "w", encoding="utf-8") as f:
+        f.write(_privoxy_line("new-long-host-1.example") + "\n")
+        f.write(_privoxy_line("new-long-host-2.example") + "\n")
+        f.write(_privoxy_line("new-long-host-3.example") + "\n")
+
+    # Курсор берём ИЗ КЭША (как прод после рестарта), не из памяти.
+    persisted = hot_routes.load_cursor(str(cache))
+    counts, _cursor = hot_routes.parse_new_access_log(
+        str(log),
+        persisted.get("log_offset"),
+        persisted.get("log_inode"),
+        persisted.get("log_dev"),
+    )
+    assert counts == {
+        "new-long-host-1.example": 1,
+        "new-long-host-2.example": 1,
+        "new-long-host-3.example": 1,
+    }
+
+
+def test_cache_meta_never_persists_content_derivative(tmp_path):
+    """Privacy-инвариант #76: на диск в meta идут ТОЛЬКО числа — никакого хеша/байт
+    контента лога. Регресс на находку privacy code-review (sha1 границы на диске).
+    """
+    log = tmp_path / "privoxy.log"
+    cache = tmp_path / "hot.json"
+    log.write_text(_privoxy_line("secret-host.example") + "\n", encoding="utf-8")
+
+    counts, cursor = hot_routes.parse_new_access_log(str(log), None, None, None)
+    hot_routes.update_cache(counts, path=str(cache), now=1000.0, cursor=cursor)
+
+    # Курсор из parse не несёт производных контента.
+    assert set(cursor) == {"log_offset", "log_inode", "log_dev", "log_size"}
+
+    # На диске meta — только числовые cursor-поля + служебные bucket_size/schema.
+    data = json.loads(cache.read_text(encoding="utf-8"))
+    assert set(data["meta"]) == {
+        "log_offset",
+        "log_inode",
+        "log_dev",
+        "log_size",
+        "bucket_size",
+        "schema",
+    }
+    for value in data["meta"].values():
+        assert isinstance(value, int)
+
+    # Даже неизвестное производное контента в meta не переживает валидацию курсора.
+    assert "log_fingerprint" not in hot_routes.load_cursor(str(cache))
 
 
 def test_update_cache_ttl_eviction(tmp_path):
