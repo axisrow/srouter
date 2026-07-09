@@ -196,8 +196,6 @@ def probe_hot_routes(state_path=None, cache_path=None, log_path=None, now=None):
                         offset=cursor.get("log_offset"),
                         inode=cursor.get("log_inode"),
                         dev=cursor.get("log_dev"),
-                        fingerprint=cursor.get("log_fingerprint"),
-                        fp_len=cursor.get("log_fp_len"),
                     )
                     cache = hot_routes.update_cache(
                         counts,

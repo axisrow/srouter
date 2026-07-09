@@ -54,9 +54,7 @@ def test_probe_hot_routes_enabled_returns_ranked_domains_with_counts(monkeypatch
 
     calls = []
 
-    def fake_parse_new_access_log(
-        path=None, offset=None, inode=None, dev=None, **kwargs
-    ):
+    def fake_parse_new_access_log(path=None, offset=None, inode=None, dev=None):
         calls.append(("parse", path, offset, inode, dev))
         return {"b.example": 1, "a.example": 3}, {
             "log_offset": 12,
@@ -163,7 +161,7 @@ def test_api_status_hot_routes_public_domains_exclude_timing_metadata(monkeypatc
     monkeypatch.setattr(
         dashboard_hotroutes.hot_routes,
         "parse_new_access_log",
-        lambda path=None, offset=None, inode=None, dev=None, **kwargs: (
+        lambda path=None, offset=None, inode=None, dev=None: (
             {"a.example": 3},
             {"log_offset": 1, "log_inode": 2, "log_dev": 3, "log_size": 1},
         ),
@@ -273,9 +271,7 @@ def test_probe_hot_routes_concurrent_poll_reserves_update_slot(monkeypatch, tmp_
     results = []
     errors = []
 
-    def fake_parse_new_access_log(
-        path=None, offset=None, inode=None, dev=None, **kwargs
-    ):
+    def fake_parse_new_access_log(path=None, offset=None, inode=None, dev=None):
         with calls_lock:
             calls["parse"] += 1
         parse_entered.set()
@@ -360,9 +356,7 @@ def test_probe_hot_routes_clamps_subsecond_update_interval(monkeypatch, tmp_path
     calls_lock = threading.Lock()
     errors = []
 
-    def fake_parse_new_access_log(
-        path=None, offset=None, inode=None, dev=None, **kwargs
-    ):
+    def fake_parse_new_access_log(path=None, offset=None, inode=None, dev=None):
         with calls_lock:
             calls["parse"] += 1
             seq = calls["parse"]
@@ -444,9 +438,7 @@ def test_probe_hot_routes_inflight_blocks_even_after_interval(monkeypatch, tmp_p
     calls_lock = threading.Lock()
     errors = []
 
-    def fake_parse_new_access_log(
-        path=None, offset=None, inode=None, dev=None, **kwargs
-    ):
+    def fake_parse_new_access_log(path=None, offset=None, inode=None, dev=None):
         with calls_lock:
             calls["parse"] += 1
             seq = calls["parse"]
@@ -523,7 +515,7 @@ def test_probe_hot_routes_parse_error_releases_inflight(monkeypatch, tmp_path):
 
     calls = {"parse": 0}
 
-    def flaky_parse(path=None, offset=None, inode=None, dev=None, **kwargs):
+    def flaky_parse(path=None, offset=None, inode=None, dev=None):
         calls["parse"] += 1
         if calls["parse"] == 1:
             raise RuntimeError("parse boom")
