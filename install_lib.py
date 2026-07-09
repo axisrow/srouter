@@ -177,7 +177,8 @@ def _launchd_is_loaded(label, *, runner=run):
     """Загружен ли launchd-агент (по `launchctl list`, последняя колонка == label).
 
     Единственный источник правды для «агент загружен» — факт о launchd, живёт в lib (канон слоёв:
-    CLI — тонкий слой над install_lib). True/False — да/нет, None — не удалось узнать (timeout).
+    CLI — тонкий слой над install_lib). True/False — да/нет, None — состояние неизвестно (timeout
+    ИЛИ ненулевой rc ИЛИ сбой запуска launchctl); достоверный False даёт только успешный list.
 
     runner — чтобы ВСЕ launchctl-вызовы (включая эту проверку) шли через одну точку: в тестах
     через фейк, иначе poll-loop внутри _launchd_reload дёргал бы реальный launchctl.
