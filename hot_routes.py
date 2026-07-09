@@ -25,6 +25,7 @@ xray в проекте по умолчанию access-лог не пишет (lo
 temp-файл рядом + `os.replace` (atomic rename); при сбое tmp подчищается, а уже
 существующий валидный кэш остаётся нетронутым.
 """
+import hashlib
 import json
 import os
 import ipaddress
@@ -48,6 +49,17 @@ DEFAULT_BUCKET_SECONDS = 3600
 # Лимиты чтения: не тянем весь (потенциально гигабайтный) лог — только хвост.
 _DEFAULT_MAX_LINES = 20000
 _DEFAULT_MAX_BYTES = 4 * 1024 * 1024  # 4 MiB хвоста
+
+# Boundary-fingerprint (issue #79): sha1-хеш последних N байт ДО сохранённого
+# offset. При copytruncate лог усекается in-place (тот же inode/dev) и дорастает
+# ЗА старый offset до следующего poll — (inode,dev)/size-эвристика ротацию не видит
+# и reader seek'ает в середину нового контента, теряя начальные строки. Перед seek
+# сверяем контент на границе: расхождение -> resync (offset=0). Хеш, а не сырые
+# байты — privacy-схема #76 (на диск идёт только hostname+count+ts, не контент лога).
+_FINGERPRINT_BYTES = 64
+# sha1 hexdigest — ровно 40 lowercase hex-символов. Строгий первоисточник валидации
+# fingerprint из кэша (канон: граница валидируется строгим паттерном, не «почти»).
+_SHA1_HEX_RE = re.compile(r"^[0-9a-f]{40}\Z")
 
 # Строгий RFC 3986 reg-name: LDH labels, без '_' / ':' / '@' / '[' / ']' / '%'.
 # IPv4/IPv6 проходят отдельными canonical-ветками в _is_hostname.
@@ -310,16 +322,57 @@ def _safe_positive_int(value, default=None):
     return n if n > 0 else default
 
 
-def _read_new_lines(path, offset, inode, dev, max_bytes, max_lines):
+def _safe_fingerprint(value):
+    """Валидировать fingerprint из meta: строго sha1-hex (40 lowercase). Иначе None."""
+    if isinstance(value, str) and _SHA1_HEX_RE.match(value):
+        return value
+    return None
+
+
+def _fingerprint_bytes(window):
+    """Хеш окна байт границы -> (hex, длина). Пустое окно -> (None, None).
+
+    Длину храним рядом с хешом: при проверке читаем из файла РОВНО столько же байт
+    перед offset, иначе короткий хвост в начале лога сравнивался бы с разной длиной.
+    """
+    if not window:
+        return None, None
+    return hashlib.sha1(window).hexdigest(), len(window)
+
+
+def _boundary_window(f, end_offset):
+    """Прочитать до _FINGERPRINT_BYTES байт, заканчивающихся на end_offset.
+
+    Возвращает b"" при end_offset<=0 или ошибке seek/read — вызывающий трактует
+    это как «границу не подтвердить». Не бросает.
+    """
+    if end_offset <= 0:
+        return b""
+    span = min(_FINGERPRINT_BYTES, end_offset)
+    try:
+        f.seek(end_offset - span)
+        return f.read(span)
+    except (OSError, ValueError):
+        return b""
+
+
+def _read_new_lines(
+    path, offset, inode, dev, max_bytes, max_lines, fingerprint=None, fp_len=None
+):
     """Прочитать только новые полные строки с сохранённого cursor.
 
-    Cursor защищён от rotation/truncate через `(inode, dev)` и размер. Первый
-    запуск без meta читает bounded tail, а не весь лог: старый гигабайтный файл не
-    превращается в долгую bootstrap-операцию. Функция никогда не бросает.
+    Cursor защищён от rotation/truncate через `(inode, dev)` и размер, а от
+    copytruncate+regrowth (issue #79, same-inode усечение с доростом за старый
+    offset) — через boundary-fingerprint: перед seek к сохранённому offset сверяем
+    хеш байт на границе; расхождение -> resync (offset=0). Первый запуск без meta
+    читает bounded tail, а не весь лог: старый гигабайтный файл не превращается в
+    долгую bootstrap-операцию. Функция никогда не бросает.
     """
     saved_offset = _safe_non_negative_int(offset)
     saved_inode = _safe_non_negative_int(inode)
     saved_dev = _safe_non_negative_int(dev)
+    saved_fp = fingerprint if isinstance(fingerprint, str) and fingerprint else None
+    saved_fp_len = _safe_positive_int(fp_len)
     max_bytes = _safe_positive_int(max_bytes, _DEFAULT_MAX_BYTES)
     max_lines = _safe_positive_int(max_lines, _DEFAULT_MAX_LINES)
     try:
@@ -328,7 +381,7 @@ def _read_new_lines(path, offset, inode, dev, max_bytes, max_lines):
         cur_inode = int(st.st_ino)
         cur_dev = int(st.st_dev)
     except (OSError, TypeError, ValueError):
-        return [], offset, inode, dev, offset
+        return [], offset, inode, dev, offset, saved_fp, saved_fp_len
 
     first_run = saved_offset is None or saved_inode is None or saved_dev is None
     read_offset = 0 if saved_offset is None else saved_offset
@@ -339,10 +392,40 @@ def _read_new_lines(path, offset, inode, dev, max_bytes, max_lines):
     if rotated or cur_size < read_offset:
         read_offset = 0
 
-    if cur_size == read_offset:
-        return [], read_offset, cur_inode, cur_dev, cur_size
+    # Boundary-fingerprint: если курсор указывает внутрь файла и мы НЕ ротировали,
+    # контент до offset обязан совпасть с сохранённым хешом. Иначе (copytruncate +
+    # regrowth) файл подменён под тем же inode -> resync к 0, чтобы не seek'нуть в
+    # середину нового контента. Legacy-курсор без fp пропускает проверку (поведение
+    # как до #79). Cursor из первого прохода в этом же процессе fp несёт.
+    if (
+        read_offset > 0
+        and not first_run
+        and not rotated
+        and saved_fp is not None
+        and saved_fp_len is not None
+    ):
+        try:
+            with open(path, "rb") as f:
+                window = _boundary_window(f, read_offset)
+        except (OSError, ValueError):
+            window = b""
+        cur_fp, cur_fp_len = _fingerprint_bytes(window)
+        if cur_fp != saved_fp or cur_fp_len != saved_fp_len:
+            read_offset = 0
 
-    tail_mode = (first_run or rotated) and cur_size > max_bytes
+    if cur_size == read_offset:
+        # Граница совпала (или её нет) и новых байт нет -> перевыдаём fingerprint по
+        # текущему offset, чтобы он persist'ился дальше без спец-случая у вызывающего.
+        try:
+            with open(path, "rb") as f:
+                fp, fp_persist_len = _fingerprint_bytes(
+                    _boundary_window(f, read_offset)
+                )
+        except (OSError, ValueError):
+            fp, fp_persist_len = None, None
+        return [], read_offset, cur_inode, cur_dev, cur_size, fp, fp_persist_len
+
+    tail_mode = (first_run or rotated or read_offset == 0) and cur_size > max_bytes
     try:
         with open(path, "rb") as f:
             if tail_mode:
@@ -357,22 +440,22 @@ def _read_new_lines(path, offset, inode, dev, max_bytes, max_lines):
                 f.seek(start)
                 read_limit = min(cur_size - start, max_bytes)
             data = f.read(read_limit)
+            if not data:
+                return [], read_offset, cur_inode, cur_dev, cur_size, saved_fp, saved_fp_len
+            last_newline = data.rfind(b"\n")
+            if last_newline < 0:
+                return [], start, cur_inode, cur_dev, cur_size, saved_fp, saved_fp_len
+            new_offset = start + last_newline + 1
+            new_fp, new_fp_len = _fingerprint_bytes(_boundary_window(f, new_offset))
     except (OSError, ValueError):
-        return [], offset, inode, dev, offset
-
-    if not data:
-        return [], read_offset, cur_inode, cur_dev, cur_size
-    last_newline = data.rfind(b"\n")
-    if last_newline < 0:
-        return [], start, cur_inode, cur_dev, cur_size
+        return [], offset, inode, dev, offset, saved_fp, saved_fp_len
 
     complete = data[:last_newline]
-    new_offset = start + last_newline + 1
     text = complete.decode("utf-8", errors="replace")
     lines = text.splitlines()
     if len(lines) > max_lines:
         lines = lines[-max_lines:]
-    return lines, new_offset, cur_inode, cur_dev, cur_size
+    return lines, new_offset, cur_inode, cur_dev, cur_size, new_fp, new_fp_len
 
 
 def parse_new_access_log(
@@ -382,6 +465,9 @@ def parse_new_access_log(
     dev=None,
     max_lines=None,
     max_bytes=None,
+    *,
+    fingerprint=None,
+    fp_len=None,
 ):
     """Подсчитать только новые privoxy-строки и вернуть обновлённый cursor."""
     if path is None:
@@ -391,8 +477,16 @@ def parse_new_access_log(
     if max_bytes is None:
         max_bytes = _DEFAULT_MAX_BYTES
 
-    lines, new_offset, new_inode, new_dev, new_size = _read_new_lines(
-        path, offset, inode, dev, max_bytes, max_lines
+    (
+        lines,
+        new_offset,
+        new_inode,
+        new_dev,
+        new_size,
+        new_fp,
+        new_fp_len,
+    ) = _read_new_lines(
+        path, offset, inode, dev, max_bytes, max_lines, fingerprint, fp_len
     )
     counts = {}
     for line in lines:
@@ -410,6 +504,9 @@ def parse_new_access_log(
         "log_dev": new_dev,
         "log_size": new_size,
     }
+    if new_fp is not None and new_fp_len is not None:
+        cursor["log_fingerprint"] = new_fp
+        cursor["log_fp_len"] = new_fp_len
     return counts, cursor
 
 
@@ -462,6 +559,14 @@ def _cursor_meta(meta):
         value = _safe_non_negative_int(meta.get(key))
         if value is not None:
             out[key] = value
+    # Boundary-fingerprint (issue #79). Пара «хеш+длина» бесполезна поодиночке —
+    # пропускаем только когда ВАЛИДНЫ оба, иначе роняем обе (fingerprint без длины
+    # не с чем сравнивать; длина без хеша ничего не защищает).
+    fp = _safe_fingerprint(meta.get("log_fingerprint"))
+    fp_len = _safe_positive_int(meta.get("log_fp_len"))
+    if fp is not None and fp_len is not None:
+        out["log_fingerprint"] = fp
+        out["log_fp_len"] = fp_len
     return out
 
 

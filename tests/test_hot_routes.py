@@ -8,6 +8,7 @@
 - hot_domains: текущий top-N из кэша (для будущего status-поля/генератора).
 - Privacy: в кэше только hostname + счётчик + timestamp, никаких полных URL/путей.
 """
+import hashlib
 import json
 import random
 import string
@@ -370,11 +371,17 @@ def test_parse_new_access_log_size_equal_offset_noop(tmp_path):
     )
 
     assert counts == {}
+    # Новых байт нет, но noop-poll всё равно фиксирует границу (fingerprint по
+    # текущему offset), чтобы курсор персистился без спец-случая у вызывающего.
+    raw = log.read_bytes()
+    span = min(hot_routes._FINGERPRINT_BYTES, len(raw))
     assert cursor == {
         "log_offset": st.st_size,
         "log_inode": st.st_ino,
         "log_dev": st.st_dev,
         "log_size": st.st_size,
+        "log_fingerprint": hashlib.sha1(raw[-span:]).hexdigest(),
+        "log_fp_len": span,
     }
 
 
@@ -408,6 +415,93 @@ def test_parse_new_access_log_truncate_reset(tmp_path):
 
     assert counts == {"after-truncate.example": 1}
     assert cursor["log_offset"] == new.st_size
+
+
+def test_parse_new_access_log_copytruncate_regrowth_counts_all(tmp_path):
+    """copytruncate (усечение in-place: тот же inode/dev) + дорост ЗА старый offset
+    до следующего poll не должен пропускать начальные строки нового файла.
+
+    Баг #79: inode/dev совпадают и cur_size >= saved_offset, поэтому старая
+    (inode,dev)/size-эвристика не детектила ротацию и reader seek'ал в середину
+    нового контента, теряя NEW1/NEW2. Boundary-fingerprint ловит подмену границы
+    и делает resync (offset=0), считая все три новые строки ровно один раз.
+    """
+    log = tmp_path / "privoxy.log"
+    # Хосты одинаковой длины -> строки равного размера: 3 новых строки гарантированно
+    # перерастают offset после 2 старых (size_new > saved_offset).
+    log.write_text(
+        _privoxy_line("old1.example") + "\n" + _privoxy_line("old2.example") + "\n",
+        encoding="utf-8",
+    )
+
+    counts, cursor = hot_routes.parse_new_access_log(str(log), None, None, None)
+    assert counts == {"old1.example": 1, "old2.example": 1}
+    saved_offset = cursor["log_offset"]
+
+    # copytruncate: open('w') усекает тот же inode/dev, затем пишет 3 НОВЫЕ строки.
+    inode_before = log.stat().st_ino
+    with open(log, "w", encoding="utf-8") as f:
+        f.write(_privoxy_line("new1.example") + "\n")
+        f.write(_privoxy_line("new2.example") + "\n")
+        f.write(_privoxy_line("new3.example") + "\n")
+    # Sanity: репро валиден только если inode тот же и файл дорос за старый offset.
+    assert log.stat().st_ino == inode_before
+    assert log.stat().st_size > saved_offset
+
+    counts, cursor2 = hot_routes.parse_new_access_log(
+        str(log),
+        cursor["log_offset"],
+        cursor["log_inode"],
+        cursor["log_dev"],
+        fingerprint=cursor.get("log_fingerprint"),
+        fp_len=cursor.get("log_fp_len"),
+    )
+    assert counts == {"new1.example": 1, "new2.example": 1, "new3.example": 1}
+    assert cursor2["log_offset"] == log.stat().st_size
+
+    # Идемпотентность: повторный poll без новых строк ничего не досчитывает.
+    counts, _cursor3 = hot_routes.parse_new_access_log(
+        str(log),
+        cursor2["log_offset"],
+        cursor2["log_inode"],
+        cursor2["log_dev"],
+        fingerprint=cursor2.get("log_fingerprint"),
+        fp_len=cursor2.get("log_fp_len"),
+    )
+    assert counts == {}
+
+
+def test_parse_new_access_log_copytruncate_regrowth_stays_bounded(tmp_path):
+    """Resync по fingerprint на большом файле читает bounded tail, не весь файл.
+
+    copytruncate может подменить содержимое под тем же inode и дорастить его далеко
+    за max_bytes ещё до следующего poll. resync (offset=0) не должен превращаться в
+    чтение гигабайта: fingerprint-mismatch попадает в тот же tail-режим, что и
+    ротация. Проверяем, что первая (обрезанная) строка окна не считается.
+    """
+    log = tmp_path / "privoxy.log"
+    log.write_text(_privoxy_line("old.example") + "\n", encoding="utf-8")
+    counts, cursor = hot_routes.parse_new_access_log(str(log), None, None, None)
+    assert counts == {"old.example": 1}
+
+    # copytruncate + дорост за пределы окна max_bytes.
+    lines = [_privoxy_line(f"win{i}.example") for i in range(6)]
+    with open(log, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    # Окно вмещает только 2 последние строки + байт (первая обрезается и не считается).
+    tail_bytes = len(("\n".join(lines[-2:]) + "\n").encode("utf-8")) + 1
+
+    counts, _cursor = hot_routes.parse_new_access_log(
+        str(log),
+        cursor["log_offset"],
+        cursor["log_inode"],
+        cursor["log_dev"],
+        fingerprint=cursor.get("log_fingerprint"),
+        fp_len=cursor.get("log_fp_len"),
+        max_bytes=tail_bytes,
+    )
+    # resync -> tail_mode: считаны только 2 последние строки, начало окна отброшено.
+    assert counts == {"win4.example": 1, "win5.example": 1}
 
 
 def test_parse_new_access_log_partial_line_no_double_count(tmp_path):
@@ -593,6 +687,8 @@ def test_update_cache_meta_roundtrip_from_cursor(tmp_path):
         "log_inode": cursor["log_inode"],
         "log_dev": cursor["log_dev"],
         "log_size": cursor["log_size"],
+        "log_fingerprint": cursor["log_fingerprint"],
+        "log_fp_len": cursor["log_fp_len"],
         "bucket_size": 60,
         "schema": 2,
     }
@@ -601,7 +697,107 @@ def test_update_cache_meta_roundtrip_from_cursor(tmp_path):
         "log_inode": cursor["log_inode"],
         "log_dev": cursor["log_dev"],
         "log_size": cursor["log_size"],
+        "log_fingerprint": cursor["log_fingerprint"],
+        "log_fp_len": cursor["log_fp_len"],
     }
+
+
+def test_copytruncate_regrowth_survives_cache_roundtrip(tmp_path):
+    """Boundary-fingerprint должен переживать персист через кэш (issue #79).
+
+    Прод-путь (dashboard_hotroutes) на каждом poll читает курсор из кэша через
+    load_cursor, а не держит его в памяти. Значит защита работает, только если
+    fingerprint проходит round-trip meta. Здесь: poll1 -> update_cache; затем
+    copytruncate+regrowth; poll2 читает курсор ИЗ КЭША (эмулируем рестарт) и обязан
+    посчитать все новые строки, не seek'нув в середину нового контента.
+    """
+    log = tmp_path / "privoxy.log"
+    cache = tmp_path / "hot.json"
+    log.write_text(
+        _privoxy_line("old1.example") + "\n" + _privoxy_line("old2.example") + "\n",
+        encoding="utf-8",
+    )
+
+    cursor0 = hot_routes.load_cursor(str(cache))  # пустой кэш -> {}
+    counts, cursor = hot_routes.parse_new_access_log(
+        str(log),
+        cursor0.get("log_offset"),
+        cursor0.get("log_inode"),
+        cursor0.get("log_dev"),
+        fingerprint=cursor0.get("log_fingerprint"),
+        fp_len=cursor0.get("log_fp_len"),
+    )
+    assert counts == {"old1.example": 1, "old2.example": 1}
+    hot_routes.update_cache(counts, path=str(cache), now=1000.0, cursor=cursor)
+
+    # copytruncate + regrowth за старый offset.
+    with open(log, "w", encoding="utf-8") as f:
+        f.write(_privoxy_line("new1.example") + "\n")
+        f.write(_privoxy_line("new2.example") + "\n")
+        f.write(_privoxy_line("new3.example") + "\n")
+
+    # Курсор берём ИЗ КЭША (как прод после рестарта), не из памяти.
+    persisted = hot_routes.load_cursor(str(cache))
+    assert persisted.get("log_fingerprint") == cursor["log_fingerprint"]
+    counts, _cursor = hot_routes.parse_new_access_log(
+        str(log),
+        persisted.get("log_offset"),
+        persisted.get("log_inode"),
+        persisted.get("log_dev"),
+        fingerprint=persisted.get("log_fingerprint"),
+        fp_len=persisted.get("log_fp_len"),
+    )
+    assert counts == {"new1.example": 1, "new2.example": 1, "new3.example": 1}
+
+
+def test_cursor_meta_drops_bogus_fingerprint(tmp_path):
+    """Битый fingerprint в meta не должен просачиваться в курсор (строгий hex)."""
+    cache = tmp_path / "hot.json"
+    cache.write_text(
+        json.dumps(
+            {
+                "meta": {
+                    "log_offset": 66,
+                    "log_inode": 7,
+                    "log_dev": 1,
+                    "log_size": 66,
+                    "log_fingerprint": "not-a-real-sha1",
+                    "log_fp_len": 64,
+                },
+                "domains": [],
+                "buckets": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    cursor = hot_routes.load_cursor(str(cache))
+    assert "log_fingerprint" not in cursor
+    assert "log_fp_len" not in cursor
+    assert cursor["log_offset"] == 66
+
+
+def test_cursor_meta_drops_orphan_fp_len(tmp_path):
+    """log_fp_len без валидного хеша бесполезен -> обе fingerprint-пары отброшены."""
+    cache = tmp_path / "hot.json"
+    cache.write_text(
+        json.dumps(
+            {
+                "meta": {
+                    "log_offset": 66,
+                    "log_inode": 7,
+                    "log_dev": 1,
+                    "log_size": 66,
+                    "log_fp_len": 64,
+                },
+                "domains": [],
+                "buckets": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    cursor = hot_routes.load_cursor(str(cache))
+    assert "log_fp_len" not in cursor
+    assert "log_fingerprint" not in cursor
 
 
 def test_update_cache_ttl_eviction(tmp_path):
