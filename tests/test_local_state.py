@@ -580,30 +580,30 @@ def _write_xray_config(p, address):
 
 
 def test_sync_route_ip_from_xray_updates_node(tmp_path):
-    """xray-конфиг держит реальный address (85.136.181.198), state — placeholder → sync обновляет route_ip."""
+    """xray-конфиг держит address (198.51.100.20), state — другой placeholder → sync обновляет route_ip."""
     state_p = tmp_path / "srouter.local.json"
     xray_p = tmp_path / "xray-config.json"
-    _write_xray_config(xray_p, "85.136.181.198")
+    _write_xray_config(xray_p, "198.51.100.20")
     _write(state_p, {"nodes": [{"name": "sg-1", "endpoint_host": "203.0.113.10",
                                  "route_ip": "203.0.113.10", "enabled": True}]})
     r = local_state.sync_route_ip_from_xray("sg-1", xray_config_path=str(xray_p), path=state_p)
     assert r["ok"] is True
-    assert r["route_ip"] == "85.136.181.198"
+    assert r["route_ip"] == "198.51.100.20"
     # state обновлён:
     node = local_state.get_node("sg-1", path=state_p)
-    assert node["route_ip"] == "85.136.181.198"
+    assert node["route_ip"] == "198.51.100.20"
 
 
 def test_sync_route_ip_idempotent(tmp_path):
     """route_ip уже = xray address → no-op (ok, unchanged)."""
     state_p = tmp_path / "srouter.local.json"
     xray_p = tmp_path / "xray-config.json"
-    _write_xray_config(xray_p, "85.136.181.198")
-    _write(state_p, {"nodes": [{"name": "sg-1", "endpoint_host": "85.136.181.198",
-                                 "route_ip": "85.136.181.198", "enabled": True}]})
+    _write_xray_config(xray_p, "203.0.113.10")
+    _write(state_p, {"nodes": [{"name": "sg-1", "endpoint_host": "203.0.113.10",
+                                 "route_ip": "203.0.113.10", "enabled": True}]})
     r = local_state.sync_route_ip_from_xray("sg-1", xray_config_path=str(xray_p), path=state_p)
     assert r["ok"] is True
-    assert r["route_ip"] == "85.136.181.198"
+    assert r["route_ip"] == "203.0.113.10"
 
 
 def test_sync_route_ip_no_xray_config_returns_false(tmp_path):
@@ -620,7 +620,7 @@ def test_sync_route_ip_unknown_node_returns_false(tmp_path):
     """Узла с таким name нет → ok:False."""
     state_p = tmp_path / "srouter.local.json"
     xray_p = tmp_path / "xray-config.json"
-    _write_xray_config(xray_p, "85.136.181.198")
+    _write_xray_config(xray_p, "203.0.113.10")
     _write(state_p, {"nodes": [{"name": "sg-1", "endpoint_host": "203.0.113.10", "route_ip": "203.0.113.10", "enabled": True}]})
     r = local_state.sync_route_ip_from_xray("other", xray_config_path=str(xray_p), path=state_p)
     assert r["ok"] is False
