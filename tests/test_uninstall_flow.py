@@ -2,6 +2,8 @@ import json
 import plistlib
 from pathlib import Path
 
+import pytest
+
 import install_lib
 
 
@@ -96,6 +98,23 @@ class ListRunner:
 
 def _bootouts(calls):
     return [c for c in calls if len(c) > 1 and c[1] == "bootout"]
+
+
+class ListFailureRunner:
+    """runner, у которого `list` возвращает сбойный dict (rc≠0 или rc=None,timeout=False).
+
+    Эмулирует сломанный/недоступный launchctl (FileNotFoundError/PermissionError/OSError →
+    sys_probe.run отдаёт rc=None,timeout=False; либо ненулевой rc). НЕ то же, что timeout.
+    """
+    def __init__(self, list_result):
+        self.list_result = list_result
+        self.calls = []
+
+    def __call__(self, cmd, timeout):
+        self.calls.append(list(cmd))
+        if len(cmd) > 1 and cmd[1] == "list":
+            return dict(self.list_result)
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
 
 
 def test_uninstall_plan_does_not_call_runner_or_touch_files(tmp_path):
@@ -333,6 +352,32 @@ def test_uninstall_launchagent_keeps_plist_when_list_timeout(tmp_path, monkeypat
     assert result["ok"] is False
     assert result["blocked"] == ["launchagent_unload_failed"]
     assert plist_path.exists(), "list timeout (неизвестно) → plist оставлен (fail-safe)"
+
+
+@pytest.mark.parametrize("list_result", [
+    {"rc": 1, "out": "", "err": "boom", "timeout": False},                    # ненулевой rc
+    {"rc": None, "out": "", "err": "FileNotFoundError: launchctl", "timeout": False},  # OSError-путь
+], ids=["nonzero_rc", "launch_failure"])
+def test_uninstall_launchagent_keeps_plist_when_list_fails(tmp_path, monkeypatch, list_result):
+    """Сломанный launchctl list (rc≠0 / rc=None,timeout=False — НЕ timeout) → fail-safe: plist ОСТАВЛЕН.
+
+    Регресс-гард: до фикса источника _launchd_is_loaded возвращал False на сбойном list («выгружен»)
+    → _unload_launchagent удалял plist ЖИВОГО агента (fail-open на privileged-границе). На коде ДО
+    фикса этот тест ПАДАЕТ (plist удаляется). Теперь сбой → None → state is not False → plist на месте.
+    """
+    monkeypatch.setattr(install_lib, "_BOOTOUT_POLL_INTERVAL", 0)
+    monkeypatch.setattr(install_lib, "_BOOTOUT_SETTLE_MAX_WAIT", 0)
+    env = _env(tmp_path)
+    plist_path = _write_removable_launchagent(env)
+    _write_state(env, {"launchagent": _managed_launchagent_detected()})
+    runner = ListFailureRunner(list_result)
+
+    result = install_lib.apply_uninstall(
+        env=env, confirmations={"launchagent": True}, runner=runner)
+
+    assert result["ok"] is False
+    assert result["blocked"] == ["launchagent_unload_failed"]
+    assert plist_path.exists(), "сломанный list (неизвестно) → plist оставлен (fail-safe), не удалять живого агента"
 
 
 def test_uninstall_launchagent_not_removable_is_noop(tmp_path):

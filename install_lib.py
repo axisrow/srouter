@@ -183,7 +183,12 @@ def _launchd_is_loaded(label, *, runner=run):
     через фейк, иначе poll-loop внутри _launchd_reload дёргал бы реальный launchctl.
     """
     r = runner([LAUNCHCTL, "list"], 5)
-    if r.get("timeout"):
+    # Достоверный False даёт ТОЛЬКО успешный list (rc==0, без timeout). Любой сбой запуска launchctl
+    # (FileNotFoundError/PermissionError/OSError → sys_probe.run отдаёт rc=None, timeout=False) или
+    # ненулевой rc — состояние НЕИЗВЕСТНО → None (fail-safe), НЕ «выгружен». Иначе сломанный launchctl
+    # классифицировался бы как confirmed-unloaded → _unload_launchagent удалил бы plist живого агента
+    # (fail-open на privileged-границе, которую issue #84 делает fail-closed).
+    if r.get("timeout") or r.get("rc") != 0:
         return None
     return any(row.split() and row.split()[-1] == label
                for row in (r.get("out") or "").splitlines())

@@ -123,3 +123,52 @@ def test_unload_bootout_rc_ignored(monkeypatch):
                                       install_lib.LAUNCHAGENT_LABEL, runner=runner)
 
     assert res["state"] is False, "bootout rc игнорируем — «уже выгружен» не ошибка"
+
+
+# ============================ _launchd_is_loaded: сбой list ≠ «выгружен» (fail-safe источник) ============================
+def _list_result_runner(list_result):
+    """runner, отдающий фиксированный dict на `list` (bootout/прочее → успех)."""
+    def runner(cmd, timeout):
+        if len(cmd) > 1 and cmd[1] == "list":
+            return dict(list_result)
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+    return runner
+
+
+def test_is_loaded_returns_None_on_nonzero_rc():
+    """launchctl list дал rc≠0 (сбой, НЕ timeout) → состояние НЕИЗВЕСТНО (None), НЕ False.
+
+    Иначе сломанный list классифицировался бы как confirmed-unloaded → _unload_launchagent удалил
+    бы plist живого агента (fail-open на privileged-границе, которую issue #84 делает fail-closed).
+    """
+    runner = _list_result_runner({"rc": 1, "out": "", "err": "boom", "timeout": False})
+    assert install_lib._launchd_is_loaded(install_lib.LAUNCHAGENT_LABEL, runner=runner) is None
+
+
+def test_is_loaded_returns_None_on_rc_none_launch_failure():
+    """sys_probe.run при OSError/FileNotFoundError/PermissionError → {rc:None, timeout:False}.
+
+    Не-timeout сбой запуска launchctl — тоже НЕИЗВЕСТНО (None), не «выгружен».
+    """
+    runner = _list_result_runner({"rc": None, "out": "", "err": "FileNotFoundError: launchctl",
+                                  "timeout": False})
+    assert install_lib._launchd_is_loaded(install_lib.LAUNCHAGENT_LABEL, runner=runner) is None
+
+
+def test_is_loaded_returns_None_on_timeout():
+    """list timeout → None (уже покрыто, держим явно рядом с rc-сбоями)."""
+    runner = _list_result_runner({"rc": None, "out": "", "err": "timeout", "timeout": True})
+    assert install_lib._launchd_is_loaded(install_lib.LAUNCHAGENT_LABEL, runner=runner) is None
+
+
+def test_is_loaded_False_only_on_successful_list():
+    """rc==0 без label в выводе → достоверный False (агент точно не загружен)."""
+    runner = _list_result_runner({"rc": 0, "out": "999\t0\tcom.other\n", "err": "", "timeout": False})
+    assert install_lib._launchd_is_loaded(install_lib.LAUNCHAGENT_LABEL, runner=runner) is False
+
+
+def test_is_loaded_True_when_label_present():
+    """rc==0 и label в последней колонке → True (загружен)."""
+    out = f"999\t0\t{install_lib.LAUNCHAGENT_LABEL}\n"
+    runner = _list_result_runner({"rc": 0, "out": out, "err": "", "timeout": False})
+    assert install_lib._launchd_is_loaded(install_lib.LAUNCHAGENT_LABEL, runner=runner) is True
