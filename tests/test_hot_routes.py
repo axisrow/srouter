@@ -419,8 +419,10 @@ def test_parse_new_access_log_copytruncate_regrowth_counts_all(tmp_path):
     Баг #79: inode/dev совпадают и cur_size >= saved_offset, поэтому старая
     (inode,dev)/size-эвристика не детектила ротацию и reader seek'ал в середину
     нового контента, теряя NEW1/NEW2. Content-free boundary-newline check ловит
-    подмену границы (байт [offset-1] нового контента почти никогда не '\\n') и
-    делает resync (offset=0), считая все три новые строки ровно один раз.
+    подмену границы, когда новый контент РАЗНОЙ длины со старым (байт [offset-1] —
+    середина строки, не '\\n'), и делает resync (offset=0), считая все три новые
+    строки ровно один раз. Equal-length предел покрыт отдельным тестом
+    (see test_..._newline_aligned_undercounts): там граница совпадает -> undercount.
     """
     log = tmp_path / "privoxy.log"
     # Реальные privoxy-строки переменной длины (хосты разной длины) -> новый контент
@@ -441,8 +443,8 @@ def test_parse_new_access_log_copytruncate_regrowth_counts_all(tmp_path):
         f.write(_privoxy_line("new-long-host-2.example") + "\n")
         f.write(_privoxy_line("new-long-host-3.example") + "\n")
     # Sanity: репро валиден только если inode тот же, файл дорос за старый offset,
-    # и байт на старой границе больше НЕ '\\n' (иначе content-free сигнал не сработал бы —
-    # это тот самый патологический undercount-случай, тут его не проверяем).
+    # и байт на старой границе больше НЕ '\\n' (иначе content-free сигнал не сработал
+    # бы — это equal-length undercount-предел, покрыт отдельным тестом).
     assert log.stat().st_ino == inode_before
     assert log.stat().st_size > saved_offset
     assert log.read_bytes()[saved_offset - 1 : saved_offset] != b"\n"
@@ -502,6 +504,47 @@ def test_parse_new_access_log_copytruncate_regrowth_stays_bounded(tmp_path):
     )
     # resync -> tail_mode: считаны только 2 последние строки, начало окна отброшено.
     assert counts == {"win4.example": 1, "win5.example": 1}
+
+
+def test_parse_new_access_log_copytruncate_newline_aligned_undercounts(tmp_path):
+    """Known accepted best-effort limit content-free детекта (issue #79).
+
+    Если новые строки РОВНО той же длины, что старые (напр. повторяющиеся CONNECT к
+    одному хосту — частый реальный случай, НЕ патология), байт на границе offset-1 в
+    новом файле снова оказывается '\\n'. _boundary_intact -> True, resync НЕ
+    происходит, начальные новые строки пропускаются -> undercount. Это сознательный
+    трейд-офф в пользу privacy #76: строгая гарантия детекта потребовала бы писать
+    производное контента лога на диск, что нарушает privacy-инвариант.
+
+    Направление отказа БЕЗОПАСНО: undercount (наблюдаемость занижена), НЕ overcount —
+    данные не портятся, реальный IP/URL не текут. Тест фиксирует это как принятое
+    поведение; если кто-то в будущем сломает механизм в сторону double-count, тест
+    упадёт (counts станет > ожидаемого undercount).
+    """
+    log = tmp_path / "privoxy.log"
+    # Повторяющийся CONNECT к одному хосту -> строки равной длины.
+    log.write_text(
+        _privoxy_line("repeat.example") + "\n" + _privoxy_line("repeat.example") + "\n",
+        encoding="utf-8",
+    )
+    counts, cursor = hot_routes.parse_new_access_log(str(log), None, None, None)
+    assert counts == {"repeat.example": 2}
+    saved_offset = cursor["log_offset"]
+
+    # copytruncate + 3 НОВЫЕ строки той же длины (три захода к тому же хосту).
+    with open(log, "w", encoding="utf-8") as f:
+        for _ in range(3):
+            f.write(_privoxy_line("repeat.example") + "\n")
+    assert log.stat().st_size > saved_offset
+    # Предусловие бага: граница equal-length совпала с '\\n' -> детект НЕ сработает.
+    assert log.read_bytes()[saved_offset - 1 : saved_offset] == b"\n"
+
+    counts, _cursor = hot_routes.parse_new_access_log(
+        str(log), cursor["log_offset"], cursor["log_inode"], cursor["log_dev"]
+    )
+    # UNDERCOUNT (принято): начальные новые строки пропущены, посчитана только
+    # последняя (та, что после старого offset). НЕ double-count, НЕ overcount.
+    assert counts == {"repeat.example": 1}
 
 
 def test_parse_new_access_log_legit_offset_zero_reads_all_lines(tmp_path):
