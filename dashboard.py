@@ -310,6 +310,15 @@ def _is_cross_origin_post():
 # (curl 127.0.0.1:8787 → Host: 127.0.0.1:8787, прямой ввод/закладка → разные формы), а werkzeug
 # в тестах по умолчанию ставит Host: localhost без порта. Привязка к порту сломала бы легит, не добавив
 # защиты от rebinding.
+# `::1` включён намеренно (не мёртвая запись): сервис по умолчанию слушает 127.0.0.1, но
+# обращение по IPv6-loopback-литералу (`http://[::1]:8787` → `Host: [::1]:8787`,
+# hostname нормализуется в `::1`) — валидный сценарий, в т.ч. при запуске на IPv6/dual-stack.
+# Любой loopback не подвержен DNS-rebinding, поэтому его наличие в allow-list безопасно и не
+# расширяет поверхность атаки. (Путь `localhost`, резолвящийся в IPv6, покрыт записью `localhost`:
+# браузер шлёт в Host саму строку `localhost`, а не адрес.)
+# ВАЖНО: это allow-list только для Host-rebinding guard (GET-доступ). CSRF-origin allow-list
+# (`_allowed_origins()` / `_GUARD_HOSTS`) намеренно уже — только 127.0.0.1/localhost, поэтому
+# мутации (POST) с `Origin: http://[::1]:8787` по-прежнему отклоняются 403 (fail-closed by design).
 _ALLOWED_HOSTNAMES = frozenset({"127.0.0.1", "localhost", "::1"})
 
 

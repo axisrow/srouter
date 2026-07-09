@@ -89,6 +89,23 @@ def test_t_preserves_dollar_ampersand_specifically():
     assert res["out"] == "Error U: a $& b"
 
 
+def test_t_does_not_reexpand_brace_token_in_value():
+    """#88: значение с литералом {N} НЕ должно переэкспандиться следующим аргументом.
+
+    При итеративном split/join arguments[1]='{1}injected' на проходе {1} подставлялся бы
+    вторым аргументом. Single-pass replace обрабатывает все {N} за один проход по ИСХОДНОЙ
+    строке шаблона — литерал {1} внутри значения остаётся как есть.
+    """
+    body = (
+        "var out = t('err_req', '{1}injected', 'REALSECOND');"
+        "console.log(JSON.stringify({out: out}));"
+    )
+    res = _run_node(_harness([], body))
+    # {0}=аргумент1 (буквально '{1}injected'), {1}=аргумент2 ('REALSECOND').
+    # Литерал '{1}' внутри первого значения НЕ должен превратиться в 'REALSECOND'.
+    assert res["out"] == "Error {1}injected: REALSECOND", res["out"]
+
+
 # --- #4/#5: renderFlow — chain-узел и корректные RTT -------------------------
 
 def _render_flow(d):
