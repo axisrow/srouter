@@ -612,8 +612,9 @@ def cmd_uninstall(args) -> int:
 
 def _is_loaded():
     """Загружен ли демон в launchd. Делегирует к install_lib._launchd_is_loaded (канон: единый
-    источник правды о launchd — CLI не дублирует парсинг launchctl list)."""
-    return _launchd_is_loaded(LAUNCHAGENT_LABEL, runner=run)
+    источник правды о launchd — CLI не дублирует парсинг launchctl). Домен gui/<uid> явно — тот же
+    таргет, что bootout в cmd_stop/_launchd_reload (домен-осознанная проверка, cycle-review #93)."""
+    return _launchd_is_loaded(LAUNCHAGENT_LABEL, domain=_launchd_domain(), runner=run)
 
 
 def cmd_start(args) -> int:
@@ -680,6 +681,13 @@ def cmd_status(args) -> int:
 
     Формат `launchctl list`: «PID  ExitCode  Label» (3 колонки). Ищем службу по последней
     колонке (fields[-1] == label) — она устойчива к числу предшествующих полей.
+
+    best-effort: legacy `list` инспектирует домен ВЫЗЫВАЮЩЕГО (из не-gui контекста — SSH/cron —
+    gui-агент может не отобразиться → неточный статус). Осознанно оставлено на `list` (cycle-review
+    #93): cmd_status только ЧИТАЕТ/печатает, домен-mismatch тут даёт неверный вывод, НЕ потерю данных
+    (в отличие от unlink-границы _launchd_is_loaded, переведённой на домен-осознанный `print`). Перевод
+    на `print` требовал бы переписать парсинг трёх состояний под хрупкий недокументированный текст —
+    цена/польза не оправдана для read-only статуса.
     """
     result = run([LAUNCHCTL, "list"], 5)
     if result.get("timeout"):

@@ -8,6 +8,8 @@ uninstall убирает. Канон — _install_ppp_hook/_remove_ppp_hook (bes
 import os
 from pathlib import Path
 
+import pytest
+
 import srouter
 
 
@@ -119,10 +121,17 @@ def test_remove_marker_gate_foreign(monkeypatch, tmp_path):
 
 # ============================ _install/_remove_launchctl_env (LaunchAgent com.srouter.codenv) ============================
 def _fake_runner():
-    """Фейк runner (как make_privileged_runner) — собирает вызовы, всегда успех."""
+    """Фейк runner (как make_privileged_runner) — собирает вызовы, успех; `print` → не загружен.
+
+    `launchctl print <domain>/<label>` → rc=113 (service-not-found = НЕ загружен): _remove_launchctl_env
+    в чистом окружении видит подтверждённую выгрузку → удаляет plist. Иначе default rc=0 читался бы как
+    «жив» → C оставлял бы plist + poll крутил settle (домен-осознанная проверка, cycle-review #93).
+    """
     calls = []
     def runner(cmd, timeout):
         calls.append(list(cmd))
+        if len(cmd) > 1 and cmd[1] == "print":
+            return {"rc": 113, "out": "", "err": "Could not find service", "timeout": False}
         return {"rc": 0, "out": "", "err": "", "timeout": False}
     runner.calls = calls
     return runner
@@ -205,23 +214,29 @@ def test_remove_launchctl_env_when_not_installed(monkeypatch, tmp_path):
     assert "не был" in note.lower()
 
 
-def _list_runner(list_states):
-    """runner с list-диспетчеризацией по CODEX_ENV_LABEL (canned _fake_runner list→out='' не доходит
-    до fail-safe). list_states: [True/False/None,...] на каждый вызов list; None → timeout."""
+def _print_runner(list_states):
+    """runner с `print`-диспетчеризацией (домен-осознанная проверка, cycle-review #93).
+
+    Проверка выгрузки — `launchctl print <domain>/CODEX_ENV_LABEL`: loaded кодируется rc
+    (True→rc0 / False→rc113=service-not-found / None→timeout), НЕ текстом. list_states:
+    [True/False/None,...] на каждый вызов print. (canned _fake_runner print→rc113 не доходит до fail-safe.)
+    """
     calls = []
     state = {"i": 0}
 
     def runner(cmd, timeout):
         calls.append(list(cmd))
         sub = cmd[1] if len(cmd) > 1 else ""
-        if sub == "list":
+        if sub == "print":
             idx = min(state["i"], len(list_states) - 1)
             state["i"] += 1
             loaded = list_states[idx]
             if loaded is None:
                 return {"rc": None, "out": "", "err": "timeout", "timeout": True}
-            out = (srouter.CODEX_ENV_LABEL + "\n") if loaded else ""
-            return {"rc": 0, "out": out, "err": "", "timeout": False}
+            if loaded:
+                return {"rc": 0, "out": f"{srouter.CODEX_ENV_LABEL} = {{ state = running }}",
+                        "err": "", "timeout": False}
+            return {"rc": 113, "out": "", "err": "Could not find service", "timeout": False}
         return {"rc": 0, "out": "", "err": "", "timeout": False}
 
     runner.calls = calls
@@ -232,7 +247,7 @@ def test_remove_launchctl_env_keeps_plist_when_still_loaded(monkeypatch, tmp_pat
     """Сайт C fail-safe (PR #83 cycle-3): агент ещё загружен после settle → plist ОСТАВЛЕН, нет unsetenv.
 
     poll живёт в install_lib → патчим install_lib._BOOTOUT_*. settle≈0 (иначе poll крутил бы 2с),
-    list всегда True → state=True. Сообщение бит-в-бит: «всё ещё загружен» + «plist оставлен».
+    print всегда rc0 → state=True. Сообщение бит-в-бит: «всё ещё загружен» + «plist оставлен».
     """
     import install_lib
     monkeypatch.setattr(install_lib, "_BOOTOUT_POLL_INTERVAL", 0)
@@ -241,7 +256,7 @@ def test_remove_launchctl_env_keeps_plist_when_still_loaded(monkeypatch, tmp_pat
     srouter._install_launchctl_env(_env(tmp_path), _fake_runner())
     plist = home / "Library" / "LaunchAgents" / f"{srouter.CODEX_ENV_LABEL}.plist"
     assert plist.exists()
-    runner = _list_runner([True] * 6)  # не выгружается
+    runner = _print_runner([True] * 6)  # не выгружается
 
     note = srouter._remove_launchctl_env(runner)
 
@@ -252,8 +267,8 @@ def test_remove_launchctl_env_keeps_plist_when_still_loaded(monkeypatch, tmp_pat
         "не выгружен → env НЕ очищаем (unsetenv не вызывается)"
 
 
-def test_remove_launchctl_env_keeps_plist_when_list_timeout(monkeypatch, tmp_path):
-    """Сайт C: list timeout (None) → tristate-различие: «не подтверждена выгрузка», plist оставлен.
+def test_remove_launchctl_env_keeps_plist_when_print_timeout(monkeypatch, tmp_path):
+    """Сайт C: print timeout (None) → tristate-различие: «не подтверждена выгрузка», plist оставлен.
 
     Тест бит-в-бит различия None vs True. None короткозамыкает poll (`while state and …`).
     """
@@ -263,14 +278,53 @@ def test_remove_launchctl_env_keeps_plist_when_list_timeout(monkeypatch, tmp_pat
     srouter._install_launchctl_env(_env(tmp_path), _fake_runner())
     plist = home / "Library" / "LaunchAgents" / f"{srouter.CODEX_ENV_LABEL}.plist"
     assert plist.exists()
-    runner = _list_runner([None])  # list timeout → state=None
+    runner = _print_runner([None])  # print timeout → state=None
 
     note = srouter._remove_launchctl_env(runner)
 
     assert "не подтверждена выгрузка" in note, f"None → «не подтверждена выгрузка»: {note}"
     assert "plist оставлен" in note
-    assert plist.exists(), "list timeout (неизвестно) → plist оставлен (fail-safe)"
+    assert plist.exists(), "print timeout (неизвестно) → plist оставлен (fail-safe)"
     assert not any(len(c) > 1 and c[1] == "unsetenv" for c in runner.calls)
+
+
+@pytest.mark.parametrize("print_result, marker", [
+    # print rc=0: агент ЖИВ (bootout мог не сработать) → «всё ещё загружен».
+    ({"rc": 0, "out": "com.srouter.codenv = { state = running }", "err": "", "timeout": False},
+     "всё ещё загружен"),
+    # print rc=112: домен gui/<uid> недоступен (не-gui контекст) → «не подтверждена выгрузка».
+    ({"rc": 112, "out": "", "err": "Could not find domain", "timeout": False},
+     "не подтверждена выгрузка"),
+], ids=["still_alive_rc0", "domain_not_found_rc112"])
+def test_remove_launchctl_env_keeps_plist_on_domain_mismatch(monkeypatch, tmp_path, print_result, marker):
+    """Сайт C домен-mismatch (cycle-review #93, 2-я critical): живой агент / недоступный домен → plist ОСТАВЛЕН.
+
+    До фикса legacy `list` без домена из не-gui контекста не видел gui-агента → False → C удалял plist
+    живого. Теперь `print gui/<uid>/CODEX_ENV_LABEL`: rc=0 (жив) → True, rc=112 (домен недоступен) → None;
+    оба → loaded is not False → plist оставлен, нет unsetenv.
+    """
+    import install_lib
+    monkeypatch.setattr(install_lib, "_BOOTOUT_POLL_INTERVAL", 0)
+    monkeypatch.setattr(install_lib, "_BOOTOUT_SETTLE_MAX_WAIT", 0)
+    home = _mock_home(monkeypatch, tmp_path)
+    srouter._install_launchctl_env(_env(tmp_path), _fake_runner())
+    plist = home / "Library" / "LaunchAgents" / f"{srouter.CODEX_ENV_LABEL}.plist"
+    assert plist.exists()
+
+    calls = []
+
+    def runner(cmd, timeout):
+        calls.append(list(cmd))
+        if len(cmd) > 1 and cmd[1] == "print":
+            return dict(print_result)
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+
+    note = srouter._remove_launchctl_env(runner)
+
+    assert marker in note, f"ожидалось «{marker}»: {note}"
+    assert "plist оставлен" in note
+    assert plist.exists(), "живой агент / недоступный домен → plist оставлен (fail-safe)"
+    assert not any(len(c) > 1 and c[1] == "unsetenv" for c in calls), "не выгружен → нет unsetenv"
 
 
 # ============================ _ensure/_remove_home_bin_in_path ============================

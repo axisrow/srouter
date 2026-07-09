@@ -19,8 +19,8 @@ def _make_runner(*, bootout_rc=0, bootstrap_sequence=None, list_states=None, rec
 
     bootstrap_sequence: список rc-кодов, выдаваемых ПОСЛЕДОВАТЕЛЬНО на каждый вызов bootstrap
       (напр. [5, 0] — первый занят, второй ок). Если исчерпан — последний код.
-    list_states: список loaded-значений (True/False/None) последовательно на каждый вызов list.
-      Эмулирует «демон ещё выгружается» (True) → «выгрузился» (False). None → timeout.
+    list_states: список loaded-значений (True/False/None) последовательно на каждый вызов print.
+      Эмулирует «демон ещё выгружается» (True→rc0) → «выгрузился» (False→rc113). None → timeout.
     record: если задан (список) — каждый вызок добавляется туда (для подсчёта bootstraps).
     """
     state = {"bootstrap_idx": 0, "list_idx": 0}
@@ -29,17 +29,21 @@ def _make_runner(*, bootout_rc=0, bootstrap_sequence=None, list_states=None, rec
         if record is not None:
             record.append(list(cmd))
         sub = cmd[1] if len(cmd) > 1 else ""
-        if sub == "list":
+        if sub == "print":
+            # Домен-осознанная проверка (cycle-review #93): loaded кодируется rc `launchctl print`
+            # (0=загружен / 113=service-not-found=выгружен / None=timeout=unknown), НЕ текстом.
             if list_states is not None:
                 idx = min(state["list_idx"], len(list_states) - 1)
                 state["list_idx"] += 1
                 loaded = list_states[idx]
             else:
                 loaded = False
-            if loaded is None:  # timeout
+            if loaded is None:  # timeout → unknown
                 return {"rc": None, "out": "", "err": "timeout", "timeout": True}
-            out = (srouter.LAUNCHAGENT_LABEL + "\n") if loaded else "999\t0\tcom.other\n"
-            return {"rc": 0, "out": out, "err": "", "timeout": False}
+            if loaded:
+                return {"rc": 0, "out": f"{srouter.LAUNCHAGENT_LABEL} = {{ state = running }}",
+                        "err": "", "timeout": False}
+            return {"rc": 113, "out": "", "err": "Could not find service", "timeout": False}
         if sub == "bootout":
             return {"rc": bootout_rc, "out": "", "err": "", "timeout": False}
         if sub == "bootstrap":
@@ -103,7 +107,7 @@ def test_restart_fails_after_max_retries(monkeypatch):
 
 
 def test_restart_waits_for_unload_after_bootout(monkeypatch):
-    """После bootout демон ещё «висит» в list (True), потом выгружается (False).
+    """После bootout демон ещё «висит» в print (True), потом выгружается (False).
 
     bootstrap НЕ должен вызываться, пока _is_loaded() ещё True — ждём полной выгрузки.
     """
@@ -111,7 +115,7 @@ def test_restart_waits_for_unload_after_bootout(monkeypatch):
     monkeypatch.setattr(install_lib, "_BOOTSTRAP_RETRY_DELAY", 0)
     monkeypatch.setattr(srouter.Path, "exists", lambda self: True)
     calls = []
-    # list: первый poll (после bootout) → True (ещё загружен), затем False (выгрузился). bootstrap → 0.
+    # print: первый poll (после bootout) → True (ещё загружен), затем False (выгрузился). bootstrap → 0.
     monkeypatch.setattr(srouter, "run",
                         _make_runner(bootstrap_sequence=[0], list_states=[True, False], record=calls))
 
@@ -119,12 +123,12 @@ def test_restart_waits_for_unload_after_bootout(monkeypatch):
     assert rc == 0
     bootstraps = _bootstraps(calls)
     assert len(bootstraps) == 1, "bootstrap вызывается ровно один раз после выгрузки"
-    # bootstrap должен идти ПОСЛЕ list→False (полной выгрузки), а не до неё.
+    # bootstrap должен идти ПОСЛЕ print→False (полной выгрузки), а не до неё.
     subs = [c[1] for c in calls if len(c) > 1]
     first_bootstrap = subs.index("bootstrap")
-    # Все list-вызовы до bootstrap: последний из них должен вернуть выгрузку (loaded-чередование в _make_runner).
-    lists_before = [c for c in calls[:first_bootstrap] if len(c) > 1 and c[1] == "list"]
-    assert len(lists_before) >= 2, "poll должен увидеть и loaded=True, и последующий loaded=False до bootstrap"
+    # Все print-вызовы до bootstrap: последний из них должен вернуть выгрузку (loaded-чередование в _make_runner).
+    prints_before = [c for c in calls[:first_bootstrap] if len(c) > 1 and c[1] == "print"]
+    assert len(prints_before) >= 2, "poll должен увидеть и loaded=True, и последующий loaded=False до bootstrap"
 
 
 def test_reload_bootstraps_when_unload_unconfirmed(monkeypatch):
@@ -161,7 +165,11 @@ def test_start_idempotent_when_already_loaded(monkeypatch):
 
 # ============================ _launchd_reload (install_lib) ============================
 def _reload_runner(*, bootstrap_rcs, list_loaded=False):
-    """Фейк runner для прямых тестов _launchd_reload: bootstrap отдаёт rc по списку, list — loaded."""
+    """Фейк runner для прямых тестов _launchd_reload: bootstrap отдаёт rc по списку, print — loaded.
+
+    Проверка выгрузки — `launchctl print` (cycle-review #93): list_loaded кодируется rc
+    (True→rc0 / False→rc113=service-not-found).
+    """
     state = {"i": 0}
 
     def runner(cmd, timeout):
@@ -171,9 +179,11 @@ def _reload_runner(*, bootstrap_rcs, list_loaded=False):
             state["i"] += 1
             rc = bootstrap_rcs[idx]
             return {"rc": rc, "out": "", "err": "" if rc == 0 else "Bootstrap failed", "timeout": False}
-        if sub == "list":
-            out = (install_lib.LAUNCHAGENT_LABEL + "\n") if list_loaded else "999\t0\tcom.other\n"
-            return {"rc": 0, "out": out, "err": "", "timeout": False}
+        if sub == "print":
+            if list_loaded:
+                return {"rc": 0, "out": f"{install_lib.LAUNCHAGENT_LABEL} = {{ state = running }}",
+                        "err": "", "timeout": False}
+            return {"rc": 113, "out": "", "err": "Could not find service", "timeout": False}
         return {"rc": 0, "out": "", "err": "", "timeout": False}
 
     return runner
