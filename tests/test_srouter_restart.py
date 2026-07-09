@@ -127,6 +127,27 @@ def test_restart_waits_for_unload_after_bootout(monkeypatch):
     assert len(lists_before) >= 2, "poll должен увидеть и loaded=True, и последующий loaded=False до bootstrap"
 
 
+def test_reload_bootstraps_when_unload_unconfirmed(monkeypatch):
+    """Сайт A инвариант (issue #84): reload ре-bootstrap'ит ДАЖЕ если выгрузка не подтверждена.
+
+    После рефактора bootout+poll живёт в _launchd_unload, а reload сознательно ИГНОРИРУЕТ его
+    state — bootstrap-retry сам покроет занятость домена. Агент так и не выгружается (list=True),
+    settle-потолок ≈0 (иначе poll крутил бы полные 2с) → bootstrap всё равно вызван, rc 0.
+    """
+    monkeypatch.setattr(install_lib, "_BOOTOUT_POLL_INTERVAL", 0)
+    monkeypatch.setattr(install_lib, "_BOOTOUT_SETTLE_MAX_WAIT", 0)
+    monkeypatch.setattr(install_lib, "_BOOTSTRAP_RETRY_DELAY", 0)
+    monkeypatch.setattr(srouter.Path, "exists", lambda self: True)
+    calls = []
+    # list всегда True (агент «не выгружается»); bootstrap → 0. reload должен выстоять regardless.
+    monkeypatch.setattr(srouter, "run",
+                        _make_runner(bootstrap_sequence=[0], list_states=[True] * 8, record=calls))
+
+    rc = srouter.cmd_restart(_args())
+    assert rc == 0, "reload bootstrap'ит даже без подтверждённой выгрузки — bootstrap regardless"
+    assert len(_bootstraps(calls)) >= 1, "bootstrap вызван несмотря на неподтверждённую выгрузку"
+
+
 def test_start_idempotent_when_already_loaded(monkeypatch):
     """cmd_start: демон уже загружен → bootstrap не вызывается вообще (текущее поведение сохранить)."""
     calls = []

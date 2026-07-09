@@ -19,7 +19,6 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import os
-import time
 import shlex
 import shutil
 import sys
@@ -36,12 +35,11 @@ from install_lib import (
     LAUNCHAGENT_LABEL,
     LAUNCHCTL,
     InstallEnv,
-    _BOOTOUT_POLL_INTERVAL,
-    _BOOTOUT_SETTLE_MAX_WAIT,
     _has_launchagent_marker,
     _launchd_domain,
     _launchd_is_loaded,
     _launchd_reload,
+    _launchd_unload,
     _write_text_atomic,
     apply_install,
     apply_uninstall,
@@ -383,16 +381,10 @@ def _remove_launchctl_env(runner) -> str:
             return "Codex env: не был установлен."
         if CODEX_ENV_MARKER not in plist_path.read_text(encoding="utf-8"):
             return f"Codex env: чужой LaunchAgent {CODEX_ENV_LABEL} — не трогаем."
-        # bootout агента (через runner — симметрия с install). bootout на незагруженном = не ошибка.
-        runner([LAUNCHCTL, "bootout", f"{_launchd_domain()}/{CODEX_ENV_LABEL}"], 10)
-        # Poll-wait: launchd не мгновенно отражает выгрузку (гонка, которую _launchd_reload чинил
-        # в PR #80). Без этого _launchd_is_loaded вернёт True в окне → ложный «ещё загружен» → plist
-        # оставлен + StartInterval-агент пере-применяет мёртвый env. Ждём как в _launchd_reload.
-        deadline = time.monotonic() + _BOOTOUT_SETTLE_MAX_WAIT
-        loaded = _launchd_is_loaded(CODEX_ENV_LABEL, runner=runner)
-        while loaded and time.monotonic() < deadline:
-            time.sleep(_BOOTOUT_POLL_INTERVAL)
-            loaded = _launchd_is_loaded(CODEX_ENV_LABEL, runner=runner)
+        # bootout + poll реальной выгрузки — единый контракт _launchd_unload (issue #84). bootout
+        # асинхронен: без poll _launchd_is_loaded вернёт True в окне → ложный «ещё загружен» → plist
+        # оставлен + StartInterval-агент пере-применяет мёртвый env. tristate проходит насквозь.
+        loaded = _launchd_unload(_launchd_domain(), CODEX_ENV_LABEL, runner=runner)["state"]
         # None = unknown (launchctl list timeout) — fail-safe: НЕ удаляем plist (оставить контроль).
         # True = агент реально ещё загружен после settle — тоже не удаляем.
         if loaded is not False:

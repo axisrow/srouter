@@ -49,6 +49,55 @@ def _managed_component(env, name, backup_path):
     }
 
 
+def _write_removable_launchagent(env):
+    """Реальный srouter-managed plist на диске + detected-entry, дающий removable=True.
+
+    _launchagent_uninstall_item: removable = managed(entry) AND marker_present(plist на диске).
+    Пишем plist с LAUNCHAGENT_MARKER по env.launchagent_path() и managed-entry в detected — тогда
+    plan['launchagent']['removable'] is True и _unload_launchagent доходит до bootout+poll+unlink.
+    Возвращает путь к plist.
+    """
+    plist_path = env.launchagent_path()
+    plist_path.parent.mkdir(parents=True, exist_ok=True)
+    plist_path.write_text(
+        f"<?xml version='1.0'?>\n<!-- {install_lib.LAUNCHAGENT_MARKER} -->\n"
+        "<plist version='1.0'><dict>"
+        f"<key>Label</key><string>{install_lib.LAUNCHAGENT_LABEL}</string>"
+        "</dict></plist>\n",
+        encoding="utf-8")
+    return plist_path
+
+
+class ListRunner:
+    """runner с диспетчеризацией по cmd[1]: list гонит loaded-состояния последовательно.
+
+    canned-dict FakeRunner не умеет sequence list-состояний (нужно True→False по каждому list-вызову
+    для poll'а _launchd_unload). list_states: [True/False/None,...] на каждый вызов list (держим
+    последнее при исчерпании); None → timeout. bootout/unsetenv/прочее → успех.
+    """
+    def __init__(self, list_states):
+        self.list_states = list_states
+        self.calls = []
+        self._i = 0
+
+    def __call__(self, cmd, timeout):
+        self.calls.append(list(cmd))
+        sub = cmd[1] if len(cmd) > 1 else ""
+        if sub == "list":
+            idx = min(self._i, len(self.list_states) - 1)
+            self._i += 1
+            loaded = self.list_states[idx]
+            if loaded is None:
+                return {"rc": None, "out": "", "err": "timeout", "timeout": True}
+            out = (install_lib.LAUNCHAGENT_LABEL + "\n") if loaded else "999\t0\tcom.other\n"
+            return {"rc": 0, "out": out, "err": "", "timeout": False}
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+
+
+def _bootouts(calls):
+    return [c for c in calls if len(c) > 1 and c[1] == "bootout"]
+
+
 def test_uninstall_plan_does_not_call_runner_or_touch_files(tmp_path):
     env = _env(tmp_path)
     backup = tmp_path / "privoxy.backup"
@@ -222,3 +271,81 @@ def test_install_init_style_apply_can_skip_launchagent_lifecycle(tmp_path):
     assert result["ok"] is True
     assert not env.launchagent_path().exists()
     assert all(install_lib.LAUNCHCTL not in call for call in runner.calls)
+
+
+# ============================ сайт B: _unload_launchagent (bootout-and-confirm-unloaded, issue #84) ============================
+def _managed_launchagent_detected():
+    """detected-entry для launchagent: managed + дефолтный label (→ item['label']=LAUNCHAGENT_LABEL)."""
+    return {"management": {"mode": "managed", "managed": True}}
+
+
+def test_uninstall_launchagent_unlinks_after_confirmed_unload(tmp_path, monkeypatch):
+    """Агент подтверждённо выгрузился (list True→False) → plist удалён, ok+changed."""
+    monkeypatch.setattr(install_lib, "_BOOTOUT_POLL_INTERVAL", 0)
+    env = _env(tmp_path)
+    plist_path = _write_removable_launchagent(env)
+    _write_state(env, {"launchagent": _managed_launchagent_detected()})
+    runner = ListRunner(list_states=[True, False])  # ещё висит → выгрузился
+
+    result = install_lib.apply_uninstall(
+        env=env, confirmations={"launchagent": True}, runner=runner)
+
+    assert result["ok"] is True
+    assert any(a.get("category") == "launchagent" and a.get("changed") for a in result["actions"]), \
+        "launchagent-действие changed=True"
+    assert not plist_path.exists(), "после подтверждённой выгрузки plist удалён"
+    assert len(_bootouts(runner.calls)) == 1, "bootout ровно один раз"
+
+
+def test_uninstall_launchagent_keeps_plist_when_still_loaded(tmp_path, monkeypatch):
+    """ПРАЙМ-ЦЕЛЬ (тест 8): агент ещё загружен после settle → plist НЕ удалён, blocked.
+
+    На СТАРОМ коде B (unlink безусловно после bootout) этот тест ПАДАЕТ — доказывает латентную
+    гонку. settle-потолок ≈0 (иначе poll крутил бы 2с), list всегда True → state=True → fail-safe.
+    Живой StartInterval-агент иначе пере-применял бы мёртвый конфиг.
+    """
+    monkeypatch.setattr(install_lib, "_BOOTOUT_POLL_INTERVAL", 0)
+    monkeypatch.setattr(install_lib, "_BOOTOUT_SETTLE_MAX_WAIT", 0)
+    env = _env(tmp_path)
+    plist_path = _write_removable_launchagent(env)
+    _write_state(env, {"launchagent": _managed_launchagent_detected()})
+    runner = ListRunner(list_states=[True] * 6)  # не выгружается
+
+    result = install_lib.apply_uninstall(
+        env=env, confirmations={"launchagent": True}, runner=runner)
+
+    assert result["ok"] is False
+    assert result["blocked"] == ["launchagent_unload_failed"]
+    assert plist_path.exists(), "агент ещё загружен → plist оставлен (fail-safe)"
+
+
+def test_uninstall_launchagent_keeps_plist_when_list_timeout(tmp_path, monkeypatch):
+    """list timeout (None = неизвестно) → fail-safe: plist НЕ удалён, blocked. None-ветка для B."""
+    monkeypatch.setattr(install_lib, "_BOOTOUT_POLL_INTERVAL", 0)
+    env = _env(tmp_path)
+    plist_path = _write_removable_launchagent(env)
+    _write_state(env, {"launchagent": _managed_launchagent_detected()})
+    runner = ListRunner(list_states=[None])  # list timeout → state=None
+
+    result = install_lib.apply_uninstall(
+        env=env, confirmations={"launchagent": True}, runner=runner)
+
+    assert result["ok"] is False
+    assert result["blocked"] == ["launchagent_unload_failed"]
+    assert plist_path.exists(), "list timeout (неизвестно) → plist оставлен (fail-safe)"
+
+
+def test_uninstall_launchagent_not_removable_is_noop(tmp_path):
+    """Non-removable item (нет plist/маркера) → {ok:True, changed:False}, НЕТ bootout (ранний возврат)."""
+    env = _env(tmp_path)
+    # plist на диске нет → marker_present False → removable False.
+    _write_state(env, {"launchagent": _managed_launchagent_detected()})
+    runner = ListRunner(list_states=[False])
+
+    result = install_lib.apply_uninstall(
+        env=env, confirmations={"launchagent": True}, runner=runner)
+
+    assert result["ok"] is True
+    assert not any(a.get("category") == "launchagent" for a in result["actions"]), \
+        "non-removable → нет launchagent-действия"
+    assert _bootouts(runner.calls) == [], "non-removable → ранний возврат, bootout не вызван"

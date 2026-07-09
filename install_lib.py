@@ -189,6 +189,42 @@ def _launchd_is_loaded(label, *, runner=run):
                for row in (r.get("out") or "").splitlines())
 
 
+def _launchd_unload(domain, label, *, runner=run):
+    """Bootout launchd-агента → poll-wait до фактической выгрузки → tristate-статус.
+
+    Единственный контракт «выгрузить с подтверждением» (issue #84). bootout асинхронен — launchd
+    освобождает gui/<uid>/<label> с задержкой (~2с), пока _launchd_is_loaded ещё возвращает True.
+    Любой потребитель ОБЯЗАН дождаться реальной выгрузки, прежде чем действовать на результат
+    (unlink plist / unsetenv / re-bootstrap). Это тот самый poll, один раз. Не бросает.
+
+    Возвращает {"state": tristate} — состояние launchd ПОСЛЕ settle-окна (тот же словарь, что
+    _launchd_is_loaded):
+      state is False -> подтверждённо выгружен (можно unlink / unsetenv / продолжать)
+      state is True  -> ещё загружен после settle (fail-safe: оставить plist)
+      state is None  -> неизвестно, launchctl list таймаутил (fail-safe: оставить plist)
+
+    bootout rc игнорируем: «уже выгружен» — не ошибка. runner маршрутизирует ВСЕ launchctl-вызовы
+    (bootout + list) через одну точку — для тестов. Возврат — dict (не голый tristate) по конвенции
+    репо (dict-возвраты у _launchd_reload/_unload_launchagent) и ради forward-совместимости.
+    """
+    def is_loaded():
+        return _launchd_is_loaded(label, runner=runner)
+
+    # 1. bootout (игнорируем rc — уже выгружен = не ошибка).
+    runner([LAUNCHCTL, "bootout", f"{domain}/{label}"], 10)
+
+    # 2. poll-wait: ждём, пока launchd РЕАЛЬНО выгрузит агента. Время по часам (не накоплением
+    # interval) — иначе при interval=0 (тесты) цикл стал бы бесконечным. `while state and …`:
+    # True truthy → крутим; None (list-timeout) falsy → выходим сразу, tristate проходит насквозь
+    # (НЕ `while state is not False` — иначе полные settle-2с на каждом таймауте + провокация True).
+    deadline = time.monotonic() + _BOOTOUT_SETTLE_MAX_WAIT
+    state = is_loaded()
+    while state and time.monotonic() < deadline:
+        time.sleep(_BOOTOUT_POLL_INTERVAL)
+        state = is_loaded()
+    return {"state": state}
+
+
 def _launchd_reload(domain, plist, label, *, runner=run):
     """Перезагрузить launchd-агента надёжно: bootout → poll-wait выгрузки → bootstrap(retry).
 
@@ -203,14 +239,10 @@ def _launchd_reload(domain, plist, label, *, runner=run):
     def is_loaded():
         return _launchd_is_loaded(label, runner=runner)
 
-    # 1. bootout (игнорируем rc — уже выгружен = не ошибка).
-    runner([LAUNCHCTL, "bootout", f"{domain}/{label}"], 10)
-
-    # 2. poll-wait: ждём, пока launchd РЕАЛЬНО выгрузит агента. Время считаем по часам (а не
-    # накоплением interval) — иначе при interval=0 (тесты) цикл стал бы бесконечным.
-    deadline = time.monotonic() + _BOOTOUT_SETTLE_MAX_WAIT
-    while is_loaded() and time.monotonic() < deadline:
-        time.sleep(_BOOTOUT_POLL_INTERVAL)
+    # 1-2. bootout + poll реальной выгрузки (общий контракт _launchd_unload). state СОЗНАТЕЛЬНО
+    # игнорируем: reload всегда re-bootstrap'ит, даже если выгрузка не подтверждена — bootstrap-retry
+    # ниже сам покроет занятость домена. Поведение идентично прежнему (bootout всегда → bootstrap).
+    _launchd_unload(domain, label, runner=runner)
 
     # 3. bootstrap с retry: домен может быть ещё занят.
     last_err = ""
@@ -870,11 +902,13 @@ def _unload_launchagent(item, runner):
     if not item.get("removable") or not plist_path:
         return {"ok": True, "changed": False}
     domain = _launchd_domain()
-    bootout = runner([LAUNCHCTL, "bootout", domain, plist_path], 15)
-    if bootout.get("timeout") or bootout.get("rc") != 0:
-        fallback = runner([LAUNCHCTL, "unload", "-w", plist_path], 15)
-        if fallback.get("timeout") or fallback.get("rc") != 0:
-            return {"ok": False, "blocked": "launchagent_unload_failed"}
+    label = item.get("label") or LAUNCHAGENT_LABEL
+    # bootout + poll реальной выгрузки (общий контракт, issue #84). unlink ТОЛЬКО при подтверждённой
+    # выгрузке (state is False): живой StartInterval-агент иначе пере-применял бы мёртвый конфиг.
+    state = _launchd_unload(domain, label, runner=runner)["state"]
+    if state is not False:
+        # ещё загружен (True) ИЛИ неизвестно/list-timeout (None): НЕ unlink. Fail-safe: оставить plist.
+        return {"ok": False, "blocked": "launchagent_unload_failed"}
     try:
         Path(plist_path).unlink(missing_ok=True)
     except OSError:
