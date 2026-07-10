@@ -173,20 +173,72 @@ def _write_launchagent(env):
     return _write_text_atomic(env.launchagent_path(), rendered)
 
 
-def _launchd_is_loaded(label, *, runner=run):
-    """Загружен ли launchd-агент (по `launchctl list`, последняя колонка == label).
+_LAUNCHCTL_SERVICE_NOT_FOUND = 113  # `launchctl print <domain>/<label>` rc: сервиса НЕТ в этом домене
+
+
+def _launchd_is_loaded(label, *, domain=None, runner=run):
+    """Загружен ли launchd-агент в КОНКРЕТНОМ домене — по `launchctl print <domain>/<label>`.
 
     Единственный источник правды для «агент загружен» — факт о launchd, живёт в lib (канон слоёв:
-    CLI — тонкий слой над install_lib). True/False — да/нет, None — не удалось узнать (timeout).
+    CLI — тонкий слой над install_lib). Домен-осознанно НАМЕРЕННО: legacy `launchctl list` без домена
+    инспектирует bootstrap-домен ВЫЗЫВАЮЩЕГО процесса (из SSH/launchd/cron — user/<uid> или system),
+    НЕ gui/<uid>. Тогда gui-агент не виден в list → ложный False → удаление plist живого агента
+    (fail-open, cycle-review #93). `print <domain>/<label>` спрашивает про ТОТ ЖЕ таргет, что и bootout
+    в _launchd_unload — граница герметична, домен-mismatch невозможен.
 
-    runner — чтобы ВСЕ launchctl-вызовы (включая эту проверку) шли через одну точку: в тестах
-    через фейк, иначе poll-loop внутри _launchd_reload дёргал бы реальный launchctl.
+    tristate по rc `launchctl print` (семантика по первоисточнику, проверена на реальном launchctl):
+      rc == 0   -> сервис есть в домене                       -> True  (загружен)
+      rc == 113 -> service-not-found (ЕДИНСТВЕННЫЙ путь к False) -> False (подтверждённо выгружен)
+      иначе (rc 112 «домен не найден» / timeout / rc=None launch-failure / любой другой rc)
+                -> состояние НЕИЗВЕСТНО                        -> None  (fail-safe: не трогать plist)
+
+    domain по умолчанию gui/<uid> (_launchd_domain) — все текущие таргеты там. runner — чтобы ВСЕ
+    launchctl-вызовы шли через одну точку: в тестах фейк, иначе poll-loop дёргал бы реальный launchctl.
     """
-    r = runner([LAUNCHCTL, "list"], 5)
-    if r.get("timeout"):
-        return None
-    return any(row.split() and row.split()[-1] == label
-               for row in (r.get("out") or "").splitlines())
+    domain = domain or _launchd_domain()
+    r = runner([LAUNCHCTL, "print", f"{domain}/{label}"], 5)
+    if r.get("rc") == 0:
+        return True
+    if not r.get("timeout") and r.get("rc") == _LAUNCHCTL_SERVICE_NOT_FOUND:
+        return False  # 113 — ЕДИНСТВЕННЫЙ достоверный «выгружен»
+    return None       # 112 / timeout / rc=None launch-failure / прочий rc — неизвестно (fail-safe)
+
+
+def _launchd_unload(domain, label, *, runner=run):
+    """Bootout launchd-агента → poll-wait до фактической выгрузки → tristate-статус.
+
+    Единственный контракт «выгрузить с подтверждением» (issue #84). bootout асинхронен — launchd
+    освобождает gui/<uid>/<label> с задержкой (~2с), пока _launchd_is_loaded ещё возвращает True.
+    Любой потребитель ОБЯЗАН дождаться реальной выгрузки, прежде чем действовать на результат
+    (unlink plist / unsetenv / re-bootstrap). Это тот самый poll, один раз. Не бросает.
+
+    Возвращает {"state": tristate} — состояние launchd ПОСЛЕ settle-окна (тот же словарь, что
+    _launchd_is_loaded):
+      state is False -> подтверждённо выгружен (можно unlink / unsetenv / продолжать)
+      state is True  -> ещё загружен после settle (fail-safe: оставить plist)
+      state is None  -> неизвестно (list/print сбой или timeout) (fail-safe: оставить plist)
+
+    bootout rc игнорируем: «уже выгружен» — не ошибка. bootout и проверка выгрузки идут по ОДНОМУ
+    таргету domain/label (герметичность, cycle-review #93). runner маршрутизирует ВСЕ launchctl-вызовы
+    (bootout + print) через одну точку — для тестов. Возврат — dict (не голый tristate) по конвенции
+    репо (dict-возвраты у _launchd_reload/_unload_launchagent) и ради forward-совместимости.
+    """
+    def is_loaded():
+        return _launchd_is_loaded(label, domain=domain, runner=runner)
+
+    # 1. bootout (игнорируем rc — уже выгружен = не ошибка).
+    runner([LAUNCHCTL, "bootout", f"{domain}/{label}"], 10)
+
+    # 2. poll-wait: ждём, пока launchd РЕАЛЬНО выгрузит агента. Время по часам (не накоплением
+    # interval) — иначе при interval=0 (тесты) цикл стал бы бесконечным. `while state and …`:
+    # True truthy → крутим; None (list-timeout) falsy → выходим сразу, tristate проходит насквозь
+    # (НЕ `while state is not False` — иначе полные settle-2с на каждом таймауте + провокация True).
+    deadline = time.monotonic() + _BOOTOUT_SETTLE_MAX_WAIT
+    state = is_loaded()
+    while state and time.monotonic() < deadline:
+        time.sleep(_BOOTOUT_POLL_INTERVAL)
+        state = is_loaded()
+    return {"state": state}
 
 
 def _launchd_reload(domain, plist, label, *, runner=run):
@@ -197,20 +249,16 @@ def _launchd_reload(domain, plist, label, *, runner=run):
     _launchd_is_loaded), а bootstrap ретраим с паузой. Возвращает {ok: bool, last_err: str}, не бросает.
 
     runner — функция cmd/timeout → dict (как _install_launchagent принимает; по умолчанию sys_probe.run).
-             ВСЕ launchctl-вызовы (bootout, list, bootstrap) идут через него — единая точка для тестов.
+             ВСЕ launchctl-вызовы (bootout, print, bootstrap) идут через него — единая точка для тестов.
     """
 
     def is_loaded():
-        return _launchd_is_loaded(label, runner=runner)
+        return _launchd_is_loaded(label, domain=domain, runner=runner)
 
-    # 1. bootout (игнорируем rc — уже выгружен = не ошибка).
-    runner([LAUNCHCTL, "bootout", f"{domain}/{label}"], 10)
-
-    # 2. poll-wait: ждём, пока launchd РЕАЛЬНО выгрузит агента. Время считаем по часам (а не
-    # накоплением interval) — иначе при interval=0 (тесты) цикл стал бы бесконечным.
-    deadline = time.monotonic() + _BOOTOUT_SETTLE_MAX_WAIT
-    while is_loaded() and time.monotonic() < deadline:
-        time.sleep(_BOOTOUT_POLL_INTERVAL)
+    # 1-2. bootout + poll реальной выгрузки (общий контракт _launchd_unload). state СОЗНАТЕЛЬНО
+    # игнорируем: reload всегда re-bootstrap'ит, даже если выгрузка не подтверждена — bootstrap-retry
+    # ниже сам покроет занятость домена. Поведение идентично прежнему (bootout всегда → bootstrap).
+    _launchd_unload(domain, label, runner=runner)
 
     # 3. bootstrap с retry: домен может быть ещё занят.
     last_err = ""
@@ -870,11 +918,13 @@ def _unload_launchagent(item, runner):
     if not item.get("removable") or not plist_path:
         return {"ok": True, "changed": False}
     domain = _launchd_domain()
-    bootout = runner([LAUNCHCTL, "bootout", domain, plist_path], 15)
-    if bootout.get("timeout") or bootout.get("rc") != 0:
-        fallback = runner([LAUNCHCTL, "unload", "-w", plist_path], 15)
-        if fallback.get("timeout") or fallback.get("rc") != 0:
-            return {"ok": False, "blocked": "launchagent_unload_failed"}
+    label = item.get("label") or LAUNCHAGENT_LABEL
+    # bootout + poll реальной выгрузки (общий контракт, issue #84). unlink ТОЛЬКО при подтверждённой
+    # выгрузке (state is False): живой StartInterval-агент иначе пере-применял бы мёртвый конфиг.
+    state = _launchd_unload(domain, label, runner=runner)["state"]
+    if state is not False:
+        # ещё загружен (True) ИЛИ неизвестно/list-timeout (None): НЕ unlink. Fail-safe: оставить plist.
+        return {"ok": False, "blocked": "launchagent_unload_failed"}
     try:
         Path(plist_path).unlink(missing_ok=True)
     except OSError:

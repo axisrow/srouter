@@ -13,7 +13,14 @@ class FakeRunner:
     def __call__(self, cmd, timeout):
         self.calls.append(list(cmd))
         key = tuple(cmd)
-        return self.responses.get(key, {"rc": 0, "out": "", "err": "", "timeout": False})
+        if key in self.responses:
+            return self.responses[key]
+        # `launchctl print <domain>/<label>` по умолчанию → rc=113 (service-not-found = НЕ загружен):
+        # в install-окружении реальный агент не поднят. Иначе default rc=0 читался бы как «загружен»
+        # → poll _launchd_unload крутил бы полный settle (домен-осознанная проверка, cycle-review #93).
+        if len(cmd) > 1 and cmd[1] == "print":
+            return {"rc": 113, "out": "", "err": "Could not find service", "timeout": False}
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
 
 
 def _env(tmp_path):
@@ -252,9 +259,10 @@ def test_install_retries_bootstrap_when_domain_busy(monkeypatch, tmp_path):
         if sub == "bootstrap":
             n = sum(1 for c in calls if c[1] == "bootstrap")
             return {"rc": 5 if n == 1 else 0, "out": "", "err": "", "timeout": False}
-        # list (для _launchd_is_loaded / poll) → не загружен, выгрузился сразу.
-        if sub == "list":
-            return {"rc": 0, "out": "999\t0\tcom.other\n", "err": "", "timeout": False}
+        # print (для _launchd_is_loaded / poll) → rc=113 (service-not-found = не загружен, выгрузился
+        # сразу). Домен-осознанная проверка через `launchctl print` (cycle-review #93).
+        if sub == "print":
+            return {"rc": 113, "out": "", "err": "Could not find service", "timeout": False}
         return {"rc": 0, "out": "", "err": "", "timeout": False}
 
     result = install_lib.apply_install(
