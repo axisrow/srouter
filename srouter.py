@@ -648,7 +648,13 @@ def cmd_uninstall(args) -> int:
     env_note = ". " + env_status["note"]
     path_note = ". " + _remove_home_bin_from_path()
 
-    print("Откат завершён: brew-сервисы остановлены, конфиги восстановлены/оставлены, "
+    # env-cleanup fail-closed (issue #94 DEFECT A): мёртвый прокси остался в gui-домене → НЕ успех,
+    # даже если всё остальное прошло. Раньше env_note просто конкатенировался в сообщение → fail-open
+    # (rc=0 при живом socks5://127.0.0.1:10808 в GUI). ok=False пробрасываем в ненулевой rc.
+    # Шапка сообщения зависит от итога: «Откат завершён» только при подтверждённо снятом env,
+    # иначе «Откат выполнен частично» (env-прокси мог остаться) — без противоречия rc=2.
+    headline = "Откат завершён" if env_status["ok"] else "Откат выполнен частично"
+    print(f"{headline}: brew-сервисы остановлены, конфиги восстановлены/оставлены, "
           "DNS сброшен, LaunchAgent удалён"
           + (". split-route удалён." if route_rc == 0 else ", split-route не удалён — см. выше.")
           + cp_note
@@ -656,9 +662,6 @@ def cmd_uninstall(args) -> int:
           + codex_note
           + env_note
           + path_note)
-    # env-cleanup fail-closed (issue #94 DEFECT A): мёртвый прокси остался в gui-домене → НЕ успех,
-    # даже если всё остальное прошло. Раньше env_note просто конкатенировался в сообщение → fail-open
-    # (rc=0 при живом socks5://127.0.0.1:10808 в GUI). ok=False пробрасываем в ненулевой rc.
     if not env_status["ok"]:
         print(f"uninstall завершён с ошибкой: Codex env не подтверждённо снят — {env_status['note']}",
               file=sys.stderr)

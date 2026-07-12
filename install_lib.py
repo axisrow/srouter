@@ -932,11 +932,10 @@ def _unload_launchagent(item, runner):
     try:
         data = plistlib.loads(path.read_bytes())
     except (OSError, plistlib.InvalidFileException, ValueError,
-            xml.parsers.expat.ExpatError) as exc:
+            xml.parsers.expat.ExpatError):
         # Битый/чужой plist: OSError (нет файла/доступ), InvalidFileException/ValueError (plistlib
         # не распознал формат), ExpatError (битый XML — НЕ подкласс ValueError, отдельная иерархия
         # xml.parsers.expat). Любая невалидность → identity не верифицируема → fail-closed.
-        del exc
         return {"ok": False, "blocked": "launchagent_identity_mismatch"}
     plist_label = data.get("Label") if isinstance(data, dict) else None
     if plist_label != expected_label or path_label != expected_label:
