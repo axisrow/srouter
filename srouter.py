@@ -412,12 +412,18 @@ def _remove_launchctl_env(runner) -> dict:
         # (caller-context = gui), uninstall бежит в возможно-другом caller-context → ЯВНЫЙ gui-таргет.
         domain = _launchd_domain()
         leftover = []
+        unverifiable = []
         for key, _ in CODEX_LAUNCHCTL_ENV:
             runner([LAUNCHCTL, "unsetenv", domain, key], 5)
             # Строгий первоисточник: getenv gui/<uid> <key>. rc unsetenv игнорируем (loose-валидатор:
             # «отработал» ≠ «снял»). Пустой вывод getenv = переменной нет в gui-домене = подтверждено.
             g = runner([LAUNCHCTL, "getenv", domain, key], 5)
-            if (g.get("out") or "").strip():
+            # fail-closed верификации (канон): сам сбой getenv → переменная НЕверифицируема. Пустой out
+            # при timeout/OSError (rc=None) НЕ считать «снято» — иначе fail-open (переменная могла
+            # остаться, но верификация не смогла спросить). Только достоверный rc=0 + пустой out = снято.
+            if g.get("timeout") or g.get("rc") is None:
+                unverifiable.append(key)
+            elif (g.get("out") or "").strip():
                 leftover.append(key)
         if leftover:
             # Переменная осталась ЖИВОЙ в gui-домене → мёртвый 127.0.0.1:10808 утечёт в GUI-приложения.
@@ -426,6 +432,14 @@ def _remove_launchctl_env(runner) -> dict:
                     "note": (f"Codex env: НЕ снят — переменные остались в gui-домене ({', '.join(leftover)}). "
                              f"Проверь: launchctl getenv gui/<uid> {leftover[0]} | "
                              f"launchctl unsetenv gui/<uid> {leftover[0]}. Plist оставлен.")}
+        if unverifiable:
+            # getenv не смог спросить gui-домен (timeout / launchctl-OSError) → состояние НЕверифицируемо.
+            # fail-closed (канон): НЕ рапортуем «снято», ok=False — оператор должен проверить вручную.
+            # Plist оставлен как контроль. Отличие от leftover: переменные МОГУТ быть сняты, но мы не знаем.
+            return {"ok": False,
+                    "note": (f"Codex env: НЕ подтверждено снятие — getenv gui-домена не ответил "
+                             f"({', '.join(unverifiable)}). Проверь: launchctl getenv gui/<uid> {unverifiable[0]}. "
+                             f"Plist оставлен.")}
         plist_path.unlink()
         return {"ok": True,
                 "note": f"Codex env: снят (LaunchAgent {CODEX_ENV_LABEL} выгружен, env очищен, plist удалён)."}

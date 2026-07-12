@@ -343,16 +343,20 @@ def _gui_domain():
     return f"gui/{install_lib.os.getuid()}"
 
 
-def _domain_aware_runner(*, unsetenv_rc=0, getenv_remaining=None, print_loaded=False):
+def _domain_aware_runner(*, unsetenv_rc=0, getenv_remaining=None, getenv_timeout=None,
+                         print_loaded=False):
     """runner для gui-domain unsetenv: unsetenv/getenv по доменному таргету.
 
     unsetenv_rc: rc на `unsetenv gui/<uid> <key>` (0=ок, 1=сбой).
     getenv_remaining: множество ключей, которые getenv ВИДИТ после unsetenv (переменная НЕ снята —
       fail-open сценарий). Если ключ не в множестве → getenv вернёт пустой вывод (снято).
+    getenv_timeout: множество ключей, на которых getenv ТАЙМАУТИТ (rc=None, timeout=True) —
+      верификация не смогла спросить gui-домен. fail-closed сценарий: нельзя считать «снято».
     print_loaded: True → print rc=0 (агент жив, до bootout-poll); по умолчанию rc=113 (выгружен).
     """
     calls = []
     remaining = set(getenv_remaining or ())
+    timeout_keys = set(getenv_timeout or ())
 
     def runner(cmd, timeout):
         calls.append(list(cmd))
@@ -367,6 +371,8 @@ def _domain_aware_runner(*, unsetenv_rc=0, getenv_remaining=None, print_loaded=F
                     "timeout": False}
         if sub == "getenv":
             key = cmd[-1]
+            if key in timeout_keys:
+                return {"rc": None, "out": "", "err": "timeout", "timeout": True}
             val = "socks5h://127.0.0.1:10808" if key in remaining else ""
             return {"rc": 0, "out": val, "err": "", "timeout": False}
         return {"rc": 0, "out": "", "err": "", "timeout": False}
@@ -447,6 +453,25 @@ def test_remove_launchctl_env_fails_closed_when_var_not_removed(monkeypatch, tmp
     assert status["ok"] is False, f"переменная осталась в gui → fail-closed (ok=False): {note}"
     assert "gui" in note.lower() and "остались" in note.lower(), \
         f"статус сигнализирует проблему (env не снят в gui): {note}"
+
+
+def test_remove_launchctl_env_fails_closed_when_getenv_timeout(monkeypatch, tmp_path):
+    """DEFECT A fail-closed верификации: getenv ТАЙМАУТИТ → НЕ считать «снято», ok=False.
+
+    Внутренний цикл-review #94: первоначальный фикс считал пустой out = «снято» всегда. Но getenv
+    при timeout/OSError (rc=None) возвращает пустой out — это НЕ «переменной нет», а «не смогли
+    спросить». Считать это «снято» = fail-open (переменная могла остаться в gui). Канон: сбой
+    верификации → unverifiable → fail-closed (ok=False). На коде без этого фикса тест ПАДАЕТ.
+    """
+    home = _mock_home(monkeypatch, tmp_path)
+    srouter._install_launchctl_env(_env(tmp_path), _fake_runner())
+    runner = _domain_aware_runner(getenv_timeout={"HTTP_PROXY"})  # getenv не ответил
+
+    status = srouter._remove_launchctl_env(runner)
+
+    assert status["ok"] is False, f"getenv timeout → unverifiable → fail-closed: {status['note']}"
+    assert "подтверждено" in status["note"].lower() or "не" in status["note"].lower(), \
+        f"статус отличает unverifiable от снято: {status['note']}"
 
 
 def test_remove_launchctl_env_returns_structured_status_ok(monkeypatch, tmp_path):
