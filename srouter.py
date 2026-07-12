@@ -346,8 +346,10 @@ def _install_launchctl_env(env, runner) -> str:
     try:
         # Предупредить, если в GUI-домене уже есть ЧУЖОЙ прокси (корпоративный/ручной) — setenv
         # скрипта его перезапишет без восстановления. Не блокируем, но WARN в статусе.
+        # getenv gui/<uid> явно (issue #94 DEFECT A аудит setenv): getenv без домена читает caller-context,
+        # а setenv-скрипт кладёт в gui — из SSH/cron caller-context другой, WARN пропустил бы чужой gui-прокси.
         warn = ""
-        existing = runner([LAUNCHCTL, "getenv", "HTTP_PROXY"], 5)
+        existing = runner([LAUNCHCTL, "getenv", _launchd_domain(), "HTTP_PROXY"], 5)
         val = (existing.get("out") or "").strip()
         if val and "127.0.0.1:10808" not in val:
             warn = f" ВНИМАНИЕ: существующий GUI HTTP_PROXY={val[:40]} будет перезаписан (backup не делается)."
@@ -368,19 +370,30 @@ def _install_launchctl_env(env, runner) -> str:
         return f"Codex env: не установлен ({str(exc)[:80]})."
 
 
-def _remove_launchctl_env(runner) -> str:
-    """Выгрузить LaunchAgent env + снять переменные + удалить plist.
+def _remove_launchctl_env(runner) -> dict:
+    """Выгрузить LaunchAgent env + снять переменные из GUI-домена + удалить plist.
+
+    Возвращает {ok: bool, note: str}. ok=False пробрасывается в ненулевой rc cmd_uninstall — это
+    и есть fail-closed (раньше возвращалась только строка → конкатенировалась в сообщение → fail-open).
 
     Порядок важен: bootout ПЕРЕД unlink. Если bootout не сработал, а агент всё ещё загружен
     (_launchd_is_loaded), НЕ удаляем plist — иначе StartInterval-агент останется в памяти и будет
     пере-применять мёртвый socks5 env каждые 5 мин (утечка нерабочего прокси в GUI-домен).
+
+    env-cleanup — ВНУТРИ gui-домена явно (issue #94 DEFECT A). `launchctl setenv/unsetenv/getenv`
+    оперируют «caller's context» (man launchctl): setenv делает LaunchAgent-скрипт, запущенный launchd
+    В gui-домене → переменные в gui. uninstall бежит из процесса cmd_uninstall (caller-context может
+    быть user/<uid> из SSH/cron). unsetenv без домена снял бы НЕ в gui → gui-домен остался бы с мёртвым
+    127.0.0.1:10808. Поэтому: `unsetenv gui/<uid> <key>` (доменный таргет принимается launchctl),
+    затем верификация `getenv gui/<uid> <key>` → пустой вывод = подтверждено снято (строгий
+    первоисточник, НЕ rc unsetenv). Любой ключ, оставшийся в gui-домене → ok=False (fail-closed).
     """
     try:
         plist_path = Path.home() / "Library" / "LaunchAgents" / f"{CODEX_ENV_LABEL}.plist"
         if not plist_path.exists():
-            return "Codex env: не был установлен."
+            return {"ok": True, "note": "Codex env: не был установлен."}
         if CODEX_ENV_MARKER not in plist_path.read_text(encoding="utf-8"):
-            return f"Codex env: чужой LaunchAgent {CODEX_ENV_LABEL} — не трогаем."
+            return {"ok": True, "note": f"Codex env: чужой LaunchAgent {CODEX_ENV_LABEL} — не трогаем."}
         # bootout + poll реальной выгрузки — единый контракт _launchd_unload (issue #84). bootout
         # асинхронен: без poll _launchd_is_loaded вернёт True в окне → ложный «ещё загружен» → plist
         # оставлен + StartInterval-агент пере-применяет мёртвый env. tristate проходит насквозь.
@@ -388,15 +401,36 @@ def _remove_launchctl_env(runner) -> str:
         # None = unknown (launchctl list timeout) — fail-safe: НЕ удаляем plist (оставить контроль).
         # True = агент реально ещё загружен после settle — тоже не удаляем.
         if loaded is not False:
-            return (f"Codex env: LaunchAgent {CODEX_ENV_LABEL} {'не подтверждена выгрузка' if loaded is None else 'всё ещё загружен'} "
-                    f"после bootout — plist оставлен (не удалять контроль). Проверь: launchctl list | grep {CODEX_ENV_LABEL}")
-        plist_path.unlink()
-        # Снять переменные из GUI-домена (setenv делал скрипт при загрузке).
+            note = (f"Codex env: LaunchAgent {CODEX_ENV_LABEL} "
+                    f"{'не подтверждена выгрузка' if loaded is None else 'всё ещё загружен'} "
+                    f"после bootout — plist оставлен (не удалять контроль). "
+                    f"Проверь: launchctl list | grep {CODEX_ENV_LABEL}")
+            # Агент потенциально жив в gui-домене → env активен. ok=False: cmd_uninstall не должен
+            # рапортовать полный успех, пока env-прокси не подтверждённо снят (fail-closed).
+            return {"ok": False, "note": note}
+        # Снять переменные ИЗ gui-домена явно и верифицировать. setenv делал LaunchAgent-скрипт
+        # (caller-context = gui), uninstall бежит в возможно-другом caller-context → ЯВНЫЙ gui-таргет.
+        domain = _launchd_domain()
+        leftover = []
         for key, _ in CODEX_LAUNCHCTL_ENV:
-            runner([LAUNCHCTL, "unsetenv", key], 5)
-        return f"Codex env: снят (LaunchAgent {CODEX_ENV_LABEL} выгружен, env очищен, plist удалён)."
+            runner([LAUNCHCTL, "unsetenv", domain, key], 5)
+            # Строгий первоисточник: getenv gui/<uid> <key>. rc unsetenv игнорируем (loose-валидатор:
+            # «отработал» ≠ «снял»). Пустой вывод getenv = переменной нет в gui-домене = подтверждено.
+            g = runner([LAUNCHCTL, "getenv", domain, key], 5)
+            if (g.get("out") or "").strip():
+                leftover.append(key)
+        if leftover:
+            # Переменная осталась ЖИВОЙ в gui-домене → мёртвый 127.0.0.1:10808 утечёт в GUI-приложения.
+            # НЕ удаляем plist (контроль), ok=False → cmd_uninstall вернёт ненулевой rc (fail-closed).
+            return {"ok": False,
+                    "note": (f"Codex env: НЕ снят — переменные остались в gui-домене ({', '.join(leftover)}). "
+                             f"Проверь: launchctl getenv gui/<uid> {leftover[0]} | "
+                             f"launchctl unsetenv gui/<uid> {leftover[0]}. Plist оставлен.")}
+        plist_path.unlink()
+        return {"ok": True,
+                "note": f"Codex env: снят (LaunchAgent {CODEX_ENV_LABEL} выгружен, env очищен, plist удалён)."}
     except Exception as exc:
-        return f"Codex env: не снят ({str(exc)[:80]})."
+        return {"ok": False, "note": f"Codex env: не снят ({str(exc)[:80]})."}
 
 
 def _ensure_home_bin_in_path(env) -> str:
@@ -596,7 +630,8 @@ def cmd_uninstall(args) -> int:
     ppp_note = ". " + _remove_ppp_hook(runner)
     # 7) Удалить Codex SOCKS5-wrappers + снять launchctl env + убрать ~/bin из PATH (ставил install).
     codex_note = ". " + _remove_codex_wrappers()
-    env_note = ". " + _remove_launchctl_env(runner)
+    env_status = _remove_launchctl_env(runner)
+    env_note = ". " + env_status["note"]
     path_note = ". " + _remove_home_bin_from_path()
 
     print("Откат завершён: brew-сервисы остановлены, конфиги восстановлены/оставлены, "
@@ -607,6 +642,13 @@ def cmd_uninstall(args) -> int:
           + codex_note
           + env_note
           + path_note)
+    # env-cleanup fail-closed (issue #94 DEFECT A): мёртвый прокси остался в gui-домене → НЕ успех,
+    # даже если всё остальное прошло. Раньше env_note просто конкатенировался в сообщение → fail-open
+    # (rc=0 при живом socks5://127.0.0.1:10808 в GUI). ok=False пробрасываем в ненулевой rc.
+    if not env_status["ok"]:
+        print(f"uninstall завершён с ошибкой: Codex env не подтверждённо снят — {env_status['note']}",
+              file=sys.stderr)
+        return 2
     return 0
 
 

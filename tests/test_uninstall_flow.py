@@ -434,3 +434,185 @@ def test_uninstall_launchagent_not_removable_is_noop(tmp_path):
     assert not any(a.get("category") == "launchagent" for a in result["actions"]), \
         "non-removable → нет launchagent-действия"
     assert _bootouts(runner.calls) == [], "non-removable → ранний возврат, bootout не вызван"
+
+
+# ============================ сайт B identity: plist↔label bound (issue #94 DEFECT B) ============================
+# label и plist_path берутся НЕЗАВИСИМОМ из state-item. marker_present проверяет маркер в plist, но НЕ
+# проверяет, что Label ВНУТРИ plist == item['label'] == целевой агент. При state-drift (label агента X,
+# path агента Y) или marker-preserving label swap: _launchd_unload bootout'ит label X → rc 113 (X не
+# найден = «выгружен») → unlink удаляет plist_path ЖИВОГО агента Y. Codex репрод: label com.srouter.stale
+# + path com.srouter.dashboard.plist → unlink dashboard.plist при живом dashboard.
+# Fix: plistlib.load(plist_path), требовать Label==expected==path-derived, fail-closed на любой mismatch.
+def _mismatch_item(env, *, plist_label, item_label):
+    """state-item с РАССИНХРОНИЗИРОВАННЫМИ label (item) и plist (на диске).
+
+    plist_path указывает на файл, содержащий plist_label (имя файла + Label внутри = plist_label).
+    item['label'] = item_label (рассинхрон от state-drift). removable=True: маркер присутствует.
+    Воспроизводит сценарий DEFECT B: bootout по item_label (не найден → rc113 → «выгружен») → unlink
+    plist_path живого plist_label-агента.
+    """
+    plist_path = env.launchagent_dir / f"{plist_label}.plist"
+    plist_path.parent.mkdir(parents=True, exist_ok=True)
+    plist_path.write_text(
+        f"<?xml version='1.0'?>\n<!-- {install_lib.LAUNCHAGENT_MARKER} -->\n"
+        "<plist version='1.0'><dict>"
+        f"<key>Label</key><string>{plist_label}</string>"
+        "</dict></plist>\n",
+        encoding="utf-8")
+    return {
+        "label": item_label,
+        "plist_path": str(plist_path),
+        "managed": True,
+        "adopted": False,
+        "marker_present": True,
+        "removable": True,
+        "status": "managed — unload/remove available",
+    }
+
+
+def test_unload_launchagent_fails_closed_on_label_plist_mismatch(monkeypatch, tmp_path):
+    """DEFECT B: item.label ≠ Label внутри plist → fail-closed, plist ЖИВОГО агента НЕ удалён.
+
+    label=com.srouter.stale (item), plist=com.srouter.dashboard.plist (Label внутри = dashboard).
+    bootout com.srouter.stale → rc 113 (не найден) → state False («выгружен»). БЕЗ identity-проверки
+    код unlink'ает dashboard.plist — ЖИВОЙ агент. Теперь: plistlib.load требует Label==item_label, на
+    mismatch → ok=False, plist оставлен. На коде до фикса тест ПАДАЕТ (plist удаляется).
+    """
+    monkeypatch.setattr(install_lib, "_BOOTOUT_POLL_INTERVAL", 0)
+    env = _env(tmp_path)
+    item = _mismatch_item(env, plist_label="com.srouter.dashboard",
+                          item_label="com.srouter.stale")
+    plist_path = Path(item["plist_path"])
+    # print по item_label (stale) → rc 113 (stale не найден = «выгружен») → дыра без identity-связки.
+    runner = ListRunner(list_states=[False])
+
+    result = install_lib._unload_launchagent(item, runner)
+
+    assert result["ok"] is False, "mismatch label↔plist → fail-closed (НЕ удалять чужой plist)"
+    assert result.get("blocked") == "launchagent_identity_mismatch", \
+        f"blocked идентифицирует именно identity-mismatch: {result}"
+    assert plist_path.exists(), "plist ЖИВОГО агента НЕ удалён (identity-mismatch)"
+
+
+def test_unload_launchagent_unlinks_when_label_matches_plist(monkeypatch, tmp_path):
+    """DEFECT B (контроль): item.label == Label внутри plist == path-derived → корректный unlink.
+
+    Identity связана: единый label на всех уровнях. bootout → state False → plistlib.load подтверждает
+    Label==item_label → unlink безопасен. Регресс-гард: валидный путь не сломан identity-проверкой.
+    """
+    monkeypatch.setattr(install_lib, "_BOOTOUT_POLL_INTERVAL", 0)
+    env = _env(tmp_path)
+    # item.label == plist_label == имя файла → тождество.
+    item = _mismatch_item(env, plist_label=install_lib.LAUNCHAGENT_LABEL,
+                          item_label=install_lib.LAUNCHAGENT_LABEL)
+    plist_path = Path(item["plist_path"])
+    runner = ListRunner(list_states=[False])
+
+    result = install_lib._unload_launchagent(item, runner)
+
+    assert result["ok"] is True and result.get("changed") is True
+    assert not plist_path.exists(), "label совпал → plist безопасно удалён"
+
+
+def test_unload_launchagent_fails_closed_on_path_label_mismatch(monkeypatch, tmp_path):
+    """DEFECT B: имя файла plist ≠ его внутренний Label → fail-closed (path-derived ≠ in-plist).
+
+    Даже если item.label совпадает с одним из них, рассинхрон имя-файла↔Label-внутри = аномалия
+    (файл подменён). path-derived label — третий арбитр: все три должны совпасть.
+    """
+    monkeypatch.setattr(install_lib, "_BOOTOUT_POLL_INTERVAL", 0)
+    env = _env(tmp_path)
+    # Файл называется stale.plist, но внутри Label=dashboard — подмена.
+    item = _mismatch_item(env, plist_label="com.srouter.dashboard",
+                          item_label="com.srouter.stale")
+    # Переименуем файл так, чтобы имя ≠ внутренний Label, но item.plist_path указывал на него.
+    plist_path = Path(item["plist_path"])
+    renamed = env.launchagent_dir / "com.srouter.stale.plist"
+    plist_path.rename(renamed)
+    item["plist_path"] = str(renamed)
+    # item.label==stale==имя файла, но Label внутри=dashboard → mismatch path↔in-plist.
+    runner = ListRunner(list_states=[False])
+
+    result = install_lib._unload_launchagent(item, runner)
+
+    assert result["ok"] is False, "имя файла ≠ Label внутри → fail-closed"
+    assert renamed.exists(), "подозрительный plist НЕ удалён"
+
+
+def test_unload_launchagent_fails_closed_on_missing_label_key(monkeypatch, tmp_path):
+    """DEFECT B: plist без ключа Label (или невалидный) → fail-closed, НЕ unlink.
+
+    Нельзя доверять item.label, если plist не подтверждает identity собственным Label. Нет Label →
+    identity не верифицируема → fail-closed (как и любой mismatch).
+    """
+    monkeypatch.setattr(install_lib, "_BOOTOUT_POLL_INTERVAL", 0)
+    env = _env(tmp_path)
+    plist_path = env.launchagent_dir / f"{install_lib.LAUNCHAGENT_LABEL}.plist"
+    plist_path.parent.mkdir(parents=True, exist_ok=True)
+    plist_path.write_text(
+        f"<?xml version='1.0'?>\n<!-- {install_lib.LAUNCHAGENT_MARKER} -->\n"
+        "<plist version='1.0'><dict><key>RunAtLoad</key><true/></dict></plist>\n",
+        encoding="utf-8")
+    item = {"label": install_lib.LAUNCHAGENT_LABEL, "plist_path": str(plist_path),
+            "removable": True}
+    runner = ListRunner(list_states=[False])
+
+    result = install_lib._unload_launchagent(item, runner)
+
+    assert result["ok"] is False, "plist без Label → identity не верифицируема → fail-closed"
+    assert plist_path.exists(), "plist без Label НЕ удалён"
+
+
+def test_unload_launchagent_fails_closed_on_malformed_xml_plist(monkeypatch, tmp_path):
+    """DEFECT B: битый XML plist (ExpatError) → fail-closed, НЕ unlink, без traceback.
+
+    ExpatError — отдельная иерархия (НЕ подкласс ValueError): недозакрытый тег / мусор. plistlib
+    пробрасывает ExpatError, его надо ловить явно — иначе _unload_launchagent упадёт с traceback
+    вместо контролируемого {ok:False}. Имя файла совпадает с label (нормальный путь), но контент
+    невалиден → identity не верифицируема → fail-closed.
+    """
+    monkeypatch.setattr(install_lib, "_BOOTOUT_POLL_INTERVAL", 0)
+    env = _env(tmp_path)
+    plist_path = env.launchagent_dir / f"{install_lib.LAUNCHAGENT_LABEL}.plist"
+    plist_path.parent.mkdir(parents=True, exist_ok=True)
+    plist_path.write_text(
+        f"<?xml version='1.0'?>\n<!-- {install_lib.LAUNCHAGENT_MARKER} -->\n"
+        "<plist version='1.0'><dict><key>Label</key><string>broken",  # недозакрытый XML
+        encoding="utf-8")
+    item = {"label": install_lib.LAUNCHAGENT_LABEL, "plist_path": str(plist_path),
+            "removable": True}
+    runner = ListRunner(list_states=[False])
+
+    result = install_lib._unload_launchagent(item, runner)
+
+    assert result["ok"] is False, "битый XML plist → fail-closed (без traceback)"
+    assert result.get("blocked") == "launchagent_identity_mismatch"
+    assert plist_path.exists(), "битый plist НЕ удалён"
+
+
+def test_unload_launchagent_identity_check_before_unlink_live_agent(monkeypatch, tmp_path):
+    """DEFECT B e2e: apply_uninstall с state-drift → ЖИВОЙ агент НЕ затронут.
+
+    Сценарий Codex: plan['launchagent'] имеет label=com.srouter.stale, plist_path=dashboard.plist
+    (живой). Без identity-связки: bootout stale (rc113) → unlink dashboard.plist. Теперь mismatch
+    перехватывается ДО unlink → ok=False, apply_uninstall блокируется, plist живого агента цел.
+    """
+    monkeypatch.setattr(install_lib, "_BOOTOUT_POLL_INTERVAL", 0)
+    env = _env(tmp_path)
+    item = _mismatch_item(env, plist_label="com.srouter.dashboard",
+                          item_label="com.srouter.stale")
+    live_plist = Path(item["plist_path"])
+    # Подменим plan['launchagent'] через detected, дающий рассинхрон item — но _launchagent_uninstall_item
+    # всегда ставит path=launchagent_path(). Поэтому тестируем границу напрямую через apply_uninstall,
+    # monkeypatch'ив build_uninstall_plan чтобы вернуть наш mismatched item.
+    plan = install_lib.build_uninstall_plan(env=env)
+    plan["launchagent"] = item
+    monkeypatch.setattr(install_lib, "build_uninstall_plan", lambda **kw: plan)
+    runner = ListRunner(list_states=[False])  # bootout stale → rc113 → «выгружен»
+
+    result = install_lib.apply_uninstall(env=env, confirmations={"launchagent": True}, runner=runner)
+
+    assert result["ok"] is False, "mismatch блокирует uninstall (fail-closed)"
+    assert "launchagent_identity_mismatch" in (result.get("blocked") or []), \
+        f"blocked идентифицирует identity-mismatch: {result.get('blocked')}"
+    assert live_plist.exists(), "ЖИВОЙ dashboard.plist НЕ удалён при state-drift"

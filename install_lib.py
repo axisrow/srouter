@@ -9,9 +9,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import plistlib
 import shutil
 import sys
 import time
+import xml.parsers.expat
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from html import escape
@@ -918,15 +920,38 @@ def _unload_launchagent(item, runner):
     if not item.get("removable") or not plist_path:
         return {"ok": True, "changed": False}
     domain = _launchd_domain()
-    label = item.get("label") or LAUNCHAGENT_LABEL
-    # bootout + poll реальной выгрузки (общий контракт, issue #84). unlink ТОЛЬКО при подтверждённой
-    # выгрузке (state is False): живой StartInterval-агент иначе пере-применял бы мёртвый конфиг.
-    state = _launchd_unload(domain, label, runner=runner)["state"]
+    expected_label = item.get("label") or LAUNCHAGENT_LABEL
+    # identity-связка plist↔label ДО выгрузки (issue #94 DEFECT B). label и plist_path берутся из
+    # state-item НЕЗАВИСИМО — при state-drift (label агента X, path агента Y) или marker-preserving
+    # подмене Label внутри plist: bootout по item.label (X) → rc 113 (не найден = «выгружен») → unlink
+    # удалил бы plist_path ЖИВОГО агента Y. Строгий первоисточник — сам plist: plistlib.load + требуем
+    # Label==item.label==path-derived (имя файла). Любой mismatch → fail-closed, plist не трогаем.
+    # Проверка ДО bootout: не удалять даже контроль живого агента, если identity не подтверждена.
+    path = Path(plist_path)
+    path_label = path.stem  # com.srouter.dashboard.plist → com.srouter.dashboard
+    try:
+        data = plistlib.loads(path.read_bytes())
+    except (OSError, plistlib.InvalidFileException, ValueError,
+            xml.parsers.expat.ExpatError) as exc:
+        # Битый/чужой plist: OSError (нет файла/доступ), InvalidFileException/ValueError (plistlib
+        # не распознал формат), ExpatError (битый XML — НЕ подкласс ValueError, отдельная иерархия
+        # xml.parsers.expat). Любая невалидность → identity не верифицируема → fail-closed.
+        del exc
+        return {"ok": False, "blocked": "launchagent_identity_mismatch"}
+    plist_label = data.get("Label") if isinstance(data, dict) else None
+    if plist_label != expected_label or path_label != expected_label:
+        # Три арбитра (item.label / Label-в-plist / имя-файла) должны совпасть. Mismatch = аномалия
+        # (state-drift / подмена файла) → НЕ unlink, окно выгрузки тоже не открываем. Fail-closed.
+        return {"ok": False, "blocked": "launchagent_identity_mismatch"}
+    # bootout + poll реальной выгрузки по ВАЛИДИРОВАННОМУ label (общий контракт, issue #84). unlink
+    # ТОЛЬКО при подтверждённой выгрузке (state is False): живой StartInterval-агент иначе
+    # пере-применял бы мёртвый конфиг.
+    state = _launchd_unload(domain, expected_label, runner=runner)["state"]
     if state is not False:
         # ещё загружен (True) ИЛИ неизвестно/list-timeout (None): НЕ unlink. Fail-safe: оставить plist.
         return {"ok": False, "blocked": "launchagent_unload_failed"}
     try:
-        Path(plist_path).unlink(missing_ok=True)
+        path.unlink(missing_ok=True)
     except OSError:
         return {"ok": False, "blocked": "launchagent_remove_failed"}
     return {"ok": True, "changed": True}
