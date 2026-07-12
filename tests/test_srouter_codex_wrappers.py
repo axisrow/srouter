@@ -182,13 +182,15 @@ def test_remove_launchctl_env_bootouts_and_unlinks(monkeypatch, tmp_path):
     plist = home / "Library" / "LaunchAgents" / f"{srouter.CODEX_ENV_LABEL}.plist"
     assert plist.exists()
 
-    note = srouter._remove_launchctl_env(runner)
+    status = srouter._remove_launchctl_env(runner)
+    note = status["note"]
 
     assert "снят" in note.lower()
     assert not plist.exists(), "plist удалён"
     assert any(len(c) > 1 and c[1] == "bootout" for c in runner.calls), "bootout вызван"
-    # unsetenv для всех proxy-ключей (env ставил скрипт setenv при загрузке).
-    unsetenvs = {c[2] for c in runner.calls if len(c) > 1 and c[1] == "unsetenv"}
+    # unsetenv для всех proxy-ключей с gui-доменным таргетом (env ставил скрипт setenv при загрузке
+    # в gui-домене; c[2] = домен gui/<uid>, c[3] = ключ — issue #94 DEFECT A).
+    unsetenvs = {c[3] for c in runner.calls if len(c) > 1 and c[1] == "unsetenv"}
     assert {"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"} <= unsetenvs
 
 
@@ -201,7 +203,7 @@ def test_remove_launchctl_env_marker_gate_foreign(monkeypatch, tmp_path):
     foreign = "<?xml version='1.0'?><plist version='1.0'><dict/>"
     plist.write_text(foreign, encoding="utf-8")
 
-    note = srouter._remove_launchctl_env(runner)
+    note = srouter._remove_launchctl_env(runner)["note"]
 
     assert "чуж" in note.lower()
     assert plist.exists(), "чужой plist не удалён"
@@ -210,7 +212,7 @@ def test_remove_launchctl_env_marker_gate_foreign(monkeypatch, tmp_path):
 def test_remove_launchctl_env_when_not_installed(monkeypatch, tmp_path):
     """Нечего удалять (plist нет) — мягкий статус, не ошибка."""
     _mock_home(monkeypatch, tmp_path)
-    note = srouter._remove_launchctl_env(_fake_runner())
+    note = srouter._remove_launchctl_env(_fake_runner())["note"]
     assert "не был" in note.lower()
 
 
@@ -258,7 +260,7 @@ def test_remove_launchctl_env_keeps_plist_when_still_loaded(monkeypatch, tmp_pat
     assert plist.exists()
     runner = _print_runner([True] * 6)  # не выгружается
 
-    note = srouter._remove_launchctl_env(runner)
+    note = srouter._remove_launchctl_env(runner)["note"]
 
     assert "всё ещё загружен" in note, f"True → «всё ещё загружен»: {note}"
     assert "plist оставлен" in note
@@ -280,7 +282,7 @@ def test_remove_launchctl_env_keeps_plist_when_print_timeout(monkeypatch, tmp_pa
     assert plist.exists()
     runner = _print_runner([None])  # print timeout → state=None
 
-    note = srouter._remove_launchctl_env(runner)
+    note = srouter._remove_launchctl_env(runner)["note"]
 
     assert "не подтверждена выгрузка" in note, f"None → «не подтверждена выгрузка»: {note}"
     assert "plist оставлен" in note
@@ -319,12 +321,185 @@ def test_remove_launchctl_env_keeps_plist_on_domain_mismatch(monkeypatch, tmp_pa
             return dict(print_result)
         return {"rc": 0, "out": "", "err": "", "timeout": False}
 
-    note = srouter._remove_launchctl_env(runner)
+    note = srouter._remove_launchctl_env(runner)["note"]
 
     assert marker in note, f"ожидалось «{marker}»: {note}"
     assert "plist оставлен" in note
     assert plist.exists(), "живой агент / недоступный домен → plist оставлен (fail-safe)"
     assert not any(len(c) > 1 and c[1] == "unsetenv" for c in calls), "не выгружен → нет unsetenv"
+
+
+# ============================ сайт A: gui-domain unsetenv + verify + fail-closed (issue #94 DEFECT A) ============================
+# `launchctl setenv/unsetenv/getenv` оперируют «caller's context» (man launchctl). setenv делает
+# LaunchAgent-скрипт, запущенный launchd ВНУТРИ gui-домена → переменные в gui-домене. uninstall бежит
+# из процесса cmd_uninstall (caller-context может быть user/<uid> из SSH/cron). unsetenv без домена
+# снимает НЕ в gui → gui-домен остаётся с мёртвым 127.0.0.1:10808. Граница: unsetenv gui/<uid> <key>
+# (доменный таргет принимается), верифицировать getenv gui/<uid> <key> → пусто, fail-closed иначе.
+# Статус пробрасывается в cmd_uninstall (раньше env_note конкатенировался в строку → fail-open).
+import install_lib
+
+
+def _gui_domain():
+    return f"gui/{install_lib.os.getuid()}"
+
+
+def _domain_aware_runner(*, unsetenv_rc=0, getenv_remaining=None, getenv_timeout=None,
+                         print_loaded=False):
+    """runner для gui-domain unsetenv: unsetenv/getenv по доменному таргету.
+
+    unsetenv_rc: rc на `unsetenv gui/<uid> <key>` (0=ок, 1=сбой).
+    getenv_remaining: множество ключей, которые getenv ВИДИТ после unsetenv (переменная НЕ снята —
+      fail-open сценарий). Если ключ не в множестве → getenv вернёт пустой вывод (снято).
+    getenv_timeout: множество ключей, на которых getenv ТАЙМАУТИТ (rc=None, timeout=True) —
+      верификация не смогла спросить gui-домен. fail-closed сценарий: нельзя считать «снято».
+    print_loaded: True → print rc=0 (агент жив, до bootout-poll); по умолчанию rc=113 (выгружен).
+    """
+    calls = []
+    remaining = set(getenv_remaining or ())
+    timeout_keys = set(getenv_timeout or ())
+
+    def runner(cmd, timeout):
+        calls.append(list(cmd))
+        sub = cmd[1] if len(cmd) > 1 else ""
+        if sub == "print":
+            if print_loaded:
+                return {"rc": 0, "out": f"{srouter.CODEX_ENV_LABEL} = {{ state = running }}",
+                        "err": "", "timeout": False}
+            return {"rc": 113, "out": "", "err": "Could not find service", "timeout": False}
+        if sub == "unsetenv":
+            return {"rc": unsetenv_rc, "out": "", "err": "" if unsetenv_rc == 0 else "boom",
+                    "timeout": False}
+        if sub == "getenv":
+            key = cmd[-1]
+            if key in timeout_keys:
+                return {"rc": None, "out": "", "err": "timeout", "timeout": True}
+            val = "socks5h://127.0.0.1:10808" if key in remaining else ""
+            return {"rc": 0, "out": val, "err": "", "timeout": False}
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+
+    runner.calls = calls
+    return runner
+
+
+def _unsetenv_calls(calls):
+    return [c for c in calls if len(c) > 1 and c[1] == "unsetenv"]
+
+
+def _getenv_calls(calls):
+    return [c for c in calls if len(c) > 1 and c[1] == "getenv"]
+
+
+def test_remove_launchctl_env_unsetenv_targets_gui_domain(monkeypatch, tmp_path):
+    """DEFECT A: unsetenv вызывается с ЯВНЫМ доменным таргетом `gui/<uid>`, НЕ голым ключом.
+
+    setenv-скрипт LaunchAgent кладёт переменные в gui-домен (caller-context = gui). uninstall из
+    cmd_uninstall бежит в caller-context (user/<uid> из SSH/cron) — unsetenv без домена снял бы не
+    там. На коде до фикса (unsetenv <key>) этот тест ПАДАЕТ: cmd[2] = ключ, нет домена.
+    """
+    home = _mock_home(monkeypatch, tmp_path)
+    srouter._install_launchctl_env(_env(tmp_path), _fake_runner())
+    runner = _domain_aware_runner()
+    expected_domain = _gui_domain()
+
+    note = srouter._remove_launchctl_env(runner)["note"]
+
+    assert "снят" in note.lower(), f"ожидаем успех: {note}"
+    calls = _unsetenv_calls(runner.calls)
+    assert calls, "unsetenv вызван хотя бы раз"
+    for cmd in calls:
+        assert len(cmd) >= 4 and cmd[2] == expected_domain, \
+            f"unsetenv таргетит gui-домен явно: ожидалось cmd[2]=={expected_domain}, получено {cmd}"
+
+
+def test_remove_launchctl_env_verifies_unsetenv_via_getenv(monkeypatch, tmp_path):
+    """DEFECT A: после unsetenv — верификация `getenv gui/<uid> <key>` (пусто = подтверждено снято).
+
+    unsetenv без verify = loose-валидатор (rc игнорируется, переменная могла остаться). Граница
+    валидируется строгим первоисточником: getenv gui/<uid> (тот же домен, что setenv-скрипт).
+    """
+    home = _mock_home(monkeypatch, tmp_path)
+    srouter._install_launchctl_env(_env(tmp_path), _fake_runner())
+    runner = _domain_aware_runner()  # getenv возвращает пусто для всех ключей (снято)
+    expected_domain = _gui_domain()
+
+    note = srouter._remove_launchctl_env(runner)["note"]
+
+    assert "снят" in note.lower(), f"ожидаем успех: {note}"
+    getenvs = _getenv_calls(runner.calls)
+    assert getenvs, "getenv верификация вызвана"
+    verified_keys = {c[-1] for c in getenvs}
+    assert {"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"} <= verified_keys, \
+        "каждый proxy-ключ верифицирован getenv"
+    for cmd in getenvs:
+        assert cmd[2] == expected_domain, f"getenv таргетит gui-домен: {cmd}"
+
+
+def test_remove_launchctl_env_fails_closed_when_var_not_removed(monkeypatch, tmp_path):
+    """DEFECT A fail-closed: getenv показывает переменную ЖИВОЙ после unsetenv → статус НЕ «снят».
+
+    unsetenv «отработал» (rc=0), но getenv gui/<uid> HTTP_PROXY всё ещё видит socks5h://127.0.0.1:10808
+    (домен-mismatch / launchd не снял). Без верификации cmd_uninstall вернул бы success → мёртвый
+    прокси в gui. Теперь: статус сигнализирует проблему, cmd_uninstall пробрасывает в rc≠0.
+    """
+    home = _mock_home(monkeypatch, tmp_path)
+    srouter._install_launchctl_env(_env(tmp_path), _fake_runner())
+    runner = _domain_aware_runner(getenv_remaining={"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+                                                    "http_proxy", "https_proxy", "all_proxy",
+                                                    "NO_PROXY", "no_proxy"})
+
+    status = srouter._remove_launchctl_env(runner)
+    note = status["note"]
+
+    assert status["ok"] is False, f"переменная осталась в gui → fail-closed (ok=False): {note}"
+    assert "gui" in note.lower() and "остались" in note.lower(), \
+        f"статус сигнализирует проблему (env не снят в gui): {note}"
+
+
+def test_remove_launchctl_env_fails_closed_when_getenv_timeout(monkeypatch, tmp_path):
+    """DEFECT A fail-closed верификации: getenv ТАЙМАУТИТ → НЕ считать «снято», ok=False.
+
+    Внутренний цикл-review #94: первоначальный фикс считал пустой out = «снято» всегда. Но getenv
+    при timeout/OSError (rc=None) возвращает пустой out — это НЕ «переменной нет», а «не смогли
+    спросить». Считать это «снято» = fail-open (переменная могла остаться в gui). Канон: сбой
+    верификации → unverifiable → fail-closed (ok=False). На коде без этого фикса тест ПАДАЕТ.
+    """
+    home = _mock_home(monkeypatch, tmp_path)
+    srouter._install_launchctl_env(_env(tmp_path), _fake_runner())
+    runner = _domain_aware_runner(getenv_timeout={"HTTP_PROXY"})  # getenv не ответил
+
+    status = srouter._remove_launchctl_env(runner)
+
+    assert status["ok"] is False, f"getenv timeout → unverifiable → fail-closed: {status['note']}"
+    assert "подтверждено" in status["note"].lower() or "не" in status["note"].lower(), \
+        f"статус отличает unverifiable от снято: {status['note']}"
+
+
+def test_remove_launchctl_env_returns_structured_status_ok(monkeypatch, tmp_path):
+    """DEFECT A: _remove_launchctl_env возвращает структурированный статус {ok:bool} для cmd_uninstall.
+
+    Раньше возвращалась только строка-статус → cmd_uninstall конкатенировал в сообщение → fail-open
+    (env не снят, но rc=0). Теперь ok=False пробрасывается в ненулевой rc cmd_uninstall.
+    """
+    home = _mock_home(monkeypatch, tmp_path)
+    srouter._install_launchctl_env(_env(tmp_path), _fake_runner())
+    runner = _domain_aware_runner()  # getenv → пусто (всё снято)
+
+    status = srouter._remove_launchctl_env(runner)
+
+    assert isinstance(status, dict), "статус — структурированный dict {ok:bool, note:str}"
+    assert status.get("ok") is True
+
+
+def test_remove_launchctl_env_returns_structured_status_not_ok(monkeypatch, tmp_path):
+    """DEFECT A: переменная не снята → status.ok is False (cmd_uninstall пробрасывает в rc≠0)."""
+    home = _mock_home(monkeypatch, tmp_path)
+    srouter._install_launchctl_env(_env(tmp_path), _fake_runner())
+    runner = _domain_aware_runner(getenv_remaining={"HTTP_PROXY"})
+
+    status = srouter._remove_launchctl_env(runner)
+
+    assert isinstance(status, dict)
+    assert status.get("ok") is False
 
 
 # ============================ _ensure/_remove_home_bin_in_path ============================

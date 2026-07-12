@@ -1,8 +1,13 @@
 #!/bin/sh
 # srouter: глобальный SOCKS5 env для GUI-приложений (Codex.app и др.) через launchctl setenv.
 #
-# Запускается LaunchAgent com.srouter.codex-env (RunAtLoad + каждые ~5мин, переживает ребут).
-# launchctl setenv кладёт переменные в GUI-домен launchd → все GUI-приложения их видят.
+# Запускается LaunchAgent com.srouter.codenv (RunAtLoad + каждые ~5мин, переживает ребут).
+# launchctl setenv кладёт переменные в caller-context (man launchctl). Этот скрипт запускается
+# launchd ВНУТРИ gui-домена → caller-context = gui → переменные попадают в gui-домен (видят все
+# GUI-приложения). Поэтому setenv ЗДЕСЬ — БЕЗ домена намеренно: `setenv gui/<uid> ...` даёт rc=64
+# (usage error) — доменный таргет setenv не принимает. Симметрия: uninstall (_remove_launchctl_env)
+# делает `unsetenv gui/<uid> <key>` с ЯВНЫМ доменом (он бежит из процесса cmd_uninstall, чей
+# caller-context может быть user/<uid> из SSH/cron — issue #94 DEFECT A).
 # Эмпирически: Claude.app/ChatGPT.app на System Settings SOCKS, global env их не ломает.
 # NO_PROXY=loopback — локальные сервисы (MCP/healthcheck) мимо прокси.
 PROXY="socks5h://127.0.0.1:10808"
