@@ -1,0 +1,26 @@
+# srouter privoxy-лаборатория (#123): запуск эксперимента.
+#
+# Запуск: docker compose -f docker/privoxy-lab/docker-compose.yml up -d
+# Мониторинг рестартов: docker events --filter container=srouter-privoxy-lab
+# Логи (crash виден): docker logs -f srouter-privoxy-lab
+#
+# Цель: изолированная среда для поимки причины самопадений host-privoxy. Если контейнер стабилен
+# (0 рестартов за N часов) → корень на хосте (launchd KeepAlive / memory jettison). Если тоже
+# фликает → privoxy-баг (конфиг / директива).
+
+services:
+  privoxy-lab:
+    build: .       # Dockerfile рядом с docker-compose.yml (docker/privoxy-lab/)
+    container_name: srouter-privoxy-lab
+    ports:
+      - "8119:8119"          # проброс на host:8119 (агенты могут ходить сюда как на резерв)
+    extra_hosts:
+      # Резолв host-xray 10808 (macOS Docker Desktop резолвит host.docker.internal автоматически,
+      # но extra_hosts страхует на Linux). privoxy-lab.conf форвардит сюда.
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped   # Docker поднимает при падении (видно в docker events — частота фликера)
+    volumes:
+      - privoxy-lab-logs:/var/log/privoxy   # persist логов для анализа (если нужен файл-лог)
+
+volumes:
+  privoxy-lab-logs:
