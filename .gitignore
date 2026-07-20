@@ -1,6 +1,8 @@
 # Локальная конфигурация (реальные адреса инфраструктуры)
 srouter_config.py
 srouter.local.json
+srouter.local.json.tmp    # cycle-review #114 C3: save_state atomic-write temp (local_state.py:596)
+*.srouter-backup-*        # _backup() timestamped — прежний (чужой) конфиг с секретами
 
 # Opt-in локальный кэш hot_routes (домены+счётчики, privacy) — НИКОГДА не коммитить
 srouter.hot_routes.json

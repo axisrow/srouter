@@ -14,9 +14,11 @@ _DOCKERIGNORE = Path(__file__).resolve().parents[2] / ".dockerignore"
 # НО для Docker build-context, т.к. .gitignore тут НЕ работает).
 _REQUIRED_PATTERNS = [
     "srouter.local.json",
+    "srouter.local.json.tmp",   # cycle-review #114 C3: save_state atomic-write temp (local_state.py:596)
     "srouter_config.py",
     ".env",
     "srouter.hot_routes.json",
+    "*.srouter-backup-*",       # _backup() timestamped — содержит прежний (чужой) конфиг с секретами
     ".git",          # build-context раздувается .git; не нужен в образе
     "__pycache__",
     ".pytest_cache",
@@ -24,10 +26,12 @@ _REQUIRED_PATTERNS = [
 
 
 def test_dockerignore_exists_and_covers_secrets():
-    """.dockerignore существует и покрывает секреты/локальный-state (cycle-review #114 C1).
+    """.dockerignore существует и покрывает секреты/локальный-state (cycle-review #114 C1+C3).
 
     Без файла — COPY . в acceptance.Dockerfile печёт srouter.local.json (Reality-материал, UUID узлов,
     endpoints) и srouter_config.py в слой образа. .gitignore НЕ фильтрует Docker build-context.
+    C3: atomic-write temp srouter.local.json.tmp и timestamped backup *.srouter-backup-* — те же секреты,
+    их тоже надо исключить (save_state local_state.py:596, _backup install_lib.py).
     """
     assert _DOCKERIGNORE.exists(), (
         f".dockerignore отсутствует — COPY . в acceptance.Dockerfile утащит секреты в образ "
