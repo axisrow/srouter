@@ -841,6 +841,9 @@ def test_codex_function_beats_brew_in_path(monkeypatch, tmp_path):
 
     Реальный zsh: source .zshrc с функцией, whence -w codex = function, вызов доходит до fake
     launcher через $HOME/bin/codex (не до brew-бинаря). Доказывает победу функции над PATH-порядком.
+
+    Требует реальный zsh в окружении (макOS — есть по умолчанию; Linux CI — убедиться, что zsh
+    установлен, иначе тест skip'нется и регрессию PATH-победы функции пропустит).
     """
     import shutil
     import subprocess

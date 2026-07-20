@@ -579,9 +579,10 @@ def _remove_codex_zsh_function() -> str:
         if ZSHRC_CODEX_FUNC_MARKER_BEGIN not in content and ZSHRC_CODEX_FUNC_MARKER_END not in content:
             return "Codex функция: не была изменена."
         # Fail-closed: ровно один парный блок. Непарный/дублированный → отказ (safe-noop).
+        # Достаточно begins==1 and ends==1 (это уже влечёт их равенство) — без третьего условия.
         begins = content.count(ZSHRC_CODEX_FUNC_MARKER_BEGIN)
         ends = content.count(ZSHRC_CODEX_FUNC_MARKER_END)
-        if begins != 1 or ends != 1 or begins != ends:
+        if begins != 1 or ends != 1:
             return ("Codex функция: не удалена — повреждённый маркер "
                     f"(begin={begins}, end={ends}), проверь ~/.zshrc вручную.")
         start = content.index(ZSHRC_CODEX_FUNC_MARKER_BEGIN)
