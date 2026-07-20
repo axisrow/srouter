@@ -629,3 +629,48 @@ def test_idempotent_reinstall_preserves_overwrote_backup_provenance(tmp_path):
     assert un["ok"] is True
     assert config_path.read_text(encoding="utf-8") == "foreign config\n", \
         "uninstall после idempotent reinstall восстанавливает оригинал (overwrote→restore), не удаляет"
+
+
+def test_reinstall_does_not_carry_backup_across_config_paths(tmp_path, monkeypatch):
+    """P1 round 2 (@307bb34): preserve backup ТОЛЬКО при совпадении config_path (path-ownership guard).
+
+    Сценарий: компонент ставился с --prefix A (backup foreign-конфига A, provenance='overwrote'). Потом
+    install с --prefix B → fresh write at B, backups[name] пуст. До фикса preserve переносил A's backup в
+    B-запись → uninstall трактует B как overwrote и restore'ит A's backup В B (foreign-конфиг A по пути B!),
+    пока оригинал A не восстанавливается. Это обход path-ownership guard (cycle-review #111 finding 1:
+    ownership привязан к пути). Фикс: preserve только когда prev.config_path == item.config_path.
+    """
+    env = _env(tmp_path)
+    new_config_path = env.component_paths("privoxy")["config"]
+    new_config_path.parent.mkdir(parents=True)
+    # target B = srouter-managed (fresh write при смене prefix).
+    new_config_path.write_text("# srouter-managed-config-v1\nlisten-address 127.0.0.1:8118\n", encoding="utf-8")
+    # state: prev под ДРУГИМ config_path (prefix A) — backup foreign-конфига A, provenance='overwrote'.
+    old_config_path = tmp_path / "old-prefix" / "privoxy" / "config"
+    backup_of_old = tmp_path / "old-prefix-backup"
+    backup_of_old.write_text("foreign config from prefix A\n", encoding="utf-8")
+    env.state_path.write_text(json.dumps({
+        "schema_version": 1, "nodes": [], "active_node": {"name": None, "pending": None},
+        "probes": {}, "network": {"channels": {"wifi_service": "Wi-Fi"}},
+        "traffic_guard": {"mode": "off", "domains": {}},
+        "detected_environment": {"privoxy": {
+            "config_path": str(old_config_path),  # ДРУГОЙ путь (prefix A), ≠ текущий B
+            "backup": str(backup_of_old),
+            "management": {"mode": "managed", "managed": True, "provenance": "overwrote"},
+        }},
+        "runtime": {},
+    }), encoding="utf-8")
+
+    # install при prefix B (target marker-managed, нет нового backup, prev.config_path != item.config_path).
+    result = install_lib.apply_install(
+        env=env, confirm=True, choices={"xray": "skip", "dnsmasq": "skip"},
+        runner=FakeRunner(), port_checker=lambda *_a, **_kw: False)
+    assert result["ok"] is True, f"install при смене prefix должен пройти: {result}"
+
+    state = json.loads(env.state_path.read_text(encoding="utf-8"))
+    entry = state["detected_environment"]["privoxy"]
+    # A's backup НЕ переносится на путь B (path-ownership guard) — иначе uninstall restore'ит чужой A в B.
+    assert entry.get("backup") != str(backup_of_old), \
+        "backup с ДРУГОГО config_path НЕ preserve'ится (path-ownership) — иначе cross-path restore"
+    assert entry["management"].get("provenance") != "overwrote", \
+        "provenance не наследуется с другого пути (path-ownership) — это fresh created по пути B"

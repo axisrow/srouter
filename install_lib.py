@@ -740,13 +740,20 @@ def _write_state_after_apply(env, plan, modes, backups, launchagent_action=None)
         # не конфликт) НО prev уже managed с backup — preserve prev.backup/provenance. Иначе _management_for
         # перезаписывал entry → provenance='created' + backup утерян → следующий uninstall УДАЛЯЛ srouter-config
         # вместо restore пользовательского оригинала (потеря в цикле install→reinstall→uninstall).
-        if mode == "managed" and not backups.get(name) and _is_managed_entry(prev) and prev.get("backup"):
+        # cycle-review cloud round 2 (@307bb34) P1: path-ownership guard. Preserve ТОЛЬКО когда prev.config_path
+        # совпадает с текущим item.config_path. Смена --prefix (A→B): prev под путём A, текущий B → backup A НЕ
+        # переносится на B (иначе uninstall restore'ит A's foreign-конфиг в B, обход path-ownership, cycle-review
+        # #111 finding 1). Привязка ownership к пути — тот же канон, что _inspect_component state_owns_path.
+        prev_same_path = (str(Path(prev.get("config_path") or "")) == str(item.get("config_path"))
+                          if prev.get("config_path") else False)
+        if (mode == "managed" and not backups.get(name) and _is_managed_entry(prev)
+                and prev.get("backup") and prev_same_path):
             provenance = _provenance_of(prev) or "overwrote"
         detected[name] = _management_for(mode, item, provenance=provenance)
         if backups.get(name):
             detected[name]["backup"] = backups[name]
-        elif mode == "managed" and _is_managed_entry(prev) and prev.get("backup"):
-            detected[name]["backup"] = prev["backup"]  # preserve backup оригинала (idempotent reinstall)
+        elif mode == "managed" and _is_managed_entry(prev) and prev.get("backup") and prev_same_path:
+            detected[name]["backup"] = prev["backup"]  # preserve backup оригинала (idempotent reinstall, тот же путь)
     if launchagent_action:
         launchagent = plan.get("launchagent") or {}
         detected["launchagent"] = {
