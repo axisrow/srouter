@@ -65,3 +65,30 @@ def test_cmd_uninstall_returns_zero_when_env_removed(monkeypatch):
     rc = srouter.cmd_uninstall(_args())
 
     assert rc == 0, f"env снят → rc=0, получил {rc}"
+
+
+# ============================ -y/--yes минует TTY-gate (issue #106) ============================
+# cmd_uninstall падал в не-TTY среде (cron/launchd/CI/фоновый процесс) ДАЖЕ с -y: isatty()-gate
+# стоял ДО проверки args.yes. -y именно для того, чтобы промпт не требовался → TTY не требуется.
+def test_cmd_uninstall_yes_works_without_tty(monkeypatch):
+    """issue #106: не-TTY + yes=True → НЕ падает с «требует терминал», доходит до apply (rc=0)."""
+    _stub_cmd_uninstall_internals(monkeypatch, env_ok=True, tty=False)
+
+    rc = srouter.cmd_uninstall(_args(yes=True))
+
+    assert rc == 0, f"не-TTY + -y должно работать как неинтерактивный запуск, получил {rc}"
+
+
+def test_cmd_uninstall_no_tty_without_yes_fails_closed(monkeypatch, capsys):
+    """issue #106 (fail-closed сохранён): не-TTY + yes=False → rc=2 с «требует терминал».
+
+    Нельзя запускать uninstall неинтерактивно БЕЗ явного -y — иначе промпт _prompt_bool зависнет
+    или прочитает EOF. Gate остаётся, но теперь он смотрит И isatty, И yes.
+    """
+    _stub_cmd_uninstall_internals(monkeypatch, env_ok=True, tty=False)
+
+    rc = srouter.cmd_uninstall(_args(yes=False))
+
+    assert rc == 2, f"не-TTY без -y → отказ (нет ни TTY, ни подтверждения), получил {rc}"
+    err = capsys.readouterr().err.lower()
+    assert "терминал" in err, f"stderr объясняет: нужен TTY или -y: {err}"

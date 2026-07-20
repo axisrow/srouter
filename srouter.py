@@ -635,7 +635,10 @@ def cmd_install(args) -> int:
         print()
 
     # 4) Подтверждение.
-    if not sys.stdin.isatty():
+    # Не-TTY запуск допустим ТОЛЬКО с -y/--yes (промпт не нужен). Без TTY и без -y — отказ:
+    # _prompt_bool зависнет на EOF. Раньше isatty()-gate стоял ДО проверки yes → -y игнорировался
+    # в не-TTY среде (cron/launchd/CI/фоновый процесс). Issue #106.
+    if not sys.stdin.isatty() and not getattr(args, "yes", False):
         print("install: подтверждение требует терминал (используйте -y/--yes).", file=sys.stderr)
         return 2
     if not getattr(args, "yes", False) and not _prompt_bool("Применить установку стека?"):
@@ -712,7 +715,10 @@ def cmd_uninstall(args) -> int:
     print()
 
     # 2) Подтверждение (полный откат — серьёзный шаг).
-    if not sys.stdin.isatty():
+    # Не-TTY запуск допустим ТОЛЬКО с -y/--yes (промпт не нужен). Без TTY и без -y — отказ:
+    # _prompt_bool зависнет на EOF. Раньше isatty()-gate стоял ДО проверки yes → -y игнорировался
+    # в не-TTY среде (cron/launchd/CI/фоновый процесс). Issue #106.
+    if not sys.stdin.isatty() and not getattr(args, "yes", False):
         print("uninstall: подтверждение требует терминал (используйте -y/--yes).", file=sys.stderr)
         return 2
     if not getattr(args, "yes", False) and not _prompt_bool("Полный откат стека к дефолту?"):
