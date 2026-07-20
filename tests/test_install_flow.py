@@ -495,3 +495,83 @@ def test_inspect_component_foreign_port_blocks_even_when_reclaimable(tmp_path, m
     assert "foreign_port" in item["conflicts"], ("чужой процесс на порту → foreign_port, даже при "
                                                  "reclaimable (маркера нет → слушатель может быть чужим)")
     assert item["conflict"] is True, "foreign_port блокирует reclaimable (не авто-применение при чужом процессе)"
+
+
+# ============================ issue #112 Часть 1: provenance в state ============================
+# install пишет detected_environment[name].management.provenance = 'created' | 'overwrote'.
+# created = config_path НЕ существовал до install (нет backup — нечего бэкапить).
+# overwrote = существовал, есть backup. Uninstall (Часть 2) различает: created → удалить, overwrote →
+# restore. Без явного provenance uninstall restore-only (Дефект #110 follow-up).
+#
+# Инвариант: backups[name] truthy ⟺ config существовал до install (needs_backup на стр.767 требует
+# config_path.exists()). Значит provenance выводится из backups.get(name) в _write_state_after_apply —
+# без нового параметра сквозь apply_install (минимально-инвазивно, no-hidden-magic).
+def test_install_records_provenance_created(tmp_path):
+    """Часть 1: fresh install (config_path НЕ существовал) → management.provenance == 'created'.
+
+    created = srouter создал конфиг с нуля (нет backup — нечего бэкапить). Uninstall должен УДАЛИТЬ
+    такой конфиг (Часть 2). Без provenance uninstall restore-only → конфиг остаётся навсегда (Дефект #110).
+    """
+    env = _env(tmp_path)
+
+    result = install_lib.apply_install(
+        env=env,
+        confirm=True,
+        choices={"xray": "skip", "privoxy": "skip"},  # только dnsmasq → fresh config_path
+        runner=FakeRunner(),
+        port_checker=lambda *_a, **_kw: False,
+    )
+
+    assert result["ok"] is True, f"fresh install должен пройти: {result}"
+    state = json.loads(env.state_path.read_text(encoding="utf-8"))
+    assert state["detected_environment"]["dnsmasq"]["management"]["provenance"] == "created", \
+        "fresh install (config_path не существовал) → provenance='created'"
+
+
+def test_install_records_provenance_overwrote(tmp_path):
+    """Часть 1: overwrite (config_path существовал) → management.provenance == 'overwrote'.
+
+    overwrote = srouter перезаписал чужой конфиг (есть backup). Uninstall должен RESTORE из backup
+    (Часть 2). provenance='overwrote' ⟺ backups[name] truthy (инвариант needs_backup на стр.767).
+    """
+    env = _env(tmp_path)
+    config_path = env.component_paths("privoxy")["config"]
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text("foreign config\n", encoding="utf-8")
+
+    result = install_lib.apply_install(
+        env=env,
+        confirm=True,
+        choices={"privoxy": "overwrite", "xray": "skip", "dnsmasq": "skip"},
+        runner=FakeRunner(),
+        port_checker=lambda *_a, **_kw: False,
+    )
+
+    assert result["ok"] is True, f"overwrite должен пройти: {result}"
+    state = json.loads(env.state_path.read_text(encoding="utf-8"))
+    assert state["detected_environment"]["privoxy"]["management"]["provenance"] == "overwrote", \
+        "overwrite (config_path существовал, есть backup) → provenance='overwrote'"
+    assert "backup" in state["detected_environment"]["privoxy"], "overwrote имеет backup в state"
+
+
+def test_install_skipped_has_no_provenance(tmp_path):
+    """Часть 1 граница: skip → provenance отсутствует (srouter не перезаписывал, semantics не применима).
+
+    adopted/skipped/restored — provenance не имеет смысла (нет created/overwrote действия).
+    Не пишем поле вообще (None в _management_for опускается) — uninstall "left untouched" для skip.
+    """
+    env = _env(tmp_path)
+
+    result = install_lib.apply_install(
+        env=env,
+        confirm=True,
+        choices={"xray": "skip", "privoxy": "skip", "dnsmasq": "skip"},
+        runner=FakeRunner(),
+        port_checker=lambda *_a, **_kw: False,
+    )
+
+    assert result["ok"] is True
+    state = json.loads(env.state_path.read_text(encoding="utf-8"))
+    for name in ("xray", "privoxy", "dnsmasq"):
+        assert "provenance" not in state["detected_environment"][name]["management"], \
+            f"{name} skipped → provenance отсутствует (не применимо)"

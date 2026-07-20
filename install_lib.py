@@ -659,13 +659,20 @@ def _apply_dns(env, plan, runner):
     return runner([NETWORKSETUP, "-setdnsservers", service, "127.0.0.1"], 20)
 
 
-def _management_for(mode, item):
+def _management_for(mode, item, *, provenance=None):
+    # provenance (issue #112 Часть 1): 'created' | 'overwrote' | None. Только для mode=='managed':
+    # created = config_path НЕ существовал до install (нет backup), overwrote = существовал (есть backup).
+    # Uninstall (Часть 2) различает: created → удалить, overwrote → restore. None — adopted/skipped/restored
+    # (srouter не перезаписывал, semantics не применима). Опускается, если None (обратная совместимость state).
+    management = {"mode": mode, "managed": mode == "managed"}
+    if provenance is not None:
+        management["provenance"] = provenance
     return {
         "config_path": item.get("config_path"),
         "port": item.get("port"),
         "service": item.get("service"),
         "port_owner": item.get("port_owner"),
-        "management": {"mode": mode, "managed": mode == "managed"},
+        "management": management,
     }
 
 
@@ -676,7 +683,13 @@ def _write_state_after_apply(env, plan, modes, backups, launchagent_action=None)
     detected = state.get("detected_environment") if isinstance(state.get("detected_environment"), dict) else {}
     for name, item in plan["components"].items():
         mode = modes.get(name, "skipped")
-        detected[name] = _management_for(mode, item)
+        # provenance (issue #112 Часть 1): только для managed. backups[name] truthy ⟺ config существовал
+        # до install (apply_install needs_backup на стр.767 требует config_path.exists() → _backup вызван).
+        # created = нет backup (fresh install с нуля), overwrote = есть backup (перезаписан чужой).
+        provenance = None
+        if mode == "managed":
+            provenance = "overwrote" if backups.get(name) else "created"
+        detected[name] = _management_for(mode, item, provenance=provenance)
         if backups.get(name):
             detected[name]["backup"] = backups[name]
     if launchagent_action:
