@@ -20,9 +20,9 @@ docker compose up -d --build
 docker compose logs -f reality-node
 ```
 
-## За Docker Hub (GFW / registry-1.docker.io)
+## Registry-mirror для Docker Hub (GFW / registry-1.docker.io)
 
-Если `docker build` / `docker pull` падают с `DeadlineExceeded` или надолго
+На dev-машине за GFW: если `docker build` / `docker pull` падают с `DeadlineExceeded` или надолго
 зависают на pulling `alpine`/`python`/других образов с Docker Hub
 (`registry-1.docker.io`), причина — блокировка/замедление хаба Great Firewall
 или аналогичным фильтром. Симптом: тот же тег тянется минутами или рвётся по
@@ -33,10 +33,11 @@ docker compose logs -f reality-node
 никаких правок), а зеркала — локальная настройка daemon, которую каждый dev в
 GFW включает под себя.
 
-Вариант A — GUI (Docker Desktop): **Settings → Docker Engine**, добавить ключ
-`"registry-mirrors"` и применить (Docker перезапустится сам).
+Вариант A — GUI (Docker Desktop на macOS/Windows dev-машине): **Settings →
+Docker Engine**, добавить ключ `"registry-mirrors"` и применить (Docker
+перезапустится сам).
 
-Вариант B — `~/.docker/daemon.json` вручную:
+Вариант B — `~/.docker/daemon.json` вручную (та же настройка для Linux):
 
 ```json
 {
@@ -52,10 +53,12 @@ GFW включает под себя.
 Затем перезапустить Docker Desktop (или `sudo systemctl restart docker` на Linux).
 Список зеркал — fallback-цепочка: движок идёт по ним по порядку, пока одно не
 ответит. Указывайте только проверенные живые зеркала — мёртвый хост в начале
-списка просто тратит таймаут перед каждым pull. Актуальность зеркал лучше
-сверять периодически: `curl -sI https://docker.m.daocloud.io/v2/` (живое зеркало
-отвечает `401 Unauthorized` на анонимный `/v2/`; пустой ответ/таймаут — зеркало
-мёртво).
+списка просто тратит таймаут перед каждым pull (поэтому `dockerproxy.net`,
+указанный в части трекеров третьим, сюда не включён — на проверке он молчал по
+таймауту; добавляйте только если `curl -sI https://dockerproxy.net/v2/` снова
+жив). Актуальность зеркал лучше сверять периодически:
+`curl -sI https://docker.m.daocloud.io/v2/` (живое зеркало отвечает
+`401 Unauthorized` на анонимный `/v2/`; пустой ответ/таймаут — зеркало мёртво).
 
 Проверить, что зеркало подхвачено движком:
 
