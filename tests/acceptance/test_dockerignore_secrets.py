@@ -1,15 +1,22 @@
-"""TDD-гвард: .dockerignore + .gitignore РЕАЛЬНО игнорируют секреты (cycle-review #114 C1/C3/C4).
+"""TDD-гвард: .dockerignore + .gitignore РЕАЛЬНО игнорируют секреты (cycle-review #114 C1/C3/C4/C5/C6).
 
 COPY . в Dockerfile копирует ВЕСЬ build-context; .gitignore НЕ фильтрует Docker (разные механизмы).
-Без .dockerignore секреты (srouter.local.json с Reality-материалом/UUID/endpoints, srouter_config.py,
-.env, atomic-write temp .tmp, timestamped backup) запекаются в слой образа → утечка.
+Без .dockerignore секреты (srouter.local.json с Reality-материалом, srouter_config.py, server/.env с
+XRAY_PRIVATE_KEY/UUID/SHORT_ID, atomic-write temp .tmp, timestamped backup) запекаются в слой образа.
 
-C4 (Codex confidence 1.0): inline-комментарии на строке паттерна ломают ignore — Docker/git парсят '#'
-как комментарий ТОЛЬКО в начале строки. `srouter.local.json.tmp    # comment` НЕ матчит реальный файл.
-Substring-тест (C3) это пропустил — паттерн в тексте есть, но не работает. Этот гард проверяет
-РЕАЛЬНУЮ семантику через `git check-ignore` (ground truth для gitignore; dockerignore использует те же
-паттерны). Не skip'ится SROUTER_ACCEPTANCE (static — git check-ignore, ничего деструктивного).
+История цикл-ревью:
+- C1: нет .dockerignore → секреты в образе.
+- C3: .tmp/backup не покрыты.
+- C4: inline-комментарии на строке паттерна ломали ignore (Docker/git '#' только в начале строки).
+- C5: glob .env без ** не покрывал server/.env (Docker требует ** для поддиректорий).
+- C6: git check-ignore валидирует .gitignore, НЕ .dockerignore → гард молчал на мутацию .dockerignore.
+
+Два независимых гард'а:
+  - .gitignore → git check-ignore (ground truth git-семантики). Host-side (в контейнере .git исключён).
+  - .dockerignore → ручной parse + pattern-match (** → .*, * → [^/]*), Docker/semantics. Работает везде
+    (не зависит от .git) — это и есть Docker security gate, которого не хватало (C6).
 """
+import re
 import subprocess
 from pathlib import Path
 
@@ -17,8 +24,8 @@ import pytest
 
 _ROOT = Path(__file__).resolve().parents[2]
 
-# Секретные/локальные пути, которые ДОЛЖНЫ игнорироваться (build-context + git). Каждый — реальный
-# артефакт, что srouter пишет на диск: config, atomic-write temp, timestamped backup, privacy-cache.
+# Секретные/локальные пути, которые ДОЛЖНЫ игнорироваться. Каждый — реальный артефакт srouter.
+# C5: server/.env (Reality-секреты XRAY_PRIVATE_KEY/UUID/SHORT_ID) — отдельный уровень вложенности.
 _SECRET_PATHS = [
     "srouter.local.json",
     "srouter.local.json.tmp",      # save_state atomic-write (local_state.py:596)
@@ -27,16 +34,13 @@ _SECRET_PATHS = [
     "srouter.hot_routes.json",
     "srouter.hot_routes.json.tmp",
     "config.srouter-backup-2026-07-20T000000Z",   # _backup() timestamped (install_lib.py:599)
+    "server/.env",                 # C5: nested (server/README.md — Reality-секреты)
+    "server/rendered/node.json",   # C5: сгенерированный артефакт с ключами (server/.generated)
 ]
 
 
 def _git_check_ignore(path: str) -> bool:
-    """True если git РЕАЛЬНО игнорирует path (ground truth для gitignore-семантики).
-
-    `git check-ignore <path>` возвращает rc=0, если путь игнорируется. rc=1 — не игнорируется. Docker
-    .dockerignore использует те же pattern-семантики, так что git check-ignore валиден как прокси для
-    обоих (C4: inline-коммент в .dockerignore так же ломает паттерн).
-    """
+    """True если git РЕАЛЬНО игнорирует path (ground truth для .gitignore-семантики)."""
     result = subprocess.run(
         ["git", "-C", str(_ROOT), "check-ignore", path],
         capture_output=True, text=True,
@@ -44,33 +48,83 @@ def _git_check_ignore(path: str) -> bool:
     return result.returncode == 0
 
 
-def test_dockerignore_exists_and_covers_secrets():
-    """.dockerignore существует и покрывает секреты/локальный-state (C1). Static-наличие.
+def _dockerignore_patterns() -> list:
+    """Прочитать .dockerignore → список паттернов (skip '#'-строк и пустых). .dockerignore: negate '!'."""
+    di = _ROOT / ".dockerignore"
+    if not di.exists():
+        return []
+    patterns = []
+    for line in di.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        # C4: '#' как комментарий только в НАЧАЛЕ строки. Если '#' не в начале — это часть паттерна
+        # (баг). Мы парсим только чистые паттерн-строки; inline-comment-строки сюда попадают целиком
+        # (с мусором) и НЕ сматчат реальный файл → тест поймает (C4 regression).
+        if not stripped or stripped.startswith("#"):
+            continue
+        patterns.append(stripped)
+    return patterns
 
-    Работает и в контейнере (нет .git) — просто проверяет файл.
+
+def _dockerignore_matches(path: str, patterns: list) -> bool:
+    """Соответствует ли path хотя бы одному .dockerignore-паттерну (Docker/gitignore semantics).
+
+    Трансляция glob → regex:
+      - ведущий `**/` → опциональный любой префикс директории (`(.*/)?`) — чтобы `**/.env` матчило и
+        корневой `.env`, и `server/.env` (Docker semantics: ** в начале покрывает любой уровень).
+      - внутреннее `**` → `.*` (любой путь вкл. /).
+      - `*` → `[^/]*` (сегмент без /).
+      - `?` → `.`.
+    Negate `!` инвертирует последнее совпадение. Упрощённая семантика (без directory-only) — достаточно.
     """
-    dockerignore = _ROOT / ".dockerignore"
-    assert dockerignore.exists(), (
-        ".dockerignore отсутствует — COPY . в acceptance.Dockerfile утащит секреты в образ. "
-        ".gitignore НЕ фильтрует Docker build-context."
+    matched = False
+    for pat in patterns:
+        negate = pat.startswith("!")
+        if negate:
+            pat = pat[1:]
+        regex = re.escape(pat)
+        # Ведущий **/ → опциональный dir-префикс (чтобы **/.env матчило и корень, и поддиректории).
+        regex = regex.replace(r"\*\*/", r"(?:.*/)?", 1)
+        # Оставшиеся ** → любой путь.
+        regex = regex.replace(r"\*\*", ".*")
+        regex = regex.replace(r"\*", "[^/]*").replace(r"\?", ".")
+        if re.fullmatch(regex, path):
+            matched = not negate
+    return matched
+
+
+def test_dockerignore_exists():
+    """`.dockerignore` существует (C1). Без него COPY . тащит секреты в образ.
+
+    Работает и в контейнере. `.gitignore` НЕ проверяем тут — он исключён из образа (.dockerignore),
+    в рантайме не нужен; его наличие проверяет host-side git-гард ниже.
+    """
+    assert (_ROOT / ".dockerignore").exists(), ".dockerignore отсутствует"
+
+
+def test_secret_paths_ignored_by_git():
+    """Секретные пути РЕАЛЬНО игнорируются git (C3+C4) — git check-ignore ground truth.
+
+    Host-side: в контейнере .git исключён → skip. Это гард .gitignore (commit-leakage).
+    """
+    if not (_ROOT / ".git").exists():
+        pytest.skip("host-side: в контейнере .git исключён — git check-ignore неприменим")
+    not_ignored = [p for p in _SECRET_PATHS if not _git_check_ignore(p)]
+    assert not not_ignored, (
+        f"Секретные пути НЕ игнорируются git: {not_ignored}. "
+        f"Частая причина (C4): inline-комментарий на строке паттерна."
     )
 
 
-def test_secret_paths_actually_ignored():
-    """Секретные пути РЕАЛЬНО игнорируются git (C3+C4) — не просто паттерн-в-файле, а работающий.
+def test_secret_paths_ignored_by_dockerignore():
+    """Секретные пути покрыты .dockerignore паттернами (C5+C6) — независимый Docker security gate.
 
-    C4 поймал: паттерн `srouter.local.json.tmp    # comment` в .gitignore/.dockerignore есть (substring-
-    тест проходил), НО git check-ignore НЕ игнорирует файл (inline-коммент ломает паттерн — '#' только
-    в начале строки). Этот тест — ground-truth через git check-ignore на каждом реальном секретном артефакте.
-
-    Только host-side: в Docker-контейнере .git исключён (.dockerignore) → git check-ignore неприменим.
-    Тестируем целостность ignore-файлов на dev-машине (где .git есть).
+    git check-ignore НЕ валидирует .dockerignore (C6). Этот тест парсит .dockerignore и проверяет
+    pattern-match напрямую. Работает и в контейнере (не зависит от .git) — это и есть Docker-gate.
+    C5: server/.env требует ** (Docker glob без ** матчит только корень контекста).
     """
-    if not (_ROOT / ".git").exists():
-        pytest.skip("host-side гард: в контейнере .git исключён — git check-ignore неприменим")
-    not_ignored = [p for p in _SECRET_PATHS if not _git_check_ignore(p)]
-    assert not not_ignored, (
-        f"Эти секретные пути НЕ игнорируются git (значит, и .dockerignore их не исключит — те же "
-        f"паттерны; COPY . утащит в образ): {not_ignored}. "
-        f"Частая причина (C4): inline-комментарий на строке паттерна — '#' только в начале строки."
+    patterns = _dockerignore_patterns()
+    not_covered = [p for p in _SECRET_PATHS if not _dockerignore_matches(p, patterns)]
+    assert not_covered == [], (
+        f"Секретные пути НЕ покрыты .dockerignore паттернами: {not_covered}. "
+        f"C5: для поддиректорий нужен ** (server/.env). C4: inline-комментарий ломает паттерн."
     )

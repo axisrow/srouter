@@ -17,17 +17,23 @@ srouter.local.json.tmp
 srouter.hot_routes.json
 srouter.hot_routes.json.tmp
 
-# Секреты окружения
-.env
-.env.*
-*.env
-!.env.example
+# Секреты окружения. RECURSIVE (cycle-review #114 C5): Docker glob без ** матчит ТОЛЬКО корень
+# контекста, НЕ поддиректории. server/.env (Reality-секреты XRAY_PRIVATE_KEY/UUID/SHORT_ID,
+# server/README.md) без ** утащился бы в образ. **/.env покрывает все уровни.
+**/.env
+**/.env.*
+**/*.env
+!**/.env.example
 
-# Сгенерированные серверные артефакты и ключи
+# Сгенерированные серверные артефакты и ключи. RECURSIVE (cycle-review #114 C5): Docker glob без **
+# матчит только корень. server/rendered/node.json и server/.generated/ содержат Reality-ключи.
 server/.generated/
 server/generated/
 server/rendered/
 server/deploy-bundles/
+server/**/*.env
+server/**/node_object.json
+server/**/node.json
 
 # Local MCP config (may contain API keys)
 .mcp.json
