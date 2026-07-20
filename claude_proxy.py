@@ -2,8 +2,12 @@
 
 После включения PF-изоляции Anthropic-доменов Claude Code CLI не может работать напрямую
 (PF режет api.anthropic.com / platform.claude.com на 160.79.104.10). CLI обязан ходить через
-прокси privoxy (8118) — иначе логин/API не работают. settings.json → env.HTTPS_PROXY подхватывается
+прокси — иначе логин/API не работают. settings.json → env.HTTPS_PROXY подхватывается
 Claude Code/node автоматически при запуске (подтверждено: HTTPS_PROXY=... claude работает).
+
+ SOCKS5 напрямую (xray 10808) минуя privoxy (8118): privoxy стабильно падает (гонка рестартов,
+ memory jettison, #115/#122). xray стабилен с 3 июля. Claude Code/node поддерживает socks5h://
+ в HTTPS_PROXY (доказано runtime: claude -p с УБИТЫМ privoxy → exit 0, ответ получен).
 
 Это ЧУЖОЙ конфиг (как ~/.gitconfig для git-proxy) — правим JSON read-modify-write (не строками),
 сохраняя все существующие env/permissions/hooks. Atomic-запись через tmp+replace. Не бросает.
@@ -12,12 +16,11 @@ import json
 from pathlib import Path
 from urllib.parse import urlparse
 
-# Прокси = privoxy (8118). Берём из dashboard_common если доступен; fallback на хардкод,
-# чтобы модуль не падал в среде без srouter_config (как git_proxy).
+# Прокси = SOCKS5 (xray 10808). Берём из dashboard_common если доступен; fallback на хардкод.
 try:
-    from dashboard_common import HTTP_PROXY_URL as _PROXY  # http://127.0.0.1:8118
+    from dashboard_common import SOCKS_PROXY_URL as _PROXY  # socks5h://127.0.0.1:10808
 except Exception:
-    _PROXY = "http://127.0.0.1:8118"
+    _PROXY = "socks5h://127.0.0.1:10808"
 
 SETTINGS = Path.home() / ".claude" / "settings.json"
 # Claude Code/node уважают HTTPS_PROXY; HTTP_PROXY добавляем для полноты (HTTP-эндпоинты).

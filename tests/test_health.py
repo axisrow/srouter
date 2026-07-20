@@ -45,12 +45,12 @@ VERSION_RUNNER_COMM = "/Users/me/.local/share/claude/versions/2.1.201"
 
 
 def test_probe_ok_when_cc_connected_to_proxy(monkeypatch):
-    """CLI CC (полный путь в comm) + lsof показал TCP к privoxy → status=ok."""
+    """CLI CC (полный путь в comm) + lsof показал TCP к SOCKS5 10808 → status=ok."""
     def fake_run(cmd, timeout):
         if cmd and cmd[0] == "/bin/ps":
             return {"rc": 0, "out": f"12345 {CLI_COMM}\n", "err": "", "timeout": False}
         if cmd and cmd[0] == "/usr/sbin/lsof":
-            return {"rc": 0, "out": f"claude 12345 axisrow 7u IPv4 ... TCP 127.0.0.1:51234->127.0.0.1:{health.PRIVOXY_PORT} (ESTABLISHED)\n", "err": "", "timeout": False}
+            return {"rc": 0, "out": f"claude 12345 axisrow 7u IPv4 ... TCP 127.0.0.1:51234->127.0.0.1:{health.XRAY_PORT} (ESTABLISHED)\n", "err": "", "timeout": False}
         return {"rc": 0, "out": "", "err": "", "timeout": False}
 
     monkeypatch.setattr(health.sys_probe, "run", fake_run)
@@ -64,32 +64,51 @@ def test_probe_detects_version_runner_cc(monkeypatch):
     """Regression: version-runner comm=`.../claude/versions/X.Y.Z` (basename=версия) — это тоже CC.
 
     Раньше whitelist `comm in ('claude','Claude')` пропускал его (basename='2.1.201'). Это основной
-    движок CC, который реально держит коннект к privoxy. Фильтр должен его узнавать.
+    движок CC, который реально держит коннект к SOCKS5. Фильтр должен его узнавать.
     """
     def fake_run(cmd, timeout):
         if cmd and cmd[0] == "/bin/ps":
             return {"rc": 0, "out": f"48008 {VERSION_RUNNER_COMM}\n", "err": "", "timeout": False}
         if cmd and cmd[0] == "/usr/sbin/lsof":
-            return {"rc": 0, "out": f"2.1.201 48008 axisrow 7u IPv4 ... TCP 127.0.0.1:51234->127.0.0.1:{health.PRIVOXY_PORT} (ESTABLISHED)\n", "err": "", "timeout": False}
+            return {"rc": 0, "out": f"2.1.201 48008 axisrow 7u IPv4 ... TCP 127.0.0.1:51234->127.0.0.1:{health.XRAY_PORT} (ESTABLISHED)\n", "err": "", "timeout": False}
         return {"rc": 0, "out": "", "err": "", "timeout": False}
 
     monkeypatch.setattr(health.sys_probe, "run", fake_run)
     res = health._claude_proxy_probe()
-    assert res["status"] == "ok", "version-runner CC должен детектиться (он держит коннект к privoxy)"
+    assert res["status"] == "ok", "version-runner CC должен детектиться (он держит коннект к SOCKS5)"
 
 
-def test_probe_down_when_cc_without_proxy_connection(monkeypatch):
-    """CC запущен (GUI comm=полный путь), но lsof НЕ показал коннект → status=down (инцидент «без ИИ»)."""
+def test_probe_down_when_cc_direct_leak(monkeypatch):
+    """CC запущен (GUI comm), lsof показал external ESTABLISHED (не localhost) → down (DIRECT-LEAK).
+
+    CC идёт НАПРЯМУЮ к api.anthropic.com мимо прокси — нарушение fail-closed-proxy-down.
+    Doctor обязан детектить и сообщить (главная находка этой сессии).
+    """
     def fake_run(cmd, timeout):
         if cmd and cmd[0] == "/bin/ps":
             return {"rc": 0, "out": f"12345 {GUI_COMM}\n", "err": "", "timeout": False}
         if cmd and cmd[0] == "/usr/sbin/lsof":
-            return {"rc": 0, "out": "claude 12345 axisrow 7u IPv4 ... TCP 127.0.0.1:51234->22 (ESTABLISHED)\n", "err": "", "timeout": False}
+            # external ESTABLISHED — CC напрямую к Anthropic (не localhost)
+            return {"rc": 0, "out": "claude 12345 axisrow 7u IPv4 ... TCP 192.168.1.5:51234->160.79.104.10:443 (ESTABLISHED)\n", "err": "", "timeout": False}
         return {"rc": 0, "out": "", "err": "", "timeout": False}
 
     monkeypatch.setattr(health.sys_probe, "run", fake_run)
     res = health._claude_proxy_probe()
-    assert res["status"] == "down"
+    assert res["status"] == "down", "CC идёт напрямую (external) → down (DIRECT-LEAK, fail-closed violation)"
+
+
+def test_probe_unknown_when_cc_idle_no_sockets(monkeypatch):
+    """CC запущен, но нет активных сокетов (idle между запросами) → unknown (не down)."""
+    def fake_run(cmd, timeout):
+        if cmd and cmd[0] == "/bin/ps":
+            return {"rc": 0, "out": f"12345 {CLI_COMM}\n", "err": "", "timeout": False}
+        if cmd and cmd[0] == "/usr/sbin/lsof":
+            return {"rc": 0, "out": "", "err": "", "timeout": False}
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+
+    monkeypatch.setattr(health.sys_probe, "run", fake_run)
+    res = health._claude_proxy_probe()
+    assert res["status"] == "unknown", "CC без активных сокетов → unknown (idle, не down)"
 
 
 def test_probe_unknown_when_lsof_times_out(monkeypatch):
