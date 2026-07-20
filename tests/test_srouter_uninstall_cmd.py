@@ -25,6 +25,14 @@ def _stub_cmd_uninstall_internals(monkeypatch, *, env_ok, tty=True):
 
     env_ok управляет возвратом _remove_launchctl_env (тестируемая связка). tty — есть ли терминал
     (минует ранний возврат «подтверждение требует терминал»).
+
+    ИНВАРИАНТ: ВСЕ хелперы отката замокаются — cmd_uninstall после apply_uninstall вызывает
+    _remove_active_split_route/claude_proxy.disable/_remove_ppp_hook/_remove_codex_wrappers/
+    _remove_codex_zsh_function (issue #97)/_remove_home_bin_from_path, и КАЖДЫЙ лезет в реальную
+    ФС/сеть/route. `_remove_codex_zsh_function` обязательно: без мока она резолвит реальный
+    Path.home()/.zshrc и удаляет managed-блок — на машине разработчика с установленным srouter
+    (маркер в ~/.zshrc есть) тест молча переписывает shell-конфиг. Cycle-review #108 cycle 2
+    (Codex critical) — зафиксировано spy.
     """
     monkeypatch.setattr(srouter, "_env_from_args", lambda args: SimpleNamespace())
     monkeypatch.setattr(srouter, "make_privileged_runner", lambda *a, **k: (lambda cmd, t: {"rc": 0}))
@@ -37,6 +45,9 @@ def _stub_cmd_uninstall_internals(monkeypatch, *, env_ok, tty=True):
                         SimpleNamespace(disable=lambda: {"ok": True}))
     monkeypatch.setattr(srouter, "_remove_ppp_hook", lambda *a, **k: "")
     monkeypatch.setattr(srouter, "_remove_codex_wrappers", lambda: "")
+    if hasattr(srouter, "_remove_codex_zsh_function"):
+        # issue #97: лезет в реальный ~/.zshrc (_zshrc_path = Path.home()/.zshrc, не замокан).
+        monkeypatch.setattr(srouter, "_remove_codex_zsh_function", lambda: "")
     monkeypatch.setattr(srouter, "_remove_home_bin_from_path", lambda: "")
     # ЕДИНСТВЕННЫЙ варьируемый параметр: статус env-cleanup.
     monkeypatch.setattr(srouter, "_remove_launchctl_env",
@@ -65,3 +76,30 @@ def test_cmd_uninstall_returns_zero_when_env_removed(monkeypatch):
     rc = srouter.cmd_uninstall(_args())
 
     assert rc == 0, f"env снят → rc=0, получил {rc}"
+
+
+# ============================ -y/--yes минует TTY-gate (issue #106) ============================
+# cmd_uninstall падал в не-TTY среде (cron/launchd/CI/фоновый процесс) ДАЖЕ с -y: isatty()-gate
+# стоял ДО проверки args.yes. -y именно для того, чтобы промпт не требовался → TTY не требуется.
+def test_cmd_uninstall_yes_works_without_tty(monkeypatch):
+    """issue #106: не-TTY + yes=True → НЕ падает с «требует терминал», доходит до apply (rc=0)."""
+    _stub_cmd_uninstall_internals(monkeypatch, env_ok=True, tty=False)
+
+    rc = srouter.cmd_uninstall(_args(yes=True))
+
+    assert rc == 0, f"не-TTY + -y должно работать как неинтерактивный запуск, получил {rc}"
+
+
+def test_cmd_uninstall_no_tty_without_yes_fails_closed(monkeypatch, capsys):
+    """issue #106 (fail-closed сохранён): не-TTY + yes=False → rc=2 с «требует терминал».
+
+    Нельзя запускать uninstall неинтерактивно БЕЗ явного -y — иначе промпт _prompt_bool зависнет
+    или прочитает EOF. Gate остаётся, но теперь он смотрит И isatty, И yes.
+    """
+    _stub_cmd_uninstall_internals(monkeypatch, env_ok=True, tty=False)
+
+    rc = srouter.cmd_uninstall(_args(yes=False))
+
+    assert rc == 2, f"не-TTY без -y → отказ (нет ни TTY, ни подтверждения), получил {rc}"
+    err = capsys.readouterr().err.lower()
+    assert "терминал" in err, f"stderr объясняет: нужен TTY или -y: {err}"
