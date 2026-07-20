@@ -162,17 +162,23 @@ def _claude_proxy_probe():
             "detail": "runtime: Claude Code запущен, но без коннекта к privoxy (перезапусти CC)"}
 
 
-# codex-binary comm-паттерн. Строгий к полному пути npm-vendor-бинаря, НЕ матчит mode-host/wrapper.
-# Реальный comm (ps -axo comm=, macOS отдаёт полный путь):
-#   /opt/homebrew/lib/node_modules/@openai/codex/.../vendor/aarch64-apple-darwin/bin/codex
-# Соседний codex-code-mode-host (другой binary) — НЕ должен матчиться. `which codex` не доказательство
-# (wrapper использует exec → процесс выглядит как brew-codex) — поэтому matcher по comm-path, не по env.
-_CODEX_BIN_RE = re.compile(r"codex-darwin.*/bin/codex$")
+# codex-binary comm-паттерн. ОБЩИЙ (не npm-only): матчит любой codex-binary независимо от способа
+# установки — npm-vendor (`.../codex-darwin-arm64/.../bin/codex`), Homebrew cask
+# (`/opt/homebrew/Caskroom/codex/<ver>/codex-aarch64-apple-darwin`), standalone-installer (`~/.local/bin/codex`),
+# release-binary. Исключает codex-code-mode-host (другой binary — НЕ основной codex-движок).
+# `which codex` НЕ доказательство (wrapper exec маскирует) → matcher по resolved comm-path.
+# cycle-review #121 C1: npm-only regex пропускал brew-cask/standalone → doctor ложно «codex не запущен».
+_CODEX_BIN_RE = re.compile(r"codex")
+_CODEX_MODE_HOST_RE = re.compile(r"codex-code-mode-host")
 
 
 def _is_codex_binary_comm(comm):
-    """Является ли comm основным codex-binary (npm vendor path)? Не mode-host, не wrapper, не shell."""
-    return bool(comm) and bool(_CODEX_BIN_RE.search(comm))
+    """Является ли comm основным codex-binary? Любой способ установки; НЕ mode-host (другой binary)."""
+    if not comm:
+        return False
+    if _CODEX_MODE_HOST_RE.search(comm):
+        return False  # mode-host — вспомогательный процесс, не основной codex-binary
+    return bool(_CODEX_BIN_RE.search(comm))
 
 
 def _codex_proxy_probe():
@@ -210,12 +216,13 @@ def _codex_proxy_probe():
     if lr.get("timeout"):
         return {"status": "unknown", "source": "n/a", "detail": "timeout lsof"}
 
-    socks_pids, privoxy_pids = set(), set()
-    has_external = False
+    # 3. Классификация per-PID по множествам маршрутов. external_pids (per-PID, не bool) — критично для
+    # C2: SOCKS-PID + direct-PID → mixed (не ok), иначе direct-сессия маскируется (#121 cycle 1 C2).
+    socks_pids, privoxy_pids, external_pids = set(), set(), set()
     for line in (lr.get("out") or "").splitlines():
         if "TCP" not in line or "ESTABLISHED" not in line:
             continue
-        # localhost-прокси: ->127.0.0.1:PORT. PID — первое поле.
+        # localhost-прокси: ->127.0.0.1:PORT. PID — fields[1] (COMMAND=0, PID=1 в lsof-выводе).
         fields = line.split()
         pid = fields[1] if len(fields) > 1 else ""
         if f"->127.0.0.1:{XRAY_PORT}" in line:
@@ -223,25 +230,41 @@ def _codex_proxy_probe():
         elif f"->127.0.0.1:{PRIVOXY_PORT}" in line:
             privoxy_pids.add(pid)
         elif "->127.0.0.1:" not in line:
-            # external ESTABLISHED (не localhost) — codex идёт напрямую.
-            has_external = True
+            # external ESTABLISHED (не localhost) — codex идёт напрямую. Track per-PID.
+            external_pids.add(pid)
 
-    # 3. Классификация по множествам.
-    if socks_pids and not privoxy_pids:
+    # 4. Классификация по комбинации множеств. Любая direct-сессия при SOCKS-сессии → mixed
+    # (multi-session-утечка, которую probe должен ловить — #120/#121 C2).
+    def _fmt(status, **kw):
+        parts = []
+        if kw.get("socks"):
+            parts.append(f"10808 (PID {','.join(sorted(kw['socks']))})")
+        if kw.get("privoxy"):
+            parts.append(f"8118 (PID {','.join(sorted(kw['privoxy']))})")
+        if kw.get("external"):
+            parts.append(f"direct (PID {','.join(sorted(kw['external']))})")
+        return ", ".join(parts)
+
+    has_good = bool(socks_pids)
+    has_bad = bool(privoxy_pids or external_pids)
+    if has_good and has_bad:
+        return {"status": "mixed", "source": "runtime",
+                "detail": (f"runtime: смешанные сессии — {_fmt('mixed', socks=socks_pids, privoxy=privoxy_pids, external=external_pids)}; "
+                           f"перезапусти ломаную TUI (exec zsh -l)")}
+    if socks_pids:
         return {"status": "ok", "source": "runtime",
                 "detail": f"runtime: codex через SOCKS5 10808 (PID {','.join(sorted(socks_pids))})"}
-    if privoxy_pids and not socks_pids:
+    if privoxy_pids and not external_pids:
         return {"status": "warn", "source": "runtime",
                 "detail": (f"runtime: codex через privoxy 8118 — long-lived WS порвётся (#120); "
                            f"перезапусти TUI в новом терминале (exec zsh -l). PID {','.join(sorted(privoxy_pids))}")}
-    if socks_pids and privoxy_pids:
-        return {"status": "mixed", "source": "runtime",
-                "detail": (f"runtime: смешанные сессии — 10808 (PID {','.join(sorted(socks_pids))}), "
-                           f"8118 (PID {','.join(sorted(privoxy_pids))}); перезапусти ломаную TUI")}
-    # Ни socks, ни privoxy — но codex запущен. Если есть external → напрямую; иначе idle (между retry).
-    if has_external:
+    if external_pids and not privoxy_pids:
         return {"status": "down", "source": "runtime",
-                "detail": "runtime: codex идёт напрямую (external IP, без прокси) — PF/провайдер режет"}
+                "detail": f"runtime: codex идёт напрямую (external IP, без прокси) — PF/провайдер режет. PID {','.join(sorted(external_pids))}"}
+    if privoxy_pids and external_pids:
+        # оба плохих, но без SOCKS — классифицируем как down (хуже warn).
+        return {"status": "down", "source": "runtime",
+                "detail": f"runtime: codex через privoxy 8118 + direct — нет SOCKS-маршрута. PID {_fmt('down', privoxy=privoxy_pids, external=external_pids)}"}
     return {"status": "unknown", "source": "runtime",
             "detail": f"runtime: codex запущен (PID {','.join(sorted(pids))}), но нет активных сокетов (idle)"}
 

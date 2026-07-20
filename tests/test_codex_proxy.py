@@ -122,3 +122,51 @@ def test_codex_probe_timeout_lsof_unknown(monkeypatch):
     monkeypatch.setattr(health.sys_probe, "run", _fake(ps, "", lsof_timeout=True))
     res = health._codex_proxy_probe()
     assert res["status"] == "unknown", "lsof timeout → unknown (не false-warn/down)"
+
+
+# ============================ cycle-review #121 cycle 1: adversarial findings (codex) ============================
+
+# Альтернативные пути установки codex (не только npm-vendor). README openai/codex допускает
+# Homebrew cask, standalone-installer, release-binary. matcher должен детектить их всех (иначе doctor
+# ложно скажет «codex не запущен» → info-only → global OK, хотя codex работает и, возможно, ломается).
+CODEX_CASK_COMM = "/opt/homebrew/Caskroom/codex/0.144.5/codex-aarch64-apple-darwin"
+CODEX_STANDALONE_COMM = "/Users/me/.local/bin/codex"
+
+
+def test_codex_probe_detects_brew_cask_codex(monkeypatch):
+    """C1: Homebrew-cask codex (`/opt/homebrew/Caskroom/codex/.../codex-aarch64-apple-darwin`) — детектится.
+
+    Сейчас regex `codex-darwin.*/bin/codex$` НЕ матчит cask-path (нет `/bin/codex` суффикса). На машине
+    с brew-cask codex doctor скажет «codex не запущен» (unknown/info-only), global OK — хотя codex
+    может идти через privoxy и рвать WS. matcher должен быть по basename/resolved-binary, не npm-layout.
+    """
+    ps = f"50001 {CODEX_CASK_COMM}\n"
+    lsof = _lsof_line(50001, 54813, health.XRAY_PORT)
+    monkeypatch.setattr(health.sys_probe, "run", _fake(ps, lsof))
+    res = health._codex_proxy_probe()
+    assert res["status"] == "ok", "brew-cask codex на 10808 → ok (matcher не только npm-vendor)"
+
+
+def test_codex_probe_detects_standalone_codex(monkeypatch):
+    """C1: standalone-installer codex (`~/.local/bin/codex`) — детектится (не mode-host)."""
+    ps = f"50002 {CODEX_STANDALONE_COMM}\n"
+    lsof = _lsof_line(50002, 54814, health.PRIVOXY_PORT)
+    monkeypatch.setattr(health.sys_probe, "run", _fake(ps, lsof))
+    res = health._codex_proxy_probe()
+    assert res["status"] == "warn", "standalone codex на 8118 → warn (matcher общий, не npm-only)"
+
+
+def test_codex_probe_socks_plus_direct_is_mixed_not_ok(monkeypatch):
+    """C2: PID на 10808 + другой PID напрямую (external) → mixed (не ok).
+
+    Баг: SOCKS-ветка возвращала ok ДО проверки has_external → direct-PID маскировался. Сценарий: одна
+    TUI-сессия рабочая (10808), другая обходит прокси (напрямую) — doctor говорил ok, пряча утечку.
+    Это ровно multi-session-дыра, которую probe должен ловить (#120).
+    """
+    ps = f"101 {CODEX_BIN_COMM}\n202 {CODEX_BIN_COMM}\n"
+    lsof = (_lsof_line(101, 54813, health.XRAY_PORT)  # PID 101 — SOCKS5
+            + "codex 202 axisrow 32u IPv4 0xABC 0t0 TCP 192.168.1.5:54814->104.244.46.93:443 (ESTABLISHED)\n")  # PID 202 — direct
+    monkeypatch.setattr(health.sys_probe, "run", _fake(ps, lsof))
+    res = health._codex_proxy_probe()
+    assert res["status"] != "ok", "SOCKS + direct → НЕ ok (direct-PID не замаскирован)"
+    assert "202" in res["detail"], "detail называет direct-PID (202)"
