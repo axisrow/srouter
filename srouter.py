@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import os
+import re
 import shlex
 import shutil
 import sys
@@ -263,6 +264,23 @@ CODEX_WRAPPERS = (
 CODEX_ENV_LABEL = "com.srouter.codenv"
 CODEX_ENV_MARKER = "srouter-managed-codex-env-v1"
 ZSHRC_PATH_MARKER = "# srouter: ~/bin в PATH для codex wrapper"
+# Shell-функция codex() в ~/.zshrc (issue #96): вызывает ~/bin/codex по абсолютному пути, чтобы
+# порядок brew в PATH был не важен (функция всегда бьёт binary). Без неё wrapper #83 проигрывает
+# /opt/homebrew/bin/codex. Парные маркеры для marker-gate install/remove (как ZSHRC_PATH_MARKER).
+ZSHRC_CODEX_FUNC_MARKER_BEGIN = "# >>> srouter-managed-codex-function-v1 >>>"
+ZSHRC_CODEX_FUNC_MARKER_END = "# <<< srouter-managed-codex-function-v1 <<<"
+# function codex { … }, не голый codex() — существующий alias может помешать парсингу определения.
+# guard `! $+aliases[codex] && ! $+functions[codex]` — не перекрываем молча чужое определение.
+# Без exec внутри (заменит интерактивный шелл). Абсолютный путь "$HOME/bin/codex".
+_CODEX_FUNC_BLOCK = (
+    f"{ZSHRC_CODEX_FUNC_MARKER_BEGIN}\n"
+    'if (( ! ${+aliases[codex]} && ! ${+functions[codex]} )); then\n'
+    '  function codex {\n'
+    '    "$HOME/bin/codex" "$@"\n'
+    '  }\n'
+    "fi\n"
+    f"{ZSHRC_CODEX_FUNC_MARKER_END}"
+)
 
 
 def _codex_wrapper_path(name: str) -> Path:
@@ -297,7 +315,14 @@ def _install_one_wrapper(env, wrapper_path: Path, template_name: str, marker: st
         if not codex_bin:
             return f"Codex {wrapper_path.name}: codex binary не найден — wrapper не установлен (установи codex)."
         template = (env.root / "launchagents" / template_name).read_text(encoding="utf-8")
-        rendered = template.replace("__SROUTER_CODEX_BIN__", codex_bin)
+        # Рендер всех плейсхолдеров из единого источника правды (_CODEX_PROXY_URL/CODEX_NO_PROXY),
+        # не хардкод литералов. CLI-wrapper (srouter-codex-cli-wrapper.sh) использует все три;
+        # App-wrapper (__SROUTER_CODEX_BIN__) — только бинарь (прочие плейсхолдеры там отсутствуют,
+        # .replace на отсутствующую подстроку — no-op). Issue #96.
+        rendered = (template
+                    .replace("__SROUTER_CODEX_BIN__", codex_bin)
+                    .replace("__SROUTER_CODEX_PROXY_URL__", _CODEX_PROXY_URL)
+                    .replace("__SROUTER_CODEX_NO_PROXY__", CODEX_NO_PROXY))
         wrapper_path.parent.mkdir(parents=True, exist_ok=True)
         if not _write_text_atomic(wrapper_path, rendered):
             return f"Codex {wrapper_path.name}: не записан (ошибка atomic write)."
@@ -502,6 +527,74 @@ def _remove_home_bin_from_path() -> str:
         return f"PATH: не убран ({str(exc)[:80]})."
 
 
+def _install_codex_zsh_function(env) -> str:
+    """Добавить shell-функцию codex() в ~/.zshrc (issue #96).
+
+    Функция вызывает ~/bin/codex по АБСОЛЮТНОМУ пути — порядок brew в PATH не важен (функция всегда
+    бьёт binary). Без неё wrapper #83 проигрывает /opt/homebrew/bin/codex → Codex идёт через privoxy
+    (наследует HTTP_PROXY от ~/.claude/settings.json env) → режёт WS → "Falling back to HTTPS".
+
+    Marker-gate (парные begin/end) + backup через install_lib._backup + atomic write — тот же
+    канон, что _ensure_home_bin_in_path. Fail-closed: чужой alias codex/function codex без нашего
+    маркера → НЕ добавляем блок (не перекрываем молча).
+    """
+    try:
+        from install_lib import _backup
+        zshrc = _zshrc_path()
+        content = zshrc.read_text(encoding="utf-8") if zshrc.exists() else ""
+        # Idempotent: блок уже на месте.
+        if ZSHRC_CODEX_FUNC_MARKER_BEGIN in content:
+            return "Codex функция: уже в ~/.zshrc (idempotent)."
+        # Fail-closed: чужое определение codex (alias или function) без нашего маркера — не трогаем.
+        # `alias codex=` или `codex()` или `function codex`/`codex ()`. Ищем как определение,
+        # не как упоминание в комментарии (требуем синтаксис присваивания/определения).
+        has_foreign = bool(re.search(r'(^|\n)\s*(alias\s+codex\s*=|function\s+codex\b|codex\s*\(\s*\)\s*\{)',
+                                    content))
+        if has_foreign:
+            return ("Codex функция: обнаружен чужой alias/function codex в ~/.zshrc — "
+                    "не добавляю (конфликт). ~/bin/codex доступен как явная точка входа.")
+        if not zshrc.exists():
+            _write_text_atomic(zshrc, _CODEX_FUNC_BLOCK + "\n")
+            return "Codex функция: создан ~/.zshrc с codex() → ~/bin/codex (новый терминал подхватит)."
+        _backup(zshrc, env)  # timestamped backup, каноничный helper
+        _write_text_atomic(zshrc, content.rstrip() + "\n\n" + _CODEX_FUNC_BLOCK + "\n")
+        return ("Codex функция: добавлена в ~/.zshrc (codex → ~/bin/codex по абс. пути, "
+                "бьёт brew в PATH). Backup: .zshrc.srouter-backup-*.")
+    except Exception as exc:
+        return f"Codex функция: не добавлена ({str(exc)[:80]})."
+
+
+def _remove_codex_zsh_function() -> str:
+    """Убрать managed-блок codex() из ~/.zshrc (симметрично _install_codex_zsh_function).
+
+    Удаляет ТОЛЬКО парный begin…end блок (включая function-определение внутри). Чужой контент
+    (export PATH, комментарии, чужой alias/function codex — если появился позже) НЕ трогаем.
+    Если маркеры непарные (повреждённое состояние) — fail-closed: отказ, не широкое удаление.
+    """
+    try:
+        zshrc = _zshrc_path()
+        if not zshrc.exists():
+            return "Codex функция: не была изменена."
+        content = zshrc.read_text(encoding="utf-8")
+        if ZSHRC_CODEX_FUNC_MARKER_BEGIN not in content and ZSHRC_CODEX_FUNC_MARKER_END not in content:
+            return "Codex функция: не была изменена."
+        # Fail-closed: ровно один парный блок. Непарный/дублированный → отказ (safe-noop).
+        begins = content.count(ZSHRC_CODEX_FUNC_MARKER_BEGIN)
+        ends = content.count(ZSHRC_CODEX_FUNC_MARKER_END)
+        if begins != 1 or ends != 1 or begins != ends:
+            return ("Codex функция: не удалена — повреждённый маркер "
+                    f"(begin={begins}, end={ends}), проверь ~/.zshrc вручную.")
+        start = content.index(ZSHRC_CODEX_FUNC_MARKER_BEGIN)
+        end = content.index(ZSHRC_CODEX_FUNC_MARKER_END) + len(ZSHRC_CODEX_FUNC_MARKER_END)
+        # Зачистить окружающие пустые строки (мы добавляли \n\n перед блоком при install).
+        before = content[:start].rstrip("\n")
+        out = before + ("\n" if before else "") + content[end:]
+        _write_text_atomic(zshrc, out.rstrip() + "\n")
+        return "Codex функция: убрана из ~/.zshrc."
+    except Exception as exc:
+        return f"Codex функция: не убрана ({str(exc)[:80]})."
+
+
 def cmd_install(args) -> int:
     """Полная установка стека: brew-сервисы + конфиги + DNS + LaunchAgent.
 
@@ -574,9 +667,11 @@ def cmd_install(args) -> int:
                    f"Watchdog: не установлен ({wd_err}).")
         # ppp-hook: мгновенный split-route при VPN up (/etc/ppp/ip-up, от root, без osascript).
         ppp_note = _install_ppp_hook(env, runner)
-        # Codex SOCKS5-wrappers (~/.local/bin wrappers через ~/bin) + launchctl env + PATH —
-        # чтобы Codex (CLI и App) ходил напрямую в xray (10808), минуя privoxy (портит WS-стриминг).
+        # Codex SOCKS5-wrappers (~/.local/bin wrappers через ~/bin) + launchctl env + PATH +
+        # shell-функция codex() в ~/.zshrc — чтобы Codex (CLI и App) ходил напрямую в xray (10808),
+        # минуя privoxy (портит WS-стриминг). Функция (#96) гарантирует победу над brew в PATH.
         codex_note = _install_codex_wrappers(env)
+        codex_func_note = _install_codex_zsh_function(env)
         env_note = _install_launchctl_env(env, runner)
         path_note = _ensure_home_bin_in_path(env)
         print("Установка стека завершена: brew-сервисы, конфиги, DNS, LaunchAgent применены.\n"
@@ -584,6 +679,7 @@ def cmd_install(args) -> int:
               f"{wd_note}\n"
               f"{ppp_note}\n"
               f"{codex_note}\n"
+              f"{codex_func_note}\n"
               f"{env_note}\n"
               f"{path_note}\n"
               f"Дашборд: http://127.0.0.1:8787  (srouter status — проверить)")
@@ -642,8 +738,10 @@ def cmd_uninstall(args) -> int:
 
     # 6) Удалить ppp-hook (/etc/ppp/ip-up) — мгновенный split-route больше не нужен.
     ppp_note = ". " + _remove_ppp_hook(runner)
-    # 7) Удалить Codex SOCKS5-wrappers + снять launchctl env + убрать ~/bin из PATH (ставил install).
+    # 7) Удалить Codex SOCKS5-wrappers + shell-функцию codex() + снять launchctl env + убрать ~/bin
+    #    из PATH (всё ставил install). marker-gate: чужое не трогаем.
     codex_note = ". " + _remove_codex_wrappers()
+    codex_func_note = ". " + _remove_codex_zsh_function()
     env_status = _remove_launchctl_env(runner)
     env_note = ". " + env_status["note"]
     path_note = ". " + _remove_home_bin_from_path()
@@ -660,6 +758,7 @@ def cmd_uninstall(args) -> int:
           + cp_note
           + ppp_note
           + codex_note
+          + codex_func_note
           + env_note
           + path_note)
     if not env_status["ok"]:

@@ -61,10 +61,20 @@ def test_install_creates_wrappers(monkeypatch, tmp_path):
         text = w.read_text(encoding="utf-8")
         assert marker in text, f"~/bin/{name} содержит srouter-маркер"
         assert os.access(w, os.X_OK), f"~/bin/{name} executable"
-    # CLI wrapper: socks5h (DNS via proxy для GFW) + exec реального codex.
+    # CLI wrapper: socks5h (DNS via proxy для GFW) + env -u санирует унаследованный прокси
+    # (от ~/.claude/settings.json env) + exec реального codex. Issue #96: без очистки privoxy
+    # из окружения Codex идёт через 8118 → privoxy режёт WS → "Falling back to HTTPS".
     cli_text = (bin_dir / "codex").read_text(encoding="utf-8")
     assert "socks5h://" in cli_text, "CLI использует socks5h (DNS via proxy)"
     assert "exec " in cli_text, "CLI exec'ает реальный codex"
+    # env -u для всех 8 прокси-переменных (верхний/нижний регистр + ALL_PROXY + NO_PROXY).
+    for var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+                "http_proxy", "https_proxy", "all_proxy",
+                "NO_PROXY", "no_proxy"):
+        assert f"-u {var}" in cli_text, f"CLI очищает унаследованную {var} через env -u (#96)"
+    # НИ ОДНОГО упоминания privoxy/8118 — launcher не должен тащить HTTP-прокси.
+    assert "8118" not in cli_text, "CLI launcher не содержит privoxy-порт (#96)"
+    assert "127.0.0.1:10808" in cli_text, "CLI指向 xray SOCKS5 10808"
     # App wrapper: --proxy-server (Chromium flag, env от install-plist не дублируется).
     app_text = (bin_dir / "codex-app-proxy").read_text(encoding="utf-8")
     assert "--proxy-server=socks5://" in app_text, "App передаёт Chromium --proxy-server"
@@ -81,6 +91,98 @@ def test_install_marker_gate_foreign_not_touched(monkeypatch, tmp_path):
 
     assert "чуж" in note.lower(), f"должен отказаться трогать чужой: {note}"
     assert (home / "bin" / "codex").read_text(encoding="utf-8") == foreign
+
+
+def test_cli_launcher_renders_configured_proxy(monkeypatch, tmp_path):
+    """Launcher рендерит __SROUTER_CODEX_PROXY_URL__/__SROUTER_CODEX_NO_PROXY__ из модульных
+    констант, а не хардкодит 10808. Меняем источник — меняется launcher (#96, anti-drift)."""
+    _mock_home(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    monkeypatch.setattr(srouter, "_CODEX_PROXY_URL", "socks5h://127.0.0.1:99999")
+    monkeypatch.setattr(srouter, "CODEX_NO_PROXY", "localhost,internal")
+
+    srouter._install_codex_wrappers(env)
+    cli_text = (Path.home() / "bin" / "codex").read_text(encoding="utf-8")
+
+    assert "127.0.0.1:99999" in cli_text, "launcher использует отрендеренный _CODEX_PROXY_URL"
+    assert "internal" in cli_text, "launcher использует отрендеренный CODEX_NO_PROXY"
+    assert "10808" not in cli_text, "launcher НЕ хардкодит 10808 литералом"
+
+
+def _install_with_fake_codex(monkeypatch, tmp_path, fake_bin):
+    """Общий хелпер интеграционных тестов launcher'а: monkeypatch _codex_bin_path → fake_bin
+    ДО install, чтобы launcher сразу отрендерился с fake-codex (а не с реальным /opt/homebrew/...,
+    который при запуске без TTY падает «stdin is not a terminal»). Возвращает путь к wrapper."""
+    _mock_home(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    monkeypatch.setattr(srouter, "_codex_bin_path", lambda: str(fake_bin))
+    srouter._install_codex_wrappers(env)
+    return Path.home() / "bin" / "codex"
+
+
+def test_cli_launcher_clears_inherited_privoxy_env(monkeypatch, tmp_path):
+    """Интеграционный (#96 core): запуск ~/bin/codex с унаследованным privoxy-окружением →
+    дочерний codex видит SOCKS5, privoxy (8118) отсутствует. Доказывает env -u работает.
+
+    Fake-codex дампит своё окружение в JSON — проверяем значения 8 переменных.
+    """
+    import json
+    import subprocess
+    out_file = tmp_path / "child-env.json"
+    fake_bin = tmp_path / "fake-codex"
+    fake_bin.write_text(
+        "#!/bin/sh\n"
+        f"python3 -c \"import json,os; "
+        f"json.dump(dict((k,os.environ.get(k,'')) for k in "
+        f"['HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','http_proxy','https_proxy','all_proxy',"
+        f"'NO_PROXY','no_proxy']), open('$OUT','w'))\"\n",
+        encoding="utf-8")
+    fake_bin.chmod(0o755)
+    wrapper = _install_with_fake_codex(monkeypatch, tmp_path, fake_bin)
+    # Наследуем privoxy-окружение (как от ~/.claude/settings.json env).
+    inherited = {
+        "HTTP_PROXY": "http://127.0.0.1:8118", "HTTPS_PROXY": "http://127.0.0.1:8118",
+        "ALL_PROXY": "http://127.0.0.1:8118",
+        "http_proxy": "http://127.0.0.1:8118", "https_proxy": "http://127.0.0.1:8118",
+        "all_proxy": "http://127.0.0.1:8118",
+        "NO_PROXY": "localhost,127.0.0.1,::1,z.ai", "no_proxy": "localhost,127.0.0.1,::1,z.ai",
+        "OUT": str(out_file),
+    }
+    subprocess.run([str(wrapper), "arg1"], env={**os.environ, **inherited},
+                   check=True, timeout=10)
+    child = json.loads(out_file.read_text(encoding="utf-8"))
+    for k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+              "http_proxy", "https_proxy", "all_proxy"):
+        assert child[k] == "socks5h://127.0.0.1:10808", \
+            f"{k} = SOCKS5 в дочернем процессе (не унаследованный privoxy): {child[k]}"
+        assert "8118" not in child[k], f"{k} не содержит privoxy-порт"
+    assert "z.ai" not in child["NO_PROXY"], "NO_PROXY очищен от чужих z.ai-исключений"
+
+
+def test_cli_launcher_forwards_argv_verbatim(monkeypatch, tmp_path):
+    """argv доходит до codex-бинаря как есть: пробелы, кавычки, glob-символы, ведущие дефисы."""
+    import subprocess
+    argv_file = tmp_path / "argv.txt"
+    fake_bin = tmp_path / "fake-codex"
+    fake_bin.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$@\" > {argv_file}\n", encoding="utf-8")
+    fake_bin.chmod(0o755)
+    wrapper = _install_with_fake_codex(monkeypatch, tmp_path, fake_bin)
+    args = ["--flag", "with space", "with'quote", "*.glob", "--", "-leading-dash"]
+    subprocess.run([str(wrapper), *args], env={**os.environ, "OUT": "x"},
+                   check=True, timeout=10)
+    forwarded = argv_file.read_text(encoding="utf-8").splitlines()
+    assert forwarded == args, f"argv проброшен verbatim: {forwarded}"
+
+
+def test_cli_launcher_propagates_exit_status(monkeypatch, tmp_path):
+    """exec пробрасывает exit-код реального codex (например 23) — без потерь."""
+    import subprocess
+    fake_bin = tmp_path / "fake-codex"
+    fake_bin.write_text("#!/bin/sh\nexit 23\n", encoding="utf-8")
+    fake_bin.chmod(0o755)
+    wrapper = _install_with_fake_codex(monkeypatch, tmp_path, fake_bin)
+    rc = subprocess.run([str(wrapper)], env={**os.environ, "OUT": "x"}).returncode
+    assert rc == 23, f"launcher возвращает реальный exit-код: {rc}"
 
 
 def test_install_idempotent(monkeypatch, tmp_path):
@@ -602,3 +704,178 @@ def test_remove_home_bin_when_not_modified(monkeypatch, tmp_path):
 
     assert "не был" in note.lower()
     assert zshrc.read_text(encoding="utf-8") == original
+
+
+# ============================ _install/_remove_codex_zsh_function (issue #96) ============================
+# Shell-функция codex() в ~/.zshrc вызывает ~/bin/codex по абсолютному пути — тогда порядок brew в
+# PATH не важен (функция всегда бьёт binary). Без неё wrapper #83 проигрывает /opt/homebrew/bin/codex.
+def test_codex_function_installed_in_zshrc(monkeypatch, tmp_path):
+    """install добавляет managed-блок codex() с парными маркерами, вызывающий ~/bin/codex."""
+    home = _mock_home(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    zshrc = home / ".zshrc"
+    zshrc.write_text("export PATH=/usr/local/bin:$PATH\n", encoding="utf-8")
+
+    note = srouter._install_codex_zsh_function(env)
+
+    assert "установ" in note.lower() or "добав" in note.lower(), f"install должен éxito: {note}"
+    content = zshrc.read_text(encoding="utf-8")
+    assert srouter.ZSHRC_CODEX_FUNC_MARKER_BEGIN in content, "begin-маркер присутствует"
+    assert srouter.ZSHRC_CODEX_FUNC_MARKER_END in content, "end-маркер присутствует"
+    assert 'function codex' in content, "определение function codex"
+    assert '"$HOME/bin/codex" "$@"' in content, "вызов по абсолютному пути ~/bin/codex"
+    # guard: не перекрывает молча, если рядом уже есть определение
+    assert '${+aliases[codex]}' in content and '${+functions[codex]}' in content
+    # чужой export сохранён
+    assert '/usr/local/bin' in content
+
+
+def test_codex_function_install_idempotent(monkeypatch, tmp_path):
+    """Повторный install оставляет ровно один managed-блок."""
+    home = _mock_home(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    zshrc = home / ".zshrc"
+    zshrc.write_text("export FOO=1\n", encoding="utf-8")
+
+    srouter._install_codex_zsh_function(env)
+    srouter._install_codex_zsh_function(env)
+
+    content = zshrc.read_text(encoding="utf-8")
+    assert content.count(srouter.ZSHRC_CODEX_FUNC_MARKER_BEGIN) == 1, "один begin-маркер"
+    assert content.count(srouter.ZSHRC_CODEX_FUNC_MARKER_END) == 1, "один end-маркер"
+    assert content.count('function codex') == 1, "одно определение функции"
+    assert 'export FOO=1' in content, "чужой контент сохранён"
+
+
+def test_codex_function_preserves_foreign_alias(monkeypatch, tmp_path):
+    """Fail-closed: чужой `alias codex=…` без srouter-маркера → блок НЕ добавлен, alias неизменён."""
+    home = _mock_home(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    zshrc = home / ".zshrc"
+    zshrc.write_text("alias codex='/usr/local/bin/my-codex'\n", encoding="utf-8")
+    before = zshrc.read_text(encoding="utf-8")
+
+    note = srouter._install_codex_zsh_function(env)
+
+    assert "чуж" in note.lower() or "конфликт" in note.lower() or "не добав" in note.lower(), \
+        f"должен отказаться перекрывать чужой alias: {note}"
+    assert zshrc.read_text(encoding="utf-8") == before, "чужой alias не изменён"
+    assert srouter.ZSHRC_CODEX_FUNC_MARKER_BEGIN not in zshrc.read_text(encoding="utf-8"), \
+        "managed-блок не добавлен при конфликте"
+
+
+def test_codex_function_preserves_foreign_function(monkeypatch, tmp_path):
+    """Fail-closed: чужая `function codex {}` → блок НЕ добавлен."""
+    home = _mock_home(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    zshrc = home / ".zshrc"
+    zshrc.write_text("function codex { /usr/local/bin/my-codex \"$@\"; }\n", encoding="utf-8")
+    before = zshrc.read_text(encoding="utf-8")
+
+    note = srouter._install_codex_zsh_function(env)
+
+    assert any(w in note.lower() for w in ("чуж", "конфликт", "не добав")), \
+        f"должен отказаться перекрывать чужую функцию: {note}"
+    assert zshrc.read_text(encoding="utf-8") == before
+    assert srouter.ZSHRC_CODEX_FUNC_MARKER_BEGIN not in zshrc.read_text(encoding="utf-8")
+
+
+def test_codex_function_uninstall_removes_only_managed_block(monkeypatch, tmp_path):
+    """uninstall удаляет ТОЛЬКО парный begin…end блок, чужой контент (включая export PATH) сохранён."""
+    home = _mock_home(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    zshrc = home / ".zshrc"
+    zshrc.write_text(
+        'export PATH=/usr/local/bin:$PATH\n'
+        '# user comment\n', encoding="utf-8")
+    srouter._install_codex_zsh_function(env)
+    assert srouter.ZSHRC_CODEX_FUNC_MARKER_BEGIN in zshrc.read_text(encoding="utf-8")
+
+    note = srouter._remove_codex_zsh_function()
+
+    assert "удал" in note.lower() or "снят" in note.lower() or "убран" in note.lower(), f"{note}"
+    content = zshrc.read_text(encoding="utf-8")
+    assert srouter.ZSHRC_CODEX_FUNC_MARKER_BEGIN not in content, "begin убран"
+    assert srouter.ZSHRC_CODEX_FUNC_MARKER_END not in content, "end убран"
+    assert 'function codex' not in content, "определение функции убрано"
+    assert '/usr/local/bin' in content, "чужой export сохранён"
+    assert '# user comment' in content, "чужой комментарий сохранён"
+
+
+def test_codex_function_uninstall_when_not_installed(monkeypatch, tmp_path):
+    """zshrc без managed-блока — мягкий статус, не ошибка, чужое не трогать."""
+    home = _mock_home(monkeypatch, tmp_path)
+    zshrc = home / ".zshrc"
+    original = "alias codex=/usr/local/bin/codex\n"
+    zshrc.write_text(original, encoding="utf-8")
+
+    note = srouter._remove_codex_zsh_function()
+
+    assert "не был" in note.lower(), f"{note}"
+    assert zshrc.read_text(encoding="utf-8") == original
+
+
+def test_codex_function_malformed_marker_fails_closed(monkeypatch, tmp_path):
+    """Непарный маркер (есть begin, нет end) → uninstall НЕ удаляет широко (fail-closed, safe-noop)."""
+    home = _mock_home(monkeypatch, tmp_path)
+    zshrc = home / ".zshrc"
+    # Только begin-маркер без end (повреждённое состояние) + чужой контент после.
+    broken = (
+        f'{srouter.ZSHRC_CODEX_FUNC_MARKER_BEGIN}\n'
+        'function codex { "$HOME/bin/codex" "$@"; }\n'
+        'export PATH=/usr/local/bin:$PATH\n'  # НЕТ end-маркера
+    )
+    zshrc.write_text(broken, encoding="utf-8")
+
+    note = srouter._remove_codex_zsh_function()
+
+    content = zshrc.read_text(encoding="utf-8")
+    # Не должен молча удалить чужой export, оставив begin висеть. Безопасный исход — отказ/noop.
+    assert "не был" in note.lower() or "поврежд" in note.lower() or "не пар" in note.lower(), \
+        f"непарный маркер → safe-noop/отказ, не широкое удаление: {note}"
+
+
+def test_codex_function_beats_brew_in_path(monkeypatch, tmp_path):
+    """КЛЮЧЕВОЙ (#96, PATH ≠ evidence): даже если /opt/homebrew/bin/codex ПЕРВЫЙ в PATH,
+    функция codex() перехватывает вызов и доходит до ~/bin/codex (managed-launcher).
+
+    Реальный zsh: source .zshrc с функцией, whence -w codex = function, вызов доходит до fake
+    launcher через $HOME/bin/codex (не до brew-бинаря). Доказывает победу функции над PATH-порядком.
+    """
+    import shutil
+    import subprocess
+    home = _mock_home(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    # brew-codex: фейк, который пишет маркер brew-called в файл (если бы выиграл он).
+    brew_called = tmp_path / "brew-called"
+    brew_dir = tmp_path / "brewbin"
+    brew_dir.mkdir()
+    (brew_dir / "codex").write_text(f"#!/bin/sh\necho brew >> {brew_called}\n", encoding="utf-8")
+    (brew_dir / "codex").chmod(0o755)
+    # managed-launcher: пишет маркер managed-called.
+    managed_called = tmp_path / "managed-called"
+    fake_codex = tmp_path / "fake-real-codex"
+    fake_codex.write_text(f"#!/bin/sh\necho managed >> {managed_called}\n", encoding="utf-8")
+    fake_codex.chmod(0o755)
+    monkeypatch.setattr(srouter, "_codex_bin_path", lambda: str(fake_codex))
+    srouter._install_codex_wrappers(env)
+    srouter._install_codex_zsh_function(env)
+    # PATH: brew ПЕРВЫМ, ~/bin — позже (как в проде через /etc/paths.d/homebrew).
+    zsh = shutil.which("zsh")
+    if not zsh:
+        import pytest
+        pytest.skip("zsh недоступен — runtime-тест функции требует zsh")
+    rc = subprocess.run(
+        [zsh, "-c",
+         f'source {home}/.zshrc; '
+         f'whence -w codex; '
+         f'codex --sentinel'],
+        env={**os.environ,
+             "PATH": f"{brew_dir}:{home}/bin:/usr/bin:/bin",
+             "HOME": str(home)},
+        capture_output=True, text=True, timeout=15)
+    whence = rc.stdout.splitlines()[0] if rc.stdout.strip() else ""
+    assert "function" in whence, f"codex должен быть функцией (не brew-binary): {whence!r}"
+    assert managed_called.exists() and managed_called.read_text(encoding="utf-8").strip() == "managed", \
+        "вызов дошёл до managed-launcher через функцию"
+    assert not brew_called.exists(), "brew-бинарь НЕ был вызван (функция перехватила)"
