@@ -40,3 +40,22 @@ def test_privoxy_lab_config_has_debug_tracing():
     assert "debug 8192" in content, (
         "debug 8192 — трассировка коннектов; host-config этого не делал (слепое пятно для поимки причины)"
     )
+
+
+# ============================ cycle-review #125: adversarial findings ============================
+
+_COMPOSE = Path(__file__).resolve().parents[2] / "docker" / "privoxy-lab" / "docker-compose.yml"
+
+
+def test_privoxy_lab_ports_bound_to_loopback_only():
+    """C2 (CRITICAL): ports 8119 должны быть 127.0.0.1:8119:8119 (НЕ wildcard 0.0.0.0).
+
+    0.0.0.0 = open-proxy на LAN: любой в сети получает неаутентифицированный HTTP-CONNECT-proxy через
+    Reality → VPS exit-IP. Только loopback — агенты на 127.0.0.1:8119, никто извне.
+    """
+    content = _COMPOSE.read_text(encoding="utf-8")
+    # Должна быть строка с 127.0.0.1:8119 (loopback binding).
+    assert "127.0.0.1:8119:8119" in content, (
+        "ports 8119 должны быть привязаны к 127.0.0.1 (loopback-only). "
+        "0.0.0.0 = open proxy на LAN — злоупотребление VPS exit-IP (cycle-review #125 C2)."
+    )

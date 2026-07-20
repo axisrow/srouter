@@ -13,7 +13,7 @@ services:
     build: .       # Dockerfile рядом с docker-compose.yml (docker/privoxy-lab/)
     container_name: srouter-privoxy-lab
     ports:
-      - "8119:8119"          # проброс на host:8119 (агенты могут ходить сюда как на резерв)
+      - "127.0.0.1:8119:8119"   # ТОЛЬКО loopback (cycle-review #125 C2): 0.0.0.0 = open-proxy на LAN
     extra_hosts:
       # Резолв host-xray 10808 (macOS Docker Desktop резолвит host.docker.internal автоматически,
       # но extra_hosts страхует на Linux). privoxy-lab.conf форвардит сюда.
