@@ -25,6 +25,14 @@ def _stub_cmd_uninstall_internals(monkeypatch, *, env_ok, tty=True):
 
     env_ok управляет возвратом _remove_launchctl_env (тестируемая связка). tty — есть ли терминал
     (минует ранний возврат «подтверждение требует терминал»).
+
+    ИНВАРИАНТ: ВСЕ хелперы отката замокаются — cmd_uninstall после apply_uninstall вызывает
+    _remove_active_split_route/claude_proxy.disable/_remove_ppp_hook/_remove_codex_wrappers/
+    _remove_codex_zsh_function (issue #97)/_remove_home_bin_from_path, и КАЖДЫЙ лезет в реальную
+    ФС/сеть/route. `_remove_codex_zsh_function` обязательно: без мока она резолвит реальный
+    Path.home()/.zshrc и удаляет managed-блок — на машине разработчика с установленным srouter
+    (маркер в ~/.zshrc есть) тест молча переписывает shell-конфиг. Cycle-review #108 cycle 2
+    (Codex critical) — зафиксировано spy.
     """
     monkeypatch.setattr(srouter, "_env_from_args", lambda args: SimpleNamespace())
     monkeypatch.setattr(srouter, "make_privileged_runner", lambda *a, **k: (lambda cmd, t: {"rc": 0}))
@@ -37,6 +45,9 @@ def _stub_cmd_uninstall_internals(monkeypatch, *, env_ok, tty=True):
                         SimpleNamespace(disable=lambda: {"ok": True}))
     monkeypatch.setattr(srouter, "_remove_ppp_hook", lambda *a, **k: "")
     monkeypatch.setattr(srouter, "_remove_codex_wrappers", lambda: "")
+    if hasattr(srouter, "_remove_codex_zsh_function"):
+        # issue #97: лезет в реальный ~/.zshrc (_zshrc_path = Path.home()/.zshrc, не замокан).
+        monkeypatch.setattr(srouter, "_remove_codex_zsh_function", lambda: "")
     monkeypatch.setattr(srouter, "_remove_home_bin_from_path", lambda: "")
     # ЕДИНСТВЕННЫЙ варьируемый параметр: статус env-cleanup.
     monkeypatch.setattr(srouter, "_remove_launchctl_env",
