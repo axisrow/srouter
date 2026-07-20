@@ -469,3 +469,29 @@ def test_inspect_component_non_brew_binary_blocks_even_when_reclaimable(tmp_path
     assert result["ok"] is False, ("non_brew_binary при reclaimable НЕ должен авто-разрешаться: "
                                    "install должен блокировать и требовать явного решения")
     assert "privoxy" in result["blocked"], "privoxy в blocked (non_brew_binary не поглощён reclaimable)"
+
+
+def test_inspect_component_foreign_port_blocks_even_when_reclaimable(tmp_path, monkeypatch):
+    """cycle-review #111 cycle 2 finding D: reclaimable НЕ должен гасить foreign_port.
+
+    reclaimable-компонент (state managed, маркер пропал) с ЧУЖИМ процессом на порту: `if owner and not
+    managed` НЕ добавляет foreign_port (managed=True от state). Значит reclaimable молча авто-применяется
+    при живом чужом процессе → brew restart поверх чужого → конкуренция/падение. Симметрично finding 2
+    (non_brew_binary), но про port. Фикс: foreign_port добавляется при чужом owner даже для stale-managed
+    (маркера нет → мы не уверены, что слушатель наш).
+    """
+    env = _env(tmp_path)
+    config_path = _write_config_without_marker(env, "privoxy")
+    detected = _detected(env, "privoxy", mode="managed", managed=True)
+    # Чужой процесс на порту 8118: _port_owner зовёт lsof, возвращаем чужой вывод.
+    lsof_out = "COMMAND PID USER FD TYPE DEVICE NODE NAME\nforeignd 999 me 5u IPv4 0t0 TCP 127.0.0.1:8118 (LISTEN)\n"
+    runner = FakeRunner({(install_lib.LSOF, "-nP", "-iTCP:8118", "-sTCP:LISTEN"):
+                         {"rc": 0, "out": lsof_out, "err": "", "timeout": False}})
+
+    item = install_lib._inspect_component(
+        "privoxy", env, runner, lambda *_a, **_kw: True, prior_detected=detected)
+
+    assert item["reclaimable"] is True, "stale-managed → reclaimable"
+    assert "foreign_port" in item["conflicts"], ("чужой процесс на порту → foreign_port, даже при "
+                                                 "reclaimable (маркера нет → слушатель может быть чужим)")
+    assert item["conflict"] is True, "foreign_port блокирует reclaimable (не авто-применение при чужом процессе)"

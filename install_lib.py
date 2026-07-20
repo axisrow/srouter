@@ -446,7 +446,11 @@ def _inspect_component(name, env, runner, port_checker, prior_detected=None):
     conflicts = []
     if config_present and not managed:
         conflicts.append("foreign_config")
-    if owner and not managed:
+    # foreign_port: порт занят И слушатель НЕ подтверждён наш. Для marker_managed (маркер на месте) — слушатель
+    # это наш brew-сервис (мы им владеем), конфликта нет. Для stale-managed (state managed, маркер пропал) —
+    # слушатель МОЖЕТ быть чужим (cycle-review #111 cycle 2 finding D): brew restart поверх чужого процесса =
+    # конкуренция/падение. Гасим foreign_port только по marker_managed (живой арбитр), не по state.
+    if owner and not marker_managed:
         conflicts.append("foreign_port")
     if non_brew:
         conflicts.append("non_brew_binary")
@@ -1030,20 +1034,24 @@ def apply_uninstall(env=None, *, confirmations=None, runner=run):
 
     actions = []
     components = []
-    # leftover (issue #110 Дефект 1): компоненты, которые srouter СТАВИЛ (item['managed']=True из state),
-    # но uninstall НЕ откатил (не restorable — нет backup / маркер пропал). cmd_uninstall меняет headline
-    # на «Откат выполнен частично» + rc=2. Граница: true-foreign (item['managed']=False — srouter не ставил,
-    # «чужое рядом») → НЕ leftover (легитимное соседство, не обман). Отличает «своё не откатилось» от «чужое рядом».
+    # leftover (issue #110 Дефект 1): stale-managed компоненты — srouter СТАВИЛ (item['managed']=True из
+    # state), НО состояние неопределённое: не restorable (нет backup) И маркер пропал (marker_present=False).
+    # Это и есть «своё не откатилось» — обман, если промолчать; cmd_uninstall меняет headline + rc=2.
+    # Границы (cycle-review #111 cycle 2 finding B — сужение, чтобы не ломать базовый workflow):
+    #   - true-foreign (managed=False — srouter не ставил, «чужое рядом») → НЕ leftover (легитимное соседство).
+    #   - свежий install (managed=True, маркер ЕСТЬ, нет backup) → НЕ leftover: это нормальный managed-конфиг,
+    #     srouter им владеет; restore-only-uninstall оставляет его (deep remove-фикс — отдельный follow-up),
+    #     НО это не partial (состояние определённое: конфиг валиден, с маркером). leftover только для stale.
     leftover = []
     if confirmations.get("configs"):
         for item in plan["components"]:
             components.append(item)
             if not item.get("restorable"):
-                # srouter ставил (state managed=True), но откатить не смог → leftover (обман, если промолчать).
-                # true-foreign (managed=False) → НЕ leftover (чужое рядом легитимно).
-                if item.get("managed"):
+                # stale-managed: ставил, НО маркер пропал (состояние неопределённое) → leftover (обман, если молчать).
+                # Маркер на месте (свежий install) → НЕ leftover (определённое managed-состояние, не partial).
+                if item.get("managed") and not item.get("marker_present"):
                     leftover.append({"name": item["name"], "status": item.get("status", "unknown"),
-                                     "reason": "not restorable (no backup / marker missing)"})
+                                     "reason": "stale-managed: not restorable and marker missing"})
                 continue
             if not _restore_backup(Path(item["backup"]), Path(item["config_path"])):
                 return {"ok": False, "blocked": [f"{item['name']}_restore_failed"], "actions": actions, "plan": plan}
@@ -1140,6 +1148,15 @@ def main(argv=None):
             return 2
         result = apply_uninstall(env=env, confirmations=confirmations)
         if result["ok"]:
+            leftover = result.get("leftover") or []
+            if leftover:
+                # partial (issue #110 Дефект 1, cycle-review #111 cycle 2 finding A): srouter ставил, но не
+                # откатил (stale-managed). main — это uninstall.sh apply entrypoint, параллельный srouter
+                # uninstall; без этой проверки partial молча exit 0 (не маскировать, как cmd_uninstall).
+                names = ", ".join(item["name"] for item in leftover)
+                print(f"uninstall apply выполнен частично: конфиги оставлены ({names}) — не найден backup/маркер.",
+                      file=sys.stderr)
+                return 2
             print("uninstall apply завершён: изменены только подтверждённые srouter-managed категории.")
             return 0
         print("uninstall apply остановлен: " + ", ".join(result.get("blocked") or ["unknown"]), file=sys.stderr)

@@ -715,3 +715,68 @@ def test_apply_uninstall_leftover_empty_when_fully_restored(tmp_path):
     assert result["ok"] is True
     assert result["leftover"] == [], "полный restore → leftover пустой"
     assert config.read_text(encoding="utf-8") == "foreign config\n", "restore отработал честно"
+
+
+def test_apply_uninstall_no_leftover_for_fresh_install_without_backup(tmp_path):
+    """cycle-review #111 cycle 2 finding B (регрессия): свежий install → НЕ leftover.
+
+    Сценарий: srouter install создал конфиг с нуля (config_path не существовал → backup не делался).
+    state.managed=True, маркер ЕСТЬ, НО backup отсутствует → restorable=False. До сужения leftover мой
+    код считал КАЖДЫЙ managed-без-backup leftover → свежий install→uninstall давал rc=2 «частично» всегда
+    (базовый workflow сломан). Фикс: leftover = managed AND NOT marker_present (stale — состояние
+    неопределённое). Свежий install (маркер на месте) — нормальный managed, НЕ leftover → rc=0.
+
+    Глубокий ремонт (uninstall удаляет created-конфиг целиком, как brew/dpkg) — отдельный follow-up:
+    здесь фиксируем только что свежий install НЕ маскируется под partial.
+    """
+    env = _env(tmp_path)
+    config = env.component_paths("privoxy")["config"]
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text("# srouter-managed-config-v1\nlisten-address 127.0.0.1:8118\n", encoding="utf-8")
+    # state: managed=True, маркер в конфиге есть, НО backup НЕТ (как при свежем install с нуля).
+    _write_state(env, {
+        "privoxy": {
+            "config_path": str(config),
+            "management": {"mode": "managed", "managed": True},
+            # НЕТ поля backup
+        }
+    })
+
+    result = install_lib.apply_uninstall(
+        env=env,
+        confirmations={"configs": True, "services": True, "dns": True, "launchagent": True},
+        runner=FakeRunner(),
+    )
+
+    assert result["ok"] is True
+    assert result["leftover"] == [], ("свежий install (маркер есть, нет backup) — НЕ leftover: это нормальный "
+                                      "managed, не partial. Глубокий remove-фикс — follow-up.")
+
+
+def test_main_uninstall_apply_nonzero_when_leftover(tmp_path, monkeypatch):
+    """cycle-review #111 cycle 2 finding A: install_lib.main (uninstall.sh apply entrypoint) учитывает leftover.
+
+    main() для mode=uninstall-apply проверял ТОЛЬКО result["ok"] → exit 0 при partial. Codex: supported
+    uninstall.sh apply path инвокает install_lib.main → partial rollback молча успешен вне srouter uninstall.
+    Фикс: main учитывает leftover (как cmd_uninstall) → rc≠0 + список leftover в stderr.
+    """
+    env = _env(tmp_path)
+    config_path = env.component_paths("privoxy")["config"]
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text("listen-address 127.0.0.1:8118\n", encoding="utf-8")  # БЕЗ маркера → stale
+    _write_state(env, {
+        "privoxy": {
+            "config_path": str(config_path),
+            "management": {"mode": "managed", "managed": True},  # srouter ставил, маркер пропал → stale → leftover
+        }
+    })
+    # main читает env из InstallEnv.from_env — подменяем state_path через argv --state.
+    rc = install_lib.main([
+        "uninstall-apply",
+        "--state", str(env.state_path),
+        "--prefix", str(env.prefix),
+        "--launchagents-dir", str(env.launchagent_dir),
+        "--restore-configs", "--stop-services", "--restore-dns", "--unload-launchagent",
+    ])
+
+    assert rc != 0, "stale-managed leftover через main(uninstall-apply) → rc≠0 (не маскировать exit 0)"
