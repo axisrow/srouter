@@ -827,6 +827,23 @@ def _is_restored_entry(entry):
     return management.get("mode") == "restored"
 
 
+def _provenance_of(entry):
+    """provenance компонента: 'created' | 'overwrote' | None (issue #112 Часть 2).
+
+    None = legacy state (до #112, нет поля) или non-managed (adopted/skipped/restored — semantics
+    не применима). created = srouter создал конфиг с нуля (нет backup). overwrote = перезаписал чужой.
+    Симметрично по стилю _is_managed_entry/_is_adopted_entry/_is_restored_entry.
+    """
+    if not isinstance(entry, dict):
+        return None
+    management = entry.get("management") if isinstance(entry.get("management"), dict) else {}
+    return management.get("provenance")
+
+
+def _is_created_entry(entry):
+    return _provenance_of(entry) == "created"
+
+
 def _component_uninstall_item(name, env, detected):
     entry = detected.get(name) if isinstance(detected.get(name), dict) else {}
     config_path = Path(entry.get("config_path") or env.component_paths(name)["config"])
@@ -835,13 +852,23 @@ def _component_uninstall_item(name, env, detected):
     managed = _is_managed_entry(entry)
     adopted = _is_adopted_entry(entry)
     restored = _is_restored_entry(entry)
+    provenance = _provenance_of(entry)
     restorable = managed and marker_present and bool(backup_path and backup_path.exists())
+    # removable (issue #112 Часть 2, РЕШЕНИЕ 1 — fail-closed двойной арбитраж): created-конфиг удаляется
+    # ТОЛЬКО при подтверждении двумя арбитрами — provenance='created' (из state: srouter создал с нуля)
+    # И живой srouter-маркер в файле (файл действительно наш, не подменён). Без маркера → НЕ удалять
+    # (state drift / crash-during-install / подмена) — fail-safe leftover. Канон «никогда молча не adopt».
+    removable = managed and provenance == "created" and marker_present
     if adopted:
         status = "adopted — left untouched"
     elif restored:
         status = "restored — left untouched"
+    elif removable:
+        status = "managed — created config, remove available"
     elif restorable:
         status = "managed — restore available"
+    elif managed and provenance == "created" and not marker_present:
+        status = "managed — created config, marker missing (fail-safe leftover)"
     elif managed:
         status = "managed — no safe backup/marker, left untouched"
     else:
@@ -853,8 +880,10 @@ def _component_uninstall_item(name, env, detected):
         "managed": managed,
         "adopted": adopted,
         "restored": restored,
+        "provenance": provenance,
         "marker_present": marker_present,
         "restorable": restorable,
+        "removable": removable,
         "status": status,
     }
 
@@ -954,6 +983,20 @@ def _restore_backup(backup_path, target_path):
         return False
 
 
+def _delete_component_config(config_path):
+    """Удалить created-config (provenance='created', issue #112 Часть 2).
+
+    Симметрично _restore_backup (для overwrote): вместо restore прежнего контента — удалить файл целиком,
+    т.к. created-конфиг полностью принадлежит srouter (нечего восстанавливать). missing_ok=True (idempotent:
+    повторный uninstall на уже удалённом — не ошибка). Fail-closed: OSError → False (не маскировать сбой).
+    """
+    try:
+        Path(config_path).unlink(missing_ok=True)
+        return True
+    except OSError:
+        return False
+
+
 def _mark_component_restored(env, item):
     state, readable = local_state.load_state_checked(path=env.state_path)
     if not readable:
@@ -973,6 +1016,37 @@ def _mark_component_restored(env, item):
 
     runtime = state.get("runtime") if isinstance(state.get("runtime"), dict) else {}
     runtime["last_uninstall_restore"] = env.now
+    state["runtime"] = runtime
+    if local_state.save_state(state, path=env.state_path) is None:
+        return "state_write_failed"
+    return ""
+
+
+def _mark_component_removed(env, item):
+    """После DELETE created-config: пометить mode='removed', managed=False (issue #112 Часть 2).
+
+    Симметрично _mark_component_restored (для overwrote→restore), но без restored_from_backup
+    (created-конфиг удалён, не восстановлен). mode='removed' → следующий install видит чистое место
+    (нет reclaimable/foreign) → create заново. Замыкает идемпотентность цикла (issue #110 корень).
+    """
+    state, readable = local_state.load_state_checked(path=env.state_path)
+    if not readable:
+        return "state_unreadable"
+    detected = state.get("detected_environment") if isinstance(state.get("detected_environment"), dict) else {}
+    entry = detected.get(item["name"]) if isinstance(detected.get(item["name"]), dict) else {}
+    entry["config_path"] = item.get("config_path")
+    # created-конфиг удалён — нечего восстанавливать. Чистим backup-ссылку (её не было для created,
+    # но defensive: state-drift мог оставить). provenance=None (больше не managed).
+    entry.pop("backup", None)
+    entry.pop("pending_backup", None)
+    entry.pop("pending_written_at", None)
+    entry["management"] = {"mode": "removed", "managed": False, "provenance": None}
+    entry["removed_at"] = env.now
+    detected[item["name"]] = entry
+    state["detected_environment"] = detected
+
+    runtime = state.get("runtime") if isinstance(state.get("runtime"), dict) else {}
+    runtime["last_uninstall_remove"] = env.now
     state["runtime"] = runtime
     if local_state.save_state(state, path=env.state_path) is None:
         return "state_write_failed"
@@ -1059,12 +1133,31 @@ def apply_uninstall(env=None, *, confirmations=None, runner=run):
     if confirmations.get("configs"):
         for item in plan["components"]:
             components.append(item)
+            # ГИБРИД по provenance (issue #112 Часть 2, РЕШЕНИЕ 1):
+            #   removable  (created + живой маркер)  → УДАЛИТЬ (created-конфиг полностью наш).
+            #   restorable (overwrote + backup+маркер) → RESTORE прежнего контента.
+            #   created БЕЗ маркера                   → fail-safe leftover (state drift / crash / подмена).
+            #   stale-managed (legacy, маркер пропал) → leftover (как #110 Дефект 1).
+            # Порядок: removable РАНЬШЕ restorable (они взаимоисключающие: created → нет backup → не restorable).
+            if item.get("removable"):
+                if not _delete_component_config(Path(item["config_path"])):
+                    return {"ok": False, "blocked": [f"{item['name']}_delete_failed"], "actions": actions, "plan": plan}
+                state_error = _mark_component_removed(env, item)
+                if state_error:
+                    return {"ok": False, "blocked": [state_error], "actions": actions, "plan": plan}
+                actions.append({"category": "configs", "component": item["name"], "changed": True})
+                continue
             if not item.get("restorable"):
-                # stale-managed: ставил, НО маркер пропал (состояние неопределённое) → leftover (обман, если молчать).
-                # Маркер на месте (свежий install) → НЕ leftover (определённое managed-состояние, не partial).
+                # created БЕЗ маркера (двойной арбитраж не пройден) → fail-safe leftover, не удалять.
+                # stale-managed (legacy без provenance, маркер пропал) → leftover (как #110 Дефект 1).
+                # Маркер на месте для legacy-without-provenance → НЕ leftover (определённое состояние, оставляем).
                 if item.get("managed") and not item.get("marker_present"):
+                    if item.get("provenance") == "created":
+                        reason = "created-config: marker missing (crash-during-install / подмена) — fail-safe, не удалено"
+                    else:
+                        reason = "stale-managed: not restorable and marker missing"
                     leftover.append({"name": item["name"], "status": item.get("status", "unknown"),
-                                     "reason": "stale-managed: not restorable and marker missing"})
+                                     "reason": reason})
                 continue
             if not _restore_backup(Path(item["backup"]), Path(item["config_path"])):
                 return {"ok": False, "blocked": [f"{item['name']}_restore_failed"], "actions": actions, "plan": plan}
