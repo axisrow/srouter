@@ -556,11 +556,16 @@ def _install_codex_zsh_function(env) -> str:
                     "не добавляю (конфликт). ~/bin/codex доступен как явная точка входа.")
         if not zshrc.exists():
             _write_text_atomic(zshrc, _CODEX_FUNC_BLOCK + "\n")
-            return "Codex функция: создан ~/.zshrc с codex() → ~/bin/codex (новый терминал подхватит)."
+            return ("Codex функция: создан ~/.zshrc с codex() → ~/bin/codex (новый терминал подхватит). "
+                    "ВНИМАНИЕ: существующие терминалы/codex-процессы не получат новое окружение — "
+                    "перезапусти их (exec zsh -l в каждом, затем закрыть/открыть TUI).")
         _backup(zshrc, env)  # timestamped backup, каноничный helper
         _write_text_atomic(zshrc, content.rstrip() + "\n\n" + _CODEX_FUNC_BLOCK + "\n")
         return ("Codex функция: добавлена в ~/.zshrc (codex → ~/bin/codex по абс. пути, "
-                "бьёт brew в PATH). Backup: .zshrc.srouter-backup-*.")
+                "бьёт brew в PATH). Backup: .zshrc.srouter-backup-*. "
+                "ВНИМАНИЕ: существующие терминалы/codex-процессы не получат новое окружение — "
+                "перезапусти их (exec zsh -l, затем закрыть/открыть TUI); иначе старая TUI пойдёт "
+                "через privoxy 8118 и порвёт long-lived WS (#120).")
     except Exception as exc:
         return f"Codex функция: не добавлена ({str(exc)[:80]})."
 
