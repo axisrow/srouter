@@ -20,6 +20,52 @@ docker compose up -d --build
 docker compose logs -f reality-node
 ```
 
+## За Docker Hub (GFW / registry-1.docker.io)
+
+Если `docker build` / `docker pull` падают с `DeadlineExceeded` или надолго
+зависают на pulling `alpine`/`python`/других образов с Docker Hub
+(`registry-1.docker.io`), причина — блокировка/замедление хаба Great Firewall
+или аналогичным фильтром. Симптом: тот же тег тянется минутами или рвётся по
+таймауту, при этом `ghcr.io` (откуда берётся `xtls/xray-core`) отвечает нормально.
+
+Решение — **registry-mirror в настройках Docker Desktop/Engine, а не `FROM <зеркало>`
+в Dockerfile**. Dockerfile остаётся чистым и портируемым (на хостах без GFW
+никаких правок), а зеркала — локальная настройка daemon, которую каждый dev в
+GFW включает под себя.
+
+Вариант A — GUI (Docker Desktop): **Settings → Docker Engine**, добавить ключ
+`"registry-mirrors"` и применить (Docker перезапустится сам).
+
+Вариант B — `~/.docker/daemon.json` вручную:
+
+```json
+{
+  "builder": { "gc": { "defaultKeepStorage": "20GB", "enabled": true } },
+  "experimental": false,
+  "registry-mirrors": [
+    "https://docker.m.daocloud.io",
+    "https://docker.1ms.run"
+  ]
+}
+```
+
+Затем перезапустить Docker Desktop (или `sudo systemctl restart docker` на Linux).
+Список зеркал — fallback-цепочка: движок идёт по ним по порядку, пока одно не
+ответит. Указывайте только проверенные живые зеркала — мёртвый хост в начале
+списка просто тратит таймаут перед каждым pull. Актуальность зеркал лучше
+сверять периодически: `curl -sI https://docker.m.daocloud.io/v2/` (живое зеркало
+отвечает `401 Unauthorized` на анонимный `/v2/`; пустой ответ/таймаут — зеркало
+мёртво).
+
+Проверить, что зеркало подхвачено движком:
+
+```bash
+docker info | grep -A5 'Registry Mirrors'
+```
+
+После этого обычный `docker build`/`docker pull` резолвят Docker Hub-образы
+через зеркало без правки Dockerfile.
+
 ## Двухфазный deploy workflow
 
 `deploy.sh` создаёт ignored bundle в `server/.generated/<node>/` и печатает полный JSON-объект,
