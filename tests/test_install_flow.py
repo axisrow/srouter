@@ -240,6 +240,122 @@ def test_real_text_templates_have_exact_managed_marker():
     assert install_lib._has_marker(root / "templates" / "dnsmasq.conf") is True
 
 
+# ============================ issue #110 Дефект 2: stale-managed = reclaimable (не foreign) ============================
+# install через _inspect_component считает компонент foreign ТОЛЬКО по маркеру в файле (стр.386):
+#   managed = config_path.exists() and _has_marker(config_path)
+# State-память (detected_environment[name].management.managed, которую сам install пишет через
+# _write_state_after_apply) ИГНОРИРУЕТСЯ. Поэтому «свой старый» конфиг (install ставил → state.managed=True,
+# но маркер пропал при смене версии/правке) = foreign_config → конфликт → non-TTY install падает rc=2 сразу
+# после uninstall. Корень #110: двойное определение managed (uninstall верит state, install верит файлу).
+#
+# Фикс: _inspect_component получает явный параметр prior_detected, отличает reclaimable (state.managed=True,
+# маркера нет — «свой старый», авторазрешается с backup) от foreign (нет ни маркера, ни state).
+# mode:"restored" — легально возвращённый uninstall'ом чужой → НЕ reclaimable (остаётся foreign).
+def _write_config_without_marker(env, name, content="foreign config\n"):
+    """Конфиг БЕЗ srouter-маркера (как «свой старый» после потери маркера, или истинно чужой)."""
+    config_path = env.component_paths(name)["config"]
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(content, encoding="utf-8")
+    return config_path
+
+
+def _detected(env, name, *, mode, managed):
+    """detected_environment-entry как его пишет install/uninstall (management.mode + managed)."""
+    return {
+        name: {
+            "config_path": str(env.component_paths(name)["config"]),
+            "management": {"mode": mode, "managed": managed},
+        }
+    }
+
+
+def test_inspect_component_reclaimable_when_state_managed_but_no_marker(tmp_path):
+    """Дефект 2: state mode=managed/managed=True, маркер пропал → reclaimable=True, НЕ foreign, НЕ conflict.
+
+    На СТАРОМ коде (стр.386 — только маркер) config без маркера = managed=False → foreign_config →
+    conflict=True. Фикс: prior_detected подключён, state_managed=True → managed=True, reclaimable=True.
+    Тест падает TypeError (нет параметра prior_detected) → потом assert (не foreign) → потом зелёный.
+    """
+    env = _env(tmp_path)
+    _write_config_without_marker(env, "privoxy")
+    detected = _detected(env, "privoxy", mode="managed", managed=True)
+
+    item = install_lib._inspect_component(
+        "privoxy", env, FakeRunner(), lambda *_a, **_kw: False, prior_detected=detected)
+
+    assert item["reclaimable"] is True, "state.managed=True + нет маркера → «свой старый», reclaimable"
+    assert "foreign_config" not in item["conflicts"], "reclaimable НЕ foreign_config"
+    assert item["conflict"] is False, "reclaimable НЕ блокирует install"
+
+
+def test_inspect_component_foreign_when_no_state_no_marker(tmp_path):
+    """Граница: true-foreign (entry нет в state, маркера нет) → foreign_config, конфликт, НЕ reclaimable.
+
+    «Чужой конфиг рядом» (srouter никогда не ставил) — это легитимное состояние, но для install это
+    конфликт, требующий adopt/overwrite/skip. reclaimable=False — НЕ авторазрешается.
+    """
+    env = _env(tmp_path)
+    _write_config_without_marker(env, "privoxy")
+
+    item = install_lib._inspect_component(
+        "privoxy", env, FakeRunner(), lambda *_a, **_kw: False, prior_detected={})
+
+    assert item["reclaimable"] is False
+    assert "foreign_config" in item["conflicts"]
+    assert item["conflict"] is True
+
+
+def test_inspect_component_restored_is_foreign_not_reclaimable(tmp_path):
+    """mode=restored — легально возвращённый uninstall'ом чужой конфиг → НЕ reclaimable, остаётся foreign.
+
+    Uninstall при restore кладёт бывший пользовательский конфиг (без маркера) обратно и пишет
+    mode:'restored' (install_lib._mark_component_restored:888). Install НЕ должен молча перезаписать
+    его как «свой старый» — restored = чужой, требует явного решения. Только mode=managed даёт reclaimable.
+    """
+    env = _env(tmp_path)
+    _write_config_without_marker(env, "privoxy")
+    detected = _detected(env, "privoxy", mode="restored", managed=False)
+
+    item = install_lib._inspect_component(
+        "privoxy", env, FakeRunner(), lambda *_a, **_kw: False, prior_detected=detected)
+
+    assert item["reclaimable"] is False, "restored = легальный чужой, НЕ reclaimable"
+    assert "foreign_config" in item["conflicts"], "restored остаётся foreign (требует явного решения)"
+
+
+def test_apply_install_reclaimable_creates_backup_then_overwrites(tmp_path):
+    """Дефект 2 ядро: reclaimable → backup создаётся (старый конфиг сохранён), конфиг перезаписан с маркером.
+
+    КРИТИЧНО (находка Plan-агента): просто убрать conflict для state-managed — недостаточно. apply_install
+    (стр.700) делает backup ТОЛЬКО при choice=='overwrite'. Без явного backup reclaimable перезапишется
+    БЕЗ бэкапа → молчаливая потеря, если state устарел (под «своим старым» чужой). Фикс: reclaimable
+    ВСЕГДА получает backup (needs_backup = overwrite OR reclaimable), затем перезапись с маркером.
+    """
+    env = _env(tmp_path)
+    config_path = _write_config_without_marker(env, "privoxy", content="my old managed config\n")
+    env.state_path.write_text(
+        json.dumps({
+            "schema_version": 1, "nodes": [], "active_node": {"name": None, "pending": None},
+            "probes": {}, "network": {"channels": {"wifi_service": "Wi-Fi"}},
+            "traffic_guard": {"mode": "off", "domains": {}},
+            "detected_environment": _detected(env, "privoxy", mode="managed", managed=True),
+            "runtime": {},
+        }),
+        encoding="utf-8")
+
+    result = install_lib.apply_install(
+        env=env, confirm=True, choices={"xray": "skip", "dnsmasq": "skip"},
+        runner=FakeRunner(), port_checker=lambda *_a, **_kw: False)
+
+    assert result["ok"] is True, f"reclaimable авторазрешается (с backup), не блокирует: {result}"
+    # Старый конфиг сохранён в backup (.srouter-backup-*).
+    backups = list(config_path.parent.glob("config.srouter-backup-*"))
+    assert backups, "reclaimable ВСЕГДА создаёт backup перед перезаписью (канон fail-closed)"
+    assert backups[0].read_text(encoding="utf-8") == "my old managed config\n", "backup = прежний конфиг"
+    # Новый конфиг имеет srouter-маркер (перезаписан как managed).
+    assert install_lib.MARKER in config_path.read_text(encoding="utf-8"), "конфиг перезаписан с маркером"
+
+
 def test_install_retries_bootstrap_when_domain_busy(monkeypatch, tmp_path):
     """apply_install выживает при гонке занятого домена: первый bootstrap rc=5, второй rc=0 → ok.
 

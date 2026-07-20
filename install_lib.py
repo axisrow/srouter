@@ -380,10 +380,30 @@ def _port_owner(name, runner):
     return {}
 
 
-def _inspect_component(name, env, runner, port_checker):
+def _inspect_component(name, env, runner, port_checker, prior_detected=None):
+    """Инспекция одного компонента для build_plan (discovery, ничего не пишет).
+
+    `managed` определяется ДВУМЯ арбитрами (issue #110 Дефект 2):
+      - marker_managed: srouter-маркер в самом конфиге («живой» арбитр, но теряется при смене версии/правке).
+      - state_managed:  detected_environment[name].management из srouter.local.json («память» — install сам
+        пишет её через _write_state_after_apply). До #110 install её игнорировал → «свой старый» конфиг
+        (state.managed=True, маркер пропал) считался foreign → конфликт → non-TTY install падал rc=2 сразу
+        после uninstall. Корень #110: двойное определение managed (uninstall верил state, install — файлу).
+
+    reclaimable = state_managed AND NOT marker_managed AND NOT state_restored — «свой старый»: install
+    ставил, маркер пропал. Авторазрешается с backup (apply_install), НЕ требует adopt/overwrite/skip.
+    state_restored (mode='restored') — легально возвращённый uninstall'ом чужой конфиг → НЕ reclaimable,
+    остаётся foreign_config (install не должен молча перезаписать чужое).
+    """
+    prior_detected = prior_detected or {}
     paths = env.component_paths(name)
     config_path = paths["config"]
-    managed = config_path.exists() and _has_marker(config_path)
+    marker_managed = config_path.exists() and _has_marker(config_path)
+    prior = prior_detected.get(name) if isinstance(prior_detected.get(name), dict) else {}
+    state_managed = _is_managed_entry(prior)
+    state_restored = _is_restored_entry(prior)
+    managed = marker_managed or state_managed
+    stale_managed = state_managed and not marker_managed
     owner = _port_owner(name, runner)
     _proto, port = PORTS[name]
     try:
@@ -393,6 +413,9 @@ def _inspect_component(name, env, runner, port_checker):
 
     non_brew = [str(p) for p in paths["non_brew"] if p.exists()]
     config_present = config_path.exists()
+    # reclaimable: «свой старый» (state помнит install, маркер пропал), НЕ restored-чужой. config_present
+    # обязан быть True — иначе восстанавливать нечего (install создаст новый конфиг).
+    reclaimable = stale_managed and config_present and not state_restored
     conflicts = []
     if config_present and not managed:
         conflicts.append("foreign_config")
@@ -408,6 +431,7 @@ def _inspect_component(name, env, runner, port_checker):
         "config_path": str(config_path),
         "config_present": config_present,
         "config_managed": managed,
+        "reclaimable": reclaimable,
         "brew_binary_present": paths["brew_binary"].exists(),
         "non_brew_binaries": non_brew,
         "service": "unknown",
@@ -465,15 +489,19 @@ def _homebrew_available(runner):
 def build_plan(env=None, runner=run, port_checker=port_open):
     """Discovery-only: ничего не пишет."""
     env = env or InstallEnv.from_env()
+    # State грузим ОДИН раз ВВЕРХ (issue #110 Дефект 2): detected_environment нужен в _inspect_component
+    # как второй арбитр managed (stateManaged) — без него «свой старый» конфиг = foreign. Раньше state
+    # грузился после цикла inspect и читал только probes; теперь пробрасываем detected_env в inspect.
+    state = local_state.load_state(path=env.state_path)
+    detected_env = state.get("detected_environment") if isinstance(state.get("detected_environment"), dict) else {}
     brew_services = runner([BREW, "services", "list"], 8)
     service_states = _parse_brew_services(brew_services.get("out") or "")
     components = {}
     for name in COMPONENTS:
-        item = _inspect_component(name, env, runner, port_checker)
+        item = _inspect_component(name, env, runner, port_checker, prior_detected=detected_env)
         item["service"] = service_states.get(name, "none" if brew_services.get("rc") == 0 else "unknown")
         components[name] = item
 
-    state = local_state.load_state(path=env.state_path)
     probes = state.get("probes") if isinstance(state.get("probes"), dict) else {}
     return {
         "mode": "plan",
@@ -658,7 +686,10 @@ def apply_install(env=None, *, confirm=False, choices=None, runner=run, port_che
     unresolved = []
     for name, item in plan["components"].items():
         choice = choices.get(name)
-        if item.get("conflict") and choice not in CHOICES:
+        # reclaimable («свой старый»: state.managed=True, маркер пропал) — НЕ конфликт для пользователя
+        # (issue #110 Дефект 2): авторазрешается в managed-режим с backup. Иначе non-TTY install падал
+        # rc=2 сразу после uninstall. Истинно foreign (не reclaimable) требует явного adopt/overwrite/skip.
+        if item.get("conflict") and not item.get("reclaimable") and choice not in CHOICES:
             unresolved.append(name)
     if unresolved:
         return {"ok": False, "blocked": unresolved, "actions": [], "plan": plan}
@@ -697,7 +728,12 @@ def apply_install(env=None, *, confirm=False, choices=None, runner=run, port_che
         if not _ensure_package(name, runner):
             return {"ok": False, "blocked": [f"{name}_install_failed"], "actions": actions, "plan": plan}
         config_path = Path(item["config_path"])
-        if config_path.exists() and choices.get(name) == "overwrite":
+        # backup при overwrite ИЛИ reclaimable (issue #110 Дефект 2). reclaimable = «свой старый»
+        # (state.managed=True, маркер пропал) — ВСЕГДА backup перед перезаписью (канон fail-closed):
+        # если state устарел и под «своим старым» оказался чужой конфиг, он сохранится в .srouter-backup-*.
+        # Без этого (раньше backup только при choice=='overwrite') reclaimable перезаписался бы без бэкапа.
+        needs_backup = config_path.exists() and (choices.get(name) == "overwrite" or item.get("reclaimable"))
+        if needs_backup:
             backup = _backup(config_path, env)
             if not backup:
                 return {"ok": False, "blocked": [f"{name}_backup_failed"], "actions": actions, "plan": plan}
@@ -966,10 +1002,20 @@ def apply_uninstall(env=None, *, confirmations=None, runner=run):
 
     actions = []
     components = []
+    # leftover (issue #110 Дефект 1): компоненты, которые srouter СТАВИЛ (item['managed']=True из state),
+    # но uninstall НЕ откатил (не restorable — нет backup / маркер пропал). cmd_uninstall меняет headline
+    # на «Откат выполнен частично» + rc=2. Граница: true-foreign (item['managed']=False — srouter не ставил,
+    # «чужое рядом») → НЕ leftover (легитимное соседство, не обман). Отличает «своё не откатилось» от «чужое рядом».
+    leftover = []
     if confirmations.get("configs"):
         for item in plan["components"]:
             components.append(item)
             if not item.get("restorable"):
+                # srouter ставил (state managed=True), но откатить не смог → leftover (обман, если промолчать).
+                # true-foreign (managed=False) → НЕ leftover (чужое рядом легитимно).
+                if item.get("managed"):
+                    leftover.append({"name": item["name"], "status": item.get("status", "unknown"),
+                                     "reason": "not restorable (no backup / marker missing)"})
                 continue
             if not _restore_backup(Path(item["backup"]), Path(item["config_path"])):
                 return {"ok": False, "blocked": [f"{item['name']}_restore_failed"], "actions": actions, "plan": plan}
@@ -1003,7 +1049,8 @@ def apply_uninstall(env=None, *, confirmations=None, runner=run):
         if unloaded.get("changed"):
             actions.append({"category": "launchagent", "component": LAUNCHAGENT_LABEL, "changed": True})
 
-    return {"ok": True, "blocked": [], "actions": actions, "components": components, "plan": plan}
+    return {"ok": True, "blocked": [], "actions": actions, "components": components,
+            "leftover": leftover, "plan": plan}
 
 
 def _prompt_bool(label):

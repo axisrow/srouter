@@ -20,11 +20,13 @@ def _args(**over):
     return SimpleNamespace(**base)
 
 
-def _stub_cmd_uninstall_internals(monkeypatch, *, env_ok, tty=True):
+def _stub_cmd_uninstall_internals(monkeypatch, *, env_ok, leftover=None, tty=True):
     """Застенить все внешние сайд-эффекты cmd_uninstall, КРОМЕ _remove_launchctl_env.
 
-    env_ok управляет возвратом _remove_launchctl_env (тестируемая связка). tty — есть ли терминал
-    (минует ранний возврат «подтверждение требует терминал»).
+    env_ok управляет возвратом _remove_launchctl_env (тестируемая связка). leftover (issue #110
+    Дефект 1) управляет ключом leftover в apply_uninstall — частичный откат (srouter ставил, но не
+    откатил) → cmd_uninstall меняет headline + rc=2. tty — есть ли терминал (минует ранний возврат
+    «подтверждение требует терминал»).
 
     ИНВАРИАНТ: ВСЕ хелперы отката замокаются — cmd_uninstall после apply_uninstall вызывает
     _remove_active_split_route/claude_proxy.disable/_remove_ppp_hook/_remove_codex_wrappers/
@@ -39,7 +41,8 @@ def _stub_cmd_uninstall_internals(monkeypatch, *, env_ok, tty=True):
     monkeypatch.setattr(srouter, "build_uninstall_plan", lambda **k: {"state_readable": True})
     monkeypatch.setattr(srouter, "format_uninstall_plan", lambda p: "")
     monkeypatch.setattr(srouter.sys, "stdin", SimpleNamespace(isatty=lambda: tty))
-    monkeypatch.setattr(srouter, "apply_uninstall", lambda **k: {"ok": True, "blocked": []})
+    monkeypatch.setattr(srouter, "apply_uninstall",
+                        lambda **k: {"ok": True, "blocked": [], "leftover": leftover or []})
     monkeypatch.setattr(srouter, "_remove_active_split_route", lambda *a, **k: 0)
     monkeypatch.setattr(srouter, "claude_proxy",
                         SimpleNamespace(disable=lambda: {"ok": True}))
@@ -103,3 +106,40 @@ def test_cmd_uninstall_no_tty_without_yes_fails_closed(monkeypatch, capsys):
     assert rc == 2, f"не-TTY без -y → отказ (нет ни TTY, ни подтверждения), получил {rc}"
     err = capsys.readouterr().err.lower()
     assert "терминал" in err, f"stderr объясняет: нужен TTY или -y: {err}"
+
+
+# ============================ issue #110 Дефект 1 e2e: leftover → partial headline + rc=2 ============================
+# cmd_uninstall агрегирует apply_uninstall. До #110 apply_uninstall рапортовал ok=True БЕЗУСЛОВНО → rc=0
+# «Откат завершён» даже когда srouter ставил компоненты, но не откатил их (нет backup/маркер пропал).
+# Теперь apply_uninstall возвращает leftover, cmd_uninstall меняет headline + rc=2 и перечисляет leftover
+# поимённо (иначе «частично» без деталей = новый обман). true-foreign НЕ попадает в leftover (см. unit-тесты).
+def test_cmd_uninstall_partial_rc_when_leftover(monkeypatch, capsys):
+    """Дефект 1 e2e: apply_uninstall вернул leftover → rc=2, headline «частично» + leftover поимённо.
+
+    Сценарий: srouter ставил privoxy (state managed=True), но backup потерян / маркер пропал →
+    uninstall не откатил конфиг, но не крашнулся (ok=True). cmd_uninstall ДОЛЖЕН сообщить честно:
+    частично + rc=2 (не маскировать rc=0 «Откат завершён»).
+    """
+    _stub_cmd_uninstall_internals(
+        monkeypatch, env_ok=True, tty=False,
+        leftover=[{"name": "privoxy", "status": "managed — no safe backup/marker, left untouched",
+                   "reason": "not restorable (no backup / marker missing)"}])
+
+    rc = srouter.cmd_uninstall(_args(yes=True))
+
+    assert rc == 2, "leftover (srouter ставил, не откатил) → rc=2 (частичный, fail-closed)"
+    out = capsys.readouterr()
+    assert "частично" in out.out.lower(), "headline «Откат выполнен частично»"
+    assert "privoxy" in out.err, "leftover перечислен поимённо в stderr (детали, не обман)"
+
+
+def test_cmd_uninstall_zero_rc_when_clean_rollback(monkeypatch):
+    """Дефект 1 e2e (контроль): leftover=[] + env_ok=True → rc=0 «Откат завершён».
+
+    Валидный полный откат не сломан: все компоненты restorable (откатились), env снят → честный rc=0.
+    """
+    _stub_cmd_uninstall_internals(monkeypatch, env_ok=True, leftover=[], tty=False)
+
+    rc = srouter.cmd_uninstall(_args(yes=True))
+
+    assert rc == 0, "полный откат (leftover=[], env снят) → rc=0"

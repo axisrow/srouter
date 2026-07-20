@@ -616,3 +616,102 @@ def test_unload_launchagent_identity_check_before_unlink_live_agent(monkeypatch,
     assert "launchagent_identity_mismatch" in (result.get("blocked") or []), \
         f"blocked идентифицирует identity-mismatch: {result.get('blocked')}"
     assert live_plist.exists(), "ЖИВОЙ dashboard.plist НЕ удалён при state-drift"
+
+
+# ============================ issue #110 Дефект 1: uninstall честно сообщает partial (leftover) ============================
+# apply_uninstall (install_lib.py:959-1006) при подтверждённой категории configs пропускает restore для
+# НЕ-restorable компонентов (стр.972 `if not restorable: continue`), а services — для НЕ-managed (стр.985).
+# Но возврат (стр.1006) БЕЗУСЛОВНО ok=True → cmd_uninstall рапортует rc=0 «Откат завершён» даже когда НИЧЕГО
+# не откатил. Это fail-open: пользователь думает, что система чистая, а конфиги/сервисы остались.
+#
+# Фикс: apply_uninstall возвращает ключ `leftover` — компоненты, которые srouter СТАВИЛ (state.managed=True),
+# но uninstall НЕ откатил (нет backup / маркер пропал → не restorable). cmd_uninstall меняет headline на
+# «Откат выполнен частично» + rc=2, leftover перечисляется поимённо.
+#
+# Граница leftover (как отличить «своё не откатилось» = обман, от «чужое рядом» = легитимно):
+#   - stale-managed (state managed=True, маркер пропал) → leftover (srouter ставил, не откатил) — КРИЧИМ.
+#   - true-foreign (entry пустой — srouter никогда не ставил) → НЕ leftover (чужое рядом легитимно) — молчим.
+def _write_stale_managed_state(env, name):
+    """state с managed=True (srouter ставил), НО без backup → компонент НЕ restorable → «не откатился».
+
+    Маркер в конфиге отсутствует (как после смены версии/ручной правки) → marker_present=False →
+    restorable = managed AND marker_present AND backup = False. apply_uninstall пропускает restore,
+    но ok=True без фикса = обман. Фикс: компонент попадает в leftover.
+    """
+    config_path = env.component_paths(name)["config"]
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text("listen-address 127.0.0.1:8118\n", encoding="utf-8")  # БЕЗ маркера
+    _write_state(env, {
+        name: {
+            "config_path": str(config_path),
+            "management": {"mode": "managed", "managed": True},
+            # НЕТ поля backup → backup_path = None → restorable = False
+        }
+    })
+    return config_path
+
+
+def test_apply_uninstall_reports_leftover_for_stale_managed(tmp_path):
+    """Дефект 1: stale-managed (state managed=True, маркера нет, без backup) → leftover непустой, ok=True.
+
+    До фикса ok=True при пустых actions = обман «Откат завершён». Теперь leftover явно перечисляет
+    компонент, который srouter ставил, но не откатил.
+    """
+    env = _env(tmp_path)
+    _write_stale_managed_state(env, "privoxy")
+
+    result = install_lib.apply_uninstall(
+        env=env,
+        confirmations={"configs": True, "services": True, "dns": True, "launchagent": True},
+        runner=FakeRunner(),
+    )
+
+    assert result["ok"] is True, "stale-managed не крашит uninstall (не ошибка, а partial)"
+    assert result["leftover"], "stale-managed компонент должен попасть в leftover (srouter ставил, не откатил)"
+    assert any(c["name"] == "privoxy" for c in result["leftover"]), "privoxy в leftover поимённо"
+
+
+def test_apply_uninstall_leftover_empty_when_truly_foreign(tmp_path):
+    """Граница: true-foreign (entry нет в state) → НЕ leftover. «Чужой конфиг рядом» легитимно, rc=0.
+
+    srouter никогда не ставил этот privoxy → не его ответственность откатывать. leftover пуст →
+    cmd_uninstall рапортует «Откат завершён» (без ложного шума на соседнее чужое).
+    """
+    env = _env(tmp_path)
+    config_path = env.component_paths("privoxy")["config"]
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text("foreign config\n", encoding="utf-8")  # чужой, БЕЗ маркера
+    _write_state(env, {})  # пустой detected — srouter это не ставил
+
+    result = install_lib.apply_uninstall(
+        env=env,
+        confirmations={"configs": True, "services": True, "dns": True, "launchagent": True},
+        runner=FakeRunner(),
+    )
+
+    assert result["ok"] is True
+    assert result["leftover"] == [], "true-foreign НЕ leftover (чужое рядом легитимно)"
+
+
+def test_apply_uninstall_leftover_empty_when_fully_restored(tmp_path):
+    """Контроль: managed + marker + backup → полный restore → leftover пустой (валидный путь не сломан).
+
+    Полностью restorable компонент откатывается честно → не попадает в leftover → rc=0 «Откат завершён».
+    """
+    env = _env(tmp_path)
+    backup = tmp_path / "privoxy.backup"
+    backup.write_text("foreign config\n", encoding="utf-8")
+    config = env.component_paths("privoxy")["config"]
+    config.parent.mkdir(parents=True)
+    config.write_text("# srouter-managed-config-v1\nlisten-address 127.0.0.1:8118\n", encoding="utf-8")
+    _write_state(env, {"privoxy": _managed_component(env, "privoxy", backup)})
+
+    result = install_lib.apply_uninstall(
+        env=env,
+        confirmations={"configs": True},
+        runner=FakeRunner(),
+    )
+
+    assert result["ok"] is True
+    assert result["leftover"] == [], "полный restore → leftover пустой"
+    assert config.read_text(encoding="utf-8") == "foreign config\n", "restore отработал честно"
