@@ -33,6 +33,26 @@ def _env(tmp_path):
     )
 
 
+def _port_checker_managed_up(calls):
+    """port_checker, правдиво моделирующий реальный сервис для apply-тестов (issue #115).
+
+    После фикса #115 _restart_component делает stop→poll освобождения→start→poll поднятия: успех
+    рестарта подтверждается поднятием порта (verify-dont-guess, не фиксированный sleep). Прежний
+    `lambda *_: False` означал «порт никогда не поднят» → restart_failed. Этот probe читает ленту
+    вызовов runner (список calls): до `brew services start <name>` порт свободен (нет foreign_port
+    в build_plan), после — поднят.
+    """
+    def check(host, port, _timeout=0.5):
+        for cmd in calls:
+            if "services" in cmd and "start" in cmd[cmd.index("services"):]:
+                name = cmd[cmd.index("services") + 2]
+                _, svc_port = install_lib.PORTS[name]
+                if svc_port == port:
+                    return True
+        return False
+    return check
+
+
 def test_plan_does_not_write_local_state(tmp_path):
     env = _env(tmp_path)
 
@@ -159,12 +179,13 @@ def test_overwrite_conflict_backs_up_and_writes_managed_config(tmp_path):
     config_path.parent.mkdir(parents=True)
     config_path.write_text("foreign config\n", encoding="utf-8")
 
+    runner = FakeRunner()
     result = install_lib.apply_install(
         env=env,
         confirm=True,
         choices={"privoxy": "overwrite", "xray": "skip", "dnsmasq": "skip"},
-        runner=FakeRunner(),
-        port_checker=lambda *_: False,
+        runner=runner,
+        port_checker=_port_checker_managed_up(runner.calls),
     )
 
     assert result["ok"] is True
@@ -343,9 +364,10 @@ def test_apply_install_reclaimable_creates_backup_then_overwrites(tmp_path):
         }),
         encoding="utf-8")
 
+    runner = FakeRunner()
     result = install_lib.apply_install(
         env=env, confirm=True, choices={"xray": "skip", "dnsmasq": "skip"},
-        runner=FakeRunner(), port_checker=lambda *_a, **_kw: False)
+        runner=runner, port_checker=_port_checker_managed_up(runner.calls))
 
     assert result["ok"] is True, f"reclaimable авторазрешается (с backup), не блокирует: {result}"
     # Старый конфиг сохранён в backup (.srouter-backup-*).
@@ -386,7 +408,7 @@ def test_install_retries_bootstrap_when_domain_busy(monkeypatch, tmp_path):
         confirm=True,
         choices={"xray": "skip", "dnsmasq": "skip"},
         runner=runner,
-        port_checker=lambda *_: False,
+        port_checker=_port_checker_managed_up(calls),
     )
     bootstraps = [c for c in calls if c[1] == "bootstrap"]
     assert result["ok"] is True, f"apply должен выстоять при гонке: {result}"
