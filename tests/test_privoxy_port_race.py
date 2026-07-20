@@ -80,18 +80,22 @@ class _PortProbe:
 
     states: список bool последовательно — что возвращает port_open на каждый poll. Эмулирует
     «старый процесс ещё держит порт» (True→True→False при освобождении) или «новый поднимается
-    с задержкой» (False→False→True после start). Записывает вызовы для проверок порядка.
+    с задержкой» (False→False→True после start). Записывает возвращённые значения в .results
+    (для проверок «poll видел busy→free перед start») и вызовы в .calls.
     """
     def __init__(self, states):
         self._states = list(states)
         self._i = 0
         self.calls = []
+        self.results = []
 
     def __call__(self, host, port, _timeout=0.5):
         self.calls.append((host, port))
         idx = min(self._i, len(self._states) - 1)
         self._i += 1
-        return self._states[idx]
+        val = self._states[idx]
+        self.results.append(val)
+        return val
 
 
 class _PortProbeForApply:
@@ -99,8 +103,9 @@ class _PortProbeForApply:
     (для каждого компонента + probe_readiness), расходуя последовательность _PortProbe до restart.
 
     Поэтому probe «знает», когда стартовал целевой сервис: mark_started(name) переключает порт
-    этого компонента в «поднят» (с可选 задержкой). До start — порт свободен; после — поднимается.
-    host:port→состояние; poll _restart_component видит реальную эволюцию порта вокруг stop/start.
+    этого компонента в «поднят» (с опциональной задержкой). До start — порт свободен; после —
+    поднимается. host:port→состояние; poll _restart_component видит реальную эволюцию порта
+    вокруг stop/start.
     """
     def __init__(self, *, up_ports=None, busy_after_stop=None):
         self._up = set(up_ports or [])
@@ -183,27 +188,30 @@ def test_restart_component_waits_for_port_release_before_start(monkeypatch):
     """ГОНКА: после stop порт ещё занят (старый процесс/TIME_WAIT держит 8118). start НЕ должен
     уходить, пока port_checker не подтвердит освобождение. Иначе `Fatal: can't bind to 8118`.
 
-    На нелеченом коде (слепой restart без poll) этого poll'а вообще нет → тест падает по отсутствию
-    проверок порта до start.
+    Усиленный assertion (cycle-review #118 round 1): недостаточно «poll был» — нужно доказать, что
+    poll-loop РЕАЛЬНО ждал перехода busy→free: среди poll'ов до start есть И True (видели занятость),
+    И False (дождались освобождения). Мутация: если бы код делал один poll и шёл к start без ожидания
+    — assert видел бы только [True] без False → падает.
     """
     monkeypatch.setattr(install_lib, "_PORT_SETTLE_POLL_INTERVAL", 0)
     monkeypatch.setattr(install_lib, "_PORT_SETTLE_MAX_WAIT", 2.0)
     monkeypatch.setattr(install_lib, "_PORT_UP_MAX_WAIT", 0)
     # После stop порт: занят, занят, свободен (старый процесс отпускает с задержкой).
     probe = _PortProbe([True, True, False, True])
-    calls = []
-    runner = _make_services_runner()
+    polls_before_start = []
 
     def recording(cmd, timeout):
-        calls.append(list(cmd))
+        # Фиксируем срез poll-результатов на момент вызова brew services start.
+        if "services" in cmd and "start" in cmd[cmd.index("services"):]:
+            polls_before_start.extend(probe.results)
         return runner(cmd, timeout)
 
+    runner = _make_services_runner()
     install_lib._restart_component("privoxy", recording, port_checker=probe)
 
-    # start должен идти ПОСЛЕ освобождения порта: probe дёргался до start (poll освобождения).
-    start_idx = next(i for i, c in enumerate(calls) if "services" in c and "start" in c[c.index("services"):])
-    assert start_idx > 0, "start должен идти после stop+poll, не первым"
-    assert len(probe.calls) >= 1, "port_checker должен вызываться до start (poll освобождения)"
+    # poll-loop РЕАЛЬНО ждал: видел busy (True), потом дождался free (False) — ДО start.
+    assert True in polls_before_start, "poll должен был увидеть занятость порта (старый процесс держит)"
+    assert False in polls_before_start, "poll должен был дождаться освобождения порта перед start"
 
 
 def test_restart_component_fails_when_port_never_releases(monkeypatch):
