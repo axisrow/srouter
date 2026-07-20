@@ -156,6 +156,21 @@ def test_codex_probe_detects_standalone_codex(monkeypatch):
     assert res["status"] == "warn", "standalone codex на 8118 → warn (matcher общий, не npm-only)"
 
 
+def test_codex_probe_detects_intel_cask_codex(monkeypatch):
+    """C3: Intel macOS codex cask (`codex-x86_64-apple-darwin`) — детектится.
+
+    Баг: regex `codex-[a-z0-9]+-apple-darwin` НЕ матчит underscore в `x86_64` → на Intel Mac
+    codex-binary невидим → doctor unknown → global OK, хотя codex на privoxy. Фикс: явный
+    `(?:aarch64|x86_64)` в arch-группе (underscore-safe).
+    """
+    intel_comm = "/usr/local/Caskroom/codex/0.144.5/codex-x86_64-apple-darwin"
+    ps = f"50003 {intel_comm}\n"
+    lsof = _lsof_line(50003, 54815, health.PRIVOXY_PORT)
+    monkeypatch.setattr(health.sys_probe, "run", _fake(ps, lsof))
+    res = health._codex_proxy_probe()
+    assert res["status"] == "warn", "Intel cask codex на 8118 → warn (matcher покрывает x86_64)"
+
+
 def test_codex_probe_socks_plus_direct_is_mixed_not_ok(monkeypatch):
     """C2: PID на 10808 + другой PID напрямую (external) → mixed (не ok).
 

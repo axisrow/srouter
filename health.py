@@ -170,7 +170,7 @@ def _claude_proxy_probe():
 #   codex-code-mode-host (вспомогательный binary, не основной движок).
 # cycle-review #121 C1: npm-only regex пропускал brew-cask/standalone → doctor ложно «codex не запущен».
 # cycle 2 cleanup: общий substring 'codex' over-matched helpers → matcher по basename (точно).
-_CODEX_BIN_RE = re.compile(r"(^|/)codex(-[a-z0-9]+-apple-darwin)?$")
+_CODEX_BIN_RE = re.compile(r"(^|/)codex(?:-(?:aarch64|x86_64)-apple-darwin)?$")
 
 
 def _is_codex_binary_comm(comm):
