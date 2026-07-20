@@ -49,6 +49,7 @@ from install_lib import (
     format_plan,
     format_uninstall_plan,
     _install_generic_launchagent,
+    _reclaimable_resolves_all_conflicts,
 )
 from sys_probe import run
 
@@ -619,10 +620,13 @@ def cmd_install(args) -> int:
     # 3) Конфликты → интерактивный выбор per компонент.
     # reclaimable («свой старый»: state.managed=True, маркер пропал, issue #110 Дефект 2) НЕ попадает
     # в интерактивный фильтр — он тихо авторазрешается в apply_install (с backup). Иначе non-TTY install
-    # падал rc=2 на «своём старом» сразу после uninstall, даже с -y. Истинно foreign требует adopt/overwrite/skip.
+    # падал rc=2 на «своём старом» сразу после uninstall, даже с -y. НО только если reclaimable покрывает
+    # ВСЕ конфликты (cycle-review #111 cycle 1 finding 2): non_brew_binary и будущие conflict-типы НЕ
+    # поглощаются → остаются в фильтре, требуют adopt/overwrite/skip. Истинно foreign требует выбора.
     choices = {}
     conflicts = [(name, item) for name, item in (plan.get("components") or {}).items()
-                 if isinstance(item, dict) and item.get("conflict") and not item.get("reclaimable")]
+                 if isinstance(item, dict) and item.get("conflict")
+                 and not _reclaimable_resolves_all_conflicts(item)]
     if conflicts:
         if not sys.stdin.isatty():
             names = ", ".join(n for n, _ in conflicts)

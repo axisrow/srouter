@@ -391,3 +391,81 @@ def test_install_retries_bootstrap_when_domain_busy(monkeypatch, tmp_path):
     bootstraps = [c for c in calls if c[1] == "bootstrap"]
     assert result["ok"] is True, f"apply должен выстоять при гонке: {result}"
     assert len(bootstraps) >= 2, "первый bootstrap rc=5 → нужна retry-попытка"
+
+
+# ============================ cycle-review #111 cycle 1: adversarial findings (Codex) ============================
+# Два finding от Codex adversarial review (confidence 0.99), оба реальны. Чиним через ТДД.
+
+# Finding 1 (HIGH): persisted ownership НЕ привязан к записанному config_path.
+# _inspect_component давал reclaimable по state.managed=True, не сравнивая prior["config_path"] с текущим
+# config_path. Сценарий: смена --prefix (напр. /opt/homebrew → /usr/local) → state от старого prefix
+# делает чужой markerless-конфиг по НОВОМУ пути reclaimable → install молча перезаписывает его (даже с
+# backup — service disruption) без adopt/overwrite/skip. Фикс: reclaimable только при совпадении путей.
+def test_inspect_component_reclaimable_requires_matching_config_path(tmp_path):
+    """Finding 1: state.managed=True, НО config_path в state ≠ текущий → НЕ reclaimable (foreign).
+
+    Смена prefix: state хранит старый путь, текущий config_path — новый. Чужой конфиг по новому пути
+    НЕ должен стать «своим старым» только по записи state.managed. Привязка ownership к совпадению пути.
+    """
+    env = _env(tmp_path)
+    _write_config_without_marker(env, "privoxy")
+    # state хранит ДРУГОЙ config_path (как при смене prefix — старое расположение).
+    detected = {"privoxy": {
+        "config_path": str(tmp_path / "old-prefix" / "privoxy" / "config"),
+        "management": {"mode": "managed", "managed": True},
+    }}
+
+    item = install_lib._inspect_component(
+        "privoxy", env, FakeRunner(), lambda *_a, **_kw: False, prior_detected=detected)
+
+    assert item["reclaimable"] is False, "state от ДРУГОГО пути не авторизует reclaimable"
+    assert "foreign_config" in item["conflicts"], "несовпадение пути → foreign (требует явного выбора)"
+
+
+# Finding 2 (MEDIUM): reclaimable подавляет НЕ связанные conflict-типы (non_brew_binary).
+# unresolved-блок exempted ВЕСЬ компонент при reclaimable, хотя reclaimable computed независимо от
+# conflicts. Сценарий: stale-managed компонент + рядом чужой non-Homebrew бинарник → non_brew_binary
+# молча поглощён → install/restart brew-сервиса при живом чужом бинарнике → конкуренция/падение.
+# Фикс: reclaimable авто-разрешает ТОЛЬКО foreign_config/foreign_port, не non_brew_binary.
+def test_inspect_component_non_brew_binary_blocks_even_when_reclaimable(tmp_path, monkeypatch):
+    """Finding 2 (downstream): reclaimable + non_brew_binary → apply_install ДОЛЖЕН блокировать.
+
+    В _inspect_component reclaimable-компонент с non_brew_binary правильно остаётся conflict=True
+    (foreign_config/foreign_port погашены managed, но non_brew_binary добавлен отдельно). Дыра — в
+    downstream-фильтрах (apply_install unresolved, cmd_install interactive): `conflict and not
+    reclaimable` exempted ВЕСЬ компонент, поглощая non_brew_binary. Сценарий: чужой non-Homebrew
+    бинарник рядом со stale-managed конфигом → install молча ставит brew-сервис → конкуренция/падение.
+    Фикс: exempted только если ЕДИНСТВЕННЫЕ конфликты — foreign_config/foreign_port (покрыты reclaimable).
+    """
+    env = _env(tmp_path)
+    config_path = _write_config_without_marker(env, "privoxy")
+    env.state_path.write_text(
+        json.dumps({
+            "schema_version": 1, "nodes": [], "active_node": {"name": None, "pending": None},
+            "probes": {}, "network": {"channels": {"wifi_service": "Wi-Fi"}},
+            "traffic_guard": {"mode": "off", "domains": {}},
+            "detected_environment": _detected(env, "privoxy", mode="managed", managed=True),
+            "runtime": {},
+        }),
+        encoding="utf-8")
+    # non_brew_binary: подменяем component_paths → существующий чужой non-Homebrew бинарник.
+    fake_non_brew = tmp_path / "foreign-bin" / "privoxy"
+    fake_non_brew.parent.mkdir(parents=True)
+    fake_non_brew.write_text("#!/bin/sh\n", encoding="utf-8")
+    original_paths = env.component_paths
+
+    def paths_with_non_brew(name):
+        paths = dict(original_paths(name))
+        paths["non_brew"] = [fake_non_brew]
+        return paths
+
+    monkeypatch.setattr(env, "component_paths", paths_with_non_brew)
+
+    result = install_lib.apply_install(
+        env=env, confirm=True, choices={"xray": "skip", "dnsmasq": "skip"},
+        runner=FakeRunner(), port_checker=lambda *_a, **_kw: False)
+
+    # reclaimable НЕ должен авторазрешать компонент с non_brew_binary — отдельная угроза требует решения.
+    assert result["ok"] is False, ("non_brew_binary при reclaimable НЕ должен авто-разрешаться: "
+                                   "install должен блокировать и требовать явного решения")
+    assert "privoxy" in result["blocked"], "privoxy в blocked (non_brew_binary не поглощён reclaimable)"

@@ -380,6 +380,27 @@ def _port_owner(name, runner):
     return {}
 
 
+# Конфликты, которые reclaimable («свой старый»: state.managed=True, маркер пропал) авто-разрешает.
+# cycle-review #111 cycle 1 finding 2: reclaimable покрывает ТОЛЬКО stale-marker-состояние
+# (foreign_config — конфиг без маркера, foreign_port — порт занят). non_brew_binary — отдельная угроза
+# (чужой бинарник рядом), НЕ должна поглощаться reclaimable → install/restart brew-сервиса при живом
+# чужом бинарнике = конкуренция/падение. downstream-фильтры (apply_install, cmd_install) exempt компонент
+# только если reclaimable И ВСЕ его конфликты ∈ RECLAIMABLE_RESOLVES.
+RECLAIMABLE_RESOLVES = frozenset({"foreign_config", "foreign_port"})
+
+
+def _reclaimable_resolves_all_conflicts(item):
+    """True если reclaimable-компонент можно авторазрешить без явного adopt/overwrite/skip.
+
+    reclaimable должен покрывать КАЖДЫЙ конфликт компонента. non_brew_binary (или будущий conflict-тип)
+    НЕ покрыт → компонент блокируется (требует решения), даже если reclaimable=True.
+    """
+    if not item.get("reclaimable"):
+        return False
+    conflicts = item.get("conflicts") or []
+    return all(c in RECLAIMABLE_RESOLVES for c in conflicts)
+
+
 def _inspect_component(name, env, runner, port_checker, prior_detected=None):
     """Инспекция одного компонента для build_plan (discovery, ничего не пишет).
 
@@ -402,8 +423,14 @@ def _inspect_component(name, env, runner, port_checker, prior_detected=None):
     prior = prior_detected.get(name) if isinstance(prior_detected.get(name), dict) else {}
     state_managed = _is_managed_entry(prior)
     state_restored = _is_restored_entry(prior)
-    managed = marker_managed or state_managed
-    stale_managed = state_managed and not marker_managed
+    # Привязка ownership к пути (cycle-review #111 cycle 1 finding 1): state.managed авторизует только
+    # конфиг по ТОМУ ЖЕ пути, что записан в state. Смена --prefix (/opt/homebrew → /usr/local) или любое
+    # другое перемещение → state от старого расположения НЕ делает чужой markerless-конфиг по новому пути
+    # reclaimable (иначе install молча перезаписал бы его + рестарт сервиса без adopt/overwrite/skip).
+    prior_path = prior.get("config_path") if isinstance(prior.get("config_path"), str) else ""
+    state_owns_path = bool(prior_path) and str(Path(prior_path)) == str(config_path)
+    managed = marker_managed or (state_managed and state_owns_path)
+    stale_managed = state_managed and state_owns_path and not marker_managed
     owner = _port_owner(name, runner)
     _proto, port = PORTS[name]
     try:
@@ -413,8 +440,8 @@ def _inspect_component(name, env, runner, port_checker, prior_detected=None):
 
     non_brew = [str(p) for p in paths["non_brew"] if p.exists()]
     config_present = config_path.exists()
-    # reclaimable: «свой старый» (state помнит install, маркер пропал), НЕ restored-чужой. config_present
-    # обязан быть True — иначе восстанавливать нечего (install создаст новый конфиг).
+    # reclaimable: «свой старый» (state помнит install по этому пути, маркер пропал), НЕ restored-чужой.
+    # config_present обязан быть True — иначе восстанавливать нечего (install создаст новый конфиг).
     reclaimable = stale_managed and config_present and not state_restored
     conflicts = []
     if config_present and not managed:
@@ -688,8 +715,9 @@ def apply_install(env=None, *, confirm=False, choices=None, runner=run, port_che
         choice = choices.get(name)
         # reclaimable («свой старый»: state.managed=True, маркер пропал) — НЕ конфликт для пользователя
         # (issue #110 Дефект 2): авторазрешается в managed-режим с backup. Иначе non-TTY install падал
-        # rc=2 сразу после uninstall. Истинно foreign (не reclaimable) требует явного adopt/overwrite/skip.
-        if item.get("conflict") and not item.get("reclaimable") and choice not in CHOICES:
+        # rc=2 сразу после uninstall. НО только если reclaimable покрывает ВСЕ конфликты (cycle-review
+        # #111 cycle 1 finding 2): non_brew_binary и будущие conflict-типы НЕ поглощаются → блокируют.
+        if item.get("conflict") and not _reclaimable_resolves_all_conflicts(item) and choice not in CHOICES:
             unresolved.append(name)
     if unresolved:
         return {"ok": False, "blocked": unresolved, "actions": [], "plan": plan}
