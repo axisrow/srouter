@@ -49,6 +49,7 @@ from install_lib import (
     format_plan,
     format_uninstall_plan,
     _install_generic_launchagent,
+    _reclaimable_resolves_all_conflicts,
 )
 from sys_probe import run
 
@@ -617,9 +618,15 @@ def cmd_install(args) -> int:
     print()
 
     # 3) Конфликты → интерактивный выбор per компонент.
+    # reclaimable («свой старый»: state.managed=True, маркер пропал, issue #110 Дефект 2) НЕ попадает
+    # в интерактивный фильтр — он тихо авторазрешается в apply_install (с backup). Иначе non-TTY install
+    # падал rc=2 на «своём старом» сразу после uninstall, даже с -y. НО только если reclaimable покрывает
+    # ВСЕ конфликты (cycle-review #111 cycle 1 finding 2): non_brew_binary и будущие conflict-типы НЕ
+    # поглощаются → остаются в фильтре, требуют adopt/overwrite/skip. Истинно foreign требует выбора.
     choices = {}
     conflicts = [(name, item) for name, item in (plan.get("components") or {}).items()
-                 if isinstance(item, dict) and item.get("conflict")]
+                 if isinstance(item, dict) and item.get("conflict")
+                 and not _reclaimable_resolves_all_conflicts(item)]
     if conflicts:
         if not sys.stdin.isatty():
             names = ", ".join(n for n, _ in conflicts)
@@ -735,6 +742,12 @@ def cmd_uninstall(args) -> int:
         blocked = ", ".join(result.get("blocked") or ["unknown"])
         print(f"uninstall остановлен: {blocked}", file=sys.stderr)
         return 2
+    # leftover (issue #110 Дефект 1): компоненты, которые srouter СТАВИЛ, но не откатил (нет backup /
+    # маркер пропал). НЕ ошибка (ok=True — uninstall не крашится), но partial: следующий install увидит
+    # эти конфиги как reclaimable (Дефект 2) либо foreign. Сообщаем честно, rc=2 — иначе headline
+    # «Откат завершён» маскирует, что по сути ничего не откатили.
+    leftover = result.get("leftover") or []
+    partial_configs = bool(leftover)
 
     # 4) Удалить split-route (новое — install_lib про маршрут не знает).
     route_rc = _remove_active_split_route(state_path, runner)
@@ -756,9 +769,10 @@ def cmd_uninstall(args) -> int:
     # env-cleanup fail-closed (issue #94 DEFECT A): мёртвый прокси остался в gui-домене → НЕ успех,
     # даже если всё остальное прошло. Раньше env_note просто конкатенировался в сообщение → fail-open
     # (rc=0 при живом socks5://127.0.0.1:10808 в GUI). ok=False пробрасываем в ненулевой rc.
-    # Шапка сообщения зависит от итога: «Откат завершён» только при подтверждённо снятом env,
-    # иначе «Откат выполнен частично» (env-прокси мог остаться) — без противоречия rc=2.
-    headline = "Откат завершён" if env_status["ok"] else "Откат выполнен частично"
+    # Шапка сообщения зависит от итога: «Откат завершён» только при подтверждённо снятом env И без
+    # leftover (issue #110 Дефект 1), иначе «Откат выполнен частично» — без противоречия rc=2.
+    full_ok = env_status["ok"] and not partial_configs
+    headline = "Откат завершён" if full_ok else "Откат выполнен частично"
     print(f"{headline}: brew-сервисы остановлены, конфиги восстановлены/оставлены, "
           "DNS сброшен, LaunchAgent удалён"
           + (". split-route удалён." if route_rc == 0 else ", split-route не удалён — см. выше.")
@@ -768,9 +782,19 @@ def cmd_uninstall(args) -> int:
           + codex_func_note
           + env_note
           + path_note)
+    # leftover per-имённо (issue #110): «частично» без деталей = новый обман. Оператор должен видеть,
+    # КАКИЕ конфиги srouter ставил, но не откатил (следующий install авторазрешит их как reclaimable
+    # с backup, либо потребует решения если они foreign).
+    if leftover:
+        names = ", ".join(item["name"] for item in leftover)
+        print(f"uninstall выполнен частично: конфиги оставлены ({names}) — не найден backup/маркер. "
+              f"Повторный install авторазрешит их (с backup) либо потребует adopt/overwrite/skip.",
+              file=sys.stderr)
     if not env_status["ok"]:
         print(f"uninstall завершён с ошибкой: Codex env не подтверждённо снят — {env_status['note']}",
               file=sys.stderr)
+        return 2
+    if partial_configs:
         return 2
     return 0
 

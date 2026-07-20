@@ -76,3 +76,53 @@ def test_cmd_install_no_tty_without_yes_fails_closed(monkeypatch, capsys):
     assert rc == 2, f"не-TTY без -y → отказ (нет ни TTY, ни подтверждения), получил {rc}"
     err = capsys.readouterr().err.lower()
     assert "терминал" in err, f"stderr объясняет: нужен TTY или -y: {err}"
+
+
+# ============================ issue #110 Дефект 2 e2e: idempotent install после partial uninstall ============================
+# Базовый сценарий бага #110: srouter uninstall (rc=0 «Откат завершён» — leftover скрыт) → srouter install
+# сразу падает в non-TTY «обнаружены конфликты (xray, privoxy, dnsmasq)», rc=2. Причина: install видел
+# stale-managed конфиги (state.managed=True, маркер пропал) как foreign → конфликт-блок non-TTY отказывал
+# независимо от -y. Фикс: reclaimable (state.managed=True, маркера нет) исключён из конфликт-фильтра →
+# авторазрешается с backup в apply_install. non-TTY -y проходит rc=0.
+def test_cmd_install_idempotent_after_partial_uninstall(monkeypatch):
+    """Дефект 1+2 интеграция: uninstall оставил stale-managed → повторный install (non-TTY, -y) rc=0.
+
+    plan содержит reclaimable-компонент (conflict=True И reclaimable=True). До фикса cmd_install
+    фильтровал конфликты без учёта reclaimable → non-TTY падал rc=2. Теперь reclaimable исключён →
+    apply_install авторазрешает его (с backup), rc=0. Это и есть идемпотентность uninstall→install.
+    """
+    _stub_cmd_install_internals(monkeypatch, apply_ok=True, tty=False)
+    # Переопределяем build_plan: компонент с conflict=True И reclaimable=True (stale-managed).
+    monkeypatch.setattr(srouter, "build_plan", lambda **k: {
+        "components": {
+            "privoxy": {"name": "privoxy", "conflict": True, "reclaimable": True,
+                        "conflicts": ["foreign_config"], "config_path": "/tmp/x", "port_owner": None},
+        }
+    })
+
+    rc = srouter.cmd_install(_args(yes=True))
+
+    assert rc == 0, ("reclaimable (stale-managed) НЕ должен блокировать non-TTY install: "
+                     f"авторазрешается с backup, получил rc={rc}")
+
+
+def test_cmd_install_foreign_conflict_still_blocks_non_tty(monkeypatch, capsys):
+    """Дефект 2 регресс-гард: ИСТИННО foreign (reclaimable=False) → non-TTY по-прежнему rc=2.
+
+    Фикс не должен открывать дыру: настоящий чужой конфиг (srouter никогда не ставил) остаётся
+    конфликтом, требующим явного adopt/overwrite/skip. non-TTY без выбора → rc=2 (как до фикса).
+    """
+    _stub_cmd_install_internals(monkeypatch, apply_ok=True, tty=False)
+    monkeypatch.setattr(srouter, "build_plan", lambda **k: {
+        "components": {
+            "privoxy": {"name": "privoxy", "conflict": True, "reclaimable": False,
+                        "conflicts": ["foreign_config"], "config_path": "/tmp/x", "port_owner": None},
+        }
+    })
+
+    rc = srouter.cmd_install(_args(yes=True))
+
+    assert rc == 2, ("true-foreign (reclaimable=False) — конфликт, non-TTY без выбора → rc=2, "
+                     f"получил rc={rc}")
+    err = capsys.readouterr().err.lower()
+    assert "конфликт" in err, "stderr объясняет: конфликт требует ручного разрешения"
