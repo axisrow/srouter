@@ -1,6 +1,11 @@
 # Локальная конфигурация (реальные адреса инфраструктуры)
 srouter_config.py
 srouter.local.json
+# cycle-review #114 C3/C4: save_state atomic-write temp (local_state.py:596). Комментарий на отдельной
+# строке — inline-коммент ломает паттерн в gitignore/dockerignore (# только в начале строки).
+srouter.local.json.tmp
+# _backup() timestamped — прежний (чужой) конфиг с секретами (install_lib.py:599)
+*.srouter-backup-*
 
 # Opt-in локальный кэш hot_routes (домены+счётчики, privacy) — НИКОГДА не коммитить
 srouter.hot_routes.json

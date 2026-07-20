@@ -51,3 +51,9 @@ py-modules = [
 
 [tool.setuptools.package-data]
 "*" = ["launchagents/*.plist", "static/*", "templates/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "acceptance: end-to-end приёмочные тесты реального CLI srouter в Docker-полигоне (skip без SROUTER_ACCEPTANCE=1)",
+]
