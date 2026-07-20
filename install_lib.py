@@ -728,15 +728,25 @@ def _write_state_after_apply(env, plan, modes, backups, launchagent_action=None)
     detected = state.get("detected_environment") if isinstance(state.get("detected_environment"), dict) else {}
     for name, item in plan["components"].items():
         mode = modes.get(name, "skipped")
+        prev = detected.get(name) if isinstance(detected.get(name), dict) else {}
         # provenance (issue #112 Часть 1): только для managed. backups[name] truthy ⟺ config существовал
-        # до install (apply_install needs_backup на стр.767 требует config_path.exists() → _backup вызван).
+        # до install (apply_install needs_backup требует config_path.exists() → _backup вызван).
         # created = нет backup (fresh install с нуля), overwrote = есть backup (перезаписан чужой).
         provenance = None
         if mode == "managed":
             provenance = "overwrote" if backups.get(name) else "created"
+        # cycle-review cloud (@bbc356a) P1: idempotent reinstall НЕ должен терять существующий backup/provenance.
+        # Если этот apply не создавал/не перезаписывал файл (backups[name] пуст — target уже marker-managed,
+        # не конфликт) НО prev уже managed с backup — preserve prev.backup/provenance. Иначе _management_for
+        # перезаписывал entry → provenance='created' + backup утерян → следующий uninstall УДАЛЯЛ srouter-config
+        # вместо restore пользовательского оригинала (потеря в цикле install→reinstall→uninstall).
+        if mode == "managed" and not backups.get(name) and _is_managed_entry(prev) and prev.get("backup"):
+            provenance = _provenance_of(prev) or "overwrote"
         detected[name] = _management_for(mode, item, provenance=provenance)
         if backups.get(name):
             detected[name]["backup"] = backups[name]
+        elif mode == "managed" and _is_managed_entry(prev) and prev.get("backup"):
+            detected[name]["backup"] = prev["backup"]  # preserve backup оригинала (idempotent reinstall)
     if launchagent_action:
         launchagent = plan.get("launchagent") or {}
         detected["launchagent"] = {

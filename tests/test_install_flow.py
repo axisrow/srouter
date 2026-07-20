@@ -575,3 +575,57 @@ def test_install_skipped_has_no_provenance(tmp_path):
     for name in ("xray", "privoxy", "dnsmasq"):
         assert "provenance" not in state["detected_environment"][name]["management"], \
             f"{name} skipped → provenance отсутствует (не применимо)"
+
+
+# ============================ cycle-review cloud (@bbc356a, чистое ядро): preserve на idempotent reinstall ============================
+# P1: past install overwrote foreign config → state: backup=foreign, provenance='overwrote'. Idempotent
+# reinstall (target marker-managed, нет нового backup) → _write_state_after_apply перезаписывает entry →
+# provenance='created', backup ДРОПАЕТСЯ → uninstall удаляет srouter-config вместо restore оригинала.
+# Это баг Части 1 (не WAL): provenance выводится из backups[name] этого apply, игнорируя prev entry.
+def test_idempotent_reinstall_preserves_overwrote_backup_provenance(tmp_path):
+    """P1: idempotent reinstall после overwrite СОХРАНЯЕТ backup/provenance='overwrote'.
+
+    Сценарий: прошлое install overwrote privoxy → state: backup=foreign-оригинал, provenance='overwrote'.
+    Повторный install: target marker-managed → no new backup → provenance='created', backup потерян.
+    Следующий uninstall: created → УДАЛИТ srouter-config вместо restore пользовательского оригинала. ПОТЕРЯ.
+    Фикс: для already-managed entry без нового backup — preserve существующих backup/provenance из prev.
+    """
+    env = _env(tmp_path)
+    config_path = env.component_paths("privoxy")["config"]
+    config_path.parent.mkdir(parents=True)
+    # target = srouter-managed (как после прошлого install).
+    config_path.write_text("# srouter-managed-config-v1\nlisten-address 127.0.0.1:8118\n", encoding="utf-8")
+    # state: прошлое install overwrote → backup=foreign-оригинал, provenance='overwrote'.
+    backup_of_original = config_path.with_name("config.srouter-backup-reinstall")
+    backup_of_original.write_text("foreign config\n", encoding="utf-8")
+    env.state_path.write_text(json.dumps({
+        "schema_version": 1, "nodes": [], "active_node": {"name": None, "pending": None},
+        "probes": {}, "network": {"channels": {"wifi_service": "Wi-Fi"}},
+        "traffic_guard": {"mode": "off", "domains": {}},
+        "detected_environment": {"privoxy": {
+            "config_path": str(config_path),
+            "backup": str(backup_of_original),
+            "management": {"mode": "managed", "managed": True, "provenance": "overwrote"},
+        }},
+        "runtime": {},
+    }), encoding="utf-8")
+
+    # idempotent reinstall БЕЗ overwrite-choice (target managed, не конфликт).
+    result = install_lib.apply_install(
+        env=env, confirm=True, choices={"xray": "skip", "dnsmasq": "skip"},
+        runner=FakeRunner(), port_checker=lambda *_a, **_kw: False)
+    assert result["ok"] is True, f"idempotent reinstall должен пройти: {result}"
+
+    state = json.loads(env.state_path.read_text(encoding="utf-8"))
+    entry = state["detected_environment"]["privoxy"]
+    assert entry.get("backup") == str(backup_of_original), \
+        "idempotent reinstall сохраняет backup оригинала — иначе uninstall удалит вместо restore"
+    assert entry["management"].get("provenance") == "overwrote", \
+        "idempotent reinstall сохраняет provenance='overwrote' — не деградирует до 'created'"
+
+    # Доказательство потери БЕЗ фикса: последующий uninstall должен RESTORE (overwrote), не DELETE (created).
+    un = install_lib.apply_uninstall(
+        env=env, confirmations={"configs": True}, runner=FakeRunner())
+    assert un["ok"] is True
+    assert config_path.read_text(encoding="utf-8") == "foreign config\n", \
+        "uninstall после idempotent reinstall восстанавливает оригинал (overwrote→restore), не удаляет"
