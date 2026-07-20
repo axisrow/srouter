@@ -5,19 +5,34 @@ End-to-end приёмка install/uninstall цикла в изолированн
 реальный CLI целиком. Этот модуль закрывает зазор: `srouter install`/`uninstall` как subprocess против
 in-container окружения (fake launchctl/brew/networksetup/osascript/route по тем же абсолютным путям).
 
-Skip без SROUTER_ACCEPTANCE=1 — чтобы не ломать 744 быстрых теста на dev-машине. Запускается только
-внутри Docker-полигона: `./docker/run-acceptance.sh`.
+**Fail-closed gate (cycle-review #114 C2):** тест НЕ запускается по одному env-var. SROUTER_ACCEPTANCE=1
+на macOS (вне контейнера) НЕ должен авторизовать прогон — иначе реальный `srouter uninstall/install`
+снесёт рабочий стек (brew services, launchctl, ~/.zshrc, ~/bin/codex, DNS). Требуется ОДНОВРЕМЕННО:
+  1. SROUTER_ACCEPTANCE=1 (явный opt-in);
+  2. Linux (не macOS) — контейнер;
+  3. sentinel-файл /srouter-acceptance-sentinel — Dockerfile создаёт ТОЛЬКО в образе;
+  4. HOME изолирован (tmp_path) — не наследуем пользовательский HOME.
+Среда одна не авторизует деструктивный прогон — только их совокупность (канон privileged-boundary-fail-closed).
 """
 import os
 import subprocess
+import sys
 
 import pytest
+
+# Sentinel: Dockerfile создаёт этот файл в образе (RUN touch). На macOS/host его нет → fail-closed.
+# Один env-var (SROUTER_ACCEPTANCE) или одна платформа НЕ достаточны — все условия одновременно.
+_SENTINEL = "/srouter-acceptance-sentinel"
 
 pytestmark = [
     pytest.mark.acceptance,
     pytest.mark.skipif(
-        os.environ.get("SROUTER_ACCEPTANCE") != "1",
-        reason="acceptance-тест: только в Docker-полигоне (SROUTER_ACCEPTANCE=1)",
+        not (
+            os.environ.get("SROUTER_ACCEPTANCE") == "1"      # явный opt-in
+            and sys.platform == "linux"                       # контейнер, не macOS host
+            and os.path.exists(_SENTINEL)                     # stub-среда (только в образе)
+        ),
+        reason="acceptance-тест: только в Docker-полигоне (SROUTER_ACCEPTANCE=1 + Linux + sentinel)",
     ),
 ]
 
@@ -27,10 +42,16 @@ def _cli_env(tmp_path):
 
     envvars читаются _env_from_args (srouter.py) → InstallEnv.from_env (install_lib.py:74-86):
     SROUTER_PREFIX/STATE_PATH/LAUNCHAGENTS_DIR/PYTHON/LOG_DIR — все крюки есть. CLI-флаги НЕ передаём —
-    намеренно через env, чтобы протестировать, что env-параметризация работает (канон: ноль правок кода).
+    намеренно через env, чтобы протестировать env-параметризацию (канон: ноль правок кода).
+
+    HOME изолируем (tmp_path/home) — иначе дочерний srouter наследует HOME контейнера (/root) и пишет
+    в него wrappers/функции. Чистый tmp — чистый прогон, ничего вне tmp_path.
     """
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
     return {
         **os.environ,
+        "HOME": str(home),
         "SROUTER_STATE_PATH": str(tmp_path / "srouter.local.json"),
         "SROUTER_PREFIX": str(tmp_path / "homebrew"),
         "SROUTER_LAUNCHAGENTS_DIR": str(tmp_path / "LaunchAgents"),

@@ -1,0 +1,56 @@
+# Docker build-context фильтр (cycle-review #114 C1).
+# .gitignore НЕ фильтрует Docker — COPY . утащил бы секреты в слой образа (srouter.local.json с
+# Reality-материалом/UUID/endpoints, srouter_config.py, .env). Этот файл — зеркало секретных/локальных
+# паттернов .gitignore ПЛЮС .git и кэши (раздувают context, не нужны в образе).
+
+# Локальная конфигурация (реальные адреса инфраструктуры, Reality-материал, UUID узлов)
+srouter_config.py
+srouter.local.json
+
+# Privacy: локальный кэш hot_routes (домены+счётчики)
+srouter.hot_routes.json
+srouter.hot_routes.json.tmp
+
+# Секреты окружения
+.env
+.env.*
+*.env
+!.env.example
+
+# Сгенерированные серверные артефакты и ключи
+server/.generated/
+server/generated/
+server/rendered/
+server/deploy-bundles/
+
+# Local MCP config (may contain API keys)
+.mcp.json
+
+# Git — не нужен в образе, раздувает build-context
+.git
+.gitignore
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# Бэкапы и временное
+*.bak
+*.bak-*
+dashboard.py.bak-*
+
+# Диагностика с реальными сетевыми данными
+diag-vpn.txt
+diag-*.txt
+
+# Служебные экспорты сессий
+*local-command-caveat*.md
+
+# Docker-локальная настройка (не публиковать)
+.claude/

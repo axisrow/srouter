@@ -34,6 +34,13 @@ COPY . /srouter
 RUN pip install --no-cache-dir --upgrade pip setuptools>=61 wheel \
     && pip install --no-cache-dir -e '.[dev]'
 
+# Bootstrap конфиг из example-шаблонов (плейсхолдеры, НЕ секреты). .dockerignore исключает настоящий
+# srouter_config.py/srouter.local.json (защита от утечки секретов), но srouter-CLI требует их для запуска
+# (dashboard_common поднимает SystemExit без srouter_config.py). Копируем example → рабочий файл с
+# плейсхолдерами (как cp srouter_config.example.py srouter_config.py в CLAUDE.md). Секретов тут нет.
+RUN cp srouter_config.example.py srouter_config.py \
+    && cp srouter.local.example.json srouter.local.json
+
 # macOS-binary stub'ы по тем же абсолютным путям, что в константах srouter
 # (install_lib.py: BREW=/opt/homebrew/bin/brew, LAUNCHCTL=/bin/launchctl, NETWORKSETUP=/usr/sbin/networksetup,
 #  ROUTE=/sbin/route; srouter.py: OSASCRIPT=/usr/bin/osascript). srouter найдёт их без правки кода.
@@ -58,6 +65,11 @@ RUN mkdir -p /opt/homebrew/bin /usr/sbin /sbin /usr/bin /bin \
 # Контейнер запускается от root → make_privileged_runner идёт по am_root-ветке (osascript не нужен),
 # но stub всё равно стоит (если код дойдёт до _to_osascript — no-op вместо command-not-found).
 USER root
+
+# Sentinel (cycle-review #114 C2): acceptance-тест требует /srouter-acceptance-sentel для прогона.
+# Файл существует ТОЛЬКО в образе → даже если SROUTER_ACCEPTANCE=1 задан на macOS host (вне контейнера),
+# тест skip'нется (нет sentinel + не Linux) → не снесёт рабочий стек. Один env-var не авторизует прогон.
+RUN touch /srouter-acceptance-sentinel
 
 # Дефолтный cmd — прогон acceptance-тестов с SROUTER_ACCEPTANCE=1 (включает skip'нутые вне полигона).
 CMD ["pytest", "tests/acceptance/", "-v"]
