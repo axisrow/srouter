@@ -170,3 +170,27 @@ def test_codex_probe_socks_plus_direct_is_mixed_not_ok(monkeypatch):
     res = health._codex_proxy_probe()
     assert res["status"] != "ok", "SOCKS + direct → НЕ ok (direct-PID не замаскирован)"
     assert "202" in res["detail"], "detail называет direct-PID (202)"
+
+
+# ============================ cycle 2 cleanup: matcher over-matching (basename-точность) ============================
+# Общий substring 'codex' цеплял helpers (moonbridge, crashpad, node, ChatGPT-for-Chrome) — false diagnostic
+# degradation. Matcher по BASENAME: 'codex' или 'codex-<arch>-apple-darwin', остальное отбрасывает.
+HELPER_COMMS = [
+    "/Users/axisrow/.codex/bin/moonbridge",
+    "/Applications/Codex.app/Contents/Frameworks/Codex Framework.framework/Versions/149.0.7827.197/Helpers/browser_crashpad_handler",
+    "/Users/axisrow/.codex/plugins/cache/openai-bundled/chrome/latest/extension-host/macos/arm64/ChatGPT for Chrome",
+    "/Applications/Codex.app/Contents/Resources/cua_node/bin/node",
+]
+
+
+def test_codex_probe_rejects_codex_helpers(monkeypatch):
+    """cycle 2 cleanup: helpers с 'codex' в path (moonbridge/crashpad/node/ChatGPT-Chrome) НЕ матчатся.
+
+    Иначе doctor ложно degraded: helper на external-сокете → mixed/down, хотя основной codex-binary ок.
+    Matcher по basename: 'codex' или 'codex-*apple-darwin'. Helpers имеют другой basename.
+    """
+    ps = "\n".join(f"{50000 + i} {c}" for i, c in enumerate(HELPER_COMMS)) + "\n"
+    lsof = ""  # без lsof-ответов — но pids должен быть пуст (helpers не matчатся)
+    monkeypatch.setattr(health.sys_probe, "run", _fake(ps, lsof))
+    res = health._codex_proxy_probe()
+    assert res["status"] == "unknown", f"helpers НЕ matчатся как codex-binary; got {res}"

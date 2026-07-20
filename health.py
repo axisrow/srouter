@@ -162,22 +162,25 @@ def _claude_proxy_probe():
             "detail": "runtime: Claude Code запущен, но без коннекта к privoxy (перезапусти CC)"}
 
 
-# codex-binary comm-паттерн. ОБЩИЙ (не npm-only): матчит любой codex-binary независимо от способа
-# установки — npm-vendor (`.../codex-darwin-arm64/.../bin/codex`), Homebrew cask
-# (`/opt/homebrew/Caskroom/codex/<ver>/codex-aarch64-apple-darwin`), standalone-installer (`~/.local/bin/codex`),
-# release-binary. Исключает codex-code-mode-host (другой binary — НЕ основной codex-движок).
-# `which codex` НЕ доказательство (wrapper exec маскирует) → matcher по resolved comm-path.
+# codex-binary comm-паттерн. Матчит ОСНОВНОЙ codex-binary по BASENAME (независимо от способа установки):
+#   basename "codex"                       — npm-vendor (.../bin/codex), standalone (~/.local/bin/codex)
+#   basename "codex-<arch>-apple-darwin"   — Homebrew cask / release-binary
+# НЕ матчит (исключает по basename):
+#   moonbridge, browser_crashpad_handler, ChatGPT for Chrome, node (Codex.app helpers / .codex/plugins),
+#   codex-code-mode-host (вспомогательный binary, не основной движок).
 # cycle-review #121 C1: npm-only regex пропускал brew-cask/standalone → doctor ложно «codex не запущен».
-_CODEX_BIN_RE = re.compile(r"codex")
-_CODEX_MODE_HOST_RE = re.compile(r"codex-code-mode-host")
+# cycle 2 cleanup: общий substring 'codex' over-matched helpers → matcher по basename (точно).
+_CODEX_BIN_RE = re.compile(r"(^|/)codex(-[a-z0-9]+-apple-darwin)?$")
 
 
 def _is_codex_binary_comm(comm):
-    """Является ли comm основным codex-binary? Любой способ установки; НЕ mode-host (другой binary)."""
+    """Является ли comm основным codex-binary? По basename: 'codex' или 'codex-<arch>-apple-darwin'.
+
+    Любой способ установки (npm/cask/standalone). Отбрасывает helpers (moonbridge, crashpad, node,
+    ChatGPT-for-Chrome) и codex-code-mode-host (вспомогательный binary).
+    """
     if not comm:
         return False
-    if _CODEX_MODE_HOST_RE.search(comm):
-        return False  # mode-host — вспомогательный процесс, не основной codex-binary
     return bool(_CODEX_BIN_RE.search(comm))
 
 
