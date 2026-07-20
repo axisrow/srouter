@@ -6,8 +6,12 @@
 # Локальная конфигурация (реальные адреса инфраструктуры, Reality-материал, UUID узлов)
 srouter_config.py
 srouter.local.json
-srouter.local.json.tmp    # cycle-review #114 C3: save_state atomic-write temp (local_state.py:596)
-*.srouter-backup-*        # _backup() timestamped — прежний (чужой) конфиг с секретами
+# cycle-review #114 C3: save_state atomic-write temp (local_state.py:596). ВАЖНО: комментарий на
+# ОТДЕЛЬНОЙ строке — Docker/git парсят '#' как комментарий только в начале строки, inline-коммент
+# ломает паттерн (C4), и файл с секретами утекает в образ.
+srouter.local.json.tmp
+# _backup() timestamped — прежний (чужой) конфиг с секретами (install_lib.py:599)
+*.srouter-backup-*
 
 # Privacy: локальный кэш hot_routes (домены+счётчики)
 srouter.hot_routes.json
