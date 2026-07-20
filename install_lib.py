@@ -138,6 +138,51 @@ def _has_marker(path):
     return first_line == TEXT_MARKER
 
 
+# ============================ known_markers migration table (issue #112 Часть 4) ============================
+# State-based migration: detected_environment.known_markers = {surface: [marker, ...]}.
+# install распознаёт ЛЮБОЙ маркер из таблицы как «свой» → мигрирует old→current. unmarked (нет ни current,
+# ни legacy) → WARN, не adopt (канон fail-closed «никогда молча не adopt»). State может опережать код
+# (новая версия маркера) или отставать — current всегда валиден.
+def load_known_markers(state_path, surface, current_markers):
+    """Union(current_markers, state.known_markers[surface]) без дубликатов.
+
+    srouter.py (wrappers/zshrc/codenv) и configs-side переиспользуют: current из кода (всегда валиден) +
+    legacy из state (migration). Без state/таблицы → только current (безопасный fallback, не угадываем).
+    """
+    state = local_state.load_state(path=state_path)
+    detected = state.get("detected_environment") if isinstance(state.get("detected_environment"), dict) else {}
+    table = detected.get("known_markers") if isinstance(detected.get("known_markers"), dict) else {}
+    known = list(table.get(surface) or [])
+    for m in current_markers:
+        if m not in known:
+            known.append(m)
+    return known
+
+
+def populate_known_markers(state_path, surface, markers):
+    """CLI-слой (srouter.py) регистрирует markers wrappers/zshrc/codenv в state (issue #112 Часть 4).
+
+    lib НЕ знает о wrappers (layers: CLI зависит от lib, не наоборот) — данные передаются сверху.
+    Idempotent: дубликаты не накапливаются. При install с новой версией маркера — old остаётся в таблице
+    как legacy → следующий install мигрирует.
+    """
+    state, readable = local_state.load_state_checked(path=state_path)
+    if not readable:
+        return "state_unreadable"
+    detected = state.get("detected_environment") if isinstance(state.get("detected_environment"), dict) else {}
+    table = detected.get("known_markers") if isinstance(detected.get("known_markers"), dict) else {}
+    existing = list(table.get(surface) or [])
+    for m in markers:
+        if m not in existing:
+            existing.append(m)
+    table[surface] = existing
+    detected["known_markers"] = table
+    state["detected_environment"] = detected
+    if local_state.save_state(state, path=state_path) is None:
+        return "state_write_failed"
+    return ""
+
+
 def _has_launchagent_marker(path):
     return LAUNCHAGENT_MARKER in _read_head(path)
 
