@@ -7,6 +7,7 @@ cmd_install падал в не-TTY среде (cron/launchd/CI/фоновый п
 Покрываем gate-логику подтверждения (cmd_install:544). Конфликт-блок (cmd_install:530) НЕ трогаем —
 там TTY нужен legitimately (per-компонентный выбор adopt/overwrite/skip неразрешим через -y).
 """
+from pathlib import Path
 from types import SimpleNamespace
 
 import srouter
@@ -25,8 +26,15 @@ def _stub_cmd_install_internals(monkeypatch, *, apply_ok=True, tty=True):
     apply_ok управляет возвратом apply_install. tty — есть ли терминал (минует ранний возврат
     «подтверждение требует терминал»). plan возвращается БЕЗ конфликтов (конфликт-блок :530 не
     тестируем — там TTY нужен legitimately, см. docstring модуля).
+
+    ИНВАРИАНТ: ВСЕ хелперы после apply_install замокаются — cmd_install после успешного apply
+    вызывает claude_proxy/_install_generic_launchagent/_install_ppp_hook/_install_codex_wrappers/
+    _install_codex_zsh_function (issue #97)/_install_launchctl_env/_ensure_home_bin_in_path, и КАЖДЫЙ
+    лезет в реальную ФС/сеть/launchd. Пропуск любого мока = тест пишет в ~/.zshrc, ~/bin, plist.
+    `_install_codex_zsh_function` обязательно: без мока она падает в try/except на env.now mock'а,
+    и тест проходит СЛУЧАЙНО (маскируя вызов) — хрупкость, ломающаяся при любом изменении stub'а.
     """
-    monkeypatch.setattr(srouter, "_env_from_args", lambda args: SimpleNamespace(root=__import__("pathlib").Path(".")))
+    monkeypatch.setattr(srouter, "_env_from_args", lambda args: SimpleNamespace(root=Path(".")))
     monkeypatch.setattr(srouter, "make_privileged_runner", lambda *a, **k: (lambda cmd, t: {"rc": 0}))
     # plan без конфликтов → блок :527 (conflicts) пустой → доходим до gate :544.
     monkeypatch.setattr(srouter, "build_plan", lambda **k: {"components": {}})
@@ -39,6 +47,9 @@ def _stub_cmd_install_internals(monkeypatch, *, apply_ok=True, tty=True):
     monkeypatch.setattr(srouter, "_install_generic_launchagent", lambda *a, **k: (True, ""))
     monkeypatch.setattr(srouter, "_install_ppp_hook", lambda *a, **k: "")
     monkeypatch.setattr(srouter, "_install_codex_wrappers", lambda env: "")
+    if hasattr(srouter, "_install_codex_zsh_function"):
+        # issue #97: лезет в реальный ~/.zshrc (_zshrc_path = Path.home()/.zshrc, не замокан).
+        monkeypatch.setattr(srouter, "_install_codex_zsh_function", lambda env: "")
     monkeypatch.setattr(srouter, "_install_launchctl_env", lambda env, runner: "")
     monkeypatch.setattr(srouter, "_ensure_home_bin_in_path", lambda env: "")
 
