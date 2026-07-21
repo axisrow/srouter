@@ -483,9 +483,10 @@ def test_inspect_component_non_brew_binary_blocks_even_when_reclaimable(tmp_path
 
     monkeypatch.setattr(env, "component_paths", paths_with_non_brew)
 
+    runner = FakeRunner()
     result = install_lib.apply_install(
         env=env, confirm=True, choices={"xray": "skip", "dnsmasq": "skip"},
-        runner=FakeRunner(), port_checker=lambda *_a, **_kw: False)
+        runner=runner, port_checker=_port_checker_managed_up(runner.calls))
 
     # reclaimable НЕ должен авторазрешать компонент с non_brew_binary — отдельная угроза требует решения.
     assert result["ok"] is False, ("non_brew_binary при reclaimable НЕ должен авто-разрешаться: "
@@ -536,12 +537,13 @@ def test_install_records_provenance_created(tmp_path):
     """
     env = _env(tmp_path)
 
+    runner = FakeRunner()
     result = install_lib.apply_install(
         env=env,
         confirm=True,
         choices={"xray": "skip", "privoxy": "skip"},  # только dnsmasq → fresh config_path
-        runner=FakeRunner(),
-        port_checker=lambda *_a, **_kw: False,
+        runner=runner,
+        port_checker=_port_checker_managed_up(runner.calls),
     )
 
     assert result["ok"] is True, f"fresh install должен пройти: {result}"
@@ -561,12 +563,13 @@ def test_install_records_provenance_overwrote(tmp_path):
     config_path.parent.mkdir(parents=True)
     config_path.write_text("foreign config\n", encoding="utf-8")
 
+    runner = FakeRunner()
     result = install_lib.apply_install(
         env=env,
         confirm=True,
         choices={"privoxy": "overwrite", "xray": "skip", "dnsmasq": "skip"},
-        runner=FakeRunner(),
-        port_checker=lambda *_a, **_kw: False,
+        runner=runner,
+        port_checker=_port_checker_managed_up(runner.calls),
     )
 
     assert result["ok"] is True, f"overwrite должен пройти: {result}"
@@ -584,12 +587,13 @@ def test_install_skipped_has_no_provenance(tmp_path):
     """
     env = _env(tmp_path)
 
+    runner = FakeRunner()
     result = install_lib.apply_install(
         env=env,
         confirm=True,
         choices={"xray": "skip", "privoxy": "skip", "dnsmasq": "skip"},
-        runner=FakeRunner(),
-        port_checker=lambda *_a, **_kw: False,
+        runner=runner,
+        port_checker=_port_checker_managed_up(runner.calls),
     )
 
     assert result["ok"] is True
@@ -633,9 +637,10 @@ def test_idempotent_reinstall_preserves_overwrote_backup_provenance(tmp_path):
     }), encoding="utf-8")
 
     # idempotent reinstall БЕЗ overwrite-choice (target managed, не конфликт).
+    runner = FakeRunner()
     result = install_lib.apply_install(
         env=env, confirm=True, choices={"xray": "skip", "dnsmasq": "skip"},
-        runner=FakeRunner(), port_checker=lambda *_a, **_kw: False)
+        runner=runner, port_checker=_port_checker_managed_up(runner.calls))
     assert result["ok"] is True, f"idempotent reinstall должен пройти: {result}"
 
     state = json.loads(env.state_path.read_text(encoding="utf-8"))
@@ -684,9 +689,10 @@ def test_reinstall_does_not_carry_backup_across_config_paths(tmp_path, monkeypat
     }), encoding="utf-8")
 
     # install при prefix B (target marker-managed, нет нового backup, prev.config_path != item.config_path).
+    runner = FakeRunner()
     result = install_lib.apply_install(
         env=env, confirm=True, choices={"xray": "skip", "dnsmasq": "skip"},
-        runner=FakeRunner(), port_checker=lambda *_a, **_kw: False)
+        runner=runner, port_checker=_port_checker_managed_up(runner.calls))
     assert result["ok"] is True, f"install при смене prefix должен пройти: {result}"
 
     state = json.loads(env.state_path.read_text(encoding="utf-8"))
