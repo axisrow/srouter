@@ -22,7 +22,7 @@ def tunnel_code_up(code):
     return isinstance(code, int) and 100 <= code < 500
 
 
-def run(cmd_list, timeout):
+def run(cmd_list, timeout, *, env=None):
     """Всегда список аргументов, без shell=True. Возвращает dict и не бросает.
 
     timeout=True ТОЛЬКО при реальном истечении срока (TimeoutExpired). Прочие сбои запуска
@@ -30,10 +30,21 @@ def run(cmd_list, timeout):
     возвращаем timeout=False с типизированной причиной в err, иначе вызывающий код принял бы
     отсутствие /usr/bin/curl за «медленную сеть» (issue #82)."""
     try:
-        proc = subprocess.run(cmd_list, capture_output=True, text=True, timeout=timeout)
+        kwargs = {"capture_output": True, "text": True, "timeout": timeout}
+        if env is not None:
+            kwargs["env"] = env
+        proc = subprocess.run(cmd_list, **kwargs)
         return {"rc": proc.returncode, "out": proc.stdout.strip(), "err": proc.stderr.strip(), "timeout": False}
-    except subprocess.TimeoutExpired:
-        return {"rc": None, "out": "", "err": "timeout", "timeout": True}
+    except subprocess.TimeoutExpired as exc:
+        def _text(value):
+            if isinstance(value, bytes):
+                return value.decode(errors="replace")
+            return value or ""
+
+        out = _text(exc.stdout).strip()
+        stderr = _text(exc.stderr).strip()
+        err = f"{stderr}\ntimeout".strip()
+        return {"rc": None, "out": out, "err": err, "timeout": True}
     except Exception as exc:
         return {"rc": None, "out": "", "err": f"{type(exc).__name__}: {exc}", "timeout": False}
 

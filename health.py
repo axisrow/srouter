@@ -12,8 +12,12 @@
 Не бросает, всегда dict со status (probe-канон).
 """
 from pathlib import Path
+import json
 import os
 import re
+import shutil
+import tempfile
+from urllib.parse import urlparse
 
 import sys_probe
 
@@ -42,6 +46,12 @@ TUNNEL_TARGETS = ("https://api.anthropic.com/", "https://api.openai.com/")
 # State watchdog'а (переход ok→down, чтобы не спамить). /tmp не переживает ребут — приемлемо:
 # после ребута fresh state, первый прогон без нотификации если уже down.
 WATCHDOG_STATE = Path("/tmp/srouter-watchdog.last")
+
+# Real Claude Code transport probe is doctor-only: failed proxy negotiation may spend several
+# seconds in retries. Dashboard /health and watchdog keep using lightweight passive checks.
+CLAUDE_TRANSPORT_TIMEOUT = 8
+CLAUDE_API_BASE_URL = "https://api.anthropic.com"
+CLAUDE_DUMMY_API_KEY = "sk-ant-srouter-transport-probe-invalid"
 
 
 def _port_up(port):
@@ -111,24 +121,12 @@ def _is_claude_code_comm(comm):
 
 
 def _claude_proxy_probe():
-    """Реально запущенный Claude Code использует прокси? Поведенческий proof (lsof), не файл.
+    """Какой локальный маршрут виден у запущенного Claude Code? Passive lsof evidence.
 
-    Решает дыру Codex review + инцидента «без ИИ»: claude_proxy.status() читает только ФАЙЛ
-    settings.json, а не реальный CC. enable()/disable() пишут файл, но не перезапускают CC → окно
-    рассинхрона файл↔процесс. Здесь — runtime-proof из ядерной таблицы сокетов.
-
-    :переход на SOCKS5: ищем коннект к 10808 (SOCKS5/xray) — CC через прокси. Если коннекта к
-    10808 нет — проверяем external (direct-leak: CC идёт НАПРЯМУЮ к api.anthropic.com мимо прокси).
-    Это нарушение fail-closed-proxy-down: doctor обязан детектить и сообщить.
-
-    Возвращает {status, source, detail} — ОДИН вызов, один срез (нет TOCTOU ok/detail):
-      status="ok"      — CC запущен и держит коннект к SOCKS5 10808 (реально юзает прокси);
-      status="down"    — CC запущен, но БЕЗ коннекта к прокси → проверка direct-leak:
-                          external ESTABLISHED → CC идёт НАПРЯМУЮ (fail-closed violation);
-                          нет сокетов вообще → idle (не можем сказать);
-      status="unknown" — CC не запущен (проверять нечего; check_all НЕ агрегирует этот check).
+    Важно (#127): ESTABLISHED к 10808 доказывает только TCP до SOCKS listener, но не SOCKS
+    handshake и не доставку запроса к API. Поэтому 10808 без active real-CLI probe никогда не
+    получает ok. External socket остаётся доказательством direct leak.
     """
-    # 1. PID'ы процессов Claude Code (тот же matcher, что и раньше).
     r = sys_probe.run([PS, "-axo", "pid=,comm="], timeout=3)
     if r.get("timeout"):
         return {"status": "unknown", "source": "n/a", "detail": "timeout ps"}
@@ -143,41 +141,186 @@ def _claude_proxy_probe():
     if not pids:
         return {"status": "unknown", "source": "n/a", "detail": "Claude Code не запущен"}
 
-    # 2. Один lsof на ВСЕ PID'ы (батч). per-PID классификация маршрутов (cycle-review #126 C2):
-    #    SOCKS+external в одном срезе = mixed (direct-leak не маскируется SOCKS-коннектом).
-    #    ->127.0.0.1:10808 → socks (CC через SOCKS5).
-    #    external ESTABLISHED (не localhost) → external (direct-leak, fail-closed violation).
-    #    нет сокетов → unknown (idle).
+    # Один lsof на все PID'ы. Любой local proxy + external = mixed/direct leak.
     lr = sys_probe.run([LSOF, "-nP", "-p", ",".join(pids)], timeout=3)
     if lr.get("timeout"):
         return {"status": "unknown", "source": "n/a", "detail": "timeout lsof"}
-    socks_pids, external_pids = set(), set()
+    proxy_pids, socks_pids, external_pids = set(), set(), set()
     for line in (lr.get("out") or "").splitlines():
         if "TCP" not in line or "ESTABLISHED" not in line:
             continue
         fields = line.split()
         pid = fields[1] if len(fields) > 1 else ""
-        if f"->127.0.0.1:{XRAY_PORT}" in line:
+        if f"->127.0.0.1:{PRIVOXY_PORT}" in line:
+            proxy_pids.add(pid)
+        elif f"->127.0.0.1:{XRAY_PORT}" in line:
             socks_pids.add(pid)
         elif "->127.0.0.1:" not in line:
             # external ESTABLISHED (не localhost) — CC идёт напрямую, мимо прокси.
             external_pids.add(pid)
-    if socks_pids and external_pids:
+    local_pids = proxy_pids | socks_pids
+    if local_pids and external_pids:
         return {"status": "down", "source": "runtime",
-                "detail": (f"runtime: Claude Code MIXED — SOCKS5 (PID {','.join(sorted(socks_pids))}) "
+                "detail": (f"runtime: Claude Code MIXED — local proxy (PID {','.join(sorted(local_pids))}) "
                            f"+ direct-leak (PID {','.join(sorted(external_pids))}). "
                            f"Один из PID идёт напрямую — нарушение fail-closed. "
                            f"Проверь HTTPS_PROXY в ~/.claude/settings.json env.")}
-    if socks_pids:
+    if proxy_pids and not socks_pids:
         return {"status": "ok", "source": "runtime",
-                "detail": f"runtime: Claude Code через SOCKS5 10808 (PID {','.join(sorted(socks_pids))})"}
+                "detail": f"runtime: Claude Code через HTTP bridge 8118 (PID {','.join(sorted(proxy_pids))})"}
+    if socks_pids:
+        routes = f"; HTTP 8118 PID {','.join(sorted(proxy_pids))}" if proxy_pids else ""
+        return {"status": "unknown", "source": "runtime",
+                "detail": (f"runtime: TCP к SOCKS5 10808 (PID {','.join(sorted(socks_pids))}){routes} "
+                           f"не доказывает API transport; нужен активный real-CLI probe")}
     if external_pids:
         return {"status": "down", "source": "runtime",
                 "detail": (f"runtime: Claude Code идёт НАПРЯМУЮ (мимо прокси) — нарушение fail-closed. "
                            f"PID {','.join(sorted(external_pids))}. "
-                           f"Проверь HTTPS_PROXY в ~/.claude/settings.json env (должен быть socks5h://127.0.0.1:10808)")}
+                           f"Проверь HTTPS_PROXY в ~/.claude/settings.json env "
+                           f"(ожидается http://127.0.0.1:8118)")}
     return {"status": "unknown", "source": "runtime",
             "detail": "runtime: Claude Code запущен, но нет активных сокетов (idle)"}
+
+
+def _find_claude_binary():
+    """Найти настоящий Claude Code без зависимости от урезанного launchd PATH."""
+    candidates = [
+        Path.home() / ".local" / "bin" / "claude",
+        Path("/opt/homebrew/bin/claude"),
+        Path("/usr/local/bin/claude"),
+    ]
+    discovered = shutil.which("claude")
+    if discovered:
+        candidates.append(Path(discovered))
+    for candidate in candidates:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return ""
+
+
+def _has_expected_api_401(output):
+    """Только structured api_error_status=401 считается положительным transport proof."""
+    for line in output.splitlines():
+        try:
+            payload = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(payload, dict) and payload.get("api_error_status") == 401:
+            return True
+    return False
+
+
+def _has_api_retry(output):
+    """Есть ли structured retry без ответа API (формат stream-json может содержать пробелы)."""
+    for line in output.splitlines():
+        try:
+            payload = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(payload, dict) and payload.get("subtype") == "api_retry":
+            return True
+    return False
+
+
+def _claude_transport_once(proxy, timeout=CLAUDE_TRANSPORT_TIMEOUT):
+    """Запустить настоящий Claude Code изолированно через один proxy.
+
+    Dummy key гарантирует нулевой model-call: успешный транспорт заканчивается ожидаемым API 401.
+    User settings, NO_PROXY, alternative base URL и реальные credentials не участвуют (#127).
+    """
+    claude = _find_claude_binary()
+    if not claude:
+        return {"status": "unknown", "proxy": proxy, "api_status": None,
+                "error": "Claude Code binary not found", "detail": "Claude Code binary not found"}
+
+    clean_keys = (
+        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+        "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+        "ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
+    )
+    with tempfile.TemporaryDirectory(prefix="srouter-claude-probe-") as temp_home:
+        config_dir = Path(temp_home) / ".claude"
+        config_dir.mkdir()
+        env = os.environ.copy()
+        for key in clean_keys:
+            env.pop(key, None)
+        env.update({
+            "HOME": temp_home,
+            "CLAUDE_CONFIG_DIR": str(config_dir),
+            "ANTHROPIC_BASE_URL": CLAUDE_API_BASE_URL,
+            "ANTHROPIC_API_KEY": CLAUDE_DUMMY_API_KEY,
+            "HTTP_PROXY": proxy,
+            "HTTPS_PROXY": proxy,
+            "http_proxy": proxy,
+            "https_proxy": proxy,
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+            "DISABLE_TELEMETRY": "1",
+            "DISABLE_ERROR_REPORTING": "1",
+        })
+        cmd = [
+            claude,
+            "--bare",
+            "--setting-sources", "",
+            "--no-session-persistence",
+            "--tools", "",
+            "--max-budget-usd", "0.01",
+            "--verbose",
+            "--output-format", "stream-json",
+            "-p", "srouter transport probe",
+        ]
+        run_result = sys_probe.run(cmd, timeout=timeout, env=env)
+
+    output = "\n".join(
+        part for part in (run_result.get("out", ""), run_result.get("err", "")) if part
+    )
+    if _has_expected_api_401(output):
+        return {"status": "ok", "proxy": proxy, "api_status": 401, "error": "",
+                "detail": "API returned expected 401 (transport works)"}
+    if "UnsupportedProxyProtocol" in output:
+        error = "UnsupportedProxyProtocol"
+    elif run_result.get("timeout") or "Connection error" in output or _has_api_retry(output):
+        error = "Connection error / timeout"
+    elif run_result.get("rc") is None:
+        error = (run_result.get("err") or "Claude Code launch failed").splitlines()[0][:160]
+    else:
+        error = f"Claude Code exited rc={run_result.get('rc')} before any API response"
+    detail = error
+    if run_result.get("timeout"):
+        detail += " before any API response"
+    return {"status": "down", "proxy": proxy, "api_status": None,
+            "error": error, "detail": detail}
+
+
+def _configured_claude_proxy():
+    """Proxy из settings.json; local import сохраняет fail-soft границу health."""
+    try:
+        import claude_proxy
+        return claude_proxy.status().get("proxy", "")
+    except Exception:
+        return ""
+
+
+def _claude_transport_probe(proxy=None):
+    """Doctor-only active proof. Для failed SOCKS запускает известный HTTP control."""
+    configured = proxy if proxy is not None else _configured_claude_proxy()
+    if not configured:
+        return {"status": "unknown", "proxy": "", "api_status": None,
+                "error": "proxy is not configured", "detail": "Claude Code proxy не настроен"}
+
+    result = _claude_transport_once(configured)
+    scheme = urlparse(configured).scheme.lower()
+    if result["status"] != "down" or scheme not in {"socks", "socks5", "socks5h"}:
+        return result
+
+    control = _claude_transport_once(_PROXY)
+    detail = f"configured proxy {configured}: {result['detail']}; HTTP control {_PROXY}: {control['detail']}"
+    if control["status"] == "ok":
+        detail += "; configured SOCKS path is unusable — configure Claude Code to use the HTTP bridge"
+    result = dict(result)
+    result["detail"] = detail
+    result["control"] = control
+    return result
 
 
 # codex-binary comm-паттерн. Матчит ОСНОВНОЙ codex-binary по BASENAME (независимо от способа установки):
@@ -290,7 +433,7 @@ def _codex_proxy_probe():
             "detail": f"runtime: codex запущен (PID {','.join(sorted(pids))}), но нет активных сокетов (idle)"}
 
 
-def check_all():
+def check_all(*, active_claude=False):
     """Все проверки стека. {status: ok|degraded|down, checks: [{name, ok, detail?, info?}]}.
 
     status: ok (всё живо) / degraded (часть жива) / down (всё мертво). Не бросает.
@@ -311,6 +454,13 @@ def check_all():
     if cp["status"] == "unknown":
         cp_check["info"] = True  # не участвует в агрегации (drivers ниже фильтруют info)
     checks.append(cp_check)
+    if active_claude:
+        active = _claude_transport_probe()
+        active_check = {"name": "Claude Code transport (real CLI)",
+                        "ok": active["status"] == "ok", "detail": active["detail"]}
+        if active["status"] == "unknown":
+            active_check["info"] = True
+        checks.append(active_check)
     # Codex-маршрут (#120): warn (privoxy 8118) — driver degraded (WS порвётся); down — driver;
     # mixed — driver (часть сессий ломаные); unknown (codex не запущен / lsof-timeout / idle) — info-only,
     # не роняет вердикт (как claude-proxy). ok — driver (всё ок).
@@ -359,6 +509,9 @@ def _print_report(result):
             print("  • дашборд: srouter restart")
         if "claude-proxy" in failed_names:
             print("  • Claude Code proxy: включи в дашборде (карточка Claude Code proxy) и ПЕРЕЗАПУСТИ Claude Code")
+        if "Claude Code transport" in failed_names:
+            print("  • Claude Code transport: используй HTTP bridge http://127.0.0.1:8118; "
+                  "SOCKS TCP-соединение само по себе не доказывает работу API")
         if "codex-proxy" in failed_names:
             print("  • Codex TUI: перезапусти в НОВОМ терминале (exec zsh -l) — старая сессия не подхватила SOCKS5;")
             print("    через privoxy 8118 long-lived WS рвётся (#120); нужен SOCKS5 10808 (~/bin/codex)")
@@ -374,7 +527,7 @@ def cmd_watchdog():
     up, от root без osascript). Watchdog только детектит падение туннеля и нотифицирует. Если
     ppp-hook не сработал (utun-VPN) — пользователь видит нотификацию и手动но ensure-split-route-root.
     """
-    result = check_all()
+    result = check_all(active_claude=False)
     is_ok = result["status"] == "ok"
     try:
         was_ok = WATCHDOG_STATE.exists() and WATCHDOG_STATE.read_text().strip() == "ok"
@@ -415,7 +568,7 @@ def main(argv=None):
         r = node_selector.ensure_split_route()
         return 0 if r.get("enabled") else 1
     # default / "check"
-    result = check_all()
+    result = check_all(active_claude=True)
     _print_report(result)
     return 0 if result["status"] == "ok" else 1
 
