@@ -382,6 +382,28 @@ def test_endpoint_check_silent_when_standard(monkeypatch):
     assert "стандарт" in res["detail"].lower()
 
 
+def test_endpoint_check_ok_when_exact_anthropic_host(monkeypatch):
+    """C2: hostname == api.anthropic.com (exact match) → ok, даже если в пути есть другие домены."""
+    monkeypatch.setattr(health, "_read_endpoint_config",
+                        lambda: {"base_url": "https://api.anthropic.com/v1/messages",
+                                 "no_proxy": "", "source": "shell"})
+    res = health._endpoint_override_check()
+    assert res["status"] == "ok"
+
+
+def test_endpoint_check_warns_on_lookalike_host(monkeypatch):
+    """C2: api.anthropic.com.attacker.example → info (lookalike, НЕ ok).
+
+    Substring match пропустил бы это как «стандартный» — security: подавляет WARN когда
+    трафик уходит за Anthropic trust boundary. Exact hostname match ловит.
+    """
+    monkeypatch.setattr(health, "_read_endpoint_config",
+                        lambda: {"base_url": "https://api.anthropic.com.attacker.example/",
+                                 "no_proxy": "", "source": "shell"})
+    res = health._endpoint_override_check()
+    assert res["status"] == "info", "lookalike host → НЕ ok (exact hostname match)"
+
+
 def test_endpoint_check_warns_when_override(monkeypatch):
     """BASE_URL=z.ai (нестандартный) → info WARN «endpoint override»."""
     monkeypatch.setattr(health, "_read_endpoint_config",

@@ -442,32 +442,45 @@ def _read_endpoint_config():
     """Читает ANTHROPIC_BASE_URL + NO_PROXY из всех источников (#129).
 
     Источники (по приоритету): shell env → ~/.claude/settings.json env → launchctl getenv.
+    Managed/local/project settings scopes (Claude Code docs) — НЕ покрыты: srouter не имеет доступа
+    к этим scope'ам из Doctor. Если ни один источник не задан → source="default" (предполагаем
+    стандартный api.anthropic.com).
     Возвращает {base_url, no_proxy, source}. Не бросает.
     """
     import claude_proxy
     # settings.json env
     data = claude_proxy._load()
     env = data.get("env", {}) if isinstance(data, dict) else {}
-    base = os.environ.get("ANTHROPIC_BASE_URL", "") or env.get("ANTHROPIC_BASE_URL", "")
-    no_proxy = os.environ.get("NO_PROXY", "") or env.get("NO_PROXY", "")
+    # launchctl getenv (gui-домен) — фолбэк если shell/settings пусты.
+    lc_base = sys_probe.run(["/bin/launchctl", "getenv", "ANTHROPIC_BASE_URL"], timeout=3)
+    lc_base_val = (lc_base.get("out") or "").strip() if not lc_base.get("timeout") else ""
+    lc_noproxy = sys_probe.run(["/bin/launchctl", "getenv", "NO_PROXY"], timeout=3)
+    lc_noproxy_val = (lc_noproxy.get("out") or "").strip() if not lc_noproxy.get("timeout") else ""
+    base = os.environ.get("ANTHROPIC_BASE_URL", "") or env.get("ANTHROPIC_BASE_URL", "") or lc_base_val
+    no_proxy = os.environ.get("NO_PROXY", "") or env.get("NO_PROXY", "") or lc_noproxy_val
     no_proxy += "," + (os.environ.get("no_proxy", "") or env.get("no_proxy", ""))
-    source = "shell" if os.environ.get("ANTHROPIC_BASE_URL") else (
-        "settings.json" if env.get("ANTHROPIC_BASE_URL") else "default")
+    source = ("shell" if os.environ.get("ANTHROPIC_BASE_URL")
+              else "settings.json" if env.get("ANTHROPIC_BASE_URL")
+              else "launchctl" if lc_base_val
+              else "default")
     return {"base_url": base, "no_proxy": no_proxy, "source": source}
 
 
 def _endpoint_override_check():
     """Детектит ANTHROPIC_BASE_URL override + NO_PROXY masking (#129).
 
-    Если BASE_URL ≠ дефолт (api.anthropic.com) → info (WARN).
-    Если домен в NO_PROXY → info «CC ходит напрямую, прокси/туннель-проверки нерелевантны».
+    Если hostname BASE_URL = api.anthropic.com (exact match) → ok (стандартный).
+    Иначе → info (WARN). Если домен в NO_PROXY → info «CC ходит напрямую».
     Урок #127: doctor был слеп к endpoint-override → ложный SOCKS5-тест.
+    cycle-review #131 C2: exact hostname match (не substring — lookalike-атака).
     """
     cfg = _read_endpoint_config()
     base = cfg["base_url"]
-    if not base or _DEFAULT_ANTHROPIC_HOST in base:
+    if not base:
         return {"status": "ok", "detail": f"стандартный endpoint ({_DEFAULT_ANTHROPIC_HOST})"}
-    host = (urlparse(base).hostname or "").lower()
+    host = (urlparse(base).hostname or "").lower().rstrip(".")
+    if host == _DEFAULT_ANTHROPIC_HOST:
+        return {"status": "ok", "detail": f"стандартный endpoint ({_DEFAULT_ANTHROPIC_HOST})"}
     no_proxy = cfg["no_proxy"]
     in_no_proxy = any(
         h.strip() and (host == h.strip() or host.endswith("." + h.strip()))
