@@ -48,6 +48,7 @@ py-modules = [
     "claude_proxy",
     "health",
     "privoxy_system",
+    "privoxy_audit",
 ]
 
 [tool.setuptools.package-data]
