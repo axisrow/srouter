@@ -965,3 +965,119 @@ def test_privoxy_cli_requires_explicit_strict_flag(monkeypatch, capsys):
     assert rc == 2
     assert called == []
     assert "--strict" in capsys.readouterr().err
+
+
+# ============================ cycle-3 hardening: единый race-free примитив ============================
+# 3 вектора одного класса: root копирует/пишет user-controlled пути без race-free примитива.
+# Тесты фиксируют ИНВАРИАНТ privileged-boundary-fail-closed (держится после внедрения примитива).
+
+
+def test_atomic_write_never_writes_through_symlink_in_user_writable_dir(tmp_path):
+    """C1: restore user_plist пишет temp-файл в user-writable ~/Library/LaunchAgents.
+
+    Если temp-имя предсказуемо (.name.tmp-PID), атакующий заранее подкладывает symlink с этим
+    именем на произвольный root-path → arbitrary root file write. Инвариант: _atomic_write
+    создаёт temp эксклюзивно (O_EXCL|O_NOFOLLOW) и/или с непредсказуемым именем (mkstemp) —
+    запись НИКОГДА не идёт по чужому symlink. Здесь подкладываем symlink под КАЖДЫЙ возможный
+    temp-паттерн и проверяем, что victim не перезаписан.
+    """
+    target = tmp_path / "user-plist.plist"
+    victim = tmp_path / "victim-root-file"
+    victim.write_text("original-victim-content", encoding="utf-8")
+
+    # Засеваем директорию symlink'ами под всеми правдоподобными temp-паттернами.
+    for planted_name in (
+        ".user-plist.plist.tmp",                      # generic prefix
+        f".user-plist.plist.tmp-{os.getpid()}",       # PID-based (текущий процесс теста ~= helper)
+        ".user-plist.plist.tmp-helper",               # любая явная форма
+    ):
+        planted = tmp_path / planted_name
+        if not planted.exists() and not planted.is_symlink():
+            planted.symlink_to(victim)
+
+    privoxy_system._atomic_write(
+        target, b"attacker-bytes", mode=0o644, uid=os.getuid(), gid=os.getgid(),
+        chown=lambda path, uid, gid: None,
+    )
+
+    assert victim.read_text(encoding="utf-8") == "original-victim-content"
+
+
+def test_atomic_write_replaces_symlink_at_target_without_writing_through_it(tmp_path):
+    """C1 (доп): сам target — symlink в user-writable dir.
+
+    write в temp и последующий os.replace(temp, target) должны атомарно ЗАМЕНИТЬ symlink
+    regular-файлом, НЕ записав attacker-bytes в symlink-цель (victim).
+    """
+    victim = tmp_path / "victim-root-file"
+    victim.write_text("original-victim-content", encoding="utf-8")
+    target = tmp_path / "user-plist.plist"
+    target.symlink_to(victim)
+
+    privoxy_system._atomic_write(
+        target, b"attacker-bytes", mode=0o644, uid=os.getuid(), gid=os.getgid(),
+        chown=lambda path, uid, gid: None,
+    )
+
+    assert victim.read_text(encoding="utf-8") == "original-victim-content"
+
+
+def test_copy_templates_does_not_leak_secret_via_symlink_in_tree(tmp_path):
+    """C2: templates-копирование не должно вынести root-only секрет, даже если symlink
+
+    внутри дерева (статичный — для race-варианта отдельный класс-инвариант тот же).
+    Содержимое секрета не должно оказаться в защищённой зоне ни при каком исходе.
+    """
+    secret = tmp_path / "root-only-secret"
+    secret.write_text("top-secret-root-content", encoding="utf-8")
+    source = tmp_path / "templates"
+    source.mkdir()
+    (source / "default").write_text("normal template", encoding="utf-8")
+    (source / "sneaky").symlink_to(secret)
+    target = tmp_path / "protected-templates"
+
+    privoxy_system._copy_templates(source, target, chown=lambda path, uid, gid: None)
+
+    if target.exists():
+        for copied in target.rglob("*"):
+            if copied.is_file():
+                assert copied.read_text(encoding="utf-8") != "top-secret-root-content"
+
+
+def test_install_runtime_does_not_leak_secret_via_symlink_binary(tmp_path, monkeypatch):
+    """C3: _install_runtime копирует Homebrew binary/dylib от root.
+
+    Source-binary как symlink на root-only секрет (без race) → copy2(follow_symlinks=True)
+    разыменует и скопирует содержимое как root-owned executable (0755). Инвариант: секрет
+    не должен оказаться в runtime_dir ни в каком виде.
+    """
+    layout = _layout(tmp_path)
+    prefix = tmp_path / "homebrew"
+    binary_dir = prefix / "opt" / "privoxy" / "sbin"
+    binary_dir.mkdir(parents=True)
+    secret = tmp_path / "root-only-secret"
+    secret.write_text("top-secret-root-content", encoding="utf-8")
+    binary_link = binary_dir / "privoxy"
+    binary_link.symlink_to(secret)
+    binary_link.chmod(0o755)
+    templates = prefix / "etc" / "privoxy" / "templates"
+    templates.mkdir(parents=True)
+    (templates / "default").write_text("template", encoding="utf-8")
+    libraries = prefix / "opt" / "pcre2" / "lib"
+    libraries.mkdir(parents=True)
+    for lib in ("libpcre2-8.0.dylib", "libpcre2-posix.3.dylib"):
+        (libraries / lib).write_text("fake-dylib", encoding="utf-8")
+
+    monkeypatch.setattr(privoxy_system, "_allowed_prefix", lambda value: str(value))
+
+    privoxy_system._install_runtime(
+        binary_link, str(prefix), layout,
+        runner=lambda cmd, timeout: {"rc": 0, "out": "", "err": "", "timeout": False},
+        chown=lambda path, uid, gid: None,
+    )
+
+    if layout.runtime_dir.exists():
+        for copied in layout.runtime_dir.rglob("*"):
+            if copied.is_file():
+                assert copied.read_text(encoding="utf-8") != "top-secret-root-content"
+

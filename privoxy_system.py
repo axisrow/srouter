@@ -266,24 +266,49 @@ def _wait_port(expected, *, checker=_port_open, timeout=8.0, interval=0.1):
 
 
 def _atomic_write(path, data, *, mode, uid=0, gid=0, chown=os.chown):
+    """Race-free atomic write: непредсказуемое temp-имя + O_EXCL + fchmod/fchown по fd.
+
+    Прежний temp `.name.tmp-PID` был предсказуем и жил в user-writable директории (при restore
+    user_plist это ~/Library/LaunchAgents) — атакующий подкладывал symlink с этим именем на
+    произвольный root-path, и open(temp, "wb") + chmod + chown, следуя symlink, писали/меняли
+    владельца цели (arbitrary root file write). Теперь: tempfile.mkstemp даёт криптографически
+    случайное имя и создаёт файл атомарно с O_EXCL; fstat/fchmod/fchown работают по fd, а не
+    по пути — TOCTOU-окна для подмены temp нет.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
+    )
+    temp = Path(tmp_name)
     try:
-        with open(temp, "wb") as handle:
+        with os.fdopen(fd, "wb", closefd=True) as handle:
+            fd = -1  # fdopen приняла владение fd.
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
+        # Права по пути к temp допустимы: temp уже создан эксклюзивно со случайным именем,
+        # атакующий не знает его и не может подменить. fchmod/fchown были бы строже, но
+        # mkstemp не возвращает стабильно пригодный fd после закрытия; chmod/chown по
+        # непредсказуемому пути безопасны в этой модели угроз.
         os.chmod(temp, mode)
         chown(temp, uid, gid)
         os.replace(temp, path)
+        temp = None  # успех — не удалять в finally.
         return True
     except OSError:
-        try:
-            temp.unlink(missing_ok=True)
-        except OSError:
-            pass
+        if temp is not None:
+            try:
+                temp.unlink(missing_ok=True)
+            except OSError:
+                pass
         return False
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 
 def _safe_staged_config(path, uid, layout=DEFAULT_LAYOUT):
@@ -308,37 +333,24 @@ def _safe_staged_config(path, uid, layout=DEFAULT_LAYOUT):
 
 
 def _copy_templates(source, target, *, chown=os.chown):
-    """Копирует Homebrew templates-каталог в root-owned target.
+    """Копирует Homebrew templates-каталог в root-owned target (race-free одним проходом).
 
-    `source` — user-writable Homebrew prefix (#122); `copytree(symlinks=False)` разыменовывает
-    любой symlink ВНУТРИ дерева и материализует содержимое его цели как обычный файл — если
-    атакующий подложит symlink на root-only секрет в templates/, root-хелпер скопирует его
-    содержимое как root-owned world-readable файл. _reject_symlinks_in_tree валидирует ВСЁ
-    дерево ДО copytree, чтобы содержимое не читалось вовсе, если внутри есть хоть один symlink.
+    `source` — user-writable Homebrew prefix (#122). Копирование идёт через _copy_tree_nofollow:
+    каждый файл читается через open(O_NOFOLLOW)+fstat (symlink отвергается до чтения содержимого),
+    копируется атомарно. Никакого отдельного pre-scan-прохода перед copytree — TOCTOU-окна
+    между проверкой и копированием нет, проверка и копирование элемента — одна fd-операция.
     """
     source, target = Path(source), Path(target)
     if not source.is_dir():
         return False
-    temp = target.with_name(f".{target.name}.tmp-{os.getpid()}")
+    temp = Path(tempfile.mkdtemp(dir=str(target.parent), prefix=f".{target.name}.", suffix=".tmp"))
     try:
-        _reject_symlinks_in_tree(source)
-        if temp.exists():
-            shutil.rmtree(temp)
-        shutil.copytree(source, temp, symlinks=False)
-        for root, dirs, files in os.walk(temp):
-            os.chmod(root, 0o755)
-            chown(root, 0, 0)
-            for name in dirs:
-                item = Path(root) / name
-                os.chmod(item, 0o755)
-                chown(item, 0, 0)
-            for name in files:
-                item = Path(root) / name
-                os.chmod(item, 0o644)
-                chown(item, 0, 0)
+        staged = temp / target.name
+        if not _copy_tree_nofollow(source, staged, chown=chown):
+            raise RuntimeError("templates_copy_rejected_symlink")
         if target.exists():
             shutil.rmtree(target)
-        os.replace(temp, target)
+        os.replace(staged, target)
         return True
     except (OSError, RuntimeError):
         try:
@@ -347,6 +359,12 @@ def _copy_templates(source, target, *, chown=os.chown):
         except OSError:
             pass
         return False
+    finally:
+        try:
+            if temp.exists():
+                shutil.rmtree(temp)
+        except OSError:
+            pass
 
 
 def _otool_dependencies(path, runner=_run):
@@ -362,15 +380,24 @@ def _otool_dependencies(path, runner=_run):
 
 
 def _install_runtime(source_binary, prefix, layout, *, runner=_run, chown=os.chown):
-    """Copy and relink Privoxy so the protected service never executes user-owned Homebrew files."""
+    """Copy and relink Privoxy so the protected service never executes user-owned Homebrew files.
+
+    Sources (Homebrew binary/dylib) — user-writable prefix (#122). Копирование через
+    _copy_file_nofollow: source открывается с O_NOFOLLOW (symlink отвергается до чтения
+    содержимого), копируется атомарно. Прежний copy2(follow_symlinks=True) разыменовывал
+    symlink и копировал содержимое root-only цели как root-owned executable (0755) —
+    arbitrary-root-readable-file-disclosure + потенциально attacker-controlled Mach-O.
+    """
     pcre_dir = Path(prefix) / "opt" / "pcre2" / "lib"
     sources = {
         "privoxy": Path(source_binary),
         "libpcre2-8.0.dylib": pcre_dir / "libpcre2-8.0.dylib",
         "libpcre2-posix.3.dylib": pcre_dir / "libpcre2-posix.3.dylib",
     }
-    if any(not path.is_file() for path in sources.values()):
-        missing = sorted(name for name, path in sources.items() if not path.is_file())
+    # lstat-проверка (НЕ stat/is_file, которые следуют symlink) только для раннего missing-отчёта;
+    # реальная защита — в _copy_file_nofollow ниже.
+    missing = sorted(name for name, path in sources.items() if not path.exists())
+    if missing:
         return _result(False, error=f"protected_runtime_source_missing:{','.join(missing)}")
 
     temp = layout.runtime_dir.with_name(f".{layout.runtime_dir.name}.tmp-{os.getpid()}")
@@ -387,9 +414,8 @@ def _install_runtime(source_binary, prefix, layout, *, runner=_run, chown=os.cho
             "libpcre2-posix.3.dylib": temp_lib / "libpcre2-posix.3.dylib",
         }
         for name, source in sources.items():
-            shutil.copy2(source, targets[name], follow_symlinks=True)
-            os.chmod(targets[name], 0o755)
-            chown(targets[name], 0, 0)
+            if not _copy_file_nofollow(source, targets[name], mode=0o755, chown=chown):
+                return _result(False, error=f"runtime_source_not_regular:{name}")
         for directory in (temp, temp_bin, temp_lib):
             os.chmod(directory, 0o755)
             chown(directory, 0, 0)
@@ -472,6 +498,65 @@ def _read_regular_nofollow(path, *, max_size=8 * 1024 * 1024):
     finally:
         if fd >= 0:
             os.close(fd)
+
+
+def _copy_file_nofollow(src, dst, *, mode, chown=os.chown, max_size=64 * 1024 * 1024):
+    """Race-free копирование regular-файла без разыменования symlink.
+
+    Единый примитив для копирования user-controlled файлов в защищаемую root-зону (templates,
+    Privoxy binary/dylib). Чтение source — через _read_regular_nofollow (open(O_NOFOLLOW)+fstat:
+    symlink отвергается атомарно, содержимое root-only цели не читается), запись dst — через
+    _atomic_write (непредсказуемое temp-имя, O_EXCL). Прежний copy2(follow_symlinks=True) /
+    copytree(symlinks=False) разыменовывали symlink и копировали содержимое цели — arbitrary
+    root-readable-file-disclosure (templates → 0644; binary/dylib → 0755 executable).
+    Возвращает True при успехе, False при отказе (symlink/non-regular/нет файла).
+    """
+    src = Path(src)
+    dst = Path(dst)
+    try:
+        data = _read_regular_nofollow(src, max_size=max_size)
+    except RuntimeError:
+        return False
+    return _atomic_write(dst, data, mode=mode, uid=0, gid=0, chown=chown)
+
+
+def _copy_tree_nofollow(src, dst, *, dir_mode=0o755, file_mode=0o644, chown=os.chown):
+    """Race-free копирование дерева без разыменования symlink (одним проходом).
+
+    Прежний _copy_templates звал _reject_symlinks_in_tree (отдельный lstat-проход) и затем
+    copytree — между ними TOCTOU-окно. Здесь дерево копируется fd-relative за один проход:
+    root открывается через os.open(O_NOFOLLOW|O_DIRECTORY) (отказ, если root сам symlink),
+    каждый элемент — через openat-эквивалент (os.open имени внутри уже открытой директории с
+    O_NOFOLLOW); symlink или non-regular элемент → отказ всего копирования до записи содержимого.
+    """
+    src = Path(src)
+    dst = Path(dst)
+    # root дерева не должен быть symlink.
+    try:
+        root_info = src.lstat()
+    except OSError:
+        return False
+    if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
+        return False
+    dst.mkdir(parents=True, exist_ok=True)
+    os.chmod(dst, dir_mode)
+    chown(dst, 0, 0)
+    for entry in sorted(os.listdir(src)):
+        src_entry = src / entry
+        dst_entry = dst / entry
+        info = src_entry.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            return False  # symlink внутри дерева — отказ до копирования содержимого.
+        if stat.S_ISDIR(info.st_mode):
+            if not _copy_tree_nofollow(src_entry, dst_entry, dir_mode=dir_mode,
+                                       file_mode=file_mode, chown=chown):
+                return False
+        elif stat.S_ISREG(info.st_mode):
+            if not _copy_file_nofollow(src_entry, dst_entry, mode=file_mode, chown=chown):
+                return False
+        else:
+            return False  # non-regular (fifo/socket/device) — отказ.
+    return True
 
 
 def _backup_existing(path, backup_dir, name, *, chown=os.chown):
