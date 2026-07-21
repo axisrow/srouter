@@ -308,11 +308,20 @@ def _safe_staged_config(path, uid, layout=DEFAULT_LAYOUT):
 
 
 def _copy_templates(source, target, *, chown=os.chown):
+    """Копирует Homebrew templates-каталог в root-owned target.
+
+    `source` — user-writable Homebrew prefix (#122); `copytree(symlinks=False)` разыменовывает
+    любой symlink ВНУТРИ дерева и материализует содержимое его цели как обычный файл — если
+    атакующий подложит symlink на root-only секрет в templates/, root-хелпер скопирует его
+    содержимое как root-owned world-readable файл. _reject_symlinks_in_tree валидирует ВСЁ
+    дерево ДО copytree, чтобы содержимое не читалось вовсе, если внутри есть хоть один symlink.
+    """
     source, target = Path(source), Path(target)
     if not source.is_dir():
         return False
     temp = target.with_name(f".{target.name}.tmp-{os.getpid()}")
     try:
+        _reject_symlinks_in_tree(source)
         if temp.exists():
             shutil.rmtree(temp)
         shutil.copytree(source, temp, symlinks=False)
@@ -331,7 +340,7 @@ def _copy_templates(source, target, *, chown=os.chown):
             shutil.rmtree(target)
         os.replace(temp, target)
         return True
-    except OSError:
+    except (OSError, RuntimeError):
         try:
             if temp.exists():
                 shutil.rmtree(temp)
@@ -438,8 +447,35 @@ def _install_runtime(source_binary, prefix, layout, *, runner=_run, chown=os.cho
             shutil.rmtree(temp, ignore_errors=True)
 
 
-def _backup_existing(path, backup_dir, name):
-    """Backup только regular-файла/директории, НЕ symlink.
+def _read_regular_nofollow(path, *, max_size=8 * 1024 * 1024):
+    """Race-free чтение: O_NOFOLLOW делает check (не symlink) и use (чтение) одним syscall.
+
+    lstat()-затем-copy2() (прежний подход) оставляет TOCTOU-окно: атакующий меняет
+    regular-file на symlink к root-only секрету МЕЖДУ проверкой и копированием. open(O_NOFOLLOW)
+    атомарно проваливается с ELOOP, если путь уже symlink — окна для подмены не существует,
+    т.к. это единственный syscall, который и проверяет, и открывает.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(str(path), flags)
+    except OSError as exc:
+        raise RuntimeError(f"backup_source_open_failed:{path}:{exc}") from exc
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise RuntimeError(f"backup_source_not_regular:{path}")
+        if info.st_size > max_size:
+            raise RuntimeError(f"backup_source_too_large:{path}")
+        with os.fdopen(fd, "rb", closefd=True) as handle:
+            fd = -1  # fdopen приняла владение fd; не закрывать повторно в finally.
+            return handle.read()
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _backup_existing(path, backup_dir, name, *, chown=os.chown):
+    """Backup только regular-файла/директории, НЕ symlink (race-free через fd).
 
     `path` (например user_plist в ~/Library/LaunchAgents) до sudo-подтверждения полностью
     под контролем непривилегированного пользователя. root-процесс не должен читать/копировать
@@ -452,23 +488,56 @@ def _backup_existing(path, backup_dir, name):
         info = path.lstat()
     except OSError:
         return ""
-    if stat.S_ISLNK(info.st_mode):
-        raise RuntimeError(f"backup_source_is_symlink:{path}")
-    if not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+    if stat.S_ISDIR(info.st_mode):
+        _reject_symlinks_in_tree(path)
+        target = Path(backup_dir) / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(path, target, symlinks=False)
+        return str(target)
+    if not stat.S_ISREG(info.st_mode):
         raise RuntimeError(f"backup_source_not_regular:{path}")
+    data = _read_regular_nofollow(path)
     target = Path(backup_dir) / name
     target.parent.mkdir(parents=True, exist_ok=True)
-    if stat.S_ISDIR(info.st_mode):
-        shutil.copytree(path, target, symlinks=False)
-    else:
-        shutil.copy2(path, target, follow_symlinks=False)
+    if not _atomic_write(target, data, mode=0o600, uid=0, gid=0, chown=chown):
+        raise RuntimeError(f"backup_write_failed:{path}")
     return str(target)
 
 
+def _reject_symlinks_in_tree(root):
+    """lstat каждого элемента дерева ДО копирования — ни один symlink не должен быть скопирован.
+
+    `copytree(symlinks=False)` разыменовывает symlink внутри дерева и материализует содержимое
+    его цели как обычный файл (задокументированное поведение shutil, не баг) — для user-writable
+    дерева (Homebrew templates) это arbitrary-root-readable-file-disclosure: подложи symlink на
+    root-only секрет внутри templates/ → root-хелпер скопирует его содержимое как root-owned
+    world-readable файл. Валидация всего дерева ДО copytree закрывает это до чтения содержимого.
+    """
+    root = Path(root)
+    top_info = root.lstat()
+    if stat.S_ISLNK(top_info.st_mode):
+        raise RuntimeError(f"tree_root_is_symlink:{root}")
+    for current, dirs, files in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        for name in dirs:
+            info = (current_path / name).lstat()
+            if stat.S_ISLNK(info.st_mode):
+                raise RuntimeError(f"tree_contains_symlink_dir:{current_path / name}")
+        for name in files:
+            info = (current_path / name).lstat()
+            if stat.S_ISLNK(info.st_mode):
+                raise RuntimeError(f"tree_contains_symlink_file:{current_path / name}")
+            if not stat.S_ISREG(info.st_mode):
+                raise RuntimeError(f"tree_contains_non_regular_file:{current_path / name}")
+
+
 def _restore_file(backup, target, *, uid, gid, mode, chown=os.chown):
-    if not backup or not Path(backup).is_file():
+    if not backup:
         return False
-    data = Path(backup).read_bytes()
+    try:
+        data = _read_regular_nofollow(backup)
+    except RuntimeError:
+        return False
     return _atomic_write(target, data, mode=mode, uid=uid, gid=gid, chown=chown)
 
 
@@ -605,14 +674,16 @@ def protect_as_root(*, username, uid, prefix, staged_config, layout=DEFAULT_LAYO
             "user_plist": str(user_plist),
             "user_loaded": user_loaded,
             "system_loaded": system_loaded,
-            "user_plist_backup": _backup_existing(user_plist, backup_dir, "user-launchagent.plist"),
-            "system_plist_backup": _backup_existing(
-                layout.launchdaemon_path, backup_dir, "system-launchdaemon.plist"
+            "user_plist_backup": _backup_existing(
+                user_plist, backup_dir, "user-launchagent.plist", chown=chown
             ),
-            "sudoers_backup": _backup_existing(layout.sudoers_path, backup_dir, "sudoers"),
+            "system_plist_backup": _backup_existing(
+                layout.launchdaemon_path, backup_dir, "system-launchdaemon.plist", chown=chown
+            ),
+            "sudoers_backup": _backup_existing(layout.sudoers_path, backup_dir, "sudoers", chown=chown),
             "config_dir_existed": layout.config_dir.exists(),
             "config_dir_backup": _backup_existing(
-                layout.config_dir, backup_dir, "protected-config-dir"
+                layout.config_dir, backup_dir, "protected-config-dir", chown=chown
             ),
             "backup_dir": str(backup_dir),
         }

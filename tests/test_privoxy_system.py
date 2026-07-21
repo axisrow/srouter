@@ -215,10 +215,85 @@ def test_backup_existing_refuses_to_follow_symlink(tmp_path):
     backup_dir = tmp_path / "backup"
     backup_dir.mkdir()
 
-    with pytest.raises(RuntimeError, match="backup_source_is_symlink"):
+    with pytest.raises(RuntimeError, match="backup_source_not_regular"):
         privoxy_system._backup_existing(link, backup_dir, "user-launchagent.plist")
 
     assert list(backup_dir.iterdir()) == []
+
+
+def test_read_regular_nofollow_race_free_against_toctou_swap(tmp_path):
+    """Cycle-2 Finding B (Codex, critical): lstat-затем-copy2 оставляла TOCTOU-окно.
+
+    Между проверкой (lstat) и использованием (copy2) атакующий мог подменить regular-file
+    на symlink к root-only секрету — copy2(follow_symlinks=False) скопировал бы сам symlink,
+    а _restore_file (Path.is_file()/read_bytes(), СЛЕДУЮЩИЕ symlink) прочитали бы секрет при
+    restore. _read_regular_nofollow обязана открывать путь с O_NOFOLLOW — единственный способ
+    закрыть race: open() и есть та же операция, что и проверка "не symlink".
+    """
+    secret = tmp_path / "root-only-secret"
+    secret.write_text("top-secret-root-content", encoding="utf-8")
+    # Симулируем состояние ПОСЛЕ TOCTOU-подмены: путь, ожидаемый как regular file,
+    # на самом деле уже symlink на секрет к моменту чтения.
+    swapped = tmp_path / "user_plist_after_swap"
+    swapped.symlink_to(secret)
+
+    # O_NOFOLLOW провалит сам open() (ELOOP) — check и use это один и тот же syscall,
+    # окна для подмены между ними не существует.
+    with pytest.raises(RuntimeError, match="backup_source_open_failed"):
+        privoxy_system._read_regular_nofollow(swapped)
+
+
+def test_restore_file_refuses_symlink_backup(tmp_path):
+    """_restore_file больше не использует Path.is_file()/read_bytes() (следуют symlink).
+
+    Если backup-путь сам оказался symlink (например из-за race при создании backup),
+    restore обязан отказаться, а не прочитать содержимое цели symlink через root-путь.
+    """
+    secret = tmp_path / "root-only-secret"
+    secret.write_text("top-secret-root-content", encoding="utf-8")
+    fake_backup = tmp_path / "backup-that-is-actually-a-symlink"
+    fake_backup.symlink_to(secret)
+    target = tmp_path / "restored-user-plist"
+
+    result = privoxy_system._restore_file(
+        str(fake_backup), target, uid=os.getuid(), gid=os.getgid(), mode=0o644,
+        chown=lambda path, uid, gid: None,
+    )
+
+    assert result is False
+    assert not target.exists()
+
+
+def test_copy_templates_refuses_symlink_inside_source_tree(tmp_path, monkeypatch):
+    """Cycle-2 Finding A (Codex, critical): copytree(symlinks=False) разыменовывает
+
+    symlink ВНУТРИ дерева и материализует содержимое его цели как обычный файл. templates_dir
+    берётся из user-writable Homebrew prefix — symlink на root-only секрет внутри templates/
+    привёл бы к раскрытию его содержимого как root-owned world-readable (0644) файла.
+    """
+    source = tmp_path / "templates"
+    source.mkdir()
+    (source / "default").write_text("normal template", encoding="utf-8")
+    secret = tmp_path / "root-only-secret"
+    secret.write_text("top-secret-root-content", encoding="utf-8")
+    (source / "sneaky-symlink").symlink_to(secret)
+
+    target = tmp_path / "protected-templates"
+
+    ok = privoxy_system._copy_templates(source, target, chown=lambda path, uid, gid: None)
+
+    assert ok is False
+    assert not target.exists()
+
+
+def test_reject_symlinks_in_tree_accepts_clean_tree(tmp_path):
+    clean = tmp_path / "clean"
+    clean.mkdir()
+    (clean / "default").write_text("template", encoding="utf-8")
+    (clean / "subdir").mkdir()
+    (clean / "subdir" / "nested").write_text("nested", encoding="utf-8")
+
+    privoxy_system._reject_symlinks_in_tree(clean)  # не должно бросить
 
 
 def test_root_transaction_refuses_protect_when_user_plist_is_symlink_to_secret(tmp_path, monkeypatch):
@@ -260,7 +335,7 @@ def test_root_transaction_refuses_protect_when_user_plist_is_symlink_to_secret(t
     )
 
     assert result["ok"] is False
-    assert "backup_source_is_symlink" in result["error"]
+    assert "backup_source_not_regular" in result["error"]
     # Секрет НЕ должен был попасть ни в один файл под backup_root.
     for backed_up in layout.backup_root.rglob("*"):
         if backed_up.is_file():
