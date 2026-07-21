@@ -1103,6 +1103,40 @@ def test_wrapper_skips_itself_hardlink_no_recursion(monkeypatch, tmp_path):
         "wrapper пропустил hardlink-копию себя (inode-aware антирекурсия) и взял реальный codex"
 
 
+def test_wrapper_skips_other_managed_copy_no_recursion(monkeypatch, tmp_path):
+    """#144(A) антирекурсия — корневой инвариант: wrapper НЕ exec'нит ДРУГУЮ управляемую srouter-копию.
+
+    Две НЕЗАВИСИМЫЕ копии managed wrapper'а в PATH (разные inode, разные realpath — например текущая
+    ~/bin/codex + stale-копия из прежней установки/миграции). inode/realpath их различают → копия A
+    принимает B за «реальный codex» и exec'ает её; B принимает A → бесконечный ping-pong через exec
+    → зависание. Управляемый wrapper отличим от реального codex ТОЛЬКО по srouter-маркеру в содержимом,
+    не по пути/inode. Антирекурсия обязана skip'ать любого кандидата, несущего srouter-маркер wrapper'а.
+    """
+    import subprocess
+    called = tmp_path / "called.txt"
+    real_codex = tmp_path / "realdir" / "codex"
+    real_codex.parent.mkdir(parents=True)
+    real_codex.write_text(f"#!/bin/sh\nprintf 'real' > {called}\n", encoding="utf-8")
+    real_codex.chmod(0o755)
+    wrapper = _install_with_path_resolving_wrapper(monkeypatch, tmp_path)
+    # stalebin/codex — ВТОРАЯ независимая копия managed wrapper'а (другой путь, другой inode).
+    stalebin = tmp_path / "stalebin"
+    stalebin.mkdir()
+    (stalebin / "codex").write_text(wrapper.read_text(encoding="utf-8"), encoding="utf-8")
+    (stalebin / "codex").chmod(0o755)
+    assert os.stat(wrapper).st_ino != os.stat(stalebin / "codex").st_ino, "precondition: разные inode (не hardlink)"
+    # ~/bin (копия A) → stalebin (копия B) → realdir. Без marker-aware skip → A↔B рекурсия/timeout.
+    try:
+        subprocess.run([str(wrapper), "x"],
+                        env={**os.environ, "PATH": f"{Path.home() / 'bin'}:{stalebin}:{tmp_path / 'realdir'}:/usr/bin:/bin"},
+                        check=True, timeout=10)
+    except subprocess.TimeoutExpired:
+        pytest.fail("две управляемые копии wrapper'а в PATH вызвали ping-pong рекурсию "
+                    "(антирекурсия не распознаёт srouter-маркер у другой копии)")
+    assert called.exists() and called.read_text(encoding="utf-8") == "real", \
+        "wrapper пропустил ДРУГУЮ managed-копию (по srouter-маркеру) и взял реальный codex"
+
+
 def test_wrapper_picks_second_codex_when_two_binaries(monkeypatch, tmp_path):
     """#144 корень дыры: на диске ДВА разных codex-binary. Caller с PATH, ведущим ко второму, должен
     попасть в него через wrapper (а не в вшитый-единственный, как раньше).

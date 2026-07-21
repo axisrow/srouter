@@ -67,6 +67,17 @@ for _dir in $PATH; do
   if [ -n "$SELF_INO" ] && command -v stat >/dev/null 2>&1; then
     _ci="$(stat -f '%i %d' "$_cand_real" 2>/dev/null)" && [ -n "$_ci" ] && [ "$_ci" = "$SELF_INO" ] && continue
   fi
+  # Антирекурсия — корневой инвариант: skip'аем ЛЮБУЮ управляемую srouter-копию (а не только себя).
+  # Две независимые копии wrapper'а в PATH (разные inode/realpath) дают бесконечный ping-pong: A exec'ает
+  # B как «реальный codex», B exec'ает A. Управляемый wrapper отличим от реального codex ТОЛЬКО по
+  # srouter-маркеру в содержимом (первый комментарий), не по пути/inode. grep по первым строкам; marker
+  # в начале файла, читаем лимит строк. grep/sed/head — стандартные утилиты /usr/bin; fallback пропускает
+  # проверку (только realpath+inode), не крашит.
+  if command -v grep >/dev/null 2>&1; then
+    if grep -q 'srouter: codex CLI wrapper' "$_cand" 2>/dev/null; then
+      continue
+    fi
+  fi
   _codex_bin="$_cand"
   break
 done
