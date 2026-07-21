@@ -104,6 +104,43 @@ def _run(cmd, timeout=30):
         return {"rc": None, "out": "", "err": f"{type(exc).__name__}: {exc}", "timeout": False}
 
 
+def _run_as_nobody(cmd, timeout=30):
+    """Выполняет cmd под euid/egid `nobody`, а не root.
+
+    Privoxy runtime копируется из user-writable Homebrew prefix (#122); подмена бинаря до
+    легитимного `protect --strict` иначе выполнилась бы с правами root внутри самого helper'а,
+    хотя итоговый LaunchDaemon и так запускает privoxy от `nobody`. config-test не требует root —
+    drop privileges здесь закрывает разницу между "скопировано под root" и "доверено выполнять как root".
+    """
+    nobody = pwd.getpwnam("nobody")
+
+    def _drop_privileges():
+        os.setgroups([])
+        os.setgid(nobody.pw_gid)
+        os.setuid(nobody.pw_uid)
+
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout,
+            preexec_fn=_drop_privileges if os.geteuid() == 0 else None,
+        )
+        return {
+            "rc": proc.returncode,
+            "out": proc.stdout.strip(),
+            "err": proc.stderr.strip(),
+            "timeout": False,
+        }
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "rc": None,
+            "out": (exc.stdout or "").strip() if isinstance(exc.stdout, str) else "",
+            "err": "timeout",
+            "timeout": True,
+        }
+    except OSError as exc:
+        return {"rc": None, "out": "", "err": f"{type(exc).__name__}: {exc}", "timeout": False}
+
+
 def _result(ok, *, error="", **extra):
     return {"ok": bool(ok), "error": error, **extra}
 
@@ -402,15 +439,29 @@ def _install_runtime(source_binary, prefix, layout, *, runner=_run, chown=os.cho
 
 
 def _backup_existing(path, backup_dir, name):
+    """Backup только regular-файла/директории, НЕ symlink.
+
+    `path` (например user_plist в ~/Library/LaunchAgents) до sudo-подтверждения полностью
+    под контролем непривилегированного пользователя. root-процесс не должен читать/копировать
+    содержимое ПО symlink — иначе backup (и позже restore) превращается в arbitrary-root-file-read
+    примитив: подмени plist на symlink к root-only секрету → protect скопирует его в backup_dir →
+    unprotect --restore запишет его содержимое обратно пользователю с 0644 (#122 privileged boundary).
+    """
     path = Path(path)
-    if not path.exists():
+    try:
+        info = path.lstat()
+    except OSError:
         return ""
+    if stat.S_ISLNK(info.st_mode):
+        raise RuntimeError(f"backup_source_is_symlink:{path}")
+    if not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+        raise RuntimeError(f"backup_source_not_regular:{path}")
     target = Path(backup_dir) / name
     target.parent.mkdir(parents=True, exist_ok=True)
-    if path.is_dir():
-        shutil.copytree(path, target)
+    if stat.S_ISDIR(info.st_mode):
+        shutil.copytree(path, target, symlinks=False)
     else:
-        shutil.copy2(path, target)
+        shutil.copy2(path, target, follow_symlinks=False)
     return str(target)
 
 
@@ -493,7 +544,7 @@ def _rollback_live(snapshot, *, layout, runner, checker, chown):
 
 def protect_as_root(*, username, uid, prefix, staged_config, layout=DEFAULT_LAYOUT,
                     runner=_run, checker=_port_open, chown=os.chown, enforce_root=True,
-                    user_home=None):
+                    user_home=None, config_test_runner=_run_as_nobody):
     """Одна root-транзакция: backup → bootout user job → install → bootstrap system → verify."""
     if enforce_root and os.geteuid() != 0:
         return _result(False, error="root_required")
@@ -565,7 +616,7 @@ def protect_as_root(*, username, uid, prefix, staged_config, layout=DEFAULT_LAYO
             ),
             "backup_dir": str(backup_dir),
         }
-    except OSError as exc:
+    except (OSError, RuntimeError) as exc:
         return _result(False, error=f"backup_failed:{exc}", backup_dir=str(backup_dir))
     if user_loaded and not snapshot["user_plist_backup"]:
         return _result(False, error="loaded_user_job_without_plist", backup_dir=str(backup_dir))
@@ -593,7 +644,9 @@ def protect_as_root(*, username, uid, prefix, staged_config, layout=DEFAULT_LAYO
         plist_check = runner([PLUTIL, "-lint", str(layout.launchdaemon_path)], 10)
         if plist_check.get("rc") != 0:
             raise RuntimeError("plist_invalid")
-        config_check = runner([str(layout.binary_path), "--config-test", str(layout.config_path)], 15)
+        config_check = config_test_runner(
+            [str(layout.binary_path), "--config-test", str(layout.config_path)], 15
+        )
         if config_check.get("rc") != 0:
             detail = (config_check.get("err") or config_check.get("out") or "")[:240]
             raise RuntimeError(f"config_test_failed:{detail}")

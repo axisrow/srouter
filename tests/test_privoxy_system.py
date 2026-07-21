@@ -200,6 +200,73 @@ def test_staged_config_rejects_symlink_and_group_writable_file(tmp_path):
         "staged_config_not_regular"
 
 
+def test_backup_existing_refuses_to_follow_symlink(tmp_path):
+    """Finding #2 (Codex, critical): symlink TOCTOU через user_plist backup.
+
+    user_plist (~/Library/LaunchAgents/homebrew.mxcl.privoxy.plist) полностью под контролем
+    непривилегированного пользователя до sudo-подтверждения. Если это symlink на произвольный
+    root-only секрет, root-процесс не должен читать его содержимое — иначе последующий
+    `unprotect --restore` запишет секрет пользователю обратно с 0644 (arbitrary file disclosure).
+    """
+    secret = tmp_path / "root-only-secret"
+    secret.write_text("top-secret-root-content", encoding="utf-8")
+    link = tmp_path / "homebrew.mxcl.privoxy.plist"
+    link.symlink_to(secret)
+    backup_dir = tmp_path / "backup"
+    backup_dir.mkdir()
+
+    with pytest.raises(RuntimeError, match="backup_source_is_symlink"):
+        privoxy_system._backup_existing(link, backup_dir, "user-launchagent.plist")
+
+    assert list(backup_dir.iterdir()) == []
+
+
+def test_root_transaction_refuses_protect_when_user_plist_is_symlink_to_secret(tmp_path, monkeypatch):
+    """End-to-end: protect_as_root не должен раскрыть содержимое чужого root-only файла,
+
+    если пользователь заранее подменил свой LaunchAgent-plist на symlink к секрету.
+    """
+    layout = _layout(tmp_path)
+    prefix = _fake_prefix(tmp_path)
+    identity = pwd.getpwuid(os.getuid())
+    home = tmp_path / "home"
+    home.mkdir()
+    secret = tmp_path / "etc-master-passwd-stand-in"
+    secret.write_text("root:only:secret:content", encoding="utf-8")
+    user_plist = home / "Library" / "LaunchAgents" / f"{privoxy_system.USER_LABEL}.plist"
+    user_plist.parent.mkdir(parents=True)
+    user_plist.symlink_to(secret)
+    staged = tmp_path / "staged"
+    staged.write_text(privoxy_system.protected_config_text(layout), encoding="utf-8")
+    staged.chmod(0o600)
+    monkeypatch.setattr(privoxy_system, "_allowed_prefix", lambda value: str(value))
+
+    def runner(cmd, timeout):
+        if cmd[:2] == [privoxy_system.LAUNCHCTL, "print"]:
+            return {"rc": 0, "out": "loaded", "err": "", "timeout": False}
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+
+    result = privoxy_system.protect_as_root(
+        username=identity.pw_name,
+        uid=identity.pw_uid,
+        prefix=str(prefix),
+        staged_config=staged,
+        layout=layout,
+        runner=runner,
+        checker=lambda: True,
+        chown=lambda path, uid, gid: None,
+        enforce_root=False,
+        user_home=home,
+    )
+
+    assert result["ok"] is False
+    assert "backup_source_is_symlink" in result["error"]
+    # Секрет НЕ должен был попасть ни в один файл под backup_root.
+    for backed_up in layout.backup_root.rglob("*"):
+        if backed_up.is_file():
+            assert "root:only:secret:content" not in backed_up.read_text(encoding="utf-8")
+
+
 def test_root_transaction_migrates_and_restores_user_service(tmp_path, monkeypatch):
     layout = _layout(tmp_path)
     prefix = _fake_prefix(tmp_path)
@@ -246,6 +313,10 @@ def test_root_transaction_migrates_and_restores_user_service(tmp_path, monkeypat
 
     def no_chown(path, uid, gid):
         return None
+
+    def config_test_runner(cmd, timeout):
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+
     result = privoxy_system.protect_as_root(
         username=identity.pw_name,
         uid=identity.pw_uid,
@@ -257,6 +328,7 @@ def test_root_transaction_migrates_and_restores_user_service(tmp_path, monkeypat
         chown=no_chown,
         enforce_root=False,
         user_home=home,
+        config_test_runner=config_test_runner,
     )
 
     assert result["ok"] is True
@@ -346,11 +418,13 @@ def test_root_transaction_rolls_back_before_touching_user_job_on_bad_config_test
     monkeypatch.setattr(privoxy_system, "_allowed_prefix", lambda value: str(value))
 
     def runner(cmd, timeout):
-        if len(cmd) > 1 and cmd[0] == str(layout.binary_path) and cmd[1] == "--config-test":
-            return {"rc": 1, "out": "", "err": "invalid", "timeout": False}
         if cmd[:2] == [privoxy_system.LAUNCHCTL, "print"]:
             return {"rc": 0, "out": "loaded", "err": "", "timeout": False}
         return {"rc": 0, "out": "", "err": "", "timeout": False}
+
+    def config_test_runner(cmd, timeout):
+        assert cmd[0] == str(layout.binary_path) and cmd[1] == "--config-test"
+        return {"rc": 1, "out": "", "err": "invalid", "timeout": False}
 
     result = privoxy_system.protect_as_root(
         username=identity.pw_name,
@@ -363,12 +437,118 @@ def test_root_transaction_rolls_back_before_touching_user_job_on_bad_config_test
         chown=lambda path, uid, gid: None,
         enforce_root=False,
         user_home=home,
+        config_test_runner=config_test_runner,
     )
 
     assert result["ok"] is False
     assert result["error"].startswith("config_test_failed")
     assert user_plist.exists()
     assert not layout.launchdaemon_path.exists()
+
+
+def test_protect_as_root_runs_config_test_as_nobody_not_root(tmp_path, monkeypatch):
+    """Finding #1 (Codex, critical): config-test не должен исполнять скопированный из
+
+    user-writable Homebrew бинарь с правами root — иначе подмена бинаря до легитимного
+    `protect --strict` даёт непривилегированному пользователю выполнение кода от root.
+    protect_as_root обязан прогонять config-test через изолированный config_test_runner
+    (drop privileges к `nobody`), а не через общий root `runner`.
+    """
+    layout = _layout(tmp_path)
+    prefix = _fake_prefix(tmp_path)
+    identity = pwd.getpwuid(os.getuid())
+    home = tmp_path / "home"
+    user_plist = home / "Library" / "LaunchAgents" / f"{privoxy_system.USER_LABEL}.plist"
+    user_plist.parent.mkdir(parents=True)
+    user_plist.write_bytes(b"<plist/>")
+    staged = tmp_path / "staged"
+    staged.write_text(privoxy_system.protected_config_text(layout), encoding="utf-8")
+    staged.chmod(0o600)
+    monkeypatch.setattr(privoxy_system, "_allowed_prefix", lambda value: str(value))
+
+    lifecycle = {"user": True, "system": False, "port": True}
+
+    def root_runner(cmd, timeout):
+        # config-test НИКОГДА не должен попадать в привилегированный runner.
+        assert not (len(cmd) > 1 and cmd[0] == str(layout.binary_path)
+                    and cmd[1] == "--config-test"), \
+            "config-test must not run through the root-privileged runner"
+        if cmd[:2] == [privoxy_system.LAUNCHCTL, "print"]:
+            target = cmd[2]
+            loaded = lifecycle["system"] if target.startswith("system/") else lifecycle["user"]
+            return {"rc": 0 if loaded else 113,
+                    "out": f"{target} = state = running\npid = 4242" if loaded else "",
+                    "err": "" if loaded else "not found", "timeout": False}
+        if cmd[:2] == [privoxy_system.LAUNCHCTL, "bootout"]:
+            target = cmd[2]
+            if target.startswith("system/"):
+                lifecycle["system"] = False
+            else:
+                lifecycle["user"] = False
+            lifecycle["port"] = False
+            return {"rc": 0, "out": "", "err": "", "timeout": False}
+        if cmd[:2] == [privoxy_system.LAUNCHCTL, "bootstrap"]:
+            if cmd[2] == "system":
+                lifecycle["system"] = True
+            else:
+                lifecycle["user"] = True
+            lifecycle["port"] = True
+            return {"rc": 0, "out": "", "err": "", "timeout": False}
+        if cmd[0] == privoxy_system.PS:
+            return {"rc": 0, "out": "nobody", "err": "", "timeout": False}
+        return {"rc": 0, "out": "ok", "err": "", "timeout": False}
+
+    calls = []
+
+    def isolated_config_test_runner(cmd, timeout):
+        calls.append(cmd)
+        assert cmd[0] == str(layout.binary_path) and cmd[1] == "--config-test"
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+
+    result = privoxy_system.protect_as_root(
+        username=identity.pw_name,
+        uid=identity.pw_uid,
+        prefix=str(prefix),
+        staged_config=staged,
+        layout=layout,
+        runner=root_runner,
+        checker=lambda: lifecycle["port"],
+        chown=lambda path, uid, gid: None,
+        enforce_root=False,
+        user_home=home,
+        config_test_runner=isolated_config_test_runner,
+    )
+
+    assert result["ok"] is True
+    assert len(calls) == 1
+
+
+def test_run_as_nobody_drops_privileges_before_exec(monkeypatch):
+    """_run_as_nobody обязана дропать euid/egid ДО exec, когда процесс — root."""
+    calls = []
+    monkeypatch.setattr(privoxy_system.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(privoxy_system.os, "setgroups", lambda groups: calls.append(("setgroups", groups)))
+    monkeypatch.setattr(privoxy_system.os, "setgid", lambda gid: calls.append(("setgid", gid)))
+    monkeypatch.setattr(privoxy_system.os, "setuid", lambda uid: calls.append(("setuid", uid)))
+
+    captured = {}
+
+    def fake_run(cmd, capture_output, text, timeout, preexec_fn):
+        captured["preexec_fn"] = preexec_fn
+        if preexec_fn is not None:
+            preexec_fn()
+        return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(privoxy_system.subprocess, "run", fake_run)
+
+    result = privoxy_system._run_as_nobody(["/bin/true"], timeout=5)
+
+    assert result["rc"] == 0
+    assert captured["preexec_fn"] is not None
+    nobody = pwd.getpwnam("nobody")
+    assert ("setgid", nobody.pw_gid) in calls
+    assert ("setuid", nobody.pw_uid) in calls
+    assert calls.index(("setgid", nobody.pw_gid)) < calls.index(("setuid", nobody.pw_uid))
 
 
 def test_reapply_failure_restores_previous_protected_runtime_and_service(tmp_path, monkeypatch):
@@ -416,9 +596,10 @@ def test_reapply_failure_restores_previous_protected_runtime_and_service(tmp_pat
         if cmd[:2] == [privoxy_system.LAUNCHCTL, "bootstrap"]:
             lifecycle.update(system=True, port=True)
             return {"rc": 0, "out": "", "err": "", "timeout": False}
-        if len(cmd) > 1 and cmd[0] == str(layout.binary_path) and cmd[1] == "--config-test":
-            return {"rc": 1, "out": "", "err": "new runtime rejected", "timeout": False}
         return {"rc": 0, "out": "ok", "err": "", "timeout": False}
+
+    def config_test_runner(cmd, timeout):
+        return {"rc": 1, "out": "", "err": "new runtime rejected", "timeout": False}
 
     result = privoxy_system.protect_as_root(
         username=identity.pw_name,
@@ -431,6 +612,7 @@ def test_reapply_failure_restores_previous_protected_runtime_and_service(tmp_pat
         chown=lambda path, uid, gid: None,
         enforce_root=False,
         user_home=home,
+        config_test_runner=config_test_runner,
     )
 
     assert result["ok"] is False
@@ -552,6 +734,57 @@ def test_post_protect_verification_failure_calls_root_rollback(tmp_path, monkeyp
     state = local_state.load_state(path=state_path)
     assert state["runtime"]["privoxy_protection_pending"]["error"] == \
         "post_protect_verification_failed"
+
+
+def test_protect_rolls_back_when_sudo_cache_survives_timestamp_timeout(tmp_path, monkeypatch):
+    """timestamp_timeout=0 — критичный инвариант: `sudo -n` обязан требовать пароль.
+
+    Если кэш всё же сработал (rc=0), protect() должен считать это компрометацией
+    strict-режима и откатить protection тем же root-helper'ом, а не оставить систему
+    в состоянии, где sudo-cache-bypass остаётся незамеченным.
+    """
+    layout = _layout(tmp_path)
+    state_path = tmp_path / "state.json"
+    _write_state(state_path, {"service": "homebrew-user"})
+    monkeypatch.setattr(
+        privoxy_system, "status", lambda **kwargs: {
+            "protected": False, "loaded": False, "port_up": True, "owner": "",
+            "config_writable": None, "binary_writable": None, "assets_writable": False,
+        }
+    )
+    monkeypatch.setattr(
+        privoxy_system,
+        "_install_helper",
+        lambda runner, selected_layout: {"ok": True, "error": ""},
+    )
+    calls = []
+
+    def runner(cmd, timeout):
+        calls.append(cmd)
+        if "protect" in cmd:
+            return {"rc": 0, "out": '{"ok":true,"error":"","backup_dir":"/backup"}',
+                    "err": "", "timeout": False}
+        if "unprotect" in cmd:
+            return {"rc": 0, "out": '{"ok":true,"error":"","restored":true}',
+                    "err": "", "timeout": False}
+        if "-n" in cmd:
+            # Симулируем утечку sudo-кэша вопреки timestamp_timeout=0.
+            return {"rc": 0, "out": "", "err": "", "timeout": False}
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+
+    result = privoxy_system.protect(
+        state_path=state_path,
+        runner=runner,
+        require_tty=False,
+        layout=layout,
+    )
+
+    assert result["ok"] is False
+    assert result["error"] == "sudo_without_fresh_authorization"
+    assert [privoxy_system.SUDO, str(layout.helper_path), "unprotect", "--restore"] in calls
+    state = local_state.load_state(path=state_path)
+    assert state["runtime"]["privoxy_protection_pending"]["error"] == \
+        "sudo_without_fresh_authorization"
 
 
 def test_build_plan_marks_protected_privoxy_and_never_schedules_brew_restart(tmp_path, monkeypatch):
