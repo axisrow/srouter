@@ -517,3 +517,182 @@ def test_inspect_component_foreign_port_blocks_even_when_reclaimable(tmp_path, m
     assert "foreign_port" in item["conflicts"], ("чужой процесс на порту → foreign_port, даже при "
                                                  "reclaimable (маркера нет → слушатель может быть чужим)")
     assert item["conflict"] is True, "foreign_port блокирует reclaimable (не авто-применение при чужом процессе)"
+
+
+# ============================ issue #112 Часть 1: provenance в state ============================
+# install пишет detected_environment[name].management.provenance = 'created' | 'overwrote'.
+# created = config_path НЕ существовал до install (нет backup — нечего бэкапить).
+# overwrote = существовал, есть backup. Uninstall (Часть 2) различает: created → удалить, overwrote →
+# restore. Без явного provenance uninstall restore-only (Дефект #110 follow-up).
+#
+# Инвариант: backups[name] truthy ⟺ config существовал до install (needs_backup на стр.767 требует
+# config_path.exists()). Значит provenance выводится из backups.get(name) в _write_state_after_apply —
+# без нового параметра сквозь apply_install (минимально-инвазивно, no-hidden-magic).
+def test_install_records_provenance_created(tmp_path):
+    """Часть 1: fresh install (config_path НЕ существовал) → management.provenance == 'created'.
+
+    created = srouter создал конфиг с нуля (нет backup — нечего бэкапить). Uninstall должен УДАЛИТЬ
+    такой конфиг (Часть 2). Без provenance uninstall restore-only → конфиг остаётся навсегда (Дефект #110).
+    """
+    env = _env(tmp_path)
+
+    result = install_lib.apply_install(
+        env=env,
+        confirm=True,
+        choices={"xray": "skip", "privoxy": "skip"},  # только dnsmasq → fresh config_path
+        runner=FakeRunner(),
+        port_checker=lambda *_a, **_kw: False,
+    )
+
+    assert result["ok"] is True, f"fresh install должен пройти: {result}"
+    state = json.loads(env.state_path.read_text(encoding="utf-8"))
+    assert state["detected_environment"]["dnsmasq"]["management"]["provenance"] == "created", \
+        "fresh install (config_path не существовал) → provenance='created'"
+
+
+def test_install_records_provenance_overwrote(tmp_path):
+    """Часть 1: overwrite (config_path существовал) → management.provenance == 'overwrote'.
+
+    overwrote = srouter перезаписал чужой конфиг (есть backup). Uninstall должен RESTORE из backup
+    (Часть 2). provenance='overwrote' ⟺ backups[name] truthy (инвариант needs_backup на стр.767).
+    """
+    env = _env(tmp_path)
+    config_path = env.component_paths("privoxy")["config"]
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text("foreign config\n", encoding="utf-8")
+
+    result = install_lib.apply_install(
+        env=env,
+        confirm=True,
+        choices={"privoxy": "overwrite", "xray": "skip", "dnsmasq": "skip"},
+        runner=FakeRunner(),
+        port_checker=lambda *_a, **_kw: False,
+    )
+
+    assert result["ok"] is True, f"overwrite должен пройти: {result}"
+    state = json.loads(env.state_path.read_text(encoding="utf-8"))
+    assert state["detected_environment"]["privoxy"]["management"]["provenance"] == "overwrote", \
+        "overwrite (config_path существовал, есть backup) → provenance='overwrote'"
+    assert "backup" in state["detected_environment"]["privoxy"], "overwrote имеет backup в state"
+
+
+def test_install_skipped_has_no_provenance(tmp_path):
+    """Часть 1 граница: skip → provenance отсутствует (srouter не перезаписывал, semantics не применима).
+
+    adopted/skipped/restored — provenance не имеет смысла (нет created/overwrote действия).
+    Не пишем поле вообще (None в _management_for опускается) — uninstall "left untouched" для skip.
+    """
+    env = _env(tmp_path)
+
+    result = install_lib.apply_install(
+        env=env,
+        confirm=True,
+        choices={"xray": "skip", "privoxy": "skip", "dnsmasq": "skip"},
+        runner=FakeRunner(),
+        port_checker=lambda *_a, **_kw: False,
+    )
+
+    assert result["ok"] is True
+    state = json.loads(env.state_path.read_text(encoding="utf-8"))
+    for name in ("xray", "privoxy", "dnsmasq"):
+        assert "provenance" not in state["detected_environment"][name]["management"], \
+            f"{name} skipped → provenance отсутствует (не применимо)"
+
+
+# ============================ cycle-review cloud (@bbc356a, чистое ядро): preserve на idempotent reinstall ============================
+# P1: past install overwrote foreign config → state: backup=foreign, provenance='overwrote'. Idempotent
+# reinstall (target marker-managed, нет нового backup) → _write_state_after_apply перезаписывает entry →
+# provenance='created', backup ДРОПАЕТСЯ → uninstall удаляет srouter-config вместо restore оригинала.
+# Это баг Части 1 (не WAL): provenance выводится из backups[name] этого apply, игнорируя prev entry.
+def test_idempotent_reinstall_preserves_overwrote_backup_provenance(tmp_path):
+    """P1: idempotent reinstall после overwrite СОХРАНЯЕТ backup/provenance='overwrote'.
+
+    Сценарий: прошлое install overwrote privoxy → state: backup=foreign-оригинал, provenance='overwrote'.
+    Повторный install: target marker-managed → no new backup → provenance='created', backup потерян.
+    Следующий uninstall: created → УДАЛИТ srouter-config вместо restore пользовательского оригинала. ПОТЕРЯ.
+    Фикс: для already-managed entry без нового backup — preserve существующих backup/provenance из prev.
+    """
+    env = _env(tmp_path)
+    config_path = env.component_paths("privoxy")["config"]
+    config_path.parent.mkdir(parents=True)
+    # target = srouter-managed (как после прошлого install).
+    config_path.write_text("# srouter-managed-config-v1\nlisten-address 127.0.0.1:8118\n", encoding="utf-8")
+    # state: прошлое install overwrote → backup=foreign-оригинал, provenance='overwrote'.
+    backup_of_original = config_path.with_name("config.srouter-backup-reinstall")
+    backup_of_original.write_text("foreign config\n", encoding="utf-8")
+    env.state_path.write_text(json.dumps({
+        "schema_version": 1, "nodes": [], "active_node": {"name": None, "pending": None},
+        "probes": {}, "network": {"channels": {"wifi_service": "Wi-Fi"}},
+        "traffic_guard": {"mode": "off", "domains": {}},
+        "detected_environment": {"privoxy": {
+            "config_path": str(config_path),
+            "backup": str(backup_of_original),
+            "management": {"mode": "managed", "managed": True, "provenance": "overwrote"},
+        }},
+        "runtime": {},
+    }), encoding="utf-8")
+
+    # idempotent reinstall БЕЗ overwrite-choice (target managed, не конфликт).
+    result = install_lib.apply_install(
+        env=env, confirm=True, choices={"xray": "skip", "dnsmasq": "skip"},
+        runner=FakeRunner(), port_checker=lambda *_a, **_kw: False)
+    assert result["ok"] is True, f"idempotent reinstall должен пройти: {result}"
+
+    state = json.loads(env.state_path.read_text(encoding="utf-8"))
+    entry = state["detected_environment"]["privoxy"]
+    assert entry.get("backup") == str(backup_of_original), \
+        "idempotent reinstall сохраняет backup оригинала — иначе uninstall удалит вместо restore"
+    assert entry["management"].get("provenance") == "overwrote", \
+        "idempotent reinstall сохраняет provenance='overwrote' — не деградирует до 'created'"
+
+    # Доказательство потери БЕЗ фикса: последующий uninstall должен RESTORE (overwrote), не DELETE (created).
+    un = install_lib.apply_uninstall(
+        env=env, confirmations={"configs": True}, runner=FakeRunner())
+    assert un["ok"] is True
+    assert config_path.read_text(encoding="utf-8") == "foreign config\n", \
+        "uninstall после idempotent reinstall восстанавливает оригинал (overwrote→restore), не удаляет"
+
+
+def test_reinstall_does_not_carry_backup_across_config_paths(tmp_path, monkeypatch):
+    """P1 round 2 (@307bb34): preserve backup ТОЛЬКО при совпадении config_path (path-ownership guard).
+
+    Сценарий: компонент ставился с --prefix A (backup foreign-конфига A, provenance='overwrote'). Потом
+    install с --prefix B → fresh write at B, backups[name] пуст. До фикса preserve переносил A's backup в
+    B-запись → uninstall трактует B как overwrote и restore'ит A's backup В B (foreign-конфиг A по пути B!),
+    пока оригинал A не восстанавливается. Это обход path-ownership guard (cycle-review #111 finding 1:
+    ownership привязан к пути). Фикс: preserve только когда prev.config_path == item.config_path.
+    """
+    env = _env(tmp_path)
+    new_config_path = env.component_paths("privoxy")["config"]
+    new_config_path.parent.mkdir(parents=True)
+    # target B = srouter-managed (fresh write при смене prefix).
+    new_config_path.write_text("# srouter-managed-config-v1\nlisten-address 127.0.0.1:8118\n", encoding="utf-8")
+    # state: prev под ДРУГИМ config_path (prefix A) — backup foreign-конфига A, provenance='overwrote'.
+    old_config_path = tmp_path / "old-prefix" / "privoxy" / "config"
+    backup_of_old = tmp_path / "old-prefix-backup"
+    backup_of_old.write_text("foreign config from prefix A\n", encoding="utf-8")
+    env.state_path.write_text(json.dumps({
+        "schema_version": 1, "nodes": [], "active_node": {"name": None, "pending": None},
+        "probes": {}, "network": {"channels": {"wifi_service": "Wi-Fi"}},
+        "traffic_guard": {"mode": "off", "domains": {}},
+        "detected_environment": {"privoxy": {
+            "config_path": str(old_config_path),  # ДРУГОЙ путь (prefix A), ≠ текущий B
+            "backup": str(backup_of_old),
+            "management": {"mode": "managed", "managed": True, "provenance": "overwrote"},
+        }},
+        "runtime": {},
+    }), encoding="utf-8")
+
+    # install при prefix B (target marker-managed, нет нового backup, prev.config_path != item.config_path).
+    result = install_lib.apply_install(
+        env=env, confirm=True, choices={"xray": "skip", "dnsmasq": "skip"},
+        runner=FakeRunner(), port_checker=lambda *_a, **_kw: False)
+    assert result["ok"] is True, f"install при смене prefix должен пройти: {result}"
+
+    state = json.loads(env.state_path.read_text(encoding="utf-8"))
+    entry = state["detected_environment"]["privoxy"]
+    # A's backup НЕ переносится на путь B (path-ownership guard) — иначе uninstall restore'ит чужой A в B.
+    assert entry.get("backup") != str(backup_of_old), \
+        "backup с ДРУГОГО config_path НЕ preserve'ится (path-ownership) — иначе cross-path restore"
+    assert entry["management"].get("provenance") != "overwrote", \
+        "provenance не наследуется с другого пути (path-ownership) — это fresh created по пути B"

@@ -81,7 +81,7 @@ def test_install_creates_wrappers(monkeypatch, tmp_path):
 
 
 def test_install_marker_gate_foreign_not_touched(monkeypatch, tmp_path):
-    """Чужой ~/bin/codex (без маркера srouter) — НЕ перезаписывать."""
+    """Чужой ~/bin/codex (без маркера srouter) — НЕ перезаписывать (unmarked → WARN, #112 Часть 4)."""
     home = _mock_home(monkeypatch, tmp_path)
     env = _env(tmp_path)
     foreign = "# my custom codex wrapper\n#!/bin/sh\nexec /usr/local/bin/codex\n"
@@ -89,7 +89,10 @@ def test_install_marker_gate_foreign_not_touched(monkeypatch, tmp_path):
 
     note = srouter._install_codex_wrappers(env)
 
-    assert "чуж" in note.lower(), f"должен отказаться трогать чужой: {note}"
+    # #112 Часть 4: unmarked wrapper (нет current, нет legacy) → WARN «без srouter-маркера — не трогаем».
+    # Формулировка migration-aware (отличает unmarked от чисто-foreign для оператора), семантика та же.
+    assert "не трогаем" in note.lower() or "чуж" in note.lower(), \
+        f"unmarked/foreign wrapper → WARN, не перезаписывать: {note}"
     assert (home / "bin" / "codex").read_text(encoding="utf-8") == foreign
 
 
@@ -882,3 +885,97 @@ def test_codex_function_beats_brew_in_path(monkeypatch, tmp_path):
     assert managed_called.exists() and managed_called.read_text(encoding="utf-8").strip() == "managed", \
         "вызов дошёл до managed-launcher через функцию"
     assert not brew_called.exists(), "brew-бинарь НЕ был вызван (функция перехватила)"
+
+
+# ============================ issue #112 Часть 4: marker-migration (РЕШЕНИЕ 2, вариант A) ============================
+# Wrappers сейчас marker-gate: текущий маркер есть → переустановить; нет → «чужой, не трогаем». При смене
+# версии маркера (v1→v2) старый «свой» wrapper = «чужой» → не обновляется (залипает). Фикс: state-based
+# known_markers table — install мигрирует old→current, WARN на unmarked (не adopt молча, канон fail-closed).
+def _write_known_markers_state(env, surface, markers):
+    """Записать detected_environment.known_markers[surface] = markers в state srouter.local.json."""
+    import json
+    state_path = env.state_path
+    state = {}
+    if state_path.exists():
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+        except ValueError:
+            state = {}
+    detected = state.setdefault("detected_environment", {})
+    table = detected.setdefault("known_markers", {})
+    table[surface] = markers
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+
+def test_install_upgrades_old_marker_wrapper(monkeypatch, tmp_path):
+    """Часть 4: wrapper со СТАРЫМ (legacy) маркером из known_markers → install обновляет до current.
+
+    Сценарий смены версии маркера: wrapper был установлен с old marker "# srouter-codex-wrapper-v0".
+    state.known_markers.wrappers знает old+current → install распознаёт old как «свой» → перезаписывает
+    с current-маркером. До #112: old ≠ current → «чужой, не трогаем» → wrapper залипал на старой версии.
+    """
+    home = _mock_home(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    bin_dir = home / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    current = _markers()["codex"]
+    legacy = "# srouter-codex-wrapper-v0 (managed)"
+    # Wrapper с LEGACY-маркером (как после смены версии маркера).
+    (bin_dir / "codex").write_text(f"{legacy}\n#!/bin/sh\nexec old-codex\n", encoding="utf-8")
+    # state знает old+current как наши (migration table).
+    _write_known_markers_state(env, "wrappers", [current, legacy])
+
+    note = srouter._install_codex_wrappers(env)
+
+    wrapper_text = (bin_dir / "codex").read_text(encoding="utf-8")
+    assert current in wrapper_text, "wrapper обновлён до current-маркера (миграция)"
+    assert legacy not in wrapper_text, "old legacy-маркер заменён"
+    assert "установ" in note.lower() or "обнов" in note.lower() or "миграц" in note.lower(), \
+        f"note сообщает об обновлении/миграции: {note}"
+
+
+def test_install_warns_on_unmarked_wrapper(monkeypatch, tmp_path):
+    """Часть 4: wrapper БЕЗ маркера (не current, не legacy) → WARN, не adopt молча (fail-closed).
+
+    Unmarked wrapper — не наш (нет ни current, ни legacy маркера). Канон «никогда молча не adopt»:
+    WARN + не перезаписывать. Оператор удаляет вручную, если это его старый wrapper. Отличие от
+    чисто-foreign: явный WARN-статус «без srouter-маркера» (migration-aware формулировка).
+    """
+    home = _mock_home(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    bin_dir = home / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    current = _markers()["codex"]
+    legacy = "# srouter-codex-wrapper-v0 (managed)"
+    # Unmarked wrapper (нет current, нет legacy маркера — произвольный чужой контент).
+    unmarked = "#!/bin/sh\nexec /usr/local/bin/codex\n# user custom\n"
+    (bin_dir / "codex").write_text(unmarked, encoding="utf-8")
+    # state знает только current+legacy (unmarked не входит).
+    _write_known_markers_state(env, "wrappers", [current, legacy])
+
+    note = srouter._install_codex_wrappers(env)
+
+    assert "не трогаем" in note.lower() or "чуж" in note.lower() or "маркер" in note.lower(), \
+        f"unmarked wrapper → WARN, не adopt: {note}"
+    assert (bin_dir / "codex").read_text(encoding="utf-8") == unmarked, "unmarked wrapper НЕ перезаписан"
+
+
+def test_install_upgrades_old_marker_wrapper_without_state_uses_current_only(monkeypatch, tmp_path):
+    """Часть 4 граница: НЕТ known_markers в state → wrapper с unknown-старым-маркером = unmarked (WARN).
+
+    Без migration-table install не знает о legacy-маркерах → использует только current. Unknown-маркер
+    = unmarked → WARN. Это безопасный fallback: migration требует явной регистрации legacy в state
+    (через populate_known_markers при install с новой версией). Не угадываем legacy вслепую.
+    """
+    home = _mock_home(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    bin_dir = home / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    # НЕТ state known_markers (env.state_path не существует или пустой).
+    unknown_old = "# srouter-codex-wrapper-unknown (managed)"
+    (bin_dir / "codex").write_text(f"{unknown_old}\n#!/bin/sh\nexec codex\n", encoding="utf-8")
+
+    note = srouter._install_codex_wrappers(env)
+
+    assert "не трогаем" in note.lower() or "чуж" in note.lower() or "маркер" in note.lower(), \
+        f"unknown old-маркер без state-migration-table → WARN (не угадываем legacy): {note}"
