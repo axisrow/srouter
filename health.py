@@ -437,6 +437,231 @@ def _codex_proxy_probe():
             "detail": f"runtime: codex запущен (PID {','.join(sorted(pids))}), но нет активных сокетов (idle)"}
 
 
+# ============================ #145: установленные codex/claude-code binary на диске ============================
+# Дополняет runtime-probes (lsof по ЖИВЫМ proc) инвентаризацией ДИСКА. Несколько версий — ранний
+# сигнал конфликта (#135 desktop-proxy-vs-managed-codex-socks5-conflict), но НЕ сбой стека → info-only
+# (как claude-proxy когда CC не запущен). Doctor показывает картину, не угадывает за пользователя.
+
+# Маркер srouter-wrapper в ~/bin/codex (первая строка шаблона srouter-codex-cli-wrapper.sh).
+# Совпадает с CODEX_WRAPPERS[0] marker в srouter.py (канон: один источник правды для маркера).
+_CODEX_WRAPPER_MARKER = "# srouter: codex CLI wrapper (managed)"
+
+# Which(1) с -a печатает ВСЕ совпадения в PATH; абсолютные пути — только строки, начинающиеся с /
+# (на zsh `which -a codex` печатает shell-функцию `codex () {...}` ПЕРЕД binary — её отбрасываем).
+WHICH = "/usr/bin/which"
+NPM = "/opt/homebrew/bin/npm"  # абсолютный путь: launchd/GUI PATH его не содержит (канон)
+
+
+def _codex_wrapper_path():
+    """Путь к codex-wrapper в ~/bin (динамически, для моков Path.home — канон srouter.py:290)."""
+    return Path.home() / "bin" / "codex"
+
+
+def _which_all(name):
+    """`which -a <name>` → список абсолютных путей. Отбрасывает shell-функции/aliases (не начинаются с /).
+    Не бросает (fail-soft: timeout/нет which → пустой список)."""
+    r = sys_probe.run([WHICH, "-a", name], timeout=3)
+    if r.get("timeout"):
+        return []
+    paths = []
+    for line in (r.get("out") or "").splitlines():
+        line = line.strip()
+        # абсолютный путь = кандидат (zsh-функция/alias/описание — пропускаем).
+        if line.startswith("/"):
+            paths.append(line)
+    return paths
+
+
+def _binary_version(path):
+    """`<path> --version` → первая непустая строка (версия). Пусто если не запустился. Не бросает."""
+    r = sys_probe.run([path, "--version"], timeout=4)
+    if r.get("timeout"):
+        return ""
+    out = (r.get("out") or "").strip()
+    if not out:
+        out = (r.get("err") or "").strip()
+    return out.splitlines()[0].strip()[:120] if out else ""
+
+
+def _is_srouter_codex_wrapper(path):
+    """Файл path — наш srouter-wrapper? Путь == ~/bin/codex И маркер в содержимом (первая строка шаблона).
+    Не полагается только на путь: чужой wrapper в ~/bin/codex без маркера — НЕ наш (regression-гвард).
+    """
+    try:
+        if path == str(_codex_wrapper_path()):
+            return _CODEX_WRAPPER_MARKER in Path(path).read_text(encoding="utf-8")
+        return False
+    except OSError:
+        return False
+
+
+def _codex_provenance(path):
+    """Provenance codex-binary по его расположению: npm / homebrew / usr-local / bin / path.
+    НЕ утверждает «обёрнут srouter» — это решает _is_srouter_codex_wrapper (по маркеру, не по пути),
+    поэтому ~/bin/codex без маркера = provenance 'bin' (чужой/устаревший wrapper), не 'srouter-wrapper'."""
+    p = str(path)
+    if "/lib/node_modules/" in p or p.endswith(".js"):
+        return "npm"
+    if "/opt/homebrew/" in p:
+        return "homebrew"
+    if "/usr/local/bin/" in p:
+        return "usr-local"
+    if p == str(_codex_wrapper_path()):
+        return "bin"
+    return "path"
+
+
+def _claude_provenance(path):
+    """Provenance claude-code по расположению: CLI / GUI app / version-runner."""
+    p = str(path)
+    if "/versions/" in p:
+        return "version-runner"
+    if "/ClaudeCode.app" in p:
+        return "gui-app"
+    return "cli"
+
+
+def _scan_codex_binaries():
+    """Найти ВСЕ codex-binary на диске. Источники: which -a, homebrew-paths, ~/bin wrapper,
+    npm global root (@openai/codex/bin/codex.js), brew-cask. Дедуп по нормализованному пути.
+    Каждый: {path, provenance, version, wrapped}. Не бросает (fail-soft)."""
+    candidates = []
+    # 1. which -a codex (все в PATH, включая ~/bin/codex wrapper).
+    candidates.extend(_which_all("codex"))
+    # 2. well-known homebrew/standalone (Apple Silicon / Intel).
+    for cand in ("/opt/homebrew/bin/codex", "/usr/local/bin/codex"):
+        if Path(cand).is_file():
+            candidates.append(cand)
+    # 3. srouter-wrapper ~/bin/codex (явно — который() может не вернуть, если ~/bin не в PATH пробы).
+    wrapper = str(_codex_wrapper_path())
+    if Path(wrapper).is_file():
+        candidates.append(wrapper)
+    # 4. npm global root (@openai/codex) — отдельный источник (which может не показать .js).
+    npm_r = sys_probe.run([NPM, "root", "-g"], timeout=4)
+    if not npm_r.get("timeout"):
+        npm_root = (npm_r.get("out") or "").strip()
+        if npm_root:
+            npm_codex = str(Path(npm_root) / "@openai" / "codex" / "bin" / "codex.js")
+            if Path(npm_codex).is_file():
+                candidates.append(npm_codex)
+    # 5. brew-cask codex (отдельный binary, не npm).
+    brew_r = sys_probe.run(["/opt/homebrew/bin/brew", "list", "--cask"], timeout=5)
+    if not brew_r.get("timeout") and "codex" in (brew_r.get("out") or ""):
+        for cand in ("/opt/homebrew/Caskroom/codex",):
+            if Path(cand).is_dir():
+                candidates.append(cand)
+
+    # Дедуп по нормализованному пути (один файл через два имени — один).
+    seen = set()
+    results = []
+    for cand in candidates:
+        try:
+            norm = str(Path(cand).resolve())
+        except OSError:
+            norm = cand
+        if norm in seen or not Path(cand).is_file():
+            continue
+        seen.add(norm)
+        results.append({
+            "path": cand,
+            "provenance": _codex_provenance(cand),
+            "version": _binary_version(cand),
+            "wrapped": _is_srouter_codex_wrapper(cand),
+        })
+    return results
+
+
+def _scan_claude_code_binaries():
+    """Найти claude-code на диске: CLI (~/.local/bin/claude), GUI app, version-runners (versions/*).
+    Переиспользует path-семантику _is_claude_code_comm (basename/versions), но на диске, не на proc.
+    Каждый: {path, provenance, version, wrapped}. wrapped всегда False (CC не оборачиваем srouter).
+    Не бросает."""
+    home = Path.home()
+    candidates = []
+    # CLI (в PATH + well-known) — which может найти иGUI-pty-host, но CLI — основной.
+    candidates.extend(_which_all("claude"))
+    cli = str(home / ".local" / "bin" / "claude")
+    if Path(cli).is_file():
+        candidates.append(cli)
+    # GUI app (bundle).
+    app = home / ".local" / "share" / "claude" / "ClaudeCode.app"
+    if app.is_dir():
+        candidates.append(str(app))
+    # version-runners (основной движок CC) — каждый каталог-версия = отдельный binary.
+    versions_dir = home / ".local" / "share" / "claude" / "versions"
+    if versions_dir.is_dir():
+        try:
+            for child in sorted(versions_dir.iterdir()):
+                if child.is_file():
+                    candidates.append(str(child))
+        except OSError:
+            pass
+
+    seen = set()
+    results = []
+    for cand in candidates:
+        try:
+            norm = str(Path(cand).resolve())
+        except OSError:
+            norm = cand
+        if norm in seen:
+            continue
+        seen.add(norm)
+        # version: только для исполняемых файлов (не .app bundle).
+        version = _binary_version(cand) if Path(cand).is_file() else ""
+        results.append({
+            "path": cand,
+            "provenance": _claude_provenance(cand),
+            "version": version,
+            "wrapped": False,
+        })
+    return results
+
+
+def _format_versions_detail(codex_bins, claude_bins):
+    """Человекочитаемый detail для doctor: буллеты provenance + версия + бейдж обёрнут/нет (issue #145)."""
+    lines = []
+    if codex_bins:
+        lines.append(f"codex: {len(codex_bins)} установлено")
+        for b in codex_bins:
+            badge = "обёрнут srouter" if b["wrapped"] else "НЕ обёрнут"
+            ver = b["version"] or "версия неизвестна"
+            lines.append(f"  • {b['provenance']} {ver} → {b['path']} ({badge})")
+    else:
+        lines.append("codex: не установлен")
+    if claude_bins:
+        lines.append(f"claude-code: {len(claude_bins)} установлено")
+        for b in claude_bins:
+            ver = b["version"] or ("версия в имени" if b["provenance"] == "version-runner" else "версия неизвестна")
+            lines.append(f"  • {b['provenance']} {ver} → {b['path']}")
+    else:
+        lines.append("claude-code: не установлен")
+    return "; ".join(lines)
+
+
+def _installed_versions_check():
+    """Инвентаризация codex/claude-code binary на ДИСКЕ + их версии + обёрнут ли srouter (#145).
+
+    Дополняет runtime-probes (живые proc): показывает, СКОЛЬКО версий установлено и какая обёрнута.
+    Info-only: несколько версий — ранний сигнал конфликта (#135), но НЕ сбой стека → не роняет status.
+    Возвращает {status, detail, codex:[...], claude_code:[...]}:
+      status="ok"      — что-то установлено (картина показана);
+      status="unknown" — ничего не найдено (info-only «не установлено»).
+    Не бросает (fail-soft: каждый источник изолирован try/except в sys_probe.run)."""
+    try:
+        codex_bins = _scan_codex_binaries()
+    except Exception:
+        codex_bins = []
+    try:
+        claude_bins = _scan_claude_code_binaries()
+    except Exception:
+        claude_bins = []
+    detail = _format_versions_detail(codex_bins, claude_bins)
+    if not codex_bins and not claude_bins:
+        return {"status": "unknown", "detail": detail, "codex": [], "claude_code": []}
+    return {"status": "ok", "detail": detail, "codex": codex_bins, "claude_code": claude_bins}
+
+
 # ============================ #129: endpoint-override detection ============================
 
 _DEFAULT_ANTHROPIC_HOST = "api.anthropic.com"
@@ -622,6 +847,18 @@ def check_all(*, active_claude=False):
     elif cx["status"] == "warn":
         cx_check["ok"] = False  # privoxy-сессия — degraded, но не «всё мертво»
     checks.append(cx_check)
+    # Установленные codex/claude-code binary на диске (#145): инвентаризация, info-only ВСЕГДА
+    # (несколько версий — ранний сигнал конфликта #135, не сбой стека). unknown (ничего не установлено)
+    # тоже info — не роняет вердикт. Doctor показывает картину, не угадывает.
+    # cycle-review round 1: disk inventory запускает npm/brew/which/<binary> --version — НЕ лёгкий,
+    # выполняет arbitrary PATH-discovered binaries. check_all шарится между doctor (active_claude=True),
+    # /health (dashboard.py:990 «Мгновенный, лёгкий») и watchdog (раз в ~20с). Инвентаризация —
+    # ТОЛЬКО doctor-путь, иначе лёгкий healthcheck получит DoS-поверхность + overhead.
+    if active_claude:
+        iv = _installed_versions_check()
+        iv_check = {"name": "версии (codex/claude-code на диске)",
+                    "ok": True, "info": True, "detail": iv["detail"]}
+        checks.append(iv_check)
     drivers = [c for c in checks if not c.get("info")]
     all_ok = all(c["ok"] for c in drivers)
     any_ok = any(c["ok"] for c in drivers)
