@@ -111,6 +111,28 @@ def test_probe_unknown_when_cc_idle_no_sockets(monkeypatch):
     assert res["status"] == "unknown", "CC без активных сокетов → unknown (idle, не down)"
 
 
+def test_probe_down_when_cc_mixed_socks_and_direct_leak(monkeypatch):
+    """C2: SOCKS + external одновременно → down (mixed, direct-leak не маскируется SOCKS).
+
+    Баг: has_socks=True возвращал ok ДО проверки has_external → один PID через SOCKS,
+    другой напрямую → doctor говорил ok. per-PID классификация: SOCKS+external = down (mixed).
+    """
+    def fake_run(cmd, timeout):
+        if cmd and cmd[0] == "/bin/ps":
+            return {"rc": 0, "out": f"101 {CLI_COMM}\n102 {CLI_COMM}\n", "err": "", "timeout": False}
+        if cmd and cmd[0] == "/usr/sbin/lsof":
+            # PID 101 через SOCKS5, PID 102 напрямую (external)
+            return {"rc": 0, "out": (
+                f"claude 101 axisrow 7u IPv4 ... TCP 127.0.0.1:51234->127.0.0.1:{health.XRAY_PORT} (ESTABLISHED)\n"
+                "claude 102 axisrow 7u IPv4 ... TCP 192.168.1.5:51235->160.79.104.10:443 (ESTABLISHED)\n"
+            ), "err": "", "timeout": False}
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+
+    monkeypatch.setattr(health.sys_probe, "run", fake_run)
+    res = health._claude_proxy_probe()
+    assert res["status"] == "down", "SOCKS + direct-leak = mixed → down (не ok, direct-leak не маскирован)"
+
+
 def test_probe_unknown_when_lsof_times_out(monkeypatch):
     """Regression: lsof timed out → status=unknown (НЕ down). Симметрично с ps-timeout.
 

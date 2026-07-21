@@ -143,30 +143,39 @@ def _claude_proxy_probe():
     if not pids:
         return {"status": "unknown", "source": "n/a", "detail": "Claude Code не запущен"}
 
-    # 2. Один lsof на ВСЕ PID'ы (батч). Классификация:
-    #    ->127.0.0.1:10808 → ok (CC через SOCKS5).
-    #    external ESTABLISHED (не localhost) → down (direct-leak, fail-closed violation).
+    # 2. Один lsof на ВСЕ PID'ы (батч). per-PID классификация маршрутов (cycle-review #126 C2):
+    #    SOCKS+external в одном срезе = mixed (direct-leak не маскируется SOCKS-коннектом).
+    #    ->127.0.0.1:10808 → socks (CC через SOCKS5).
+    #    external ESTABLISHED (не localhost) → external (direct-leak, fail-closed violation).
     #    нет сокетов → unknown (idle).
     lr = sys_probe.run([LSOF, "-nP", "-p", ",".join(pids)], timeout=3)
     if lr.get("timeout"):
         return {"status": "unknown", "source": "n/a", "detail": "timeout lsof"}
-    has_socks = False
-    has_external = False
+    socks_pids, external_pids = set(), set()
     for line in (lr.get("out") or "").splitlines():
         if "TCP" not in line or "ESTABLISHED" not in line:
             continue
+        fields = line.split()
+        pid = fields[1] if len(fields) > 1 else ""
         if f"->127.0.0.1:{XRAY_PORT}" in line:
-            has_socks = True
+            socks_pids.add(pid)
         elif "->127.0.0.1:" not in line:
             # external ESTABLISHED (не localhost) — CC идёт напрямую, мимо прокси.
-            has_external = True
-    if has_socks:
-        return {"status": "ok", "source": "runtime",
-                "detail": "runtime: Claude Code через SOCKS5 10808"}
-    if has_external:
+            external_pids.add(pid)
+    if socks_pids and external_pids:
         return {"status": "down", "source": "runtime",
-                "detail": "runtime: Claude Code идёт НАПРЯМУЮ (мимо прокси) — нарушение fail-closed. "
-                          "Проверь HTTPS_PROXY в ~/.claude/settings.json env (должен быть socks5h://127.0.0.1:10808)"}
+                "detail": (f"runtime: Claude Code MIXED — SOCKS5 (PID {','.join(sorted(socks_pids))}) "
+                           f"+ direct-leak (PID {','.join(sorted(external_pids))}). "
+                           f"Один из PID идёт напрямую — нарушение fail-closed. "
+                           f"Проверь HTTPS_PROXY в ~/.claude/settings.json env.")}
+    if socks_pids:
+        return {"status": "ok", "source": "runtime",
+                "detail": f"runtime: Claude Code через SOCKS5 10808 (PID {','.join(sorted(socks_pids))})"}
+    if external_pids:
+        return {"status": "down", "source": "runtime",
+                "detail": (f"runtime: Claude Code идёт НАПРЯМУЮ (мимо прокси) — нарушение fail-closed. "
+                           f"PID {','.join(sorted(external_pids))}. "
+                           f"Проверь HTTPS_PROXY в ~/.claude/settings.json env (должен быть socks5h://127.0.0.1:10808)")}
     return {"status": "unknown", "source": "runtime",
             "detail": "runtime: Claude Code запущен, но нет активных сокетов (idle)"}
 
