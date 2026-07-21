@@ -908,7 +908,10 @@ def routing_apply(hosts, *, action="add", adopt=False, outbound=DEFAULT_ROUTING_
     Hybrid adopt: foreign-config без маркера → требует adopt=True (захватить секцию). После adopt
     rule помечается _srouter_managed, домены + hash пишутся в state. Locate по маркеру, не по tag
     (защита от переименования outbound). Hash-drift (конфиг меняли руками) → refuse.
-    При ошибке restart — backup восстанавливается, state active НЕ меняется (two-phase rollback).
+    Транзакционность: state пишется ДО restart xray; при провале ЛЮБОГО шага (unreadable state,
+    state-write, restart) — откат к исходному config (и state, если restart упал после успешной
+    записи state), никогда не оставляя config и state рассинхронизированными. Существующий, но
+    битый state-файл никогда не заменяется дефолтом (data-loss guard).
 
     Возвращает {ok, changed, err}. Не бросает (fail-soft как sync_route_ip_from_xray).
     """
@@ -951,19 +954,21 @@ def routing_apply(hosts, *, action="add", adopt=False, outbound=DEFAULT_ROUTING_
     rule = rules[idx]
     current_domains = list(rule.get("domain") or [])
 
-    # 2. drift-detection ДО idempotency: если конфиг меняли руками после нашего apply — refuse,
-    #    даже если итоговый домен-список совпал (не маскировать чужие правки под «idempotent»).
-    state = None
+    # 2. читать state ОДИН раз здесь (readable проверяем всегда, drift — только когда есть с чем
+    #    сравнивать). Битый существующий state-файл → fail-closed ДО любых мутаций конфига: не смеем
+    #    ни читать активный набор для drift-сравнения, ни (ниже, в state-write) заменять его дефолтом
+    #    (data-loss — теряет nodes/active_node/traffic_guard/isolate пользователя).
+    try:
+        state, state_readable = _load_state_checked(state_path)
+    except Exception:
+        state, state_readable = None, False
+    if not state_readable or not isinstance(state, dict):
+        return {"ok": False, "changed": False, "err": "state_unreadable"}
     if adopt is False or rule.get(ROUTING_MARKER) is True:
-        try:
-            state, _ = _load_state_checked(state_path)
-        except Exception:
-            state = None
-        if isinstance(state, dict):
-            rt = state.get("routing") if isinstance(state.get("routing"), dict) else {}
-            stored_hash = rt.get("last_applied_hash")
-            if stored_hash and _routing_domains_hash(current_domains) != stored_hash:
-                return {"ok": False, "changed": False, "err": "hash_drift_config_changed_externally"}
+        rt = state.get("routing") if isinstance(state.get("routing"), dict) else {}
+        stored_hash = rt.get("last_applied_hash")
+        if stored_hash and _routing_domains_hash(current_domains) != stored_hash:
+            return {"ok": False, "changed": False, "err": "hash_drift_config_changed_externally"}
 
     new_domains = routing_plan(current_domains, hosts, action=action)
     if new_domains == current_domains:
@@ -993,32 +998,46 @@ def routing_apply(hosts, *, action="add", adopt=False, outbound=DEFAULT_ROUTING_
             pass
         return {"ok": False, "changed": False, "err": "config_write_failed"}
 
-    # 5. restart xray (fail-closed: при провале — восстановить backup)
+    # 5. state-write ДО restart (транзакционность: если state не запишется — откатываем config и НЕ
+    #    трогаем xray вовсе, не оставляя рассинхрон config↔state). state гарантированно readable dict
+    #    (шаг 2 fail-closed на unreadable state ДО этой точки — исключений здесь не бывает).
+    try:
+        if not isinstance(state.get("routing"), dict):
+            state["routing"] = {}
+        state["routing"]["active"] = new_domains
+        state["routing"]["outbound"] = outbound
+        state["routing"]["last_applied_hash"] = _routing_domains_hash(new_domains)
+        state_write_ok = save_state(state, state_path) is not None
+    except Exception:
+        state_write_ok = False
+    if not state_write_ok:
+        try:
+            config_p.write_text(backup_text, encoding="utf-8")
+        except OSError:
+            pass
+        return {"ok": False, "changed": False, "err": "state_write_failed"}
+
+    # 6. restart xray (fail-closed: при провале — восстановить и config, и state, чтобы оба
+    #    остались согласованы со старым/рабочим состоянием — иначе state сказал бы «применено»,
+    #    хотя xray так и не поднялся с новым конфигом).
     if runner is not None and install_lib is not None:
         try:
             res = install_lib._restart_component("xray", runner, port_checker=port_checker)
         except Exception:
             res = {"rc": 1, "err": "restart_exception"}
         if res.get("rc") != 0 or res.get("timeout"):
-            # rollback
             try:
                 config_p.write_text(backup_text, encoding="utf-8")
             except OSError:
                 pass
+            try:
+                if isinstance(state, dict):
+                    state["routing"]["active"] = current_domains
+                    state["routing"]["outbound"] = outbound
+                    state["routing"]["last_applied_hash"] = _routing_domains_hash(current_domains)
+                    save_state(state, state_path)
+            except Exception:
+                pass
             return {"ok": False, "changed": False, "err": f"restart_failed:{res.get('err', 'unknown')}"}
-
-    # 6. promote: state active + hash (two-phase — только после успеха restart)
-    try:
-        if not isinstance(state, dict):
-            state, _ = _load_state_checked(state_path)
-        if isinstance(state, dict):
-            if not isinstance(state.get("routing"), dict):
-                state["routing"] = {}
-            state["routing"]["active"] = new_domains
-            state["routing"]["outbound"] = outbound
-            state["routing"]["last_applied_hash"] = _routing_domains_hash(new_domains)
-            save_state(state, state_path)
-    except Exception:
-        pass  # config уже применён; state sync — best-effort
 
     return {"ok": True, "changed": True, "err": ""}

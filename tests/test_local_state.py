@@ -835,3 +835,65 @@ def test_routing_apply_restore_backup_on_restart_fail(tmp_path):
     # state active НЕ обновлён (promote не произошёл)
     st = json.loads(state_p.read_text(encoding="utf-8"))
     assert "domain:telegram.org" not in st.get("routing", {}).get("active", [])
+
+
+def test_routing_apply_unreadable_state_refuses_without_touching_config(tmp_path):
+    """Битый srouter.local.json (существующий, но невалидный JSON) → refuse ДО любых мутаций конфига
+    (fail-closed): config НЕ меняется, xray НЕ трогается, state НЕ затирается дефолтом (data-loss
+    недопустим — потерял бы nodes/active_node/traffic_guard/isolate пользователя)."""
+    xray_p = tmp_path / "xray-config.json"
+    state_p = tmp_path / "srouter.local.json"
+    _write_xray_routing_config(xray_p, BASELINE_DOMAINS, managed=False)  # foreign, adopt-путь
+    original_config_text = xray_p.read_text(encoding="utf-8")
+    original_state_text = "{ this is broken json, not valid"
+    state_p.write_text(original_state_text, encoding="utf-8")
+    calls = []
+    r = local_state.routing_apply(
+        ["telegram.org"], action="add", adopt=True,
+        config_path=str(xray_p), state_path=state_p, runner=_ok_runner(calls),
+        port_checker=_port_checker_settle_then_up(),
+    )
+    assert r["ok"] is False
+    assert r.get("err") == "state_unreadable"
+    # ни config, ни state не тронуты — atomic no-op при unreadable state
+    assert xray_p.read_text(encoding="utf-8") == original_config_text
+    assert state_p.read_text(encoding="utf-8") == original_state_text
+    assert calls == []  # restart не звался
+
+
+def test_routing_apply_save_state_failure_rolls_back_config_not_partial(tmp_path, monkeypatch):
+    """Если save_state() проваливается (диск полон/permission) — весь apply откатывается
+    транзакционно (config тоже восстановлен из backup), а не оставляет config применённым при
+    несинхронизированном state (иначе — рассинхрон config↔state и ложный hash_drift при повторе)."""
+    xray_p = tmp_path / "xray-config.json"
+    state_p = tmp_path / "srouter.local.json"
+    _write_xray_routing_config(xray_p, BASELINE_DOMAINS, managed=True)
+    _write(state_p, {"nodes": [], "routing": {"active": BASELINE_DOMAINS, "outbound": "reality-out",
+                                              "last_applied_hash": local_state._routing_domains_hash(BASELINE_DOMAINS)}})
+    original_config_text = xray_p.read_text(encoding="utf-8")
+
+    monkeypatch.setattr(local_state, "save_state", lambda state, path=None: None)
+    calls = []
+    r1 = local_state.routing_apply(
+        ["telegram.org"], action="add", adopt=False,
+        config_path=str(xray_p), state_path=state_p, runner=_ok_runner(calls),
+        port_checker=_port_checker_settle_then_up(),
+    )
+    assert r1["ok"] is False
+    assert r1.get("err") == "state_write_failed"
+    # config откачен к оригиналу (не оставлен применённым при непросинканном state)
+    assert xray_p.read_text(encoding="utf-8") == original_config_text
+    # restart НЕ звался вовсе (state-write идёт до restart)
+    assert calls == []
+    monkeypatch.undo()
+
+    # повторный (легитимный) запрос после восстановления save_state — должен пройти нормально,
+    # НЕ словив ложный hash_drift (config так и не менялся, state тоже не менялся — оба согласованы)
+    calls2 = []
+    r2 = local_state.routing_apply(
+        ["telegram.org"], action="add", adopt=False,
+        config_path=str(xray_p), state_path=state_p, runner=_ok_runner(calls2),
+        port_checker=_port_checker_settle_then_up(),
+    )
+    assert r2["ok"] is True, r2
+    assert r2["changed"] is True
