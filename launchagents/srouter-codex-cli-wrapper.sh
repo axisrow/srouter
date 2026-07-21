@@ -30,16 +30,23 @@
 PROXY="__SROUTER_CODEX_PROXY_URL__"
 LOOPBACK="__SROUTER_CODEX_NO_PROXY__"
 
-# realpath себя ($0): нужен, чтобы при обходе PATH пропустить самого себя (антирекурсия). readlink -f
-# доступен в macOS /bin/sh (BSD readlink поддерживает -f с Monterey+); fallback — сам $0 без -f.
+# Свой fingerprint для антирекурсии: realpath (ловит symlink на wrapper) + inode:device (ловит
+# hardlink на wrapper — тот же inode, но другой realpath; сравнение только по realpath его пропускает).
+# readlink -f доступен в macOS /bin/sh (BSD readlink поддерживает -f с Monterey+); fallback — $0.
+# stat -f '%i %d' (inode device) — BSD stat на macOS; fallback — пустой fingerprint (только realpath).
 SELF="$0"
 SELF_REAL="$SELF"
 if command -v readlink >/dev/null 2>&1; then
   _rl="$(readlink -f "$SELF" 2>/dev/null)" && [ -n "$_rl" ] && SELF_REAL="$_rl"
 fi
+SELF_INO=""
+if command -v stat >/dev/null 2>&1; then
+  _si="$(stat -f '%i %d' "$SELF_REAL" 2>/dev/null)" && [ -n "$_si" ] && SELF_INO="$_si"
+fi
 
 # Рантайм-резолв codex по PATH вызывающего, минуя сам wrapper. Обходим каждую директорию PATH, ищем
-# первый codex, чей realpath ≠ realpath wrapper'а. Так wrapper никогда не exec'нет сам себя (#144).
+# первый codex, который НЕ является самим wrapper'ом (ни по realpath, ни по inode:device).
+# Инвариант: wrapper никогда не exec'нет сам себя — ни напрямую, ни через symlink, ни через hardlink (#144).
 _codex_bin=""
 _save_IFS="$IFS"
 IFS=":"
@@ -53,8 +60,13 @@ for _dir in $PATH; do
   if command -v readlink >/dev/null 2>&1; then
     _cr="$(readlink -f "$_cand" 2>/dev/null)" && [ -n "$_cr" ] && _cand_real="$_cr"
   fi
-  # Антирекурсия: пропускаем самих себя (wrapper может быть в PATH и/или симлинком).
+  # Антирекурсия — symlink-случай: canonical path кандидата совпадает с wrapper'ом.
   [ "$_cand_real" = "$SELF_REAL" ] && continue
+  # Антирекурсия — hardlink-случай: тот же inode+device (разный путь, тот же файл). Сравниваем только
+  # при наличии обоих fingerprints (иначе неопределённое совпадение пустых строк дало бы false-positive skip).
+  if [ -n "$SELF_INO" ] && command -v stat >/dev/null 2>&1; then
+    _ci="$(stat -f '%i %d' "$_cand_real" 2>/dev/null)" && [ -n "$_ci" ] && [ "$_ci" = "$SELF_INO" ] && continue
+  fi
   _codex_bin="$_cand"
   break
 done

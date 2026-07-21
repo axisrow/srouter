@@ -1071,6 +1071,38 @@ def test_wrapper_skips_itself_no_recursion(monkeypatch, tmp_path):
         "wrapper пропустил себя (антирекурсия) и взял следующий codex из PATH"
 
 
+def test_wrapper_skips_itself_hardlink_no_recursion(monkeypatch, tmp_path):
+    """#144(A) антирекурсия — hardlink-случай (корневой инвариант «wrapper не exec'нет сам себя»).
+
+    Hardlink-копия wrapper'а в другой PATH-директории: тот же inode, но ДРУГОЙ realpath.
+    Сравнение только по realpath (пути) НЕ распознаёт hardlink как себя → бесконечная рекурсия.
+    Антирекурсия обязана ловить и hardlink (inode+device совпадают), не только symlink (realpath).
+
+    Без фикса: wrapper берёт hardlink как «реальный codex» → exec'ает копию себя → снова → timeout.
+    """
+    import subprocess
+    called = tmp_path / "called.txt"
+    real_codex = tmp_path / "realdir" / "codex"
+    real_codex.parent.mkdir(parents=True)
+    real_codex.write_text(f"#!/bin/sh\nprintf 'real' > {called}\n", encoding="utf-8")
+    real_codex.chmod(0o755)
+    wrapper = _install_with_path_resolving_wrapper(monkeypatch, tmp_path)
+    # hardbin/codex — HARDLINK на wrapper (тот же inode, другой путь). os.link создаёт hardlink.
+    hardbin = tmp_path / "hardbin"
+    hardbin.mkdir()
+    os.link(str(wrapper), str(hardbin / "codex"))
+    assert os.stat(wrapper).st_ino == os.stat(hardbin / "codex").st_ino, "precondition: hardlink = тот же inode"
+    # hardbin ПЕРВЫМ (минуя wrapper в ~/bin), затем realdir. Без hardlink-aware skip → рекурсия/timeout.
+    try:
+        subprocess.run([str(wrapper), "x"],
+                        env={**os.environ, "PATH": f"{Path.home() / 'bin'}:{hardbin}:{tmp_path / 'realdir'}:/usr/bin:/bin"},
+                        check=True, timeout=10)
+    except subprocess.TimeoutExpired:
+        pytest.fail("hardlink-копия wrapper'а в PATH вызвала рекурсию (антирекурсия не ловит hardlink)")
+    assert called.exists() and called.read_text(encoding="utf-8") == "real", \
+        "wrapper пропустил hardlink-копию себя (inode-aware антирекурсия) и взял реальный codex"
+
+
 def test_wrapper_picks_second_codex_when_two_binaries(monkeypatch, tmp_path):
     """#144 корень дыры: на диске ДВА разных codex-binary. Caller с PATH, ведущим ко второму, должен
     попасть в него через wrapper (а не в вшитый-единственный, как раньше).
