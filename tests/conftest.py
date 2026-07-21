@@ -29,9 +29,14 @@ def _block_osascript_admin(monkeypatch):
             is_osascript = isinstance(cmd, list) and cmd and "osascript" in str(cmd[0])
         except Exception:
             is_osascript = False
+        is_sudo = isinstance(cmd, list) and cmd and str(cmd[0]) == "/usr/bin/sudo"
         if is_osascript:
             # osascript с admin — возвращаем success no-op (тест не должен звать GUI).
             return mock.Mock(returncode=0, stdout="", stderr="")
+        if is_sudo:
+            # Новый protected-Privoxy path спрашивает пароль через sudo. Ни один unit/CI-тест не
+            # имеет права трогать живой system-domain; конкретные тесты подменяют runner явно.
+            return mock.Mock(returncode=77, stdout="", stderr="sudo blocked by pytest guard")
         return _real_run(cmd, *args, **kwargs)
 
     monkeypatch.setattr(subprocess, "run", _guarded_run)

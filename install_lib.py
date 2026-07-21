@@ -21,6 +21,7 @@ from pathlib import Path
 
 import gen_xray_config
 import local_state
+import privoxy_system
 from sys_probe import BREW_COMPONENTS
 from sys_probe import parse_brew_services as _parse_brew_services
 from sys_probe import port_open, run
@@ -606,6 +607,22 @@ def _homebrew_available(runner):
     return result.get("rc") == 0
 
 
+def _privoxy_protected_for_env(env):
+    """State — главный контракт; physical fallback только для канонического production state.
+
+    Иначе unit/acceptance с временным --state начали бы зависеть от живого /Library на host после
+    активации защиты (#122) и скрывали бы legacy install-ветки.
+    """
+    if privoxy_system.state_protected(env.state_path):
+        return True
+    try:
+        canonical = (ROOT / "srouter.local.json").resolve()
+        requested = Path(env.state_path).resolve()
+    except OSError:
+        return False
+    return requested == canonical and privoxy_system.protection_present()
+
+
 def build_plan(env=None, runner=run, port_checker=port_open):
     """Discovery-only: ничего не пишет."""
     env = env or InstallEnv.from_env()
@@ -619,7 +636,21 @@ def build_plan(env=None, runner=run, port_checker=port_open):
     components = {}
     for name in COMPONENTS:
         item = _inspect_component(name, env, runner, port_checker, prior_detected=detected_env)
-        item["service"] = service_states.get(name, "none" if brew_services.get("rc") == 0 else "unknown")
+        if name == "privoxy" and _privoxy_protected_for_env(env):
+            # Protected mode — отдельная system-domain ownership boundary. Legacy install обязан
+            # сохранить её и НЕ создавать конкурирующий user LaunchAgent через brew services.
+            item.update({
+                "protected": True,
+                "config_path": str(privoxy_system.DEFAULT_LAYOUT.config_path),
+                "config_present": privoxy_system.DEFAULT_LAYOUT.config_path.exists(),
+                "config_managed": True,
+                "reclaimable": False,
+                "conflicts": [],
+                "conflict": False,
+                "service": "protected-system",
+            })
+        else:
+            item["service"] = service_states.get(name, "none" if brew_services.get("rc") == 0 else "unknown")
         components[name] = item
 
     probes = state.get("probes") if isinstance(state.get("probes"), dict) else {}
@@ -663,6 +694,8 @@ def format_plan(plan):
     ]
     for name, item in plan.get("components", {}).items():
         conflict = "CONFLICT" if item.get("conflict") else "ok"
+        if item.get("protected"):
+            conflict = "PROTECTED"
         lines.append(
             f"- {name}: {conflict}; config={item.get('config_path')}; "
             f"managed={item.get('config_managed')}; service={item.get('service')}; "
@@ -826,6 +859,12 @@ def _write_state_after_apply(env, plan, modes, backups, launchagent_action=None)
     for name, item in plan["components"].items():
         mode = modes.get(name, "skipped")
         prev = detected.get(name) if isinstance(detected.get(name), dict) else {}
+        if mode == "protected":
+            # Не переписываем protection/previous/backup, которые создала двухфазная root-транзакция.
+            # Reinstall лишь подтверждает, что защищённый компонент намеренно оставлен как есть.
+            detected[name] = dict(prev)
+            detected[name]["service"] = "protected-system"
+            continue
         # provenance (issue #112 Часть 1): только для managed. backups[name] truthy ⟺ config существовал
         # до install (apply_install needs_backup требует config_path.exists() → _backup вызван).
         # created = нет backup (fresh install с нуля), overwrote = есть backup (перезаписан чужой).
@@ -904,7 +943,9 @@ def apply_install(env=None, *, confirm=False, choices=None, runner=run, port_che
 
     modes = {}
     for name, item in plan["components"].items():
-        if choices.get(name) == "adopt":
+        if item.get("protected"):
+            modes[name] = "protected"
+        elif choices.get(name) == "adopt":
             modes[name] = "adopted"
         elif choices.get(name) == "skip":
             modes[name] = "skipped"
@@ -925,7 +966,7 @@ def apply_install(env=None, *, confirm=False, choices=None, runner=run, port_che
     for name in COMPONENTS:
         mode = modes.get(name)
         item = plan["components"][name]
-        if mode in ("adopted", "skipped"):
+        if mode in ("adopted", "skipped", "protected"):
             actions.append({"component": name, "mode": mode, "changed": False})
             continue
 

@@ -47,6 +47,7 @@ py-modules = [
     "git_proxy",
     "claude_proxy",
     "health",
+    "privoxy_system",
 ]
 
 [tool.setuptools.package-data]
