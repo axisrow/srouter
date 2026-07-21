@@ -497,6 +497,79 @@ def _endpoint_override_check():
     return {"status": "info", "detail": f"endpoint override: {base} (нестандартный endpoint)"}
 
 
+# ============================ #134: Desktop App proxy (launchctl getenv) ============================
+
+# launchctl держит ТРИ прокси-ключа; Desktop App наследует все. Инцидент #127: SOCKS5 сидел в
+# HTTP_PROXY (не HTTPS_PROXY) → doctor (читая только HTTPS_PROXY) сказал ✅. Обходим все три,
+# НЕ угадывая selector приложения (он у Claude/Node/Electron разный) — показываем «как есть».
+# NOTE: не то же что CODEX_LAUNCHCTL_ENV в srouter.py — там (key, SOCKS5-value)-пары для Codex
+# install; здесь — диагностика Claude Desktop, другая семантика.
+LAUNCHCTL_PROXY_KEYS = ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY")
+
+def _read_proxy_sources():
+    """Читает Desktop App прокси (launchctl, все ключи) + CLI прокси (settings.json) — #134.
+
+    Desktop App читает launchctl getenv (gui-домен), в отличие от CLI (settings.json). launchctl
+    держит ТРИ ключа (LAUNCHCTL_PROXY_KEYS); инцидент #127 — SOCKS5 в HTTP_PROXY. Не угадываем
+    приоритет приложения — собираем все найденные «как есть», классификацию делает _desktop_proxy_check.
+    cli_proxy (settings.json HTTPS_PROXY) нужен для детекта расхождения CLI vs Desktop (issue #134 п.2) —
+    один клиент может работать, другой быть сломан, а без сравнения doctor молчит (#127-класс инцидент).
+    Возвращает {desktop_keys: {KEY: value}, cli_proxy: str}. Не бросает (fail-soft: timeout → пустой out,
+    отфильтруется if val; import claude_proxy — local, сохраняет fail-soft границу health).
+    """
+    desktop_keys = {}
+    for key in LAUNCHCTL_PROXY_KEYS:
+        lc = sys_probe.run(["/bin/launchctl", "getenv", key], timeout=3)
+        val = (lc.get("out") or "").strip()  # timeout → out="" → пропустится if val ниже
+        if val:
+            desktop_keys[key] = val
+    try:
+        import claude_proxy
+        data = claude_proxy._load()
+        env = data.get("env", {}) if isinstance(data, dict) else {}
+        cli_proxy = env.get("HTTPS_PROXY", "") or os.environ.get("HTTPS_PROXY", "")
+    except Exception:
+        cli_proxy = ""
+    return {"desktop_keys": desktop_keys, "cli_proxy": cli_proxy}
+
+
+def _desktop_proxy_check():
+    """Прокси Desktop App (launchctl getenv) — SOCKS5 в любом ключе → down (#127/#134).
+
+    Не угадываем selector приложения (у Claude/Node/Electron разные). Для Claude SOCKS5 ломается
+    везде (#127 fiasco), HTTP работает. SOCKS5 в любом launchctl-ключе — либо уже ломает, либо
+    мина (вспыхнет при смене конфига) → down. Scheme-классификация через urlparse (эталон #127,
+    не подстрока — иначе http://socks.example.com даст ложный down). detail перечисляет все
+    найденные ключи «как есть».
+    Расхождение settings.json (CLI) vs launchctl HTTPS_PROXY (Desktop) → warn (issue #134 п.2):
+    один клиент может работать, другой сломан, а без этого сравнения doctor молчит (#127-класс).
+    down (уже сломанный SOCKS5) важнее warn (потенциальное расхождение) — проверяется первым.
+    """
+    src = _read_proxy_sources()
+    keys = src["desktop_keys"]
+    cli_proxy = src.get("cli_proxy", "")
+    if not keys:
+        return {"status": "unknown",
+                "detail": "launchctl proxy не задан — Desktop App идёт напрямую (ok для NO_PROXY-доменов, не защищён PF для остальных)"}
+    # SOCKS-scheme в ЛЮБОМ ключе → down (Claude Code/Desktop App через SOCKS не умеют, #127).
+    # urlparse по scheme, не подстрока — канон loose-validator (health.py:313).
+    socks_keys = {k: v for k, v in keys.items()
+                  if urlparse(v).scheme.lower() in {"socks", "socks5", "socks5h"}}
+    if socks_keys:
+        bad = ", ".join(f"{k}={v}" for k, v in socks_keys.items())
+        return {"status": "down",
+                "detail": f"SOCKS5 в launchctl ({bad}) — Desktop App UnsupportedProxyProtocol (#127)"}
+    # Расхождение CLI (settings.json) vs Desktop (launchctl HTTPS_PROXY) — оба заданы и различны.
+    desktop_https = keys.get("HTTPS_PROXY", "")
+    if cli_proxy and desktop_https and cli_proxy != desktop_https:
+        return {"status": "warn",
+                "detail": f"CLI={cli_proxy}, Desktop={desktop_https} — расхождение прокси "
+                          f"(один клиент может работать, другой — нет)"}
+    # Только HTTP-прокси, без расхождения → ok, перечисляем все найденные ключи.
+    found = ", ".join(f"{k}={v}" for k, v in keys.items())
+    return {"status": "ok", "detail": f"Desktop App proxy (launchctl): {found}"}
+
+
 def check_all(*, active_claude=False):
     """Все проверки стека. {status: ok|degraded|down, checks: [{name, ok, detail?, info?}]}.
 
@@ -531,6 +604,13 @@ def check_all(*, active_claude=False):
     if eo["status"] == "info":
         eo_check["info"] = True
     checks.append(eo_check)
+    # Desktop App proxy (#134): SOCKS5 в launchctl = broken Desktop App; warn = CLI/Desktop
+    # расхождение (driver degraded — реальный сигнал несоответствия, не info-only).
+    dp = _desktop_proxy_check()
+    dp_check = {"name": "desktop proxy (launchctl)", "ok": dp["status"] == "ok", "detail": dp["detail"]}
+    if dp["status"] == "unknown":
+        dp_check["info"] = True
+    checks.append(dp_check)
     # Codex-маршрут (#120): warn (privoxy 8118) — driver degraded (WS порвётся); down — driver;
     # mixed — driver (часть сессий ломаные); unknown (codex не запущен / lsof-timeout / idle) — info-only,
     # не роняет вердикт (как claude-proxy). ok — driver (всё ок).

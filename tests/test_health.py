@@ -254,6 +254,8 @@ def test_check_all_down_when_everything_dead(monkeypatch):
     monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed"))
     monkeypatch.setattr(health, "_claude_proxy_probe",
                         lambda: {"status": "down", "source": "runtime", "detail": "runtime"})
+    monkeypatch.setattr(health, "_desktop_proxy_check",
+                        lambda: {"status": "down", "detail": "down"})
     # codex-proxy тоже мокаем (иначе реальный ps/lsof найдёт живой codex → ok → не down).
     monkeypatch.setattr(health, "_codex_proxy_probe",
                         lambda: {"status": "down", "source": "runtime", "detail": "runtime"})
@@ -547,6 +549,192 @@ def test_notify_logs_to_file(monkeypatch, tmp_path):
     assert "Basso" in content
 
 
+# ============================ #134: Desktop App proxy (launchctl getenv) ============================
+# CLI читает settings.json, Desktop App читает launchctl getenv (gui-домен launchd). launchctl держит
+# ТРИ ключа (HTTP_PROXY/HTTPS_PROXY/ALL_PROXY); инцидент #127 — SOCKS5 сидел в HTTP_PROXY. Doctor
+# показывает все найденные ключи «как есть»; SOCKS5 в ЛЮБОМ → down (Claude через SOCKS не умеет, #127).
+
+# --- _desktop_proxy_check: классификация по desktop_keys (мокаем _read_proxy_sources целиком) ---
+
+def test_desktop_proxy_ok_when_only_http(monkeypatch):
+    """launchctl: HTTPS_PROXY=http://8118 (только HTTP) → ok, detail перечисляет ключ."""
+    monkeypatch.setattr(health, "_read_proxy_sources",
+                        lambda: {"desktop_keys": {"HTTPS_PROXY": "http://127.0.0.1:8118"}})
+    res = health._desktop_proxy_check()
+    assert res["status"] == "ok"
+    assert "HTTPS_PROXY" in res["detail"]
+
+
+def test_desktop_proxy_down_when_socks5_in_https_proxy(monkeypatch):
+    """SOCKS5 в HTTPS_PROXY → down (Desktop App не поддерживает SOCKS5)."""
+    monkeypatch.setattr(health, "_read_proxy_sources",
+                        lambda: {"desktop_keys": {"HTTPS_PROXY": "socks5h://127.0.0.1:10808"}})
+    res = health._desktop_proxy_check()
+    assert res["status"] == "down"
+    assert "socks" in res["detail"].lower() or "SOCKS5" in res["detail"]
+
+
+def test_desktop_proxy_down_when_socks5_in_http_proxy(monkeypatch):
+    """SOCKS5 в HTTP_PROXY (не HTTPS_PROXY) → down. РЕГРЕССИЯ на инцидент #127: SOCKS5 сидел в
+    HTTP_PROXY, doctor (читая только HTTPS_PROXY) говорил ✅."""
+    monkeypatch.setattr(health, "_read_proxy_sources",
+                        lambda: {"desktop_keys": {"HTTP_PROXY": "socks5h://127.0.0.1:10808"}})
+    res = health._desktop_proxy_check()
+    assert res["status"] == "down"
+    assert "HTTP_PROXY" in res["detail"]
+
+
+def test_desktop_proxy_down_when_socks5_in_all_proxy(monkeypatch):
+    """SOCKS5 в ALL_PROXY → down (SOCKS5 в любом ключе — мина)."""
+    monkeypatch.setattr(health, "_read_proxy_sources",
+                        lambda: {"desktop_keys": {"ALL_PROXY": "socks5h://127.0.0.1:10808"}})
+    res = health._desktop_proxy_check()
+    assert res["status"] == "down"
+
+
+def test_desktop_proxy_ok_when_http_in_all_keys(monkeypatch):
+    """Все три ключа HTTP → ok, detail перечисляет все найденные ключи «как есть»."""
+    monkeypatch.setattr(health, "_read_proxy_sources",
+                        lambda: {"desktop_keys": {"HTTPS_PROXY": "http://127.0.0.1:8118",
+                                                  "HTTP_PROXY": "http://127.0.0.1:8118",
+                                                  "ALL_PROXY": "http://127.0.0.1:8118"}})
+    res = health._desktop_proxy_check()
+    assert res["status"] == "ok"
+    assert "HTTPS_PROXY" in res["detail"]
+    assert "HTTP_PROXY" in res["detail"]
+    assert "ALL_PROXY" in res["detail"]
+
+
+def test_desktop_proxy_unknown_when_no_launchctl(monkeypatch):
+    """launchctl пуст (ничего не задано) → unknown, не driver (как claude-proxy)."""
+    monkeypatch.setattr(health, "_read_proxy_sources", lambda: {"desktop_keys": {}})
+    res = health._desktop_proxy_check()
+    assert res["status"] == "unknown"
+
+
+def test_desktop_proxy_down_shadows_socks5_even_with_http(monkeypatch):
+    """HTTPS_PROXY=HTTP + HTTP_PROXY=SOCKS5 → down (не угадываем selector; SOCKS5 — мина).
+
+    У приложений разный selector приоритетов (Claude/Node/Electron), мы его НЕ моделируем —
+    SOCKS5 в любом ключе = конфиг грязный/опасный → down. Фиксирует границу обобщения #134."""
+    monkeypatch.setattr(health, "_read_proxy_sources",
+                        lambda: {"desktop_keys": {"HTTPS_PROXY": "http://127.0.0.1:8118",
+                                                  "HTTP_PROXY": "socks5h://127.0.0.1:10808"}})
+    res = health._desktop_proxy_check()
+    assert res["status"] == "down"
+
+
+def test_desktop_proxy_http_host_named_socks_not_false_down(monkeypatch):
+    """HTTP-прокси с 'socks' в имени хоста → ok (scheme=http, не подстрока).
+
+    Регрессия на scheme-классификацию: 'http://socks.local:8118' — легитимный HTTP-прокси,
+    подстрока 'socks' в нём НЕ должна давать down (канон loose-validator, health.py:313)."""
+    monkeypatch.setattr(health, "_read_proxy_sources",
+                        lambda: {"desktop_keys": {"HTTPS_PROXY": "http://socks.local:8118"}})
+    res = health._desktop_proxy_check()
+    assert res["status"] == "ok"
+
+
+def test_desktop_proxy_warns_on_settings_vs_launchctl_mismatch(monkeypatch):
+    """settings.json HTTPS_PROXY (CLI) != launchctl HTTPS_PROXY (Desktop) → WARN расхождение.
+
+    Issue #134 п.2: CLI и Desktop App читают прокси из РАЗНЫХ источников. Расхождение — реальный
+    инцидент-класс (#127): один клиент работает, другой сломан, а doctor молчит. cycle-review gap:
+    коммит ff0bd74 (обход всех 3 launchctl-ключей) заменил _read_proxy_sources без переноса
+    cli_proxy/mismatch-логики из ad4ccc4 — регрессия, PR body всё ещё заявляет "Расхождение → WARN",
+    но код и тесты её не содержали."""
+    monkeypatch.setattr(health, "_read_proxy_sources",
+                        lambda: {"desktop_keys": {"HTTPS_PROXY": "http://127.0.0.1:8118"},
+                                "cli_proxy": "socks5h://127.0.0.1:10808"})
+    res = health._desktop_proxy_check()
+    assert res["status"] == "warn"
+    assert "socks5h://127.0.0.1:10808" in res["detail"]
+    assert "http://127.0.0.1:8118" in res["detail"]
+
+
+def test_desktop_proxy_silent_when_settings_matches_launchctl(monkeypatch):
+    """settings.json HTTPS_PROXY == launchctl HTTPS_PROXY → ok, без WARN о расхождении."""
+    monkeypatch.setattr(health, "_read_proxy_sources",
+                        lambda: {"desktop_keys": {"HTTPS_PROXY": "http://127.0.0.1:8118"},
+                                "cli_proxy": "http://127.0.0.1:8118"})
+    res = health._desktop_proxy_check()
+    assert res["status"] == "ok"
+
+
+def test_desktop_proxy_no_mismatch_check_when_cli_proxy_unset(monkeypatch):
+    """cli_proxy пуст (CLI proxy не настроен) → нет ложного mismatch, обычная launchctl-классификация."""
+    monkeypatch.setattr(health, "_read_proxy_sources",
+                        lambda: {"desktop_keys": {"HTTPS_PROXY": "http://127.0.0.1:8118"},
+                                "cli_proxy": ""})
+    res = health._desktop_proxy_check()
+    assert res["status"] == "ok"
+
+
+def test_desktop_proxy_socks5_down_takes_priority_over_mismatch(monkeypatch):
+    """SOCKS5 в launchctl (down) важнее расхождения с CLI — down не маскируется в warn."""
+    monkeypatch.setattr(health, "_read_proxy_sources",
+                        lambda: {"desktop_keys": {"HTTPS_PROXY": "socks5h://127.0.0.1:10808"},
+                                "cli_proxy": "http://127.0.0.1:8118"})
+    res = health._desktop_proxy_check()
+    assert res["status"] == "down"
+
+
+def test_read_proxy_sources_includes_cli_proxy_from_settings_json(monkeypatch):
+    """_read_proxy_sources читает HTTPS_PROXY из settings.json как cli_proxy (issue #134 п.2)."""
+    class FakeClaudeProxy:
+        @staticmethod
+        def _load():
+            return {"env": {"HTTPS_PROXY": "http://127.0.0.1:8118"}}
+    monkeypatch.setitem(__import__("sys").modules, "claude_proxy", FakeClaudeProxy())
+    monkeypatch.setattr(health.sys_probe, "run", _lc_run_per_key({}))
+    src = health._read_proxy_sources()
+    assert src["cli_proxy"] == "http://127.0.0.1:8118"
+
+
+# --- _read_proxy_sources: контракт обхода launchctl-ключей (мокаем sys_probe.run) ---
+
+def _lc_run_per_key(vals, timeout_keys=()):
+    """Мок sys_probe.run для launchctl getenv: возвращает out по ключу; timeout_keys → timeout=True."""
+    def fake_run(cmd, timeout):
+        key = cmd[-1]
+        if key in timeout_keys:
+            return {"rc": None, "out": "", "err": "", "timeout": True}
+        return {"rc": 0, "out": vals.get(key, ""), "err": "", "timeout": False}
+    return fake_run
+
+
+def test_read_proxy_sources_reads_all_three_launchctl_keys(monkeypatch):
+    """HTTPS_PROXY пуст, HTTP_PROXY=socks5h → desktop_keys содержит SOCKS5 (не теряется).
+
+    ДЫРА на upstream: _read_proxy_sources читал только HTTPS_PROXY → терял SOCKS5 в HTTP_PROXY.
+    """
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _lc_run_per_key({"HTTPS_PROXY": "", "HTTP_PROXY": "socks5h://127.0.0.1:10808", "ALL_PROXY": ""}))
+    src = health._read_proxy_sources()
+    assert "HTTP_PROXY" in src["desktop_keys"]
+    assert "socks" in src["desktop_keys"]["HTTP_PROXY"].lower(), f"SOCKS5 в HTTP_PROXY потерян: {src}"
+
+
+def test_read_proxy_sources_collects_all_set_keys(monkeypatch):
+    """Все три ключа заданы → все три в desktop_keys (показываем «как есть»)."""
+    vals = {"HTTPS_PROXY": "http://127.0.0.1:8118",
+            "HTTP_PROXY": "http://127.0.0.1:8118",
+            "ALL_PROXY": "http://127.0.0.1:8118"}
+    monkeypatch.setattr(health.sys_probe, "run", _lc_run_per_key(vals))
+    src = health._read_proxy_sources()
+    assert set(src["desktop_keys"]) == {"HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"}
+
+
+def test_read_proxy_sources_ignores_launchctl_timeout(monkeypatch):
+    """sys_probe.run timeout для всех трёх → desktop_keys пуст (fail-soft).
+
+    Timeout не должен давать ложный SOCKS5 или падение.
+    """
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _lc_run_per_key({}, timeout_keys=("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY")))
+    src = health._read_proxy_sources()
+    assert src["desktop_keys"] == {}
+
 
 # ============================ #132: launchd lifecycle forensics ============================
 
@@ -656,4 +844,3 @@ def test_watchdog_records_launchd_lifecycle(monkeypatch, tmp_path):
     health.cmd_watchdog()
 
     assert recorded == [True]
-
