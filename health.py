@@ -115,23 +115,20 @@ def _claude_proxy_probe():
 
     Решает дыру Codex review + инцидента «без ИИ»: claude_proxy.status() читает только ФАЙЛ
     settings.json, а не реальный CC. enable()/disable() пишут файл, но не перезапускают CC → окно
-    рассинхрона файл↔процесс. Здесь — runtime-proof из ядерной таблицы сокетов: CC держит
-    established TCP к privoxy (127.0.0.1:PRIVOXY_PORT). Надёжно для всех типов CC-сессий (daemon,
-    GUI pty-host, orchestrator-обёртки) — ps eww/launchctl procinfo слепы для обёрток (измерено).
+    рассинхрона файл↔процесс. Здесь — runtime-proof из ядерной таблицы сокетов.
+
+    :переход на SOCKS5: ищем коннект к 10808 (SOCKS5/xray) — CC через прокси. Если коннекта к
+    10808 нет — проверяем external (direct-leak: CC идёт НАПРЯМУЮ к api.anthropic.com мимо прокси).
+    Это нарушение fail-closed-proxy-down: doctor обязан детектить и сообщить.
 
     Возвращает {status, source, detail} — ОДИН вызов, один срез (нет TOCTOU ok/detail):
-      status="ok"      — CC запущен и держит коннект к privoxy (реально юзает прокси);
-      status="down"    — CC запущен, но БЕЗ коннекта (идёт напрямую → PF режет → «без ИИ»);
+      status="ok"      — CC запущен и держит коннект к SOCKS5 10808 (реально юзает прокси);
+      status="down"    — CC запущен, но БЕЗ коннекта к прокси → проверка direct-leak:
+                          external ESTABLISHED → CC идёт НАПРЯМУЮ (fail-closed violation);
+                          нет сокетов вообще → idle (не можем сказать);
       status="unknown" — CC не запущен (проверять нечего; check_all НЕ агрегирует этот check).
     """
-    # 1. PID'ы процессов Claude Code. `ps comm=` на macOS отдаёт ПОЛНЫЙ ПУТЬ к бинарю (не basename,
-    #    не усечённый — эмпирически проверено на Darwin 25.5.0). Реальные CC-варианты:
-    #      ~/.local/bin/claude                                    (CLI, basename="claude")
-    #      ~/.local/share/claude/ClaudeCode.app/.../claude        (GUI pty-host, basename="claude")
-    #      ~/.local/share/claude/versions/X.Y.Z                   (version-runner — основной движок,
-    #                                                              basename=версия, НЕ "claude")
-    #    Поэтому матчим по basename=="claude" ИЛИ path под ~/.local/share/claude/versions/ — это ловит
-    #    все 3 варианта и отбрасывает desktop Claude.app helpers, codex, claude*-wrappers.
+    # 1. PID'ы процессов Claude Code (тот же matcher, что и раньше).
     r = sys_probe.run([PS, "-axo", "pid=,comm="], timeout=3)
     if r.get("timeout"):
         return {"status": "unknown", "source": "n/a", "detail": "timeout ps"}
@@ -146,20 +143,41 @@ def _claude_proxy_probe():
     if not pids:
         return {"status": "unknown", "source": "n/a", "detail": "Claude Code не запущен"}
 
-    # 2. Один lsof на ВСЕ PID'ы (батч, не N вызовов). БЕЗ -iTCP: с -iTCP macOS тащит общий LISTEN-сокет
-    #    privoxy для всех процессов → ложный позитив. Фильтруем по "->127.0.0.1:PORT" тут.
-    needle = f"->127.0.0.1:{PRIVOXY_PORT}"
+    # 2. Один lsof на ВСЕ PID'ы (батч). per-PID классификация маршрутов (cycle-review #126 C2):
+    #    SOCKS+external в одном срезе = mixed (direct-leak не маскируется SOCKS-коннектом).
+    #    ->127.0.0.1:10808 → socks (CC через SOCKS5).
+    #    external ESTABLISHED (не localhost) → external (direct-leak, fail-closed violation).
+    #    нет сокетов → unknown (idle).
     lr = sys_probe.run([LSOF, "-nP", "-p", ",".join(pids)], timeout=3)
     if lr.get("timeout"):
-        # lsof не успел — состояние неизвестно (как при ps-timeout). НЕ «down»: иначе пользователь
-        # получит ложный degraded + неверный совет «перезапусти CC», хотя коннект может быть жив.
         return {"status": "unknown", "source": "n/a", "detail": "timeout lsof"}
+    socks_pids, external_pids = set(), set()
     for line in (lr.get("out") or "").splitlines():
-        if "TCP" in line and needle in line:
-            return {"status": "ok", "source": "runtime",
-                    "detail": "runtime: Claude Code держит коннект к privoxy"}
-    return {"status": "down", "source": "runtime",
-            "detail": "runtime: Claude Code запущен, но без коннекта к privoxy (перезапусти CC)"}
+        if "TCP" not in line or "ESTABLISHED" not in line:
+            continue
+        fields = line.split()
+        pid = fields[1] if len(fields) > 1 else ""
+        if f"->127.0.0.1:{XRAY_PORT}" in line:
+            socks_pids.add(pid)
+        elif "->127.0.0.1:" not in line:
+            # external ESTABLISHED (не localhost) — CC идёт напрямую, мимо прокси.
+            external_pids.add(pid)
+    if socks_pids and external_pids:
+        return {"status": "down", "source": "runtime",
+                "detail": (f"runtime: Claude Code MIXED — SOCKS5 (PID {','.join(sorted(socks_pids))}) "
+                           f"+ direct-leak (PID {','.join(sorted(external_pids))}). "
+                           f"Один из PID идёт напрямую — нарушение fail-closed. "
+                           f"Проверь HTTPS_PROXY в ~/.claude/settings.json env.")}
+    if socks_pids:
+        return {"status": "ok", "source": "runtime",
+                "detail": f"runtime: Claude Code через SOCKS5 10808 (PID {','.join(sorted(socks_pids))})"}
+    if external_pids:
+        return {"status": "down", "source": "runtime",
+                "detail": (f"runtime: Claude Code идёт НАПРЯМУЮ (мимо прокси) — нарушение fail-closed. "
+                           f"PID {','.join(sorted(external_pids))}. "
+                           f"Проверь HTTPS_PROXY в ~/.claude/settings.json env (должен быть socks5h://127.0.0.1:10808)")}
+    return {"status": "unknown", "source": "runtime",
+            "detail": "runtime: Claude Code запущен, но нет активных сокетов (idle)"}
 
 
 # codex-binary comm-паттерн. Матчит ОСНОВНОЙ codex-binary по BASENAME (независимо от способа установки):
