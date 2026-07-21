@@ -10,7 +10,14 @@ _claude_proxy_probe() возвращает {status, source, detail}:
   status="down"    — CC имеет внешний direct socket;
   status="unknown" — только SOCKS TCP socket, idle, timeout или CC не запущен.
 """
+import pytest as _pytest
+
 import health
+
+
+# Watchdog tests must not inspect the real user's launchd domain or write real lifecycle logs.
+# Dedicated lifecycle tests below call the saved implementation explicitly with isolated paths.
+_REAL_RECORD_WATCHDOG_LIFECYCLE = getattr(health, "_record_watchdog_lifecycle", None)
 
 
 def _all_up_monkey(monkeypatch, *, probe_status="ok", probe_detail="runtime: коннект",
@@ -438,6 +445,13 @@ def test_check_all_has_endpoint_override_check(monkeypatch):
 # ============================ #109: watchdog state-машина + _notify логирование ============================
 # Баг: was_ok бинарный (state == "ok") → degraded→down не пушит. + _notify не логирует.
 
+
+@_pytest.fixture(autouse=True)
+def _block_real_watchdog_lifecycle(monkeypatch):
+    if hasattr(health, "_record_watchdog_lifecycle"):
+        monkeypatch.setattr(health, "_record_watchdog_lifecycle", lambda: None)
+
+
 def test_watchdog_pushes_on_degraded_to_down(monkeypatch, tmp_path):
     """state=degraded → check_all=down → пуш (переход не-ok→down, не только ok→down)."""
     state_file = tmp_path / "watchdog.last"
@@ -491,8 +505,6 @@ def test_watchdog_recovery_push_on_down_to_ok(monkeypatch, tmp_path):
 # ============================ cycle-review #133: table-driven transition matrix ============================
 # Codex C1: degraded→degraded спамило (is_ok collapse). Exact-state transitions решают.
 # Полная матрица: каждый (prev, cur) → ожидаемое количество пушей.
-import pytest as _pytest
-
 _TRANSITIONS = [
     # (prev_state, cur_status, expected_pushes, description)
     ("ok", "down", 1, "ok→down: пуш (новое падение)"),
@@ -533,3 +545,115 @@ def test_notify_logs_to_file(monkeypatch, tmp_path):
     content = log_file.read_text(encoding="utf-8")
     assert "test message" in content
     assert "Basso" in content
+
+
+
+# ============================ #132: launchd lifecycle forensics ============================
+
+
+def test_launchd_job_snapshot_parses_keepalive_state(monkeypatch, tmp_path):
+    """Snapshot distinguishes a loaded KeepAlive job from an absent/booted-out job."""
+    plist = tmp_path / "homebrew.mxcl.privoxy.plist"
+    plist.write_text("<plist/>", encoding="utf-8")
+    launchctl_output = """gui/501/homebrew.mxcl.privoxy = {
+\tstate = running
+\truns = 7
+\tpid = 81045
+\tlast exit code = 0
+\tlast terminating signal = Terminated: 15
+}
+"""
+    monkeypatch.setattr(
+        health.sys_probe,
+        "run",
+        lambda cmd, timeout: {
+            "rc": 0,
+            "out": launchctl_output,
+            "err": "",
+            "timeout": False,
+        },
+    )
+
+    snapshot = health._launchd_job_snapshot("homebrew.mxcl.privoxy", plist_path=plist)
+
+    assert snapshot["loaded"] is True
+    assert snapshot["state"] == "running"
+    assert snapshot["runs"] == 7
+    assert snapshot["pid"] == 81045
+    assert snapshot["last_exit_code"] == "0"
+    assert snapshot["last_terminating_signal"] == "Terminated: 15"
+    assert snapshot["plist"]["exists"] is True
+    assert snapshot["plist"]["inode"] == plist.stat().st_ino
+
+
+def test_launchd_job_snapshot_marks_booted_out_job(monkeypatch, tmp_path):
+    """launchctl print failure is recorded as loaded=false, not guessed to be a crash."""
+    plist = tmp_path / "missing.plist"
+    monkeypatch.setattr(
+        health.sys_probe,
+        "run",
+        lambda cmd, timeout: {
+            "rc": 113,
+            "out": "",
+            "err": "Could not find service",
+            "timeout": False,
+        },
+    )
+
+    snapshot = health._launchd_job_snapshot("homebrew.mxcl.privoxy", plist_path=plist)
+
+    assert snapshot["loaded"] is False
+    assert snapshot["state"] is None
+    assert snapshot["pid"] is None
+    assert snapshot["plist"]["exists"] is False
+    assert "Could not find service" in snapshot["error"]
+
+
+def test_record_watchdog_lifecycle_logs_only_changes(monkeypatch, tmp_path):
+    """First sample seeds state; PID/runs/plist change produces one structured forensic event."""
+    assert _REAL_RECORD_WATCHDOG_LIFECYCLE is not None
+    state_file = tmp_path / "launchd-state.json"
+    log_file = tmp_path / "launchd-events.jsonl"
+    monkeypatch.setattr(health, "WATCHDOG_LIFECYCLE_STATE", state_file)
+    monkeypatch.setattr(health, "WATCHDOG_LIFECYCLE_LOG", log_file)
+
+    samples = iter([
+        {
+            "privoxy": {"loaded": True, "pid": 100, "runs": 1,
+                        "plist": {"exists": True, "mtime_ns": 10, "inode": 20}},
+            "xray": {"loaded": True, "pid": 955, "runs": 1,
+                     "plist": {"exists": True, "mtime_ns": 1, "inode": 2}},
+        },
+        {
+            "privoxy": {"loaded": True, "pid": 200, "runs": 2,
+                        "plist": {"exists": True, "mtime_ns": 10, "inode": 20}},
+            "xray": {"loaded": True, "pid": 955, "runs": 1,
+                     "plist": {"exists": True, "mtime_ns": 1, "inode": 2}},
+        },
+    ])
+    monkeypatch.setattr(health, "_collect_launchd_lifecycle", lambda: next(samples))
+
+    _REAL_RECORD_WATCHDOG_LIFECYCLE()
+    assert state_file.exists()
+    assert not log_file.exists(), "baseline must not be reported as a lifecycle event"
+
+    _REAL_RECORD_WATCHDOG_LIFECYCLE()
+    event = __import__("json").loads(log_file.read_text(encoding="utf-8").strip())
+    assert event["previous"]["privoxy"]["pid"] == 100
+    assert event["current"]["privoxy"]["pid"] == 200
+    assert event["current"]["privoxy"]["runs"] == 2
+
+
+def test_watchdog_records_launchd_lifecycle(monkeypatch, tmp_path):
+    """Every watchdog tick records lifecycle state independently of health transitions."""
+    state_file = tmp_path / "watchdog.last"
+    state_file.write_text("ok")
+    monkeypatch.setattr(health, "WATCHDOG_STATE", state_file)
+    monkeypatch.setattr(health, "check_all", lambda **kw: {"status": "ok", "checks": []})
+    recorded = []
+    monkeypatch.setattr(health, "_record_watchdog_lifecycle", lambda: recorded.append(True))
+
+    health.cmd_watchdog()
+
+    assert recorded == [True]
+
