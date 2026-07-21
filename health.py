@@ -46,6 +46,7 @@ TUNNEL_TARGETS = ("https://api.anthropic.com/", "https://api.openai.com/")
 # State watchdog'а (переход ok→down, чтобы не спамить). /tmp не переживает ребут — приемлемо:
 # после ребута fresh state, первый прогон без нотификации если уже down.
 WATCHDOG_STATE = Path("/tmp/srouter-watchdog.last")
+WATCHDOG_NOTIFY_LOG = Path.home() / "Library" / "Logs" / "srouter-watchdog.notify.log"
 
 # Real Claude Code transport probe is doctor-only: failed proxy negotiation may spend several
 # seconds in retries. Dashboard /health and watchdog keep using lightweight passive checks.
@@ -546,7 +547,18 @@ def check_all(*, active_claude=False):
 
 
 def _notify(msg, sound="Glass"):
-    """macOS-нотификация через osascript (встроенный, всегда доступен). Не бросает."""
+    """macOS-нотификация через osascript + audit trail в лог (#109).
+
+    Логируем ВСЕГДА (даже если osascript не сработал) — audit trail «что пушалось и когда».
+    osascript — best-effort (не роняет watchdog при сбое).
+    """
+    from datetime import datetime
+    try:
+        WATCHDOG_NOTIFY_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(WATCHDOG_NOTIFY_LOG, "a", encoding="utf-8") as f:
+            f.write(f"{datetime.now().isoformat()} [{sound}] {msg}\n")
+    except Exception:
+        pass  # лог — best-effort
     try:
         sys_probe.run([OSASCRIPT, "-e",
                        f'display notification "{msg}" with title "srouter" sound name "{sound}"'],
@@ -596,16 +608,17 @@ def cmd_watchdog():
     result = check_all(active_claude=False)
     is_ok = result["status"] == "ok"
     try:
-        was_ok = WATCHDOG_STATE.exists() and WATCHDOG_STATE.read_text().strip() == "ok"
+        prev_state = WATCHDOG_STATE.read_text().strip() if WATCHDOG_STATE.exists() else ""
     except Exception:
-        was_ok = False
+        prev_state = ""
+    was_down = prev_state in ("down", "")  # был down или неизвестен (fresh state)
 
-    if not is_ok and was_ok:
-        # Переход ok→down — кричим громко.
+    if not is_ok and not was_down:
+        # Переход НЕ-down (ok/degraded) → down — кричим громко (#109: не только ok→down).
         failed = ", ".join(c["name"] for c in result["checks"] if not c["ok"] and not c.get("info"))
         _notify(f"туннель/стек упал ({failed})", "Basso")
-    elif is_ok and not was_ok:
-        # Восстановление — тихое уведомление.
+    elif is_ok and was_down:
+        # Восстановление (down/degraded → ok) — тихое уведомление.
         _notify("стек восстановлен", "Glass")
     # down→down / ok→ok — молча (не спамим).
 

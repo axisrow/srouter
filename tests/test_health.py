@@ -433,3 +433,67 @@ def test_check_all_has_endpoint_override_check(monkeypatch):
     names = [c["name"] for c in result["checks"]]
     assert any("endpoint" in n.lower() and "anthropic" in n.lower() for n in names), \
         f"должен быть endpoint-override check, got: {names}"
+
+
+# ============================ #109: watchdog state-машина + _notify логирование ============================
+# Баг: was_ok бинарный (state == "ok") → degraded→down не пушит. + _notify не логирует.
+
+def test_watchdog_pushes_on_degraded_to_down(monkeypatch, tmp_path):
+    """state=degraded → check_all=down → пуш (переход не-ok→down, не только ok→down)."""
+    state_file = tmp_path / "watchdog.last"
+    state_file.write_text("degraded")
+    monkeypatch.setattr(health, "WATCHDOG_STATE", state_file)
+    monkeypatch.setattr(health, "check_all", lambda **kw: {"status": "down", "checks": [{"name": "privoxy", "ok": False}]})
+    notified = []
+    monkeypatch.setattr(health, "_notify", lambda msg, sound="Glass": notified.append((msg, sound)))
+    health.cmd_watchdog()
+    assert len(notified) == 1, "degraded→down должен пушить"
+    assert "упал" in notified[0][0]
+
+
+def test_watchdog_pushes_on_ok_to_down(monkeypatch, tmp_path):
+    """state=ok → check_all=down → пуш (regression: ok→down работал и раньше)."""
+    state_file = tmp_path / "watchdog.last"
+    state_file.write_text("ok")
+    monkeypatch.setattr(health, "WATCHDOG_STATE", state_file)
+    monkeypatch.setattr(health, "check_all", lambda **kw: {"status": "down", "checks": [{"name": "privoxy", "ok": False}]})
+    notified = []
+    monkeypatch.setattr(health, "_notify", lambda msg, sound="Glass": notified.append((msg, sound)))
+    health.cmd_watchdog()
+    assert len(notified) == 1
+
+
+def test_watchdog_silent_on_down_to_down(monkeypatch, tmp_path):
+    """state=down → check_all=down → молчит (не спамит)."""
+    state_file = tmp_path / "watchdog.last"
+    state_file.write_text("down")
+    monkeypatch.setattr(health, "WATCHDOG_STATE", state_file)
+    monkeypatch.setattr(health, "check_all", lambda **kw: {"status": "down", "checks": [{"name": "privoxy", "ok": False}]})
+    notified = []
+    monkeypatch.setattr(health, "_notify", lambda msg, sound="Glass": notified.append((msg, sound)))
+    health.cmd_watchdog()
+    assert len(notified) == 0, "down→down — молчит"
+
+
+def test_watchdog_recovery_push_on_down_to_ok(monkeypatch, tmp_path):
+    """state=down → check_all=ok → тихий пуш восстановления."""
+    state_file = tmp_path / "watchdog.last"
+    state_file.write_text("down")
+    monkeypatch.setattr(health, "WATCHDOG_STATE", state_file)
+    monkeypatch.setattr(health, "check_all", lambda **kw: {"status": "ok", "checks": []})
+    notified = []
+    monkeypatch.setattr(health, "_notify", lambda msg, sound="Glass": notified.append((msg, sound)))
+    health.cmd_watchdog()
+    assert len(notified) == 1
+    assert "восстановлен" in notified[0][0]
+
+
+def test_notify_logs_to_file(monkeypatch, tmp_path):
+    """_notify пишет audit trail в лог-файл (timestamp + msg)."""
+    log_file = tmp_path / "srouter-watchdog.notify.log"
+    monkeypatch.setattr(health, "WATCHDOG_NOTIFY_LOG", log_file)
+    monkeypatch.setattr(health.sys_probe, "run", lambda cmd, timeout: {"rc": 0, "out": "", "err": "", "timeout": False})
+    health._notify("test message", "Basso")
+    content = log_file.read_text(encoding="utf-8")
+    assert "test message" in content
+    assert "Basso" in content
