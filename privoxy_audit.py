@@ -506,6 +506,7 @@ def _wait_daemon_readiness(layout, *, timeout=5.0, interval=0.1, clock=time.mono
         if state == "error":
             return status.get("last_error") or "daemon_error"
         sleep(interval)
+    return "readiness_timeout"  # daemon не дошёл до ready за timeout — вероятна FDA-denial.
 
 
 def _startup_grace(child, *, grace=1.5, interval=0.1, clock=time.monotonic, sleep=time.sleep,
@@ -523,7 +524,6 @@ def _startup_grace(child, *, grace=1.5, interval=0.1, clock=time.monotonic, slee
             return False  # eslogger умер до истечения grace.
         sleep(interval)
     return child.poll() is None
-    return "readiness_timeout"
 
 
 def uninstall_as_root(*, purge_log=False, layout=DEFAULT_LAYOUT, runner=_run,

@@ -246,6 +246,42 @@ def test_install_fails_when_daemon_never_confirms_readiness(tmp_path):
     assert "fda" in result["error"]
 
 
+def test_wait_daemon_readiness_returns_timeout_when_status_never_advances(tmp_path, monkeypatch):
+    """B1-v3 (Codex cycle-3): если daemon застрял в starting/installing или не публикует status,
+
+    _wait_daemon_readiness обязан вернуть readiness_timeout (НЕ fall-through к None). Иначе
+    install трактует None как success → false-success (security-control рапортован установленным,
+    audit нефункционален). Баг: return readiness_timeout стоял в недостижимом месте.
+    """
+    layout = _layout(tmp_path)
+    monkeypatch.setattr(privoxy_audit, "_read_status_file", lambda layout_: {"state": "starting"})
+
+    result = privoxy_audit._wait_daemon_readiness(
+        layout, timeout=0.2, interval=0.05,
+        clock=privoxy_audit.time.monotonic, sleep=privoxy_audit.time.sleep,
+    )
+
+    assert result == "readiness_timeout"
+
+
+def test_install_fails_when_readiness_poll_times_out_via_real_poller(tmp_path, monkeypatch):
+    """B1-v3: real-poller path — daemon застрял в starting → install возвращает ok=False (не None-success)."""
+    layout = _layout(tmp_path)
+    _write_helper(layout)
+    identity = pwd.getpwuid(os.getuid())
+    runner, _ = _install_runner_factory({"value": False})
+    monkeypatch.setattr(privoxy_audit, "_read_status_file", lambda layout_: {"state": "starting"})
+
+    # Без readiness_poll — используется реальный _wait_daemon_readiness с застрявшим starting.
+    result = privoxy_audit.install_as_root(
+        username=identity.pw_name, uid=identity.pw_uid, gid=identity.pw_gid,
+        layout=layout, runner=runner, chown=lambda path, uid, gid: None, enforce_root=False,
+    )
+
+    assert result["ok"] is False
+    assert "fda" in result["error"]
+
+
 def test_install_refuses_foreign_launchdaemon_before_lifecycle_change(tmp_path):
     layout = _layout(tmp_path)
     _write_helper(layout)
