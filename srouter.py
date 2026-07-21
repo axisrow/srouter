@@ -50,6 +50,8 @@ from install_lib import (
     format_uninstall_plan,
     _install_generic_launchagent,
     _reclaimable_resolves_all_conflicts,
+    load_known_markers,
+    populate_known_markers,
 )
 from sys_probe import run
 
@@ -308,10 +310,28 @@ def _codex_bin_path() -> str:
 
 
 def _install_one_wrapper(env, wrapper_path: Path, template_name: str, marker: str) -> str:
-    """Поставить один wrapper. Marker-gate (чужой — не трогаем) + atomic write + chmod +x."""
+    """Поставить один wrapper. Marker-gate + marker-migration + atomic write + chmod +x.
+
+    issue #112 Часть 4 (РЕШЕНИЕ 2): при существующем wrapper'е различаем ТРИ случая:
+      - current-маркер есть → переустановить (idempotent, обновить рендер).
+      - legacy-маркер из known_markers → МИГРИРОВАТЬ (перезаписать с current-маркером). Смена версии
+        маркера: старый «свой» распознаётся через state-таблицу, иначе залипал бы на старой версии.
+      - unmarked (нет ни current, ни legacy) → WARN, НЕ adopt молча (канон fail-closed, чужое не трогаем).
+    """
     try:
-        if wrapper_path.exists() and marker not in wrapper_path.read_text(encoding="utf-8"):
-            return f"Codex {wrapper_path.name}: чужой {wrapper_path} — не трогаем."
+        if wrapper_path.exists():
+            content = wrapper_path.read_text(encoding="utf-8")
+            if marker in content:
+                pass  # наш current — переустановим (idempotent).
+            else:
+                # Marker-migration: проверить legacy-маркеры из known_markers (state-based, #112 ч.4).
+                known = load_known_markers(env.state_path, "wrappers", [marker])
+                legacy_hits = [m for m in known if m != marker and m in content]
+                if not legacy_hits:
+                    # Unmarked wrapper — не наш (нет current, нет legacy). WARN, не adopt.
+                    return (f"Codex {wrapper_path.name}: существует без srouter-маркера — не трогаем "
+                            f"(удали вручную, если это твой старый wrapper).")
+                # legacy-маркер найден → мигрируем (продолжаем к рендеру, atomic write обновит файл).
         codex_bin = _codex_bin_path()
         if not codex_bin:
             return f"Codex {wrapper_path.name}: codex binary не найден — wrapper не установлен (установи codex)."
@@ -690,6 +710,20 @@ def cmd_install(args) -> int:
         codex_func_note = _install_codex_zsh_function(env)
         env_note = _install_launchctl_env(env, runner)
         path_note = _ensure_home_bin_in_path(env)
+        # Marker-migration table (issue #112 Часть 4): регистрируем текущие маркеры wrappers/zshrc/codenv
+        # в state.known_markers. При будущей смене версии маркера old останется как legacy → следующий
+        # install мигрирует old→current. Без регистрации install использует только current (safe fallback).
+        # Best-effort: ошибка/отсутствие state_path не блокируют install (маркеры в коде всё равно валидны).
+        try:
+            _km_state_path = env.state_path
+            for _entry in CODEX_WRAPPERS:
+                populate_known_markers(_km_state_path, "wrappers", [_entry[2]])
+            populate_known_markers(_km_state_path, "zshrc_path", [ZSHRC_PATH_MARKER])
+            populate_known_markers(_km_state_path, "zshrc_codex_func",
+                                   [ZSHRC_CODEX_FUNC_MARKER_BEGIN, ZSHRC_CODEX_FUNC_MARKER_END])
+            populate_known_markers(_km_state_path, "codenv", [CODEX_ENV_MARKER])
+        except Exception:
+            pass
         print("Установка стека завершена: brew-сервисы, конфиги, DNS, LaunchAgent применены.\n"
               f"{cp_note}\n"
               f"{wd_note}\n"

@@ -52,6 +52,10 @@ def _stub_cmd_install_internals(monkeypatch, *, apply_ok=True, tty=True):
         monkeypatch.setattr(srouter, "_install_codex_zsh_function", lambda env: "")
     monkeypatch.setattr(srouter, "_install_launchctl_env", lambda env, runner: "")
     monkeypatch.setattr(srouter, "_ensure_home_bin_in_path", lambda env: "")
+    # issue #112 Часть 4: cmd_install регистрирует known_markers в state после установки wrappers/zshrc.
+    # Мокаем (как все best-effort хелперы) — иначе лезет в реальный state_path и local_state.save_state.
+    if hasattr(srouter, "populate_known_markers"):
+        monkeypatch.setattr(srouter, "populate_known_markers", lambda *a, **k: "")
 
 
 def test_cmd_install_yes_works_without_tty(monkeypatch):

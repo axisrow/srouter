@@ -26,6 +26,7 @@ CURL = "/usr/bin/curl"
 LSOF = "/usr/sbin/lsof"
 PS = "/bin/ps"
 OSASCRIPT = "/usr/bin/osascript"
+LAUNCHCTL = "/bin/launchctl"
 
 # Прокси = privoxy (8118). Берём из dashboard_common если доступен; fallback на хардкод,
 # чтобы модуль не падал в среде без srouter_config (как git_proxy/claude_proxy).
@@ -47,6 +48,8 @@ TUNNEL_TARGETS = ("https://api.anthropic.com/", "https://api.openai.com/")
 # после ребута fresh state, первый прогон без нотификации если уже down.
 WATCHDOG_STATE = Path("/tmp/srouter-watchdog.last")
 WATCHDOG_NOTIFY_LOG = Path.home() / "Library" / "Logs" / "srouter-watchdog.notify.log"
+WATCHDOG_LIFECYCLE_STATE = Path("/tmp/srouter-watchdog.launchd.json")
+WATCHDOG_LIFECYCLE_LOG = Path.home() / "Library" / "Logs" / "srouter-watchdog.lifecycle.jsonl"
 
 # Real Claude Code transport probe is doctor-only: failed proxy negotiation may spend several
 # seconds in retries. Dashboard /health and watchdog keep using lightweight passive checks.
@@ -647,6 +650,117 @@ def _notify(msg, sound="Glass"):
         pass  # нотификация — best-effort, не роняет watchdog
 
 
+def _launchd_field(output, key):
+    """Первое scalar-поле из `launchctl print`; nested endpoint state не перетирает root state."""
+    match = re.search(rf"^\s*{re.escape(key)}\s*=\s*(.*?)\s*;?\s*$", output or "", re.MULTILINE)
+    return match.group(1) if match else None
+
+
+def _launchd_int(output, key):
+    value = _launchd_field(output, key)
+    try:
+        return int(value) if value is not None else None
+    except ValueError:
+        return None
+
+
+def _launchd_job_snapshot(label, *, plist_path=None):
+    """Компактный forensic snapshot launchd job без домыслов о причине отсутствия.
+
+    KeepAlive-restart сохраняет загруженный label и plist, но меняет pid/runs/last-exit. Внешний
+    `bootout` даёт loaded=false; последующий `brew services start` обычно меняет plist mtime/inode и
+    сбрасывает runs. Эта разница нужна для #132: строка startup banner сама по себе её не показывает.
+    """
+    if plist_path is None:
+        plist_path = Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
+    else:
+        plist_path = Path(plist_path)
+
+    result = sys_probe.run(
+        [LAUNCHCTL, "print", f"gui/{os.getuid()}/{label}"],
+        timeout=3,
+    )
+    output = result.get("out") or ""
+    loaded = result.get("rc") == 0 and bool(output.strip())
+
+    plist = {"exists": False, "mtime_ns": None, "inode": None}
+    try:
+        stat = plist_path.stat()
+        plist = {"exists": True, "mtime_ns": stat.st_mtime_ns, "inode": stat.st_ino}
+    except OSError:
+        pass
+
+    error = ""
+    if not loaded:
+        error = (result.get("err") or ("timeout" if result.get("timeout") else "not loaded"))[:240]
+
+    return {
+        "label": label,
+        "loaded": loaded,
+        "state": _launchd_field(output, "state") if loaded else None,
+        "pid": _launchd_int(output, "pid") if loaded else None,
+        "runs": _launchd_int(output, "runs") if loaded else None,
+        "last_exit_code": _launchd_field(output, "last exit code") if loaded else None,
+        "last_terminating_signal": (
+            _launchd_field(output, "last terminating signal") if loaded else None
+        ),
+        "plist": plist,
+        "error": error,
+    }
+
+
+def _collect_launchd_lifecycle():
+    """Снимок двух симметричных Homebrew jobs; xray — стабильный контроль для #132."""
+    return {
+        "privoxy": _launchd_job_snapshot("homebrew.mxcl.privoxy"),
+        "xray": _launchd_job_snapshot("homebrew.mxcl.xray"),
+    }
+
+
+def _record_watchdog_lifecycle():
+    """Записать JSONL только при изменении launchd lifecycle; первый снимок — тихий baseline.
+
+    Best-effort: forensic logging не меняет health status и никогда не роняет watchdog. Даже если
+    stop/start целиком попал между watchdog ticks, изменение plist mtime/inode или pid/runs остаётся
+    видимым в следующем снимке.
+    """
+    try:
+        current = _collect_launchd_lifecycle()
+    except Exception:
+        return
+
+    previous = None
+    try:
+        if WATCHDOG_LIFECYCLE_STATE.exists():
+            previous = json.loads(WATCHDOG_LIFECYCLE_STATE.read_text(encoding="utf-8"))
+    except Exception:
+        previous = None
+
+    if previous is not None and previous != current:
+        try:
+            from datetime import datetime
+
+            WATCHDOG_LIFECYCLE_LOG.parent.mkdir(parents=True, exist_ok=True)
+            event = {
+                "timestamp": datetime.now().astimezone().isoformat(),
+                "previous": previous,
+                "current": current,
+            }
+            with open(WATCHDOG_LIFECYCLE_LOG, "a", encoding="utf-8") as log_file:
+                log_file.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+        except Exception:
+            pass
+
+    try:
+        WATCHDOG_LIFECYCLE_STATE.parent.mkdir(parents=True, exist_ok=True)
+        WATCHDOG_LIFECYCLE_STATE.write_text(
+            json.dumps(current, ensure_ascii=False, sort_keys=True),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
 def _print_report(result):
     """Человекочитаемый отчёт check_all (для doctor). Вывод в stdout."""
     print(f"srouter health: {result['status'].upper()}\n")
@@ -686,6 +800,7 @@ def cmd_watchdog():
     ppp-hook не сработал (utun-VPN) — пользователь видит нотификацию и手动но ensure-split-route-root.
     """
     result = check_all(active_claude=False)
+    _record_watchdog_lifecycle()
     cur = result["status"]
     try:
         prev = WATCHDOG_STATE.read_text().strip() if WATCHDOG_STATE.exists() else ""

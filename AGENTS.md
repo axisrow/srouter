@@ -39,6 +39,8 @@ For apply/restart flows, use two-phase state: write pending intent, generate/app
 
 Tests live under `tests/` (pytest-style, `test_*.py`). Run `pytest` from the repo root; `tests/conftest.py` adds the repo root to `sys.path` so root-level modules import without installing the package. Existing coverage spans local-state helpers, probe helpers, route validation, two-phase apply behavior, and the launchd/uninstall flow. Prefer adding tests there for non-trivial changes.
 
+Keep tests and review cycles off the live macOS proxy stack. Do not run host `brew services start|stop|restart privoxy|xray`, `srouter install|uninstall`, or matching `launchctl bootout/kickstart` commands unless the active task explicitly authorizes a live lifecycle change; use the Docker acceptance environment for lifecycle tests. A `Privoxy version` startup banner proves only that a process started, not that Privoxy crashed or launchd KeepAlive restarted it. Preserve `launchctl print` evidence (`runs`, PID, last exit/signal, and plist identity/mtime) before classifying a lifecycle event.
+
 ## Commit & Pull Request Guidelines
 
 Recent history uses short, descriptive subjects, including Conventional Commit-style prefixes such as `chore:`. Keep commit subjects concise and imperative when possible, for example `fix: handle ip.sb geo timeout`.

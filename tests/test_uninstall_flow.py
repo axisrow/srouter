@@ -50,12 +50,16 @@ def _write_state(env, detected=None, network=None):
     return state
 
 
-def _managed_component(env, name, backup_path):
+def _managed_component(env, name, backup_path, *, provenance=None):
+    # provenance (issue #112): 'created' | 'overwrote' | None. None = legacy state (до #112).
     config_path = env.component_paths(name)["config"]
+    management = {"mode": "managed", "managed": True}
+    if provenance is not None:
+        management["provenance"] = provenance
     return {
         "config_path": str(config_path),
         "backup": str(backup_path),
-        "management": {"mode": "managed", "managed": True},
+        "management": management,
     }
 
 
@@ -718,27 +722,26 @@ def test_apply_uninstall_leftover_empty_when_fully_restored(tmp_path):
 
 
 def test_apply_uninstall_no_leftover_for_fresh_install_without_backup(tmp_path):
-    """cycle-review #111 cycle 2 finding B (регрессия): свежий install → НЕ leftover.
+    """cycle-review #111 cycle 2 finding B (регрессия) + #112 legacy-граница: marker-managed БЕЗ
+    provenance → НЕ leftover, НЕ удалён.
 
-    Сценарий: srouter install создал конфиг с нуля (config_path не существовал → backup не делался).
-    state.managed=True, маркер ЕСТЬ, НО backup отсутствует → restorable=False. До сужения leftover мой
-    код считал КАЖДЫЙ managed-без-backup leftover → свежий install→uninstall давал rc=2 «частично» всегда
-    (базовый workflow сломан). Фикс: leftover = managed AND NOT marker_present (stale — состояние
-    неопределённое). Свежий install (маркер на месте) — нормальный managed, НЕ leftover → rc=0.
-
-    Глубокий ремонт (uninstall удаляет created-конфиг целиком, как brew/dpkg) — отдельный follow-up:
-    здесь фиксируем только что свежий install НЕ маскируется под partial.
+    Сценарий: state БЕЗ provenance (legacy, до #112), managed=True, маркер ЕСТЬ, backup НЕТ.
+    - #111 cycle 2 finding B: НЕ leftover (состояние определённое, маркер на месте) → rc=0, не partial.
+    - #112: legacy-без-provenance НЕ удаляется (требует явного provenance='created', чтобы не удалить
+      adopt-конфиг по ошибке). Конфиг оставлен «left untouched» — оператор повторяет install →
+      fresh provenance='created' → uninstall удалит (см. test_uninstall_removes_created_config).
+    Двойная защита: не маскируем под partial (rc=0) И не удаляем вслепую по legacy-state.
     """
     env = _env(tmp_path)
     config = env.component_paths("privoxy")["config"]
     config.parent.mkdir(parents=True, exist_ok=True)
     config.write_text("# srouter-managed-config-v1\nlisten-address 127.0.0.1:8118\n", encoding="utf-8")
-    # state: managed=True, маркер в конфиге есть, НО backup НЕТ (как при свежем install с нуля).
+    # state: managed=True, маркер в конфиге есть, НО backup НЕТ И provenance НЕТ (legacy до #112).
     _write_state(env, {
         "privoxy": {
             "config_path": str(config),
             "management": {"mode": "managed", "managed": True},
-            # НЕТ поля backup
+            # НЕТ полей backup И provenance — legacy state
         }
     })
 
@@ -749,8 +752,10 @@ def test_apply_uninstall_no_leftover_for_fresh_install_without_backup(tmp_path):
     )
 
     assert result["ok"] is True
-    assert result["leftover"] == [], ("свежий install (маркер есть, нет backup) — НЕ leftover: это нормальный "
-                                      "managed, не partial. Глубокий remove-фикс — follow-up.")
+    assert result["leftover"] == [], ("legacy marker-managed без provenance — НЕ leftover: определённое "
+                                      "состояние, rc=0. Deep remove требует явного provenance (см. #112 ч.2).")
+    # #112: legacy-без-provenance НЕ удаляется (консервативно) — конфиг оставлен.
+    assert config.exists(), "legacy state без provenance → конфиг НЕ удалён (требуется fresh install)"
 
 
 def test_main_uninstall_apply_nonzero_when_leftover(tmp_path, monkeypatch):
@@ -780,3 +785,174 @@ def test_main_uninstall_apply_nonzero_when_leftover(tmp_path, monkeypatch):
     ])
 
     assert rc != 0, "stale-managed leftover через main(uninstall-apply) → rc≠0 (не маскировать exit 0)"
+
+
+# ============================ issue #112 Часть 2: uninstall hybrid remove/restore по provenance ============================
+# До #112 uninstall restore-only: created-конфиг (нет backup) → restorable=False → оставался навсегда.
+# Гибрид (РЕШЕНИЕ 1, fail-closed):
+#   provenance='created' (из state) И живой srouter-маркер в файле → УДАЛИТЬ (двойной арбитраж).
+#   provenance='overwrote' (есть backup) → RESTORE из backup.
+#   created БЕЗ маркера → fail-safe leftover (не трогать — возможен crash-during-install / подмена).
+# Канон: «никогда молча не adopt» — маркер = живой арбитр, что файл действительно наш.
+def _write_created_managed_state(env, name, *, marker=True):
+    """state с provenance='created' (srouter создал с нуля, нет backup) + конфиг с маркером.
+
+    created → uninstall должен УДАЛИТЬ. marker=True — конфиг с srouter-маркером (двойной арбитраж пройден).
+    marker=False — маркер пропал (crash-during-install / подмена) → fail-safe leftover.
+    """
+    config_path = env.component_paths(name)["config"]
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    content = "# srouter-managed-config-v1\nlisten-address 127.0.0.1:8118\n" if marker else "listen-address 127.0.0.1:8118\n"
+    config_path.write_text(content, encoding="utf-8")
+    _write_state(env, {
+        name: {
+            "config_path": str(config_path),
+            "management": {"mode": "managed", "managed": True, "provenance": "created"},
+            # НЕТ поля backup — created = нечего бэкапить.
+        }
+    })
+    return config_path
+
+
+def test_uninstall_removes_created_config(tmp_path):
+    """Часть 2 ядро: provenance='created' + живой маркер → конфиг УДАЛЁН (не restored, не leftover).
+
+    До #112: restorable=False (нет backup) → continue → конфиг оставался навсегда (restore-only дыра).
+    Теперь: двойной арбитраж (created из state + marker в файле) → _delete_component_config + mode='removed'.
+    rc=0 (DELETE = clean rollback, не partial).
+    """
+    env = _env(tmp_path)
+    config_path = _write_created_managed_state(env, "privoxy", marker=True)
+
+    result = install_lib.apply_uninstall(
+        env=env,
+        confirmations={"configs": True, "services": True, "dns": True, "launchagent": True},
+        runner=FakeRunner(),
+    )
+
+    assert result["ok"] is True, f"created → delete (clean rollback): {result}"
+    assert not config_path.exists(), "created-конфиг УДАЛЁН, не оставлен"
+    assert result["leftover"] == [], "created+marker удалился → не leftover (rc=0)"
+    assert any(a.get("category") == "configs" and a.get("component") == "privoxy" for a in result["actions"]), \
+        "configs-действие зарегистрировано"
+    # state: mode='removed' (симметрично restored для overwrote).
+    state = json.loads(env.state_path.read_text(encoding="utf-8"))
+    assert state["detected_environment"]["privoxy"]["management"]["mode"] == "removed"
+
+
+def test_uninstall_restores_overwrote_config(tmp_path):
+    """Часть 2 регресс: provenance='overwrote' + backup → RESTORE (существующий путь сохранён).
+
+    overwrote = srouter перезаписал чужой (есть backup). Uninstall восстанавливает прежний контент.
+    Созданный restore-путь #110/#111 НЕ сломан гибридом.
+    """
+    env = _env(tmp_path)
+    backup = tmp_path / "privoxy.backup"
+    backup.write_text("foreign config\n", encoding="utf-8")
+    config = env.component_paths("privoxy")["config"]
+    config.parent.mkdir(parents=True)
+    config.write_text("# srouter-managed-config-v1\nlisten-address 127.0.0.1:8118\n", encoding="utf-8")
+    _write_state(env, {"privoxy": _managed_component(env, "privoxy", backup, provenance="overwrote")})
+
+    result = install_lib.apply_uninstall(
+        env=env,
+        confirmations={"configs": True},
+        runner=FakeRunner(),
+    )
+
+    assert result["ok"] is True
+    assert config.read_text(encoding="utf-8") == "foreign config\n", "overwrote → restore прежнего контента"
+    state = json.loads(env.state_path.read_text(encoding="utf-8"))
+    assert state["detected_environment"]["privoxy"]["management"]["mode"] == "restored"
+
+
+def test_uninstall_created_without_marker_is_leftover_fail_safe(tmp_path):
+    """Часть 2 fail-closed: provenance='created' + маркер пропал → НЕ удалять, fail-safe leftover.
+
+    Двойной арбитраж не пройден: state говорит created, НО маркера нет (crash-during-install / подмена файла).
+    Удалить такой файл = риск удалить чужой (state drift). Маркер = живой арбитр «файл действительно наш».
+    Без маркера → fail-safe leftover, оператор видит reason «created-config: marker missing».
+    """
+    env = _env(tmp_path)
+    config_path = _write_created_managed_state(env, "privoxy", marker=False)
+
+    result = install_lib.apply_uninstall(
+        env=env,
+        confirmations={"configs": True, "services": True, "dns": True, "launchagent": True},
+        runner=FakeRunner(),
+    )
+
+    assert result["ok"] is True, "fail-safe leftover не крашит uninstall"
+    assert config_path.exists(), "created БЕЗ маркера → НЕ удалён (fail-closed, не adopt)"
+    assert any(c["name"] == "privoxy" for c in result["leftover"]), "created+no-marker → leftover"
+    leftover_item = next(c for c in result["leftover"] if c["name"] == "privoxy")
+    assert "marker" in leftover_item["reason"].lower(), "reason указывает на missing marker"
+
+
+def test_uninstall_then_install_idempotent_created(tmp_path):
+    """Часть 2 e2e: цикл install(created)→uninstall(deleted)→install(created) замкнут, без конфликтов.
+
+    До #112: uninstall оставлял created-конфиг → следующий install видел его как foreign/reclaimable →
+    накопление. Теперь: uninstall удаляет → следующий install видит чистое место → create заново.
+    Идемпотентность цикла замыкается (issue #110 корневой ремонт).
+    """
+    env = _env(tmp_path)
+
+    # 1) install → создаст dnsmasq-конфиг (fresh), provenance='created'.
+    ins1 = install_lib.apply_install(
+        env=env, confirm=True, choices={"xray": "skip", "privoxy": "skip"},
+        runner=FakeRunner(), port_checker=lambda *_a, **_kw: False)
+    assert ins1["ok"] is True
+    config_path = env.component_paths("dnsmasq")["config"]
+    assert config_path.exists(), "install создал конфиг"
+    state1 = json.loads(env.state_path.read_text(encoding="utf-8"))
+    assert state1["detected_environment"]["dnsmasq"]["management"]["provenance"] == "created"
+
+    # 2) uninstall → удаляет created-конфиг.
+    un1 = install_lib.apply_uninstall(
+        env=env, confirmations={"configs": True, "services": True, "dns": True, "launchagent": True},
+        runner=FakeRunner())
+    assert un1["ok"] is True
+    assert not config_path.exists(), "uninstall удалил created-конфиг"
+    assert un1["leftover"] == [], "created ушёл в delete, не leftover"
+
+    # 3) install повторно → место чистое → create заново, без конфликтов (идемпотентность).
+    ins2 = install_lib.apply_install(
+        env=env, confirm=True, choices={"xray": "skip", "privoxy": "skip"},
+        runner=FakeRunner(), port_checker=lambda *_a, **_kw: False)
+    assert ins2["ok"] is True, f"повторный install на чистом месте не падает: {ins2}"
+    assert config_path.exists(), "config создан заново"
+    state2 = json.loads(env.state_path.read_text(encoding="utf-8"))
+    assert state2["detected_environment"]["dnsmasq"]["management"]["provenance"] == "created"
+
+
+def test_apply_uninstall_legacy_state_without_provenance_left_untouched(tmp_path):
+    """Часть 2 обратная совместимость: state БЕЗ provenance (legacy, до #112) + marker + no backup.
+
+    Консервативно: НЕ removable (требует явного provenance='created') → "left untouched".
+    Не удаляем то, о чём не знаем (srouter мог adopt, не create). Оператор повторяет install →
+    fresh provenance → uninstall удалит. Регресс: legacy-state не сломан новой семантикой.
+    """
+    env = _env(tmp_path)
+    config = env.component_paths("privoxy")["config"]
+    config.parent.mkdir(parents=True)
+    config.write_text("# srouter-managed-config-v1\nlisten-address 127.0.0.1:8118\n", encoding="utf-8")
+    # state БЕЗ provenance (как до #112): managed=True, маркер есть, НО нет backup И нет provenance.
+    _write_state(env, {
+        "privoxy": {
+            "config_path": str(config),
+            "management": {"mode": "managed", "managed": True},  # legacy — нет provenance
+        }
+    })
+
+    result = install_lib.apply_uninstall(
+        env=env,
+        confirmations={"configs": True, "services": True, "dns": True, "launchagent": True},
+        runner=FakeRunner(),
+    )
+
+    assert result["ok"] is True
+    # legacy без provenance → НЕ удаляем (не знаем, created или overwrote) → конфиг оставлен.
+    assert config.exists(), "legacy state без provenance → НЕ удалён (консервативно)"
+    # НЕ leftover (состояние определённое: маркер на месте, srouter владеет) — как свежий install до #112.
+    assert result["leftover"] == [], "legacy marker-managed не leftover (определённое состояние)"
