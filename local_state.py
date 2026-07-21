@@ -1017,9 +1017,10 @@ def routing_apply(hosts, *, action="add", adopt=False, outbound=DEFAULT_ROUTING_
             pass
         return {"ok": False, "changed": False, "err": "state_write_failed"}
 
-    # 6. restart xray (fail-closed: при провале — восстановить и config, и state, чтобы оба
-    #    остались согласованы со старым/рабочим состоянием — иначе state сказал бы «применено»,
-    #    хотя xray так и не поднялся с новым конфигом).
+    # 6. restart xray (fail-closed: при провале — восстановить config+state И повторно перезапустить
+    #    xray СО СТАРЫМ восстановленным конфигом. _restart_component уже сделал stop к моменту провала
+    #    start — без recovery-рестарта xray остаётся down до ручного вмешательства, превращая рутинную
+    #    неудачную операцию routing add-domain в постоянный простой всего прокси, Codex round 2).
     if runner is not None and install_lib is not None:
         try:
             res = install_lib._restart_component("xray", runner, port_checker=port_checker)
@@ -1031,13 +1032,20 @@ def routing_apply(hosts, *, action="add", adopt=False, outbound=DEFAULT_ROUTING_
             except OSError:
                 pass
             try:
-                if isinstance(state, dict):
-                    state["routing"]["active"] = current_domains
-                    state["routing"]["outbound"] = outbound
-                    state["routing"]["last_applied_hash"] = _routing_domains_hash(current_domains)
-                    save_state(state, state_path)
+                state["routing"]["active"] = current_domains
+                state["routing"]["outbound"] = outbound
+                state["routing"]["last_applied_hash"] = _routing_domains_hash(current_domains)
+                save_state(state, state_path)
             except Exception:
                 pass
-            return {"ok": False, "changed": False, "err": f"restart_failed:{res.get('err', 'unknown')}"}
+            recovery_err = ""
+            try:
+                recovery = install_lib._restart_component("xray", runner, port_checker=port_checker)
+                if recovery.get("rc") != 0 or recovery.get("timeout"):
+                    recovery_err = f"; recovery_restart_failed:{recovery.get('err', 'unknown')}"
+            except Exception:
+                recovery_err = "; recovery_restart_exception"
+            return {"ok": False, "changed": False,
+                    "err": f"restart_failed:{res.get('err', 'unknown')}{recovery_err}"}
 
     return {"ok": True, "changed": True, "err": ""}

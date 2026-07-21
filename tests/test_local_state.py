@@ -897,3 +897,38 @@ def test_routing_apply_save_state_failure_rolls_back_config_not_partial(tmp_path
     )
     assert r2["ok"] is True, r2
     assert r2["changed"] is True
+
+
+def test_routing_apply_restart_fail_recovers_xray_with_restored_config(tmp_path):
+    """restart с НОВЫМ конфигом падает (xray_start_failed) → config откатывается к backup, И xray
+    ПЕРЕЗАПУСКАЕТСЯ со старым (восстановленным) конфигом — не остаётся stopped (Codex round 2:
+    _restart_component уже сделал stop к моменту провала start; без повторного start после rollback
+    рутинная неудачная операция routing add-domain превращается в постоянный простой всего прокси)."""
+    xray_p = tmp_path / "xray-config.json"
+    state_p = tmp_path / "srouter.local.json"
+    _write_xray_routing_config(xray_p, BASELINE_DOMAINS, managed=True)
+    _write(state_p, {"nodes": [], "routing": {"active": BASELINE_DOMAINS, "outbound": "reality-out",
+                                              "last_applied_hash": local_state._routing_domains_hash(BASELINE_DOMAINS)}})
+
+    attempt = {"n": 0}
+
+    def flaky_runner(cmd, timeout):
+        if "start" in cmd and "xray" in cmd:
+            attempt["n"] += 1
+            if attempt["n"] == 1:
+                return {"rc": 1, "out": "", "err": "xray_start_failed", "timeout": False}
+            return {"rc": 0, "out": "", "err": "", "timeout": False}  # recovery start succeeds
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+
+    r = local_state.routing_apply(
+        ["telegram.org"], action="add", adopt=False,
+        config_path=str(xray_p), state_path=state_p, runner=flaky_runner,
+        port_checker=_port_checker_settle_then_up(),
+    )
+    assert r["ok"] is False
+    assert r.get("err", "").startswith("restart_failed")
+    # xray был перезапущен СО СТАРЫМ конфигом после провала — не остался stopped
+    assert attempt["n"] == 2, f"ожидался повторный start (recovery) после провала первого: {attempt}"
+    # config на диске — старый (без telegram), но xray снова работает с ним
+    cfg = json.loads(xray_p.read_text(encoding="utf-8"))
+    assert "domain:telegram.org" not in cfg["routing"]["rules"][0]["domain"]
