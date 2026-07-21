@@ -696,3 +696,29 @@ def test_reinstall_does_not_carry_backup_across_config_paths(tmp_path, monkeypat
         "backup с ДРУГОГО config_path НЕ preserve'ится (path-ownership) — иначе cross-path restore"
     assert entry["management"].get("provenance") != "overwrote", \
         "provenance не наследуется с другого пути (path-ownership) — это fresh created по пути B"
+
+
+# ============================ #136: routing_apply → _restart_component("xray") ============================
+def test_routing_apply_calls_xray_restart(tmp_path):
+    """После патча routing-доменов в config.json вызывается restart xray (stop→start), фикс #136."""
+    import local_state
+    xray_p = tmp_path / "xray-config.json"
+    state_p = tmp_path / "srouter.local.json"
+    domains = ["domain:anthropic.com", "domain:github.com"]
+    xray_p.write_text(json.dumps({
+        "outbounds": [{"tag": "reality-out", "protocol": "vless"}],
+        "routing": {"rules": [{"type": "field", "outboundTag": "reality-out",
+                               "domain": domains}]},
+    }), encoding="utf-8")
+    state_p.write_text(json.dumps({"nodes": []}), encoding="utf-8")
+    runner = FakeRunner()
+    r = local_state.routing_apply(
+        ["telegram.org"], action="add", adopt=True,
+        config_path=str(xray_p), state_path=state_p,
+        runner=runner, port_checker=_port_checker_managed_up(runner.calls),
+    )
+    assert r["ok"] is True, r
+    # brew services stop xray + start xray в calls
+    cmds = [" ".join(c) for c in runner.calls]
+    assert any("services stop xray" in c for c in cmds), f"stop xray не вызвался: {cmds}"
+    assert any("services start xray" in c for c in cmds), f"start xray не вызвался: {cmds}"

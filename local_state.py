@@ -847,3 +847,178 @@ def sync_route_ip_from_xray(name, xray_config_path=XRAY_CONFIG_PATH, path=None):
         except Exception:
             return {"ok": False, "route_ip": ""}
     return {"ok": True, "route_ip": address}
+
+
+# ============================ #136: routing-domains в production xray-config (hybrid adopt) ============================
+# srouter управляет routing.rules секцией reality-out: adopt существующего rule (маркер _srouter_managed
+# на уровне rule, НЕ top-level — foreign-конфиг не захватывается целиком), домены хранит в state
+# (active + last_applied_hash для drift-detection). Two-phase: backup → modify → restart → promote.
+# Эталон read-xray: _read_xray_vless_address; atomic-save: save_state; restart: install_lib._restart_component.
+
+ROUTING_MARKER = "_srouter_managed"  # ключ в rule (xray игнорирует неизвестные ключи — безопасно)
+DEFAULT_ROUTING_OUTBOUND = "reality-out"
+
+
+def routing_plan(current_domains, hosts, action="add"):
+    """Построить новый домен-список: добавить/убрать hosts в current_domains. Чистая функция, без записи.
+
+    hosts — bare hostnames ('telegram.org'); нормализуются в 'domain:<host>' (xray exact+subdomains).
+    action='add' — добавить недостающие (idempotent: дубль игнорируется);
+    action='remove' — убрать совпадающие.
+    Возвращает новый список (сохраняя порядок current + new в конце для add).
+    """
+    if not isinstance(current_domains, list):
+        current_domains = []
+    if not isinstance(hosts, list):
+        hosts = [hosts] if isinstance(hosts, str) else []
+    norm = [f"domain:{h}" if not str(h).startswith("domain:") else str(h) for h in hosts if h]
+    if action == "remove":
+        rm = set(norm)
+        return [d for d in current_domains if d not in rm]
+    # add: сохранить порядок, дубли пропустить
+    existing = set(current_domains)
+    out = list(current_domains)
+    for d in norm:
+        if d not in existing:
+            out.append(d)
+            existing.add(d)
+    return out
+
+
+def _routing_find_managed_rule(rules):
+    """Найти индекс rule с _srouter_managed:true. -1 если нет..Raise если их >1 (ambiguous)."""
+    idxs = [i for i, r in enumerate(rules)
+            if isinstance(r, dict) and r.get(ROUTING_MARKER) is True]
+    if len(idxs) > 1:
+        return -2  # ambiguous — несколько managed-секций, отказать
+    return idxs[0] if idxs else -1
+
+
+def _routing_domains_hash(domains):
+    """Стабильный hash домен-списка для drift-detection (сортировка → не зависит от порядка)."""
+    import hashlib
+    ordered = "\n".join(sorted(domains))
+    return hashlib.sha256(ordered.encode("utf-8")).hexdigest()[:16]
+
+
+def routing_apply(hosts, *, action="add", adopt=False, outbound=DEFAULT_ROUTING_OUTBOUND,
+                  config_path=XRAY_CONFIG_PATH, state_path=None, runner=None, port_checker=None):
+    """Применить изменение routing-доменов в production xray-config + restart xray (two-phase).
+
+    Hybrid adopt: foreign-config без маркера → требует adopt=True (захватить секцию). После adopt
+    rule помечается _srouter_managed, домены + hash пишутся в state. Locate по маркеру, не по tag
+    (защита от переименования outbound). Hash-drift (конфиг меняли руками) → refuse.
+    При ошибке restart — backup восстанавливается, state active НЕ меняется (two-phase rollback).
+
+    Возвращает {ok, changed, err}. Не бросает (fail-soft как sync_route_ip_from_xray).
+    """
+    # lazy import чтобы не тащить зависимость модуля при простом чтении state
+    try:
+        import install_lib
+    except Exception:
+        install_lib = None
+
+    # 1. читать config (fail-soft)
+    try:
+        data = json.loads(Path(config_path).read_text(encoding="utf-8"))
+    except Exception:
+        return {"ok": False, "changed": False, "err": "config_unreadable"}
+    if not isinstance(data, dict):
+        return {"ok": False, "changed": False, "err": "config_not_dict"}
+    routing = data.get("routing")
+    if not isinstance(routing, dict):
+        return {"ok": False, "changed": False, "err": "no_routing_section"}
+    rules = routing.get("rules")
+    if not isinstance(rules, list) or not rules:
+        return {"ok": False, "changed": False, "err": "no_routing_rules"}
+
+    idx = _routing_find_managed_rule(rules)
+    if idx == -2:
+        return {"ok": False, "changed": False, "err": "ambiguous_managed_rules"}
+
+    if idx == -1:
+        # нет managed-секции
+        if not adopt:
+            return {"ok": False, "changed": False, "err": "foreign_config_needs_adopt"}
+        # adopt: найти rule по outboundTag (ровно один)
+        matches = [i for i, r in enumerate(rules)
+                   if isinstance(r, dict) and r.get("outboundTag") == outbound
+                   and isinstance(r.get("domain"), list)]
+        if len(matches) != 1:
+            return {"ok": False, "changed": False, "err": f"adopt_needs_one_{outbound}_rule"}
+        idx = matches[0]
+
+    rule = rules[idx]
+    current_domains = list(rule.get("domain") or [])
+
+    # 2. drift-detection ДО idempotency: если конфиг меняли руками после нашего apply — refuse,
+    #    даже если итоговый домен-список совпал (не маскировать чужие правки под «idempotent»).
+    state = None
+    if adopt is False or rule.get(ROUTING_MARKER) is True:
+        try:
+            state, _ = _load_state_checked(state_path)
+        except Exception:
+            state = None
+        if isinstance(state, dict):
+            rt = state.get("routing") if isinstance(state.get("routing"), dict) else {}
+            stored_hash = rt.get("last_applied_hash")
+            if stored_hash and _routing_domains_hash(current_domains) != stored_hash:
+                return {"ok": False, "changed": False, "err": "hash_drift_config_changed_externally"}
+
+    new_domains = routing_plan(current_domains, hosts, action=action)
+    if new_domains == current_domains:
+        return {"ok": True, "changed": False, "err": ""}  # idempotent, restart не нужен
+
+    # 3. backup (two-phase: восстановим при ошибке restart)
+    config_p = Path(config_path)
+    backup_text = config_p.read_text(encoding="utf-8")
+
+    # 4. modify rule in-place copy + atomic write
+    new_rule = dict(rule)
+    new_rule["domain"] = new_domains
+    new_rule[ROUTING_MARKER] = True
+    new_rules = list(rules)
+    new_rules[idx] = new_rule
+    new_data = dict(data)
+    new_data["routing"] = dict(routing)
+    new_data["routing"]["rules"] = new_rules
+    try:
+        tmp = config_p.with_suffix(config_p.suffix + ".tmp")
+        tmp.write_text(json.dumps(new_data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(config_p)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)  # type: ignore[possibly-undefined]
+        except (OSError, UnboundLocalError):
+            pass
+        return {"ok": False, "changed": False, "err": "config_write_failed"}
+
+    # 5. restart xray (fail-closed: при провале — восстановить backup)
+    if runner is not None and install_lib is not None:
+        try:
+            res = install_lib._restart_component("xray", runner, port_checker=port_checker)
+        except Exception:
+            res = {"rc": 1, "err": "restart_exception"}
+        if res.get("rc") != 0 or res.get("timeout"):
+            # rollback
+            try:
+                config_p.write_text(backup_text, encoding="utf-8")
+            except OSError:
+                pass
+            return {"ok": False, "changed": False, "err": f"restart_failed:{res.get('err', 'unknown')}"}
+
+    # 6. promote: state active + hash (two-phase — только после успеха restart)
+    try:
+        if not isinstance(state, dict):
+            state, _ = _load_state_checked(state_path)
+        if isinstance(state, dict):
+            if not isinstance(state.get("routing"), dict):
+                state["routing"] = {}
+            state["routing"]["active"] = new_domains
+            state["routing"]["outbound"] = outbound
+            state["routing"]["last_applied_hash"] = _routing_domains_hash(new_domains)
+            save_state(state, state_path)
+    except Exception:
+        pass  # config уже применён; state sync — best-effort
+
+    return {"ok": True, "changed": True, "err": ""}

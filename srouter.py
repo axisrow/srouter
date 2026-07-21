@@ -52,6 +52,7 @@ from install_lib import (
     _reclaimable_resolves_all_conflicts,
     load_known_markers,
     populate_known_markers,
+    port_open,
 )
 from sys_probe import run
 
@@ -967,6 +968,88 @@ def cmd_doctor(args) -> int:
     return 0 if result["status"] == "ok" else 1
 
 
+def cmd_routing(args) -> int:
+    """Управление routing-доменами production xray-config (#136).
+
+    srouter adopt'ит секцию reality-out (маркер _srouter_managed, НЕ захватывая весь foreign-конфиг),
+    домены хранит в srouter.local.json. Two-phase: backup → modify → restart xray → promote.
+    `add-domain telegram.org` — добавить домен в проксируемые (первый раз требует --adopt).
+    """
+    subcmd = getattr(args, "routing_subcommand", None)
+    state_path = getattr(args, "state", None)
+    outbound = getattr(args, "outbound", None) or local_state.DEFAULT_ROUTING_OUTBOUND
+
+    if subcmd == "list":
+        # показать текущие домены reality-out из config (read-only, без state)
+        domains = _read_routing_domains(args.xray_config, outbound)
+        if domains is None:
+            print("routing: не найден rule reality-out в xray-config "
+                  f"({args.xray_config}). adopt? или --outbound другой?", file=sys.stderr)
+            return 2
+        managed = _routing_has_marker(args.xray_config, outbound)
+        print(f"routing ({outbound}) {'[managed by srouter]' if managed else '[foreign]'}:")
+        for d in domains:
+            print(f"  {d}")
+        return 0
+
+    if subcmd not in ("add-domain", "remove-domain"):
+        print(f"routing: неизвестная подкоманда {subcmd!r}", file=sys.stderr)
+        return 2
+
+    host = args.host
+    action = "add" if subcmd == "add-domain" else "remove"
+    adopt = getattr(args, "adopt", False)
+    if not adopt and not sys.stdin.isatty():
+        # non-TTY без --adopt: не виснуть на промпте (канон cmd_install TTY-gate)
+        pass  # routing_apply сам вернёт err=foreign_config_needs_adopt без adopt
+    runner = make_privileged_runner(run)
+    r = local_state.routing_apply(
+        [host], action=action, adopt=adopt, outbound=outbound,
+        config_path=args.xray_config, state_path=state_path,
+        runner=runner, port_checker=port_open,
+    )
+    if not r["ok"]:
+        print(f"routing {subcmd} {host}: {r.get('err', 'failed')}", file=sys.stderr)
+        if r.get("err") == "foreign_config_needs_adopt":
+            print("  (первый раз: добавь --adopt, чтобы srouter принял секцию reality-out "
+                  "под управление — домены существующего rule сохранятся)", file=sys.stderr)
+        return 2
+    verb = "добавлен" if action == "add" else "убран"
+    if r.get("changed"):
+        print(f"routing: {host} {verb}, xray перезапущен.")
+    else:
+        print(f"routing: {host} уже в нужном состоянии (no-op).")
+    return 0
+
+
+def _read_routing_domains(config_path, outbound):
+    """Текущие domain[] rule с outboundTag=outbound. None если rule не найден/битый."""
+    try:
+        import json as _json
+        from pathlib import Path
+        data = _json.loads(Path(config_path).read_text(encoding="utf-8"))
+        for r in (data.get("routing") or {}).get("rules") or []:
+            if isinstance(r, dict) and r.get("outboundTag") == outbound and isinstance(r.get("domain"), list):
+                return r["domain"]
+    except Exception:
+        return None
+    return None
+
+
+def _routing_has_marker(config_path, outbound):
+    """Есть ли _srouter_managed на rule с outboundTag=outbound."""
+    try:
+        import json as _json
+        from pathlib import Path
+        data = _json.loads(Path(config_path).read_text(encoding="utf-8"))
+        for r in (data.get("routing") or {}).get("rules") or []:
+            if isinstance(r, dict) and r.get("outboundTag") == outbound:
+                return r.get(local_state.ROUTING_MARKER) is True
+    except Exception:
+        pass
+    return False
+
+
 def _version_string() -> str:
     """Версия из метаданных пакета (единственный источник — pyproject.toml)."""
     try:
@@ -1002,6 +1085,30 @@ def build_parser() -> argparse.ArgumentParser:
             p.add_argument("-y", "--yes", action="store_true",
                            help="Подтвердить без интерактивного промпта (конфликты всё равно блокируют).")
         p.set_defaults(func=fn)
+
+    # routing (#136): управление routing-доменами production xray-config. Отдельная подкоманда —
+    # свои sub-subcommands (add-domain/remove-domain/list). НЕ "route" (конфликт с split-route).
+    p_route = sub.add_parser(
+        "routing",
+        help="Управление routing-доменами xray (add-domain/remove-domain/list). #136.")
+    p_route_sub = p_route.add_subparsers(dest="routing_subcommand", required=True)
+    for sub_name, sub_help in (
+        ("add-domain", "Добавить домен в проксируемые (первый раз — --adopt)."),
+        ("remove-domain", "Убрать домен из проксируемых."),
+        ("list", "Показать текущие routing-домены (read-only)."),
+    ):
+        sp = p_route_sub.add_parser(sub_name, help=sub_help)
+        sp.add_argument("--outbound", default=None,
+                        help=f"outboundTag rule (по умолчанию {local_state.DEFAULT_ROUTING_OUTBOUND}).")
+        sp.add_argument("--state", default=None, help="Путь к srouter.local.json.")
+        sp.add_argument("--xray-config", default=local_state.XRAY_CONFIG_PATH,
+                        help="Путь к production xray-config.json.")
+        if sub_name in ("add-domain", "remove-domain"):
+            sp.add_argument("host", help="Домен (напр. telegram.org).")
+            sp.add_argument("--adopt", action="store_true",
+                            help="Принять секцию reality-out под управление (первый раз). "
+                                 "Существующие домены сохраняются, добавляется маркер _srouter_managed.")
+        sp.set_defaults(func=cmd_routing)
     return parser
 
 
