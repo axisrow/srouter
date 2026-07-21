@@ -384,11 +384,14 @@ def test_daemon_persists_only_matching_exec_events(tmp_path, monkeypatch):
         pid = 9001
         stdout = io.StringIO("".join(json.dumps(value) + "\n" for value in events))
         stderr = io.StringIO("")
+        _exited = False
 
         def poll(self):
-            return 0
+            # Живой eslogger с открытым stdout: None, пока не вычитан полностью.
+            return None if not self._exited else 0
 
         def wait(self, timeout=None):
+            self._exited = True
             return 1
 
         def terminate(self):
@@ -401,6 +404,7 @@ def test_daemon_persists_only_matching_exec_events(tmp_path, monkeypatch):
         layout=layout,
         popen=lambda *args, **kwargs: Child(),
         chown=lambda path, uid, gid: None,
+        grace=0,  # grace-handshake вылючен для unit-теста (мок-Child жив, реальный grace не нужен).
     )
     result = privoxy_audit.report(limit=10, layout=layout)
 
@@ -411,6 +415,51 @@ def test_daemon_persists_only_matching_exec_events(tmp_path, monkeypatch):
     saved = json.loads(layout.status_path.read_text(encoding="utf-8"))
     assert saved["gid"] == identity.pw_gid
     assert saved["parse_errors"] == 1
+
+
+def test_daemon_reports_fda_failure_when_eslogger_dies_during_grace(tmp_path, monkeypatch):
+    """B1-v2 (Codex cycle-2): eslogger стартует (Popen успешен), но падает от FDA/TCC-denial
+
+    ВНУТРИ startup-grace — ДО того, как readiness мог бы быть опубликован. daemon обязан поймать
+    это (child.poll() != None за grace) и написать state=error, а НЕ ранний running. Иначе
+    install's readiness-poll принял бы running за success (false-success race из cycle 1).
+    """
+    layout = _layout(tmp_path)
+    identity = pwd.getpwuid(os.getuid())
+    layout.status_path.parent.mkdir(parents=True)
+    layout.status_path.write_text(json.dumps({
+        "marker": privoxy_audit.AUDIT_MARKER, "gid": identity.pw_gid,
+    }), encoding="utf-8")
+
+    class FailingChild:
+        pid = 9002
+        # stdout пустой — eslogger падает до первого event.
+        stdout = io.StringIO("")
+        stderr = io.StringIO("Operation not permitted (TCC)")
+
+        def poll(self):
+            return 1  # упал немедленно (FDA-denial).
+
+        def wait(self, timeout=None):
+            return 1
+
+        def terminate(self):
+            return None
+
+    monkeypatch.setattr(privoxy_audit.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(privoxy_audit.signal, "signal", lambda signum, handler: None)
+
+    rc = privoxy_audit.daemon(
+        layout=layout,
+        popen=lambda *args, **kwargs: FailingChild(),
+        chown=lambda path, uid, gid: None,
+        grace=0.2,  # короткий grace для теста; FailingChild.poll()=1 → падение поймано сразу.
+    )
+
+    assert rc == 2
+    saved = json.loads(layout.status_path.read_text(encoding="utf-8"))
+    assert saved["state"] == "error"
+    assert "startup" in saved["last_error"]
 
 
 def test_cli_parser_exposes_nested_audit_commands():

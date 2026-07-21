@@ -485,24 +485,44 @@ def install_as_root(*, username, uid, gid, layout=DEFAULT_LAYOUT, runner=_run,
     return _result(True, changed=True)
 
 
-def _wait_daemon_readiness(layout, *, timeout=3.0, interval=0.1, clock=time.monotonic,
+def _wait_daemon_readiness(layout, *, timeout=5.0, interval=0.1, clock=time.monotonic,
                            sleep=time.sleep):
-    """Bounded poll daemon status после bootstrap. Возвращает None при readiness (running/degraded),
+    """Bounded poll daemon status после bootstrap. Возвращает None при readiness, иначе —
+    строку-причину отказа (error-detail или 'readiness_timeout').
 
-    иначе — строку-причину отказа (error-detail или 'readiness_timeout'). Ждём, пока daemon не
-    выйдет из начального 'installing' (которое сам install_as_root пишет перед bootstrap): как только
-    daemon переписал status, мы знаем его истинное состояние. error → отказ; таймаут (daemon молчит)
-    → отказ (вероятна FDA-denial, eslogger ещё не упал).
+    Принимает как success только состояния, опубликованные ПОСЛЕ startup-grace daemon'а:
+    `ready` (grace пройден, eslogger выжил), `running`/`degraded` (steady-state после первого
+    event). `starting` (ранний publish сразу после Popen) и `installing` НЕ success — продолжаем
+    poll. error → отказ; таймаут (daemon не дошёл до ready) → отказ (вероятна FDA-denial).
+    B1-v2: ранний `starting` больше не принимается за readiness — grace-handshake в daemon'е
+    гарантирует, что ready означает реальную выживаемость eslogger.
     """
     deadline = clock() + timeout
     while clock() < deadline:
         status = _read_status_file(layout)
         state = status.get("state")
-        if state in ("running", "degraded"):
+        if state in ("ready", "running", "degraded"):
             return None
         if state == "error":
             return status.get("last_error") or "daemon_error"
         sleep(interval)
+
+
+def _startup_grace(child, *, grace=1.5, interval=0.1, clock=time.monotonic, sleep=time.sleep,
+                   stopped_flag=None):
+    """Bounded startup-окно: eslogger должен ВЫЖИТЬ grace-период. True — выжил (ready), False —
+    упал за grace (типичный FDA/TCC-denial — быстрый exit). Опрашивает child.poll() неблокирующе;
+    FDA-failure обычно проявляется за <1с, поэтому grace=1.5с её ловит до того, как install примет
+    readiness. stopped_flag — признак внешней остановки (SIGTERM) для раннего выхода.
+    """
+    deadline = clock() + grace
+    while clock() < deadline:
+        if stopped_flag is not None and stopped_flag():
+            return True  # внешний stop — не FDA-failure, считаем grace пройденным.
+        if child.poll() is not None:
+            return False  # eslogger умер до истечения grace.
+        sleep(interval)
+    return child.poll() is None
     return "readiness_timeout"
 
 
@@ -608,7 +628,8 @@ def _event_shape_valid(event):
     )
 
 
-def daemon(*, layout=DEFAULT_LAYOUT, popen=subprocess.Popen, chown=os.chown):
+def daemon(*, layout=DEFAULT_LAYOUT, popen=subprocess.Popen, chown=os.chown,
+           grace=1.5, clock=time.monotonic, sleep=time.sleep):
     if os.geteuid() != 0:
         _write_status(layout, {"state": "error", "last_error": "root_required"}, chown=chown)
         return 2
@@ -657,10 +678,30 @@ def daemon(*, layout=DEFAULT_LAYOUT, popen=subprocess.Popen, chown=os.chown):
     stderr_thread.start()
     _write_status(layout, {
         **counters,
-        "state": "running",
+        "state": "starting",
         "started_at": _now(),
         "pid": os.getpid(),
         "eslogger_pid": child.pid,
+        "last_error": "",
+    }, chown=chown)
+
+    # Grace-handshake (B1-v2): НЕ публиковать running сразу после Popen — eslogger может упасть
+    # от FDA/TCC-denial асинхронно ПОЗЖЕ. install's readiness-poll принял бы ранний running за
+    # success. Выжидаем bounded startup-окно, опрашивая child.poll(): если eslogger умер за grace
+    # (типичный TCC-denial — быстрый exit) → error; выжил → ready (readiness-poll примет только это).
+    if not _startup_grace(child, grace=grace, clock=clock, sleep=sleep,
+                          stopped_flag=lambda: stopped):
+        stderr = " | ".join(stderr_lines)[-1200:]
+        error = f"eslogger_exited_during_startup:{child.poll()}:{stderr}"
+        _write_status(layout, {**counters, "state": "error", "last_error": error}, chown=chown)
+        try:
+            child.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            child.kill()
+        return 2
+    _write_status(layout, {
+        **counters,
+        "state": "ready",
         "last_error": "",
     }, chown=chown)
 
