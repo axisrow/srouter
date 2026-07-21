@@ -494,6 +494,44 @@ def _endpoint_override_check():
     return {"status": "info", "detail": f"endpoint override: {base} (нестандартный endpoint)"}
 
 
+# ============================ #134: Desktop App proxy (launchctl getenv) ============================
+
+def _read_proxy_sources():
+    """Читает HTTPS_PROXY из settings.json + launchctl getenv (#134).
+
+    CLI читает settings.json, Desktop App читает launchctl getenv (gui-домен).
+    Возвращает {cli_proxy, desktop_proxy}. Не бросает.
+    """
+    import claude_proxy
+    data = claude_proxy._load()
+    env = data.get("env", {}) if isinstance(data, dict) else {}
+    cli_proxy = env.get("HTTPS_PROXY", "") or os.environ.get("HTTPS_PROXY", "")
+    lc = sys_probe.run(["/bin/launchctl", "getenv", "HTTPS_PROXY"], timeout=3)
+    desktop_proxy = (lc.get("out") or "").strip() if not lc.get("timeout") else ""
+    return {"cli_proxy": cli_proxy, "desktop_proxy": desktop_proxy}
+
+
+def _desktop_proxy_check():
+    """Проверяет прокси для Desktop App (launchctl getenv) + расхождение с CLI (#134).
+
+    Desktop App ≠ CLI (#127 инцидент): CLI читает settings.json, Desktop App — launchctl getenv.
+    SOCKS5 в launchctl → UnsupportedProxyProtocol (Desktop App не поддерживает SOCKS5).
+    Расхождение settings vs launchctl → WARN (один работает, другой может не работать).
+    """
+    src = _read_proxy_sources()
+    cli = src["cli_proxy"]
+    desktop = src["desktop_proxy"]
+    if "socks" in desktop.lower():
+        return {"status": "down",
+                "detail": f"Desktop App proxy: {desktop} (SOCKS5 не поддерживается — UnsupportedProxyProtocol)"}
+    if cli and desktop and cli != desktop:
+        return {"status": "info",
+                "detail": f"CLI={cli}, Desktop={desktop} — рассинхронизация прокси"}
+    if desktop:
+        return {"status": "ok", "detail": f"Desktop App proxy: {desktop}"}
+    return {"status": "unknown", "detail": "launchctl HTTPS_PROXY не задан (Desktop App — напрямую)"}
+
+
 def check_all(*, active_claude=False):
     """Все проверки стека. {status: ok|degraded|down, checks: [{name, ok, detail?, info?}]}.
 
@@ -528,6 +566,12 @@ def check_all(*, active_claude=False):
     if eo["status"] == "info":
         eo_check["info"] = True
     checks.append(eo_check)
+    # Desktop App proxy (#134): SOCKS5 в launchctl = broken Desktop App
+    dp = _desktop_proxy_check()
+    dp_check = {"name": "desktop proxy (launchctl)", "ok": dp["status"] == "ok", "detail": dp["detail"]}
+    if dp["status"] in ("info", "unknown"):
+        dp_check["info"] = True
+    checks.append(dp_check)
     # Codex-маршрут (#120): warn (privoxy 8118) — driver degraded (WS порвётся); down — driver;
     # mixed — driver (часть сессий ломаные); unknown (codex не запущен / lsof-timeout / idle) — info-only,
     # не роняет вердикт (как claude-proxy). ok — driver (всё ок).

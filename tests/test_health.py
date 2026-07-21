@@ -247,6 +247,8 @@ def test_check_all_down_when_everything_dead(monkeypatch):
     monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed"))
     monkeypatch.setattr(health, "_claude_proxy_probe",
                         lambda: {"status": "down", "source": "runtime", "detail": "runtime"})
+    monkeypatch.setattr(health, "_desktop_proxy_check",
+                        lambda: {"status": "down", "detail": "down"})
     # codex-proxy тоже мокаем (иначе реальный ps/lsof найдёт живой codex → ok → не down).
     monkeypatch.setattr(health, "_codex_proxy_probe",
                         lambda: {"status": "down", "source": "runtime", "detail": "runtime"})
@@ -533,3 +535,41 @@ def test_notify_logs_to_file(monkeypatch, tmp_path):
     content = log_file.read_text(encoding="utf-8")
     assert "test message" in content
     assert "Basso" in content
+
+
+# ============================ #134: Desktop App proxy (launchctl getenv) + CLI/Desktop расхождение ============================
+# CLI читает settings.json, Desktop App читает launchctl getenv. Doctor был слеп к Desktop App (#127 инцидент).
+
+def test_launchctl_proxy_ok_when_http(monkeypatch):
+    """launchctl getenv HTTPS_PROXY=http://8118 → ok (Desktop App через HTTP)."""
+    monkeypatch.setattr(health, "_read_proxy_sources",
+                        lambda: {"cli_proxy": "http://127.0.0.1:8118", "desktop_proxy": "http://127.0.0.1:8118"})
+    res = health._desktop_proxy_check()
+    assert res["status"] == "ok"
+
+
+def test_launchctl_proxy_down_when_socks5(monkeypatch):
+    """launchctl getenv HTTPS_PROXY=socks5h://10808 → down (Desktop App не поддерживает SOCKS5)."""
+    monkeypatch.setattr(health, "_read_proxy_sources",
+                        lambda: {"cli_proxy": "http://127.0.0.1:8118", "desktop_proxy": "socks5h://127.0.0.1:10808"})
+    res = health._desktop_proxy_check()
+    assert res["status"] == "down"
+    assert "socks" in res["detail"].lower() or "SOCKS5" in res["detail"]
+
+
+def test_proxy_mismatch_warns(monkeypatch):
+    """settings=HTTP, launchctl=SOCKS5 → info WARN «CLI и Desktop App разные прокси»."""
+    monkeypatch.setattr(health, "_read_proxy_sources",
+                        lambda: {"cli_proxy": "http://127.0.0.1:8118", "desktop_proxy": "http://127.0.0.1:9999"})
+    res = health._desktop_proxy_check()
+    assert res["status"] == "info"
+    assert "рассинхрон" in res["detail"].lower() or "CLI" in res["detail"]
+
+
+def test_proxy_match_silent(monkeypatch):
+    """settings=launchctl=HTTP → ok (синхронизация, нет расхождения)."""
+    monkeypatch.setattr(health, "_read_proxy_sources",
+                        lambda: {"cli_proxy": "http://127.0.0.1:8118", "desktop_proxy": "http://127.0.0.1:8118"})
+    res = health._desktop_proxy_check()
+    assert res["status"] == "ok"
+    assert "рассинхрон" not in res["detail"].lower()
