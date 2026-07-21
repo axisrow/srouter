@@ -25,6 +25,21 @@ class FakeRunner:
         return {"rc": 0, "out": "", "err": "", "timeout": False}
 
 
+def _port_checker_managed_up(calls):
+    """port_checker по контракту _restart_component (фикс #115): до `brew services start <name>`
+    порт свободен (False), после — поднят (True). Прежний `lambda *_: False` = «порт никогда не
+    поднят» → `<name>_restart_failed`. Читает ленту вызовов runner."""
+    def check(host, port, _timeout=0.5):
+        for cmd in calls:
+            if "services" in cmd and "start" in cmd[cmd.index("services"):]:
+                name = cmd[cmd.index("services") + 2]
+                _, svc_port = install_lib.PORTS[name]
+                if svc_port == port:
+                    return True
+        return False
+    return check
+
+
 def _env(tmp_path):
     return install_lib.InstallEnv(
         root=Path(__file__).resolve().parent.parent,
@@ -899,9 +914,10 @@ def test_uninstall_then_install_idempotent_created(tmp_path):
     env = _env(tmp_path)
 
     # 1) install → создаст dnsmasq-конфиг (fresh), provenance='created'.
+    runner1 = FakeRunner()
     ins1 = install_lib.apply_install(
         env=env, confirm=True, choices={"xray": "skip", "privoxy": "skip"},
-        runner=FakeRunner(), port_checker=lambda *_a, **_kw: False)
+        runner=runner1, port_checker=_port_checker_managed_up(runner1.calls))
     assert ins1["ok"] is True
     config_path = env.component_paths("dnsmasq")["config"]
     assert config_path.exists(), "install создал конфиг"
@@ -917,9 +933,10 @@ def test_uninstall_then_install_idempotent_created(tmp_path):
     assert un1["leftover"] == [], "created ушёл в delete, не leftover"
 
     # 3) install повторно → место чистое → create заново, без конфликтов (идемпотентность).
+    runner2 = FakeRunner()
     ins2 = install_lib.apply_install(
         env=env, confirm=True, choices={"xray": "skip", "privoxy": "skip"},
-        runner=FakeRunner(), port_checker=lambda *_a, **_kw: False)
+        runner=runner2, port_checker=_port_checker_managed_up(runner2.calls))
     assert ins2["ok"] is True, f"повторный install на чистом месте не падает: {ins2}"
     assert config_path.exists(), "config создан заново"
     state2 = json.loads(env.state_path.read_text(encoding="utf-8"))
