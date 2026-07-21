@@ -433,3 +433,103 @@ def test_check_all_has_endpoint_override_check(monkeypatch):
     names = [c["name"] for c in result["checks"]]
     assert any("endpoint" in n.lower() and "anthropic" in n.lower() for n in names), \
         f"должен быть endpoint-override check, got: {names}"
+
+
+# ============================ #109: watchdog state-машина + _notify логирование ============================
+# Баг: was_ok бинарный (state == "ok") → degraded→down не пушит. + _notify не логирует.
+
+def test_watchdog_pushes_on_degraded_to_down(monkeypatch, tmp_path):
+    """state=degraded → check_all=down → пуш (переход не-ok→down, не только ok→down)."""
+    state_file = tmp_path / "watchdog.last"
+    state_file.write_text("degraded")
+    monkeypatch.setattr(health, "WATCHDOG_STATE", state_file)
+    monkeypatch.setattr(health, "check_all", lambda **kw: {"status": "down", "checks": [{"name": "privoxy", "ok": False}]})
+    notified = []
+    monkeypatch.setattr(health, "_notify", lambda msg, sound="Glass": notified.append((msg, sound)))
+    health.cmd_watchdog()
+    assert len(notified) == 1, "degraded→down должен пушить"
+    assert "упал" in notified[0][0]
+
+
+def test_watchdog_pushes_on_ok_to_down(monkeypatch, tmp_path):
+    """state=ok → check_all=down → пуш (regression: ok→down работал и раньше)."""
+    state_file = tmp_path / "watchdog.last"
+    state_file.write_text("ok")
+    monkeypatch.setattr(health, "WATCHDOG_STATE", state_file)
+    monkeypatch.setattr(health, "check_all", lambda **kw: {"status": "down", "checks": [{"name": "privoxy", "ok": False}]})
+    notified = []
+    monkeypatch.setattr(health, "_notify", lambda msg, sound="Glass": notified.append((msg, sound)))
+    health.cmd_watchdog()
+    assert len(notified) == 1
+
+
+def test_watchdog_silent_on_down_to_down(monkeypatch, tmp_path):
+    """state=down → check_all=down → молчит (не спамит)."""
+    state_file = tmp_path / "watchdog.last"
+    state_file.write_text("down")
+    monkeypatch.setattr(health, "WATCHDOG_STATE", state_file)
+    monkeypatch.setattr(health, "check_all", lambda **kw: {"status": "down", "checks": [{"name": "privoxy", "ok": False}]})
+    notified = []
+    monkeypatch.setattr(health, "_notify", lambda msg, sound="Glass": notified.append((msg, sound)))
+    health.cmd_watchdog()
+    assert len(notified) == 0, "down→down — молчит"
+
+
+def test_watchdog_recovery_push_on_down_to_ok(monkeypatch, tmp_path):
+    """state=down → check_all=ok → тихий пуш восстановления."""
+    state_file = tmp_path / "watchdog.last"
+    state_file.write_text("down")
+    monkeypatch.setattr(health, "WATCHDOG_STATE", state_file)
+    monkeypatch.setattr(health, "check_all", lambda **kw: {"status": "ok", "checks": []})
+    notified = []
+    monkeypatch.setattr(health, "_notify", lambda msg, sound="Glass": notified.append((msg, sound)))
+    health.cmd_watchdog()
+    assert len(notified) == 1
+    assert "восстановлен" in notified[0][0]
+
+
+# ============================ cycle-review #133: table-driven transition matrix ============================
+# Codex C1: degraded→degraded спамило (is_ok collapse). Exact-state transitions решают.
+# Полная матрица: каждый (prev, cur) → ожидаемое количество пушей.
+import pytest as _pytest
+
+_TRANSITIONS = [
+    # (prev_state, cur_status, expected_pushes, description)
+    ("ok", "down", 1, "ok→down: пуш (новое падение)"),
+    ("degraded", "down", 1, "degraded→down: пуш (новое падение)"),
+    ("ok", "degraded", 0, "ok→degraded: НЕ пуш (degraded — не «упал»)"),
+    ("down", "down", 0, "down→down: молчит (не спам)"),
+    ("degraded", "degraded", 0, "degraded→degraded: молчит (не спам — фикс C1)"),
+    ("down", "ok", 1, "down→ok: пуш восстановления"),
+    ("degraded", "ok", 1, "degraded→ok: пуш восстановления"),
+    ("ok", "ok", 0, "ok→ok: молчит"),
+    ("", "down", 1, "fresh→down: пуш (первый прогон, уже упало)"),
+    ("", "ok", 0, "fresh→ok: НЕ пуш (первый прогон, всё ок — не восстановление)"),
+    ("corrupt!!!", "down", 0, "corrupt→down: НЕ пуш (неизвестный prev — безопасно молчим)"),
+]
+
+
+@_pytest.mark.parametrize("prev,cur,expected,desc", _TRANSITIONS, ids=[t[3] for t in _TRANSITIONS])
+def test_watchdog_transition_matrix(prev, cur, expected, desc, monkeypatch, tmp_path):
+    """Table-driven: каждый (prev, cur) переход → ожидаемое количество пушей (#133 C1)."""
+    state_file = tmp_path / "watchdog.last"
+    if prev:
+        state_file.write_text(prev)
+    monkeypatch.setattr(health, "WATCHDOG_STATE", state_file)
+    monkeypatch.setattr(health, "check_all",
+                        lambda **kw: {"status": cur, "checks": [{"name": "test", "ok": False}] if cur != "ok" else []})
+    notified = []
+    monkeypatch.setattr(health, "_notify", lambda msg, sound="Glass": notified.append((msg, sound)))
+    health.cmd_watchdog()
+    assert len(notified) == expected, f"{desc}: ожидал {expected} пушей, получил {len(notified)}"
+
+
+def test_notify_logs_to_file(monkeypatch, tmp_path):
+    """_notify пишет audit trail в лог-файл (timestamp + msg)."""
+    log_file = tmp_path / "srouter-watchdog.notify.log"
+    monkeypatch.setattr(health, "WATCHDOG_NOTIFY_LOG", log_file)
+    monkeypatch.setattr(health.sys_probe, "run", lambda cmd, timeout: {"rc": 0, "out": "", "err": "", "timeout": False})
+    health._notify("test message", "Basso")
+    content = log_file.read_text(encoding="utf-8")
+    assert "test message" in content
+    assert "Basso" in content
