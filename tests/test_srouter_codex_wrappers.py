@@ -113,12 +113,21 @@ def test_cli_launcher_renders_configured_proxy(monkeypatch, tmp_path):
 
 
 def _install_with_fake_codex(monkeypatch, tmp_path, fake_bin):
-    """Общий хелпер интеграционных тестов launcher'а: monkeypatch _codex_bin_path → fake_bin
-    ДО install, чтобы launcher сразу отрендерился с fake-codex (а не с реальным /opt/homebrew/...,
-    который при запуске без TTY падает «stdin is not a terminal»). Возвращает путь к wrapper."""
+    """Общий хелпер интеграционных тестов launcher'а. monkeypatch _codex_bin_path → fake_bin как
+    install-time GATE (есть ли codex вообще), и делает fake_bin достижимым как `codex` в PATH
+    вызывающего — wrapper с #144 runtime-резолвит binary по PATH минуя себя, путь НЕ вшивается.
+    Копия fake_bin → tmp_path/fakebin/codex, fakebin добавлен в PATH через monkeypatch.setenv
+    (наследуется env={**os.environ, ...}). Возвращает путь к wrapper."""
     _mock_home(monkeypatch, tmp_path)
     env = _env(tmp_path)
     monkeypatch.setattr(srouter, "_codex_bin_path", lambda: str(fake_bin))
+    fakebin = tmp_path / "fakebin"
+    fakebin.mkdir()
+    # Копия под именем codex — wrapper ищет именно `codex` в PATH.
+    (fakebin / "codex").write_text(fake_bin.read_text(encoding="utf-8"), encoding="utf-8")
+    (fakebin / "codex").chmod(0o755)
+    # ~/bin ПЕРЕД fakebin: проверяем, что wrapper пропускает себя и берёт fakebin/codex (антирекурсия).
+    monkeypatch.setenv("PATH", f"{Path.home() / 'bin'}:{fakebin}:/usr/bin:/bin")
     srouter._install_codex_wrappers(env)
     return Path.home() / "bin" / "codex"
 
@@ -852,21 +861,23 @@ def test_codex_function_beats_brew_in_path(monkeypatch, tmp_path):
     import subprocess
     home = _mock_home(monkeypatch, tmp_path)
     env = _env(tmp_path)
-    # brew-codex: фейк, который пишет маркер brew-called в файл (если бы выиграл он).
-    brew_called = tmp_path / "brew-called"
+    # brew-codex ПЕРВЫМ в PATH (как в проде через /etc/paths.d/homebrew). #144: wrapper runtime-резолвит
+    # его по PATH минуя себя, выставляя SOCKS5 → fake-codex пишет 'managed' ТОЛЬКО если HTTP_PROXY=socks5h
+    # (т.е. вызов прошёл через wrapper). Без функции zsh взял бы brew-binary напрямую, БЕЗ SOCKS5 env →
+    # 'direct'. Так мы отличаем «через wrapper» от «прямой binary» — это и есть доказательство победы
+    # функции над PATH-порядком при runtime-резолве (#144).
+    result_file = tmp_path / "result.txt"
     brew_dir = tmp_path / "brewbin"
     brew_dir.mkdir()
-    (brew_dir / "codex").write_text(f"#!/bin/sh\necho brew >> {brew_called}\n", encoding="utf-8")
+    (brew_dir / "codex").write_text(
+        f"#!/bin/sh\n"
+        f'if [ "$HTTP_PROXY" = "socks5h://127.0.0.1:10808" ]; then '
+        f'printf managed > {result_file}; else printf direct > {result_file}; fi\n',
+        encoding="utf-8")
     (brew_dir / "codex").chmod(0o755)
-    # managed-launcher: пишет маркер managed-called.
-    managed_called = tmp_path / "managed-called"
-    fake_codex = tmp_path / "fake-real-codex"
-    fake_codex.write_text(f"#!/bin/sh\necho managed >> {managed_called}\n", encoding="utf-8")
-    fake_codex.chmod(0o755)
-    monkeypatch.setattr(srouter, "_codex_bin_path", lambda: str(fake_codex))
+    monkeypatch.setattr(srouter, "_codex_bin_path", lambda: str(brew_dir / "codex"))
     srouter._install_codex_wrappers(env)
     srouter._install_codex_zsh_function(env)
-    # PATH: brew ПЕРВЫМ, ~/bin — позже (как в проде через /etc/paths.d/homebrew).
     zsh = shutil.which("zsh")
     if not zsh:
         import pytest
@@ -882,9 +893,9 @@ def test_codex_function_beats_brew_in_path(monkeypatch, tmp_path):
         capture_output=True, text=True, timeout=15)
     whence = rc.stdout.splitlines()[0] if rc.stdout.strip() else ""
     assert "function" in whence, f"codex должен быть функцией (не brew-binary): {whence!r}"
-    assert managed_called.exists() and managed_called.read_text(encoding="utf-8").strip() == "managed", \
-        "вызов дошёл до managed-launcher через функцию"
-    assert not brew_called.exists(), "brew-бинарь НЕ был вызван (функция перехватила)"
+    assert result_file.exists(), f"вызов дошёл до codex (через функцию): stderr={rc.stderr!r}"
+    assert result_file.read_text(encoding="utf-8") == "managed", \
+        "вызов прошёл через wrapper (SOCKS5 выставлен) — функция перехватила, brew-binary не позван напрямую"
 
 
 # ============================ issue #112 Часть 4: marker-migration (РЕШЕНИЕ 2, вариант A) ============================
@@ -979,3 +990,162 @@ def test_install_upgrades_old_marker_wrapper_without_state_uses_current_only(mon
 
     assert "не трогаем" in note.lower() or "чуж" in note.lower() or "маркер" in note.lower(), \
         f"unknown old-маркер без state-migration-table → WARN (не угадываем legacy): {note}"
+
+
+# ============================ issue #144: wrapper runtime-резолвит binary (подход A) ============================
+# ДЫРА: srouter.py _codex_bin_path() хардкодил ОДИН codex-binary в __SROUTER_CODEX_BIN__; >1 binary на
+# диске или caller с другим PATH → второй codex идёт напрямую, fail-closed нарушен.
+#
+# ФИКС (A): wrapper НЕ хардкодит binary, а runtime-резолвит его по PATH ВЫЗЫВАЮЩЕЙ оболочки, МИНУЯ
+# сам себя (антирекурсия). Один wrapper ловит любую версию codex, оказавшуюся в PATH caller'а.
+# Это best-effort layer (не fail-closed): честный kill-switch = PF (isolate_firewall.py, отдельная граница).
+import os as _os
+import subprocess as _subprocess
+
+
+def test_wrapper_does_not_hardcode_bin_placeholder(monkeypatch, tmp_path):
+    """#144(A): отрендеренный wrapper НЕ содержит литерального __SROUTER_CODEX_BIN__ и НЕ вшивает
+    абсолютный путь найденного binary. Binary резолвится в runtime по PATH, а не вшит в install-time."""
+    home = _mock_home(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    # Даже когда codex найден, путь НЕ должен попасть в wrapper.
+    fake_bin = tmp_path / "realcodex"
+    fake_bin.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_bin.chmod(0o755)
+    monkeypatch.setattr(srouter, "_codex_bin_path", lambda: str(fake_bin))
+
+    srouter._install_codex_wrappers(env)
+    cli_text = (home / "bin" / "codex").read_text(encoding="utf-8")
+
+    assert "__SROUTER_CODEX_BIN__" not in cli_text, "плейсхолдер должен быть заменён runtime-резолвом"
+    assert str(fake_bin) not in cli_text, "абсолютный путь binary НЕ вшит (#144 runtime-резолв)"
+    assert "/opt/homebrew/bin/codex" not in cli_text, "хардкод homebrew-пути отсутствует"
+
+
+def _install_with_path_resolving_wrapper(monkeypatch, tmp_path):
+    """Install wrapper БЕЗ вшитого binary (подход A): _codex_bin_path возвращает found (чтобы install
+    не упал на «binary не найден»), но путь не используется в рендере. Возвращает путь к wrapper."""
+    _mock_home(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    # Наличие codex нужно install'у как gate (WARN если совсем нет), но путь не вшивается.
+    monkeypatch.setattr(srouter, "_codex_bin_path", lambda: str(tmp_path / "any-codex"))
+    srouter._install_codex_wrappers(env)
+    return Path.home() / "bin" / "codex"
+
+
+def test_wrapper_runtime_resolves_codex_from_caller_path(monkeypatch, tmp_path):
+    """#144(A) core: wrapper в runtime находит codex из PATH ВЫЗЫВАЮЩЕЙ оболочки (минуя себя) и exec'ает
+    именно его. Смена binary в PATH НЕ требует reinstall wrapper'а — runtime всегда берёт текущий.
+
+    Fake codex пишет маркер своего пути → проверяем, что exec'нут именно тот codex, что первым в PATH.
+    """
+    called = tmp_path / "called-codex.txt"
+    codex_dir = tmp_path / "codexbin"
+    codex_dir.mkdir()
+    real_codex = codex_dir / "codex"
+    real_codex.write_text(f"#!/bin/sh\nprintf '%s' 'real-codex' > {called}\n", encoding="utf-8")
+    real_codex.chmod(0o755)
+    wrapper = _install_with_path_resolving_wrapper(monkeypatch, tmp_path)
+
+    _subprocess.run([str(wrapper), "x"],
+                    env={**_os.environ, "PATH": f"{Path.home() / 'bin'}:{codex_dir}:/usr/bin:/bin"},
+                    check=True, timeout=10)
+    assert called.exists(), "wrapper runtime-резолвнул и exec'нул codex из PATH"
+    assert called.read_text(encoding="utf-8") == "real-codex", "exec'нут именно codex из PATH caller'а"
+
+
+def test_wrapper_skips_itself_no_recursion(monkeypatch, tmp_path):
+    """#144(A) антирекурсия: wrapper НЕ находит сам себя как реальный binary. ~/bin/codex = wrapper,
+    он первый в PATH → wrapper обязан его ПРОПУСТИТЬ и взять следующий codex, иначе бесконечный цикл."""
+    called = tmp_path / "called.txt"
+    real_codex = tmp_path / "other" / "codex"
+    real_codex.parent.mkdir(parents=True)
+    real_codex.write_text(f"#!/bin/sh\nprintf 'real' > {called}\n", encoding="utf-8")
+    real_codex.chmod(0o755)
+    wrapper = _install_with_path_resolving_wrapper(monkeypatch, tmp_path)
+
+    # ~/bin ПЕРВЫМ в PATH (там wrapper), затем каталог с реальным codex. Без skip-self — рекурсия/timeout.
+    _subprocess.run([str(wrapper), "x"],
+                    env={**_os.environ, "PATH": f"{Path.home() / 'bin'}:{tmp_path / 'other'}:/usr/bin:/bin"},
+                    check=True, timeout=10)
+    assert called.exists() and called.read_text(encoding="utf-8") == "real", \
+        "wrapper пропустил себя (антирекурсия) и взял следующий codex из PATH"
+
+
+def test_wrapper_picks_second_codex_when_two_binaries(monkeypatch, tmp_path):
+    """#144 корень дыры: на диске ДВА разных codex-binary. Caller с PATH, ведущим ко второму, должен
+    попасть в него через wrapper (а не в вшитый-единственный, как раньше).
+
+    Две директории, в каждой свой codex (пишут разные маркеры). Wrapper runtime берёт тот, что в PATH
+    вызывающего — независимо от того, что нашёл _codex_bin_path в install-time.
+    """
+    first_called = tmp_path / "first.txt"
+    second_called = tmp_path / "second.txt"
+    d1 = tmp_path / "d1"
+    d2 = tmp_path / "d2"
+    d1.mkdir(); d2.mkdir()
+    (d1 / "codex").write_text(f"#!/bin/sh\nprintf 'first' > {first_called}\n", encoding="utf-8")
+    (d1 / "codex").chmod(0o755)
+    (d2 / "codex").write_text(f"#!/bin/sh\nprintf 'second' > {second_called}\n", encoding="utf-8")
+    (d2 / "codex").chmod(0o755)
+    # install-time нашёл d1/codex (раньше вшло бы в __SROUTER_CODEX_BIN__ и d2 был бы проигнорирован).
+    monkeypatch.setattr(srouter, "_codex_bin_path", lambda: str(d1 / "codex"))
+    _mock_home(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    srouter._install_codex_wrappers(env)
+    wrapper = Path.home() / "bin" / "codex"
+
+    # Caller с PATH, где d2 ПЕРВЫМ (минуя wrapper в ~/bin): wrapper должен взять d2/codex.
+    _subprocess.run([str(wrapper), "x"],
+                    env={**_os.environ, "PATH": f"{Path.home() / 'bin'}:{d2}:{d1}:/usr/bin:/bin"},
+                    check=True, timeout=10)
+    assert second_called.exists() and second_called.read_text(encoding="utf-8") == "second", \
+        "caller с PATH→d2 дошёл до d2/codex через runtime-резолв (не до вшитого d1)"
+    assert not first_called.exists(), "вшитый install-time codex НЕ выиграл у PATH caller'а"
+
+
+def test_wrapper_runtime_resolves_after_binary_change(monkeypatch, tmp_path):
+    """#144 подводный камень «незаметная смена binary после brew upgrade»: runtime-резолв берёт ТЕКУЩИЙ
+    codex из PATH. Сменился binary в том же пути — wrapper сам подхватывает новый, reinstall не нужен."""
+    marker = tmp_path / "marker.txt"
+    bin_slot = tmp_path / "slot"
+    bin_slot.mkdir()
+    wrapper = _install_with_path_resolving_wrapper(monkeypatch, tmp_path)
+
+    # Версия 1 по пути slot/codex.
+    (bin_slot / "codex").write_text(f"#!/bin/sh\nprintf 'v1' > {marker}\n", encoding="utf-8")
+    (bin_slot / "codex").chmod(0o755)
+    _subprocess.run([str(wrapper), "x"],
+                    env={**_os.environ, "PATH": f"{Path.home() / 'bin'}:{bin_slot}:/usr/bin:/bin"},
+                    check=True, timeout=10)
+    assert marker.read_text(encoding="utf-8") == "v1"
+
+    # brew upgrade: тот же путь, другой binary. БЕЗ reinstall wrapper'а.
+    (bin_slot / "codex").write_text(f"#!/bin/sh\nprintf 'v2' > {marker}\n", encoding="utf-8")
+    (bin_slot / "codex").chmod(0o755)
+    _subprocess.run([str(wrapper), "x"],
+                    env={**_os.environ, "PATH": f"{Path.home() / 'bin'}:{bin_slot}:/usr/bin:/bin"},
+                    check=True, timeout=10)
+    assert marker.read_text(encoding="utf-8") == "v2", "runtime-резолв подхватил обновлённый binary"
+
+
+def test_install_warns_about_uncovered_entry_points(monkeypatch, tmp_path):
+    """#144 подход A — best-effort, НЕ fail-closed. install обязан ЧЕСТНО предупредить оператора, что
+    wrapper НЕ покрывает: прямой абсолютный путь /opt/.../codex, node .../codex.js, exec.LookPath с
+    другим PATH. PF kill-switch — единственная настоящая граница (отдельная, здесь не трогаем)."""
+    home = _mock_home(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    fake_bin = tmp_path / "codex"
+    fake_bin.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_bin.chmod(0o755)
+    monkeypatch.setattr(srouter, "_codex_bin_path", lambda: str(fake_bin))
+
+    note = srouter._install_codex_wrappers(env)
+
+    low = note.lower()
+    assert ("best-effort" in low or "best effort" in low), \
+        f"install честно маркирует wrapper как best-effort (не fail-closed): {note}"
+    # Подсветка необёрнутых точек входа (хоть бы общим WARN «прямой вызов/абсолютный путь не покрыт»).
+    assert ("абсолют" in low or "напрям" in low or "не покрыт" in low
+            or "не перехват" in low or "не обёрнут" in low), \
+        f"install WARN про необёрнутые точки входа: {note}"
