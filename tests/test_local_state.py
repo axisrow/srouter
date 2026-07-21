@@ -640,3 +640,295 @@ def test_sync_route_ip_broken_xray_config_returns_false(tmp_path):
 def test_default_state_has_auto_route_sync_true():
     """auto_route_sync включён по умолчанию (новые инсталляции — с автосинком split-route)."""
     assert local_state._DEFAULT_STATE.get("auto_route_sync") is True
+
+
+# ============================ #136: routing-domains в production xray-config (hybrid adopt) ============================
+# srouter управляет routing.rules секцией reality-out: adopt существующего rule (маркер _srouter_managed),
+# домены хранит в state (active+hash), two-phase apply (backup→validate→restart→promote). НЕ захватывает
+# весь foreign-конфиг. Эталон read-xray: sync_route_ip_from_xray; atomic-save: save_state.
+
+def _write_xray_routing_config(p, domains, outbound="reality-out", managed=False):
+    """Минимальный xray-config с routing.rules[0]={outboundTag, domain} — как production.
+
+    managed=True → правило помечено _srouter_managed (после adopt). Имитирует текущий foreign
+    production-конфиг (28 доменов, БЕЗ маркера) при managed=False.
+    """
+    rule = {"type": "field", "outboundTag": outbound, "domain": list(domains)}
+    if managed:
+        rule["_srouter_managed"] = True
+    p.write_text(json.dumps({
+        "outbounds": [{"tag": outbound, "protocol": "vless"}],
+        "routing": {"rules": [rule, {"type": "field", "outboundTag": "direct"}]},
+    }), encoding="utf-8")
+
+
+def _ok_runner(calls):
+    """FakeRunner: записывает команды в calls, всегда rc=0 (для restart-тестов)."""
+    def run(cmd, timeout):
+        calls.append(list(cmd))
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+    return run
+
+
+def _port_checker_settle_then_up():
+    """port_checker по контракту _restart_component: settle → False (порт свободен), start → True.
+
+    _restart_component зовёт port_checker дважды: (1) poll освобождения порта (ждёт False),
+    (2) poll поднятия (ждёт True). Лента чередуется: первый вызов — busy (проверка settle на
+    занятом), но settle-цикл хочет увидеть освобождение. Простейшая корректная лента для успешного
+    рестарта: settle видит свободен (False), start видит поднят (True)."""
+    calls = {"n": 0}
+
+    def checker(host, port, timeout):
+        calls["n"] += 1
+        # нечётный вызов (settle-busy проверка) → False (порт свободен, можно стартовать);
+        # чётный (post-start поднятие) → True (поднят)
+        return calls["n"] % 2 == 0
+    return checker
+
+
+BASELINE_DOMAINS = ["domain:anthropic.com", "domain:github.com", "domain:youtube.com"]
+
+
+def test_routing_plan_add_domain():
+    """routing_plan строит новый домен-список (add), БЕЗ записи в config/state."""
+    new = local_state.routing_plan(BASELINE_DOMAINS, ["telegram.org"], action="add")
+    assert "domain:telegram.org" in new
+    assert "domain:anthropic.com" in new  # baseline сохранён
+    assert len(new) == len(BASELINE_DOMAINS) + 1
+
+
+def test_routing_plan_add_idempotent():
+    """Домен уже в списке → routing_plan no-op (не дублирует)."""
+    with_tg = BASELINE_DOMAINS + ["domain:telegram.org"]
+    new = local_state.routing_plan(with_tg, ["telegram.org"], action="add")
+    assert new.count("domain:telegram.org") == 1
+
+
+def test_routing_plan_remove_domain():
+    """routing_plan remove убирает домен."""
+    with_tg = BASELINE_DOMAINS + ["domain:telegram.org"]
+    new = local_state.routing_plan(with_tg, ["telegram.org"], action="remove")
+    assert "domain:telegram.org" not in new
+    assert "domain:anthropic.com" in new
+
+
+def test_routing_apply_adopt_captures_existing_and_adds(tmp_path):
+    """adopt foreign-config: захватывает существующие домены + добавляет telegram, ставит маркер,
+    пишет state (active+hash), restart xray. adopt — первый раз."""
+    xray_p = tmp_path / "xray-config.json"
+    state_p = tmp_path / "srouter.local.json"
+    _write_xray_routing_config(xray_p, BASELINE_DOMAINS, managed=False)  # foreign, без маркера
+    _write(state_p, {"nodes": []})
+    calls = []
+    r = local_state.routing_apply(
+        ["telegram.org"], action="add", adopt=True,
+        config_path=str(xray_p), state_path=state_p, runner=_ok_runner(calls),
+        port_checker=_port_checker_settle_then_up(),
+    )
+    assert r["ok"] is True, r
+    # config обновлён: telegram добавлен, правило помечено, baseline сохранён
+    cfg = json.loads(xray_p.read_text(encoding="utf-8"))
+    rule = cfg["routing"]["rules"][0]
+    assert rule.get("_srouter_managed") is True
+    assert "domain:telegram.org" in rule["domain"]
+    assert "domain:anthropic.com" in rule["domain"]
+    # restart xray вызвался (stop + start)
+    assert ["stop", "xray"] in [c[3:5] for c in calls] or any("stop" in c and "xray" in c for c in calls)
+    assert any("start" in c and "xray" in c for c in calls)
+
+
+def test_routing_apply_refuses_foreign_without_adopt(tmp_path):
+    """foreign-config без маркера И без adopt → ok:False (fail-closed, не захватывать чужое)."""
+    xray_p = tmp_path / "xray-config.json"
+    state_p = tmp_path / "srouter.local.json"
+    _write_xray_routing_config(xray_p, BASELINE_DOMAINS, managed=False)
+    _write(state_p, {"nodes": []})
+    calls = []
+    r = local_state.routing_apply(
+        ["telegram.org"], action="add", adopt=False,
+        config_path=str(xray_p), state_path=state_p, runner=_ok_runner(calls),
+        port_checker=_port_checker_settle_then_up(),
+    )
+    assert r["ok"] is False
+    # config НЕ тронут
+    cfg = json.loads(xray_p.read_text(encoding="utf-8"))
+    assert cfg["routing"]["rules"][0].get("_srouter_managed") is not True
+    assert calls == []  # restart не звался
+
+
+def test_routing_apply_idempotent_after_adopt(tmp_path):
+    """После adopt повторный add того же домена → changed:False, restart не нужен."""
+    xray_p = tmp_path / "xray-config.json"
+    state_p = tmp_path / "srouter.local.json"
+    _write_xray_routing_config(xray_p, BASELINE_DOMAINS + ["domain:telegram.org"], managed=True)
+    _write(state_p, {"nodes": [], "routing": {"active": BASELINE_DOMAINS + ["domain:telegram.org"],
+                                              "outbound": "reality-out"}})
+    calls = []
+    r = local_state.routing_apply(
+        ["telegram.org"], action="add", adopt=False,
+        config_path=str(xray_p), state_path=state_p, runner=_ok_runner(calls),
+        port_checker=_port_checker_settle_then_up(),
+    )
+    assert r["ok"] is True
+    assert r["changed"] is False
+    assert calls == []  # ничего не менялось → restart не нужен
+
+
+def test_routing_apply_hash_drift_refuses(tmp_path):
+    """Конфиг меняли руками после нашего apply (hash ≠ state) → refuse, не затереть чужие правки."""
+    xray_p = tmp_path / "xray-config.json"
+    state_p = tmp_path / "srouter.local.json"
+    _write_xray_routing_config(xray_p, BASELINE_DOMAINS + ["domain:telegram.org"], managed=True)
+    # state говорит hash от ДРУГОГО состава → drift
+    _write(state_p, {"nodes": [], "routing": {"active": ["domain:other.com"],
+                                              "outbound": "reality-out",
+                                              "last_applied_hash": "deadbeef"}})
+    calls = []
+    r = local_state.routing_apply(
+        ["telegram.org"], action="add", adopt=False,
+        config_path=str(xray_p), state_path=state_p, runner=_ok_runner(calls),
+        port_checker=_port_checker_settle_then_up(),
+    )
+    assert r["ok"] is False
+    assert "drift" in r.get("err", "").lower() or "drift" in str(r).lower()
+
+
+def test_routing_apply_corrupted_json_fail_soft(tmp_path):
+    """Битый xray-config → ok:False (fail-soft), не бросает, restart не зовётся."""
+    xray_p = tmp_path / "xray-config.json"
+    state_p = tmp_path / "srouter.local.json"
+    xray_p.write_text("{ not valid json", encoding="utf-8")
+    _write(state_p, {"nodes": []})
+    calls = []
+    r = local_state.routing_apply(
+        ["telegram.org"], action="add", adopt=True,
+        config_path=str(xray_p), state_path=state_p, runner=_ok_runner(calls),
+        port_checker=_port_checker_settle_then_up(),
+    )
+    assert r["ok"] is False
+    assert calls == []
+
+
+def test_routing_apply_restore_backup_on_restart_fail(tmp_path):
+    """restart xray упал → backup восстановлен, state active НЕ изменился (two-phase rollback)."""
+    xray_p = tmp_path / "xray-config.json"
+    state_p = tmp_path / "srouter.local.json"
+    _write_xray_routing_config(xray_p, BASELINE_DOMAINS, managed=True)
+    _write(state_p, {"nodes": [], "routing": {"active": BASELINE_DOMAINS, "outbound": "reality-out"}})
+    original = xray_p.read_text(encoding="utf-8")
+
+    def failing_runner(cmd, timeout):
+        # brew services start xray → rc=1 (restart провалился)
+        if "start" in cmd and "xray" in cmd:
+            return {"rc": 1, "out": "", "err": "xray_start_failed", "timeout": False}
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+
+    r = local_state.routing_apply(
+        ["telegram.org"], action="add", adopt=False,
+        config_path=str(xray_p), state_path=state_p, runner=failing_runner,
+        port_checker=_port_checker_settle_then_up(),
+    )
+    assert r["ok"] is False
+    # config восстановлен из backup (telegram НЕ добавлен)
+    assert xray_p.read_text(encoding="utf-8") == original
+    # state active НЕ обновлён (promote не произошёл)
+    st = json.loads(state_p.read_text(encoding="utf-8"))
+    assert "domain:telegram.org" not in st.get("routing", {}).get("active", [])
+
+
+def test_routing_apply_unreadable_state_refuses_without_touching_config(tmp_path):
+    """Битый srouter.local.json (существующий, но невалидный JSON) → refuse ДО любых мутаций конфига
+    (fail-closed): config НЕ меняется, xray НЕ трогается, state НЕ затирается дефолтом (data-loss
+    недопустим — потерял бы nodes/active_node/traffic_guard/isolate пользователя)."""
+    xray_p = tmp_path / "xray-config.json"
+    state_p = tmp_path / "srouter.local.json"
+    _write_xray_routing_config(xray_p, BASELINE_DOMAINS, managed=False)  # foreign, adopt-путь
+    original_config_text = xray_p.read_text(encoding="utf-8")
+    original_state_text = "{ this is broken json, not valid"
+    state_p.write_text(original_state_text, encoding="utf-8")
+    calls = []
+    r = local_state.routing_apply(
+        ["telegram.org"], action="add", adopt=True,
+        config_path=str(xray_p), state_path=state_p, runner=_ok_runner(calls),
+        port_checker=_port_checker_settle_then_up(),
+    )
+    assert r["ok"] is False
+    assert r.get("err") == "state_unreadable"
+    # ни config, ни state не тронуты — atomic no-op при unreadable state
+    assert xray_p.read_text(encoding="utf-8") == original_config_text
+    assert state_p.read_text(encoding="utf-8") == original_state_text
+    assert calls == []  # restart не звался
+
+
+def test_routing_apply_save_state_failure_rolls_back_config_not_partial(tmp_path, monkeypatch):
+    """Если save_state() проваливается (диск полон/permission) — весь apply откатывается
+    транзакционно (config тоже восстановлен из backup), а не оставляет config применённым при
+    несинхронизированном state (иначе — рассинхрон config↔state и ложный hash_drift при повторе)."""
+    xray_p = tmp_path / "xray-config.json"
+    state_p = tmp_path / "srouter.local.json"
+    _write_xray_routing_config(xray_p, BASELINE_DOMAINS, managed=True)
+    _write(state_p, {"nodes": [], "routing": {"active": BASELINE_DOMAINS, "outbound": "reality-out",
+                                              "last_applied_hash": local_state._routing_domains_hash(BASELINE_DOMAINS)}})
+    original_config_text = xray_p.read_text(encoding="utf-8")
+
+    monkeypatch.setattr(local_state, "save_state", lambda state, path=None: None)
+    calls = []
+    r1 = local_state.routing_apply(
+        ["telegram.org"], action="add", adopt=False,
+        config_path=str(xray_p), state_path=state_p, runner=_ok_runner(calls),
+        port_checker=_port_checker_settle_then_up(),
+    )
+    assert r1["ok"] is False
+    assert r1.get("err") == "state_write_failed"
+    # config откачен к оригиналу (не оставлен применённым при непросинканном state)
+    assert xray_p.read_text(encoding="utf-8") == original_config_text
+    # restart НЕ звался вовсе (state-write идёт до restart)
+    assert calls == []
+    monkeypatch.undo()
+
+    # повторный (легитимный) запрос после восстановления save_state — должен пройти нормально,
+    # НЕ словив ложный hash_drift (config так и не менялся, state тоже не менялся — оба согласованы)
+    calls2 = []
+    r2 = local_state.routing_apply(
+        ["telegram.org"], action="add", adopt=False,
+        config_path=str(xray_p), state_path=state_p, runner=_ok_runner(calls2),
+        port_checker=_port_checker_settle_then_up(),
+    )
+    assert r2["ok"] is True, r2
+    assert r2["changed"] is True
+
+
+def test_routing_apply_restart_fail_recovers_xray_with_restored_config(tmp_path):
+    """restart с НОВЫМ конфигом падает (xray_start_failed) → config откатывается к backup, И xray
+    ПЕРЕЗАПУСКАЕТСЯ со старым (восстановленным) конфигом — не остаётся stopped (Codex round 2:
+    _restart_component уже сделал stop к моменту провала start; без повторного start после rollback
+    рутинная неудачная операция routing add-domain превращается в постоянный простой всего прокси)."""
+    xray_p = tmp_path / "xray-config.json"
+    state_p = tmp_path / "srouter.local.json"
+    _write_xray_routing_config(xray_p, BASELINE_DOMAINS, managed=True)
+    _write(state_p, {"nodes": [], "routing": {"active": BASELINE_DOMAINS, "outbound": "reality-out",
+                                              "last_applied_hash": local_state._routing_domains_hash(BASELINE_DOMAINS)}})
+
+    attempt = {"n": 0}
+
+    def flaky_runner(cmd, timeout):
+        if "start" in cmd and "xray" in cmd:
+            attempt["n"] += 1
+            if attempt["n"] == 1:
+                return {"rc": 1, "out": "", "err": "xray_start_failed", "timeout": False}
+            return {"rc": 0, "out": "", "err": "", "timeout": False}  # recovery start succeeds
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+
+    r = local_state.routing_apply(
+        ["telegram.org"], action="add", adopt=False,
+        config_path=str(xray_p), state_path=state_p, runner=flaky_runner,
+        port_checker=_port_checker_settle_then_up(),
+    )
+    assert r["ok"] is False
+    assert r.get("err", "").startswith("restart_failed")
+    # xray был перезапущен СО СТАРЫМ конфигом после провала — не остался stopped
+    assert attempt["n"] == 2, f"ожидался повторный start (recovery) после провала первого: {attempt}"
+    # config на диске — старый (без telegram), но xray снова работает с ним
+    cfg = json.loads(xray_p.read_text(encoding="utf-8"))
+    assert "domain:telegram.org" not in cfg["routing"]["rules"][0]["domain"]
