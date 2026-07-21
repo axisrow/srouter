@@ -116,21 +116,17 @@ def _versions_monkey(monkeypatch, tmp_path):
 
 def test_codex_two_binaries_different_provenance_both_shown(_versions_monkey, tmp_path):
     """ДЫРА #145: doctor видел только ЖИВЫЕ процессы. Два codex-binary на диске разного provenance
-    (npm + homebrew-dir) → чек показывает ОБА."""
+    (npm + homebrew-dir) → чек показывает ОБА. Wrapper в ~/bin/codex отсутствует."""
     brew_codex = "/opt/homebrew/bin/codex"
     local_codex = "/usr/local/bin/codex"
     files = {
-        brew_codex: "#!/usr/bin/env node\n",   # real npm binary (Apple-Silicon не важно)
-        local_codex: "#!/usr/bin/env node\n",  # второй real binary (ручная установка)
-        str(tmp_path / "bin" / "codex"): None,  # нет wrapper'а (каталог bin есть, codex там — ниже)
+        brew_codex: "#!/usr/bin/env node\n",   # homebrew-binary
+        local_codex: "#!/usr/bin/env node\n",  # второй binary (ручная установка)
     }
-    # НЕТ wrapper'а в ~/bin/codex (удаляем запись — каталог bin без файла)
-    files = {brew_codex: files[brew_codex], local_codex: files[local_codex]}
-    apply = _versions_monkey
-    apply(files,
-          which_codex=[brew_codex, local_codex],
-          codex_versions={brew_codex: "codex-cli 0.144.6",
-                          local_codex: "codex-cli 0.144.5"})
+    _versions_monkey(files,
+                     which_codex=[brew_codex, local_codex],
+                     codex_versions={brew_codex: "codex-cli 0.144.6",
+                                     local_codex: "codex-cli 0.144.5"})
 
     res = health._installed_versions_check()
     assert res["status"] == "ok", "что-то установлено → ok (info-only, не роняет)"
@@ -139,7 +135,7 @@ def test_codex_two_binaries_different_provenance_both_shown(_versions_monkey, tm
         f"оба codex-binary должны детектиться, got {paths}"
     provs = {b["path"]: b["provenance"] for b in res["codex"]}
     assert provs[brew_codex] != provs[local_codex], \
-        "разные provenance (homebrew vs usr/local) — не должны склеиваться"
+        "разные provenance (homebrew vs usr-local) — не должны склеиваться"
 
 
 # ============================ (2) wrapper + real → оба детектятся, wrapper помечен «обёрнут» ============================

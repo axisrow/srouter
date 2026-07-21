@@ -516,7 +516,7 @@ def _claude_provenance(path):
     p = str(path)
     if "/versions/" in p:
         return "version-runner"
-    if ".app" in p or "/ClaudeCode.app" in p:
+    if "/ClaudeCode.app" in p:
         return "gui-app"
     return "cli"
 
