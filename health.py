@@ -606,27 +606,31 @@ def cmd_watchdog():
     ppp-hook не сработал (utun-VPN) — пользователь видит нотификацию и手动но ensure-split-route-root.
     """
     result = check_all(active_claude=False)
-    is_ok = result["status"] == "ok"
+    cur = result["status"]
     try:
-        prev_state = WATCHDOG_STATE.read_text().strip() if WATCHDOG_STATE.exists() else ""
+        prev = WATCHDOG_STATE.read_text().strip() if WATCHDOG_STATE.exists() else ""
     except Exception:
-        prev_state = ""
-    was_down = prev_state in ("down", "")  # был down или неизвестен (fresh state)
+        prev = ""
 
-    if not is_ok and not was_down:
-        # Переход НЕ-down (ok/degraded) → down — кричим громко (#109: не только ok→down).
+    # Exact-state transitions (#109 + cycle-review #133 C1):
+    # Пуш при переходе ok/degraded → down (новое падение). Не пушить degraded→degraded (спам!).
+    # Восстановление при down/degraded → ok.
+    if cur == "down" and prev in ("ok", "degraded", ""):
+        # Новое падение (ok→down, degraded→down, fresh→down).
         failed = ", ".join(c["name"] for c in result["checks"] if not c["ok"] and not c.get("info"))
         _notify(f"туннель/стек упал ({failed})", "Basso")
-    elif is_ok and was_down:
-        # Восстановление (down/degraded → ok) — тихое уведомление.
-        _notify("стек восстановлен", "Glass")
-    # down→down / ok→ok — молча (не спамим).
+    elif cur == "ok" and prev in ("down", "degraded", ""):
+        # Восстановление (down→ok, degraded→ok, fresh→ok не пушим — fresh = первый прогон).
+        if prev in ("down", "degraded"):
+            _notify("стек восстановлен", "Glass")
+    # down→down, degraded→degraded, ok→degraded — молча (не спамим).
+    # ok→degraded НЕ пушим (degraded — не «упал», просто «часть жива»).
 
     try:
         WATCHDOG_STATE.write_text(result["status"])
     except Exception:
         pass  # state — best-effort
-    return 0 if is_ok else 1
+    return 0 if cur == "ok" else 1
 
 
 def main(argv=None):
