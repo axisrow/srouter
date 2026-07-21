@@ -559,9 +559,9 @@ def _print_report(result):
     """Человекочитаемый отчёт check_all (для doctor). Вывод в stdout."""
     print(f"srouter health: {result['status'].upper()}\n")
     for c in result["checks"]:
-        # info-only check (например claude-proxy когда CC не запущен) — ℹ️, не ❌: он не роняет
-        # вердикт и не означает сбой, просто «не применимо сейчас».
-        mark = "ℹ️" if c.get("info") else ("✅" if c["ok"] else "❌")
+        # info-only check: endpoint-override (WARN), claude-proxy idle (нейтрально).
+        # ⚠️ — жёлтый треугольник (привлекает внимание, но не ❌): override/idle, а не «всё мертво».
+        mark = "⚠️" if c.get("info") else ("✅" if c["ok"] else "❌")
         detail = f" ({c['detail']})" if c.get("detail") else ""
         print(f"  {mark} {c['name']}{detail}")
     if result["status"] != "ok":
