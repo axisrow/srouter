@@ -299,8 +299,11 @@ def _zshrc_path() -> Path:
 
 
 def _codex_bin_path() -> str:
-    """Абсолютный путь к реальному codex binary (не наш wrapper). shutil.which минуя ~/bin/codex,
-    fallback на homebrew-пути (Apple Silicon / Intel). None если не найден — wrapper будет WARN."""
+    """Абсолютный путь к реальному codex binary (не наш wrapper) — install-time GATE: отвечает только
+    на вопрос «есть ли на диске хоть один codex» (если нет → WARN, wrapper не ставится). ПУТЬ сюда НЕ
+    вшивается: с #144 CLI-wrapper runtime-резолвит codex по PATH вызывающего минуя себя (подход A),
+    так что >1 binary на диске и смена binary после brew upgrade покрыты без reinstall.
+    shutil.which минуя ~/bin/codex, fallback на homebrew-пути (Apple Silicon / Intel). '' если не найден."""
     wrapper = _codex_wrapper_path("codex")
     found = shutil.which("codex")
     if found and Path(found).resolve() != wrapper.resolve():
@@ -338,18 +341,23 @@ def _install_one_wrapper(env, wrapper_path: Path, template_name: str, marker: st
         if not codex_bin:
             return f"Codex {wrapper_path.name}: codex binary не найден — wrapper не установлен (установи codex)."
         template = (env.root / "launchagents" / template_name).read_text(encoding="utf-8")
-        # Рендер всех плейсхолдеров из единого источника правды (_CODEX_PROXY_URL/CODEX_NO_PROXY),
-        # не хардкод литералов. CLI-wrapper (srouter-codex-cli-wrapper.sh) использует все три;
-        # App-wrapper (__SROUTER_CODEX_BIN__) — только бинарь (прочие плейсхолдеры там отсутствуют,
-        # .replace на отсутствующую подстроку — no-op). Issue #96.
+        # Рендер плейсхолдеров из единого источника правды (_CODEX_PROXY_URL/CODEX_NO_PROXY), не хардкод
+        # литералов. CLI-wrapper (srouter-codex-cli-wrapper.sh) использует только эти два: реальный codex
+        # он РАНТАЙМ-резолвит по PATH минуя себя (#144, подход A), абсолютный путь НЕ вшивается. App-wrapper
+        # плейсхолдеров прокси не содержит (.replace на отсутствующей подстроке — no-op).
         rendered = (template
-                    .replace("__SROUTER_CODEX_BIN__", codex_bin)
                     .replace("__SROUTER_CODEX_PROXY_URL__", _CODEX_PROXY_URL)
                     .replace("__SROUTER_CODEX_NO_PROXY__", CODEX_NO_PROXY))
         wrapper_path.parent.mkdir(parents=True, exist_ok=True)
         if not _write_text_atomic(wrapper_path, rendered):
             return f"Codex {wrapper_path.name}: не записан (ошибка atomic write)."
         wrapper_path.chmod(0o755)
+        # CLI-wrapper: best-effort layer (#144). Не fail-closed — честная граница = PF kill-switch.
+        if wrapper_path.name == "codex":
+            return (f"Codex {wrapper_path.name}: установлен ({wrapper_path} — SOCKS5 минуя privoxy). "
+                    f"Best-effort (НЕ fail-closed): runtime-резолвит codex по PATH вызывающего. "
+                    f"НЕ перехватывает прямой абсолютный путь к binary, `node codex.js` и вызов с "
+                    f"другим PATH — настоящая fail-closed граница = PF kill-switch (isolate_firewall.py).")
         return f"Codex {wrapper_path.name}: установлен ({wrapper_path} — SOCKS5 минуя privoxy)."
     except Exception as exc:
         return f"Codex {wrapper_path.name}: не установлен ({str(exc)[:80]})."

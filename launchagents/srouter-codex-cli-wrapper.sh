@@ -12,12 +12,81 @@
 # детерминированно выставляет SOCKS5. Это гарантирует SOCKS-маршрут независимо от того, кто и как
 # испортил окружение до нас. Одного -u недостаточно (даст direct) — всегда переустанавливаем.
 #
+# Issue #144 (подход A): реальный codex НЕ вшивается install-тайм. Wrapper РАНТАЙМ-резолвит его по
+# PATH ВЫЗЫВАЮЩЕЙ оболочки, МИНУЯ сам себя (антирекурсия). Один wrapper ловит любую версию codex,
+# оказавшуюся в PATH caller'а — в т.ч. после brew upgrade (binary сменился в том же пути → подхватится
+# автоматически, reinstall не нужен). Раньше путь вшивался install-тайм в обёртку → >1 codex на диске
+# или caller с другим PATH шли напрямую (fail-closed нарушен).
+#
+# ГРАНИЦА — BEST-EFFORT, НЕ fail-closed: wrapper перехватывает ТОЛЬКО вызовы, дошедшие до этого файла
+# (через ~/bin/codex или shell-функцию codex() в ~/.zshrc). Прямой абсолютный путь /opt/.../codex,
+# `node .../codex.js`, exec.LookPath с другим PATH (AO-worktree) — НЕ перехватываются. Настоящая
+# fail-closed граница = сетевой PF kill-switch (isolate_firewall.py, отдельный слой).
+#
 # Вызывается shell-функцией codex() из ~/.zshrc по абсолютному пути (srouter install) — тогда порядок
 # brew в PATH не важен. Для не-zsh вызывающих сторон (bash, command codex, GUI) стабильная точка
 # входа — сам этот launcher ~/bin/codex.
 # Первый комментарий — маркер srouter (uninstall удаляет только своё, чужой wrapper не трогает).
 PROXY="__SROUTER_CODEX_PROXY_URL__"
 LOOPBACK="__SROUTER_CODEX_NO_PROXY__"
+
+# Свой fingerprint для антирекурсии: realpath (ловит symlink на wrapper) + inode:device (ловит
+# hardlink на wrapper — тот же inode, но другой realpath; сравнение только по realpath его пропускает).
+# readlink -f доступен в macOS /bin/sh (BSD readlink поддерживает -f с Monterey+); fallback — $0.
+# stat -f '%i %d' (inode device) — BSD stat на macOS; fallback — пустой fingerprint (только realpath).
+SELF="$0"
+SELF_REAL="$SELF"
+if command -v readlink >/dev/null 2>&1; then
+  _rl="$(readlink -f "$SELF" 2>/dev/null)" && [ -n "$_rl" ] && SELF_REAL="$_rl"
+fi
+SELF_INO=""
+if command -v stat >/dev/null 2>&1; then
+  _si="$(stat -f '%i %d' "$SELF_REAL" 2>/dev/null)" && [ -n "$_si" ] && SELF_INO="$_si"
+fi
+
+# Рантайм-резолв codex по PATH вызывающего, минуя сам wrapper. Обходим каждую директорию PATH, ищем
+# первый codex, который НЕ является самим wrapper'ом (ни по realpath, ни по inode:device).
+# Инвариант: wrapper никогда не exec'нет сам себя — ни напрямую, ни через symlink, ни через hardlink (#144).
+_codex_bin=""
+_save_IFS="$IFS"
+IFS=":"
+for _dir in $PATH; do
+  IFS="$_save_IFS"
+  [ -z "$_dir" ] && continue
+  _cand="$_dir/codex"
+  # -x проверяет executable (как test -x); пропускаем директории/несуществующие.
+  [ -f "$_cand" ] && [ -x "$_cand" ] || continue
+  _cand_real="$_cand"
+  if command -v readlink >/dev/null 2>&1; then
+    _cr="$(readlink -f "$_cand" 2>/dev/null)" && [ -n "$_cr" ] && _cand_real="$_cr"
+  fi
+  # Антирекурсия — symlink-случай: canonical path кандидата совпадает с wrapper'ом.
+  [ "$_cand_real" = "$SELF_REAL" ] && continue
+  # Антирекурсия — hardlink-случай: тот же inode+device (разный путь, тот же файл). Сравниваем только
+  # при наличии обоих fingerprints (иначе неопределённое совпадение пустых строк дало бы false-positive skip).
+  if [ -n "$SELF_INO" ] && command -v stat >/dev/null 2>&1; then
+    _ci="$(stat -f '%i %d' "$_cand_real" 2>/dev/null)" && [ -n "$_ci" ] && [ "$_ci" = "$SELF_INO" ] && continue
+  fi
+  # Антирекурсия — корневой инвариант: skip'аем ЛЮБУЮ управляемую srouter-копию (а не только себя).
+  # Две независимые копии wrapper'а в PATH (разные inode/realpath) дают бесконечный ping-pong: A exec'ает
+  # B как «реальный codex», B exec'ает A. Управляемый wrapper отличим от реального codex ТОЛЬКО по
+  # srouter-маркеру в содержимом (первый комментарий), не по пути/inode. grep по первым строкам; marker
+  # в начале файла, читаем лимит строк. grep/sed/head — стандартные утилиты /usr/bin; fallback пропускает
+  # проверку (только realpath+inode), не крашит.
+  if command -v grep >/dev/null 2>&1; then
+    if grep -q 'srouter: codex CLI wrapper' "$_cand" 2>/dev/null; then
+      continue
+    fi
+  fi
+  _codex_bin="$_cand"
+  break
+done
+IFS="$_save_IFS"
+
+if [ -z "$_codex_bin" ]; then
+  printf 'srouter codex wrapper: реальный codex не найден в PATH (минуя wrapper). Установи codex.\n' >&2
+  exit 127
+fi
 
 exec /usr/bin/env \
   -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
@@ -26,4 +95,4 @@ exec /usr/bin/env \
   HTTP_PROXY="$PROXY" HTTPS_PROXY="$PROXY" ALL_PROXY="$PROXY" \
   http_proxy="$PROXY" https_proxy="$PROXY" all_proxy="$PROXY" \
   NO_PROXY="$LOOPBACK" no_proxy="$LOOPBACK" \
-  __SROUTER_CODEX_BIN__ "$@"
+  "$_codex_bin" "$@"
