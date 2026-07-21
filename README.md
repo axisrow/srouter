@@ -191,12 +191,27 @@ srouter doctor         # диагностика: порты + туннель + C
 srouter start          # запустить демон (если LaunchAgent уже установлен)
 srouter stop           # остановить демон (plist сохранён)
 srouter restart        # перезапустить демон (применить правки кода)
+
+# Радикальная защита Privoxy от команд пользовательских агентов (#122):
+srouter privoxy protect --strict  # разовый перенос в system-domain; потребует пароль
+srouter privoxy status            # read-only, без пароля
+srouter privoxy restart           # каждый раз требует пароль/Touch ID
+srouter privoxy unprotect         # защищённый откат к прежней user-службе
 ```
 
 `srouter install` / `uninstall` управляют **всем стеком** (brew-сервисы, конфиги, DNS, LaunchAgent,
 watchdog, ppp-hook, Claude Code/git-прокси, Codex SOCKS5-wrappers + env). `start`/`stop`/`restart` — только демоном дашборда.
 `doctor` — разовая диагностика здоровья. Watchdog (запускается автоматически) — нотификация при
 падении туннеля. Неинтерактивный путь для CI/скриптов — `./install.sh apply` (см. `install_lib.py`).
+
+`privoxy protect --strict` переносит только Privoxy в root-controlled LaunchDaemon, но запускает
+сам proxy от бесправного пользователя `nobody`. Его plist/config становятся недоступны для записи
+обычным процессам. Исполняемый файл и нужные библиотеки копируются из Homebrew в root-owned каталог,
+поэтому последующее изменение/обновление Homebrew не подменяет запущенную службу. Strict-режим
+устанавливает `sudo timestamp_timeout=0`: любое `sudo` на этом Mac после этого требует нового
+подтверждения. Dashboard не может управлять защищённым Privoxy — только показывает состояние и
+направляет к ручной CLI-команде. `srouter install` распознаёт этот режим и не создаёт конкурирующий
+пользовательский Privoxy.
 
 ## VPN и split-route
 
@@ -398,12 +413,26 @@ srouter doctor         # diagnostics: ports + tunnel + Claude-proxy (✅/❌)
 srouter start          # start the daemon (if the LaunchAgent is already installed)
 srouter stop           # stop the daemon (the plist is kept)
 srouter restart        # restart the daemon (apply code changes)
+
+# Protect Privoxy from unprivileged agent lifecycle commands (#122):
+srouter privoxy protect --strict  # one-time system-domain migration; asks for authorization
+srouter privoxy status            # read-only, no password
+srouter privoxy restart           # requires password/Touch ID every time
+srouter privoxy unprotect         # privileged rollback to the previous user service
 ```
 
 `srouter install` / `uninstall` manage the **entire stack** (brew services, configs, DNS, LaunchAgent,
 watchdog, ppp-hook, Claude Code/git proxy). `start`/`stop`/`restart` — only the dashboard daemon.
 `doctor` — one-shot health diagnostics. Watchdog (auto-loaded) — notification on tunnel drop.
 Non-interactive path for CI/scripts — `./install.sh apply` (see `install_lib.py`).
+
+`privoxy protect --strict` moves only Privoxy to a root-controlled LaunchDaemon while the proxy
+itself runs as the unprivileged `nobody` user. Its plist/config are not writable by normal processes.
+The Privoxy executable and required libraries are copied out of user-owned Homebrew into a root-owned
+directory, so a later Homebrew change cannot replace the running service. Strict mode installs
+`sudo timestamp_timeout=0`, so every sudo command on this Mac requires fresh authorization. The
+dashboard cannot mutate protected Privoxy, and later `srouter install` runs keep the protected service
+instead of creating a competing user service.
 
 ## VPN and split-route
 

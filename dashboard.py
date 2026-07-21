@@ -28,6 +28,7 @@ import isolate_firewall  # PF-изоляция доменов: зовём чер
 import git_proxy  # вкл/откл git-прокси для github (через git config --global)
 import claude_proxy  # вкл/откл HTTPS_PROXY для Claude Code (~/.claude/settings.json)
 import health  # check_all для /health эндпоинта
+import privoxy_system  # protected system-service gate (#122)
 
 # Активный узел нельзя замораживать на import: #8 меняет srouter.local.json в рантайме.
 # Эти имена оставлены только для совместимости старых импорт-тестов; рабочий код ниже
@@ -232,6 +233,13 @@ def _throttle_result(r):
 
 # ============================ non-privileged: сервисы ============================
 def service_control(name, action):
+    if name == "privoxy" and privoxy_system.protection_present():
+        return {
+            "rc": 77,
+            "out": "",
+            "err": "privoxy_protected: используйте `srouter privoxy start|stop|restart`",
+            "timeout": False,
+        }
     return sys_probe.run([BREW, "services", action, name], timeout=20)
 
 
@@ -480,7 +488,8 @@ def api_service(name, action):
     if name not in ("xray", "privoxy") or action not in ("start", "stop", "restart"):
         return jsonify({"ok": False, "err": "not allowed"}), 400
     r = service_control(name, action)
-    return jsonify({"ok": r["rc"] == 0, **r})
+    status = 409 if r.get("rc") == 77 else 200
+    return jsonify({"ok": r["rc"] == 0, **r}), status
 
 
 @app.get("/api/guard")

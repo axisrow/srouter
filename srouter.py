@@ -58,6 +58,7 @@ from sys_probe import run
 
 import claude_proxy  # вкл/откл HTTPS_PROXY для Claude Code (~/.claude/settings.json)
 import health  # doctor-проверки стека
+import privoxy_system  # root-gated system LaunchDaemon для Privoxy (#122)
 
 # OSASCRIPT отсутствует в install_lib — локальная константа (копия dashboard_common).
 OSASCRIPT = "/usr/bin/osascript"
@@ -772,6 +773,31 @@ def cmd_uninstall(args) -> int:
         print("uninstall отменён.")
         return 1
 
+    # Защищённый Privoxy нельзя отдавать legacy apply_uninstall: тот управляет пользовательскими
+    # brew-services и не имеет права писать /Library. Сначала одной root-транзакцией возвращаем
+    # прежний user-service/state, затем обычный uninstall применяет существующую provenance-семантику.
+    env_state_path = getattr(env, "state_path", None)
+    protected_state = bool(env_state_path) and privoxy_system.state_protected(env_state_path)
+    physical_protected = False
+    if isinstance(env, InstallEnv) and env_state_path:
+        try:
+            physical_protected = (
+                Path(env_state_path).resolve() == (Path(__file__).resolve().parent / "srouter.local.json").resolve()
+                and privoxy_system.protection_present()
+            )
+        except OSError:
+            physical_protected = False
+    if physical_protected or protected_state:
+        protected = privoxy_system.unprotect(
+            state_path=env_state_path or state_path or InstallEnv.from_env().state_path,
+            restore=True,
+            runner=run,
+        )
+        if not protected.get("ok"):
+            print(f"uninstall остановлен: защищённый privoxy не восстановлен "
+                  f"({protected.get('error', 'unknown')})", file=sys.stderr)
+            return 2
+
     # 3) apply_uninstall: ВСЕ 4 категории. Сам остановит сервисы и выгрузит демон.
     result = apply_uninstall(
         env=env,
@@ -968,6 +994,64 @@ def cmd_doctor(args) -> int:
     return 0 if result["status"] == "ok" else 1
 
 
+def cmd_privoxy(args) -> int:
+    """Ручное root-gated управление защищённым Privoxy (#122)."""
+    action = getattr(args, "privoxy_action", None)
+    state_path = getattr(args, "state", None) or InstallEnv.from_env().state_path
+    prefix = getattr(args, "prefix", None) or "/opt/homebrew"
+
+    if action == "status":
+        result = privoxy_system.status(runner=run)
+        protection = "защищён" if result["protected"] else "не защищён"
+        loaded = "загружен" if result["loaded"] else "не загружен"
+        port = "8118 слушает" if result["port_up"] else "8118 закрыт"
+        owner = result.get("owner") or "-"
+        shadow = "; ВНИМАНИЕ: загружена user-копия" if result.get("user_shadow_loaded") else ""
+        writable = ""
+        if (result.get("config_writable") is True or result.get("binary_writable") is True
+                or result.get("assets_writable") is True):
+            writable = "; ВНИМАНИЕ: защищённые файлы доступны для записи"
+        print(f"Privoxy: {protection}; {loaded}; {port}; PID={result.get('pid') or '-'}; "
+              f"user={owner}{shadow}{writable}")
+        healthy = (
+            result["protected"]
+            and result["loaded"]
+            and result["port_up"]
+            and result.get("owner") == "nobody"
+            and result.get("config_writable") is False
+            and result.get("binary_writable") is False
+            and result.get("assets_writable") is False
+            and not result.get("user_shadow_loaded")
+        )
+        return 0 if healthy else 1
+
+    if action == "protect":
+        if not getattr(args, "strict", False):
+            print("protect требует явный флаг --strict (sudo будет спрашивать подтверждение каждый раз).",
+                  file=sys.stderr)
+            return 2
+        result = privoxy_system.protect(state_path=state_path, prefix=prefix, runner=run)
+    elif action == "unprotect":
+        result = privoxy_system.unprotect(state_path=state_path, restore=True, runner=run)
+    elif action in ("start", "stop", "restart"):
+        result = privoxy_system.control(action, runner=run)
+    else:
+        print(f"privoxy: неизвестное действие {action!r}", file=sys.stderr)
+        return 2
+
+    if not result.get("ok"):
+        print(f"privoxy {action}: {result.get('error', 'failed')}", file=sys.stderr)
+        status = result.get("status")
+        if status:
+            print(f"  protected={status.get('protected')} loaded={status.get('loaded')} "
+                  f"port_up={status.get('port_up')} owner={status.get('owner') or '-'}",
+                  file=sys.stderr)
+        return 2
+    changed = "изменён" if result.get("changed", True) else "уже в нужном состоянии"
+    print(f"Privoxy {action}: {changed}.")
+    return 0
+
+
 def cmd_routing(args) -> int:
     """Управление routing-доменами production xray-config (#136).
 
@@ -1109,6 +1193,25 @@ def build_parser() -> argparse.ArgumentParser:
                             help="Принять секцию reality-out под управление (первый раз). "
                                  "Существующие домены сохраняются, добавляется маркер _srouter_managed.")
         sp.set_defaults(func=cmd_routing)
+
+    # privoxy (#122): статус read-only; любые мутации идут через root-owned helper и свежий sudo.
+    p_privoxy = sub.add_parser("privoxy", help="Защищённый system-режим Privoxy.")
+    p_privoxy_sub = p_privoxy.add_subparsers(dest="privoxy_action", required=True)
+    for sub_name, sub_help in (
+        ("status", "Показать защищённый статус без sudo."),
+        ("protect", "Перенести Privoxy в system LaunchDaemon."),
+        ("start", "Запустить защищённый Privoxy."),
+        ("stop", "Остановить защищённый Privoxy."),
+        ("restart", "Перезапустить защищённый Privoxy."),
+        ("unprotect", "Вернуть прежний пользовательский service/config."),
+    ):
+        sp = p_privoxy_sub.add_parser(sub_name, help=sub_help)
+        sp.add_argument("--state", default=None, help="Путь к srouter.local.json.")
+        if sub_name == "protect":
+            sp.add_argument("--prefix", default=None, help="Homebrew prefix (/opt/homebrew или /usr/local).")
+            sp.add_argument("--strict", action="store_true",
+                            help="Отключить sudo timestamp cache для текущего пользователя.")
+        sp.set_defaults(func=cmd_privoxy)
     return parser
 
 

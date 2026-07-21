@@ -20,6 +20,7 @@ import tempfile
 from urllib.parse import urlparse
 
 import sys_probe
+import privoxy_system
 
 # Абсолютные пути: launchd/GUI PATH их не содержит (канон проекта).
 CURL = "/usr/bin/curl"
@@ -60,6 +61,10 @@ CLAUDE_DUMMY_API_KEY = "sk-ant-srouter-transport-probe-invalid"
 
 def _port_up(port):
     """Слушает ли кто-то TCP порт (быстро, без сети). True/False."""
+    if port == PRIVOXY_PORT and privoxy_system.protection_present():
+        # macOS скрывает fd system-daemon пользователя `nobody` от обычного `lsof`, поэтому после
+        # #122 lsof даёт ложный down. Loopback connect проверяет именно доступность 8118 без sudo.
+        return sys_probe.port_open("127.0.0.1", port, timeout=0.5)
     r = sys_probe.run([LSOF, "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"], timeout=3)
     if r.get("timeout"):
         return False
@@ -664,20 +669,24 @@ def _launchd_int(output, key):
         return None
 
 
-def _launchd_job_snapshot(label, *, plist_path=None):
+def _launchd_job_snapshot(label, *, plist_path=None, domain=None):
     """Компактный forensic snapshot launchd job без домыслов о причине отсутствия.
 
     KeepAlive-restart сохраняет загруженный label и plist, но меняет pid/runs/last-exit. Внешний
     `bootout` даёт loaded=false; последующий `brew services start` обычно меняет plist mtime/inode и
     сбрасывает runs. Эта разница нужна для #132: строка startup banner сама по себе её не показывает.
     """
+    domain = domain or f"gui/{os.getuid()}"
     if plist_path is None:
-        plist_path = Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
+        if domain == "system":
+            plist_path = Path("/Library/LaunchDaemons") / f"{label}.plist"
+        else:
+            plist_path = Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
     else:
         plist_path = Path(plist_path)
 
     result = sys_probe.run(
-        [LAUNCHCTL, "print", f"gui/{os.getuid()}/{label}"],
+        [LAUNCHCTL, "print", f"{domain}/{label}"],
         timeout=3,
     )
     output = result.get("out") or ""
@@ -696,6 +705,7 @@ def _launchd_job_snapshot(label, *, plist_path=None):
 
     return {
         "label": label,
+        "domain": domain,
         "loaded": loaded,
         "state": _launchd_field(output, "state") if loaded else None,
         "pid": _launchd_int(output, "pid") if loaded else None,
@@ -710,9 +720,14 @@ def _launchd_job_snapshot(label, *, plist_path=None):
 
 
 def _collect_launchd_lifecycle():
-    """Снимок двух симметричных Homebrew jobs; xray — стабильный контроль для #132."""
+    """Privoxy снимается в фактическом domain; xray остаётся стабильным user-контролем."""
+    protected = privoxy_system.protection_present()
     return {
-        "privoxy": _launchd_job_snapshot("homebrew.mxcl.privoxy"),
+        "privoxy": _launchd_job_snapshot(
+            privoxy_system.SYSTEM_LABEL if protected else "homebrew.mxcl.privoxy",
+            plist_path=(privoxy_system.DEFAULT_LAYOUT.launchdaemon_path if protected else None),
+            domain=("system" if protected else None),
+        ),
         "xray": _launchd_job_snapshot("homebrew.mxcl.xray"),
     }
 
@@ -773,8 +788,14 @@ def _print_report(result):
     if result["status"] != "ok":
         print("\nЧто проверить:")
         failed_names = " ".join(c["name"] for c in result["checks"] if not c["ok"] and not c.get("info"))
-        if "privoxy" in failed_names or "xray" in failed_names:
-            print("  • brew services restart xray privoxy  (или srouter install)")
+        if "privoxy" in failed_names:
+            if privoxy_system.protection_present():
+                print("  • Privoxy защищён: выполни `srouter privoxy status`, затем вручную "
+                      "`srouter privoxy restart` (потребуется подтверждение)")
+            else:
+                print("  • privoxy: brew services restart privoxy  (или srouter install)")
+        if "xray" in failed_names:
+            print("  • xray: brew services restart xray  (или srouter install)")
         if "туннель" in failed_names:
             print("  • туннель: проверь узел (srouter status / дашборд nodes), возможно узел недоступен")
         if "dashboard" in failed_names:
