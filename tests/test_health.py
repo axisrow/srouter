@@ -367,3 +367,69 @@ def test_tunnel_up_first_target_down_second_up(monkeypatch):
                         _tunnel_curl_per_target({"anthropic": "000", "openai": "200"}))
     ok, _ = health._tunnel_up()
     assert ok is True
+
+
+# ============================ #129: endpoint-override detection (ANTHROPIC_BASE_URL) ============================
+# Doctor должен детектить нестандартный ANTHROPIC_BASE_URL + NO_PROXY masking.
+# Урок #127: doctor был слеп к endpoint-override → ложный SOCKS5-тест (CC к z.ai напрямую, не через прокси).
+
+def test_endpoint_check_silent_when_standard(monkeypatch):
+    """BASE_URL не задан (дефолт api.anthropic.com) → ok, silent."""
+    monkeypatch.setattr(health, "_read_endpoint_config",
+                        lambda: {"base_url": "", "no_proxy": "", "source": "shell"})
+    res = health._endpoint_override_check()
+    assert res["status"] == "ok"
+    assert "стандарт" in res["detail"].lower()
+
+
+def test_endpoint_check_ok_when_exact_anthropic_host(monkeypatch):
+    """C2: hostname == api.anthropic.com (exact match) → ok, даже если в пути есть другие домены."""
+    monkeypatch.setattr(health, "_read_endpoint_config",
+                        lambda: {"base_url": "https://api.anthropic.com/v1/messages",
+                                 "no_proxy": "", "source": "shell"})
+    res = health._endpoint_override_check()
+    assert res["status"] == "ok"
+
+
+def test_endpoint_check_warns_on_lookalike_host(monkeypatch):
+    """C2: api.anthropic.com.attacker.example → info (lookalike, НЕ ok).
+
+    Substring match пропустил бы это как «стандартный» — security: подавляет WARN когда
+    трафик уходит за Anthropic trust boundary. Exact hostname match ловит.
+    """
+    monkeypatch.setattr(health, "_read_endpoint_config",
+                        lambda: {"base_url": "https://api.anthropic.com.attacker.example/",
+                                 "no_proxy": "", "source": "shell"})
+    res = health._endpoint_override_check()
+    assert res["status"] == "info", "lookalike host → НЕ ok (exact hostname match)"
+
+
+def test_endpoint_check_warns_when_override(monkeypatch):
+    """BASE_URL=z.ai (нестандартный) → info WARN «endpoint override»."""
+    monkeypatch.setattr(health, "_read_endpoint_config",
+                        lambda: {"base_url": "https://api.z.ai/api/anthropic",
+                                 "no_proxy": "localhost", "source": "settings.json"})
+    res = health._endpoint_override_check()
+    assert res["status"] == "info"
+    assert "z.ai" in res["detail"]
+    assert "override" in res["detail"].lower() or "нестандарт" in res["detail"].lower()
+
+
+def test_endpoint_check_warns_when_in_no_proxy(monkeypatch):
+    """BASE_URL=z.ai + z.ai в NO_PROXY → info WARN «CC ходит напрямую, прокси нерелевантен»."""
+    monkeypatch.setattr(health, "_read_endpoint_config",
+                        lambda: {"base_url": "https://api.z.ai/api/anthropic",
+                                 "no_proxy": "localhost,127.0.0.1,::1,z.ai,.z.ai",
+                                 "source": "settings.json"})
+    res = health._endpoint_override_check()
+    assert res["status"] == "info"
+    assert "напрямую" in res["detail"].lower() or "no_proxy" in res["detail"].lower()
+
+
+def test_check_all_has_endpoint_override_check(monkeypatch):
+    """В checks есть запись про endpoint (ANTHROPIC_BASE_URL)."""
+    _all_up_monkey(monkeypatch)
+    result = health.check_all()
+    names = [c["name"] for c in result["checks"]]
+    assert any("endpoint" in n.lower() and "anthropic" in n.lower() for n in names), \
+        f"должен быть endpoint-override check, got: {names}"

@@ -433,6 +433,66 @@ def _codex_proxy_probe():
             "detail": f"runtime: codex запущен (PID {','.join(sorted(pids))}), но нет активных сокетов (idle)"}
 
 
+# ============================ #129: endpoint-override detection ============================
+
+_DEFAULT_ANTHROPIC_HOST = "api.anthropic.com"
+
+
+def _read_endpoint_config():
+    """Читает ANTHROPIC_BASE_URL + NO_PROXY из всех источников (#129).
+
+    Источники (по приоритету): shell env → ~/.claude/settings.json env → launchctl getenv.
+    Managed/local/project settings scopes (Claude Code docs) — НЕ покрыты: srouter не имеет доступа
+    к этим scope'ам из Doctor. Если ни один источник не задан → source="default" (предполагаем
+    стандартный api.anthropic.com).
+    Возвращает {base_url, no_proxy, source}. Не бросает.
+    """
+    import claude_proxy
+    # settings.json env
+    data = claude_proxy._load()
+    env = data.get("env", {}) if isinstance(data, dict) else {}
+    # launchctl getenv (gui-домен) — фолбэк если shell/settings пусты.
+    lc_base = sys_probe.run(["/bin/launchctl", "getenv", "ANTHROPIC_BASE_URL"], timeout=3)
+    lc_base_val = (lc_base.get("out") or "").strip() if not lc_base.get("timeout") else ""
+    lc_noproxy = sys_probe.run(["/bin/launchctl", "getenv", "NO_PROXY"], timeout=3)
+    lc_noproxy_val = (lc_noproxy.get("out") or "").strip() if not lc_noproxy.get("timeout") else ""
+    base = os.environ.get("ANTHROPIC_BASE_URL", "") or env.get("ANTHROPIC_BASE_URL", "") or lc_base_val
+    no_proxy = os.environ.get("NO_PROXY", "") or env.get("NO_PROXY", "") or lc_noproxy_val
+    no_proxy += "," + (os.environ.get("no_proxy", "") or env.get("no_proxy", ""))
+    source = ("shell" if os.environ.get("ANTHROPIC_BASE_URL")
+              else "settings.json" if env.get("ANTHROPIC_BASE_URL")
+              else "launchctl" if lc_base_val
+              else "default")
+    return {"base_url": base, "no_proxy": no_proxy, "source": source}
+
+
+def _endpoint_override_check():
+    """Детектит ANTHROPIC_BASE_URL override + NO_PROXY masking (#129).
+
+    Если hostname BASE_URL = api.anthropic.com (exact match) → ok (стандартный).
+    Иначе → info (WARN). Если домен в NO_PROXY → info «CC ходит напрямую».
+    Урок #127: doctor был слеп к endpoint-override → ложный SOCKS5-тест.
+    cycle-review #131 C2: exact hostname match (не substring — lookalike-атака).
+    """
+    cfg = _read_endpoint_config()
+    base = cfg["base_url"]
+    if not base:
+        return {"status": "ok", "detail": f"стандартный endpoint ({_DEFAULT_ANTHROPIC_HOST})"}
+    host = (urlparse(base).hostname or "").lower().rstrip(".")
+    if host == _DEFAULT_ANTHROPIC_HOST:
+        return {"status": "ok", "detail": f"стандартный endpoint ({_DEFAULT_ANTHROPIC_HOST})"}
+    no_proxy = cfg["no_proxy"]
+    in_no_proxy = any(
+        h.strip() and (host == h.strip() or host.endswith("." + h.strip()))
+        for h in no_proxy.split(",")
+    )
+    if in_no_proxy:
+        return {"status": "info",
+                "detail": f"endpoint override: {base} (в NO_PROXY → CC ходит напрямую, "
+                          f"прокси/туннель-проверки нерелевантны)"}
+    return {"status": "info", "detail": f"endpoint override: {base} (нестандартный endpoint)"}
+
+
 def check_all(*, active_claude=False):
     """Все проверки стека. {status: ok|degraded|down, checks: [{name, ok, detail?, info?}]}.
 
@@ -461,6 +521,12 @@ def check_all(*, active_claude=False):
         if active["status"] == "unknown":
             active_check["info"] = True
         checks.append(active_check)
+    # endpoint-override (#129): WARN если ANTHROPIC_BASE_URL не стандартный
+    eo = _endpoint_override_check()
+    eo_check = {"name": "endpoint (ANTHROPIC_BASE_URL)", "ok": True, "detail": eo["detail"]}
+    if eo["status"] == "info":
+        eo_check["info"] = True
+    checks.append(eo_check)
     # Codex-маршрут (#120): warn (privoxy 8118) — driver degraded (WS порвётся); down — driver;
     # mixed — driver (часть сессий ломаные); unknown (codex не запущен / lsof-timeout / idle) — info-only,
     # не роняет вердикт (как claude-proxy). ok — driver (всё ок).
