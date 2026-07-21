@@ -6,6 +6,7 @@ uninstall убирает. Канон — _install_ppp_hook/_remove_ppp_hook (bes
 трогать», строка-статус).
 """
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -999,8 +1000,6 @@ def test_install_upgrades_old_marker_wrapper_without_state_uses_current_only(mon
 # ФИКС (A): wrapper НЕ хардкодит binary, а runtime-резолвит его по PATH ВЫЗЫВАЮЩЕЙ оболочки, МИНУЯ
 # сам себя (антирекурсия). Один wrapper ловит любую версию codex, оказавшуюся в PATH caller'а.
 # Это best-effort layer (не fail-closed): честный kill-switch = PF (isolate_firewall.py, отдельная граница).
-import os as _os
-import subprocess as _subprocess
 
 
 def test_wrapper_does_not_hardcode_bin_placeholder(monkeypatch, tmp_path):
@@ -1047,8 +1046,8 @@ def test_wrapper_runtime_resolves_codex_from_caller_path(monkeypatch, tmp_path):
     real_codex.chmod(0o755)
     wrapper = _install_with_path_resolving_wrapper(monkeypatch, tmp_path)
 
-    _subprocess.run([str(wrapper), "x"],
-                    env={**_os.environ, "PATH": f"{Path.home() / 'bin'}:{codex_dir}:/usr/bin:/bin"},
+    subprocess.run([str(wrapper), "x"],
+                    env={**os.environ, "PATH": f"{Path.home() / 'bin'}:{codex_dir}:/usr/bin:/bin"},
                     check=True, timeout=10)
     assert called.exists(), "wrapper runtime-резолвнул и exec'нул codex из PATH"
     assert called.read_text(encoding="utf-8") == "real-codex", "exec'нут именно codex из PATH caller'а"
@@ -1065,8 +1064,8 @@ def test_wrapper_skips_itself_no_recursion(monkeypatch, tmp_path):
     wrapper = _install_with_path_resolving_wrapper(monkeypatch, tmp_path)
 
     # ~/bin ПЕРВЫМ в PATH (там wrapper), затем каталог с реальным codex. Без skip-self — рекурсия/timeout.
-    _subprocess.run([str(wrapper), "x"],
-                    env={**_os.environ, "PATH": f"{Path.home() / 'bin'}:{tmp_path / 'other'}:/usr/bin:/bin"},
+    subprocess.run([str(wrapper), "x"],
+                    env={**os.environ, "PATH": f"{Path.home() / 'bin'}:{tmp_path / 'other'}:/usr/bin:/bin"},
                     check=True, timeout=10)
     assert called.exists() and called.read_text(encoding="utf-8") == "real", \
         "wrapper пропустил себя (антирекурсия) и взял следующий codex из PATH"
@@ -1096,8 +1095,8 @@ def test_wrapper_picks_second_codex_when_two_binaries(monkeypatch, tmp_path):
     wrapper = Path.home() / "bin" / "codex"
 
     # Caller с PATH, где d2 ПЕРВЫМ (минуя wrapper в ~/bin): wrapper должен взять d2/codex.
-    _subprocess.run([str(wrapper), "x"],
-                    env={**_os.environ, "PATH": f"{Path.home() / 'bin'}:{d2}:{d1}:/usr/bin:/bin"},
+    subprocess.run([str(wrapper), "x"],
+                    env={**os.environ, "PATH": f"{Path.home() / 'bin'}:{d2}:{d1}:/usr/bin:/bin"},
                     check=True, timeout=10)
     assert second_called.exists() and second_called.read_text(encoding="utf-8") == "second", \
         "caller с PATH→d2 дошёл до d2/codex через runtime-резолв (не до вшитого d1)"
@@ -1115,16 +1114,16 @@ def test_wrapper_runtime_resolves_after_binary_change(monkeypatch, tmp_path):
     # Версия 1 по пути slot/codex.
     (bin_slot / "codex").write_text(f"#!/bin/sh\nprintf 'v1' > {marker}\n", encoding="utf-8")
     (bin_slot / "codex").chmod(0o755)
-    _subprocess.run([str(wrapper), "x"],
-                    env={**_os.environ, "PATH": f"{Path.home() / 'bin'}:{bin_slot}:/usr/bin:/bin"},
+    subprocess.run([str(wrapper), "x"],
+                    env={**os.environ, "PATH": f"{Path.home() / 'bin'}:{bin_slot}:/usr/bin:/bin"},
                     check=True, timeout=10)
     assert marker.read_text(encoding="utf-8") == "v1"
 
     # brew upgrade: тот же путь, другой binary. БЕЗ reinstall wrapper'а.
     (bin_slot / "codex").write_text(f"#!/bin/sh\nprintf 'v2' > {marker}\n", encoding="utf-8")
     (bin_slot / "codex").chmod(0o755)
-    _subprocess.run([str(wrapper), "x"],
-                    env={**_os.environ, "PATH": f"{Path.home() / 'bin'}:{bin_slot}:/usr/bin:/bin"},
+    subprocess.run([str(wrapper), "x"],
+                    env={**os.environ, "PATH": f"{Path.home() / 'bin'}:{bin_slot}:/usr/bin:/bin"},
                     check=True, timeout=10)
     assert marker.read_text(encoding="utf-8") == "v2", "runtime-резолв подхватил обновлённый binary"
 
