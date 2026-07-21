@@ -149,13 +149,101 @@ def test_install_transaction_creates_root_contract_and_bootstraps(tmp_path):
         runner=runner,
         chown=lambda path, uid, gid: None,
         enforce_root=False,
+        readiness_poll=lambda layout_: None,
     )
 
     assert result["ok"] is True
     assert privoxy_audit.AUDIT_MARKER in layout.launchdaemon_path.read_text()
     assert layout.event_log_path.exists()
-    assert (layout.event_log_path.stat().st_mode & 0o777) == 0o640
+    # event log — root-only (0o600), НЕ group-readable. Redaction эвристический, поэтому captured
+    # command args не должны быть читаемы shared primary group (staff) — cross-user disclosure (B2).
+    assert (layout.event_log_path.stat().st_mode & 0o777) == 0o600
     assert [privoxy_audit.LAUNCHCTL, "bootstrap", "system", str(layout.launchdaemon_path)] in calls
+
+
+def _install_runner_factory(loaded_ref):
+    """runner для install_as_root: bootstrap переключает loaded; bootout сбрасывает."""
+    calls = []
+
+    def runner(cmd, timeout):
+        calls.append(cmd)
+        if cmd[:2] == [privoxy_audit.LAUNCHCTL, "print"]:
+            return {"rc": 0 if loaded_ref["value"] else 113,
+                    "out": "state = running" if loaded_ref["value"] else "", "err": ""}
+        if cmd[:2] == [privoxy_audit.LAUNCHCTL, "bootstrap"]:
+            loaded_ref["value"] = True
+        if cmd[:2] == [privoxy_audit.LAUNCHCTL, "bootout"]:
+            loaded_ref["value"] = False
+        return {"rc": 0, "out": "", "err": ""}
+    return runner, calls
+
+
+def test_install_fails_when_daemon_reports_fda_denial_during_readiness(tmp_path):
+    """B1: install обязан дождаться readiness daemon'а и вернуть failure, если eslogger падает
+
+    от Full Disk Access denial. Иначе CLI рапортует установленное security-control, хотя audit
+    нефункционален (false-success). install_as_root опрашивает status после bootstrap; если daemon
+    пишет state=error (FDA/eslogger_exited), install возвращает ok=False с error=fda_denial.
+    """
+    layout = _layout(tmp_path)
+    _write_helper(layout)
+    identity = pwd.getpwuid(os.getuid())
+    runner, _ = _install_runner_factory({"value": False})
+
+    # Симулируем FDA-denial: readiness-poll видит state=error (daemon "успел" упасть).
+    def readiness_poll(layout_):
+        return "eslogger_exited:1:Operation not permitted (TCC)"
+
+    result = privoxy_audit.install_as_root(
+        username=identity.pw_name, uid=identity.pw_uid, gid=identity.pw_gid,
+        layout=layout, runner=runner, chown=lambda path, uid, gid: None, enforce_root=False,
+        readiness_poll=readiness_poll,
+    )
+
+    assert result["ok"] is False
+    assert "fda" in result["error"]
+
+
+def test_install_succeeds_when_daemon_reaches_running_readiness(tmp_path):
+    """B1 (happy path): daemon подтвердил readiness (state=running) в окне — install success."""
+    layout = _layout(tmp_path)
+    _write_helper(layout)
+    identity = pwd.getpwuid(os.getuid())
+    runner, _ = _install_runner_factory({"value": False})
+
+    def readiness_poll(layout_):
+        return None  # readiness подтверждена
+
+    result = privoxy_audit.install_as_root(
+        username=identity.pw_name, uid=identity.pw_uid, gid=identity.pw_gid,
+        layout=layout, runner=runner, chown=lambda path, uid, gid: None, enforce_root=False,
+        readiness_poll=readiness_poll,
+    )
+
+    assert result["ok"] is True
+
+
+def test_install_fails_when_daemon_never_confirms_readiness(tmp_path):
+    """B1 (timeout): daemon не переписал status из 'installing' за bounded-окно — install failure.
+
+    Скорее всего FDA-denial, eslogger ещё не упал. CLI не должен рапортовать success вслепую.
+    """
+    layout = _layout(tmp_path)
+    _write_helper(layout)
+    identity = pwd.getpwuid(os.getuid())
+    runner, _ = _install_runner_factory({"value": False})
+
+    def readiness_poll(layout_):
+        return "readiness_timeout"
+
+    result = privoxy_audit.install_as_root(
+        username=identity.pw_name, uid=identity.pw_uid, gid=identity.pw_gid,
+        layout=layout, runner=runner, chown=lambda path, uid, gid: None, enforce_root=False,
+        readiness_poll=readiness_poll,
+    )
+
+    assert result["ok"] is False
+    assert "fda" in result["error"]
 
 
 def test_install_refuses_foreign_launchdaemon_before_lifecycle_change(tmp_path):

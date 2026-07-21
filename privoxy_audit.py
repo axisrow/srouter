@@ -20,6 +20,7 @@ import stat
 import subprocess
 import sys
 import threading
+import time
 
 
 AUDIT_VERSION = 1
@@ -321,16 +322,18 @@ def normalize_event(event):
 
 
 def _append_event(layout, record, *, gid, chown=os.chown):
+    # gid сохранён в сигнатуре для совместимости вызывающего (daemon), но НЕ используется как
+    # group-owner log'а: root-only (0o600), иначе shared primary group (staff) читает args (B2).
     path = layout.event_log_path
     path.parent.mkdir(parents=True, exist_ok=True)
     flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
-    fd = os.open(path, flags, 0o640)
+    fd = os.open(path, flags, 0o600)
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
             return False
-        os.fchmod(fd, 0o640)
-        chown(path, 0, gid)
+        os.fchmod(fd, 0o600)
+        chown(path, 0, 0)
         raw = (json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
         remaining = memoryview(raw)
         while remaining:
@@ -386,21 +389,24 @@ def _prepare_directories(layout, gid, *, chown=os.chown, expected_uid=0):
             info = layout.event_log_path.lstat()
             if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
                 return _result(False, error="audit_log_not_regular")
-            if info.st_uid != expected_uid or info.st_mode & 0o027:
+            if info.st_uid != expected_uid or info.st_mode & 0o077:
                 return _result(False, error="audit_log_ownership_or_mode_drift")
-            os.chmod(layout.event_log_path, 0o640)
-            chown(layout.event_log_path, 0, gid)
+            # root-only (0o600): НЕ group-readable. Redaction эвристический, а primary group
+            # вызывающего на macOS обычно staff (shared) — иначе любой локальный аккаунт в группе
+            # читал бы poorly-redacted command args (cross-user disclosure).
+            os.chmod(layout.event_log_path, 0o600)
+            chown(layout.event_log_path, 0, 0)
         else:
-            fd = os.open(layout.event_log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o640)
+            fd = os.open(layout.event_log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             os.close(fd)
-            chown(layout.event_log_path, 0, gid)
+            chown(layout.event_log_path, 0, 0)
         return _result(True)
     except OSError as exc:
         return _result(False, error=f"audit_directory_prepare_failed:{exc}")
 
 
 def install_as_root(*, username, uid, gid, layout=DEFAULT_LAYOUT, runner=_run,
-                    chown=os.chown, enforce_root=True):
+                    chown=os.chown, enforce_root=True, readiness_poll=None):
     if enforce_root and os.geteuid() != 0:
         return _result(False, error="root_required")
     if enforce_root and layout != DEFAULT_LAYOUT:
@@ -462,7 +468,42 @@ def install_as_root(*, username, uid, gid, layout=DEFAULT_LAYOUT, runner=_run,
         error = f"audit_bootstrap_failed:{(boot.get('err') or '')[:160]}"
         _write_status(layout, {"state": "error", "gid": gid, "last_error": error}, chown=chown)
         return _result(False, error=error)
+    # Readiness-handshake (B1): bootstrap подтверждает только launchd-загрузку job'а, НЕ что
+    # eslogger действительно работает. FDA/TCC-denial проявляется асинхронно — daemon падает и
+    # пишет state=error ПОЗЖЕ возврата install. Без handshake CLI рапортует установленное
+    # security-control, хотя audit нефункционален (false-success). Ждём bounded-окно, пока daemon
+    # не перепишет status: error → failure (FDA/eslogger_exited), running/degraded → success,
+    # installing по таймауту → failure (daemon не подтвердил readiness — скорее всего FDA).
+    if readiness_poll is None:
+        readiness = _wait_daemon_readiness(layout)
+    else:
+        readiness = readiness_poll(layout)
+    if readiness is not None:
+        error = f"audit_fda_denied_or_unready:{readiness}"
+        _write_status(layout, {"state": "error", "gid": gid, "last_error": error}, chown=chown)
+        return _result(False, error=error)
     return _result(True, changed=True)
+
+
+def _wait_daemon_readiness(layout, *, timeout=3.0, interval=0.1, clock=time.monotonic,
+                           sleep=time.sleep):
+    """Bounded poll daemon status после bootstrap. Возвращает None при readiness (running/degraded),
+
+    иначе — строку-причину отказа (error-detail или 'readiness_timeout'). Ждём, пока daemon не
+    выйдет из начального 'installing' (которое сам install_as_root пишет перед bootstrap): как только
+    daemon переписал status, мы знаем его истинное состояние. error → отказ; таймаут (daemon молчит)
+    → отказ (вероятна FDA-denial, eslogger ещё не упал).
+    """
+    deadline = clock() + timeout
+    while clock() < deadline:
+        status = _read_status_file(layout)
+        state = status.get("state")
+        if state in ("running", "degraded"):
+            return None
+        if state == "error":
+            return status.get("last_error") or "daemon_error"
+        sleep(interval)
+    return "readiness_timeout"
 
 
 def uninstall_as_root(*, purge_log=False, layout=DEFAULT_LAYOUT, runner=_run,
