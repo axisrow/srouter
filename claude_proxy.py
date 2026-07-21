@@ -2,12 +2,10 @@
 
 После включения PF-изоляции Anthropic-доменов Claude Code CLI не может работать напрямую
 (PF режет api.anthropic.com / platform.claude.com на 160.79.104.10). CLI обязан ходить через
-прокси — иначе логин/API не работают. settings.json → env.HTTPS_PROXY подхватывается
-Claude Code/node автоматически при запуске (подтверждено: HTTPS_PROXY=... claude работает).
-
- SOCKS5 напрямую (xray 10808) минуя privoxy (8118): privoxy стабильно падает (гонка рестартов,
- memory jettison, #115/#122). xray стабилен с 3 июля. Claude Code/node поддерживает socks5h://
- в HTTPS_PROXY (доказано runtime: claude -p с УБИТЫМ privoxy → exit 0, ответ получен).
+прокси — иначе логин/API не работают. settings.json → env.HTTPS_PROXY подхватывается Claude Code
+при запуске. Для Claude Code используем HTTP bridge privoxy 8118. SOCKS listener xray 10808
+остаётся для клиентов, которые действительно поддерживают SOCKS, но не записывается в
+HTTP_PROXY/HTTPS_PROXY Claude Code (#127).
 
 Это ЧУЖОЙ конфиг (как ~/.gitconfig для git-proxy) — правим JSON read-modify-write (не строками),
 сохраняя все существующие env/permissions/hooks. Atomic-запись через tmp+replace. Не бросает.
@@ -16,11 +14,12 @@ import json
 from pathlib import Path
 from urllib.parse import urlparse
 
-# Прокси = SOCKS5 (xray 10808). Берём из dashboard_common если доступен; fallback на хардкод.
+# Прокси Claude Code = HTTP bridge privoxy 8118. Не заменять на SOCKS по одному lsof/exit-code:
+# black-box proof — реальный Claude Code должен получить ожидаемый API 401 (#127).
 try:
-    from dashboard_common import SOCKS_PROXY_URL as _PROXY  # socks5h://127.0.0.1:10808
+    from dashboard_common import HTTP_PROXY_URL as _PROXY  # http://127.0.0.1:8118
 except Exception:
-    _PROXY = "socks5h://127.0.0.1:10808"
+    _PROXY = "http://127.0.0.1:8118"
 
 SETTINGS = Path.home() / ".claude" / "settings.json"
 # Claude Code/node уважают HTTPS_PROXY; HTTP_PROXY добавляем для полноты (HTTP-эндпоинты).
@@ -113,6 +112,10 @@ def enable():
 
     Не трогает другие env-ключи (TRAVELPAYOUTS_TOKEN, IS_DEMO и т.д.) — read-modify-write.
     """
+    scheme = urlparse(_PROXY).scheme.lower()
+    if scheme not in {"http", "https"}:
+        return {"ok": False, "err": f"unsupported proxy scheme for Claude Code: {scheme or 'missing'}"}
+
     data = _load()
     if not isinstance(data, dict):
         data = {}

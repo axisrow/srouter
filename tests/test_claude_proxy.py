@@ -5,6 +5,10 @@
 import json
 
 import claude_proxy
+from dashboard_common import HTTP_PROXY_URL
+
+
+EXPECTED_CLAUDE_PROXY = "http://127.0.0.1:8118"
 
 
 def _setup(monkeypatch, tmp_path):
@@ -26,11 +30,32 @@ def test_enable_creates_env_and_status_on(monkeypatch, tmp_path):
     r = claude_proxy.enable()
     assert r["ok"] is True
     data = json.loads(settings.read_text())
-    assert data["env"]["HTTPS_PROXY"] == claude_proxy._PROXY
-    assert data["env"]["HTTP_PROXY"] == claude_proxy._PROXY
+    assert data["env"]["HTTPS_PROXY"] == EXPECTED_CLAUDE_PROXY
+    assert data["env"]["HTTP_PROXY"] == EXPECTED_CLAUDE_PROXY
     s = claude_proxy.status()
     assert s["enabled"] is True
-    assert s["proxy"] == claude_proxy._PROXY
+    assert s["proxy"] == EXPECTED_CLAUDE_PROXY
+
+
+def test_default_proxy_is_supported_http_bridge():
+    """Regression #127: контракт фиксируется независимо от изменяемой `_PROXY`."""
+    assert HTTP_PROXY_URL == EXPECTED_CLAUDE_PROXY
+    assert claude_proxy._PROXY == EXPECTED_CLAUDE_PROXY
+
+
+def test_enable_rejects_socks_without_mutating_settings(monkeypatch, tmp_path):
+    """Даже будущая ошибочная смена константы не должна записать SOCKS в чужой settings.json."""
+    settings = _setup(monkeypatch, tmp_path)
+    original = {"env": {"EXISTING_KEY": "keep-me"}, "model": "opus"}
+    settings.write_text(json.dumps(original))
+    monkeypatch.setattr(claude_proxy, "_PROXY", "socks5h://127.0.0.1:10808")
+
+    result = claude_proxy.enable()
+
+    assert result["ok"] is False
+    assert "unsupported proxy scheme" in result["err"]
+    assert json.loads(settings.read_text()) == original
+    assert claude_proxy.status()["enabled"] is False
 
 
 def test_enable_preserves_existing_env(monkeypatch, tmp_path):
@@ -40,7 +65,7 @@ def test_enable_preserves_existing_env(monkeypatch, tmp_path):
     claude_proxy.enable()
     data = json.loads(settings.read_text())
     assert data["env"]["EXISTING_KEY"] == "keep-me"  # существующий ключ сохранён
-    assert data["env"]["HTTPS_PROXY"] == claude_proxy._PROXY  # proxy добавлен
+    assert data["env"]["HTTPS_PROXY"] == EXPECTED_CLAUDE_PROXY  # proxy добавлен
     assert data["model"] == "opus"  # другие секции не тронуты
 
 
@@ -83,7 +108,7 @@ def test_enable_handles_broken_json(monkeypatch, tmp_path):
     r = claude_proxy.enable()
     assert r["ok"] is True  # не падает на битом файле
     data = json.loads(settings.read_text())  # результат — валидный JSON
-    assert data["env"]["HTTPS_PROXY"] == claude_proxy._PROXY
+    assert data["env"]["HTTPS_PROXY"] == EXPECTED_CLAUDE_PROXY
 
 
 # ============================ NO_PROXY для z.ai (glm идёт напрямую, мимо privoxy) ============================
@@ -160,7 +185,7 @@ def test_status_reports_provider_direct(monkeypatch, tmp_path):
     settings = _setup(monkeypatch, tmp_path)
     settings.write_text(json.dumps({"env": {
         "ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic",
-        "HTTPS_PROXY": claude_proxy._PROXY,
+        "HTTPS_PROXY": EXPECTED_CLAUDE_PROXY,
         "NO_PROXY": "api.z.ai",
     }}))
     s = claude_proxy.status()
@@ -189,4 +214,3 @@ def test_enable_merges_divergent_no_proxy_variants(monkeypatch, tmp_path):
         assert "a.com" in np, f"{k}: a.com (из NO_PROXY) сохранён"
         assert "b.com" in np, f"{k}: b.com (из no_proxy) сохранён"
         assert "api.z.ai" in np, f"{k}: provider-хост добавлен"
-

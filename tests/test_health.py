@@ -1,14 +1,14 @@
 """ТДД-тесты health.check_all + _claude_proxy_probe: doctor видит РЕАЛЬНОЕ состояние Claude-proxy.
 
-Контракт (дыра, найденная Codex review + инцидентом «без ИИ»): claude_proxy.status() читал только
-ФАЙЛ settings.json, а не реальный CC. enable()/disable() пишут файл, но не перезапускают CC → окно
-рассинхрона файл↔процесс. Решение: runtime-proof через lsof — CC держит established TCP к privoxy
-(127.0.0.1:8118). Поведенческий proof из ядерной таблицы сокетов, надёжный для всех типов CC-сессий.
+Пассивный lsof-probe показывает маршрут живого процесса и ловит direct leak, но не доказывает
+поддержку proxy protocol. В частности, established TCP к SOCKS 10808 не означает успешный SOCKS
+handshake или ответ API (#127). Поддержку доказывает только active real-CLI test с ожидаемым 401;
+его тесты находятся в test_claude_transport.py.
 
 _claude_proxy_probe() возвращает {status, source, detail}:
-  status="ok"      — CC запущен и держит коннект к privoxy (реально юзает прокси);
-  status="down"    — CC запущен, но БЕЗ коннекта (идёт напрямую → PF режет → «без ИИ»);
-  status="unknown" — CC не запущен (check_all НЕ агрегирует этот check — info-only, не driver).
+  status="ok"      — CC держит коннект к ожидаемому HTTP bridge 8118;
+  status="down"    — CC имеет внешний direct socket;
+  status="unknown" — только SOCKS TCP socket, idle, timeout или CC не запущен.
 """
 import health
 
@@ -45,12 +45,12 @@ VERSION_RUNNER_COMM = "/Users/me/.local/share/claude/versions/2.1.201"
 
 
 def test_probe_ok_when_cc_connected_to_proxy(monkeypatch):
-    """CLI CC (полный путь в comm) + lsof показал TCP к SOCKS5 10808 → status=ok."""
+    """CLI CC (полный путь в comm) + lsof показал TCP к privoxy 8118 → status=ok."""
     def fake_run(cmd, timeout):
         if cmd and cmd[0] == "/bin/ps":
             return {"rc": 0, "out": f"12345 {CLI_COMM}\n", "err": "", "timeout": False}
         if cmd and cmd[0] == "/usr/sbin/lsof":
-            return {"rc": 0, "out": f"claude 12345 axisrow 7u IPv4 ... TCP 127.0.0.1:51234->127.0.0.1:{health.XRAY_PORT} (ESTABLISHED)\n", "err": "", "timeout": False}
+            return {"rc": 0, "out": f"claude 12345 axisrow 7u IPv4 ... TCP 127.0.0.1:51234->127.0.0.1:{health.PRIVOXY_PORT} (ESTABLISHED)\n", "err": "", "timeout": False}
         return {"rc": 0, "out": "", "err": "", "timeout": False}
 
     monkeypatch.setattr(health.sys_probe, "run", fake_run)
@@ -64,18 +64,34 @@ def test_probe_detects_version_runner_cc(monkeypatch):
     """Regression: version-runner comm=`.../claude/versions/X.Y.Z` (basename=версия) — это тоже CC.
 
     Раньше whitelist `comm in ('claude','Claude')` пропускал его (basename='2.1.201'). Это основной
-    движок CC, который реально держит коннект к SOCKS5. Фильтр должен его узнавать.
+    движок CC, который реально держит коннект к privoxy. Фильтр должен его узнавать.
     """
     def fake_run(cmd, timeout):
         if cmd and cmd[0] == "/bin/ps":
             return {"rc": 0, "out": f"48008 {VERSION_RUNNER_COMM}\n", "err": "", "timeout": False}
         if cmd and cmd[0] == "/usr/sbin/lsof":
-            return {"rc": 0, "out": f"2.1.201 48008 axisrow 7u IPv4 ... TCP 127.0.0.1:51234->127.0.0.1:{health.XRAY_PORT} (ESTABLISHED)\n", "err": "", "timeout": False}
+            return {"rc": 0, "out": f"2.1.201 48008 axisrow 7u IPv4 ... TCP 127.0.0.1:51234->127.0.0.1:{health.PRIVOXY_PORT} (ESTABLISHED)\n", "err": "", "timeout": False}
         return {"rc": 0, "out": "", "err": "", "timeout": False}
 
     monkeypatch.setattr(health.sys_probe, "run", fake_run)
     res = health._claude_proxy_probe()
-    assert res["status"] == "ok", "version-runner CC должен детектиться (он держит коннект к SOCKS5)"
+    assert res["status"] == "ok", "version-runner CC должен детектиться (он держит коннект к privoxy)"
+
+
+def test_probe_unknown_when_cc_has_only_socks_tcp_connection(monkeypatch):
+    """Regression #127: TCP к xray доказывает listener/route, но не API transport."""
+    def fake_run(cmd, timeout):
+        if cmd and cmd[0] == "/bin/ps":
+            return {"rc": 0, "out": f"12345 {CLI_COMM}\n", "err": "", "timeout": False}
+        if cmd and cmd[0] == "/usr/sbin/lsof":
+            return {"rc": 0, "out": f"claude 12345 axisrow 7u IPv4 ... TCP 127.0.0.1:51234->127.0.0.1:{health.XRAY_PORT} (ESTABLISHED)\n", "err": "", "timeout": False}
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+
+    monkeypatch.setattr(health.sys_probe, "run", fake_run)
+    res = health._claude_proxy_probe()
+    assert res["status"] == "unknown"
+    assert "актив" in res["detail"].lower()
+    assert "не доказывает" in res["detail"].lower()
 
 
 def test_probe_down_when_cc_direct_leak(monkeypatch):
@@ -111,26 +127,26 @@ def test_probe_unknown_when_cc_idle_no_sockets(monkeypatch):
     assert res["status"] == "unknown", "CC без активных сокетов → unknown (idle, не down)"
 
 
-def test_probe_down_when_cc_mixed_socks_and_direct_leak(monkeypatch):
-    """C2: SOCKS + external одновременно → down (mixed, direct-leak не маскируется SOCKS).
+def test_probe_down_when_cc_mixed_proxy_and_direct_leak(monkeypatch):
+    """HTTP proxy + external одновременно → down (mixed, direct-leak не маскируется proxy).
 
-    Баг: has_socks=True возвращал ok ДО проверки has_external → один PID через SOCKS,
-    другой напрямую → doctor говорил ok. per-PID классификация: SOCKS+external = down (mixed).
+    Баг: has_proxy=True возвращал ok ДО проверки has_external → один PID через proxy,
+    другой напрямую → doctor говорил ok. per-PID классификация: proxy+external = down (mixed).
     """
     def fake_run(cmd, timeout):
         if cmd and cmd[0] == "/bin/ps":
             return {"rc": 0, "out": f"101 {CLI_COMM}\n102 {CLI_COMM}\n", "err": "", "timeout": False}
         if cmd and cmd[0] == "/usr/sbin/lsof":
-            # PID 101 через SOCKS5, PID 102 напрямую (external)
+            # PID 101 через privoxy, PID 102 напрямую (external)
             return {"rc": 0, "out": (
-                f"claude 101 axisrow 7u IPv4 ... TCP 127.0.0.1:51234->127.0.0.1:{health.XRAY_PORT} (ESTABLISHED)\n"
+                f"claude 101 axisrow 7u IPv4 ... TCP 127.0.0.1:51234->127.0.0.1:{health.PRIVOXY_PORT} (ESTABLISHED)\n"
                 "claude 102 axisrow 7u IPv4 ... TCP 192.168.1.5:51235->160.79.104.10:443 (ESTABLISHED)\n"
             ), "err": "", "timeout": False}
         return {"rc": 0, "out": "", "err": "", "timeout": False}
 
     monkeypatch.setattr(health.sys_probe, "run", fake_run)
     res = health._claude_proxy_probe()
-    assert res["status"] == "down", "SOCKS + direct-leak = mixed → down (не ok, direct-leak не маскирован)"
+    assert res["status"] == "down", "proxy + direct-leak = mixed → down (не ok, direct-leak не маскирован)"
 
 
 def test_probe_unknown_when_lsof_times_out(monkeypatch):
