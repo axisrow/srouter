@@ -850,10 +850,15 @@ def check_all(*, active_claude=False):
     # Установленные codex/claude-code binary на диске (#145): инвентаризация, info-only ВСЕГДА
     # (несколько версий — ранний сигнал конфликта #135, не сбой стека). unknown (ничего не установлено)
     # тоже info — не роняет вердикт. Doctor показывает картину, не угадывает.
-    iv = _installed_versions_check()
-    iv_check = {"name": "версии (codex/claude-code на диске)",
-                "ok": True, "info": True, "detail": iv["detail"]}
-    checks.append(iv_check)
+    # cycle-review round 1: disk inventory запускает npm/brew/which/<binary> --version — НЕ лёгкий,
+    # выполняет arbitrary PATH-discovered binaries. check_all шарится между doctor (active_claude=True),
+    # /health (dashboard.py:990 «Мгновенный, лёгкий») и watchdog (раз в ~20с). Инвентаризация —
+    # ТОЛЬКО doctor-путь, иначе лёгкий healthcheck получит DoS-поверхность + overhead.
+    if active_claude:
+        iv = _installed_versions_check()
+        iv_check = {"name": "версии (codex/claude-code на диске)",
+                    "ok": True, "info": True, "detail": iv["detail"]}
+        checks.append(iv_check)
     drivers = [c for c in checks if not c.get("info")]
     all_ok = all(c["ok"] for c in drivers)
     any_ok = any(c["ok"] for c in drivers)

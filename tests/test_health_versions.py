@@ -202,11 +202,15 @@ def test_nothing_installed_info_unknown(_versions_monkey, tmp_path):
 
 
 def test_check_all_status_ok_when_nothing_installed(monkeypatch, tmp_path):
-    """Порты+туннель живы, ничего из codex/claude не установлено → status=ok (info-чек не роняет)."""
+    """Doctor-путь (active_claude=True), ничего не установлено → status=ok (info-чек не роняет).
+    versions-check есть в отчёте как info-only с detail «не установлено»."""
     monkeypatch.setattr(health, "_port_up", lambda port: True)
     monkeypatch.setattr(health, "_tunnel_up", lambda: (True, "HTTP 200"))
     monkeypatch.setattr(health, "_claude_proxy_probe",
                         lambda: {"status": "unknown", "source": "n/a", "detail": "CC не запущен"})
+    monkeypatch.setattr(health, "_claude_transport_probe",
+                        lambda *a, **k: {"status": "unknown", "detail": "", "proxy": "",
+                                         "api_status": None, "error": ""})
     monkeypatch.setattr(health, "_codex_proxy_probe",
                         lambda: {"status": "unknown", "source": "n/a", "detail": "codex не запущен"})
     monkeypatch.setattr(health, "_endpoint_override_check",
@@ -216,11 +220,11 @@ def test_check_all_status_ok_when_nothing_installed(monkeypatch, tmp_path):
     monkeypatch.setattr(health, "_installed_versions_check",
                         lambda: {"status": "unknown", "detail": "не установлено",
                                  "codex": [], "claude_code": []})
-    result = health.check_all()
+    result = health.check_all(active_claude=True)
     assert result["status"] == "ok", "info-чек версий НЕ роняет вердикт"
     names = [c["name"] for c in result["checks"]]
-    assert any("верс" in n.lower() or "codex" in n.lower() and "claude" in n.lower()
-               for n in names), f"должен быть versions-check, got {names}"
+    assert any("верс" in n.lower() and "диск" in n.lower() for n in names), \
+        f"должен быть versions-check, got {names}"
     vcheck = [c for c in result["checks"] if c.get("info") and "не установлен" in (c.get("detail") or "").lower()]
     assert vcheck, "versions-check должен быть info-only с detail «не установлено»"
 
@@ -316,3 +320,60 @@ def test_detail_includes_provenance_version_and_wrapped_badge(_versions_monkey, 
     assert "0.144.6" in detail, "detail должен содержать версию"
     assert "обёрнут" in detail, "detail должен показывать бейдж «обёрнут» для wrapper"
     assert wrapper in res["detail"] or "wrapper" in detail, "detail упоминает wrapper-путь/роль"
+
+
+# ============================ cycle-review round 1: disk inventory = doctor-only ============================
+# check_all() шарится между /health (dashboard.py:990 «Мгновенный, лёгкий»), watchdog (раз в ~20с) и
+# doctor. Disk inventory запускает npm/brew/which/<binary> --version — НЕ лёгкий, выполняет arbitrary
+# PATH-discovered binaries → DoS-поверхность на threaded /health + watchdog overhead. Должен зваться
+# ТОЛЬКО из doctor-пути (active_claude=True), не из лёгких /health/watchdog.
+
+def _all_up_drivers(monkeypatch):
+    """Мок всех driver-чеков в check_all (порты/туннель/probes) — ОСТАВЛЯЕТ _installed_versions_check
+    реальным (не мокает), чтобы тест мог зафиксировать, вызывался ли disk inventory."""
+    monkeypatch.setattr(health, "_port_up", lambda port: True)
+    monkeypatch.setattr(health, "_tunnel_up", lambda: (True, "HTTP 200"))
+    monkeypatch.setattr(health, "_claude_proxy_probe",
+                        lambda: {"status": "unknown", "source": "n/a", "detail": "CC не запущен"})
+    monkeypatch.setattr(health, "_codex_proxy_probe",
+                        lambda: {"status": "unknown", "source": "n/a", "detail": "codex не запущен"})
+    monkeypatch.setattr(health, "_endpoint_override_check",
+                        lambda: {"status": "ok", "detail": "стандартный"})
+    monkeypatch.setattr(health, "_desktop_proxy_check",
+                        lambda: {"status": "unknown", "detail": "нет launchctl"})
+
+
+def test_versions_check_skipped_in_lightweight_health_watchdog_path(monkeypatch):
+    """ДЫРА (round 1): check_all(active_claude=False) (путь /health и watchdog) НЕ должен звать
+    _installed_versions_check — иначе лёгкий healthcheck запускает arbitrary binaries + DoS-поверхность.
+    """
+    _all_up_drivers(monkeypatch)
+    calls = []
+    monkeypatch.setattr(health, "_installed_versions_check",
+                        lambda: calls.append(1) or {"status": "unknown", "detail": "не должно зваться",
+                                                     "codex": [], "claude_code": []})
+    result = health.check_all(active_claude=False)
+    assert calls == [], "check_all(active_claude=False) НЕ должен звать disk inventory (лёгкий путь)"
+    names = [c["name"] for c in result["checks"]]
+    assert not any("версии" in n.lower() and "диск" in n.lower() for n in names), \
+        f"versions-check не должен появляться в лёгком пути, got {names}"
+
+
+def test_versions_check_runs_in_doctor_path(monkeypatch):
+    """check_all(active_claude=True) (doctor) — disk inventory ВЫПОЛНЯЕТСЯ (инвентаризация нужна врачу).
+    Симметрия с test выше: doctor показывает картину, /health/watchdog — нет.
+    """
+    _all_up_drivers(monkeypatch)
+    monkeypatch.setattr(health, "_claude_transport_probe",
+                        lambda *a, **k: {"status": "unknown", "detail": "", "proxy": "",
+                                         "api_status": None, "error": ""})
+    calls = []
+    monkeypatch.setattr(health, "_installed_versions_check",
+                        lambda: calls.append(1) or {"status": "ok", "detail": "codex установлен",
+                                                     "codex": [{"path": "/x/codex"}], "claude_code": []})
+    result = health.check_all(active_claude=True)
+    assert calls == [1], "check_all(active_claude=True) ДОЛЖЕН звать disk inventory (doctor)"
+    names = [c["name"] for c in result["checks"]]
+    assert any("версии" in n.lower() and "диск" in n.lower() for n in names), \
+        f"versions-check должен быть в doctor-отчёте, got {names}"
+
