@@ -263,10 +263,19 @@ privoxy — он SOCKS5 не умеет):
 Всё ставит/убирает `srouter install`/`uninstall` (marker-gate: чужой wrapper/плагин не трогает).
 Проверка: `which codex` → `~/bin/codex`; `codex doctor` → `proxy env vars: HTTP_PROXY, HTTPS_PROXY`.
 
-> Почему не `[network] proxy_url` в `~/.codex/config.toml`? Codex игнорирует его для WS (только env).
+> Почему не `[network] proxy_url` в `~/.codex/config.toml`? Ключ валидный, но управляет
+> execution-scoped sandbox-прокси для субпроцессов codex, а не HTTP-клиентом к `chatgpt.com`. Для
+> клиента работает только env (`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`).
 > Почему не отдельный WS-proxy env? `WS_PROXY`/`WSS_PROXY` тоже игнорируются (проверено в 0.142.5).
 > Профиль `openai-http` с `supports_websockets=false` даёт 401 с ChatGPT-подпиской. Поэтому — SOCKS5
 > напрямую, единый рабочий путь.
+
+> **Ограничение wrapper'а (AO worktree):** `~/bin/codex` + zsh-функция работают **только** в
+> интерактивном zsh. В AO worktree claude-code (Go) резолвит codex через Go `exec.LookPath`, который
+> игнорирует zsh-функции и берёт `/opt/homebrew/bin/codex` (поз.5 в PATH) мимо `~/bin/codex` (поз.7).
+> Без wrapper privoxy не снят → режёт WS. Симлинк `~/.local/bin/codex` **не помогает** (поз.24).
+> Фикс — на стороне AO (`ALL_PROXY=socks5h://127.0.0.1:10808` + снять privoxy в env воркера), **не**
+> srouter.
 
 ## Интеграции
 
@@ -497,10 +506,19 @@ stays on privoxy — it can't do SOCKS5):
 All installed/removed by `srouter install`/`uninstall` (marker-gate: a foreign wrapper/plugin is left
 untouched). Verify: `which codex` → `~/bin/codex`; `codex doctor` → `proxy env vars: HTTP_PROXY, HTTPS_PROXY`.
 
-> Why not `[network] proxy_url` in `~/.codex/config.toml`? Codex ignores it for WS (only env).
+> Why not `[network] proxy_url` in `~/.codex/config.toml`? It is a valid key, but it controls the
+> execution-scoped sandbox proxy for spawned `codex` subprocesses — not the HTTP client to
+> `chatgpt.com`. For that client, only env works (`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`).
 > Why not a separate WS-proxy env? `WS_PROXY`/`WSS_PROXY` are also ignored (verified in 0.142.5).
 > The `openai-http` profile with `supports_websockets=false` 401s on a ChatGPT subscription. So —
 > SOCKS5 directly, the one working path.
+
+> **Wrapper limitation (AO worktree):** `~/bin/codex` + the zsh function only work inside interactive
+> zsh. In an AO worktree, claude-code (Go) resolves `codex` via Go `exec.LookPath`, which ignores zsh
+> functions and picks `/opt/homebrew/bin/codex` (PATH position 5) past `~/bin/codex` (position 7).
+> Without the wrapper, the privoxy env is still set → it cuts WS. A `~/.local/bin/codex` symlink does
+> **not** help (position 24). The fix belongs on the AO side (`ALL_PROXY=socks5h://127.0.0.1:10808` +
+> drop privoxy from the worker env), **not** srouter.
 
 ## Rollback
 
@@ -569,7 +587,7 @@ every 6 h (a stale IP in the table is harmless — we block, not permit).
 | Tool | Wiring |
 |---|---|
 | **Claude Code** | `HTTPS_PROXY=http://127.0.0.1:8118` in `~/.claude/settings.json` |
-| **Codex** | `[network] proxy_url` in `~/.codex/config.toml` (it ignores env proxy) |
+| **Codex** | env only for the Codex↔`chatgpt.com` client: `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` (e.g. `socks5h://127.0.0.1:10808` via wrappers + LaunchAgent). `[network] proxy_url` in `~/.codex/config.toml` does NOT drive that client — it configures the execution-scoped sandbox proxy for spawned `codex` subprocesses. |
 | **git / gh** | GitHub domains whitelisted on the node |
 | **Browser** | system SOCKS5 `127.0.0.1:10808` |
 
