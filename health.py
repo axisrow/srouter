@@ -33,12 +33,18 @@ LAUNCHCTL = "/bin/launchctl"
 # чтобы модуль не падал в среде без srouter_config (как git_proxy/claude_proxy).
 try:
     from dashboard_common import HTTP_PROXY_URL as _PROXY  # http://127.0.0.1:8118
+    # Порты компонентов стека — единый источник dashboard_common (issue #155).
+    from dashboard_common import PRIVOXY_PORT, XRAY_SOCKS_PORT as XRAY_PORT
 except Exception:
     _PROXY = "http://127.0.0.1:8118"
+    # Fallback на то же каноническое значение. Ветка унаследована от канона (git_proxy/
+    # claude_proxy); сегодня SystemExit от dashboard_common в среде без srouter_config
+    # пробивает except Exception, поэтому health всё равно требует конфиг — но значения
+    # здесь держат единый литерал, а не расходящийся хардкод. Маркер canonical-fallback-port
+    # — tests/test_proxy_constants.py пропускает как осознанный fallback, не свежий дубликат.
+    PRIVOXY_PORT = 8118  # canonical-fallback-port
+    XRAY_PORT = 10808  # canonical-fallback-port
 
-# Порты компонентов стека.
-PRIVOXY_PORT = 8118
-XRAY_PORT = 10808
 DASHBOARD_PORT = 8787
 
 # Эндпоинты туннеля для проверки — ДВА таргета, как probe_tunnel (dashboard_network): origin-5xx

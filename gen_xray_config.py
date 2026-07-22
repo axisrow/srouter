@@ -20,7 +20,18 @@ MARKER = "srouter-managed"
 ROOT = Path(__file__).resolve().parent
 TEMPLATE_PATH = ROOT / "templates" / "xray-config.template.json"
 LISTEN_HOST = "127.0.0.1"
-XRAY_SOCKS_PORT = 10808
+
+# SOCKS-порт xray — единый источник dashboard_common (issue #155). gen_xray_config должен
+# работать и в среде без srouter_config (install-путь): dashboard_common при отсутствии
+# конфига поднимает SystemExit (BaseException, не Exception) — ловим BaseException, иначе
+# install упадёт раньше, чем сможет сгенерировать конфиг. Fallback = то же каноническое
+# значение; строка помечена маркером canonical-fallback-port — tests/test_proxy_constants.py
+# разрешает её как осознанный fallback, а не свежий дубликат.
+try:
+    from dashboard_common import XRAY_SOCKS_PORT  # noqa: F401  (canonical-fallback-port)
+except BaseException:  # noqa: BLE001  — SystemExit от dashboard_common в среде без srouter_config
+    XRAY_SOCKS_PORT = 10808  # canonical-fallback-port
+
 TRAFFIC_GUARD_BLACKHOLE_TAG = "traffic-guard-blackhole"
 
 _TAG_RE = re.compile(r"[^A-Za-z0-9_-]+")
