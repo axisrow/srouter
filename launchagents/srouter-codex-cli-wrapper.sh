@@ -18,6 +18,11 @@
 # автоматически, reinstall не нужен). Раньше путь вшивался install-тайм в обёртку → >1 codex на диске
 # или caller с другим PATH шли напрямую (fail-closed нарушен).
 #
+# Issue #150 (cycle-guard): антирекурсия точечными identity-чеками (realpath/inode/srouter-маркер, см.
+# ниже) не замыкается на foreign-wrapper БЕЗ маркера с `exec codex "$@"` → бесконечный цикл
+# managed→foreign→managed (rc=124). 3-й класс защиты — versioned env-сентинель SROUTER_CODEX_WRAPPER_V1:
+# cycle-state инвариант, обрывает цикл при повторном входе managed wrapper (см. блок ниже).
+#
 # ГРАНИЦА — BEST-EFFORT, НЕ fail-closed: wrapper перехватывает ТОЛЬКО вызовы, дошедшие до этого файла
 # (через ~/bin/codex или shell-функцию codex() в ~/.zshrc). Прямой абсолютный путь /opt/.../codex,
 # `node .../codex.js`, exec.LookPath с другим PATH (AO-worktree) — НЕ перехватываются. Настоящая
@@ -42,6 +47,25 @@ fi
 SELF_INO=""
 if command -v stat >/dev/null 2>&1; then
   _si="$(stat -f '%i %d' "$SELF_REAL" 2>/dev/null)" && [ -n "$_si" ] && SELF_INO="$_si"
+fi
+
+# Issue #150 — cycle-guard: versioned env-сентинель фиксирует динамический факт «managed wrapper уже
+# присутствует в этой цепочке exec». Точечные identity-чеки антирекурсии (realpath/inode/srouter-маркер)
+# — это эвристики классификации файла, у каждой есть дыра: всегда найдётся foreign-wrapper БЕЗ нашего
+# маркера, делающий `exec codex "$@"` (managed→foreign→managed→... → rc=124 timeout, 3-я находка
+# cycle-review PR #146). Сентинель — не очередная identity-эвристика, а cycle-state инвариант: при
+# повторном входе managed wrapper в ту же exec-chain обрываем цикл fail-loud, не доходя до real Codex.
+# Versioned-имя (SROUTER_CODEX_WRAPPER_V1) — чтобы не столкнуться со случайной пользовательской
+# переменной без версии; смена формата → bump суффикса (V2...). НЕ PATH-санitизация (отвергнута в #150:
+# blast radius на 24/7-инфре — tools/агенты молча теряют ~/bin); сентинель = env-ФЛАГ, PATH не трогает.
+if [ "${SROUTER_CODEX_WRAPPER_V1:-0}" = "1" ]; then
+  printf '%s\n' \
+    "srouter codex wrapper: обнаружен цикл exec (managed→foreign→managed)." \
+    "SROUTER_CODEX_WRAPPER_V1 уже стоит — managed wrapper повторно вошёл в ту же цепочку exec." \
+    "В PATH найден foreign-wrapper (без srouter-маркера), резолвящий codex обратно в наш wrapper." \
+    "Обрываю цикл, чтобы избежать rc=124 (timeout). real Codex НЕ запускался." \
+    "Устрани конфликт codex-обёрток в PATH (см. issue #150)." >&2
+  exit 126
 fi
 
 # Рантайм-резолв codex по PATH вызывающего, минуя сам wrapper. Обходим каждую директорию PATH, ищем
@@ -95,4 +119,5 @@ exec /usr/bin/env \
   HTTP_PROXY="$PROXY" HTTPS_PROXY="$PROXY" ALL_PROXY="$PROXY" \
   http_proxy="$PROXY" https_proxy="$PROXY" all_proxy="$PROXY" \
   NO_PROXY="$LOOPBACK" no_proxy="$LOOPBACK" \
+  SROUTER_CODEX_WRAPPER_V1=1 \
   "$_codex_bin" "$@"
