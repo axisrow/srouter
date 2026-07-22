@@ -282,7 +282,7 @@ privoxy — он SOCKS5 не умеет):
 | Инструмент | Подключение |
 |---|---|
 | **Claude Code** | `HTTPS_PROXY=http://127.0.0.1:8118` в `~/.claude/settings.json` (privoxy HTTP; SOCKS5 CC не умеет) |
-| **Codex CLI/App** | **напрямую SOCKS5 в xray** (`socks5h://127.0.0.1:10808`) через wrappers + LaunchAgent env, минуя privoxy. privoxy портит WS-стриминг Codex (`Reconnecting`/`request timed out`); `[network] proxy_url` в `~/.codex/config.toml` Codex игнорирует для WS — поэтому wrappers в `~/bin/codex` (CLI) + `~/bin/codex-app-proxy` (App, `--proxy-server` для Chromium) + глобальный env через `com.srouter.codenv` LaunchAgent (переживает ребут). Запускать Codex **App** через `~/bin/codex-app-proxy`, а не иконку Dock (Dock не передаёт `--proxy-server`). |
+| **Codex CLI/App** | **напрямую SOCKS5 в xray** (`socks5h://127.0.0.1:10808`) через wrappers + LaunchAgent env, минуя privoxy. privoxy портит WS-стриминг Codex (`Reconnecting`/`request timed out`); для клиента Codex↔`chatgpt.com` работает только env (`[network] proxy_url` в `~/.codex/config.toml` управляет execution-scoped sandbox-прокси для субпроцессов, не клиентом) — поэтому wrappers в `~/bin/codex` (CLI) + `~/bin/codex-app-proxy` (App, `--proxy-server` для Chromium) + глобальный env через `com.srouter.codenv` LaunchAgent (переживает ребут). Запускать Codex **App** через `~/bin/codex-app-proxy`, а не иконку Dock (Dock не передаёт `--proxy-server`). |
 | **git / gh** | домены GitHub в вайтлисте узла → резолв и трафик через ускоритель |
 | **Браузер** | системный SOCKS5 `127.0.0.1:10808` (вайтлист разруливает сам) |
 
