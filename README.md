@@ -197,6 +197,12 @@ srouter privoxy protect --strict  # разовый перенос в system-doma
 srouter privoxy status            # read-only, без пароля
 srouter privoxy restart           # каждый раз требует пароль/Touch ID
 srouter privoxy unprotect         # защищённый откат к прежней user-службе
+
+# Пассивно записывать будущие попытки трогать Privoxy (#122):
+srouter privoxy audit install     # потребует пароль и Full Disk Access для /usr/bin/eslogger
+srouter privoxy audit status      # состояние аудитора, без пароля
+srouter privoxy audit report      # последние подходящие команды, без пароля
+srouter privoxy audit uninstall   # служба удаляется, журнал сохраняется
 ```
 
 `srouter install` / `uninstall` управляют **всем стеком** (brew-сервисы, конфиги, DNS, LaunchAgent,
@@ -212,6 +218,14 @@ watchdog, ppp-hook, Claude Code/git-прокси, Codex SOCKS5-wrappers + env). 
 подтверждения. Dashboard не может управлять защищённым Privoxy — только показывает состояние и
 направляет к ручной CLI-команде. `srouter install` распознаёт этот режим и не создаёт конкурирующий
 пользовательский Privoxy.
+
+`privoxy audit` ничего не меняет в Privoxy и не пытается автоматически его «лечить». Системная
+служба читает события запуска программ, сохраняет только команды, относящиеся к lifecycle Privoxy,
+и отбрасывает остальные события в памяти. macOS требует вручную добавить `/usr/bin/eslogger` в
+System Settings → Privacy & Security → Full Disk Access; `audit status` явно покажет отказ. Формат
+`eslogger` не стабилен, поэтому ошибки разбора видны в статусе, а не игнорируются. Удаление аудитора
+сохраняет `/Library/Logs/srouter/privoxy-audit/command-audit.jsonl`; удалить его можно только явным
+`audit uninstall --purge-log`.
 
 ## VPN и split-route
 
@@ -419,6 +433,12 @@ srouter privoxy protect --strict  # one-time system-domain migration; asks for a
 srouter privoxy status            # read-only, no password
 srouter privoxy restart           # requires password/Touch ID every time
 srouter privoxy unprotect         # privileged rollback to the previous user service
+
+# Passively record future attempts to mutate Privoxy (#122):
+srouter privoxy audit install     # asks for authorization; /usr/bin/eslogger needs Full Disk Access
+srouter privoxy audit status      # read-only auditor state
+srouter privoxy audit report      # recent matching commands, read-only
+srouter privoxy audit uninstall   # removes daemon but preserves evidence log
 ```
 
 `srouter install` / `uninstall` manage the **entire stack** (brew services, configs, DNS, LaunchAgent,
@@ -433,6 +453,13 @@ directory, so a later Homebrew change cannot replace the running service. Strict
 `sudo timestamp_timeout=0`, so every sudo command on this Mac requires fresh authorization. The
 dashboard cannot mutate protected Privoxy, and later `srouter install` runs keep the protected service
 instead of creating a competing user service.
+
+`privoxy audit` never changes or automatically repairs Privoxy. Its system daemon consumes process
+execution events, persists only commands related to the Privoxy lifecycle, and discards everything
+else in memory. macOS requires `/usr/bin/eslogger` to be added manually under System Settings →
+Privacy & Security → Full Disk Access; `audit status` reports a denial explicitly. Because eslogger's
+JSON schema is not stable, parse failures are surfaced as degraded status. Uninstall preserves
+`/Library/Logs/srouter/privoxy-audit/command-audit.jsonl` unless `audit uninstall --purge-log` is explicit.
 
 ## VPN and split-route
 

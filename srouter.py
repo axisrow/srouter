@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import ipaddress
+import json
 import os
 import re
 import shlex
@@ -58,6 +59,7 @@ from sys_probe import run
 
 import claude_proxy  # вкл/откл HTTPS_PROXY для Claude Code (~/.claude/settings.json)
 import health  # doctor-проверки стека
+import privoxy_audit  # пассивный root-owned аудит lifecycle-команд Privoxy (#122)
 import privoxy_system  # root-gated system LaunchDaemon для Privoxy (#122)
 
 # OSASCRIPT отсутствует в install_lib — локальная константа (копия dashboard_common).
@@ -1005,6 +1007,71 @@ def cmd_doctor(args) -> int:
 def cmd_privoxy(args) -> int:
     """Ручное root-gated управление защищённым Privoxy (#122)."""
     action = getattr(args, "privoxy_action", None)
+    if action == "audit":
+        audit_action = getattr(args, "privoxy_audit_action", None)
+        if audit_action == "status":
+            current = privoxy_audit.status(runner=run)
+            installed = "установлен" if current["installed"] else "не установлен"
+            loaded = "загружен" if current["loaded"] else "не загружен"
+            print(
+                f"Аудит Privoxy: {installed}; {loaded}; state={current['state']}; "
+                f"events={current['events_written']}; parse_errors={current['parse_errors']}."
+            )
+            if current.get("last_error"):
+                print(f"  последняя ошибка: {current['last_error']}", file=sys.stderr)
+            if current.get("fda_required"):
+                print(
+                    "  macOS требует Full Disk Access для /usr/bin/eslogger; после выдачи "
+                    "повторите: srouter privoxy audit install",
+                    file=sys.stderr,
+                )
+            return 0 if current["installed"] and current["loaded"] \
+                and current["state"] == "running" else 1
+        if audit_action == "report":
+            outcome = privoxy_audit.report(limit=getattr(args, "limit", 50))
+            if not outcome["ok"]:
+                print(f"privoxy audit report: {outcome['error']}", file=sys.stderr)
+                return 2
+            if getattr(args, "json", False):
+                print(json.dumps(outcome["records"], ensure_ascii=False, indent=2))
+            elif not outcome["records"]:
+                print(f"Аудит Privoxy: подходящих команд пока нет. Лог: {outcome['path']}")
+            else:
+                for record in outcome["records"]:
+                    actor = record.get("actor") or {}
+                    target = record.get("target") or {}
+                    command = " ".join(target.get("args") or [])
+                    print(
+                        f"{record.get('captured_at') or '-'} actor={actor.get('pid') or '-'} "
+                        f"{actor.get('executable') or '-'} -> {command or target.get('executable') or '-'}"
+                    )
+            if outcome.get("parse_errors"):
+                print(f"В журнале повреждённых строк: {outcome['parse_errors']}", file=sys.stderr)
+            return 0
+        if audit_action == "install":
+            outcome = privoxy_audit.install(runner=run)
+        elif audit_action == "uninstall":
+            outcome = privoxy_audit.uninstall(
+                purge_log=getattr(args, "purge_log", False), runner=run,
+            )
+        else:
+            print(f"privoxy audit: неизвестное действие {audit_action!r}", file=sys.stderr)
+            return 2
+        if not outcome.get("ok"):
+            print(f"privoxy audit {audit_action}: {outcome.get('error', 'failed')}", file=sys.stderr)
+            return 2
+        changed = "изменён" if outcome.get("changed", True) else "уже в нужном состоянии"
+        print(f"Аудит Privoxy {audit_action}: {changed}.")
+        current = outcome.get("status")
+        if isinstance(current, dict) and (current.get("fda_required") or current.get("state") == "error"):
+            print(
+                "macOS не разрешила чтение Endpoint Security. Добавьте /usr/bin/eslogger в "
+                "System Settings → Privacy & Security → Full Disk Access и повторите install.",
+                file=sys.stderr,
+            )
+            return 1
+        return 0
+
     state_path = getattr(args, "state", None) or InstallEnv.from_env().state_path
     prefix = getattr(args, "prefix", None) or "/opt/homebrew"
 
@@ -1219,6 +1286,23 @@ def build_parser() -> argparse.ArgumentParser:
             sp.add_argument("--prefix", default=None, help="Homebrew prefix (/opt/homebrew или /usr/local).")
             sp.add_argument("--strict", action="store_true",
                             help="Отключить sudo timestamp cache для текущего пользователя.")
+        sp.set_defaults(func=cmd_privoxy)
+    p_audit = p_privoxy_sub.add_parser(
+        "audit", help="Пассивный журнал команд, способных менять Privoxy.")
+    p_audit_sub = p_audit.add_subparsers(dest="privoxy_audit_action", required=True)
+    for sub_name, sub_help in (
+        ("install", "Установить root-owned eslogger-аудитор (нужен свежий sudo)."),
+        ("status", "Показать состояние аудитора без sudo."),
+        ("report", "Показать последние подходящие команды без sudo."),
+        ("uninstall", "Удалить аудитор, сохранив журнал по умолчанию."),
+    ):
+        sp = p_audit_sub.add_parser(sub_name, help=sub_help)
+        if sub_name == "report":
+            sp.add_argument("--limit", type=int, default=50, help="Число последних событий (1–1000).")
+            sp.add_argument("--json", action="store_true", help="Вывести записи как JSON.")
+        if sub_name == "uninstall":
+            sp.add_argument("--purge-log", action="store_true",
+                            help="Также удалить накопленный журнал (необратимо).")
         sp.set_defaults(func=cmd_privoxy)
     return parser
 
