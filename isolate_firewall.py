@@ -42,6 +42,7 @@ import ipaddress
 import local_state
 import sys_probe
 import traffic_shape  # переиспользуем osascript-мост, валидаторы, парсер токена
+from dashboard_common import _applescript_text  # единый канон экранирования (issue #154)
 
 # ============================ константы (shell-safe) ============================
 PFCTL = "/sbin/pfctl"
@@ -84,7 +85,7 @@ _valid_token = traffic_shape._valid_token
 _parse_token = traffic_shape._parse_token
 _isolate_result = traffic_shape._shape_result   # та же форма (ok/cancelled/rc/out/err/timeout)
 _reject = traffic_shape._reject
-_applescript_text = traffic_shape._applescript_text
+# _applescript_text импортирован сверху из dashboard_common (канон, issue #154).
 
 
 def _admin_run(shell_cmd):

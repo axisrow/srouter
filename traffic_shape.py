@@ -70,6 +70,7 @@ import socket
 
 import local_state
 import sys_probe
+from dashboard_common import _applescript_text
 
 
 # ============================ константы (shell-safe) ============================
@@ -207,16 +208,6 @@ def _shape_result(r):
 def _reject(msg):
     """Единый reject без запуска команды: форма как у _shape_result, но run не зван."""
     return {"ok": False, "cancelled": False, "rc": None, "out": "", "err": msg, "timeout": False}
-
-
-def _applescript_text(text):
-    """Экранировать shell-строку для вставки в `do shell script "..."`.
-
-    Канон dashboard_connectivity._applescript_text: сначала бэкслэши, потом кавычки.
-    Anchor-имя содержит кавычки (`-a "com.apple/..."`), без экранирования applescript
-    оборвёт строку.
-    """
-    return str(text).replace("\\", "\\\\").replace('"', '\\"')
 
 
 def _admin_run(shell_cmd):
