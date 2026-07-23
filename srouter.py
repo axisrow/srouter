@@ -21,7 +21,6 @@ import ipaddress
 import json
 import os
 import re
-import shlex
 import shutil
 import sys
 from pathlib import Path
@@ -30,9 +29,7 @@ from importlib.metadata import PackageNotFoundError, version
 import local_state
 from install_lib import (
     BREW,
-    NETWORKSETUP,
     ROUTE,
-    SUDO,
     CHOICES,
     LAUNCHAGENT_LABEL,
     LAUNCHCTL,
@@ -61,9 +58,11 @@ import claude_proxy  # вкл/откл HTTPS_PROXY для Claude Code (~/.claude
 import health  # doctor-проверки стека
 import privoxy_audit  # пассивный root-owned аудит lifecycle-команд Privoxy (#122)
 import privoxy_system  # root-gated system LaunchDaemon для Privoxy (#122)
+import privileged_ops  # единая osascript/sudo-обёртка + whitelist (#156)
 
-# OSASCRIPT отсутствует в install_lib — локальная константа (копия dashboard_common).
-OSASCRIPT = "/usr/bin/osascript"
+# OSASCRIPT переэкспортируется из privileged_ops (единый источник #156) для обратной
+# совместимости с тестами/кодом, обращающимся к srouter.OSASCRIPT.
+OSASCRIPT = privileged_ops.OSASCRIPT
 
 
 def _env_from_args(args) -> InstallEnv:
@@ -80,32 +79,21 @@ def _env_from_args(args) -> InstallEnv:
 
 def _is_privileged_cmd(cmd) -> bool:
     """Только эти сигнатуры install_lib требуют root. Остальное (brew/launchctl/lsof,
-    route -n get, networksetup -listallnetworkservices) работает без повышения."""
-    if not cmd:
-        return False
-    head = cmd[0]
-    # networksetup -setdnsservers — мутация DNS (НЕ -listallnetworkservices, это чтение).
-    if head == NETWORKSETUP and len(cmd) > 1 and cmd[1] == "-setdnsservers":
-        return True
-    # sudo brew services ... dnsmasq — dnsmasq на UDP:53. xray/privoxy идут БЕЗ sudo.
-    if head == SUDO and len(cmd) > 1 and cmd[1] == BREW:
-        return True
-    # route -n delete -host <ip> — удаление split-route (новое в uninstall). route get — чтение.
-    if head == ROUTE and len(cmd) > 2 and cmd[1] == "-n" and cmd[2] == "delete":
-        return True
-    return False
+    route -n get, networksetup -listallnetworkservices) работает без повышения.
+
+    Делегирует в privileged_ops.is_allowed — единый whitelist привилегированных команд (#156).
+    Сохранено как тонкая обёртка для обратной совместимости с тестами/вызовами.
+    """
+    return privileged_ops.is_allowed(cmd)
 
 
 def _to_osascript(cmd):
     """Обернуть cmd в osascript-мост 'do shell script ... with administrator privileges'.
 
-    SUDO удаляется из cmd — osascript сам повышает привилегии (канон dashboard.py:122-134).
-    Без этого получилось бы sudo внутри уже-privileges-сессии (избыточно, потенциально ломается).
+    Делегирует в privileged_ops.build_osascript — единый канон экранирования
+    (dashboard_common._applescript_text, #154) и очистки SUDO (#156).
     """
-    cleaned = list(cmd[1:] if cmd and cmd[0] == SUDO else cmd)
-    shell_cmd = " ".join(shlex.quote(str(a)) for a in cleaned)
-    applescript = f'do shell script "{shell_cmd}" with administrator privileges'
-    return [OSASCRIPT, "-e", applescript]
+    return privileged_ops.build_osascript(cmd)
 
 
 def make_privileged_runner(underlying_run=run, *, osascript_timeout: int = 60):
@@ -114,6 +102,9 @@ def make_privileged_runner(underlying_run=run, *, osascript_timeout: int = 60):
     Под sudo (os.geteuid()==0) все команды идут напрямую. Иначе привилегированные
     (networksetup -setdnsservers / sudo brew ... dnsmasq / route delete) оборачиваются
     в osascript-мост с GUI-паролем; остальные — напрямую.
+
+    Делегирует классификацию в privileged_ops (#156), сохраняя прежнее поведение
+    (непривилегированные/ root — напрямую; привилегированные не-root — osascript).
     """
     am_root = os.geteuid() == 0
 
