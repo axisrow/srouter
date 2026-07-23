@@ -160,9 +160,11 @@ def bounded_acquire(lock, *, name, level, timeout_sec=None):
 
     ВАЖНО (issue #159 cycle-review fix): таймаут = исключение, НЕ «выполнить тело с
     fallback». @contextmanager физически не может пропустить тело вызывающего, поэтому
-    fallback на таймауте обязан быть явным try/except LockAcquireTimeout В CALLER (см.
-    точки применения: probe_hot_routes, probe_nodes_snapshot, gather_status, _geo_lookup,
-    select_node). Тело with НИКОГДА не выполняется без захваченного лока.
+    fallback на таймауте обязан быть явным try/except LockAcquireTimeout В CALLER.
+    Cache-fallback точки: _geo_lookup, probe_nodes_snapshot, gather_status,
+    _store_*/_last_* (probe_hot_routes); structured-error consumer: select_node.
+    Cleanup (_release_update) использует timeout_sec=0 (unbounded). Тело with НИКОГДА
+    не выполняется без захваченного лока.
 
     Это каноническая обёртка для всех кэш-локов и _SELECT_LOCK.
     _MUTATION_LOCK НЕ оборачивается (уже non-blocking 409, трогать запрещено каноном).

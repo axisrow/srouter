@@ -243,7 +243,10 @@ def test_hotroutes_release_update_unbounded_clears_marker_under_contention(monke
     assert cleared["elapsed"] > 0.1
 
 
-# ============================ единый источник LEVEL_* (канон no-hidden-magic) ============================def test_single_source_of_lock_levels():
+# ============================ единый источник LEVEL_* (канон no-hidden-magic) ============================
+
+
+def test_single_source_of_lock_levels():
     # Эталон tests/test_proxy_constants.py: ОПРЕДЕЛЕНИЯ числовых уровней блокировок
     # живут ТОЛЬКО в lock_hierarchy.py. Использования (`level=lock_hierarchy.LEVEL_*`)
     # в точках вызова — норма; ловим только повторное присвоение `LEVEL_* = <int>`.
@@ -282,7 +285,6 @@ def test_select_node_lock_timeout_returns_structured_error(monkeypatch):
         result = node_selector.select_node("sg-1", enabled_names={"sg-1"})
         assert result["ok"] is False
         assert result["step"] == "lock-timeout"
-        assert "lock-timeout" in result["step"]
     finally:
         release.set()
         t.join(timeout=5.0)
@@ -292,7 +294,7 @@ def test_select_node_never_throws_even_when_state_read_fails(monkeypatch):
     # РЕГРЕССИЯ cycle-5 (Codex conf 1.0): _active_name зовётся снаружи внутреннего try/except
     # _select_node_locked. Если local_state.active_node бросает, select_node всё равно обязан
     # НЕ бросать (контракт). _active_name теперь defensive.
-    def boom(*a, **k):
+    def boom(*_a, **_k):
         raise RuntimeError("state read failed")
 
     monkeypatch.setattr(node_selector.local_state, "active_node", boom)
