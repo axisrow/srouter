@@ -9,7 +9,15 @@ import dashboard_geo
 import dashboard_network
 import local_state
 import sys_probe
-from dashboard_common import *
+from dashboard_common import (
+    CURL,
+    NODE_PROBE_TTL_SEC,
+    PROBE_SOCKS_HOST,
+    SCUTIL,
+    _probe_options,
+    _safe_port,
+    _seconds_arg,
+)
 
 
 __all__ = [

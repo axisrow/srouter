@@ -13,14 +13,50 @@ from concurrent.futures import ThreadPoolExecutor, wait
 from flask import Flask, g, jsonify, Response, request
 
 import local_state
-from dashboard_common import *
-from dashboard_connectivity import *
-from dashboard_geo import *
-from dashboard_network import *
-from dashboard_nodes import *
-from dashboard_traffic import *
-from dashboard_hotroutes import *
-from dashboard_isolate import *
+from dashboard_common import (
+    BREW,
+    CHANNEL_TARGETS,
+    CURL,
+    GATEWAY,
+    IFCONFIG,
+    NETWORKSETUP,
+    OSASCRIPT,
+    PING,
+    ROUTE,
+    _active_route_context,
+    _active_route_ip,
+    _ip_literal,
+)
+from dashboard_connectivity import (
+    _known_service_name,
+    _parse_network_services,
+    _probe_direct_reachability,
+    probe_connectivity,
+    probe_exit_ips_per_iface,
+    probe_ifaces,
+    switch_channel,
+)
+from dashboard_geo import probe_geo_distance, probe_ips
+from dashboard_network import (
+    _parse_ping_stats,
+    probe_direct,
+    probe_exit_ip,
+    probe_ping,
+    probe_route_to_vps,
+    probe_services,
+    probe_tunnel,
+    probe_vpn,
+)
+from dashboard_nodes import (
+    _nodes_cache,
+    _parse_throughput_output,
+    probe_dns,
+    probe_nodes,
+    probe_nodes_snapshot,
+)
+from dashboard_traffic import probe_traffic_guard
+from dashboard_hotroutes import probe_hot_routes
+from dashboard_isolate import probe_isolate
 import node_selector
 import sys_probe
 import traffic_shape  # throttle-движок (#13): зовём через атрибут (traffic_shape.apply_throttle)
@@ -29,6 +65,24 @@ import git_proxy  # вкл/откл git-прокси для github (через g
 import claude_proxy  # вкл/откл HTTPS_PROXY для Claude Code (~/.claude/settings.json)
 import health  # check_all для /health эндпоинта
 import privoxy_system  # protected system-service gate (#122)
+
+# Явный re-export-контракт (issue #157): до чистки star imports эти имена попадали
+# в namespace dashboard неявно через `from <submodule> import *` и тесты обращаются
+# к ним как dashboard.<name>. `__all__` декларирует этот контракт явно (вместо магии
+# star import) и одновременно гасит ruff F401 на умышленно неиспользуемых в коде
+# dashboard.py, но публично реэкспортируемых именах.
+__all__ = [
+    "CURL",
+    "IFCONFIG",
+    "NETWORKSETUP",
+    "PING",
+    "_known_service_name",
+    "_parse_network_services",
+    "_probe_direct_reachability",
+    "_parse_ping_stats",
+    "_nodes_cache",
+    "_parse_throughput_output",
+]
 
 # Активный узел нельзя замораживать на import: #8 меняет srouter.local.json в рантайме.
 # Эти имена оставлены только для совместимости старых импорт-тестов; рабочий код ниже
