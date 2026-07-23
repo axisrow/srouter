@@ -29,6 +29,7 @@ py-modules = [
     "dashboard",
     "srouter",
     "install_lib",
+    "marker_block",
     "local_state",
     "dashboard_common",
     "dashboard_connectivity",
