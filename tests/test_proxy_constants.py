@@ -38,20 +38,23 @@ def _py_files():
 # Намеренно не ловим упоминания портов в строках/сообщениях/тестовых данных — только
 # факты присваивания константе (тот самый класс дрейфа, что описан в issue #155).
 PROXY_PORT_DEFINE_PATTERNS = [
-    r"\bPRIVOXY_PORT\s*=\s*\d",
-    r"\bXRAY_PORT\s*=\s*\d",
-    r"\bXRAY_SOCKS_PORT\s*=\s*\d",
-    r"\bPRIVOXY_SOCKS_PORT\s*=\s*\d",
+    # case-insensitive: ловит PRIVOXY_PORT, privoxy_port, XRAY_PORT и т.п.
+    r"(?i)\bPRIVOXY_PORT\s*=\s*\d",
+    r"(?i)\bXRAY_PORT\s*=\s*\d",
+    r"(?i)\bXRAY_SOCKS_PORT\s*=\s*\d",
+    r"(?i)\bPRIVOXY_SOCKS_PORT\s*=\s*\d",
     # Поймать любой *_PORT = <порт прокси> как константу (8118/10808).
-    r"\b\w*_PORT\s*=\s*81[0-9]{2}\b",
-    r"\b\w*_PORT\s*=\s*108\d{2}\b",
+    r"(?i)\b\w*_PORT\s*=\s*81[0-9]{2}\b",
+    r"(?i)\b\w*_PORT\s*=\s*108\d{2}\b",
 ]
 
 # Паттерны host:port-литералов в ОПРЕДЕЛЕНИИ констант (не в любой строке):
 # PRIVOXY = ("127.0.0.1", 8118) / HTTP_PROXY_URL = "http://127.0.0.1:8118" и т.п.
+# Ловим канонические URL-имена с суффиксом _URL; голые HTTP_PROXY/SOCKS_PROXY НЕ ловим —
+# это легитимные имена тестовых fixtures (tests/test_claude_transport.py), не дрейф канона.
 PROXY_ADDR_DEFINE_PATTERNS = [
-    r'\bPRIVOXY\s*=\s*\(\s*["\']127\.0\.0\.1["\']',
-    r'\bXRAY_SOCKS\s*=\s*\(\s*["\']127\.0\.0\.1["\']',
+    r'(?i)\bPRIVOXY\s*=\s*\(\s*["\']127\.0\.0\.1["\']',
+    r'(?i)\bXRAY_SOCKS\s*=\s*\(\s*["\']127\.0\.0\.1["\']',
     r'\bHTTP_PROXY_URL\s*=\s*["\']http://127\.0\.0\.1:811',
     r'\bSOCKS_PROXY_URL\s*=\s*["\']socks5',
 ]
