@@ -2,7 +2,7 @@
 
 Корень #120 (выяснил сам codex): старая shell-сессия не получила новое окружение → codex резолвился
 в brew-бинарь с унаследованным HTTP_PROXY=privoxy (8118) → long-lived WS рвался. Новая сессия через
-shell-функцию → ~/bin/codex → SOCKS5 (10808) → работает. `which codex` НЕ доказательство (wrapper
+shell-функцию → ~/bin/codex-srouter → SOCKS5 (10808) → работает. `which codex` НЕ доказательство (wrapper
 использует exec, процесс выглядит как brew-codex). Единственный критерий — runtime-сокет PID к
 10808 (ok) vs 8118 (warn, порвёт WS) vs напрямую (down).
 

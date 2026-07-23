@@ -18,19 +18,26 @@
 # автоматически, reinstall не нужен). Раньше путь вшивался install-тайм в обёртку → >1 codex на диске
 # или caller с другим PATH шли напрямую (fail-closed нарушен).
 #
+# Issue #169 (rename): wrapper файл переименован codex → codex-srouter. Поэтому при runtime-резолве ниже
+# (поиск `codex` в PATH) wrapper НИКОГДА не выберет сам себя — имя не совпадает → коллизия неймспейса
+# устранена СТРУКТУРНО. Антирекурсия по realpath/inode/маркеру и cycle-guard #150/#153 остаются как
+# defense-in-depth (могут быть 2 копии wrapper'а или foreign, целенаправленно зовущий codex-srouter).
+#
 # Issue #150 (cycle-guard): антирекурсия точечными identity-чеками (realpath/inode/srouter-маркер, см.
 # ниже) не замыкается на foreign-wrapper БЕЗ маркера с `exec codex "$@"` → бесконечный цикл
 # managed→foreign→managed (rc=124). 3-й класс защиты — versioned env-сентинель SROUTER_CODEX_WRAPPER_V1:
 # cycle-state инвариант, обрывает цикл при повторном входе managed wrapper (см. блок ниже).
 #
 # ГРАНИЦА — BEST-EFFORT, НЕ fail-closed: wrapper перехватывает ТОЛЬКО вызовы, дошедшие до этого файла
-# (через ~/bin/codex или shell-функцию codex() в ~/.zshrc). Прямой абсолютный путь /opt/.../codex,
+# (через ~/bin/codex-srouter или shell-функцию codex() в ~/.zshrc). Прямой абсолютный путь /opt/.../codex,
 # `node .../codex.js`, exec.LookPath с другим PATH (AO-worktree) — НЕ перехватываются. Настоящая
 # fail-closed граница = сетевой PF kill-switch (isolate_firewall.py, отдельный слой).
 #
-# Вызывается shell-функцией codex() из ~/.zshrc по абсолютному пути (srouter install) — тогда порядок
-# brew в PATH не важен. Для не-zsh вызывающих сторон (bash, command codex, GUI) стабильная точка
-# входа — сам этот launcher ~/bin/codex.
+# Issue #169 rename: wrapper файл называется codex-srouter (НЕ codex) — убрать коллизию неймспейса с
+# real binary (оба звались codex → natural-рекурсия #150/#144). real binary по-прежнему зовётся codex,
+# его и резолвит этот wrapper в PATH ниже. Стабильная точка входа для не-zsh вызывающих сторон (bash,
+# command codex, GUI) — сам этот launcher ~/bin/codex-srouter. Shell-функция codex() зовёт codex-srouter
+# по абсолютному пути (тогда порядок brew в PATH не важен).
 # Первый комментарий — маркер srouter (uninstall удаляет только своё, чужой wrapper не трогает).
 PROXY="__SROUTER_CODEX_PROXY_URL__"
 LOOPBACK="__SROUTER_CODEX_NO_PROXY__"
