@@ -116,7 +116,7 @@ def _versions_monkey(monkeypatch, tmp_path):
 
 def test_codex_two_binaries_different_provenance_both_shown(_versions_monkey, tmp_path):
     """ДЫРА #145: doctor видел только ЖИВЫЕ процессы. Два codex-binary на диске разного provenance
-    (npm + homebrew-dir) → чек показывает ОБА. Wrapper в ~/bin/codex отсутствует."""
+    (npm + homebrew-dir) → чек показывает ОБА. Wrapper в ~/bin/codex-srouter отсутствует."""
     brew_codex = "/opt/homebrew/bin/codex"
     local_codex = "/usr/local/bin/codex"
     files = {
@@ -141,10 +141,11 @@ def test_codex_two_binaries_different_provenance_both_shown(_versions_monkey, tm
 # ============================ (2) wrapper + real → оба детектятся, wrapper помечен «обёрнут» ============================
 
 def test_codex_wrapper_and_real_both_detected_wrapper_marked(_versions_monkey, tmp_path):
-    """~/bin/codex (srouter-wrapper) + /opt/homebrew/bin/codex (real) → оба в выводе, wrapper
+    """~/bin/codex-srouter (srouter-wrapper) + /opt/homebrew/bin/codex (real) → оба в выводе, wrapper
     помечен wrapped=True, real — wrapped=False. Маркер srouter: '# srouter: codex CLI wrapper (managed)'.
+    Issue #169: wrapper переименован codex → codex-srouter (real binary по-прежнему codex).
     """
-    wrapper = str(tmp_path / "bin" / "codex")
+    wrapper = str(tmp_path / "bin" / "codex-srouter")
     real = "/opt/homebrew/bin/codex"
     files = {
         wrapper: "#!/bin/sh\n# srouter: codex CLI wrapper (managed)\nexec /usr/bin/env\n",
@@ -159,15 +160,15 @@ def test_codex_wrapper_and_real_both_detected_wrapper_marked(_versions_monkey, t
     by_path = {b["path"]: b for b in res["codex"]}
     assert wrapper in by_path and real in by_path, \
         f"и wrapper, и real должны детектиться, got {set(by_path)}"
-    assert by_path[wrapper]["wrapped"] is True, "wrapper в ~/bin/codex — обёрнут srouter"
+    assert by_path[wrapper]["wrapped"] is True, "wrapper в ~/bin/codex-srouter — обёрнут srouter"
     assert by_path[real]["wrapped"] is False, "real binary НЕ обёрнут"
 
 
 def test_codex_wrapper_not_srouter_marked_unwrapped(_versions_monkey, tmp_path):
-    """~/bin/codex БЕЗ srouter-маркера (чужой wrapper) → wrapped=False (мы его не ставили).
+    """~/bin/codex-srouter БЕЗ srouter-маркера (чужой wrapper) → wrapped=False (мы его не ставили).
     Regression: naive «файл существует в ~/bin → wrapped» принимает чужой wrapper за свой.
     """
-    foreign = str(tmp_path / "bin" / "codex")
+    foreign = str(tmp_path / "bin" / "codex-srouter")
     real = "/opt/homebrew/bin/codex"
     files = {
         foreign: "#!/bin/sh\n# my custom codex wrapper\nexec /somewhere/codex\n",
@@ -300,7 +301,7 @@ def test_detail_includes_provenance_version_and_wrapped_badge(_versions_monkey, 
     """detail (для doctor-отчёта) содержит для каждого binary: provenance + version + бейдж обёрнут/нет.
     Формат — см. пример в issue #145 (буллеты).
     """
-    wrapper = str(tmp_path / "bin" / "codex")
+    wrapper = str(tmp_path / "bin" / "codex-srouter")
     real = "/opt/homebrew/bin/codex"
     files = {
         wrapper: "#!/bin/sh\n# srouter: codex CLI wrapper (managed)\n",

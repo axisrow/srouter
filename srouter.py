@@ -253,28 +253,41 @@ CODEX_LAUNCHCTL_ENV = tuple((k, _CODEX_PROXY_URL) for k in
                              "http_proxy", "https_proxy", "all_proxy")) \
                       + (("NO_PROXY", CODEX_NO_PROXY), ("no_proxy", CODEX_NO_PROXY))
 # Wrappers: (name, template, marker). Цикл в install/remove — не два явных вызова.
+# Issue #169: CLI-wrapper переименован codex → codex-srouter — убрать коллизию неймспейса (wrapper и
+# real binary оба звались codex → natural-рекурсия #150/#144, foreign-wrapper резолвит codex=wrapper).
+# После rename wrapper файл = codex-srouter, real binary так и зовётся codex → wrapper больше не
+# находит себя по имени при runtime-резолве, коллизия устранена СТРУКТУРНО. Маркер НЕ менялся при rename
+# (идентифицирует «srouter-managed wrapper», не имя файла) — migration старого ~/bin/codex по этому маркеру.
 CODEX_WRAPPERS = (
-    ("codex", "srouter-codex-cli-wrapper.sh", "# srouter: codex CLI wrapper (managed)"),
+    ("codex-srouter", "srouter-codex-cli-wrapper.sh", "# srouter: codex CLI wrapper (managed)"),
     ("codex-app-proxy", "srouter-codex-app-proxy-wrapper.sh", "# srouter: codex-app-proxy wrapper (managed)"),
 )
+# Имя CLI-wrapper'а (первая запись CODEX_WRAPPERS) — единый источник правды для rename-migration.
+CODEX_CLI_WRAPPER_NAME = CODEX_WRAPPERS[0][0]
+# Старое имя CLI-wrapper'а до rename (#169). Migration: srouter-managed ~/bin/codex (по маркеру) → удалить
+# при install/remove; чужой (без маркера) — не трогать (канон provenance issue-112-hybrid-uninstall).
+CODEX_CLI_WRAPPER_LEGACY_NAME = "codex"
 # LaunchAgent для глобального env: launchctl setenv SOCKS5 в GUI-домен (переживает ребут).
 # Label = com.srouter.codenv → prefix CODENV для плейсхолдеров __SROUTER_CODENV_*__ в шаблоне plist.
 CODEX_ENV_LABEL = "com.srouter.codenv"
 CODEX_ENV_MARKER = "srouter-managed-codex-env-v1"
 ZSHRC_PATH_MARKER = "# srouter: ~/bin в PATH для codex wrapper"
-# Shell-функция codex() в ~/.zshrc (issue #96): вызывает ~/bin/codex по абсолютному пути, чтобы
+# Shell-функция codex() в ~/.zshrc (issue #96): вызывает ~/bin/codex-srouter по абсолютному пути, чтобы
 # порядок brew в PATH был не важен (функция всегда бьёт binary). Без неё wrapper #83 проигрывает
 # /opt/homebrew/bin/codex. Парные маркеры для marker-gate install/remove (как ZSHRC_PATH_MARKER).
+# Issue #169: функция зовёт ПЕРЕИМЕНОВАННЫЙ wrapper ~/bin/codex-srouter (имя codex освобождено под real
+# binary — коллизия неймспейса устранена). Функция по-прежнему зовётся codex() в интерактивном шелле,
+# чтобы пользовательский habit `codex …` работал — только внутри она ведёт на codex-srouter.
 ZSHRC_CODEX_FUNC_MARKER_BEGIN = "# >>> srouter-managed-codex-function-v1 >>>"
 ZSHRC_CODEX_FUNC_MARKER_END = "# <<< srouter-managed-codex-function-v1 <<<"
 # function codex { … }, не голый codex() — существующий alias может помешать парсингу определения.
 # guard `! $+aliases[codex] && ! $+functions[codex]` — не перекрываем молча чужое определение.
-# Без exec внутри (заменит интерактивный шелл). Абсолютный путь "$HOME/bin/codex".
+# Без exec внутри (заменит интерактивный шелл). Абсолютный путь "$HOME/bin/codex-srouter" (#169 rename).
 _CODEX_FUNC_BLOCK = (
     f"{ZSHRC_CODEX_FUNC_MARKER_BEGIN}\n"
     'if (( ! ${+aliases[codex]} && ! ${+functions[codex]} )); then\n'
     '  function codex {\n'
-    '    "$HOME/bin/codex" "$@"\n'
+    '    "$HOME/bin/codex-srouter" "$@"\n'
     '  }\n'
     "fi\n"
     f"{ZSHRC_CODEX_FUNC_MARKER_END}"
@@ -291,18 +304,32 @@ def _zshrc_path() -> Path:
     return Path.home() / ".zshrc"
 
 
+def _looks_like_managed_codex_wrapper(path: str) -> bool:
+    """Файл path — наш managed codex-wrapper (несёт srouter-маркер)? Маркер — единственный признак
+    «managed wrapper», НЕ путь/имя (memory issue-144: wrapper ≠ binary). cycle-review cycle-4 FIX #1:
+    install-time resolver обязан различать managed-wrapper от real binary по маркеру — иначе legacy
+    ~/bin/codex (managed) misclassify как real binary → migration удаляет его без независимого real codex
+    → новый codex-srouter exit 127. Тот же marker-skip, что wrapper template делает в runtime-резолве."""
+    try:
+        return CODEX_WRAPPERS[0][2] in Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return False
+
+
 def _codex_bin_path() -> str:
     """Абсолютный путь к реальному codex binary (не наш wrapper) — install-time GATE: отвечает только
-    на вопрос «есть ли на диске хоть один codex» (если нет → WARN, wrapper не ставится). ПУТЬ сюда НЕ
+    на вопрос «есть ли на диске независимый real codex» (если нет → WARN, wrapper не ставится). ПУТЬ сюда НЕ
     вшивается: с #144 CLI-wrapper runtime-резолвит codex по PATH вызывающего минуя себя (подход A),
     так что >1 binary на диске и смена binary после brew upgrade покрыты без reinstall.
-    shutil.which минуя ~/bin/codex, fallback на homebrew-пути (Apple Silicon / Intel). '' если не найден."""
-    wrapper = _codex_wrapper_path("codex")
+    shutil.which минуя наш wrapper (codex-srouter после #169), fallback на homebrew-пути (Apple Silicon / Intel).
+    '' если не найден. cycle-review cycle-4 FIX #1: отвергаем ЛЮБОЙ кандидат с managed-маркером (не только
+    codex-srouter) — legacy ~/bin/codex (managed) НЕ считается real binary, иначе migration удалила бы его
+    без независимого real codex. Примечание #169: real binary зовётся codex (имя освобождено от wrapper'а)."""
     found = shutil.which("codex")
-    if found and Path(found).resolve() != wrapper.resolve():
+    if found and not _looks_like_managed_codex_wrapper(found):
         return found
     for cand in (str(Path(BREW).parent / "codex"), "/opt/homebrew/bin/codex", "/usr/local/bin/codex"):
-        if Path(cand).exists():
+        if Path(cand).exists() and not _looks_like_managed_codex_wrapper(cand):
             return cand
     return ""  # не найден — _install_one_wrapper покажет WARN
 
@@ -346,7 +373,7 @@ def _install_one_wrapper(env, wrapper_path: Path, template_name: str, marker: st
             return f"Codex {wrapper_path.name}: не записан (ошибка atomic write)."
         wrapper_path.chmod(0o755)
         # CLI-wrapper: best-effort layer (#144). Не fail-closed — честная граница = PF kill-switch.
-        if wrapper_path.name == "codex":
+        if wrapper_path.name == CODEX_CLI_WRAPPER_NAME:
             return (f"Codex {wrapper_path.name}: установлен ({wrapper_path} — SOCKS5 минуя privoxy). "
                     f"Best-effort (НЕ fail-closed): runtime-резолвит codex по PATH вызывающего. "
                     f"НЕ перехватывает прямой абсолютный путь к binary, `node codex.js` и вызов с "
@@ -357,9 +384,65 @@ def _install_one_wrapper(env, wrapper_path: Path, template_name: str, marker: st
 
 
 def _install_codex_wrappers(env) -> str:
-    """Поставить ~/bin/codex + ~/bin/codex-app-proxy. Best-effort, цикл по CODEX_WRAPPERS."""
-    return "\n".join(_install_one_wrapper(env, _codex_wrapper_path(name), tmpl, marker)
-                     for name, tmpl, marker in CODEX_WRAPPERS)
+    """Поставить ~/bin/codex-srouter + ~/bin/codex-app-proxy. Best-effort, цикл по CODEX_WRAPPERS.
+
+    Issue #169 rename-migration: перед установкой нового codex-srouter подчищаем устаревший
+    srouter-managed ~/bin/codex от прежней установки (до rename) — иначе коллизия неймспейса
+    остаётся (два wrapper'а: старый codex + новый codex-srouter). Чужой ~/bin/codex (без маркера)
+    — не трогаем (fail-closed provenance, #112).
+
+    cycle-review FIX A (транзакционность): migration legacy ~/bin/codex → удаление разрешено ТОЛЬКО
+    если новый codex-srouter установлен и валиден (несёт current-маркер, executable). Если install
+    нового упал (codex binary не найден / write-fail / foreign codex-srouter без маркера) — legacy
+    СОХРАНЯЕТСЯ, иначе пользователь терял работающий wrapper без замены (молчаливый частичный успех)."""
+    parts = [_install_one_wrapper(env, _codex_wrapper_path(name), tmpl, marker)
+             for name, tmpl, marker in CODEX_WRAPPERS]
+    cli_marker = CODEX_WRAPPERS[0][2]
+    # Транзакционность: новый codex-srouter должен стоять И быть нашим (current-маркер + executable).
+    # Иначе миграция отменилась бы (удаление legacy без замены = потеря wrapper'а).
+    # _codex_zsh_target_installed() — единый критерий валидности target (общий с _install_codex_zsh_function,
+    # cycle-review cycle-2 FIX #1): одно определение «target валиден» → нет рассинхрона между
+    # legacy-preservation (здесь) и zsh-migration (там).
+    if _codex_zsh_target_installed():
+        migration_note = _migrate_legacy_codex_cli_wrapper(cli_marker, action="install")
+        if migration_note:
+            parts.append(migration_note)
+    else:
+        legacy = _codex_wrapper_path(CODEX_CLI_WRAPPER_LEGACY_NAME)
+        if legacy.exists():
+            parts.append(
+                f"Codex {CODEX_CLI_WRAPPER_LEGACY_NAME}: миграция отложена — новый "
+                f"{CODEX_CLI_WRAPPER_NAME} не установлен/не валиден (сохранил устаревший wrapper, #169).")
+    return "\n".join(parts)
+
+
+def _migrate_legacy_codex_cli_wrapper(marker: str, *, action: str) -> str:
+    """Rename-migration старого ~/bin/codex (#169). Возвращает note-строку (пусто = нечего делать).
+
+    install: srouter-managed ~/bin/codex (по маркеру) → УДАЛИТЬ (устарел, заменён на codex-srouter);
+             чужой (без маркера) → WARN «не трогаем» (fail-closed provenance #112, как marker-gate).
+    remove:  srouter-managed ~/bin/codex → удалить (leftover cleanup, симметрия install);
+             чужой → пусто (remove молча не трогает чужое, WARN только в install-контексте).
+
+    Маркер НЕ менялся при rename (идентифицирует «srouter-managed wrapper», не имя файла) → один и тот же
+    маркер валиден и для codex-srouter, и для устаревшего codex. Это и есть признак «наш»."""
+    legacy = _codex_wrapper_path(CODEX_CLI_WRAPPER_LEGACY_NAME)
+    try:
+        if not legacy.exists():
+            return ""
+        content = legacy.read_text(encoding="utf-8")
+        if marker in content:
+            # srouter-managed устаревший wrapper → удалить (rename-cleanup).
+            legacy.unlink()
+            return (f"Codex {CODEX_CLI_WRAPPER_LEGACY_NAME}: мигрирован → удалён устаревший "
+                    f"wrapper (заменён на {CODEX_CLI_WRAPPER_NAME}, #169).")
+        # Чужой ~/bin/codex без маркера — не наш. install WARN'ует оператору, remove молча пропускает.
+        if action == "install":
+            return (f"Codex {CODEX_CLI_WRAPPER_LEGACY_NAME}: существует чужой ~/bin/{CODEX_CLI_WRAPPER_LEGACY_NAME} "
+                    f"без srouter-маркера — не трогаем (замени на codex-srouter или удали вручную).")
+        return ""
+    except Exception as exc:
+        return (f"Codex {CODEX_CLI_WRAPPER_LEGACY_NAME}: миграция не выполнена ({str(exc)[:60]}).")
 
 
 def _remove_one_wrapper(wrapper_path: Path, marker: str) -> str:
@@ -376,9 +459,18 @@ def _remove_one_wrapper(wrapper_path: Path, marker: str) -> str:
 
 
 def _remove_codex_wrappers() -> str:
-    """Удалить wrappers (если srouter-managed). Цикл по CODEX_WRAPPERS, единый разделитель с install."""
-    return "\n".join(_remove_one_wrapper(_codex_wrapper_path(name), marker)
-                     for name, _, marker in CODEX_WRAPPERS)
+    """Удалить wrappers (если srouter-managed). Цикл по CODEX_WRAPPERS, единый разделитель с install.
+
+    Issue #169 rename-migration: также подчищаем устаревший srouter-managed ~/bin/codex от прежней
+    установки (до rename) — leftover иначе даёт «призрак» wrapper'а после деинсталляции. Чужой
+    ~/bin/codex (без маркера) — не трогаем (fail-closed provenance #112)."""
+    parts = [_remove_one_wrapper(_codex_wrapper_path(name), marker)
+             for name, _, marker in CODEX_WRAPPERS]
+    cli_marker = CODEX_WRAPPERS[0][2]
+    migration_note = _migrate_legacy_codex_cli_wrapper(cli_marker, action="remove")
+    if migration_note:
+        parts.append(migration_note)
+    return "\n".join(parts)
 
 
 def _install_launchctl_env(env, runner) -> str:
@@ -551,12 +643,33 @@ def _remove_home_bin_from_path() -> str:
         return f"PATH: не убран ({str(exc)[:80]})."
 
 
+def _codex_zsh_target_installed() -> bool:
+    """Установлен ли новый codex-srouter И валиден (is_file + executable + current-маркер)?
+
+    cycle-review cycle-2 FIX #1 (transactional coherence): zsh-migration stale-блока codex→codex-srouter
+    согласовывается с wrapper-install — мигрируем zsh только если target реально стоит. Иначе FIX A
+    сохранит рабочий legacy ~/bin/codex, а FIX B перенаправит zsh на codex-srouter (которого нет) →
+    inconsistency (`codex` зовёт несуществующий файл, притом рабочий legacy стоит). Те же критерии, что
+    new_installed_ok в _install_codex_wrappers — единый источник правды валидности target."""
+    try:
+        wrapper = _codex_wrapper_path(CODEX_CLI_WRAPPER_NAME)
+        return (wrapper.is_file()
+                and os.access(wrapper, os.X_OK)
+                and CODEX_WRAPPERS[0][2] in wrapper.read_text(encoding="utf-8"))
+    except OSError:
+        return False
+
+
 def _install_codex_zsh_function(env) -> str:
     """Добавить shell-функцию codex() в ~/.zshrc (issue #96).
 
-    Функция вызывает ~/bin/codex по АБСОЛЮТНОМУ пути — порядок brew в PATH не важен (функция всегда
-    бьёт binary). Без неё wrapper #83 проигрывает /opt/homebrew/bin/codex → Codex идёт через privoxy
+    Функция вызывает ~/bin/codex-srouter по АБСОЛЮТНОМУ пути — порядок brew в PATH не важен (функция
+    всегда бьёт binary). Без неё wrapper #83 проигрывает /opt/homebrew/bin/codex → Codex идёт через privoxy
     (наследует HTTP_PROXY от ~/.claude/settings.json env) → режёт WS → "Falling back to HTTPS".
+
+    Issue #169: функция зовёт переименованный wrapper ~/bin/codex-srouter (внутри _CODEX_FUNC_BLOCK).
+    Сама функция по-прежнему зовётся codex() в интерактивном шелле — пользовательский habit `codex …`
+    сохранён, только внутри ведёт на codex-srouter (имя codex освобождено под real binary).
 
     Marker-gate (парные begin/end) + backup через install_lib._backup + atomic write — тот же
     канон, что _ensure_home_bin_in_path. Fail-closed: чужой alias codex/function codex без нашего
@@ -566,9 +679,64 @@ def _install_codex_zsh_function(env) -> str:
         from install_lib import _backup
         zshrc = _zshrc_path()
         content = zshrc.read_text(encoding="utf-8") if zshrc.exists() else ""
-        # Idempotent: блок уже на месте.
-        if ZSHRC_CODEX_FUNC_MARKER_BEGIN in content:
+        # Idempotent ИЛИ migration stale-блока (cycle-review FIX B). Managed-блок уже на месте —
+        # но он может быть от установки ДО rename (#169) и звать устаревший ~/bin/codex. Только по
+        # голому маркеру short-circuit'ить нельзя: zsh-функция осталась бы звать удалённый legacy
+        # wrapper → `codex` в интерактивном шелле ломался, притом install рапортил успех.
+        # Различаем: блок зовёт текущий codex-srouter → idempotent; зовёт устаревший codex → обновляем.
+        begins = content.count(ZSHRC_CODEX_FUNC_MARKER_BEGIN)
+        ends = content.count(ZSHRC_CODEX_FUNC_MARKER_END)
+        begin_idx = content.find(ZSHRC_CODEX_FUNC_MARKER_BEGIN)
+        end_idx = content.find(ZSHRC_CODEX_FUNC_MARKER_END)
+        # cycle-review cycle-3/cycle-4: замкнутый инвариант маркеров — ровно одна УПОРЯДОЧЕННАЯ пара
+        # (begin перед end), не только count==1. Реверснутые/дублированные → fail-closed (иначе start>end →
+        # пустой span → реконструкция дублирует контент .zshrc, рапорт успеха). Проверяется ПЕРВЫМ — ДО любой
+        # проверки current/stale строки (cycle-4 FIX #2: строка по всему content не должна обходить инвариант).
+        ordered_pair = begins == 1 and ends == 1 and 0 <= begin_idx < end_idx
+        if begins >= 1 or ends >= 1:
+            # Любой маркер присутствует → требуем ровно одну упорядоченную пару, иначе fail-closed.
+            if not ordered_pair:
+                return ("Codex функция: повреждённый managed-маркер в ~/.zshrc "
+                        f"(begin={begins}, end={ends}, ordered={ordered_pair}) — не обновляю (проверь вручную).")
+            # Инспектируем target-строку ТОЛЬКО внутри валидированного span (не по всему content — cycle-4 FIX #2).
+            span = content[begin_idx:end_idx + len(ZSHRC_CODEX_FUNC_MARKER_END)]
+            if '"$HOME/bin/codex-srouter" "$@"' in span:
+                # cycle-review cycle-4 FIX #2: current-блок принимаем «idempotent» ТОЛЬКО после target-gate.
+                # Иначе predсуществующий блок (target удалён) ведёт в никуда, а install рапортует ОК.
+                if not _codex_zsh_target_installed():
+                    return ("Codex функция: managed-блок зовёт codex-srouter, но target не установлен/не валиден — "
+                            "проверь ~/bin/codex-srouter (блок не трогаю, не рапортую idempotent вслепую).")
+                return "Codex функция: уже в ~/.zshrc (idempotent)."
+            if '"$HOME/bin/codex" "$@"' in span:
+                # cycle-review cycle-3 FIX #1-root (unified target gate): мигрируем stale-блок codex → codex-srouter
+                # ТОЛЬКО если новый codex-srouter установлен и валиден. Иначе FIX A сохранит legacy ~/bin/codex
+                # (рабочий), а zsh перенаправится на codex-srouter (которого нет) → inconsistency.
+                if not _codex_zsh_target_installed():
+                    return ("Codex функция: новый codex-srouter не установлен/не валиден — "
+                            "stale zsh-блок НЕ мигрирую (оставляю ~/bin/codex, рабочий). "
+                            "Запусти srouter install после установки codex binary.")
+                _backup(zshrc, env)  # timestamped backup перед правкой managed-блока
+                start = begin_idx
+                end = end_idx + len(ZSHRC_CODEX_FUNC_MARKER_END)
+                updated_block = span.replace('"$HOME/bin/codex" "$@"',
+                                             '"$HOME/bin/codex-srouter" "$@"')
+                # проверяем результат atomic-write, не рапортуем успех молча (cycle-2 FIX #1b).
+                if not _write_text_atomic(zshrc, content[:start] + updated_block + content[end:]):
+                    return "Codex функция: не обновлена (ошибка atomic write ~/.zshrc)."
+                return ("Codex функция: обновлён путь в managed-блоке (codex → codex-srouter, rename #169). "
+                        "Backup: .zshrc.srouter-backup-*. "
+                        "ВНИМАНИЕ: существующие терминалы/codex-процессы не получат новое окружение — "
+                        "перезапусти их (exec zsh -l, затем закрыть/открыть TUI).")
+            # Managed-маркер есть, но target-строка не распознана (модифицированный блок) — не трогаем (fail-closed).
             return "Codex функция: уже в ~/.zshrc (idempotent)."
+        # cycle-review cycle-3 FIX #1-root (unified target gate): fresh-create/append path. zsh-функция
+        # (codex-srouter) создаётся ТОЛЬКО если target установлен и валиден. Иначе она shadow'ит сохранённый
+        # legacy ~/bin/codex (FIX A) и зовёт несуществующий codex-srouter — та же inconsistency через fresh-create.
+        # Замкнутый инвариант: _codex_zsh_target_installed() — единый gate ДЛЯ ВСЕХ путей (migration/create/append).
+        if not _codex_zsh_target_installed():
+            return ("Codex функция: новый codex-srouter не установлен/не валиден — "
+                    "zsh-функция не добавляется (иначе shadow'нет рабочий ~/bin/codex, зовя несуществующий target). "
+                    "Запусти srouter install после установки codex binary.")
         # Fail-closed: чужое определение codex (alias или function) без нашего маркера — не трогаем.
         # `alias codex=` или `codex()` или `function codex`/`codex ()`. Ищем как определение,
         # не как упоминание в комментарии (требуем синтаксис присваивания/определения).
@@ -576,15 +744,15 @@ def _install_codex_zsh_function(env) -> str:
                                     content))
         if has_foreign:
             return ("Codex функция: обнаружен чужой alias/function codex в ~/.zshrc — "
-                    "не добавляю (конфликт). ~/bin/codex доступен как явная точка входа.")
+                    "не добавляю (конфликт). ~/bin/codex-srouter доступен как явная точка входа.")
         if not zshrc.exists():
             _write_text_atomic(zshrc, _CODEX_FUNC_BLOCK + "\n")
-            return ("Codex функция: создан ~/.zshrc с codex() → ~/bin/codex (новый терминал подхватит). "
+            return ("Codex функция: создан ~/.zshrc с codex() → ~/bin/codex-srouter (новый терминал подхватит). "
                     "ВНИМАНИЕ: существующие терминалы/codex-процессы не получат новое окружение — "
                     "перезапусти их (exec zsh -l в каждом, затем закрыть/открыть TUI).")
         _backup(zshrc, env)  # timestamped backup, каноничный helper
         _write_text_atomic(zshrc, content.rstrip() + "\n\n" + _CODEX_FUNC_BLOCK + "\n")
-        return ("Codex функция: добавлена в ~/.zshrc (codex → ~/bin/codex по абс. пути, "
+        return ("Codex функция: добавлена в ~/.zshrc (codex → ~/bin/codex-srouter по абс. пути, "
                 "бьёт brew в PATH). Backup: .zshrc.srouter-backup-*. "
                 "ВНИМАНИЕ: существующие терминалы/codex-процессы не получат новое окружение — "
                 "перезапусти их (exec zsh -l, затем закрыть/открыть TUI); иначе старая TUI пойдёт "
@@ -607,19 +775,25 @@ def _remove_codex_zsh_function() -> str:
         content = zshrc.read_text(encoding="utf-8")
         if ZSHRC_CODEX_FUNC_MARKER_BEGIN not in content and ZSHRC_CODEX_FUNC_MARKER_END not in content:
             return "Codex функция: не была изменена."
-        # Fail-closed: ровно один парный блок. Непарный/дублированный → отказ (safe-noop).
-        # Достаточно begins==1 and ends==1 (это уже влечёт их равенство) — без третьего условия.
+        # cycle-review cycle-4 FIX #3: тот же ordered-pair инвариант, что в install (cycle-3). Ровно одна
+        # УПОРЯДОЧЕННАЯ пара (begin перед end). Реверснутые/дублированные → safe no-op, НЕ corruption
+        # (иначе start>end → slice overlap → дублирование контента .zshrc, рапорт «убрана»).
         begins = content.count(ZSHRC_CODEX_FUNC_MARKER_BEGIN)
         ends = content.count(ZSHRC_CODEX_FUNC_MARKER_END)
-        if begins != 1 or ends != 1:
+        begin_idx = content.find(ZSHRC_CODEX_FUNC_MARKER_BEGIN)
+        end_idx = content.find(ZSHRC_CODEX_FUNC_MARKER_END)
+        ordered_pair = begins == 1 and ends == 1 and 0 <= begin_idx < end_idx
+        if not ordered_pair:
             return ("Codex функция: не удалена — повреждённый маркер "
-                    f"(begin={begins}, end={ends}), проверь ~/.zshrc вручную.")
-        start = content.index(ZSHRC_CODEX_FUNC_MARKER_BEGIN)
-        end = content.index(ZSHRC_CODEX_FUNC_MARKER_END) + len(ZSHRC_CODEX_FUNC_MARKER_END)
+                    f"(begin={begins}, end={ends}, ordered={ordered_pair}), проверь ~/.zshrc вручную.")
+        start = begin_idx
+        end = end_idx + len(ZSHRC_CODEX_FUNC_MARKER_END)
         # Зачистить окружающие пустые строки (мы добавляли \n\n перед блоком при install).
         before = content[:start].rstrip("\n")
         out = before + ("\n" if before else "") + content[end:]
-        _write_text_atomic(zshrc, out.rstrip() + "\n")
+        # проверяем результат atomic-write, не рапортуем успех молча (cycle-4 симметрия с install).
+        if not _write_text_atomic(zshrc, out.rstrip() + "\n"):
+            return "Codex функция: не убрана (ошибка atomic write ~/.zshrc)."
         return "Codex функция: убрана из ~/.zshrc."
     except Exception as exc:
         return f"Codex функция: не убрана ({str(exc)[:80]})."

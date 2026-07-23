@@ -453,8 +453,10 @@ def _codex_proxy_probe():
 # сигнал конфликта (#135 desktop-proxy-vs-managed-codex-socks5-conflict), но НЕ сбой стека → info-only
 # (как claude-proxy когда CC не запущен). Doctor показывает картину, не угадывает за пользователя.
 
-# Маркер srouter-wrapper в ~/bin/codex (первая строка шаблона srouter-codex-cli-wrapper.sh).
+# Маркер srouter-wrapper в ~/bin/codex-srouter (первая строка шаблона srouter-codex-cli-wrapper.sh).
 # Совпадает с CODEX_WRAPPERS[0] marker в srouter.py (канон: один источник правды для маркера).
+# Issue #169: wrapper файл переименован codex → codex-srouter, но МАРКЕР не менялся (идентифицирует
+# «srouter-managed wrapper», не имя файла) → один и тот же маркер в health.py и srouter.py.
 _CODEX_WRAPPER_MARKER = "# srouter: codex CLI wrapper (managed)"
 
 # Which(1) с -a печатает ВСЕ совпадения в PATH; абсолютные пути — только строки, начинающиеся с /
@@ -464,8 +466,9 @@ NPM = "/opt/homebrew/bin/npm"  # абсолютный путь: launchd/GUI PATH
 
 
 def _codex_wrapper_path():
-    """Путь к codex-wrapper в ~/bin (динамически, для моков Path.home — канон srouter.py:290)."""
-    return Path.home() / "bin" / "codex"
+    """Путь к codex-wrapper в ~/bin/codex-srouter (динамически, для моков Path.home — канон srouter.py).
+    Issue #169 rename: wrapper файл codex → codex-srouter (real binary по-прежнему зовётся codex)."""
+    return Path.home() / "bin" / "codex-srouter"
 
 
 def _which_all(name):
@@ -495,8 +498,9 @@ def _binary_version(path):
 
 
 def _is_srouter_codex_wrapper(path):
-    """Файл path — наш srouter-wrapper? Путь == ~/bin/codex И маркер в содержимом (первая строка шаблона).
-    Не полагается только на путь: чужой wrapper в ~/bin/codex без маркера — НЕ наш (regression-гвард).
+    """Файл path — наш srouter-wrapper? Путь == ~/bin/codex-srouter И маркер в содержимом (первая строка шаблона).
+    Не полагается только на путь: чужой wrapper в ~/bin/codex-srouter без маркера — НЕ наш (regression-гвард).
+    Issue #169: путь к wrapper'у = ~/bin/codex-srouter (rename из codex).
     """
     try:
         if path == str(_codex_wrapper_path()):
@@ -509,7 +513,7 @@ def _is_srouter_codex_wrapper(path):
 def _codex_provenance(path):
     """Provenance codex-binary по его расположению: npm / homebrew / usr-local / bin / path.
     НЕ утверждает «обёрнут srouter» — это решает _is_srouter_codex_wrapper (по маркеру, не по пути),
-    поэтому ~/bin/codex без маркера = provenance 'bin' (чужой/устаревший wrapper), не 'srouter-wrapper'."""
+    поэтому ~/bin/codex-srouter без маркера = provenance 'bin' (чужой/устаревший wrapper), не 'srouter-wrapper'."""
     p = str(path)
     if "/lib/node_modules/" in p or p.endswith(".js"):
         return "npm"
@@ -535,15 +539,20 @@ def _claude_provenance(path):
 def _scan_codex_binaries():
     """Найти ВСЕ codex-binary на диске. Источники: which -a, homebrew-paths, ~/bin wrapper,
     npm global root (@openai/codex/bin/codex.js), brew-cask. Дедуп по нормализованному пути.
-    Каждый: {path, provenance, version, wrapped}. Не бросает (fail-soft)."""
+    Каждый: {path, provenance, version, wrapped}. Не бросает (fail-soft).
+
+    Issue #169: real binary зовётся codex (имя освобождено от wrapper'а при rename). srouter-wrapper
+    живёт в ~/bin/codex-srouter и НЕ находится через `which -a codex` (другое имя) — добавляем его явно
+    (шаг 3), чтобы doctor показывал wrapped-статус."""
     candidates = []
-    # 1. which -a codex (все в PATH, включая ~/bin/codex wrapper).
+    # 1. which -a codex (real binary в PATH; старый устаревший ~/bin/codex тоже, если остался после rename).
     candidates.extend(_which_all("codex"))
     # 2. well-known homebrew/standalone (Apple Silicon / Intel).
     for cand in ("/opt/homebrew/bin/codex", "/usr/local/bin/codex"):
         if Path(cand).is_file():
             candidates.append(cand)
-    # 3. srouter-wrapper ~/bin/codex (явно — который() может не вернуть, если ~/bin не в PATH пробы).
+    # 3. srouter-wrapper ~/bin/codex-srouter (явно — который() codex его не вернёт: имя codex-srouter,
+    # и ~/bin может не быть в PATH пробы). Переименован в #169 из ~/bin/codex.
     wrapper = str(_codex_wrapper_path())
     if Path(wrapper).is_file():
         candidates.append(wrapper)
@@ -1112,7 +1121,7 @@ def _print_report(result):
                   "SOCKS TCP-соединение само по себе не доказывает работу API")
         if "codex-proxy" in failed_names:
             print("  • Codex TUI: перезапусти в НОВОМ терминале (exec zsh -l) — старая сессия не подхватила SOCKS5;")
-            print("    через privoxy 8118 long-lived WS рвётся (#120); нужен SOCKS5 10808 (~/bin/codex)")
+            print("    через privoxy 8118 long-lived WS рвётся (#120); нужен SOCKS5 10808 (~/bin/codex-srouter)")
 
 
 def cmd_watchdog():

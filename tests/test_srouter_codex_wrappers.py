@@ -1,7 +1,7 @@
 """ТДД-тесты srouter codex SOCKS5-wrappers + launchctl env (LaunchAgent plist) + PATH.
 
 Codex (CLI + App) работает стабильно только через SOCKS5 (xray 10808) минуя privoxy (портит WS).
-srouter install ставит ~/bin/codex + ~/bin/codex-app-proxy + LaunchAgent env-plist + ~/bin в PATH;
+srouter install ставит ~/bin/codex-srouter + ~/bin/codex-app-proxy + LaunchAgent env-plist + ~/bin в PATH;
 uninstall убирает. Канон — _install_ppp_hook/_remove_ppp_hook (best-effort, marker-gate «чужое не
 трогать», строка-статус).
 """
@@ -45,9 +45,22 @@ def _markers():
     return {name: marker for name, _, marker in srouter.CODEX_WRAPPERS}
 
 
+def _cli_wrapper_name():
+    """Имя CLI-wrapper'а в ~/bin (первая запись CODEX_WRAPPERS) — единый источник правды."""
+    return srouter.CODEX_WRAPPERS[0][0]
+
+
+def _cli_wrapper_path():
+    """Путь к CLI-wrapper в ~/bin (для тестов — через канон _codex_wrapper_path)."""
+    return srouter._codex_wrapper_path(_cli_wrapper_name())
+
+
 # ============================ _install/_remove_codex_wrappers ============================
 def test_install_creates_wrappers(monkeypatch, tmp_path):
-    """install ставит ~/bin/codex + ~/bin/codex-app-proxy с маркером + socks5h + executable."""
+    """install ставит ~/bin/codex-srouter + ~/bin/codex-app-proxy с маркером + socks5h + executable.
+
+    Issue #169: CLI-wrapper переименован codex → codex-srouter — убрать коллизию неймспейса
+    (wrapper и real binary оба звались codex). Имя берётся из CODEX_WRAPPERS (единый источник)."""
     home = _mock_home(monkeypatch, tmp_path)
     env = _env(tmp_path)
     bin_dir = home / "bin"
@@ -62,10 +75,14 @@ def test_install_creates_wrappers(monkeypatch, tmp_path):
         text = w.read_text(encoding="utf-8")
         assert marker in text, f"~/bin/{name} содержит srouter-маркер"
         assert os.access(w, os.X_OK), f"~/bin/{name} executable"
+    # Issue #169 — rename: CLI-wrapper файл называется codex-srouter, НЕ codex (коллизия с real binary).
+    assert _cli_wrapper_name() == "codex-srouter", "CLI-wrapper переименован в codex-srouter (#169)"
+    assert (bin_dir / "codex-srouter").exists(), "wrapper под именем codex-srouter"
+    assert not (bin_dir / "codex").exists(), "старого ~/bin/codex НЕТ (rename, коллизия устранена)"
     # CLI wrapper: socks5h (DNS via proxy для GFW) + env -u санирует унаследованный прокси
     # (от ~/.claude/settings.json env) + exec реального codex. Issue #96: без очистки privoxy
     # из окружения Codex идёт через 8118 → privoxy режёт WS → "Falling back to HTTPS".
-    cli_text = (bin_dir / "codex").read_text(encoding="utf-8")
+    cli_text = (bin_dir / "codex-srouter").read_text(encoding="utf-8")
     assert "socks5h://" in cli_text, "CLI использует socks5h (DNS via proxy)"
     assert "exec " in cli_text, "CLI exec'ает реальный codex"
     # env -u для всех 8 прокси-переменных (верхний/нижний регистр + ALL_PROXY + NO_PROXY).
@@ -82,11 +99,11 @@ def test_install_creates_wrappers(monkeypatch, tmp_path):
 
 
 def test_install_marker_gate_foreign_not_touched(monkeypatch, tmp_path):
-    """Чужой ~/bin/codex (без маркера srouter) — НЕ перезаписывать (unmarked → WARN, #112 Часть 4)."""
+    """Чужой ~/bin/codex-srouter (без маркера srouter) — НЕ перезаписывать (unmarked → WARN, #112 Часть 4)."""
     home = _mock_home(monkeypatch, tmp_path)
     env = _env(tmp_path)
     foreign = "# my custom codex wrapper\n#!/bin/sh\nexec /usr/local/bin/codex\n"
-    (home / "bin" / "codex").write_text(foreign, encoding="utf-8")
+    (home / "bin" / "codex-srouter").write_text(foreign, encoding="utf-8")
 
     note = srouter._install_codex_wrappers(env)
 
@@ -94,7 +111,7 @@ def test_install_marker_gate_foreign_not_touched(monkeypatch, tmp_path):
     # Формулировка migration-aware (отличает unmarked от чисто-foreign для оператора), семантика та же.
     assert "не трогаем" in note.lower() or "чуж" in note.lower(), \
         f"unmarked/foreign wrapper → WARN, не перезаписывать: {note}"
-    assert (home / "bin" / "codex").read_text(encoding="utf-8") == foreign
+    assert (home / "bin" / "codex-srouter").read_text(encoding="utf-8") == foreign
 
 
 def test_cli_launcher_renders_configured_proxy(monkeypatch, tmp_path):
@@ -106,7 +123,7 @@ def test_cli_launcher_renders_configured_proxy(monkeypatch, tmp_path):
     monkeypatch.setattr(srouter, "CODEX_NO_PROXY", "localhost,internal")
 
     srouter._install_codex_wrappers(env)
-    cli_text = (Path.home() / "bin" / "codex").read_text(encoding="utf-8")
+    cli_text = (Path.home() / "bin" / _cli_wrapper_name()).read_text(encoding="utf-8")
 
     assert "127.0.0.1:99999" in cli_text, "launcher использует отрендеренный _CODEX_PROXY_URL"
     assert "internal" in cli_text, "launcher использует отрендеренный CODEX_NO_PROXY"
@@ -130,11 +147,11 @@ def _install_with_fake_codex(monkeypatch, tmp_path, fake_bin):
     # ~/bin ПЕРЕД fakebin: проверяем, что wrapper пропускает себя и берёт fakebin/codex (антирекурсия).
     monkeypatch.setenv("PATH", f"{Path.home() / 'bin'}:{fakebin}:/usr/bin:/bin")
     srouter._install_codex_wrappers(env)
-    return Path.home() / "bin" / "codex"
+    return Path.home() / "bin" / _cli_wrapper_name()
 
 
 def test_cli_launcher_clears_inherited_privoxy_env(monkeypatch, tmp_path):
-    """Интеграционный (#96 core): запуск ~/bin/codex с унаследованным privoxy-окружением →
+    """Интеграционный (#96 core): запуск ~/bin/codex-srouter с унаследованным privoxy-окружением →
     дочерний codex видит SOCKS5, privoxy (8118) отсутствует. Доказывает env -u работает.
 
     Fake-codex дампит своё окружение в JSON — проверяем значения 8 переменных.
@@ -203,9 +220,9 @@ def test_install_idempotent(monkeypatch, tmp_path):
     home = _mock_home(monkeypatch, tmp_path)
     env = _env(tmp_path)
     srouter._install_codex_wrappers(env)
-    first = (home / "bin" / "codex").read_text(encoding="utf-8")
+    first = (home / "bin" / _cli_wrapper_name()).read_text(encoding="utf-8")
     srouter._install_codex_wrappers(env)  # повторный
-    second = (home / "bin" / "codex").read_text(encoding="utf-8")
+    second = (home / "bin" / _cli_wrapper_name()).read_text(encoding="utf-8")
     assert first == second, "повторный install = idempotent"
 
 
@@ -213,12 +230,12 @@ def test_remove_deletes_managed(monkeypatch, tmp_path):
     """uninstall удаляет wrappers если они srouter-managed."""
     home = _mock_home(monkeypatch, tmp_path)
     srouter._install_codex_wrappers(_env(tmp_path))
-    assert (home / "bin" / "codex").exists()
+    assert (home / "bin" / _cli_wrapper_name()).exists()
 
     note = srouter._remove_codex_wrappers()
 
     assert "удалён" in note.lower()
-    assert not (home / "bin" / "codex").exists()
+    assert not (home / "bin" / _cli_wrapper_name()).exists()
     assert not (home / "bin" / "codex-app-proxy").exists()
 
 
@@ -226,12 +243,12 @@ def test_remove_marker_gate_foreign(monkeypatch, tmp_path):
     """Чужой wrapper (без маркера) — НЕ удалять."""
     home = _mock_home(monkeypatch, tmp_path)
     foreign = "# my custom\n#!/bin/sh\nexec codex\n"
-    (home / "bin" / "codex").write_text(foreign, encoding="utf-8")
+    (home / "bin" / _cli_wrapper_name()).write_text(foreign, encoding="utf-8")
 
     note = srouter._remove_codex_wrappers()
 
     assert "чуж" in note.lower()
-    assert (home / "bin" / "codex").read_text(encoding="utf-8") == foreign
+    assert (home / "bin" / _cli_wrapper_name()).read_text(encoding="utf-8") == foreign
 
 
 # ============================ _install/_remove_launchctl_env (LaunchAgent com.srouter.codenv) ============================
@@ -720,14 +737,20 @@ def test_remove_home_bin_when_not_modified(monkeypatch, tmp_path):
 
 
 # ============================ _install/_remove_codex_zsh_function (issue #96) ============================
-# Shell-функция codex() в ~/.zshrc вызывает ~/bin/codex по абсолютному пути — тогда порядок brew в
+# Shell-функция codex() в ~/.zshrc вызывает ~/bin/codex-srouter по абсолютному пути — тогда порядок brew в
 # PATH не важен (функция всегда бьёт binary). Без неё wrapper #83 проигрывает /opt/homebrew/bin/codex.
 def test_codex_function_installed_in_zshrc(monkeypatch, tmp_path):
-    """install добавляет managed-блок codex() с парными маркерами, вызывающий ~/bin/codex."""
+    """install добавляет managed-блок codex() с парными маркерами, вызывающий ~/bin/codex-srouter.
+
+    Issue #169: функция зовёт переименованный wrapper ~/bin/codex-srouter (имя codex освобождено
+    под real binary — коллизия неймспейса устранена)."""
     home = _mock_home(monkeypatch, tmp_path)
     env = _env(tmp_path)
     zshrc = home / ".zshrc"
     zshrc.write_text("export PATH=/usr/local/bin:$PATH\n", encoding="utf-8")
+    # precondition (cycle-3 root fix): zsh-функция codex-srouter создаётся только при валидном target.
+    srouter._install_codex_wrappers(env)
+    assert (home / "bin" / "codex-srouter").exists()
 
     note = srouter._install_codex_zsh_function(env)
 
@@ -736,7 +759,7 @@ def test_codex_function_installed_in_zshrc(monkeypatch, tmp_path):
     assert srouter.ZSHRC_CODEX_FUNC_MARKER_BEGIN in content, "begin-маркер присутствует"
     assert srouter.ZSHRC_CODEX_FUNC_MARKER_END in content, "end-маркер присутствует"
     assert 'function codex' in content, "определение function codex"
-    assert '"$HOME/bin/codex" "$@"' in content, "вызов по абсолютному пути ~/bin/codex"
+    assert '"$HOME/bin/codex-srouter" "$@"' in content, "вызов по абсолютному пути ~/bin/codex-srouter (#169)"
     # guard: не перекрывает молча, если рядом уже есть определение
     assert '${+aliases[codex]}' in content and '${+functions[codex]}' in content
     # чужой export сохранён
@@ -749,6 +772,7 @@ def test_codex_function_install_idempotent(monkeypatch, tmp_path):
     env = _env(tmp_path)
     zshrc = home / ".zshrc"
     zshrc.write_text("export FOO=1\n", encoding="utf-8")
+    srouter._install_codex_wrappers(env)  # precondition: валидный target (cycle-3 root fix)
 
     srouter._install_codex_zsh_function(env)
     srouter._install_codex_zsh_function(env)
@@ -801,6 +825,7 @@ def test_codex_function_uninstall_removes_only_managed_block(monkeypatch, tmp_pa
     zshrc.write_text(
         'export PATH=/usr/local/bin:$PATH\n'
         '# user comment\n', encoding="utf-8")
+    srouter._install_codex_wrappers(env)  # precondition: валидный target (cycle-3 root fix)
     srouter._install_codex_zsh_function(env)
     assert srouter.ZSHRC_CODEX_FUNC_MARKER_BEGIN in zshrc.read_text(encoding="utf-8")
 
@@ -835,7 +860,7 @@ def test_codex_function_malformed_marker_fails_closed(monkeypatch, tmp_path):
     # Только begin-маркер без end (повреждённое состояние) + чужой контент после.
     broken = (
         f'{srouter.ZSHRC_CODEX_FUNC_MARKER_BEGIN}\n'
-        'function codex { "$HOME/bin/codex" "$@"; }\n'
+        'function codex { "$HOME/bin/codex-srouter" "$@"; }\n'
         'export PATH=/usr/local/bin:$PATH\n'  # НЕТ end-маркера
     )
     zshrc.write_text(broken, encoding="utf-8")
@@ -850,7 +875,7 @@ def test_codex_function_malformed_marker_fails_closed(monkeypatch, tmp_path):
 
 def test_codex_function_beats_brew_in_path(monkeypatch, tmp_path):
     """КЛЮЧЕВОЙ (#96, PATH ≠ evidence): даже если /opt/homebrew/bin/codex ПЕРВЫЙ в PATH,
-    функция codex() перехватывает вызов и доходит до ~/bin/codex (managed-launcher).
+    функция codex() перехватывает вызов и доходит до ~/bin/codex-srouter (managed-launcher).
 
     Реальный zsh: source .zshrc с функцией, whence -w codex = function, вызов доходит до fake
     launcher через $HOME/bin/codex (не до brew-бинаря). Доказывает победу функции над PATH-порядком.
@@ -930,16 +955,16 @@ def test_install_upgrades_old_marker_wrapper(monkeypatch, tmp_path):
     env = _env(tmp_path)
     bin_dir = home / "bin"
     bin_dir.mkdir(exist_ok=True)
-    current = _markers()["codex"]
+    current = _markers()[_cli_wrapper_name()]
     legacy = "# srouter-codex-wrapper-v0 (managed)"
     # Wrapper с LEGACY-маркером (как после смены версии маркера).
-    (bin_dir / "codex").write_text(f"{legacy}\n#!/bin/sh\nexec old-codex\n", encoding="utf-8")
+    (bin_dir / _cli_wrapper_name()).write_text(f"{legacy}\n#!/bin/sh\nexec old-codex\n", encoding="utf-8")
     # state знает old+current как наши (migration table).
     _write_known_markers_state(env, "wrappers", [current, legacy])
 
     note = srouter._install_codex_wrappers(env)
 
-    wrapper_text = (bin_dir / "codex").read_text(encoding="utf-8")
+    wrapper_text = (bin_dir / _cli_wrapper_name()).read_text(encoding="utf-8")
     assert current in wrapper_text, "wrapper обновлён до current-маркера (миграция)"
     assert legacy not in wrapper_text, "old legacy-маркер заменён"
     assert "установ" in note.lower() or "обнов" in note.lower() or "миграц" in note.lower(), \
@@ -957,11 +982,11 @@ def test_install_warns_on_unmarked_wrapper(monkeypatch, tmp_path):
     env = _env(tmp_path)
     bin_dir = home / "bin"
     bin_dir.mkdir(exist_ok=True)
-    current = _markers()["codex"]
+    current = _markers()[_cli_wrapper_name()]
     legacy = "# srouter-codex-wrapper-v0 (managed)"
     # Unmarked wrapper (нет current, нет legacy маркера — произвольный чужой контент).
     unmarked = "#!/bin/sh\nexec /usr/local/bin/codex\n# user custom\n"
-    (bin_dir / "codex").write_text(unmarked, encoding="utf-8")
+    (bin_dir / _cli_wrapper_name()).write_text(unmarked, encoding="utf-8")
     # state знает только current+legacy (unmarked не входит).
     _write_known_markers_state(env, "wrappers", [current, legacy])
 
@@ -969,7 +994,7 @@ def test_install_warns_on_unmarked_wrapper(monkeypatch, tmp_path):
 
     assert "не трогаем" in note.lower() or "чуж" in note.lower() or "маркер" in note.lower(), \
         f"unmarked wrapper → WARN, не adopt: {note}"
-    assert (bin_dir / "codex").read_text(encoding="utf-8") == unmarked, "unmarked wrapper НЕ перезаписан"
+    assert (bin_dir / _cli_wrapper_name()).read_text(encoding="utf-8") == unmarked, "unmarked wrapper НЕ перезаписан"
 
 
 def test_install_upgrades_old_marker_wrapper_without_state_uses_current_only(monkeypatch, tmp_path):
@@ -985,7 +1010,7 @@ def test_install_upgrades_old_marker_wrapper_without_state_uses_current_only(mon
     bin_dir.mkdir(exist_ok=True)
     # НЕТ state known_markers (env.state_path не существует или пустой).
     unknown_old = "# srouter-codex-wrapper-unknown (managed)"
-    (bin_dir / "codex").write_text(f"{unknown_old}\n#!/bin/sh\nexec codex\n", encoding="utf-8")
+    (bin_dir / _cli_wrapper_name()).write_text(f"{unknown_old}\n#!/bin/sh\nexec codex\n", encoding="utf-8")
 
     note = srouter._install_codex_wrappers(env)
 
@@ -993,17 +1018,468 @@ def test_install_upgrades_old_marker_wrapper_without_state_uses_current_only(mon
         f"unknown old-маркер без state-migration-table → WARN (не угадываем legacy): {note}"
 
 
+# ============================ issue #169: rename codex → codex-srouter (migration старого ~/bin/codex) ============================
+# Rename убирает коллизию неймспейса (wrapper и real binary оба звались codex → natural-рекурсия #150/#144).
+# После rename wrapper файл = codex-srouter; real binary так и зовётся codex. Старый ~/bin/codex от прежней
+# установки (до rename) остаётся на диске → MUST мигрировать: srouter-managed (по маркеру) → удалить (устарел),
+# чужой (без маркера) → НЕ трогать (канон provenance issue-112-hybrid-uninstall, «чужое не трогаем»).
+def _legacy_marker():
+    """Маркер wrapper'а до rename — 'codex CLI wrapper (managed)' (имя файла было codex, маркер тот же).
+    Маркер НЕ менялся при rename (он идентифицирует «srouter-managed wrapper», не имя файла)."""
+    return srouter.CODEX_WRAPPERS[0][2]
+
+
+def test_install_removes_legacy_managed_codex_wrapper(monkeypatch, tmp_path):
+    """#169 migration: старый ~/bin/codex со srouter-маркером → install УДАЛЯЕТ (устарел, заменён на codex-srouter).
+
+    Сценарий upgrade: пользователь ставил srouter до rename → ~/bin/codex несёт наш маркер (он «наш»).
+    После rename install обязан убрать устаревший ~/bin/codex (иначе коллизия неймспейса остаётся: два
+    wrapper'а, один под старым именем, один под новым). Без миграции old ~/bin/codex залипал бы и продолжал
+    перехватывать вызовы codex в не-zsh контекстах (foreign точка входа)."""
+    home = _mock_home(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    bin_dir = home / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    legacy = _legacy_marker()
+    # Старый ~/bin/codex от прежней установки (до rename) — несёт наш маркер → «наш».
+    (bin_dir / "codex").write_text(f"{legacy}\n#!/bin/sh\nexec /usr/bin/env codex\n", encoding="utf-8")
+
+    note = srouter._install_codex_wrappers(env)
+
+    assert (bin_dir / "codex-srouter").exists(), "новый wrapper codex-srouter установлен"
+    assert not (bin_dir / "codex").exists(), \
+        f"устаревший srouter-managed ~/bin/codex удалён (migration rename #169): {note}"
+    assert "миграц" in note.lower() or "удалён" in note.lower() or "обнов" in note.lower(), \
+        f"note сообщает о миграции устаревшего codex: {note}"
+
+
+def test_install_preserves_foreign_legacy_codex_wrapper(monkeypatch, tmp_path):
+    """#169 migration fail-closed: старый ~/bin/codex БЕЗ srouter-маркера (чужой) → НЕ трогать.
+
+    Канон provenance (#112): «чужое не трогаем». Чужой ~/bin/codex (пользовательский wrapper/скрипт без
+    нашего маркера) — не наш, rename не должен его удалять. Только WARN оператору. Это симметрично
+    marker-gate install/remove: маркер — единственный доказательство «наш»."""
+    home = _mock_home(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    bin_dir = home / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    foreign_codex = "#!/bin/sh\n# my own codex launcher\nexec /usr/local/bin/codex \"$@\"\n"
+    (bin_dir / "codex").write_text(foreign_codex, encoding="utf-8")
+
+    note = srouter._install_codex_wrappers(env)
+
+    assert (bin_dir / "codex-srouter").exists(), "новый wrapper установлен"
+    assert (bin_dir / "codex").read_text(encoding="utf-8") == foreign_codex, \
+        f"чужой ~/bin/codex НЕ трогаем (fail-closed provenance): {note}"
+    assert "не трогаем" in note.lower() or "чуж" in note.lower() or "codex" in note.lower(), \
+        f"note WARN о чужом ~/bin/codex: {note}"
+
+
+def test_install_rename_idempotent_after_migration(monkeypatch, tmp_path):
+    """#169 idempotency: повторный install после миграции не падает, не дублирует, не трогает уже-чистое состояние.
+
+    Первый install мигрирует (старый codex удалён, codex-srouter поставлен). Второй install — codex уже
+    нет (нечего мигрировать), codex-srouter уже на месте (idempotent install). Результат идентичен первому."""
+    home = _mock_home(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    bin_dir = home / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    legacy = _legacy_marker()
+    (bin_dir / "codex").write_text(f"{legacy}\n#!/bin/sh\nexec codex\n", encoding="utf-8")
+
+    srouter._install_codex_wrappers(env)  # миграция
+    assert not (bin_dir / "codex").exists() and (bin_dir / "codex-srouter").exists()
+    after_migration = (bin_dir / "codex-srouter").read_text(encoding="utf-8")
+
+    srouter._install_codex_wrappers(env)  # повторный — idempotent
+    assert not (bin_dir / "codex").exists(), "после миграции старого codex по-прежнему нет"
+    assert (bin_dir / "codex-srouter").read_text(encoding="utf-8") == after_migration, \
+        "повторный install = idempotent (codex-srouter не изменился)"
+
+
+def test_install_keeps_legacy_when_new_wrapper_not_installed(monkeypatch, tmp_path):
+    """cycle-review FIX A (codex+claude critical): migration ТРАНЗАКЦИОННА. Если новый codex-srouter НЕ
+    установлен (codex binary не найден → WARN) — устаревший managed ~/bin/codex ДОЛЖЕН ОСТАТЬСЯ.
+
+    Без транзакционности: migration безусловно удалял legacy, даже когда замена не встала → пользователь
+    терял работающий wrapper без замены (молча, install рапортовал частичный успех). Корневой инвариант:
+    миграция разрешена ТОЛЬКО после подтверждения, что новый codex-srouter установлен и валиден.
+    """
+    home = _mock_home(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    bin_dir = home / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    legacy = _legacy_marker()
+    legacy_content = f"{legacy}\n#!/bin/sh\nexec codex\n"
+    (bin_dir / "codex").write_text(legacy_content, encoding="utf-8")
+    # codex binary НЕ найден → install нового codex-srouter WARN'ется и не ставится.
+    monkeypatch.setattr(srouter, "_codex_bin_path", lambda: "")
+
+    note = srouter._install_codex_wrappers(env)
+
+    assert not (bin_dir / "codex-srouter").exists(), "новый wrapper не установлен (codex bin missing)"
+    assert (bin_dir / "codex").exists(), \
+        f"legacy managed ~/bin/codex СОХРАНЁН (migration отменена — замена не встала): {note}"
+    assert (bin_dir / "codex").read_text(encoding="utf-8") == legacy_content, "legacy не изменён"
+
+
+def test_codex_bin_path_rejects_managed_legacy_wrapper(monkeypatch, tmp_path):
+    """cycle-review cycle-4 FIX #1 (codex critical 0.99): _codex_bin_path ОТВЕРГАЕТ любой кандидат с
+    managed-маркером (не только codex-srouter), как wrapper template делает marker-skip. Иначе legacy
+    managed ~/bin/codex (первый в PATH) misclassify как real binary → install проходит → migration удаляет
+    legacy без независимого real codex → новый codex-srouter exit 127 (runtime-resolve не находит real).
+
+    Memory issue-144-wrapper-runtime-resolve: wrapper ≠ binary, runtime-resolve. install-time gate тоже
+    обязан различать managed-wrapper от real binary — по маркеру, не по пути (маркер = единственный признак)."""
+    home = _mock_home(monkeypatch, tmp_path)
+    bin_dir = home / "bin"
+    marker = srouter.CODEX_WRAPPERS[0][2]
+    # legacy managed codex в ~/bin (первый в PATH), НЕТ независимого real codex.
+    (bin_dir / "codex").write_text(f"{marker}\n#!/bin/sh\nexec /hardcoded/old/codex\n", encoding="utf-8")
+    (bin_dir / "codex").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin:/bin")
+
+    resolved = srouter._codex_bin_path()
+
+    assert resolved != str(bin_dir / "codex"), \
+        f"managed legacy wrapper НЕ принят за real binary (маркер → reject): resolved={resolved}"
+
+
+def test_install_no_delete_legacy_when_only_managed_codex_in_path(monkeypatch, tmp_path):
+    """cycle-review cycle-4 FIX #1 (интеграционный): legacy managed ~/bin/codex — ЕДИНСТВЕННЫЙ codex в PATH
+    (нет независимого real binary). Install НЕ должен мигрировать (удалять) legacy: новый codex-srouter
+    создастся, но runtime-resolve не найдёт real codex → exit 127. Migration разрешена только когда resolver
+    нашёл НЕЗАВИСИМЫЙ real codex (без managed-маркера).
+
+    Примечание: _codex_bin_path мокаем → '' (моделируем «нет независимого real codex»; в реальном окружении
+    /opt/homebrew/bin/codex может существовать и thenбы пройти — здесь изолируем именно этот класс)."""
+    home = _mock_home(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    bin_dir = home / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    marker = srouter.CODEX_WRAPPERS[0][2]
+    legacy_content = f"{marker}\n#!/bin/sh\nexec /hardcoded/old/codex\n"
+    (bin_dir / "codex").write_text(legacy_content, encoding="utf-8")
+    (bin_dir / "codex").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin:/bin")  # legacy единственный codex в PATH
+    monkeypatch.setattr(srouter, "_codex_bin_path", lambda: "")  # НЕТ независимого real codex
+
+    note = srouter._install_codex_wrappers(env)
+
+    # legacy СОХРАНЁН (нет независимого real codex → codex-srouter не встал → migration отменена).
+    assert (bin_dir / "codex").exists(), \
+        f"legacy preserved — нет независимого real codex (resolver отверг managed): {note}"
+    assert (bin_dir / "codex").read_text(encoding="utf-8") == legacy_content
+
+
+def test_install_idempotent_current_block_validates_target(monkeypatch, tmp_path):
+    """cycle-review cycle-4 FIX #2 (codex critical 0.99): existing current block (зовёт codex-srouter) при
+    target-missing НЕ рапортует чистый успех. Строка codex-srouter проверяется ПОСЛЕ ordered_pair и
+    target-gate — иначе predсуществующий блок ведёт в никуда (target удалён), а install говорит ОК."""
+    home = _mock_home(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    zshrc = home / ".zshrc"
+    # managed current block (зовёт codex-srouter), но target НЕ установлен.
+    zshrc.write_text(srouter._CODEX_FUNC_BLOCK, encoding="utf-8")
+    assert not (home / "bin" / "codex-srouter").exists()
+
+    note = srouter._install_codex_zsh_function(env)
+
+    low = note.lower()
+    # НЕ чистый «idempotent» успех — note сигнализирует проблему target. (Слово «idempotent» может быть в
+    # диагностике «не рапортую idempotent вслепую» — поэтому проверяем отсутствие чистого успеха-маркера.)
+    assert "уже в ~/.zshrc (idempotent)" not in note, \
+        f"current block при target-missing НЕ чистый idempotent-успех: {note}"
+    assert "не установлен" in low or "не валиден" in low, \
+        f"note сигнализирует невалидный target: {note}"
+
+
+def test_remove_codex_zsh_function_reversed_markers_safe_noop(monkeypatch, tmp_path):
+    """cycle-review cycle-4 FIX #3 (claude+codex critical 0.99): uninstall с реверснутыми маркерами (END
+    перед BEGIN, count==1 каждый) — SAFE NO-OP, НЕ corruption. Иначе start>end → slice overlap → дублирование
+    контента, рапорт «убрана». Замкнутый инвариант: ordered-pair parser общий для install И remove."""
+    home = _mock_home(monkeypatch, tmp_path)
+    zshrc = home / ".zshrc"
+    reversed_block = (
+        f"{srouter.ZSHRC_CODEX_FUNC_MARKER_END}\n"      # END первым (реверс)
+        "export UNIQUE=line1\n"
+        "export UNIQUE2=line2\n"
+        f"{srouter.ZSHRC_CODEX_FUNC_MARKER_BEGIN}\n"    # BEGIN вторым
+    )
+    zshrc.write_text(reversed_block, encoding="utf-8")
+
+    note = srouter._remove_codex_zsh_function()
+
+    content = zshrc.read_text(encoding="utf-8")
+    assert content == reversed_block, \
+        f"reversed markers → byte-for-byte safe no-op (НЕ corruption): {note}"
+    assert content.count("export UNIQUE=line1") == 1, "контент НЕ дублирован"
+
+
+def test_install_zsh_function_updates_stale_legacy_path(monkeypatch, tmp_path):
+    """cycle-review FIX B (codex critical): существующий managed zsh-блок со СТАРЫМ путём ~/bin/codex
+    (от установки до rename) → install ОБНОВЛЯЕТ его на ~/bin/codex-srouter.
+
+    Regression upgrade-path: _install_codex_zsh_function short-circuit'ил на голом маркере
+    (ZSHRC_CODEX_FUNC_MARKER_BEGIN в content → «idempotent»). Но блок звал ~/bin/codex, который
+    migration удалил → функция вела в удалённый файл → `codex` в интерактивном шелле ломался, притом
+    install рапортил успех. Фикс: если managed-блок зовёт устаревший путь — обновить его.
+    """
+    home = _mock_home(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    bin_dir = home / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    zshrc = home / ".zshrc"
+    # Существующая установка (до rename): managed zsh-блок зовёт СТАРЫЙ ~/bin/codex.
+    stale_block = (
+        f"{srouter.ZSHRC_CODEX_FUNC_MARKER_BEGIN}\n"
+        'if (( ! ${+aliases[codex]} && ! ${+functions[codex]} )); then\n'
+        '  function codex {\n'
+        '    "$HOME/bin/codex" "$@"\n'   # СТАРЫЙ путь
+        '  }\n'
+        "fi\n"
+        f"{srouter.ZSHRC_CODEX_FUNC_MARKER_END}"
+    )
+    zshrc.write_text(stale_block, encoding="utf-8")
+    # Новый codex-srouter установлен (как делает cmd_install перед zsh-func) — target валиден → миграция разрешена.
+    srouter._install_codex_wrappers(env)
+    assert (bin_dir / "codex-srouter").exists(), "precondition: codex-srouter установлен (target валиден)"
+
+    note = srouter._install_codex_zsh_function(env)
+
+    content = zshrc.read_text(encoding="utf-8")
+    assert '"$HOME/bin/codex-srouter" "$@"' in content, \
+        f"stale zsh-блок обновлён на codex-srouter: {note}"
+    assert content.count('"$HOME/bin/codex" "$@"') == 0, \
+        "старый путь ~/bin/codex в zsh-функции полностью убран"
+
+
+def test_install_zsh_function_idempotent_when_already_renamed(monkeypatch, tmp_path):
+    """cycle-review FIX B граница: если managed-блок уже зовёт codex-srouter (fresh install / повторный) —
+    short-circuit «idempotent» корректен (обновлять нечего). Не ломает нормальный idempotent install."""
+    home = _mock_home(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    zshrc = home / ".zshrc"
+    zshrc.write_text(srouter._CODEX_FUNC_BLOCK, encoding="utf-8")
+    before = zshrc.read_text(encoding="utf-8")
+
+    note = srouter._install_codex_zsh_function(env)
+
+    assert "idempotent" in note.lower(), f"уже renam'нутый блок — idempotent: {note}"
+    assert zshrc.read_text(encoding="utf-8") == before, "блок не изменён (уже актуален)"
+
+
+def test_install_zsh_function_no_migration_when_new_wrapper_missing(monkeypatch, tmp_path):
+    """cycle-review cycle-2 FIX #1 (codex critical 0.99 — transactional coherence): если новый codex-srouter
+    НЕ установлен (codex binary не найден → wrapper не встал) — stale zsh-блок НЕ мигрируется на codex-srouter.
+
+    Иначе inconsistency: FIX A сохраняет legacy ~/bin/codex (рабочий), но FIX B перенаправляет zsh-функцию на
+    codex-srouter (которого нет) → `codex` в интерактивном шелле зовёт несуществующий файл, притом рабочий
+    legacy стоит. Корневой инвариант: zsh-migration согласована с wrapper-install — мигрируем zsh ТОЛЬКО если
+    новый codex-srouter установлен и валиден (is_file + executable + current-маркер)."""
+    home = _mock_home(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    bin_dir = home / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    zshrc = home / ".zshrc"
+    stale_block = (
+        f"{srouter.ZSHRC_CODEX_FUNC_MARKER_BEGIN}\n"
+        'if (( ! ${+aliases[codex]} && ! ${+functions[codex]} )); then\n'
+        '  function codex {\n'
+        '    "$HOME/bin/codex" "$@"\n'   # СТАРЫЙ путь — РАБОЧИЙ (legacy preserved FIX A)
+        '  }\n'
+        "fi\n"
+        f"{srouter.ZSHRC_CODEX_FUNC_MARKER_END}"
+    )
+    zshrc.write_text(stale_block, encoding="utf-8")
+    # Новый codex-srouter НЕ установлен (нет файла) → мигрировать zsh нельзя.
+    assert not (bin_dir / "codex-srouter").exists()
+
+    note = srouter._install_codex_zsh_function(env)
+
+    content = zshrc.read_text(encoding="utf-8")
+    assert '"$HOME/bin/codex" "$@"' in content, \
+        f"zsh-блок НЕ мигрирован — остался звать рабочий legacy ~/bin/codex (new wrapper missing): {note}"
+    assert '"$HOME/bin/codex-srouter" "$@"' not in content, \
+        "zsh НЕ перенаправлен на несуществующий codex-srouter (transactional coherence)"
+
+
+def test_install_zsh_function_migration_reports_write_failure(monkeypatch, tmp_path):
+    """cycle-review cycle-2 FIX #1b (codex): результат _write_text_atomic проверяется. Если atomic-write
+    упал → note сообщает об отказе, не рапортует успех (иначе оператор думает что zsh обновлён, а файл не записан)."""
+    home = _mock_home(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    zshrc = home / ".zshrc"
+    stale_block = (
+        f"{srouter.ZSHRC_CODEX_FUNC_MARKER_BEGIN}\n"
+        '  function codex {\n    "$HOME/bin/codex" "$@"\n  }\n'
+        f"{srouter.ZSHRC_CODEX_FUNC_MARKER_END}"
+    )
+    zshrc.write_text(stale_block, encoding="utf-8")
+    # _write_text_atomic падает (имитация отказа записи).
+    monkeypatch.setattr(srouter, "_write_text_atomic", lambda path, text: False)
+    # Нужен валидный новый codex-srouter, чтобы миграция вообще пыталась выполниться.
+    monkeypatch.setattr(srouter, "_codex_zsh_target_installed", lambda: True)
+
+    note = srouter._install_codex_zsh_function(env)
+
+    assert "не" in note.lower() or "отказ" in note.lower() or "не обнов" in note.lower() or "сбой" in note.lower(), \
+        f"write-failure → note сообщает об отказе, не успех: {note}"
+
+
+def test_install_zsh_function_malformed_markers_not_rewritten(monkeypatch, tmp_path):
+    """cycle-review cycle-2 FIX #1c (codex): malformed markers (дублированный/непарный BEGIN/END) → НЕ
+    переписываем span (можно задеть чужой контент). Требуем ровно одну упорядоченную пару, target внутри неё."""
+    home = _mock_home(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    zshrc = home / ".zshrc"
+    # ДВА BEGIN-маркера (повреждённое состояние) — index() взял бы первый, span мог бы задеть чужой контент.
+    malformed = (
+        f"{srouter.ZSHRC_CODEX_FUNC_MARKER_BEGIN}\n"
+        '  function codex {\n    "$HOME/bin/codex" "$@"\n  }\n'
+        f"{srouter.ZSHRC_CODEX_FUNC_MARKER_BEGIN}\n"   # второй BEGIN
+        '  function codex {\n    "$HOME/bin/codex" "$@"\n  }\n'
+        f"{srouter.ZSHRC_CODEX_FUNC_MARKER_END}\n"
+    )
+    zshrc.write_text(malformed, encoding="utf-8")
+
+    note = srouter._install_codex_zsh_function(env)
+
+    content = zshrc.read_text(encoding="utf-8")
+    assert content == malformed, \
+        f"malformed (двойной BEGIN) → НЕ переписываем, оставляем как есть (fail-closed): {note}"
+
+
+def test_install_zsh_function_no_create_when_new_wrapper_missing(monkeypatch, tmp_path):
+    """cycle-review cycle-3 FIX #1-root (codex critical 0.99 — unified target gate): fresh-create path.
+    Если новый codex-srouter НЕ установлен И zshrc не имеет managed-блока → НЕ создавать zsh-функцию
+    (иначе она shadow'ит сохранённый legacy ~/bin/codex, зовёт несуществующий codex-srouter = та же
+    FIX A/B inconsistency, через fresh-create путь, не migration). Замкнутый инвариант: zsh-функция
+    (codex-srouter) создаётся/мигрируется/принимается ТОЛЬКО если _codex_zsh_target_installed() во ВСЕХ путях."""
+    home = _mock_home(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    zshrc = home / ".zshrc"
+    zshrc.write_text("export FOO=1\n")  # нет managed zsh блока; codex-srouter НЕ установлен
+    assert not (home / "bin" / "codex-srouter").exists()
+
+    note = srouter._install_codex_zsh_function(env)
+
+    content = zshrc.read_text(encoding="utf-8")
+    assert srouter._CODEX_FUNC_BLOCK not in content, \
+        f"fresh-create zsh-функция НЕ добавлена (target missing → не shadow'им legacy): {note}"
+    assert '"$HOME/bin/codex-srouter"' not in content, "zsh НЕ указывает на отсутствующий codex-srouter"
+
+
+def test_install_zsh_function_no_append_when_new_wrapper_missing(monkeypatch, tmp_path):
+    """cycle-review cycle-3 FIX #1-root: append path (zshrc есть, без managed-блока, без foreign codex-def) —
+    тоже не добавляем _CODEX_FUNC_BLOCK если target не установлен. Покрывает третий путь функции."""
+    home = _mock_home(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    zshrc = home / ".zshrc"
+    zshrc.write_text("export PATH=/usr/local/bin:$PATH\n# user comment\n")
+    assert not (home / "bin" / "codex-srouter").exists()
+
+    note = srouter._install_codex_zsh_function(env)
+
+    content = zshrc.read_text(encoding="utf-8")
+    assert srouter._CODEX_FUNC_BLOCK not in content, \
+        f"append zsh-функции НЕ выполнен (target missing): {note}"
+
+
+def test_install_zsh_function_reversed_markers_not_rewritten(monkeypatch, tmp_path):
+    """cycle-review cycle-3 FIX #2-root (codex critical 0.99 — ordered marker pair): реверснутые маркеры
+    (END перед BEGIN, begins==1/ends==1 проходят) → НЕ переписываем. Иначе start>end → content[start:end]
+    пустой → реконструкция ДУБЛИРУЕТ контент .zshrc (рапорт успеха). Замкнутый инвариант: требуем ровно одну
+    УПОРЯДОЧЕННУЮ пару (begin_index < end_index), target внутри неё."""
+    home = _mock_home(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    bin_dir = home / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    zshrc = home / ".zshrc"
+    reversed_block = (
+        f"{srouter.ZSHRC_CODEX_FUNC_MARKER_END}\n"      # END ПЕРВЫМ (реверс)
+        "export FOO=bar\n"
+        '  function codex {\n    "$HOME/bin/codex" "$@"\n  }\n'
+        f"{srouter.ZSHRC_CODEX_FUNC_MARKER_BEGIN}\n"    # BEGIN вторым
+    )
+    zshrc.write_text(reversed_block, encoding="utf-8")
+    # codex-srouter валиден (чтобы миграция пыталась выполниться) — но реверс маркеров должен её заблокировать.
+    srouter._install_codex_wrappers(env)
+    assert (bin_dir / "codex-srouter").exists()
+
+    note = srouter._install_codex_zsh_function(env)
+
+    content = zshrc.read_text(encoding="utf-8")
+    assert content == reversed_block, \
+        f"реверснутые маркеры → НЕ переписываем (start>end corruption): {note}"
+    assert content.count("export FOO=bar") == 1, "контент НЕ дублирован (ordered-pair guard)"
+
+
+def test_remove_also_cleans_legacy_managed_codex_wrapper(monkeypatch, tmp_path):
+    """#169 uninstall cleanup: remove удаляет codex-srouter И подчищает устаревший srouter-managed ~/bin/codex.
+
+    Сценарий: пользователь не перезапускал install после rename → ~/bin/codex (srouter-managed) остался.
+    Uninstall обязан убрать ВСЁ srouter-managed (старое имя в т.ч.), иначе leftover даёт «призрак» wrapper'а
+    после деинсталляции. Чужой ~/bin/codex при remove — НЕ трогаем (fail-closed, как install)."""
+    home = _mock_home(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    bin_dir = home / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    legacy = _legacy_marker()
+    # Установлено: новый codex-srouter (install) + устаревший srouter-managed ~/bin/codex (до rename).
+    srouter._install_codex_wrappers(env)
+    (bin_dir / "codex").write_text(f"{legacy}\n#!/bin/sh\nexec codex\n", encoding="utf-8")
+    assert (bin_dir / "codex").exists() and (bin_dir / "codex-srouter").exists()
+
+    note = srouter._remove_codex_wrappers()
+
+    assert not (bin_dir / "codex-srouter").exists(), "codex-srouter удалён"
+    assert not (bin_dir / "codex").exists(), \
+        f"устаревший srouter-managed ~/bin/codex тоже удалён при uninstall (leftover cleanup): {note}"
+
+
+def test_remove_keeps_foreign_legacy_codex_wrapper(monkeypatch, tmp_path):
+    """#169 uninstall fail-closed: чужой ~/bin/codex (без маркера) — НЕ удалять при uninstall (как install)."""
+    home = _mock_home(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    bin_dir = home / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    srouter._install_codex_wrappers(env)
+    foreign_codex = "#!/bin/sh\n# user codex\nexec /usr/local/bin/codex \"$@\"\n"
+    (bin_dir / "codex").write_text(foreign_codex, encoding="utf-8")
+
+    note = srouter._remove_codex_wrappers()
+
+    assert not (bin_dir / "codex-srouter").exists(), "наш codex-srouter удалён"
+    assert (bin_dir / "codex").read_text(encoding="utf-8") == foreign_codex, \
+        f"чужой ~/bin/codex НЕ удалён (fail-closed provenance): {note}"
+
+
 # ============================ issue #150: cycle-guard через versioned env-сентинель ============================
 # 3-я находка cycle-review PR #146 (воспроизведено rc=124). ДЫРА: точечные identity-чеки антирекурсии
-# (realpath/inode/srouter-маркер) не замыкаются на foreign-wrapper БЕЗ маркера, делающий `exec codex "$@"`.
-# Managed находит foreign (нет маркера → «реальный codex») → exec'ает → foreign резолвит codex=managed →
-# exec'ает managed → бесконечный цикл → rc=124 (timeout).
+# (realpath/inode/srouter-маркер) не замыкаются на foreign-wrapper БЕЗ маркера, делающий рекурсивный вызов
+# managed wrapper'а. Managed находит foreign (нет маркера → «реальный codex») → exec'ает → foreign резолвит
+# managed обратно → exec'ает managed → бесконечный цикл → rc=124 (timeout).
 #
 # ФИКС: cycle-state инвариант через versioned env-сентинель SROUTER_CODEX_WRAPPER_V1=<pid>:<hop>.
 # При повторном входе managed wrapper в рекурсивную цепочку — обрыв с fail-loud диагностикой
 # (exit 126, не 124). Покрывает ТРИ класса рекурсии: exec-цикл (PID-match), fork-цикл (hop-ceiling),
 # и отличает от легитимного descendant (hop < ceiling). НЕ PATH-санitизация (отвергнута в issue #150:
 # blast radius на 24/7-инфре — tools теряют ~/bin).
+#
+# Issue #169 (rename codex→codex-srouter) СДВИГАЕТ threat-model: managed wrapper больше не зовётся `codex`,
+# значит foreign-wrapper с `exec codex "$@"` / `codex "$@"` НЕ находит managed (находит себя → foreign↔foreign
+# цикл). ДО rename managed звался codex и был первым в PATH → foreign неизбежно попадал в managed → cycle-guard
+# обрывал (rc=126). После rename этот ЕСТЕСТВЕННЫЙ путь устранён структурно (в этом и цель rename из epic #166),
+# НО как следствие cycle-guard больше НЕ ловит foreign↔foreign self-cycle (см. test_cycle_guard_foreign_self_cycle_documented_limitation):
+# foreign-wrapper, делающий рекурсивный `codex`-вызов, циклит сам с собой без повторного входа managed →
+# sentinel никогда не ceiling'ится. Это availability-класс через ЧУЖОЙ wrapper в собственном PATH под контролем
+# того же UID — #150 ЯВНО выводит его за scope best-effort слоя (нужен active malice / сломанный чужой wrapper
+# в уже контролируемом PATH; честная fail-closed граница = PF kill-switch, #168, отдельный слой).
+#
+# Coverage cycle-guard ПОСЛЕ rename (#169): ловит повторный вход MANAGED codex-srouter (PID-match + hop-ceiling).
+# Тесты ниже моделируют foreign, целенаправленно зовущий managed codex-srouter по имени — cycle-guard обрывает.
+# Ограничение (foreign↔foreign по имени codex) — отдельный тест-документация ниже, НЕ rc=126 (вне scope).
 
 
 def _install_cycle_guard_wrapper(monkeypatch, tmp_path):
@@ -1014,20 +1490,21 @@ def _install_cycle_guard_wrapper(monkeypatch, tmp_path):
     env = _env(tmp_path)
     monkeypatch.setattr(srouter, "_codex_bin_path", lambda: str(tmp_path / "any-codex"))
     srouter._install_codex_wrappers(env)
-    return Path.home() / "bin" / "codex"
+    return Path.home() / "bin" / _cli_wrapper_name()
 
 
 def test_foreign_wrapper_recursion_cycle_breaks_not_timeout(monkeypatch, tmp_path):
-    """#150 core (красный→зелёный): foreign-wrapper БЕЗ srouter-маркера с `exec codex "$@"` в PATH
-    вызывает бесконечный цикл managed→foreign→managed → был rc=124 (timeout).
+    """#150 core (красный→зелёный), адаптированный под rename #169: foreign-wrapper БЕЗ srouter-маркера,
+    целенаправленно резолвящий ИМЯ managed wrapper'а (codex-srouter), вызывает цикл managed→foreign→managed.
 
-    Сценарий #150 reproducer: foreign «codex» без srouter-маркера, резолвит codex обратно из PATH →
-    находит managed (~/bin/codex) → exec'ает → managed снова находит foreign → ... → бесконечный цикл.
+    До rename managed wrapper звался codex → foreign `exec codex "$@"` неизбежно попадал в managed (он
+    первый в PATH) → цикл. Rename (#169) структурно убирает ЭТОТ естественный путь: foreign `exec codex`
+    теперь находит себя (foreign↔foreign, вне srouter). Но cycle-guard #153 обязан работать и когда
+    foreign целенаправленно зовёт managed по новому имени codex-srouter — повторный вход managed обрывается
+    fail-loud (exit 126, не 124). Доказывает, что rename не сломал cycle-guard.
 
-    Cycle-guard (versioned env-сентинель SROUTER_CODEX_WRAPPER_V1) обязан ОБОРВАТЬ цикл: повторный
-    вход managed wrapper → fail-loud exit (понятный код, не 124), НЕ дойдя до real Codex.
-
-    Без фикса: subprocess.run падает по TimeoutExpired (rc=124) — тест ПАДАЕТ.
+    Сценарий: managed codex-srouter runtime-резолвит `codex` → foreign codex (без маркера → «реальный») →
+    foreign `exec codex-srouter "$@"` (новое имя managed) → повторный вход managed → cycle-guard обрыв.
     """
     import subprocess
     called = tmp_path / "called.txt"
@@ -1037,22 +1514,23 @@ def test_foreign_wrapper_recursion_cycle_breaks_not_timeout(monkeypatch, tmp_pat
     real_codex.write_text(f"#!/bin/sh\nprintf 'real' > {called}\n", encoding="utf-8")
     real_codex.chmod(0o755)
     wrapper = _install_cycle_guard_wrapper(monkeypatch, tmp_path)
-    # foreignbin/codex — ЧУЖОЙ wrapper БЕЗ srouter-маркера, делает `exec codex "$@"` (резолвит codex
-    # из PATH → находит managed ~/bin/codex → цикл). Это 3-я находка cycle-review, не покрытая #146.
+    # foreignbin/codex — ЧУЖОЙ wrapper БЕЗ srouter-маркера. Резолвит managed по новому имени codex-srouter
+    # (после rename #169 foreign `exec codex` попадал бы в себя → foreign↔foreign; здесь моделируем
+    # целенаправленный вызов managed, чтобы проверить cycle-guard на повторном входе managed codex-srouter).
+    managed_name = _cli_wrapper_name()
     foreignbin = tmp_path / "foreignbin"
     foreignbin.mkdir()
-    (foreignbin / "codex").write_text("#!/bin/sh\nexec codex \"$@\"\n", encoding="utf-8")
+    (foreignbin / "codex").write_text(f"#!/bin/sh\nexec {managed_name} \"$@\"\n", encoding="utf-8")
     (foreignbin / "codex").chmod(0o755)
-    # ~/bin (managed wrapper) → foreignbin (foreign wrapper) → realdir (реальный codex).
-    # Managed first: skip'нет себя → возьмёт foreignbin/codex (нет маркера → «реальный») → цикл.
+    # ~/bin (managed codex-srouter) → foreignbin (foreign codex → зовёт codex-srouter) → realdir (real codex).
     try:
         proc = subprocess.run(
             [str(wrapper), "x"],
             env={**os.environ, "PATH": f"{Path.home() / 'bin'}:{foreignbin}:{tmp_path / 'realdir'}:/usr/bin:/bin"},
             capture_output=True, text=True, timeout=10)
     except subprocess.TimeoutExpired:
-        pytest.fail("foreign-wrapper без srouter-маркера вызвал бесконечную рекурсию managed→foreign→managed "
-                    "(rc=124 timeout) — cycle-guard не замыкается (#150)")
+        pytest.fail("foreign-wrapper (зовущий managed codex-srouter) вызвал бесконечную рекурсию "
+                    "managed→foreign→managed (rc=124 timeout) — cycle-guard не замыкается (#150/#153)")
     # Цикл ОБОРВАН: не timeout. Fail-loud — понятный exit-код (не 0, не 124).
     assert proc.returncode != 0, f"cycle должен обрываться fail-loud (ненулевой exit), не успех: rc={proc.returncode}"
     assert proc.returncode != 124, "cycle-guard обязан дать диагностику, не молчаливый 124-timeout"
@@ -1076,7 +1554,7 @@ def test_cycle_guard_pid_scoped_not_blocking_descendant(monkeypatch, tmp_path):
     env = _env(tmp_path)
     monkeypatch.setattr(srouter, "_codex_bin_path", lambda: str(tmp_path / "any-codex"))
     srouter._install_codex_wrappers(env)
-    wrapper = home / "bin" / "codex"
+    wrapper = home / "bin" / _cli_wrapper_name()
     child_marker = tmp_path / "child_ran.txt"
     real_codex_dir = tmp_path / "realdir"
     real_codex_dir.mkdir()
@@ -1100,10 +1578,11 @@ def test_cycle_guard_pid_scoped_not_blocking_descendant(monkeypatch, tmp_path):
 
 
 def test_cycle_guard_fork_foreign_bounded_not_process_bomb(monkeypatch, tmp_path):
-    """#150 hop-counter инвариант (cycle-review PR #153 round-2): fork'ающий foreign-wrapper обходит
-    PID-scoped guard, но обязан bounded-обрываться, не накапливая процессы.
+    """#150 hop-counter инвариант (cycle-review PR #153 round-2), адаптированный под rename #169: fork'ающий
+    foreign-wrapper, целенаправленно зовущий managed codex-srouter, обходит PID-scoped guard, но обязан
+    bounded-обрываться, не накапливая процессы.
 
-    Foreign БЕЗ exec (`codex "$@"`; не `exec codex`) форкает codex-вызов (= managed) — каждый re-entry
+    Foreign БЕЗ exec (`codex-srouter "$@"`) форкает вызов managed codex-srouter — каждый re-entry
     получает новый PID → PID-check пропускает → без hop-ceiling это fork-bomb до per-user process limit
     (process-table exhaustion, DoS на 24/7-инфре, Codex confidence 0.98). Легитимный descendant завершается
     (real codex работает и выходит), fork-foreign — НЕТ (каждый уровень порождает следующий без лимита).
@@ -1117,15 +1596,17 @@ def test_cycle_guard_fork_foreign_bounded_not_process_bomb(monkeypatch, tmp_path
     env = _env(tmp_path)
     monkeypatch.setattr(srouter, "_codex_bin_path", lambda: str(tmp_path / "any-codex"))
     srouter._install_codex_wrappers(env)
-    wrapper = home / "bin" / "codex"
+    wrapper = home / "bin" / _cli_wrapper_name()
     real_codex = tmp_path / "realdir" / "codex"
     real_codex.parent.mkdir(parents=True)
     real_codex.write_text("#!/bin/sh\nprintf real > /dev/null\n", encoding="utf-8")
     real_codex.chmod(0o755)
-    # foreign БЕЗ exec: форкает codex (= managed) и ждёт. Каждый уровень порождает следующий — не завершается.
+    # foreign БЕЗ exec: форкает managed codex-srouter (новое имя, #169) и ждёт. Каждый уровень порождает
+    # следующий — не завершается. До rename foreign звал `codex` (= managed первым в PATH); теперь зовёт имя.
+    managed_name = _cli_wrapper_name()
     foreignbin = tmp_path / "foreignbin"
     foreignbin.mkdir()
-    (foreignbin / "codex").write_text('#!/bin/sh\ncodex "$@"; exit $?\n', encoding="utf-8")
+    (foreignbin / "codex").write_text(f'#!/bin/sh\n{managed_name} "$@"; exit $?\n', encoding="utf-8")
     (foreignbin / "codex").chmod(0o755)
     caller_path = f"{home / 'bin'}:{foreignbin}:{tmp_path / 'realdir'}:/usr/bin:/bin"
     proc = subprocess.run([str(wrapper), "x"],
@@ -1134,6 +1615,41 @@ def test_cycle_guard_fork_foreign_bounded_not_process_bomb(monkeypatch, tmp_path
     assert proc.returncode == 126, \
         (f"fork-foreign должен bounded-обрываться rc=126 (hop-ceiling), не fork-bomb: "
          f"получено rc={proc.returncode}, stderr={proc.stderr[:200]!r}")
+
+
+def test_cycle_guard_foreign_self_cycle_documented_limitation():
+    """cycle-review cycle-2 FIX #2 (codex critical 0.99 — uncontained process-exhaustion test): STATIC
+    контракт-тест ДОКУМЕНТИРОВАННОГО ограничения coverage cycle-guard после rename #169.
+
+    Предыдущая версия запускала РЕАЛЬНЫЙ fork-bomb (foreign `codex "$@"` → self-cycle) под subprocess timeout —
+    но timeout убивает только direct child, descendants выживают и продолжают плодиться (1134+ orphan-процессов
+    за один прогон, дестабилизируя CI/машину — сами воспроизводили availability-атаку, которую декларируем вне
+    scope). Codex confidence 0.99: replace with static/bounded contract test.
+
+    Этот тест проверяет ограничение ПО СТРУКТУРЕ wrapper template, без запуска fork-bomb:
+      1. cycle-guard sentinel (SROUTER_CODEX_WRAPPER_V1) проверяется ТОЛЬКО в managed wrapper (grep по маркеру).
+      2. runtime-resolve НЕ distinguishes foreign-wrapper (без маркера) от real codex — кандидат принимается
+         как «реальный codex», если не несёт srouter-маркер (grep: marker-skip единственный фильтр).
+    → foreign-wrapper `codex "$@"` резолвится в себя (после rename managed = codex-srouter, не в `codex`-PATH),
+      циклит без re-entry managed → sentinel не ceiling'ится. Это и есть ограничение, доказанное статически.
+
+    ПОЧЕМУ НЕ ЧИНИТСЯ (решение пользователя, канон #150): foreign↔foreign self-cycle — availability-класс через
+    ЧУЖОЙ wrapper в собственном PATH под контролем того же UID; #150 ЯВНО выводит за scope best-effort слоя
+    (PATH-санitизация отвергнута — blast radius на 24/7-инфре). Честная fail-closed = PF kill-switch (#168)."""
+    template = (Path(__file__).resolve().parent.parent / "launchagents" / "srouter-codex-cli-wrapper.sh"
+                ).read_text(encoding="utf-8")
+    # (1) cycle-guard sentinel проверяется только в managed wrapper (маркер srouter присутствует в template).
+    managed_marker = "# srouter: codex CLI wrapper (managed)"
+    assert managed_marker in template, "template — managed wrapper (несёт srouter-маркер)"
+    assert "SROUTER_CODEX_WRAPPER_V1" in template, "cycle-guard sentinel присутствует в managed wrapper"
+    # (2) runtime-resolve skip'ает кандидата ТОЛЬКО по srouter-маркеру; foreign (без маркера) = «реальный codex».
+    # Это структурно означает: foreign-wrapper, делающий рекурсивный codex-вызов, не отличим от real binary →
+    # если он первый в `codex`-PATH (managed = codex-srouter, не codex), циклит сам с собой без re-entry managed.
+    assert "grep -q 'srouter: codex CLI wrapper'" in template, \
+        "runtime-resolve distinguish'ит managed-копию только по srouter-маркеру (foreign = «real codex»)"
+    # Контракт: ограничение задокументировано в framing-комментарии теста (см. блок #150 выше). Если cycle-guard
+    # когда-нибудь покроет foreign↔foreign — добавится второй distinguishment (помимо marker-skip), и этот
+    # static-инвариант изменится → тест напомнит обновить документацию.
 
 
 def test_cycle_guard_non_numeric_hop_resets_not_crash(monkeypatch, tmp_path):
@@ -1149,7 +1665,7 @@ def test_cycle_guard_non_numeric_hop_resets_not_crash(monkeypatch, tmp_path):
     env = _env(tmp_path)
     monkeypatch.setattr(srouter, "_codex_bin_path", lambda: str(tmp_path / "any-codex"))
     srouter._install_codex_wrappers(env)
-    wrapper = home / "bin" / "codex"
+    wrapper = home / "bin" / _cli_wrapper_name()
     real_codex = tmp_path / "realdir" / "codex"; real_codex.parent.mkdir(parents=True)
     real_codex.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     real_codex.chmod(0o755)
@@ -1224,7 +1740,7 @@ def test_cycle_guard_uses_versioned_sentinel_env(monkeypatch, tmp_path):
     env = _env(tmp_path)
     monkeypatch.setattr(srouter, "_codex_bin_path", lambda: str(tmp_path / "any-codex"))
     srouter._install_codex_wrappers(env)
-    cli_text = (home / "bin" / "codex").read_text(encoding="utf-8")
+    cli_text = (home / "bin" / _cli_wrapper_name()).read_text(encoding="utf-8")
 
     assert "SROUTER_CODEX_WRAPPER_V1" in cli_text, \
         "wrapper использует versioned сентинель SROUTER_CODEX_WRAPPER_V1 (#150)"
@@ -1251,7 +1767,7 @@ def test_wrapper_does_not_hardcode_bin_placeholder(monkeypatch, tmp_path):
     monkeypatch.setattr(srouter, "_codex_bin_path", lambda: str(fake_bin))
 
     srouter._install_codex_wrappers(env)
-    cli_text = (home / "bin" / "codex").read_text(encoding="utf-8")
+    cli_text = (home / "bin" / _cli_wrapper_name()).read_text(encoding="utf-8")
 
     assert "__SROUTER_CODEX_BIN__" not in cli_text, "плейсхолдер должен быть заменён runtime-резолвом"
     assert str(fake_bin) not in cli_text, "абсолютный путь binary НЕ вшит (#144 runtime-резолв)"
@@ -1266,7 +1782,7 @@ def _install_with_path_resolving_wrapper(monkeypatch, tmp_path):
     # Наличие codex нужно install'у как gate (WARN если совсем нет), но путь не вшивается.
     monkeypatch.setattr(srouter, "_codex_bin_path", lambda: str(tmp_path / "any-codex"))
     srouter._install_codex_wrappers(env)
-    return Path.home() / "bin" / "codex"
+    return Path.home() / "bin" / _cli_wrapper_name()
 
 
 def test_wrapper_runtime_resolves_codex_from_caller_path(monkeypatch, tmp_path):
@@ -1395,7 +1911,7 @@ def test_wrapper_picks_second_codex_when_two_binaries(monkeypatch, tmp_path):
     _mock_home(monkeypatch, tmp_path)
     env = _env(tmp_path)
     srouter._install_codex_wrappers(env)
-    wrapper = Path.home() / "bin" / "codex"
+    wrapper = Path.home() / "bin" / _cli_wrapper_name()
 
     # Caller с PATH, где d2 ПЕРВЫМ (минуя wrapper в ~/bin): wrapper должен взять d2/codex.
     subprocess.run([str(wrapper), "x"],
