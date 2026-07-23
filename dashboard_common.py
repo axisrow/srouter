@@ -45,13 +45,24 @@ if isinstance(_raw_prefixes, (list, tuple)):
 else:
     PHYSICAL_IFACE_PREFIXES = ("en",)
 
-PRIVOXY = ("127.0.0.1", 8118)
-XRAY_SOCKS = ("127.0.0.1", 10808)
-HTTP_PROXY_URL = "http://127.0.0.1:8118"
+# === Единый источник констант прокси (issue #155) ===
+# Порты privoxy (8118) и xray SOCKS (10808) раньше дублировались по health.py,
+# gen_xray_config.py, dashboard_common.py → при смене порта легко забыть копию →
+# рассинхронизация и трудноотлаживаемые баги маршрутизации. Теперь литералы живут
+# ТОЛЬКО здесь (канон more-options-better: единый модуль констант), все производные
+# имена выражены через них. Гвард против re-дублирования — tests/test_proxy_constants.py.
+PRIVOXY_PORT = 8118
+XRAY_SOCKS_PORT = 10808
+PRIVOXY_ADDR = ("127.0.0.1", PRIVOXY_PORT)
+XRAY_SOCKS_ADDR = ("127.0.0.1", XRAY_SOCKS_PORT)
+# Обратная совместимость: короткие имена, на которые уже завязан код (dashboard_*.py).
+PRIVOXY = PRIVOXY_ADDR
+XRAY_SOCKS = XRAY_SOCKS_ADDR
+HTTP_PROXY_URL = f"http://{PRIVOXY_ADDR[0]}:{PRIVOXY_ADDR[1]}"
 # SOCKS5 напрямую в xray (минуя privoxy) — для клиентов, умеющих SOCKS нативно (Codex).
 # socks5h:// = DNS резолвится прокси (важно за GFW); socks5:// — для Chromium --proxy-server (не понимает socks5h).
-SOCKS_PROXY_URL = f"socks5h://{XRAY_SOCKS[0]}:{XRAY_SOCKS[1]}"
-SOCKS_PROXY_URL_CHROMIUM = f"socks5://{XRAY_SOCKS[0]}:{XRAY_SOCKS[1]}"
+SOCKS_PROXY_URL = f"socks5h://{XRAY_SOCKS_ADDR[0]}:{XRAY_SOCKS_ADDR[1]}"
+SOCKS_PROXY_URL_CHROMIUM = f"socks5://{XRAY_SOCKS_ADDR[0]}:{XRAY_SOCKS_ADDR[1]}"
 PROBE_SOCKS_HOST = "127.0.0.1"
 NODE_PROBE_TTL_SEC = 300
 
@@ -70,6 +81,10 @@ __all__ = [
     "VPN_SERVER",
     "VPN_EXIT_IP",
     "PHYSICAL_IFACE_PREFIXES",
+    "PRIVOXY_ADDR",
+    "PRIVOXY_PORT",
+    "XRAY_SOCKS_ADDR",
+    "XRAY_SOCKS_PORT",
     "PRIVOXY",
     "XRAY_SOCKS",
     "HTTP_PROXY_URL",
