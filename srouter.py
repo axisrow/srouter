@@ -385,13 +385,33 @@ def _install_codex_wrappers(env) -> str:
     Issue #169 rename-migration: перед установкой нового codex-srouter подчищаем устаревший
     srouter-managed ~/bin/codex от прежней установки (до rename) — иначе коллизия неймспейса
     остаётся (два wrapper'а: старый codex + новый codex-srouter). Чужой ~/bin/codex (без маркера)
-    — не трогаем (fail-closed provenance, #112)."""
-    cli_marker = CODEX_WRAPPERS[0][2]
+    — не трогаем (fail-closed provenance, #112).
+
+    cycle-review FIX A (транзакционность): migration legacy ~/bin/codex → удаление разрешено ТОЛЬКО
+    если новый codex-srouter установлен и валиден (несёт current-маркер, executable). Если install
+    нового упал (codex binary не найден / write-fail / foreign codex-srouter без маркера) — legacy
+    СОХРАНЯЕТСЯ, иначе пользователь терял работающий wrapper без замены (молчаливый частичный успех)."""
     parts = [_install_one_wrapper(env, _codex_wrapper_path(name), tmpl, marker)
              for name, tmpl, marker in CODEX_WRAPPERS]
-    migration_note = _migrate_legacy_codex_cli_wrapper(cli_marker, action="install")
-    if migration_note:
-        parts.append(migration_note)
+    cli_marker = CODEX_WRAPPERS[0][2]
+    new_wrapper = _codex_wrapper_path(CODEX_CLI_WRAPPER_NAME)
+    # Транзакционность: новый codex-srouter должен стоять И быть нашим (current-маркер + executable).
+    # Иначе миграция отменилась бы (удаление legacy без замены = потеря wrapper'а).
+    new_installed_ok = (
+        new_wrapper.is_file()
+        and os.access(new_wrapper, os.X_OK)
+        and cli_marker in new_wrapper.read_text(encoding="utf-8")
+    )
+    if new_installed_ok:
+        migration_note = _migrate_legacy_codex_cli_wrapper(cli_marker, action="install")
+        if migration_note:
+            parts.append(migration_note)
+    else:
+        legacy = _codex_wrapper_path(CODEX_CLI_WRAPPER_LEGACY_NAME)
+        if legacy.exists():
+            parts.append(
+                f"Codex {CODEX_CLI_WRAPPER_LEGACY_NAME}: миграция отложена — новый "
+                f"{CODEX_CLI_WRAPPER_NAME} не установлен/не валиден (сохранил устаревший wrapper, #169).")
     return "\n".join(parts)
 
 
@@ -641,8 +661,27 @@ def _install_codex_zsh_function(env) -> str:
         from install_lib import _backup
         zshrc = _zshrc_path()
         content = zshrc.read_text(encoding="utf-8") if zshrc.exists() else ""
-        # Idempotent: блок уже на месте.
-        if ZSHRC_CODEX_FUNC_MARKER_BEGIN in content:
+        # Idempotent ИЛИ migration stale-блока (cycle-review FIX B). Managed-блок уже на месте —
+        # но он может быть от установки ДО rename (#169) и звать устаревший ~/bin/codex. Только по
+        # голому маркеру short-circuit'ить нельзя: zsh-функция осталась бы звать удалённый legacy
+        # wrapper → `codex` в интерактивном шелле ломался, притом install рапортил успех.
+        # Различаем: блок зовёт текущий codex-srouter → idempotent; зовёт устаревший codex → обновляем.
+        if ZSHRC_CODEX_FUNC_MARKER_BEGIN in content and ZSHRC_CODEX_FUNC_MARKER_END in content:
+            if '"$HOME/bin/codex-srouter" "$@"' in content:
+                return "Codex функция: уже в ~/.zshrc (idempotent)."
+            if '"$HOME/bin/codex" "$@"' in content:
+                # Stale managed-блок (до rename): мигрируем путь codex → codex-srouter внутри блока.
+                _backup(zshrc, env)  # timestamped backup перед правкой managed-блока
+                start = content.index(ZSHRC_CODEX_FUNC_MARKER_BEGIN)
+                end = content.index(ZSHRC_CODEX_FUNC_MARKER_END) + len(ZSHRC_CODEX_FUNC_MARKER_END)
+                updated_block = content[start:end].replace('"$HOME/bin/codex" "$@"',
+                                                           '"$HOME/bin/codex-srouter" "$@"')
+                _write_text_atomic(zshrc, content[:start] + updated_block + content[end:])
+                return ("Codex функция: обновлён путь в managed-блоке (codex → codex-srouter, rename #169). "
+                        "Backup: .zshrc.srouter-backup-*. "
+                        "ВНИМАНИЕ: существующие терминалы/codex-процессы не получат новое окружение — "
+                        "перезапусти их (exec zsh -l, затем закрыть/открыть TUI).")
+            # Managed-маркер есть, но путь не распознан (модифицированный блок) — не трогаем (fail-closed).
             return "Codex функция: уже в ~/.zshrc (idempotent)."
         # Fail-closed: чужое определение codex (alias или function) без нашего маркера — не трогаем.
         # `alias codex=` или `codex()` или `function codex`/`codex ()`. Ищем как определение,

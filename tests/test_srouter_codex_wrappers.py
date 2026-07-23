@@ -1092,6 +1092,82 @@ def test_install_rename_idempotent_after_migration(monkeypatch, tmp_path):
         "повторный install = idempotent (codex-srouter не изменился)"
 
 
+def test_install_keeps_legacy_when_new_wrapper_not_installed(monkeypatch, tmp_path):
+    """cycle-review FIX A (codex+claude critical): migration ТРАНЗАКЦИОННА. Если новый codex-srouter НЕ
+    установлен (codex binary не найден → WARN) — устаревший managed ~/bin/codex ДОЛЖЕН ОСТАТЬСЯ.
+
+    Без транзакционности: migration безусловно удалял legacy, даже когда замена не встала → пользователь
+    терял работающий wrapper без замены (молча, install рапортовал частичный успех). Корневой инвариант:
+    миграция разрешена ТОЛЬКО после подтверждения, что новый codex-srouter установлен и валиден.
+    """
+    home = _mock_home(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    bin_dir = home / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    legacy = _legacy_marker()
+    legacy_content = f"{legacy}\n#!/bin/sh\nexec codex\n"
+    (bin_dir / "codex").write_text(legacy_content, encoding="utf-8")
+    # codex binary НЕ найден → install нового codex-srouter WARN'ется и не ставится.
+    monkeypatch.setattr(srouter, "_codex_bin_path", lambda: "")
+
+    note = srouter._install_codex_wrappers(env)
+
+    assert not (bin_dir / "codex-srouter").exists(), "новый wrapper не установлен (codex bin missing)"
+    assert (bin_dir / "codex").exists(), \
+        f"legacy managed ~/bin/codex СОХРАНЁН (migration отменена — замена не встала): {note}"
+    assert (bin_dir / "codex").read_text(encoding="utf-8") == legacy_content, "legacy не изменён"
+
+
+def test_install_zsh_function_updates_stale_legacy_path(monkeypatch, tmp_path):
+    """cycle-review FIX B (codex critical): существующий managed zsh-блок со СТАРЫМ путём ~/bin/codex
+    (от установки до rename) → install ОБНОВЛЯЕТ его на ~/bin/codex-srouter.
+
+    Regression upgrade-path: _install_codex_zsh_function short-circuit'ил на голом маркере
+    (ZSHRC_CODEX_FUNC_MARKER_BEGIN в content → «idempotent»). Но блок звал ~/bin/codex, который
+    migration удалил → функция вела в удалённый файл → `codex` в интерактивном шелле ломался, притом
+    install рапортил успех. Фикс: если managed-блок зовёт устаревший путь — обновить его.
+    """
+    home = _mock_home(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    bin_dir = home / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    zshrc = home / ".zshrc"
+    # Существующая установка (до rename): managed zsh-блок зовёт СТАРЫЙ ~/bin/codex.
+    stale_block = (
+        f"{srouter.ZSHRC_CODEX_FUNC_MARKER_BEGIN}\n"
+        'if (( ! ${+aliases[codex]} && ! ${+functions[codex]} )); then\n'
+        '  function codex {\n'
+        '    "$HOME/bin/codex" "$@"\n'   # СТАРЫЙ путь
+        '  }\n'
+        "fi\n"
+        f"{srouter.ZSHRC_CODEX_FUNC_MARKER_END}"
+    )
+    zshrc.write_text(stale_block, encoding="utf-8")
+
+    note = srouter._install_codex_zsh_function(env)
+
+    content = zshrc.read_text(encoding="utf-8")
+    assert '"$HOME/bin/codex-srouter" "$@"' in content, \
+        f"stale zsh-блок обновлён на codex-srouter: {note}"
+    assert content.count('"$HOME/bin/codex" "$@"') == 0, \
+        "старый путь ~/bin/codex в zsh-функции полностью убран"
+
+
+def test_install_zsh_function_idempotent_when_already_renamed(monkeypatch, tmp_path):
+    """cycle-review FIX B граница: если managed-блок уже зовёт codex-srouter (fresh install / повторный) —
+    short-circuit «idempotent» корректен (обновлять нечего). Не ломает нормальный idempotent install."""
+    home = _mock_home(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    zshrc = home / ".zshrc"
+    zshrc.write_text(srouter._CODEX_FUNC_BLOCK, encoding="utf-8")
+    before = zshrc.read_text(encoding="utf-8")
+
+    note = srouter._install_codex_zsh_function(env)
+
+    assert "idempotent" in note.lower(), f"уже renam'нутый блок — idempotent: {note}"
+    assert zshrc.read_text(encoding="utf-8") == before, "блок не изменён (уже актуален)"
+
+
 def test_remove_also_cleans_legacy_managed_codex_wrapper(monkeypatch, tmp_path):
     """#169 uninstall cleanup: remove удаляет codex-srouter И подчищает устаревший srouter-managed ~/bin/codex.
 
@@ -1145,11 +1221,18 @@ def test_remove_keeps_foreign_legacy_codex_wrapper(monkeypatch, tmp_path):
 # blast radius на 24/7-инфре — tools теряют ~/bin).
 #
 # Issue #169 (rename codex→codex-srouter) СДВИГАЕТ threat-model: managed wrapper больше не зовётся `codex`,
-# значит foreign-wrapper с `exec codex "$@"` НЕ находит managed (находит себя → foreign↔foreign цикл вне
-# srouter — чужой сломанный wrapper, не наша обязанность чинить). Класс managed↔foreign рекурсии теперь
-# требует, чтобы foreign целенаправленно резолвил ИМЯ managed wrapper'а (codex-srouter). Тесты ниже
-# моделируют именно это — cycle-guard #153 (PID/hop инвариант) продолжает работать поверх переименованного
-# wrapper, обрывая повторный вход managed codex-srouter (rename не сломал #153).
+# значит foreign-wrapper с `exec codex "$@"` / `codex "$@"` НЕ находит managed (находит себя → foreign↔foreign
+# цикл). ДО rename managed звался codex и был первым в PATH → foreign неизбежно попадал в managed → cycle-guard
+# обрывал (rc=126). После rename этот ЕСТЕСТВЕННЫЙ путь устранён структурно (в этом и цель rename из epic #166),
+# НО как следствие cycle-guard больше НЕ ловит foreign↔foreign self-cycle (см. test_cycle_guard_foreign_self_cycle_documented_limitation):
+# foreign-wrapper, делающий рекурсивный `codex`-вызов, циклит сам с собой без повторного входа managed →
+# sentinel никогда не ceiling'ится. Это availability-класс через ЧУЖОЙ wrapper в собственном PATH под контролем
+# того же UID — #150 ЯВНО выводит его за scope best-effort слоя (нужен active malice / сломанный чужой wrapper
+# в уже контролируемом PATH; честная fail-closed граница = PF kill-switch, #168, отдельный слой).
+#
+# Coverage cycle-guard ПОСЛЕ rename (#169): ловит повторный вход MANAGED codex-srouter (PID-match + hop-ceiling).
+# Тесты ниже моделируют foreign, целенаправленно зовущий managed codex-srouter по имени — cycle-guard обрывает.
+# Ограничение (foreign↔foreign по имени codex) — отдельный тест-документация ниже, НЕ rc=126 (вне scope).
 
 
 def _install_cycle_guard_wrapper(monkeypatch, tmp_path):
@@ -1285,6 +1368,57 @@ def test_cycle_guard_fork_foreign_bounded_not_process_bomb(monkeypatch, tmp_path
     assert proc.returncode == 126, \
         (f"fork-foreign должен bounded-обрываться rc=126 (hop-ceiling), не fork-bomb: "
          f"получено rc={proc.returncode}, stderr={proc.stderr[:200]!r}")
+
+
+def test_cycle_guard_foreign_self_cycle_documented_limitation(monkeypatch, tmp_path):
+    """cycle-review FIX C (codex critical #2, confidence 0.97): ДОКУМЕНТИРОВАННОЕ ОГРАНИЧЕНИЕ coverage после
+    rename #169. foreign-wrapper, делающий рекурсивный `codex "$@"`-вызов (НЕ зовущий managed codex-srouter),
+# циклит сам с собой (foreign↔foreign) БЕЗ повторного входа managed → cycle-guard #153 НЕ обрывает.
+
+    ДО rename: managed wrapper звался codex (первый в PATH) → foreign `codex "$@"` попадал в managed →
+    cycle-guard обрывал rc=126 (тест test_cycle_guard_fork_foreign_bounded_not_process_bomb на старом имени).
+    ПОСЛЕ rename: managed = codex-srouter → foreign `codex "$@"` находит себя → self-cycle без managed в
+    цепочке → sentinel никогда не ceiling'ится. Это регрессия COVERAGE (srouter перестал покрывать класс),
+    обнаруженная Codex и ранее скрытая адаптацией тестов под новое имя.
+
+    ПОЧЕМУ НЕ ЧИНИТСЯ здесь (решение пользователя, канон #150): foreign↔foreign self-cycle — availability-класс
+    через ЧУЖОЙ wrapper в собственном PATH под контролем того же UID. #150 ЯВНО выводит этот класс за scope
+    best-effort слоя (нужен active malice / сломанный чужой wrapper в уже контролируемом PATH; PATH-санitизация
+    отвергнута — blast radius на 24/7-инфре). Честная fail-closed граница = PF kill-switch (#168, отдельный слой).
+    Тест фиксирует ограничение как осознанный контракт: foreign↔foreign НЕ обрывается (timeout/hang), и это
+    задокументировано, а не скрыто.
+    """
+    import subprocess
+    home = _mock_home(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    monkeypatch.setattr(srouter, "_codex_bin_path", lambda: str(tmp_path / "any-codex"))
+    srouter._install_codex_wrappers(env)
+    wrapper = home / "bin" / _cli_wrapper_name()
+    real_codex = tmp_path / "realdir" / "codex"
+    real_codex.parent.mkdir(parents=True)
+    real_codex.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    real_codex.chmod(0o755)
+    # foreign БЕЗ exec: зовёт `codex` (НЕ codex-srouter) → резолвит себя → foreign↔foreign self-cycle.
+    foreignbin = tmp_path / "foreignbin"
+    foreignbin.mkdir()
+    (foreignbin / "codex").write_text('#!/bin/sh\ncodex "$@"; exit $?\n', encoding="utf-8")
+    (foreignbin / "codex").chmod(0o755)
+    caller_path = f"{home / 'bin'}:{foreignbin}:{tmp_path / 'realdir'}:/usr/bin:/bin"
+    # ДОКУМЕНТИРОВАННОЕ ограничение: foreign↔foreign self-cycle НЕ обрывается cycle-guard → fork-bomb,
+    # который subprocess убивает по timeout (TimeoutExpired) — это и есть сигнал «ограничение не устранено».
+    # cycle-guard обрывил бы с rc=126; timeout/ненулевой rc = ограничение подтверждено (вне scope #150).
+    timed_out = False
+    rc = None
+    try:
+        proc = subprocess.run([str(wrapper), "x"],
+                              env={**os.environ, "PATH": caller_path},
+                              capture_output=True, text=True, timeout=6)
+        rc = proc.returncode
+    except subprocess.TimeoutExpired:
+        timed_out = True
+    assert timed_out or rc != 126, \
+        (f"foreign↔foreign self-cycle вне scope (#150); если стал обрываться rc=126 (без timeout) — coverage "
+         f"расширилась, обнови тест-документацию: rc={rc}, timed_out={timed_out}")
 
 
 def test_cycle_guard_non_numeric_hop_resets_not_crash(monkeypatch, tmp_path):
