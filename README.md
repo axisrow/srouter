@@ -184,8 +184,9 @@ srouter install
 #   • изолирует Codex двумя слоями: SOCKS5-wrappers (~/bin/codex-srouter + codex-app-proxy) и
 #     глобальный env через LaunchAgent (чтобы Codex ходил напрямую в xray, минуя privoxy) — это
 #     текущая живая защита; + PF kill-switch в ядре (#168) как будущая fail-closed граница (режет
-#     прямой выход codex на en*/ppp*, оставляя только loopback SOCKS5), правила загружаются install-тайм,
-#     но активируются после provisioning (uid 503, отдельный follow-up);
+#     прямой TCP-выход codex на en0–en6/ppp0–ppp1, оставляя только loopback SOCKS5), правила
+#     загружаются install-тайм, но пока дормантны — активируются после полной активации
+#     (provisioning uid 503 + доменная изоляция + TCP на en/ppp, отдельный follow-up);
 #   • показывает план и спрашивает подтверждение.
 srouter status         # проверить, что демон работает (http://127.0.0.1:8787)
 srouter doctor         # диагностика: порты + туннель + Claude-proxy (✅/❌)
@@ -511,8 +512,9 @@ srouter install
 #   • isolates Codex in two layers: SOCKS5 wrappers (~/bin/codex-srouter + codex-app-proxy) and
 #     global env via a LaunchAgent (so Codex goes straight to xray, bypassing privoxy) — the current
 #     live guard; + a PF kill-switch in the kernel (#168) as the future fail-closed boundary (cuts
-#     codex direct egress on en*/ppp*, allowing only loopback SOCKS5), rules load at install time but
-#     activate after provisioning (uid 503, a separate follow-up);
+#     codex direct TCP egress on en0–en6/ppp0–ppp1, allowing only loopback SOCKS5), rules load at
+#     install time but stay dormant today — they activate after full activation (uid-503 provisioning
+#     + domain isolation + TCP on en/ppp, a separate follow-up);
 #   • prints a plan and asks for confirmation.
 srouter status         # check the daemon is up (http://127.0.0.1:8787)
 srouter doctor         # diagnostics: ports + tunnel + Claude-proxy (✅/❌)
