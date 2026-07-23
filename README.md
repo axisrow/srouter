@@ -181,10 +181,11 @@ srouter install
 #   • настраивает DNS, устанавливает LaunchAgent дашборда и watchdog;
 #   • ставит ppp-hook для мгновенного split-route при VPN;
 #   • настраивает прокси для Claude Code и git (github.com);
-#   • изолирует Codex двумя слоями: PF kill-switch в ядре (#168, настоящая fail-closed граница —
-#     режет прямой выход codex на en*/ppp*, оставляя только loopback SOCKS5) + SOCKS5-wrappers
-#     (~/bin/codex-srouter + codex-app-proxy) и глобальный env через LaunchAgent как defense-in-depth
-#     переход, чтобы Codex ходил напрямую в xray, минуя privoxy;
+#   • изолирует Codex двумя слоями: SOCKS5-wrappers (~/bin/codex-srouter + codex-app-proxy) и
+#     глобальный env через LaunchAgent (чтобы Codex ходил напрямую в xray, минуя privoxy) — это
+#     текущая живая защита; + PF kill-switch в ядре (#168) как будущая fail-closed граница (режет
+#     прямой выход codex на en*/ppp*, оставляя только loopback SOCKS5), правила загружаются install-тайм,
+#     но активируются после provisioning (uid 503, отдельный follow-up);
 #   • показывает план и спрашивает подтверждение.
 srouter status         # проверить, что демон работает (http://127.0.0.1:8787)
 srouter doctor         # диагностика: порты + туннель + Claude-proxy (✅/❌)
@@ -270,9 +271,12 @@ Codex (CLI и App) нестабилен через privoxy (8118, HTTP-CONNECT) 
 `127.0.0.1:10808` (→ xray → VPS). Это **замкнутый инвариант**: любой обход wrapper'а (rename в PATH,
 прямой путь к binary, чужой wrapper, Go `exec.LookPath` в AO worktree) нерелевантен — пакет всё равно
 дропнется на физическом интерфейсе. Прокси упал → codex-трафик в никуда, **не напрямую**. ⚠️
-**Активация требует provisioning** (системный пользователь uid 503 + запуск codex под ним) — до этого
-правила загружены, но не матчат трафик; см. [🔒 PF codex-изоляция](#🔒-pf-codex-изоляция-kill-switch)
-ниже.
+**Сейчас это dormant foundation, НЕ активная защита.** Активация требует provisioning (системный
+пользователь `_srouter_codex` uid 503 + запуск codex под ним, отдельный follow-up) — до этого правила
+загружены в sub-anchor, но не матчат трафик (codex бежит под обычным пользователем, не под 503). Значит
+**прямо сейчас** fail-closed и «обход wrapper'а нерелевантен» выполняются **только** после
+provisioning; пока единственная живая защита от прямого выхода — wrappers/env (слой 2). Детали — в
+разделе «🔒 PF codex-изоляция» ниже.
 
 **2. SOCKS5-wrappers — defense-in-depth / best-effort переход.** Прокладки, которые выставляют
 codex'у env на SOCKS5, чтобы трафик шёл правильным путём *до того*, как PF его всё равно защитит.
@@ -295,30 +299,34 @@ binary/exec.LookPath), поэтому границей служит именно
 Всё ставит/убирает `srouter install`/`uninstall` (marker-gate: чужой wrapper/плагин не трогает).
 Проверка wrappers: `which codex` → `/opt/homebrew/bin/codex` (real binary); `which codex-srouter` →
 `~/bin/codex-srouter`; `codex doctor` → `proxy env vars: HTTP_PROXY, HTTPS_PROXY`.
-Проверка PF-границы: `python3 isolate_firewall.py status-codex` (см. секцию PF ниже).
+Состояние PF-codex (записанное состояние установки, **не** живая проверка границы — `status-codex`
+читает lease, не зовёт `pfctl` и не проверяет, что codex реально бежит под uid 503):
+`python3 isolate_firewall.py status-codex` (см. секцию PF ниже).
 
 > Почему не `[network] proxy_url` в `~/.codex/config.toml`? Ключ валидный, но управляет
 > execution-scoped sandbox-прокси для субпроцессов codex, а не HTTP-клиентом к `chatgpt.com`. Для
 > клиента работает только env (`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`).
 > Почему не отдельный WS-proxy env? `WS_PROXY`/`WSS_PROXY` тоже игнорируются (проверено в 0.142.5).
 > Профиль `openai-http` с `supports_websockets=false` даёт 401 с ChatGPT-подпиской. Поэтому — SOCKS5
-> напрямую, единый рабочий путь. **Гарантия, что Codex не уйдёт напрямую, даёт PF kill-switch, а не
-> wrappers или env** (env/wrapper можно обойти PATH; PF — нет).
+> напрямую, единый рабочий путь. **Гарантию, что Codex не уйдёт напрямую, даст PF kill-switch после
+> provisioning, а не wrappers или env** (env/wrapper можно обойти PATH; PF — нет). Пока provisioning
+> не реализован (follow-up), единственная живая защита от прямого выхода — wrappers/env (слой 2).
 
-> **Обход wrappers НЕ ломает изоляцию (PF держит).** Ранее wrapper был единственным слоем, и его
-> обходы были дырами: в AO worktree claude-code (Go) резолвит codex через Go `exec.LookPath`, который
+> **Обход wrappers и статус изоляции.** Ранее wrapper был единственным слоем, и его обходы были
+> дырами: в AO worktree claude-code (Go) резолвит codex через Go `exec.LookPath`, который
 > игнорирует zsh-функции и берёт `/opt/homebrew/bin/codex` (real binary), а wrapper не зовётся.
-> С PF kill-switch такой обход лишь означает «трафик пошёл мимо wrappers» — но PF всё равно дропнет
-> его на физическом интерфейсе, оставляя только loopback SOCKS5. Для AO-воркеров лучше всё же держать
-> `ALL_PROXY=socks5h://127.0.0.1:10808` (трафик сразу идёт по нужному каналу), но это оптимизация, не
-> граница безопасности.
+> После provisioning (codex под uid 503) такой обход лишь означает «трафик пошёл мимо wrappers» — но
+> PF всё равно дропнет его на физическом интерфейсе, оставляя только loopback SOCKS5. **До
+> provisioning** PF не активен, поэтому обход wrapper'а в AO worktree сегодня = дыра, и фикс — на
+> стороне AO (`ALL_PROXY=socks5h://127.0.0.1:10808` в env воркера). Для AO-воркеров всё же лучше
+> держать `ALL_PROXY`, чтобы трафик шёл по нужному каналу сразу.
 
 ## Интеграции
 
 | Инструмент | Подключение |
 |---|---|
 | **Claude Code** | `HTTPS_PROXY=http://127.0.0.1:8118` в `~/.claude/settings.json` (privoxy HTTP; SOCKS5 CC не умеет) |
-| **Codex CLI/App** | **изоляция — PF kill-switch в ядре** (#168, настоящая fail-closed граница: прямой выход codex режется на en*/ppp*, остаётся только loopback SOCKS5) + **напрямую SOCKS5 в xray** (`socks5h://127.0.0.1:10808`) через wrappers + LaunchAgent env как defense-in-depth, минуя privoxy. privoxy портит WS-стриминг Codex (`Reconnecting`/`request timed out`); для клиента Codex↔`chatgpt.com` работает только env (`[network] proxy_url` в `~/.codex/config.toml` управляет execution-scoped sandbox-прокси для субпроцессов, не клиентом) — поэтому wrappers в `~/bin/codex-srouter` (CLI, имя `codex-srouter` убирает коллизию wrapper↔real-binary #169) + `~/bin/codex-app-proxy` (App, `--proxy-server` для Chromium) + глобальный env через `com.srouter.codenv` LaunchAgent (переживает ребут). Запускать Codex **App** через `~/bin/codex-app-proxy`, а не иконку Dock (Dock не передаёт `--proxy-server`). См. раздел «Изоляция Codex». |
+| **Codex CLI/App** | **напрямую SOCKS5 в xray** (`socks5h://127.0.0.1:10808`) через wrappers + LaunchAgent env, минуя privoxy — текущая живая защита; + **PF kill-switch в ядре** (#168) как будущая fail-closed граница (режет прямой выход codex на en*/ppp*, оставляя только loopback SOCKS5; активируется после provisioning uid 503, отдельный follow-up). privoxy портит WS-стриминг Codex (`Reconnecting`/`request timed out`); для клиента Codex↔`chatgpt.com` работает только env (`[network] proxy_url` в `~/.codex/config.toml` управляет execution-scoped sandbox-прокси для субпроцессов, не клиентом) — поэтому wrappers в `~/bin/codex-srouter` (CLI, имя `codex-srouter` убирает коллизию wrapper↔real-binary #169) + `~/bin/codex-app-proxy` (App, `--proxy-server` для Chromium) + глобальный env через `com.srouter.codenv` LaunchAgent (переживает ребут). Запускать Codex **App** через `~/bin/codex-app-proxy`, а не иконку Dock (Dock не передаёт `--proxy-server`). См. раздел «Изоляция Codex». |
 | **git / gh** | домены GitHub в вайтлисте узла → резолв и трафик через ускоритель |
 | **Браузер** | системный SOCKS5 `127.0.0.1:10808` (вайтлист разруливает сам) |
 
@@ -476,10 +484,11 @@ srouter install
 #   • sets DNS, installs the dashboard LaunchAgent and watchdog;
 #   • sets up ppp-hook for instant split-route on VPN up;
 #   • configures proxy for Claude Code and git (github.com);
-#   • isolates Codex in two layers: a PF kill-switch in the kernel (#168, the real fail-closed
-#     boundary — cuts codex direct egress on en*/ppp*, allowing only loopback SOCKS5) + SOCKS5
-#     wrappers (~/bin/codex-srouter + codex-app-proxy) and global env via a LaunchAgent as a
-#     defense-in-depth transition, so Codex goes straight to xray, bypassing privoxy;
+#   • isolates Codex in two layers: SOCKS5 wrappers (~/bin/codex-srouter + codex-app-proxy) and
+#     global env via a LaunchAgent (so Codex goes straight to xray, bypassing privoxy) — the current
+#     live guard; + a PF kill-switch in the kernel (#168) as the future fail-closed boundary (cuts
+#     codex direct egress on en*/ppp*, allowing only loopback SOCKS5), rules load at install time but
+#     activate after provisioning (uid 503, a separate follow-up);
 #   • prints a plan and asks for confirmation.
 srouter status         # check the daemon is up (http://127.0.0.1:8787)
 srouter doctor         # diagnostics: ports + tunnel + Claude-proxy (✅/❌)
@@ -564,9 +573,12 @@ codex **direct egress** (running under system UID 503) on en*/ppp* and allow onl
 `127.0.0.1:10808` (→ xray → VPS). This is a **closed invariant**: any wrapper bypass (PATH rename,
 direct binary path, foreign wrapper, Go `exec.LookPath` in an AO worktree) is irrelevant — the packet
 is dropped at the physical interface regardless. Proxy down → codex traffic goes nowhere, **not
-direct**. ⚠️ **Activation requires provisioning** (system user uid 503 + launching codex under it) —
-until then the rules are loaded but match no traffic; see
-[🔒 PF codex isolation](#🔒-pf-codex-isolation-kill-switch) below.
+direct**. ⚠️ **Right now this is a dormant foundation, NOT an active guard.** Activation requires
+provisioning (system user `_srouter_codex` uid 503 + launching codex under it, a separate follow-up) —
+until then the rules are loaded in the sub-anchor but match no traffic (codex runs as a normal user,
+not 503). So **today** the fail-closed and "wrapper bypass is irrelevant" properties hold **only**
+after provisioning; the single live guard against direct egress right now is the wrappers/env (layer 2).
+Details in the "🔒 PF codex isolation" section below.
 
 **2. SOCKS5 wrappers — defense-in-depth / best-effort transition.** Shims that set Codex's env to
 SOCKS5 so traffic takes the correct path *before* PF guards it anyway. Wrappers **are not the
@@ -589,23 +601,28 @@ optimization (they route traffic through the right channel without relying on th
 All installed/removed by `srouter install`/`uninstall` (marker-gate: a foreign wrapper/plugin is left
 untouched). Verify wrappers: `which codex` → `/opt/homebrew/bin/codex` (real binary);
 `which codex-srouter` → `~/bin/codex-srouter`; `codex doctor` → `proxy env vars: HTTP_PROXY, HTTPS_PROXY`.
-Verify the PF boundary: `python3 isolate_firewall.py status-codex` (see the PF section below).
+PF-codex state (the recorded install state, **not** a live boundary check — `status-codex` reads the
+lease, does not call `pfctl`, and does not verify codex actually runs under uid 503):
+`python3 isolate_firewall.py status-codex` (see the PF section below).
 
 > Why not `[network] proxy_url` in `~/.codex/config.toml`? It is a valid key, but it controls the
 > execution-scoped sandbox proxy for spawned `codex` subprocesses — not the HTTP client to
 > `chatgpt.com`. For that client, only env works (`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`).
 > Why not a separate WS-proxy env? `WS_PROXY`/`WSS_PROXY` are also ignored (verified in 0.142.5).
 > The `openai-http` profile with `supports_websockets=false` 401s on a ChatGPT subscription. So —
-> SOCKS5 directly, the one working path. **The guarantee that Codex can't go direct comes from the PF
-> kill-switch, not from wrappers or env** (env/wrappers are bypassable via PATH; PF is not).
+> SOCKS5 directly, the one working path. **The guarantee that Codex can't go direct will come from the
+> PF kill-switch after provisioning, not from wrappers or env** (env/wrappers are bypassable via PATH;
+> PF is not). Until provisioning lands (follow-up), the only live guard against direct egress is the
+> wrappers/env (layer 2).
 
-> **Bypassing the wrappers does NOT break isolation (PF still holds).** Previously the wrapper was the
-> only layer, so its bypasses were holes: in an AO worktree, claude-code (Go) resolves `codex` via Go
-> `exec.LookPath`, which ignores zsh functions and picks `/opt/homebrew/bin/codex` (the real binary),
-> so the wrapper is never called. With the PF kill-switch, such a bypass only means "traffic skipped
-> the wrappers" — but PF still drops it at the physical interface, leaving only loopback SOCKS5. For
-> AO workers it's still best to keep `ALL_PROXY=socks5h://127.0.0.1:10808` (traffic takes the right
-> channel immediately), but that's an optimization, not a security boundary.
+> **Wrapper bypass and the isolation status.** Previously the wrapper was the only layer, so its
+> bypasses were holes: in an AO worktree, claude-code (Go) resolves `codex` via Go `exec.LookPath`,
+> which ignores zsh functions and picks `/opt/homebrew/bin/codex` (the real binary), so the wrapper is
+> never called. After provisioning (codex under uid 503) such a bypass only means "traffic skipped the
+> wrappers" — but PF still drops it at the physical interface, leaving only loopback SOCKS5. **Before
+> provisioning** PF is not active, so a wrapper bypass in an AO worktree today is a hole, and the fix
+> is on the AO side (`ALL_PROXY=socks5h://127.0.0.1:10808` in the worker env). AO workers should still
+> keep `ALL_PROXY` so traffic takes the right channel immediately.
 
 ## Rollback
 
@@ -688,7 +705,7 @@ no traffic. Remove manually with `sudo pfctl -a "com.apple/srouter_isolate/codex
 | Tool | Wiring |
 |---|---|
 | **Claude Code** | `HTTPS_PROXY=http://127.0.0.1:8118` in `~/.claude/settings.json` |
-| **Codex** | **isolation = PF kill-switch in the kernel** (#168, the real fail-closed boundary: codex direct egress is cut on en*/ppp*, leaving only loopback SOCKS5) + env for the Codex↔`chatgpt.com` client (`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`, e.g. `socks5h://127.0.0.1:10808` via wrappers + LaunchAgent) as defense-in-depth. `[network] proxy_url` in `~/.codex/config.toml` does NOT drive that client — it configures the execution-scoped sandbox proxy for spawned `codex` subprocesses. See the "Codex isolation" section. |
+| **Codex** | env for the Codex↔`chatgpt.com` client (`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`, e.g. `socks5h://127.0.0.1:10808` via wrappers + LaunchAgent) — the current live guard; + **a PF kill-switch in the kernel** (#168) as the future fail-closed boundary (cuts codex direct egress on en*/ppp*, leaving only loopback SOCKS5; activates after uid-503 provisioning, a separate follow-up). `[network] proxy_url` in `~/.codex/config.toml` does NOT drive that client — it configures the execution-scoped sandbox proxy for spawned `codex` subprocesses. See the "Codex isolation" section. |
 | **git / gh** | GitHub domains whitelisted on the node |
 | **Browser** | system SOCKS5 `127.0.0.1:10808` |
 
