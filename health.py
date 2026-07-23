@@ -827,39 +827,50 @@ def _endpoint_override_check():
 # Regex извлекает ANTHROPIC_* vars из вывода `ps eww`. Env разделяется ПРОБЕЛОМ (не \012); [^ ]*
 # обрезает значение до следующего пробела. Ключи — только ANTHROPIC_* (наш trust boundary).
 _RUNTIME_ENV_RE = re.compile(r"(ANTHROPIC_[A-Z_]+)=([^ ]*)")
+# Каждая строка процесса в `ps eww` начинается с PID-цифр (`^[0-9]+ `); заголовок отбрасывается.
+# Per-PID секционирование (см. _read_runtime_endpoint_config) — не слить env разных процессов.
+_PID_LINE_RE = re.compile(r"^\s*(\d+)\s")
 
 
 def _read_runtime_endpoint_config():
-    """Читает env ЖИВОГО CC-процесса через `ps eww` (#143).
+    """Читает env ЖИВОГО CC-процесса через `ps eww` (#143), per-PID.
 
-    Возвращает {base_url, model_env, pids, readable}:
+    Возвращает {per_pid, pids, readable}:
       - readable=False, pids=[]   — CC не запущен (ps -axo пуст) ИЛИ ps-timeout;
-      - readable=False, pids=[..] — CC запущен, но ps eww пуст/timeout (чужой UID/sandbox — PID
-        сохранены для forensics в detail чека);
-      - readable=True             — env прочитан; base_url/model_env заполнены из ANTHROPIC_* vars.
-    base_url: ANTHROPIC_BASE_URL живого процесса ("" если не задан им). model_env: {KEY: value}
-    для всех ANTHROPIC_* (включая ANTHROPIC_DEFAULT_*_MODEL и секреты — doctor доверяет тому же UID;
-    фильтрацию секретов делает чек, НЕ эта функция). Не бросает.
+      - readable=False, pids=[..] — CC запущен, но ps eww пуст/timeout/нет ANTHROPIC_* (чужой
+        UID/sandbox — PID сохранены для forensics в detail чека);
+      - readable=True, per_pid={pid: {KEY: value}} — env прочитан ПО PID'ам.
+    per_pid: {pid: {ANTHROPIC_*: value}} для каждого CC PID (включая секреты — doctor доверяет
+    тому же UID; фильтрацию секретов делает чек, НЕ эта функция). Per-PID, не merged — иначе
+    dict(findall) перезаписал бы дубликаты ключей и ОДИН override-процесс маскировался бы
+    standard-процессом (cycle-review Codex: false-negative ровно в сценарии #143 — несколько
+    живых CC-сессий штатны). Один ps eww батчем; вывод секционируется по строкам `^[0-9]+ `.
     """
     pids = _claude_code_pids()
     if not pids:
-        return {"base_url": "", "model_env": {}, "pids": [], "readable": False}
-    # Один ps eww на ВСЕ PID батчем (запятая, как lsof в _claude_proxy_probe). Любой PID CC отдаёт env.
+        return {"per_pid": {}, "pids": [], "readable": False}
+    # Один ps eww на ВСЕ PID батчем (запятая, как lsof в _claude_proxy_probe). ps eww отдаёт
+    # каждую строку процесса с PID в начале — секционируем per-PID, не одним dict().
     r = sys_probe.run([PS, "eww", "-p", ",".join(pids)], timeout=3)
     if r.get("timeout") or not (r.get("out") or "").strip():
-        return {"base_url": "", "model_env": {}, "pids": pids, "readable": False}
-    model_env = dict(_RUNTIME_ENV_RE.findall(r["out"]))
-    # ps eww дал вывод, но НИ ОДНОЙ ANTHROPIC_* не извлечено (мусор/неполный env/чужой контекст) —
-    # evidence нет → НЕ readable. Иначе чек дал бы ложный ok «стандартный endpoint» без proof
-    # (verify-dont-guess: нет ANTHROPIC_* = нет evidence, classify unknown, не ok).
-    if not model_env:
-        return {"base_url": "", "model_env": {}, "pids": pids, "readable": False}
-    return {
-        "base_url": model_env.get("ANTHROPIC_BASE_URL", ""),
-        "model_env": model_env,
-        "pids": pids,
-        "readable": True,
-    }
+        return {"per_pid": {}, "pids": pids, "readable": False}
+    per_pid = {}
+    cur_pid, cur_lines = "", []
+    for line in (r["out"] or "").splitlines():
+        m = _PID_LINE_RE.match(line)
+        if m:  # новая строка процесса — фиксируем предыдущую
+            if cur_pid:
+                per_pid[cur_pid] = dict(_RUNTIME_ENV_RE.findall("\n".join(cur_lines)))
+            cur_pid, cur_lines = m.group(1), [line]
+        elif cur_pid:
+            cur_lines.append(line)  # продолжение env того же PID (маловероятно, но устойчиво)
+    if cur_pid:
+        per_pid[cur_pid] = dict(_RUNTIME_ENV_RE.findall("\n".join(cur_lines)))
+    # НИ у одного PID нет ANTHROPIC_* (мусор/неполный env/чужой контекст) — evidence нет → НЕ
+    # readable. Иначе чек дал бы ложный ok «стандартный endpoint» без proof (verify-dont-guess).
+    if not any(per_pid.values()):
+        return {"per_pid": {}, "pids": pids, "readable": False}
+    return {"per_pid": per_pid, "pids": pids, "readable": True}
 
 
 def _runtime_model_override_check():
@@ -867,14 +878,15 @@ def _runtime_model_override_check():
 
     Возвращает {status, detail}. status:
       - "unknown" — CC не запущен / env не читается (fail-soft; info-only, как _claude_proxy_probe idle);
-      - "ok"      — runtime==api.anthropic.com, нет model-substitution, нет расхождения с файлами;
-      - "info"    — runtime override / model-substitution / runtime != files.
-    Сигналы (накапливаются в detail):
+      - "ok"      — ВСЕ CC PID'ы на api.anthropic.com, без model-substitution, без расхождения с файлами;
+      - "info"    — ХОТЯ БЫ ОДИН CC PID с override/substitution/расхождением.
+    Per-PID агрегация: ЛЮБОЙ override-PID = unsafe runtime (стандартный процесс его НЕ маскирует —
+    cycle-review Codex false-negative fix). Сигналы per-PID (накапливаются в detail):
       (a) runtime base_url override на нестандартный хост;
       (b) ANTHROPIC_DEFAULT_* присутствуют → slot-mapping модели подменён (даже при чистом base_url);
       (c) stale-process: runtime override есть, а файлы doctor ЧИСТЫ → ровно сценарий #143
           (живой CC держит override после сброса настроек);
-      (d) runtime != files (оба нестандартные, но разные).
+      (d) runtime != files (PID и файлы на разных нестандартных endpoint'ах).
     Канон info-only: НЕ driver (как _endpoint_override_check) — картина для диагностики (#143 п.1+4).
     Security: detail выводит ТОЛЬКО base_url и ANTHROPIC_DEFAULT_* — никогда ANTHROPIC_API_KEY /
     ANTHROPIC_AUTH_TOKEN (doctor доверяет тому же UID, но логи/terminal не должны содержать секреты).
@@ -887,34 +899,43 @@ def _runtime_model_override_check():
 
     cfg = _read_endpoint_config()  # что видит doctor по файлам/сессии
     files_base = cfg["base_url"]
-    runtime_base = rt["base_url"]
-    runtime_host = (urlparse(runtime_base).hostname or "").lower().rstrip(".")
     files_host = (urlparse(files_base).hostname or "").lower().rstrip(".")
-    # model_keys — ТОЛЬКО ANTHROPIC_DEFAULT_* (base_url отдельно). Секреты в detail НЕ попадают.
-    model_keys = {k: v for k, v in rt["model_env"].items() if k.startswith("ANTHROPIC_DEFAULT_")}
-    pid_str = ",".join(rt["pids"])
+    files_clean = (not files_base) or files_host == _DEFAULT_ANTHROPIC_HOST
 
     signals = []
-    runtime_overridden = bool(runtime_base and runtime_host != _DEFAULT_ANTHROPIC_HOST)
-    # (a) runtime base_url override на нестандартный хост.
-    if runtime_overridden:
-        signals.append(f"runtime endpoint: {runtime_base}")
-    # (b) model substitution: ANTHROPIC_DEFAULT_*_MODEL присутствуют → slot-mapping подменён.
-    if model_keys:
-        pairs = ", ".join(f"{k}={v}" for k, v in sorted(model_keys.items()))
-        signals.append(f"model substitution: {pairs}")
-    # (c) stale-process: runtime override есть, а файлы doctor чисты → ровно сценарий #143.
-    files_clean = (not files_base) or files_host == _DEFAULT_ANTHROPIC_HOST
-    if runtime_overridden and files_clean:
-        signals.append("stale process: CC держит override после сброса настроек (runtime != files)")
-    # (d) расхождение runtime vs files даже когда оба нестандартные но разные.
-    if runtime_base and files_base and runtime_base != files_base:
-        signals.append(f"runtime != files (runtime={runtime_base}, files={files_base})")
+    ok_pids = []
+    for pid in rt["pids"]:
+        env = rt["per_pid"].get(pid, {})
+        if not env:  # этого PID env не прочитан (мусор) — не ok и не сигнал, просто пропускаем
+            continue
+        runtime_base = env.get("ANTHROPIC_BASE_URL", "")
+        runtime_host = (urlparse(runtime_base).hostname or "").lower().rstrip(".")
+        model_keys = {k: v for k, v in env.items() if k.startswith("ANTHROPIC_DEFAULT_")}
+        runtime_overridden = bool(runtime_base and runtime_host != _DEFAULT_ANTHROPIC_HOST)
+        pid_signals = []
+        if runtime_overridden:
+            pid_signals.append(f"runtime endpoint: {runtime_base}")
+        if model_keys:
+            pairs = ", ".join(f"{k}={v}" for k, v in sorted(model_keys.items()))
+            pid_signals.append(f"model substitution: {pairs}")
+        if runtime_overridden and files_clean:
+            pid_signals.append("stale process (override после сброса настроек, runtime != files)")
+        if runtime_base and files_base and runtime_base != files_base:
+            pid_signals.append(f"runtime != files ({runtime_base} vs {files_base})")
+        if pid_signals:
+            signals.append(f"PID {pid}: " + "; ".join(pid_signals))
+        else:
+            ok_pids.append(pid)
 
+    pid_list = ",".join(rt["pids"])
     if not signals:
         return {"status": "ok",
-                "detail": f"runtime: стандартный endpoint, без model-substitution (PID {pid_str})"}
-    return {"status": "info", "detail": f"runtime (PID {pid_str}): " + "; ".join(signals)}
+                "detail": f"runtime: стандартный endpoint, без model-substitution (PID {pid_list})"}
+    detail = f"runtime override (PID {pid_list}): " + " | ".join(signals)
+    if ok_pids:
+        detail += f" (остальные standard: PID {','.join(ok_pids)})"
+    return {"status": "info", "detail": detail}
+
 
 
 # ============================ #134: Desktop App proxy (launchctl getenv) ============================

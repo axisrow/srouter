@@ -970,18 +970,21 @@ def test_check_all_has_privoxy_log_check_info_only(monkeypatch):
 # ps eww -p <pid> читает env процесса того же UID (эмпирически подтверждено). Fail-soft: чужой
 # UID/sandbox → пустой вывод. Константы comm-формата — см. CLI_COMM/VERSION_RUNNER_COMM выше.
 
-def _runtime_fake_run(pid_comm_pairs, env_str):
-    """fake_run для #143: `ps -axo pid=,comm=` → PID-лист; `ps eww -p <pids>` → env-строка.
+def _runtime_fake_run(pid_comm_pairs, pid_envs):
+    """fake_run для #143: `ps -axo pid=,comm=` → PID-лист; `ps eww -p <pids>` → per-PID env.
 
     Различает команды по форме: ps с "-axo" даёт листинг процессов; ps с "eww" даёт env.
-    env_str — одна строка с ANTHROPIC_*=value, разделённые пробелом (формат реального ps eww).
+    pid_envs: {pid: "ANTHROPIC_*=value ANTHROPIC_*=value ..."} — env КАЖДОГО PID (формат реального
+    ps eww: каждая строка процесса начинается с PID `^[0-9]+ `). Per-PID, не merged.
     """
     listing = "\n".join(f"{pid} {comm}" for pid, comm in pid_comm_pairs) + "\n"
+    # ps eww отдаёт каждую строку процесса с PID в начале; заголовок отбрасывается парсером.
+    eww = "\n".join(f"{pid} /path/claude {env}" for pid, env in pid_envs.items()) + "\n"
 
     def fake_run(cmd, timeout):
         if cmd and cmd[0] == "/bin/ps":
             if "eww" in cmd:
-                return {"rc": 0, "out": env_str, "err": "", "timeout": False}
+                return {"rc": 0, "out": eww, "err": "", "timeout": False}
             # ps -axo pid=,comm=
             return {"rc": 0, "out": listing, "err": "", "timeout": False}
         return {"rc": 0, "out": "", "err": "", "timeout": False}
@@ -991,43 +994,42 @@ def _runtime_fake_run(pid_comm_pairs, env_str):
 
 def test_runtime_config_not_readable_when_cc_not_running(monkeypatch):
     """CC не запущен (ps -axo пуст) → readable=False, pids=[]. Fail-soft, не падает."""
-    monkeypatch.setattr(health.sys_probe, "run", _runtime_fake_run([], ""))
+    monkeypatch.setattr(health.sys_probe, "run", _runtime_fake_run([], {}))
     res = health._read_runtime_endpoint_config()
     assert res["readable"] is False
     assert res["pids"] == []
-    assert res["base_url"] == ""
-    assert res["model_env"] == {}
+    assert res["per_pid"] == {}
 
 
 def test_runtime_config_not_readable_when_ps_eww_empty(monkeypatch):
     """ps eww пуст (чужой UID/sandbox) → readable=False, но PID сохранены для forensics."""
     monkeypatch.setattr(health.sys_probe, "run",
-                        _runtime_fake_run([("12345", CLI_COMM)], ""))
+                        _runtime_fake_run([("12345", CLI_COMM)], {"12345": ""}))
     res = health._read_runtime_endpoint_config()
     assert res["readable"] is False
     assert res["pids"] == ["12345"], "PID сохранены для forensics даже когда env не читается"
 
 
 def test_runtime_config_extracts_base_url_and_models(monkeypatch):
-    """Эмпирические данные PID 77749: BASE_URL=z.ai + glm-модели. Regex их извлекает."""
+    """Эмпирические данные PID 77749: BASE_URL=z.ai + glm-модели. Regex их извлекает per-PID."""
     env = ("ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic "
            "ANTHROPIC_DEFAULT_HAIKU_MODEL=glm-4.7 "
            "ANTHROPIC_DEFAULT_SONNET_MODEL=glm-5-turbo "
            "ANTHROPIC_API_KEY=sk-secret")
     monkeypatch.setattr(health.sys_probe, "run",
-                        _runtime_fake_run([("77749", VERSION_RUNNER_COMM)], env))
+                        _runtime_fake_run([("77749", VERSION_RUNNER_COMM)], {"77749": env}))
     res = health._read_runtime_endpoint_config()
     assert res["readable"] is True
-    assert res["base_url"] == "https://api.z.ai/api/anthropic"
-    assert res["model_env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "glm-4.7"
-    assert res["model_env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "glm-5-turbo"
-    assert "ANTHROPIC_BASE_URL" in res["model_env"]
+    pid_env = res["per_pid"]["77749"]
+    assert pid_env["ANTHROPIC_BASE_URL"] == "https://api.z.ai/api/anthropic"
+    assert pid_env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "glm-4.7"
+    assert pid_env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "glm-5-turbo"
 
 
 def test_runtime_check_unknown_when_cc_not_running(monkeypatch):
     """CC не запущен → status=unknown (info-only, как _claude_proxy_probe idle)."""
     monkeypatch.setattr(health, "_read_runtime_endpoint_config",
-                        lambda: {"base_url": "", "model_env": {}, "pids": [], "readable": False})
+                        lambda: {"per_pid": {}, "pids": [], "readable": False})
     res = health._runtime_model_override_check()
     assert res["status"] == "unknown"
     assert "не запущен" in res["detail"]
@@ -1036,7 +1038,7 @@ def test_runtime_check_unknown_when_cc_not_running(monkeypatch):
 def test_runtime_check_unknown_when_env_unreadable(monkeypatch):
     """env чужого UID/sandbox не читается → unknown, но PID в detail для forensics."""
     monkeypatch.setattr(health, "_read_runtime_endpoint_config",
-                        lambda: {"base_url": "", "model_env": {}, "pids": ["123"], "readable": False})
+                        lambda: {"per_pid": {}, "pids": ["123"], "readable": False})
     res = health._runtime_model_override_check()
     assert res["status"] == "unknown"
     assert "123" in res["detail"]
@@ -1045,8 +1047,8 @@ def test_runtime_check_unknown_when_env_unreadable(monkeypatch):
 def test_runtime_check_info_when_base_url_override(monkeypatch):
     """runtime base_url=z.ai override → info (файлы тоже override)."""
     monkeypatch.setattr(health, "_read_runtime_endpoint_config",
-                        lambda: {"base_url": "https://api.z.ai/api/anthropic",
-                                 "model_env": {}, "pids": ["77749"], "readable": True})
+                        lambda: {"per_pid": {"77749": {"ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic"}},
+                                 "pids": ["77749"], "readable": True})
     monkeypatch.setattr(health, "_read_endpoint_config",
                         lambda: {"base_url": "https://api.z.ai/api/anthropic",
                                  "no_proxy": "", "source": "settings.json"})
@@ -1059,8 +1061,7 @@ def test_runtime_check_info_when_base_url_override(monkeypatch):
 def test_runtime_check_info_when_model_substitution(monkeypatch):
     """ANTHROPIC_DEFAULT_*_MODEL заданы → model substitution, даже если base_url чистый (стандартный)."""
     monkeypatch.setattr(health, "_read_runtime_endpoint_config",
-                        lambda: {"base_url": "",
-                                 "model_env": {"ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5-turbo"},
+                        lambda: {"per_pid": {"77749": {"ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5-turbo"}},
                                  "pids": ["77749"], "readable": True})
     monkeypatch.setattr(health, "_read_endpoint_config",
                         lambda: {"base_url": "", "no_proxy": "", "source": "default"})
@@ -1077,8 +1078,8 @@ def test_runtime_check_info_stale_process_signal(monkeypatch):
     слеп — именно этот сигнал ловит дыру. Ровно сценарий issue #143.
     """
     monkeypatch.setattr(health, "_read_runtime_endpoint_config",
-                        lambda: {"base_url": "https://api.z.ai/api/anthropic",
-                                 "model_env": {}, "pids": ["77749"], "readable": True})
+                        lambda: {"per_pid": {"77749": {"ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic"}},
+                                 "pids": ["77749"], "readable": True})
     monkeypatch.setattr(health, "_read_endpoint_config",
                         lambda: {"base_url": "", "no_proxy": "", "source": "default"})
     res = health._runtime_model_override_check()
@@ -1089,7 +1090,8 @@ def test_runtime_check_info_stale_process_signal(monkeypatch):
 def test_runtime_check_ok_when_all_standard(monkeypatch):
     """runtime==стандартный, нет substitution, нет расхождения → ok, silent."""
     monkeypatch.setattr(health, "_read_runtime_endpoint_config",
-                        lambda: {"base_url": "", "model_env": {}, "pids": ["77749"], "readable": True})
+                        lambda: {"per_pid": {"77749": {"ANTHROPIC_BASE_URL": "https://api.anthropic.com"}},
+                                 "pids": ["77749"], "readable": True})
     monkeypatch.setattr(health, "_read_endpoint_config",
                         lambda: {"base_url": "", "no_proxy": "", "source": "default"})
     res = health._runtime_model_override_check()
@@ -1100,15 +1102,16 @@ def test_runtime_check_ok_when_all_standard(monkeypatch):
 def test_runtime_check_detail_never_leaks_api_key(monkeypatch):
     """Security mutation-гвард: detail НЕ выводит ANTHROPIC_API_KEY/AUTH_TOKEN (только base_url + DEFAULT_*).
 
-    model_env содержит ВСЕ ANTHROPIC_* (включая секреты — doctor доверяет тому же UID). Но detail
-    чека обязан фильтровать — иначе секрет в логе doctor. Ловит мутацию «вывести model_env целиком».
+    per_pid[p] содержит ВСЕ ANTHROPIC_* (включая секреты — doctor доверяет тому же UID). Но detail
+    чека обязан фильтровать — иначе секрет в логе doctor. Ловит мутацию «вывести env целиком».
     """
     monkeypatch.setattr(health, "_read_runtime_endpoint_config",
-                        lambda: {"base_url": "https://api.z.ai/api/anthropic",
-                                 "model_env": {"ANTHROPIC_API_KEY": "sk-secret-value",
-                                               "ANTHROPIC_AUTH_TOKEN": "tok-secret",
-                                               "ANTHROPIC_DEFAULT_HAIKU_MODEL": "glm-4.7"},
-                                 "pids": ["77749"], "readable": True})
+                        lambda: {"per_pid": {"77749": {
+                            "ANTHROPIC_API_KEY": "sk-secret-value",
+                            "ANTHROPIC_AUTH_TOKEN": "tok-secret",
+                            "ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic",
+                            "ANTHROPIC_DEFAULT_HAIKU_MODEL": "glm-4.7"}},
+                            "pids": ["77749"], "readable": True})
     monkeypatch.setattr(health, "_read_endpoint_config",
                         lambda: {"base_url": "https://api.z.ai/api/anthropic",
                                  "no_proxy": "", "source": "settings.json"})
@@ -1127,7 +1130,8 @@ def test_runtime_check_ps_eww_batched_per_pid_set(monkeypatch):
         if cmd and cmd[0] == "/bin/ps":
             if "eww" in cmd:
                 seen_eww.append(cmd)
-                env = "ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic"
+                env = ("111 /path/claude ANTHROPIC_BASE_URL=https://api.anthropic.com\n"
+                       "222 /path/claude ANTHROPIC_BASE_URL=https://api.anthropic.com")
                 return {"rc": 0, "out": env, "err": "", "timeout": False}
             return {"rc": 0, "out": f"111 {CLI_COMM}\n222 {VERSION_RUNNER_COMM}\n",
                     "err": "", "timeout": False}
@@ -1182,18 +1186,18 @@ def test_runtime_config_not_readable_when_no_anthropic_vars(monkeypatch):
     → readable=False. Иначе чек дал бы ложный ok «стандартный endpoint» без evidence (verify-dont-guess)."""
     monkeypatch.setattr(health.sys_probe, "run",
                         _runtime_fake_run([("12345", CLI_COMM)],
-                                          "PATH=/usr/bin HOME=/tmp SHELL=/bin/zsh"))
+                                          {"12345": "PATH=/usr/bin HOME=/tmp SHELL=/bin/zsh"}))
     res = health._read_runtime_endpoint_config()
     assert res["readable"] is False, "нет ANTHROPIC_* vars = нет evidence → не readable"
     assert res["pids"] == ["12345"], "PID сохранены для forensics"
-    assert res["model_env"] == {}
+    assert res["per_pid"] == {}
 
 
 def test_runtime_check_unknown_when_no_anthropic_vars(monkeypatch):
     """cycle-review B2: env без ANTHROPIC_* → status=unknown (НЕ ложный ok)."""
     monkeypatch.setattr(health.sys_probe, "run",
                         _runtime_fake_run([("12345", CLI_COMM)],
-                                          "PATH=/usr/bin HOME=/tmp"))
+                                          {"12345": "PATH=/usr/bin HOME=/tmp"}))
     res = health._runtime_model_override_check()
     assert res["status"] == "unknown", "нет evidence → unknown, не ok"
     assert "12345" in res["detail"]
@@ -1223,3 +1227,50 @@ def test_runtime_env_check_info_only_even_when_ok(monkeypatch):
     assert rt[0]["ok"] is True, "ok-status → ok:True"
     drivers = [c for c in result["checks"] if not c.get("info")]
     assert rt[0] not in drivers, "info-only чек НЕ входит в drivers даже при ok"
+
+
+def test_runtime_check_detects_override_when_mixed_pids(monkeypatch):
+    """cycle-review Codex critical: ОДИН override-PID среди standard-PID НЕ должен маскироваться.
+
+    ps eww батчит все PID в один вывод. dict(findall()) перезаписывает дубликаты ключей последним
+    значением → один standard-процесс мог скрыть overridden (ложный ok). Это false-negative именно
+    в сценарии #143 (несколько живых CC-сессий — штатно). Агрегация per-PID: ЛЮБОЙ override =
+    unsafe runtime. Тест в ОБА порядка PID (override первым и последним) — ловит обе маскировки.
+    """
+    OVERRIDE_ENV = ("ANTHROPIC_BASE_URL=https://evil.example "
+                    "ANTHROPIC_API_KEY=k-override "
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL=glm-evil")
+    STANDARD_ENV = ("ANTHROPIC_BASE_URL=https://api.anthropic.com "
+                    "ANTHROPIC_API_KEY=k-standard")
+    OVERRIDE_PID, STANDARD_PID = "111", "222"
+    OVERRIDE_COMM, STANDARD_COMM = CLI_COMM, VERSION_RUNNER_COMM
+
+    def run_once(pid_order, env_order):
+        # pid_order — порядок PID в ps -axo листинге; env_order — порядок в ps eww выводе.
+        listing = "\n".join(f"{p} {c}" for p, c in pid_order) + "\n"
+        eww = "\n".join(f"{p} /path/claude {env}" for p, env in env_order) + "\n"
+
+        def fake_run(cmd, timeout):
+            if cmd and cmd[0] == "/bin/ps":
+                if "eww" in cmd:
+                    return {"rc": 0, "out": eww, "err": "", "timeout": False}
+                return {"rc": 0, "out": listing, "err": "", "timeout": False}
+            return {"rc": 0, "out": "", "err": "", "timeout": False}
+        return fake_run
+
+    monkeypatch.setattr(health, "_read_endpoint_config",
+                        lambda: {"base_url": "", "no_proxy": "", "source": "default"})
+
+    for label, fake in [
+        ("override-first listing, override-first env",
+         run_once([(OVERRIDE_PID, OVERRIDE_COMM), (STANDARD_PID, STANDARD_COMM)],
+                  [(OVERRIDE_PID, OVERRIDE_ENV), (STANDARD_PID, STANDARD_ENV)])),
+        ("override-last listing, override-last env",
+         run_once([(STANDARD_PID, STANDARD_COMM), (OVERRIDE_PID, OVERRIDE_COMM)],
+                  [(STANDARD_PID, STANDARD_ENV), (OVERRIDE_PID, OVERRIDE_ENV)])),
+    ]:
+        monkeypatch.setattr(health.sys_probe, "run", fake)
+        res = health._runtime_model_override_check()
+        # ЛЮБОЙ override-PID (evil.example) → info, НЕ ok. standard-процесс его не маскирует.
+        assert res["status"] == "info", f"[{label}] override-PID не должен маскироваться, got {res['status']}"
+        assert "evil.example" in res["detail"], f"[{label}] detail должен показать overridden endpoint"
