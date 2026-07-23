@@ -226,6 +226,22 @@ def test_remove_managed_block_block_only_content():
     assert removed == "\n"  # before пуст → rstrip → "\n"
 
 
+def test_remove_managed_block_tight_trailing_content():
+    """Блок сразу (без \\n) следует за контентом/перед контентом — remove сшивает окружение корректно.
+
+    Lock-тест на edge-case, не покрытый install-style append (где блок обрамлён \\n). cycle-review
+    step-9: поведение верифицировано byte-for-byte vs прежний remove-код, здесь фиксируем в suite,
+    чтобы мутация newline-cleanup (например, потеря rstrip) падала на этом случае."""
+    # pre\n + BLOCK + post (без newline между BLOCK и post).
+    content = "pre\n" + _block_text() + "post\n"
+    block = find_managed_block(content, BEG, END)
+    assert block is not None
+    removed = remove_managed_block(content, block)
+    assert BEG not in removed and END not in removed
+    # Окружение сшито: "pre\n" + "post\n" (before="pre" оставляет один \n, content[end:]="post\n").
+    assert removed == "pre\npost\n"
+
+
 def test_remove_managed_block_none_raises():
     """block is None → ValueError."""
     with pytest.raises(ValueError):
