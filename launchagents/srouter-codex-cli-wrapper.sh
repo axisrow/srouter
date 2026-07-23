@@ -18,6 +18,11 @@
 # автоматически, reinstall не нужен). Раньше путь вшивался install-тайм в обёртку → >1 codex на диске
 # или caller с другим PATH шли напрямую (fail-closed нарушен).
 #
+# Issue #150 (cycle-guard): антирекурсия точечными identity-чеками (realpath/inode/srouter-маркер, см.
+# ниже) не замыкается на foreign-wrapper БЕЗ маркера с `exec codex "$@"` → бесконечный цикл
+# managed→foreign→managed (rc=124). 3-й класс защиты — versioned env-сентинель SROUTER_CODEX_WRAPPER_V1:
+# cycle-state инвариант, обрывает цикл при повторном входе managed wrapper (см. блок ниже).
+#
 # ГРАНИЦА — BEST-EFFORT, НЕ fail-closed: wrapper перехватывает ТОЛЬКО вызовы, дошедшие до этого файла
 # (через ~/bin/codex или shell-функцию codex() в ~/.zshrc). Прямой абсолютный путь /opt/.../codex,
 # `node .../codex.js`, exec.LookPath с другим PATH (AO-worktree) — НЕ перехватываются. Настоящая
@@ -42,6 +47,68 @@ fi
 SELF_INO=""
 if command -v stat >/dev/null 2>&1; then
   _si="$(stat -f '%i %d' "$SELF_REAL" 2>/dev/null)" && [ -n "$_si" ] && SELF_INO="$_si"
+fi
+
+# Issue #150 — cycle-guard: versioned env-сентинель фиксирует динамический факт «managed wrapper уже
+# присутствует в этой цепочке вызовов». Точечные identity-чеки антирекурсии (realpath/inode/srouter-маркер)
+# — это эвристики классификации файла, у каждой есть дыра: всегда найдётся foreign-wrapper БЕЗ нашего
+# маркера, делающий рекурсивный codex-вызов (managed→foreign→managed→... → rc=124 timeout, 3-я находка
+# cycle-review PR #146). Сентинель — не очередная identity-эвристика, а cycle-state инвариант: обрываем
+# рекурсию fail-loud (exit 126), не доходя до real Codex.
+# Versioned-имя (SROUTER_CODEX_WRAPPER_V1) — чтобы не столкнуться со случайной пользовательской
+# переменной без версии; смена формата → bump суффикса (V2...). НЕ PATH-санitизация (отвергнута в #150:
+# blast radius на 24/7-инфре — tools/агенты молча теряют ~/bin); сентинель = env-ФЛАГ, PATH не трогает.
+#
+# Формат сентинели: <PID>:<hop>. Покрывает ТРИ класса рекурсии (cycle-review PR #153 rounds 1-2):
+#   1. exec-цикл (foreign с `exec codex`): exec СОХРАНЯЕТ PID → при повторном входе PID == $$ → обрыв
+#      (быстрый путь, hop не важен — тот же процесс). Round 1: булево-флаг контаминировал дерево Codex.
+#   2. fork-цикл (foreign БЕЗ exec, `codex "$@"`): fork даёт НОВЫЙ PID → не отлавливается PID-check'ом.
+#      Hop-счётчик: каждый fork-re-entry инкрементирует унаследованный hop; при hop > CEILING → обрыв,
+#      иначе переписываем sentinel своим PID:hop. Round 2: PID-only пропускал fork-bomb до process-table.
+#   3. ЛЕГИТИМНЫЙ descendant (real Codex spawn'ит worker через managed wrapper): тоже fork, hop растёт,
+#      но bounded (вложенная agent-орkeстрация — единицы уровней). CEILING=16 даёт запас для любой
+#      разумной вложенности и обрывает бесконтрольную foreign-рекурсию задолго до исчерпания лимита.
+# ПОКРЫТИЕ И ГРАНИЦА (cycle-review PR #153 rounds 1-3): sentinel ловит 3 класса NATURAL-рекурсии
+# (exec-цикл, linear fork, env-inherited re-entry). Граница threat-model: env-passing — эвристика
+# передачи состояния без замкнутого инварианта (как и identity-чеки файла, см. #150), её обходят
+# НАМЕРЕННЫЕ конструкции foreign-wrapper под контролем того же UID — `env -u SROUTER_CODEX_WRAPPER_V1`
+# (стирает sentinel) и параллельный fan-out (`codex & codex &`, экспоненциальный рост дерева). Это
+# availability-класс вне natural-рекурсии #150 (нужен active malice в PATH уже контролируемого UID),
+# осознанно не покрывается best-effort layer'ом — честная fail-closed граница = PF kill-switch.
+_CE_CYCLE_CEILING=16
+if [ "${SROUTER_CODEX_WRAPPER_V1:-}" != "" ]; then
+  _prev_pid="${SROUTER_CODEX_WRAPPER_V1%%:*}"
+  if [ "$_prev_pid" = "$$" ]; then
+    # Класс 1: повторный вход в ТОТ ЖЕ процесс (exec-цикл managed→foreign→managed). Обрыв безусловно.
+    printf '%s\n' \
+      "srouter codex wrapper: обнаружен цикл exec (managed→foreign→managed)." \
+      "SROUTER_CODEX_WRAPPER_V1=$$ — managed wrapper повторно вошёл в тот же процесс (exec сохраняет PID)." \
+      "В PATH найден foreign-wrapper (без srouter-маркера), резолвящий codex обратно в наш wrapper." \
+      "Обрываю цикл, чтобы избежать rc=124 (timeout). real Codex НЕ запускался." \
+      "Устрани конфликт codex-обёрток в PATH (см. issue #150)." >&2
+    exit 126
+  fi
+  # Класс 2/3: новый PID (fork). Извлекаем hop унаследованного sentinel и инкрементируем.
+  _prev_hop="${SROUTER_CODEX_WRAPPER_V1#*:}"
+  [ "$_prev_hop" = "$SROUTER_CODEX_WRAPPER_V1" ] && _prev_hop=0   # нет ':' (старый формат) → 0
+  # Non-numeric hop guard: аномальное/манипулированное значение (не natural) → reset, не арифм.сбой.
+  case "$_prev_hop" in
+    ''|*[!0-9]*) _prev_hop=0 ;;
+  esac
+  _next_hop=$((_prev_hop + 1))
+  if [ "$_next_hop" -gt "$_CE_CYCLE_CEILING" ]; then
+    # Класс 2: fork-рекурсия превысила потолок (foreign БЕЗ exec накапливает процессы). Обрыв.
+    printf '%s\n' \
+      "srouter codex wrapper: обнаружена fork-рекурсия (глубина re-entry ${_next_hop} > ${_CE_CYCLE_CEILING})." \
+      "В PATH foreign-wrapper БЕЗ exec, порождающий codex рекурсивно (каждый уровень — новый процесс)." \
+      "Без ceiling это исчерпало бы per-user process limit (process-table exhaustion, DoS на 24/7)." \
+      "Обрываю рекурсию fail-loud. real Codex НЕ запускался." \
+      "Устрани конфликт codex-обёрток в PATH (см. issue #150)." >&2
+    exit 126
+  fi
+  _CE_SENTINEL_VALUE="$$:${_next_hop}"   # легитимный descendant (класс 3): продолжаем, обновляем sentinel
+else
+  _CE_SENTINEL_VALUE="$$:0"              # первый вход — sentinel не установлен
 fi
 
 # Рантайм-резолв codex по PATH вызывающего, минуя сам wrapper. Обходим каждую директорию PATH, ищем
@@ -95,4 +162,5 @@ exec /usr/bin/env \
   HTTP_PROXY="$PROXY" HTTPS_PROXY="$PROXY" ALL_PROXY="$PROXY" \
   http_proxy="$PROXY" https_proxy="$PROXY" all_proxy="$PROXY" \
   NO_PROXY="$LOOPBACK" no_proxy="$LOOPBACK" \
+  SROUTER_CODEX_WRAPPER_V1="$_CE_SENTINEL_VALUE" \
   "$_codex_bin" "$@"

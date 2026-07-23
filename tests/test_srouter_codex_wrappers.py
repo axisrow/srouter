@@ -993,6 +993,243 @@ def test_install_upgrades_old_marker_wrapper_without_state_uses_current_only(mon
         f"unknown old-маркер без state-migration-table → WARN (не угадываем legacy): {note}"
 
 
+# ============================ issue #150: cycle-guard через versioned env-сентинель ============================
+# 3-я находка cycle-review PR #146 (воспроизведено rc=124). ДЫРА: точечные identity-чеки антирекурсии
+# (realpath/inode/srouter-маркер) не замыкаются на foreign-wrapper БЕЗ маркера, делающий `exec codex "$@"`.
+# Managed находит foreign (нет маркера → «реальный codex») → exec'ает → foreign резолвит codex=managed →
+# exec'ает managed → бесконечный цикл → rc=124 (timeout).
+#
+# ФИКС: cycle-state инвариант через versioned env-сентинель SROUTER_CODEX_WRAPPER_V1=<pid>:<hop>.
+# При повторном входе managed wrapper в рекурсивную цепочку — обрыв с fail-loud диагностикой
+# (exit 126, не 124). Покрывает ТРИ класса рекурсии: exec-цикл (PID-match), fork-цикл (hop-ceiling),
+# и отличает от легитимного descendant (hop < ceiling). НЕ PATH-санitизация (отвергнута в issue #150:
+# blast radius на 24/7-инфре — tools теряют ~/bin).
+
+
+def _install_cycle_guard_wrapper(monkeypatch, tmp_path):
+    """Install managed wrapper (подход A, без вшитого binary) для cycle-guard тестов.
+
+    _codex_bin_path → found (install-gate проходит), путь не вшивается (#144). Возвращает путь к wrapper."""
+    _mock_home(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    monkeypatch.setattr(srouter, "_codex_bin_path", lambda: str(tmp_path / "any-codex"))
+    srouter._install_codex_wrappers(env)
+    return Path.home() / "bin" / "codex"
+
+
+def test_foreign_wrapper_recursion_cycle_breaks_not_timeout(monkeypatch, tmp_path):
+    """#150 core (красный→зелёный): foreign-wrapper БЕЗ srouter-маркера с `exec codex "$@"` в PATH
+    вызывает бесконечный цикл managed→foreign→managed → был rc=124 (timeout).
+
+    Сценарий #150 reproducer: foreign «codex» без srouter-маркера, резолвит codex обратно из PATH →
+    находит managed (~/bin/codex) → exec'ает → managed снова находит foreign → ... → бесконечный цикл.
+
+    Cycle-guard (versioned env-сентинель SROUTER_CODEX_WRAPPER_V1) обязан ОБОРВАТЬ цикл: повторный
+    вход managed wrapper → fail-loud exit (понятный код, не 124), НЕ дойдя до real Codex.
+
+    Без фикса: subprocess.run падает по TimeoutExpired (rc=124) — тест ПАДАЕТ.
+    """
+    import subprocess
+    called = tmp_path / "called.txt"
+    # Реальный codex (должен НЕ запуститься в цикле — иначе цикл не оборван, просто дошёл до него).
+    real_codex = tmp_path / "realdir" / "codex"
+    real_codex.parent.mkdir(parents=True)
+    real_codex.write_text(f"#!/bin/sh\nprintf 'real' > {called}\n", encoding="utf-8")
+    real_codex.chmod(0o755)
+    wrapper = _install_cycle_guard_wrapper(monkeypatch, tmp_path)
+    # foreignbin/codex — ЧУЖОЙ wrapper БЕЗ srouter-маркера, делает `exec codex "$@"` (резолвит codex
+    # из PATH → находит managed ~/bin/codex → цикл). Это 3-я находка cycle-review, не покрытая #146.
+    foreignbin = tmp_path / "foreignbin"
+    foreignbin.mkdir()
+    (foreignbin / "codex").write_text("#!/bin/sh\nexec codex \"$@\"\n", encoding="utf-8")
+    (foreignbin / "codex").chmod(0o755)
+    # ~/bin (managed wrapper) → foreignbin (foreign wrapper) → realdir (реальный codex).
+    # Managed first: skip'нет себя → возьмёт foreignbin/codex (нет маркера → «реальный») → цикл.
+    try:
+        proc = subprocess.run(
+            [str(wrapper), "x"],
+            env={**os.environ, "PATH": f"{Path.home() / 'bin'}:{foreignbin}:{tmp_path / 'realdir'}:/usr/bin:/bin"},
+            capture_output=True, text=True, timeout=10)
+    except subprocess.TimeoutExpired:
+        pytest.fail("foreign-wrapper без srouter-маркера вызвал бесконечную рекурсию managed→foreign→managed "
+                    "(rc=124 timeout) — cycle-guard не замыкается (#150)")
+    # Цикл ОБОРВАН: не timeout. Fail-loud — понятный exit-код (не 0, не 124).
+    assert proc.returncode != 0, f"cycle должен обрываться fail-loud (ненулевой exit), не успех: rc={proc.returncode}"
+    assert proc.returncode != 124, "cycle-guard обязан дать диагностику, не молчаливый 124-timeout"
+
+
+def test_cycle_guard_pid_scoped_not_blocking_descendant(monkeypatch, tmp_path):
+    """#150 PID-scoped инвариант (cycle-review PR #153): сентинель НЕ контаминирует дерево real Codex.
+
+    Булево-сентинель (=1) наследовался бы всему дереву процесса real Codex → блокировал каждый
+    descendant-вызов managed wrapper (agent/tool spawning worker) ложным exit 126, несмотря на то, что
+    это ЛЕГИТИМНЫЙ второй вход, а не цикл. Это регрессия nested-agent/orchestration (Codex confidence 0.99).
+
+    Реальный Codex при spawn worker'а делает fork()+exec() — НОВЫЙ PID, не exec() (тот же PID). Сентинель
+    хранит PID первого managed-входа ($$): exec сохраняет PID (цикл managed→foreign→managed → match →
+    обрыв), fork даёт новый PID (descendant → no match → легитимный вход, переписывает сентинель своим
+    PID). Этот тест моделирует descendant через fork (background subshell `(...)&` = новый процесс).
+    """
+    import subprocess
+    import time
+    home = _mock_home(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    monkeypatch.setattr(srouter, "_codex_bin_path", lambda: str(tmp_path / "any-codex"))
+    srouter._install_codex_wrappers(env)
+    wrapper = home / "bin" / "codex"
+    child_marker = tmp_path / "child_ran.txt"
+    real_codex_dir = tmp_path / "realdir"
+    real_codex_dir.mkdir()
+    # parent real-codex: fork'ает descendant (НОВЫЙ PID через background subshell), ждёт, exit 0.
+    # descendant зовёт managed wrapper как agent spawning worker.
+    (real_codex_dir / "codex").write_text(
+        "#!/bin/sh\n"
+        f'if [ "$1" = "--child" ]; then printf ok > {child_marker}; exit 0; fi\n'
+        f'("{wrapper}" --child) &\n'
+        f'wait\n'
+        f'exit 0\n', encoding="utf-8")
+    (real_codex_dir / "codex").chmod(0o755)
+    caller_path = f"{home / 'bin'}:{real_codex_dir}:/usr/bin:/bin"
+    proc = subprocess.run([str(wrapper)],
+                          env={**os.environ, "PATH": caller_path},
+                          capture_output=True, text=True, timeout=15)
+    time.sleep(0.3)  # descendant background может дописывать маркер
+    assert child_marker.exists() and child_marker.read_text(encoding="utf-8") == "ok", \
+        (f"descendant codex (fork, новый PID) заблокирован ложным sentinel — regression nested-agent: "
+         f"parent rc={proc.returncode}, stderr={proc.stderr!r}")
+
+
+def test_cycle_guard_fork_foreign_bounded_not_process_bomb(monkeypatch, tmp_path):
+    """#150 hop-counter инвариант (cycle-review PR #153 round-2): fork'ающий foreign-wrapper обходит
+    PID-scoped guard, но обязан bounded-обрываться, не накапливая процессы.
+
+    Foreign БЕЗ exec (`codex "$@"`; не `exec codex`) форкает codex-вызов (= managed) — каждый re-entry
+    получает новый PID → PID-check пропускает → без hop-ceiling это fork-bomb до per-user process limit
+    (process-table exhaustion, DoS на 24/7-инфре, Codex confidence 0.98). Легитимный descendant завершается
+    (real codex работает и выходит), fork-foreign — НЕТ (каждый уровень порождает следующий без лимита).
+
+    Hop-счётчик в sentinel (<pid>:<hop>): каждый fork-re-entry инкрементирует унаследованный hop; при
+    hop > CEILING → обрыв rc=126. Отличает бесконтрольную fork-рекурсию (foreign) от bounded-вложенности
+    легитимного descendant (которая «выдыхается» сама — процессы завершаются).
+    """
+    import subprocess
+    home = _mock_home(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    monkeypatch.setattr(srouter, "_codex_bin_path", lambda: str(tmp_path / "any-codex"))
+    srouter._install_codex_wrappers(env)
+    wrapper = home / "bin" / "codex"
+    real_codex = tmp_path / "realdir" / "codex"
+    real_codex.parent.mkdir(parents=True)
+    real_codex.write_text("#!/bin/sh\nprintf real > /dev/null\n", encoding="utf-8")
+    real_codex.chmod(0o755)
+    # foreign БЕЗ exec: форкает codex (= managed) и ждёт. Каждый уровень порождает следующий — не завершается.
+    foreignbin = tmp_path / "foreignbin"
+    foreignbin.mkdir()
+    (foreignbin / "codex").write_text('#!/bin/sh\ncodex "$@"; exit $?\n', encoding="utf-8")
+    (foreignbin / "codex").chmod(0o755)
+    caller_path = f"{home / 'bin'}:{foreignbin}:{tmp_path / 'realdir'}:/usr/bin:/bin"
+    proc = subprocess.run([str(wrapper), "x"],
+                          env={**os.environ, "PATH": caller_path},
+                          capture_output=True, text=True, timeout=15)
+    assert proc.returncode == 126, \
+        (f"fork-foreign должен bounded-обрываться rc=126 (hop-ceiling), не fork-bomb: "
+         f"получено rc={proc.returncode}, stderr={proc.stderr[:200]!r}")
+
+
+def test_cycle_guard_non_numeric_hop_resets_not_crash(monkeypatch, tmp_path):
+    """#150 robustness (cycle-review PR #153 round-3 minor): аномальное/манипулированное значение sentinel
+    (non-numeric hop) не должно ронять wrapper арифметической ошибкой — reset в 0, продолжаем штатно.
+
+    Сценарий: env намеренно установлен в 'garbage' (нет ':' или non-numeric hop). Natural-пути сюда не
+    доходят (wrapper всегда пишет <pid>:<int>), но fail-loud-семантика обязана держаться и на аномалиях:
+    arith-ошибка в sh дала бы непредсказуемый exit. Guard `case` сбрасывает non-numeric → 0 → штатный вход.
+    """
+    import subprocess
+    home = _mock_home(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    monkeypatch.setattr(srouter, "_codex_bin_path", lambda: str(tmp_path / "any-codex"))
+    srouter._install_codex_wrappers(env)
+    wrapper = home / "bin" / "codex"
+    real_codex = tmp_path / "realdir" / "codex"; real_codex.parent.mkdir(parents=True)
+    real_codex.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    real_codex.chmod(0o755)
+    caller_path = f"{home / 'bin'}:{tmp_path / 'realdir'}:/usr/bin:/bin"
+    # env с аномальным sentinel (non-numeric hop) — wrapper обязан reset'нуть и продолжить, не крашнуться.
+    proc = subprocess.run([str(wrapper), "x"],
+                          env={**os.environ, "PATH": caller_path,
+                               "SROUTER_CODEX_WRAPPER_V1": "99999:not-a-number"},
+                          capture_output=True, text=True, timeout=10)
+    assert proc.returncode == 0, \
+        f"non-numeric hop должен reset'нуться → штатный запуск (не arith-краш): rc={proc.returncode}, stderr={proc.stderr!r}"
+
+
+def test_cycle_guard_runs_real_codex_on_single_pass(monkeypatch, tmp_path):
+    """#150 шаг 3: на ОДНОКРАТНОМ нормальном входе (нет цикла) cycle-guard НЕ срабатывает — real Codex
+    запускается, аргументы доходят. Сентинель guard'ит только повторный вход, не первый.
+
+    Foreign-wrapper отсутствует → managed резолвит реальный codex → exec'ает (сентинель ставится, но
+    повторного входа managed нет) → real codex работает штатно.
+    """
+    import subprocess
+    called = tmp_path / "called.txt"
+    real_codex = tmp_path / "realdir" / "codex"
+    real_codex.parent.mkdir(parents=True)
+    real_codex.write_text(f"#!/bin/sh\nprintf '%s' \"$1\" > {called}\n", encoding="utf-8")
+    real_codex.chmod(0o755)
+    wrapper = _install_cycle_guard_wrapper(monkeypatch, tmp_path)
+
+    proc = subprocess.run(
+        [str(wrapper), "hello-arg"],
+        env={**os.environ, "PATH": f"{Path.home() / 'bin'}:{tmp_path / 'realdir'}:/usr/bin:/bin"},
+        capture_output=True, text=True, timeout=10)
+
+    assert proc.returncode == 0, f"однократный запуск — успех: {proc.stderr!r}"
+    assert called.exists() and called.read_text(encoding="utf-8") == "hello-arg", \
+        "real Codex запущен, argv проброшен (cycle-guard не мешает штатному вызову)"
+
+
+def test_cycle_guard_preserves_caller_path(monkeypatch, tmp_path):
+    """#150 шаг 3 (отказ от PATH-санitизации обоснован): cycle-guard НЕ режет PATH дочернего codex.
+    Сентинель — это env-ФЛАГ (SROUTER_CODEX_WRAPPER_V1), не модификация PATH. Дочерний codex видит
+    исходный PATH вызывающего целиком (включая ~/bin) — tools/агенты ничего не теряют (blast radius
+    PATH-санitизации из issue #150 здесь отсутствует).
+    """
+    import subprocess
+    import json
+    out_file = tmp_path / "child-path.json"
+    real_codex = tmp_path / "realdir" / "codex"
+    real_codex.parent.mkdir(parents=True)
+    real_codex.write_text(
+        f"#!/bin/sh\npython3 -c \"import json,os; json.dump(os.environ.get('PATH',''), open('{out_file}','w'))\"\n",
+        encoding="utf-8")
+    real_codex.chmod(0o755)
+    wrapper = _install_cycle_guard_wrapper(monkeypatch, tmp_path)
+    caller_path = f"{Path.home() / 'bin'}:{tmp_path / 'realdir'}:/usr/bin:/bin"
+
+    subprocess.run([str(wrapper), "x"],
+                   env={**os.environ, "PATH": caller_path},
+                   check=True, timeout=10)
+    child_path = json.loads(out_file.read_text(encoding="utf-8"))
+    assert child_path == caller_path, \
+        f"PATH дочернего codex сохранён целиком (сентинель не PATH-санitизация): {child_path!r} != {caller_path!r}"
+
+
+def test_cycle_guard_uses_versioned_sentinel_env(monkeypatch, tmp_path):
+    """#150 шаг 4 (инвариант): отрендеренный managed wrapper использует versioned env-сентинель
+    SROUTER_CODEX_WRAPPER_V1 (с суффиксом версии), а не голый SROUTER_CODEX_WRAPPER — чтобы не
+    столкнуться со случайной пользовательской переменной без версии. Версия позволяет сменить сентинель
+    при изменении формата без конфликта.
+    """
+    home = _mock_home(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    monkeypatch.setattr(srouter, "_codex_bin_path", lambda: str(tmp_path / "any-codex"))
+    srouter._install_codex_wrappers(env)
+    cli_text = (home / "bin" / "codex").read_text(encoding="utf-8")
+
+    assert "SROUTER_CODEX_WRAPPER_V1" in cli_text, \
+        "wrapper использует versioned сентинель SROUTER_CODEX_WRAPPER_V1 (#150)"
+
+
 # ============================ issue #144: wrapper runtime-резолвит binary (подход A) ============================
 # ДЫРА: srouter.py _codex_bin_path() хардкодил ОДИН codex-binary в __SROUTER_CODEX_BIN__; >1 binary на
 # диске или caller с другим PATH → второй codex идёт напрямую, fail-closed нарушен.
