@@ -1094,9 +1094,13 @@ def _routing_apply_locked(config_path, state_path, outbound, hosts, action, adop
     except Exception:
         state_write_ok = False
     if not state_write_ok:
-        # atomic rollback: tmp+fsync+replace, не truncate+write (ENOSPC не повредит production)
-        _atomic_write_text(config_p, backup_text)
-        return {"ok": False, "changed": False, "err": "state_write_failed"}
+        # atomic rollback: tmp+fsync+replace, не truncate+write (ENOSPC не повредит production).
+        # ПРОВЕРЯЕМ результат rollback (Codex P1): провал rollback-replace оставляет config новым,
+        # а state не записан → рассинхрон config↔state. Явно сообщаем rollback_failed, не маскируем
+        # под state_write_failed (иначе хранитель рассинхрона в неведении о реальном состоянии config).
+        rollback_ok = _atomic_write_text(config_p, backup_text)
+        err = "state_write_failed" if rollback_ok else "state_write_failed_rollback_failed"
+        return {"ok": False, "changed": not rollback_ok, "err": err}
 
     # 6. restart xray (fail-closed: при провале — восстановить config+state И повторно перезапустить
     #    xray СО СТАРЫМ восстановленным конфигом. _restart_component уже сделал stop к моменту провала
@@ -1109,15 +1113,20 @@ def _routing_apply_locked(config_path, state_path, outbound, hosts, action, adop
             res = {"rc": 1, "err": "restart_exception"}
         if res.get("rc") != 0 or res.get("timeout"):
             # atomic rollback к backup (tmp+fsync+replace); провал записи не оставляет config
-            # усечённым/молча неоткаченным — #139 Finding 1
-            _atomic_write_text(config_p, backup_text)
-            try:
-                state["routing"]["active"] = current_domains
-                state["routing"]["outbound"] = outbound
-                state["routing"]["last_applied_hash"] = _routing_domains_hash(current_domains)
-                save_state(state, state_path)
-            except Exception:
-                pass
+            # усечённым/молча неоткаченным — #139 Finding 1. ПРОВЕРЯЕМ результат (Codex P1):
+            # если rollback не удался — config остаётся новым. Тогда state НЕ откатываем (иначе
+            # рассинхрон в обратную сторону: config новый, state откатан), а recovery поднимает
+            # xray с тем config, что реально на диске. Флаг config_restored сигнализирует в err.
+            rollback_ok = _atomic_write_text(config_p, backup_text)
+            if rollback_ok:
+                try:
+                    state["routing"]["active"] = current_domains
+                    state["routing"]["outbound"] = outbound
+                    state["routing"]["last_applied_hash"] = _routing_domains_hash(current_domains)
+                    save_state(state, state_path)
+                except Exception:
+                    pass
+            rollback_note = "" if rollback_ok else "; rollback_failed_config_kept_new"
             recovery_err = ""
             try:
                 recovery = install_lib._restart_component("xray", runner, port_checker=port_checker)
@@ -1125,8 +1134,8 @@ def _routing_apply_locked(config_path, state_path, outbound, hosts, action, adop
                     recovery_err = f"; recovery_restart_failed:{recovery.get('err', 'unknown')}"
             except Exception:
                 recovery_err = "; recovery_restart_exception"
-            return {"ok": False, "changed": False,
-                    "err": f"restart_failed:{res.get('err', 'unknown')}{recovery_err}"}
+            return {"ok": False, "changed": True,
+                    "err": f"restart_failed:{res.get('err', 'unknown')}{rollback_note}{recovery_err}"}
 
     return {"ok": True, "changed": True, "err": ""}
 

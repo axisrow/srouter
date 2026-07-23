@@ -938,27 +938,23 @@ def test_routing_apply_restart_fail_recovers_xray_with_restored_config(tmp_path)
 # ============================ #139: atomic rollback + flock на xray-config ============================
 
 def test_routing_apply_rollback_is_atomic_on_state_write_failure(tmp_path, monkeypatch):
-    """Finding 1 (#139): rollback-запись при провале state-write ДОЛЖНА быть атомарной (tmp+replace),
-    не truncate+write. Если replace/запись tmp падает на ENOSPC/IO-error — production xray-config.json
-    остаётся НЕТРОНУТЫМ (старое содержимое целиком), а НЕ truncated/пустым (что убило бы весь прокси).
+    """Finding 1 (#139): rollback-запись при провале state-write атомарна (tmp+replace), не
+    truncate+write. Два аспекта:
 
-    Доказательство: перехватываем момент rollback atomic-rename. При небезопасной реализации
-    (config_p.write_text) rollback уже сделал truncate к моменту exception → файл повреждался бы.
-    При атомарной (tmp.write_text → tmp.replace) rollback writes во временный файл; провал replace
-    оставляет production-файл нетронутым."""
+    (a) ENOSPC в момент rollback-replace НЕ повреждает production (валидный JSON целиком — atomic
+        rollback пишет в tmp, провал os.replace не трогает оригинал);
+    (b) провал rollback ОТРАЖЁН в err (Codex cycle-review P1): если rollback не удался, config
+        остаётся новым, state не записан → рассинхрон. Явный err="*_rollback_failed", а не маска
+        "state_write_failed" (хранитель рассинхрона в неведении). При успехе rollback — config
+        фактически == backup (telegram НЕ добавлен)."""
     xray_p = tmp_path / "xray-config.json"
     state_p = tmp_path / "srouter.local.json"
     _write_xray_routing_config(xray_p, BASELINE_DOMAINS, managed=True)
     _write(state_p, {"nodes": [], "routing": {"active": BASELINE_DOMAINS, "outbound": "reality-out",
                                               "last_applied_hash": local_state._routing_domains_hash(BASELINE_DOMAINS)}})
-
-    # save_state падает → шаг 5 откатывает config. Заставляем rollback atomic-rename упасть.
     monkeypatch.setattr(local_state, "save_state", lambda state, path=None: None)
-    # Считаем os.replace-вызовы внутри _atomic_write_text (и save_state, но он замокан):
-    # 1-й = шаг4 modify (apply нового конфига), 2-й = rollback к backup. Провал rollback-rename →
-    # production-файл НЕ должен быть повреждён: atomic rollback пишет в tmp-файл, провал os.replace
-    # оставляет оригинал (новый применённый конфиг) нетронутым, а rollback возвращает _atomic_write_text
-    # False и err="state_write_failed". Не truncate+write, где ENOSPC калечил бы production посередине.
+
+    # os.replace-вызовы внутри _atomic_write_text: 1=шаг4 modify (новый конфиг), 2=rollback к backup.
     real_replace = os.replace
     replace_calls = {"n": 0}
 
@@ -969,16 +965,15 @@ def test_routing_apply_rollback_is_atomic_on_state_write_failure(tmp_path, monke
         return real_replace(src, dst)
 
     monkeypatch.setattr(local_state.os, "replace", flaky_replace)
-
     r = local_state.routing_apply(
         ["telegram.org"], action="add", adopt=False,
         config_path=str(xray_p), state_path=state_p, runner=_ok_runner([]),
         port_checker=_port_checker_settle_then_up(),
     )
     assert r["ok"] is False
-    assert r.get("err") == "state_write_failed"
-    # КРИТИЧНО: production config НЕ повреждён rollback'ом — валидный JSON целиком на диске,
-    # не truncated/пустой (atomic rollback пишет в tmp, провал replace не трогает оригинал).
+    # (b) провал rollback ЯВНО в err — не маскирован под state_write_failed
+    assert r.get("err") == "state_write_failed_rollback_failed", r
+    # (a) production НЕ повреждён: валидный JSON целиком, не truncated/пустой
     on_disk = xray_p.read_text(encoding="utf-8")
     assert on_disk, "production xray-config пуст после провала rollback (truncate без write)"
     cfg = json.loads(on_disk)
@@ -988,10 +983,35 @@ def test_routing_apply_rollback_is_atomic_on_state_write_failure(tmp_path, monke
     monkeypatch.setattr(local_state.os, "replace", real_replace)
 
 
+def test_routing_apply_rollback_restores_backup_on_state_write_failure(tmp_path, monkeypatch):
+    """Happy-rollback ветка (Codex P1 обратная сторона): при провале state-write rollback УСПЕШЕН →
+    config фактически восстановлен к backup (telegram НЕ добавлен), err="state_write_failed" (без
+    _rollback_failed). Доказывает, что rollback реально откатывает, а не просто не повреждает."""
+    xray_p = tmp_path / "xray-config.json"
+    state_p = tmp_path / "srouter.local.json"
+    _write_xray_routing_config(xray_p, BASELINE_DOMAINS, managed=True)
+    _write(state_p, {"nodes": [], "routing": {"active": BASELINE_DOMAINS, "outbound": "reality-out",
+                                              "last_applied_hash": local_state._routing_domains_hash(BASELINE_DOMAINS)}})
+    monkeypatch.setattr(local_state, "save_state", lambda state, path=None: None)
+
+    r = local_state.routing_apply(
+        ["telegram.org"], action="add", adopt=False,
+        config_path=str(xray_p), state_path=state_p, runner=_ok_runner([]),
+        port_checker=_port_checker_settle_then_up(),
+    )
+    assert r["ok"] is False
+    assert r.get("err") == "state_write_failed"
+    # rollback откатал: telegram НЕ добавлен (config == backup по доменам)
+    cfg = json.loads(xray_p.read_text(encoding="utf-8"))
+    assert "domain:telegram.org" not in cfg["routing"]["rules"][0]["domain"], (
+        "rollback при state-write-failure не откатал config к backup (telegram остался)")
+
+
 def test_routing_apply_rollback_is_atomic_on_restart_failure(tmp_path, monkeypatch):
-    """Finding 1 (#139), restart-fail ветка: при провале restart и откате к backup — та же
-    атомарность. Если rollback-replace падает (IO-error) — config остаётся в НОВОМ (применённом)
-    состоянии целиком, а НЕ усечённым посередине write_text."""
+    """Finding 1 (#139), restart-fail ветка: rollback атомарен + провал отражён в err (Codex P1).
+    ENOSPC в rollback-replace → production валиден (не усечён), err содержит "rollback_failed"
+    (config остался новым), state НЕ откатан (иначе рассинхрон в обратную сторону), recovery идёт
+    с config как есть."""
     xray_p = tmp_path / "xray-config.json"
     state_p = tmp_path / "srouter.local.json"
     _write_xray_routing_config(xray_p, BASELINE_DOMAINS, managed=True)
@@ -1003,11 +1023,7 @@ def test_routing_apply_rollback_is_atomic_on_restart_failure(tmp_path, monkeypat
             return {"rc": 1, "out": "", "err": "xray_start_failed", "timeout": False}
         return {"rc": 0, "out": "", "err": "", "timeout": False}
 
-    # rollback-rename падает. Считаем os.replace-вызовы: 1=шаг4 modify, 2=save_state успех,
-    # 3=rollback к backup. На НЕатомарной реализации (config_p.write_text) truncate уже сделан к
-    # моменту exception → production повреждён. На атомарной (_atomic_write_text) rollback пишет в tmp,
-    # провал os.replace оставляет production (новый применённый конфиг) нетронутым — но err сообщает
-    # о провале, и rollback возвращает False БЕЗ повреждения файла.
+    # os.replace-вызовы: 1=шаг4 modify, 2=save_state успех, 3=rollback к backup.
     real_replace = os.replace
     replace_calls = {"n": 0}
 
@@ -1018,17 +1034,17 @@ def test_routing_apply_rollback_is_atomic_on_restart_failure(tmp_path, monkeypat
         return real_replace(src, dst)
 
     monkeypatch.setattr(local_state.os, "replace", flaky_replace)
-
     r = local_state.routing_apply(
         ["telegram.org"], action="add", adopt=False,
         config_path=str(xray_p), state_path=state_p, runner=failing_runner,
         port_checker=_port_checker_settle_then_up(),
     )
     assert r["ok"] is False
-    assert r.get("err", "").startswith("restart_failed")
-    # production config НЕ повреждён (atomic rollback пишет в tmp, не truncate+write в production).
-    # ENOSPC в момент rollback-replace оставляет production валидным — либо backup, либо новый конфиг,
-    # но никогда не усечённым/пустым посередине write.
+    err = r.get("err", "")
+    assert err.startswith("restart_failed"), err
+    # (Codex P1) провал rollback ЯВНО в err — config остался новым (не откатан)
+    assert "rollback_failed" in err, f"провал rollback не отражён в err: {err}"
+    # production НЕ повреждён — валидный JSON (atomic rollback пишет в tmp, провал replace не трогает)
     on_disk = xray_p.read_text(encoding="utf-8")
     assert on_disk, "production xray-config пуст после провала rollback (truncate без write)"
     cfg = json.loads(on_disk)
