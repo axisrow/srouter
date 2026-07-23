@@ -46,19 +46,19 @@ OTOOL = "/usr/bin/otool"
 INSTALL_NAME_TOOL = "/usr/bin/install_name_tool"
 CODESIGN = "/usr/bin/codesign"
 
-# Прокси-порты (8118/10808) — единый источник dashboard_common (issue #155/#165), НЕ литералы.
-# listen-address/forward-socks5t в protected_config_text обязаны следовать за каноническим портом:
-# иначе privoxy слушает 8118, а xray-bridge (forward-socks5t → 10808) разводит drift → silent fail.
-# Root-часть модуля работает через sudo в окружении БЕЗ srouter_config: dashboard_common поднимает
-# SystemExit. Ловим именно SystemExit (не BaseException), иначе реальный баг источника
-# (SyntaxError/ImportError) маскируется мёртвым fallback (no-hidden-magic-follow-canon).
-# Fallback = то же каноническое значение; canonical-fallback-port разрешает гвард test_proxy_constants.
-try:
-    from dashboard_common import PRIVOXY_PORT as _PRIVOXY_PORT  # noqa: F401  (canonical-fallback-port)
-    from dashboard_common import XRAY_SOCKS_PORT as _XRAY_SOCKS_PORT  # noqa: F401  (canonical-fallback-port)
-except SystemExit:  # dashboard_common без srouter_config поднимает SystemExit (root/install-путь)
-    _PRIVOXY_PORT = 8118  # canonical-fallback-port
-    _XRAY_SOCKS_PORT = 10808  # canonical-fallback-port
+# Прокси-порты (8118/10808). Этот модуль — root-only helper (см. docstring модуля: «намеренно
+# использует только stdlib»). Он копируется ОДНИМ файлом в /Library/PrivilegedHelperTools и
+# исполняется изолированно через sudo — рядом НЕТ dashboard_common.py (и srouter_config.py).
+# Поэтому НЕ импортируем dashboard_common (ModuleNotFoundError убил бы helper в production —
+# regression, пойманная cycle-review PR #177). Порты держим локальными литералами; anti-drift
+# гарантирует parity-гвард tests/test_proxy_constants.py::test_privoxy_protected_config_follows_canonical_ports
+# — он эмпирически сверяет listen-address/forward-socks5t из protected_config_text с каноническим
+# источником dashboard_common (та же стратегия, что для shell/config: mutation-доказуемо ловит drift).
+# Если канонический порт меняется — parity-гвард падает и указывает сюда.
+# canonical-fallback-port: гвард PR #162 (test_single_source_defines_proxy_port_constants)
+# разрешает эти локальные литералы как осознанный fallback для helper-изоляции (НЕ свежий дубли).
+_PRIVOXY_PORT = 8118  # canonical-fallback-port (helper-изоляция: stdlib-only, без dashboard_common)
+_XRAY_SOCKS_PORT = 10808  # canonical-fallback-port (helper-изоляция: stdlib-only, без dashboard_common)
 
 # #152: разрешённые privoxy-уровни логирования. Канон probe-semantics-from-primary-source —
 # уровень по privoxy user-manual (раздел 7.3 Debugging, битовые значения), НЕ по аналогии/имени.

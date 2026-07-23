@@ -222,20 +222,38 @@ def _canonical_proxy_ports():
 def test_install_lib_ports_follow_canonical_source():
     """install_lib.PORTS (dict-литерал, не `_PORT =`) обязан брать порты из источника,
     а не хардкодить 8118/10808. install_lib работает без srouter_config (install-путь),
-    поэтому держит canonical-fallback на то же значение — оба обязаны совпадать с источником."""
-    expected = _canonical_proxy_ports()
-    actual = {install_lib.PORTS["xray"][1], install_lib.PORTS["privoxy"][1]}
-    assert actual == expected, (
-        "install_lib.PORTS разошёлся с каноническим источником (issue #165). "
-        f"PORTS={actual}, canonical={expected}. Импортируй из dashboard_common."
+    поэтому держит canonical-fallback на то же значение. Проверка ordered (ключ→порт), не set —
+    ловит swap PORTS['xray']↔PORTS['privoxy'], который дал бы install-проверкам чужой порт."""
+    assert install_lib.PORTS["xray"][1] == dashboard_common.XRAY_SOCKS_PORT, (
+        "install_lib.PORTS['xray'] разошёлся с каноническим XRAY_SOCKS_PORT (issue #165)."
+    )
+    assert install_lib.PORTS["privoxy"][1] == dashboard_common.PRIVOXY_PORT, (
+        "install_lib.PORTS['privoxy'] разошёлся с каноническим PRIVOXY_PORT (issue #165)."
     )
     # dnsmasq UDP 53 — НЕ прокси-порт, остаётся локальным литералом (вне scope).
     assert install_lib.PORTS["dnsmasq"] == ("udp", 53)
 
 
+def _assert_directive_port(text, directive, expected_port):
+    """Строгая (ordered) проверка: privoxy-директива обязана нести ИМЕННО expected_port.
+    Ловит swap (listen-address:10808 + forward-socks5t:8118), который set-сравнение пропускает —
+    set {8118,10808}=={8118,10808} даже при перепутанных назначениях (cycle-review PR #177, Codex).
+    Ожидается ровно одно вхождение directive с host:port; port обязан == expected_port."""
+    lines = [ln for ln in text.splitlines()
+             if ln.lstrip().startswith(directive) and "127.0.0.1:" in ln]
+    assert lines, f"директива '{directive}' с 127.0.0.1:PORT отсутствует"
+    ports = _loopback_ports("\n".join(lines))
+    assert ports == {expected_port}, (
+        f"директива '{directive}' должна нести ровно канонический порт {expected_port}, "
+        f"а несёт {ports}. Swap портов между директивами = полный отказ прокси (issue #165)."
+    )
+
+
 def test_privoxy_protected_config_follows_canonical_ports(tmp_path):
-    """privoxy_system.protected_config_text() — listen-address/forward-socks5t выражены через
-    источник, а не хардкод 8118/10808. Иначе privoxy слушает один порт, xray-bridge целит другой."""
+    """privoxy_system.protected_config_text() — listen-address/forward-socks5t обязаны нести
+    ИМЕННО свои канонические порты (ordered, не set): listen-address → PRIVOXY_PORT,
+    forward-socks5t → XRAY_SOCKS_PORT. Swap (privoxy слушает SOCKS-порт, bridge на HTTP-порт)
+    даёт полный отказ прокси — set-сравнение это пропускает, поэтому строгая привязка директивы."""
     import privoxy_system
 
     layout = privoxy_system.ProtectedLayout(
@@ -247,25 +265,64 @@ def test_privoxy_protected_config_follows_canonical_ports(tmp_path):
         sudoers_path=tmp_path / "s",
     )
     config = privoxy_system.protected_config_text(layout)
-    expected = _canonical_proxy_ports()
-    assert _loopback_ports(config) == expected, (
-        "protected_config_text разошёлся с каноническим источником (issue #165). "
-        f"loopback-порты={_loopback_ports(config)}, canonical={expected}."
-    )
+    _assert_directive_port(config, "listen-address", dashboard_common.PRIVOXY_PORT)
+    _assert_directive_port(config, "forward-socks5t", dashboard_common.XRAY_SOCKS_PORT)
 
 
 def test_install_template_privoxy_config_follows_canonical_ports():
     """templates/privoxy.config — статичный install-template (копируется в config при install).
-    Его listen-address/forward-socks5t обязаны совпадать с каноническим портом, иначе installed
-    Privoxy слушает не тот порт, что health/xray (drift → полный отказ прокси)."""
+    listen-address/forward-socks5t обязаны нести ИМЕННО свои канонические порты (ordered, не set),
+    иначе installed Privoxy слушает не тот порт, что health/xray (drift → полный отказ прокси).
+    Swap ловится строгой привязкой директивы → порт."""
     template = ROOT / "templates" / "privoxy.config"
     assert template.exists(), "templates/privoxy.config отсутствует"
     text = template.read_text(encoding="utf-8")
-    expected = _canonical_proxy_ports()
-    assert _loopback_ports(text) == expected, (
-        "templates/privoxy.config разошёлся с каноническим источником (issue #165). "
-        f"loopback-порты={_loopback_ports(text)}, canonical={expected}. "
-        "listen-address/forward-socks5t обязаны следовать за dashboard_common."
+    _assert_directive_port(text, "listen-address", dashboard_common.PRIVOXY_PORT)
+    _assert_directive_port(text, "forward-socks5t", dashboard_common.XRAY_SOCKS_PORT)
+
+
+def test_privoxy_system_helper_runs_isolated_without_dashboard_common(tmp_path):
+    """Regression (Codex cycle-review PR #177): privoxy_system — root-only helper, копируется
+    ОДНИМ файлом в /Library/PrivilegedHelperTools и исполняется через sudo. Рядом НЕТ
+    dashboard_common.py (и srouter_config.py). Любой верхне-уровневый `from dashboard_common
+    import ...` ронял helper ModuleNotFoundError в production — baseline main работал, PR #177
+    падал (чистая регрессия). Helper обязан быть stdlib-only: порты — локальные литералы с
+    parity-гвёрдом (test_privoxy_protected_config_follows_canonical_ports).
+
+    Симулируем production: копируем ТОЛЬКО privoxy_system.py в изолированную директорию,
+    запускаем как скрипт в чистом окружении (env -i, без проекта в sys.path) и требуем, чтобы
+    helper дошёл до своей первой проверки (root_required), а не упал на импорте."""
+    import shutil
+    import subprocess
+
+    isolated = tmp_path / "PrivilegedHelperTools"
+    isolated.mkdir()
+    helper = isolated / "com.srouter.privoxyctl"
+    shutil.copy2(ROOT / "privoxy_system.py", helper)
+
+    # env -i — чистое окружение launchd-стиля: НЕТ PYTHONPATH, НЕТ проекта в sys.path,
+    # CWD не содержит dashboard_common. -S отключает site (максимальная изоляция от dev-окружения).
+    result = subprocess.run(
+        [sys.executable, "-S", str(helper), "status"],
+        cwd="/",
+        capture_output=True,
+        text=True,
+        env={"PATH": "/usr/bin:/bin", "HOME": "/var/root"},
+        timeout=15,
+    )
+    # Helper намеренно выходит ненулевым при не-root (root_required) — это его контракт, не падение.
+    # Regression-критерий: импорт верхнего уровня НЕ должен падать на ModuleNotFoundError/dashboard_common.
+    assert "dashboard_common" not in result.stderr, (
+        "privoxy_system helper тянет dashboard_common на верхнем уровне → ModuleNotFoundError в "
+        f"production (cycle-review PR #177 regression). stderr={result.stderr[-400:]!r}"
+    )
+    assert "Traceback" not in result.stderr, (
+        f"helper упал с traceback в изолированном окружении. stderr={result.stderr[-400:]!r}"
+    )
+    # Дошёл до своей первой проверки (helper запущен не под root в тесте) — значит импорт прошёл.
+    assert "root_required" in result.stdout, (
+        f"helper не дошёл до root-проверки (импорт должен пройти без dashboard_common). "
+        f"stdout={result.stdout!r} stderr={result.stderr[-400:]!r}"
     )
 
 
