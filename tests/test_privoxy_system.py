@@ -1115,12 +1115,19 @@ def test_protected_config_debug_1_only_when_explicit(tmp_path):
     assert "debug 1\n" in privoxy_system.protected_config_text(layout, debug=1)
 
 
-def test_protected_config_debug_8_nonblocking_log_level(tmp_path):
-    """debug 8 = non-blocking log (компонуется с другими уровнями)."""
+def test_protected_config_debug_8_header_parsing_rejected_for_privacy(tmp_path):
+    """debug 8 = show HEADER PARSING (privoxy manual) — ЧУВствительно (auth/cookie заголовки).
+
+    Канон probe-semantics-from-primary-source: privoxy user-manual определяет debug 8 как
+    «show header parsing», НЕ «non-blocking log» (это 8192). Header parsing пишет значения
+    заголовков на диск → dictionary-атака (privacy-no-content-hash-on-disk). env-whitelist обязан
+    отвергать 8 так же, как 32768 (raw-запросы).
+    """
     layout = _layout(tmp_path)
     config = privoxy_system.protected_config_text(layout, debug=8)
-    assert "debug 8\n" in config
-    assert privoxy_system.validate_protected_config(config, layout, debug=8)["ok"] is True
+    directives = privoxy_system._config_directives(config)
+    assert "debug" not in directives, "level 8 (header parsing) не должен стать директивой debug"
+    assert privoxy_system.validate_protected_config(config, layout)["ok"] is True
 
 
 def test_validate_protected_config_rejects_debug_level_mismatch(tmp_path):
@@ -1152,13 +1159,24 @@ def test_safe_staged_config_threads_debug_level_to_validation(tmp_path):
 
 
 def test_privoxy_debug_from_env_whitelist_and_default(monkeypatch):
-    """SROUTER_PRIVOXY_DEBUG → int из whitelist {1,2,8}; остальное/пусто/отсутствие → 0 (privacy)."""
+    """SROUTER_PRIVOXY_DEBUG → int из whitelist {1,2}; остальное/пусто/отсутствие/8 → 0 (privacy)."""
     monkeypatch.delenv("SROUTER_PRIVOXY_DEBUG", raising=False)
     assert privoxy_system._privoxy_debug_from_env() == 0
 
-    for raw, expected in [("2", 2), ("1", 1), ("8", 8), ("", 0), ("abc", 0), ("-1", 0)]:
+    for raw, expected in [("2", 2), ("1", 1), ("", 0), ("abc", 0), ("-1", 0), ("8", 0)]:
         monkeypatch.setenv("SROUTER_PRIVOXY_DEBUG", raw)
         assert privoxy_system._privoxy_debug_from_env() == expected, raw
+
+
+def test_privoxy_debug_from_env_rejects_header_parsing_level_8_for_privacy(monkeypatch):
+    """debug 8 = header parsing (auth/cookie VALUES на диск) — env НЕ ускоряет его, как 32768.
+
+    Канон probe-semantics-from-primary-source: уровень — по privoxy manual, не по аналогии/имени.
+    8 выглядит «невинно» (младший бит), но парсит заголовки → чувствительно. env-переключатель
+    обязан ограничиться приватными уровнями {1, 2}.
+    """
+    monkeypatch.setenv("SROUTER_PRIVOXY_DEBUG", "8")
+    assert privoxy_system._privoxy_debug_from_env() == 0
 
 
 def test_privoxy_debug_from_env_rejects_raw_requests_level_for_privacy(monkeypatch):

@@ -46,16 +46,18 @@ OTOOL = "/usr/bin/otool"
 INSTALL_NAME_TOOL = "/usr/bin/install_name_tool"
 CODESIGN = "/usr/bin/codesign"
 
-# #152: разрешённые уровни privoxy-логирования (privoxy user-manual, раздел 7.3 Debugging).
+# #152: разрешённые privoxy-уровни логирования. Канон probe-semantics-from-primary-source —
+# уровень по privoxy user-manual (раздел 7.3 Debugging, битовые значения), НЕ по аналогии/имени.
 #   0 — выкл (ДЕФОЛТ, privacy: на диск не идёт даже производное контента);
-#   1 — URLs / Common Log Format (ЧУВСТВИТЕЛЬНО: URL могут содержать токены/query —
-#       dictionary-атака, см. privacy-no-content-hash-on-disk); только осознанно;
-#   2 — connections (open/close/timeout) — приватно (без URL/body), ловит флап/таймауты
-#       к github через 8118; рекомендуемый уровень диагностики;
-#   8 — non-blocking log (компонуется с другими).
-# Намеренно НЕ включает 32768 (raw-запросы с заголовками/телом) — это не env-переключатель «по
-# требованию», а ручная правка конфига. Канон: probe-semantics-from-primary-source, more-options-better.
-PRIVOXY_DEBUG_LEVELS = frozenset({0, 1, 2, 8})
+#   1 — show each GET/POST/CONNECT request = URLs / Common Log Format (ЧУВСТВИТЕЛЬНО: URL могут
+#       содержать токены/query — dictionary-атака, см. privacy-no-content-hash-on-disk); осознанно;
+#   2 — show each connection status (open/close/timeout) — приватно (без URL/body), ловит
+#       флап/таймауты к github через 8118; рекомендуемый уровень диагностики.
+# Намеренно НЕ включает:
+#   8 — show header parsing: пишет ЗНАЧЕНИЯ заголовков (auth/cookie) на диск → чувствительно,
+#       как 1 и 32768 (канон privacy-no-content-hash-on-disk); env-ускорение его не включает;
+#   32768 — raw-запросы с заголовками/телом — ручная правка конфига, не env-переключатель.
+PRIVOXY_DEBUG_LEVELS = frozenset({0, 1, 2})
 PRIVOXY_DEBUG_ENV = "SROUTER_PRIVOXY_DEBUG"
 
 
@@ -161,8 +163,8 @@ def protected_config_text(layout=DEFAULT_LAYOUT, debug=0):
     """Минимальная конфигурация bridge-only без user-writable action/filter files.
 
     debug — уровень privoxy-логирования (issue #152): 0=выкл (ДЕФОЛТ, privacy), 1=URLs (чувствительно),
-    2=connections (приватно, ловит флап), 8=non-blocking log. Уровень вне whitelist PRIVOXY_DEBUG_LEVELS
-    молча опускается до 0 — env-ускорение НЕ способно включить raw-запросы (32768) или произвольные биты.
+    2=connections (приватно, ловит флап). Уровень вне whitelist PRIVOXY_DEBUG_LEVELS молча опускается
+    до 0 — env-ускорение НЕ способно включить header-parsing (8, чувствительно) или raw-запросы (32768).
     """
     debug = debug if debug in PRIVOXY_DEBUG_LEVELS else 0
     debug_line = f"debug {debug}\n" if debug else ""
@@ -686,8 +688,9 @@ def _privoxy_debug_from_env():
     """Уровень privoxy-логирования из SROUTER_PRIVOXY_DEBUG (issue #152, канон InstallEnv.from_env).
 
     Возвращает int из whitelist PRIVOXY_DEBUG_LEVELS; при отсутствии/нечисле/вне whitelist → 0
-    (privacy-дефолт: логирование выкл). env-ускорение НЕ способно включить raw-запросы (32768) или
-    произвольные битовые комбинации — только осознанные диагностические уровни {1, 2, 8}.
+    (privacy-дефолт: логирование выкл). env-ускорение НЕ способно включить header-parsing (8,
+    чувствительно: auth/cookie заголовки на диск) или raw-запросы (32768) — только осознанные
+    диагностические уровни {1, 2} (URLs осознанно, connections приватно).
     """
     raw = os.environ.get(PRIVOXY_DEBUG_ENV, "").strip()
     if not raw:
