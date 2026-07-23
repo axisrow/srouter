@@ -50,7 +50,10 @@ ordering-guard (held()) по умолчанию OFF (SROUTER_LOCK_ORDER_GUARD=1 
 ========================= WATCHDOG (подход C) =========================
 
 bounded_acquire() — bounded `acquire(timeout=t)`: hang держащего кода не вешает 24/7-инфру
-намертво, за бюджет выходит через on_timeout (stale/empty-fallback) или LockAcquireTimeout.
+намертво, за бюджет поднимает LockAcquireTimeout (тело with НЕ выполняется — lock не
+захвачен). Fallback на таймауте (stale/empty-cache, skip-write) обязан быть явным
+try/except LockAcquireTimeout В CALLER; cleanup-операции (напр. _release_update) обязаны
+использовать timeout_sec=0 (unbounded), чтобы доводить discard до конца.
 Default SROUTER_LOCK_TIMEOUT_SEC=0 (unbounded) — поведение идентично старому `with lock:`,
 нулевая регрессия. _MUTATION_LOCK НЕ оборачивается (уже non-blocking 409).
 

@@ -199,18 +199,47 @@ def test_hotroutes_update_due_timeout_returns_false_and_skips_body(monkeypatch):
         lk.release()
 
 
-def test_hotroutes_release_update_unbounded_clears_marker():
-    # РЕГРЕССИЯ (cycle-2, Codex conf 1.0): _release_update — это CLEANUP в finally, зовётся
-    # только когда _update_due УЖЕ установил in-progress флаг. Раньше bounded-acquire на
-    # таймауте пропускал discard → leaked marker → refresh hot-routes подавлен навсегда.
-    # Теперь _release_update использует UNBOUNDED acquire: discard гарантированно доводится,
-    # даже когда дефолтный SROUTER_LOCK_TIMEOUT_SEC>0 ограничивает остальные точки.
+def test_hotroutes_release_update_unbounded_clears_marker_under_contention(monkeypatch):
+    # РЕГРЕССИЯ (cycle-2, Codex conf 1.0; тест усилен cycle-3): _release_update — CLEANUP в
+    # finally, зовётся только когда _update_due УЖЕ установил флаг. Прежняя bounded-реализация
+    # при contention (lock занят) таймаутила и ПРОПУСКАЛА discard → leaked marker. Теперь
+    # unbounded: даже при активном SROUTER_LOCK_TIMEOUT_SEC>0 и реальной contention discard
+    # доводится. Доказываем: holder держит _lock дольше watchdog-бюджета, но _release_update
+    # ждёт освобождения и очищает маркер.
     import dashboard_hotroutes
+    monkeypatch.setenv("SROUTER_LOCK_TIMEOUT_SEC", "0.05")  # watchdog активен для остальных точек
     key = ("cache", "log", 5, 60.0, 1)
-    dashboard_hotroutes._in_progress_updates.add(key)  # имитируем успешный _update_due
-    assert key in dashboard_hotroutes._in_progress_updates
-    dashboard_hotroutes._release_update(key)  # unbounded → обязано очистить
-    assert key not in dashboard_hotroutes._in_progress_updates
+    dashboard_hotroutes._in_progress_updates.add(key)  # флаг установлен успешным _update_due
+    lk = dashboard_hotroutes._lock
+
+    held = threading.Event()
+    release = threading.Event()
+    cleared = {"v": None, "elapsed": None}
+
+    def holder():
+        with lk:  # держим дольше watchdog-бюджеа (0.05с) → bounded-реализация упала бы тут
+            held.set()
+            release.wait(timeout=5.0)
+
+    t = threading.Thread(target=holder)
+    t.start()
+    assert held.wait(timeout=2.0)
+
+    def releaser():
+        start = time.monotonic()
+        dashboard_hotroutes._release_update(key)  # unbounded → ждёт holder, не сдаётся
+        cleared["v"] = key not in dashboard_hotroutes._in_progress_updates
+        cleared["elapsed"] = time.monotonic() - start
+
+    rt = threading.Thread(target=releaser)
+    rt.start()
+    time.sleep(0.15)  # holder всё ещё держит; bounded-версия уже бы таймаутила здесь
+    release.set()
+    rt.join(timeout=5.0)
+    t.join(timeout=5.0)
+    assert cleared["v"] is True, "in-progress marker утёк — _release_update не очистил флаг"
+    # Доказательство unbounded-поведения: releaser ждал holder > watchdog-бюджета (0.05с).
+    assert cleared["elapsed"] > 0.1
 
 
 # ============================ единый источник LEVEL_* (канон no-hidden-magic) ============================def test_single_source_of_lock_levels():
