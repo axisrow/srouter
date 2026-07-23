@@ -11,6 +11,7 @@ PRIVOXY=127.0.0.1:8118 и XRAY_SOCKS=127.0.0.1:10808 раньше дублиро
 файлы только импортируют. Никакой новой магии — просто единый импорт.
 """
 from pathlib import Path
+import sys
 
 import pytest
 
@@ -116,6 +117,60 @@ def test_gen_xray_uses_canonical_socks_port():
     """gen_xray_config.XRAY_SOCKS_PORT — реэкспорт источника, не локальный литерал 10808."""
     import gen_xray_config
     assert gen_xray_config.XRAY_SOCKS_PORT is dashboard_common.XRAY_SOCKS_PORT
+
+
+def test_gen_xray_fallback_does_not_mask_real_import_errors():
+    """gen_xray_config обязан работать без srouter_config (install-путь), поэтому ловит
+    SystemExit от dashboard_common и падает на fallback. НО это не должно маскировать
+    РЕАЛЬНЫЕ ошибки импорта (SyntaxError, ImportError) в dashboard_common — иначе баг в
+    источнике тихо проглатывается, и разработчик видит «всё работает» на мёртвом fallback
+    (no-hidden-magic-follow-canon). Допускается маскировать только SystemExit (то, что
+    dashboard_common реально поднимает при отсутствии конфига), а НЕ BaseException целиком.
+
+    Реализовано через subprocess: подменяем dashboard_common в sys.modules на модуль,
+    чей import падает ImportError, и импортируем gen_xray_config в свежем процессе.
+    Если except ловит BaseException → gen_xray_config тихо проглатывает ошибку, exit=0,
+    XRAY_SOCKS_PORT=10808 → тест ПАДАЕТ (баг маскируется). После фикса (except SystemExit)
+    ImportError пробивается, subprocess падает ненулевым кодом → тест ЗЕЛЁНЫЙ.
+    """
+    import subprocess
+
+    root = Path(__file__).resolve().parent.parent
+    # Скрипт подменяет dashboard_common на падающий-ImportError модуль ДО импорта
+    # gen_xray_config, в изолированном процессе (не трогая состояние pytest).
+    probe = (
+        "import sys, types\n"
+        "broken = types.ModuleType('dashboard_common')\n"
+        "def _boom(*a, **k):\n"
+        "    raise ImportError('real bug in dashboard_common')\n"
+        "broken.__spec__ = None\n"
+        "broken.__path__ = []\n"
+        "# Перехватываем встроенный import: при запросе dashboard_common — ImportError.\n"
+        "_orig_import = __builtins__.__import__ if isinstance(__builtins__, dict) else __builtins__.__import__\n"
+        "def _fake_import(name, *args, **kwargs):\n"
+        "    if name == 'dashboard_common':\n"
+        "        raise ImportError('real bug in dashboard_common')\n"
+        "    return _orig_import(name, *args, **kwargs)\n"
+        "import builtins\n"
+        "builtins.__import__ = _fake_import\n"
+        "import gen_xray_config\n"
+        "print('MASKED:', gen_xray_config.XRAY_SOCKS_PORT)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=str(root),
+        capture_output=True,
+        text=True,
+    )
+    # Если импорт dashboard_common падает ImportError и это маскируется (BaseException),
+    # процесс выйдет 0 и напечатает 'MASKED: 10808'. Правильное поведение — ImportError
+    # пробивается (except ловит только SystemExit), процесс падает ненулевым кодом.
+    masked = "MASKED" in result.stdout
+    assert not masked, (
+        "gen_xray_config маскирует РЕАЛЬНУЮ ошибку импорта dashboard_common (ImportError) "
+        "через except BaseException — баг источника становится невидимым на мёртвом fallback "
+        f"(no-hidden-magic). stdout={result.stdout!r} stderr={result.stderr[-400:]!r}"
+    )
 
 
 if __name__ == "__main__":
