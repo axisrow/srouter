@@ -190,6 +190,45 @@ def test_find_managed_block_accepts_begin_at_content_start():
     assert find_managed_block(content, BEG, END) is not None
 
 
+# cycle-review cycle-3 FIX (codex critical 0.99): whole-line matching — маркер обязан занимать ВСЮ
+# строку целиком, не только начинаться/заканчиваться на boundary. Cycle-2 FIX был односторонним
+# (char-before-BEGIN + char-after-END), пропускал suffix-after-BEGIN и prefix-before-END → silent
+# deletion чужого контента (data-loss). Whole-line замыкает все 4 стороны разом.
+def test_find_managed_block_rejects_suffix_after_begin():
+    """Суффикс на той же строке после BEGIN (BEGIN + \" example\") → malformed → None.
+
+    Воспроизведение codex cycle-3 critical: BEGIN начинается на line-boundary, но имеет trailing-суффикс
+    → маркер НЕ занимает всю строку. Без whole-line check remove удалил бы весь intervening user-контент."""
+    content = "pre\n" + BEG + " example\nuserline1\nuserline2\n" + END + "\n"
+    assert find_managed_block(content, BEG, END) is None
+
+
+def test_find_managed_block_rejects_prefix_before_end():
+    """Префикс на той же строке перед END (\"echo user \" + END) → malformed → None.
+
+    Воспроизведение codex cycle-3 critical (второй подслучай): END завершается newline, но имеет
+    leading-префикс → маркер НЕ занимает всю строку → remove удалил бы intervening user-контент."""
+    content = "pre\n" + BEG + "\nuserline1\nuserline2\necho user " + END + "\n"
+    assert find_managed_block(content, BEG, END) is None
+
+
+def test_find_managed_block_rejects_crlf_glued_marker():
+    """CRLF: маркер + \\r без \\n на той же строке → malformed → None (\\r ≠ line-boundary).
+
+    Codex next-steps: handle CRLF. \\r сам по себе — НЕ line boundary; whole-line matching отвергает
+    маркер с glued \\r-суффиксом так же, как glued text."""
+    content = "pre\n" + BEG + "\rbody\n" + END + "\n"  # \r glued after BEGIN (не \n)
+    assert find_managed_block(content, BEG, END) is None
+
+
+def test_find_managed_block_rejects_newline_in_marker_arg():
+    """Маркер, содержащий \\n в аргументе → невалидный контракт → assert/reject (codex next-steps).
+
+    Whole-line matching с newline-маркером бессмысленно (маркер обязан быть одной строкой)."""
+    with pytest.raises(AssertionError):
+        find_managed_block("multi\nline\n", "multi\n", "line\n")
+
+
 # ============================ replace_managed_block ============================
 def test_replace_managed_block_swaps_span():
     """replace_managed_block заменяет блок на new_span, сохраняя окружение."""

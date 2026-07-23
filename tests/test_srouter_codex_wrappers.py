@@ -1252,6 +1252,40 @@ def test_remove_codex_zsh_function_tight_trailing_fail_closed(monkeypatch, tmp_p
         "glued команда НЕ активирована (осталась частью комментария END-маркера)"
 
 
+@pytest.mark.parametrize("malformed_kind", ["suffix_after_begin", "prefix_before_end"])
+def test_remove_codex_zsh_function_partial_line_marker_fail_closed(monkeypatch, tmp_path, malformed_kind):
+    """cycle-review cycle-3 FIX (codex critical 0.99): partial-line markers (suffix-after-BEGIN /
+    prefix-before-END) → SAFE NO-OP, НЕ удаляют intervening чужой контент (data-loss).
+
+    Cycle-2 line-boundary FIX был односторонним (char-before-BEGIN + char-after-END) — пропускал
+    маркер с trailing-суффиксом (BEGIN + \" example\") и leading-префиксом (\"echo user \" + END),
+    хотя маркер НЕ занимал всю строку. remove_managed_block тогда удалял intervening user-контент
+    и рапортил успех → silent data-loss без backup. Whole-line matching (cycle-3) замыкает все 4
+    стороны: find_managed_block возвращает None → _remove_codex_zsh_function отказ, .zshrc
+    byte-for-byte нетронут."""
+    home = _mock_home(monkeypatch, tmp_path)
+    zshrc = home / ".zshrc"
+    B = srouter.ZSHRC_CODEX_FUNC_MARKER_BEGIN
+    E = srouter.ZSHRC_CODEX_FUNC_MARKER_END
+    user_lines = "export USER_LINE_1=keep\nexport USER_LINE_2=keep\n"
+    if malformed_kind == "suffix_after_begin":
+        # BEGIN + trailing suffix on same line → marker not whole-line.
+        malformed = f"{B} example suffix\n{user_lines}{E}\n"
+    else:  # prefix_before_end
+        # leading prefix + END on same line → marker not whole-line.
+        malformed = f"{B}\n{user_lines}echo user prefix {E}\n"
+    zshrc.write_text(malformed, encoding="utf-8")
+
+    note = srouter._remove_codex_zsh_function()
+
+    content = zshrc.read_text(encoding="utf-8")
+    assert content == malformed, \
+        f"partial-line marker ({malformed_kind}) → byte-for-byte safe no-op (НЕ data-loss): {note}"
+    # Intervening user-контент сохранён (не удалён).
+    assert content.count("USER_LINE_1=keep") == 1, "чужой контент НЕ удалён (no data-loss)"
+    assert content.count("USER_LINE_2=keep") == 1
+
+
 def test_install_zsh_function_updates_stale_legacy_path(monkeypatch, tmp_path):
     """cycle-review FIX B (codex critical): существующий managed zsh-блок со СТАРЫМ путём ~/bin/codex
     (от установки до rename) → install ОБНОВЛЯЕТ его на ~/bin/codex-srouter.
