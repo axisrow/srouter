@@ -213,6 +213,10 @@ def test_check_all_status_ok_when_nothing_installed(monkeypatch, tmp_path):
                         lambda: {"status": "ok", "detail": "стандартный"})
     monkeypatch.setattr(health, "_desktop_proxy_check",
                         lambda: {"status": "unknown", "detail": "нет launchctl"})
+    # #143 runtime-env чек тоже под active_claude gate; мокаем, иначе doctor-path тест зовёт
+    # реальный ps eww против dev-машины.
+    monkeypatch.setattr(health, "_runtime_model_override_check",
+                        lambda: {"status": "unknown", "detail": "mock"})
     monkeypatch.setattr(health, "_installed_versions_check",
                         lambda: {"status": "unknown", "detail": "не установлено",
                                  "codex": [], "claude_code": []})
@@ -337,6 +341,10 @@ def _all_up_drivers(monkeypatch):
                         lambda: {"status": "ok", "detail": "стандартный"})
     monkeypatch.setattr(health, "_desktop_proxy_check",
                         lambda: {"status": "unknown", "detail": "нет launchctl"})
+    # #143 runtime-env чек тоже под active_claude gate; мокаем, иначе doctor-path тест зовёт
+    # реальный ps eww против dev-машины.
+    monkeypatch.setattr(health, "_runtime_model_override_check",
+                        lambda: {"status": "unknown", "detail": "mock"})
 
 
 def test_versions_check_skipped_in_lightweight_health_watchdog_path(monkeypatch):

@@ -135,6 +135,29 @@ def _is_claude_code_comm(comm):
     return "/claude/versions/" in comm
 
 
+def _claude_code_pids():
+    """CC PID'ы через `ps -axo pid=,comm=` (#143 — общий источник для runtime env-чека).
+
+    Переиспользует _is_claude_code_comm (один критерий CC-процесса). Возвращает список PID-строк,
+    [] если CC не запущен ИЛИ ps-timeout. Fail-soft: любой сбой ps → []. (Тот же парсинг, что в
+    _claude_proxy_probe:145-155 — line.split(None,1) сохраняет пробелы в comm-пути.)
+    НЕ трогает _claude_proxy_probe — там своя проверка timeout для двух разных detail-сообщений
+    («timeout ps» vs «CC не запущен»), которые здесь схлопываются в один пустой результат.
+    """
+    r = sys_probe.run([PS, "-axo", "pid=,comm="], timeout=3)
+    if r.get("timeout"):
+        return []
+    pids = []
+    for line in (r.get("out") or "").splitlines():
+        parts = line.split(None, 1)
+        if len(parts) < 2:
+            continue
+        pid_s, comm = parts[0].strip(), parts[1].strip()
+        if pid_s.isdigit() and _is_claude_code_comm(comm):
+            pids.append(pid_s)
+    return pids
+
+
 def _claude_proxy_probe():
     """Какой локальный маршрут виден у запущенного Claude Code? Passive lsof evidence.
 
@@ -366,7 +389,9 @@ def _codex_proxy_probe():
     Решает #120: codex TUI рвёт long-lived WS через privoxy 8118, но стабилен через SOCKS5 10808.
     `which codex` НЕ доказательство — wrapper использует exec, процесс выглядит как brew-codex в ps.
     Единственный критерий — runtime-сокет конкретного PID к 10808 (ok) vs 8118 (warn, #120) vs напрямую
-    (down). ps eww env на macOS не читается (права) → классификация по lsof-сокетам, как у claude-proxy.
+    (down). ps eww env ЧУЖОГО/системного codex-процесса на macOS не читается (права) → классификация по
+    lsof-сокетам, как у claude-proxy. (Для same-UID CC env читается — см. #143 _read_runtime_endpoint_config;
+    здесь lsof остаётся источником, т.к. codex-binary часто запущен под другим контекстом/правами.)
 
     Возвращает {status, source, detail}:
       status="ok"      — codex-binary-PID держит коннект к 10808 (SOCKS5/xray, стабильно);
@@ -789,6 +814,109 @@ def _endpoint_override_check():
     return {"status": "info", "detail": f"endpoint override: {base} (нестандартный endpoint)"}
 
 
+# ============================ #143: runtime env живого CC-процесса (ps eww) ============================
+# Сценарий #143: CC запустился с ANTHROPIC_BASE_URL / ANTHROPIC_DEFAULT_*_MODEL override; затем
+# пользователь сбросил settings.json/shell/launchctl на стандартные, а ЖИВОЙ процесс сохранил env.
+# Doctor читает файлы (_read_endpoint_config, #129) → видит «стандартный endpoint», а CC реально
+# ходит на подменённый сервер. Файлы слепы к runtime-override — нужно env ЖИВОГО процесса.
+# На macOS `ps eww -p <pid>` читает env процесса ТОГО ЖЕ UID (эмпирически подтверждено: живой CC
+# отдаёт ANTHROPIC_BASE_URL=api.z.ai + ANTHROPIC_DEFAULT_*_MODEL=glm-*). Чужой/системный UID →
+# пустой вывод (fail-soft). НЕ противоречит докстрингу _codex_proxy_probe (:369 уточнён): там env
+# чужого codex-процесса не читается → lsof-классификация; здесь — same-UID CC.
+
+# Regex извлекает ANTHROPIC_* vars из вывода `ps eww`. Env разделяется ПРОБЕЛОМ (не \012); [^ ]*
+# обрезает значение до следующего пробела. Ключи — только ANTHROPIC_* (наш trust boundary).
+_RUNTIME_ENV_RE = re.compile(r"(ANTHROPIC_[A-Z_]+)=([^ ]*)")
+
+
+def _read_runtime_endpoint_config():
+    """Читает env ЖИВОГО CC-процесса через `ps eww` (#143).
+
+    Возвращает {base_url, model_env, pids, readable}:
+      - readable=False, pids=[]   — CC не запущен (ps -axo пуст) ИЛИ ps-timeout;
+      - readable=False, pids=[..] — CC запущен, но ps eww пуст/timeout (чужой UID/sandbox — PID
+        сохранены для forensics в detail чека);
+      - readable=True             — env прочитан; base_url/model_env заполнены из ANTHROPIC_* vars.
+    base_url: ANTHROPIC_BASE_URL живого процесса ("" если не задан им). model_env: {KEY: value}
+    для всех ANTHROPIC_* (включая ANTHROPIC_DEFAULT_*_MODEL и секреты — doctor доверяет тому же UID;
+    фильтрацию секретов делает чек, НЕ эта функция). Не бросает.
+    """
+    pids = _claude_code_pids()
+    if not pids:
+        return {"base_url": "", "model_env": {}, "pids": [], "readable": False}
+    # Один ps eww на ВСЕ PID батчем (запятая, как lsof в _claude_proxy_probe). Любой PID CC отдаёт env.
+    r = sys_probe.run([PS, "eww", "-p", ",".join(pids)], timeout=3)
+    if r.get("timeout") or not (r.get("out") or "").strip():
+        return {"base_url": "", "model_env": {}, "pids": pids, "readable": False}
+    model_env = dict(_RUNTIME_ENV_RE.findall(r["out"]))
+    # ps eww дал вывод, но НИ ОДНОЙ ANTHROPIC_* не извлечено (мусор/неполный env/чужой контекст) —
+    # evidence нет → НЕ readable. Иначе чек дал бы ложный ok «стандартный endpoint» без proof
+    # (verify-dont-guess: нет ANTHROPIC_* = нет evidence, classify unknown, не ok).
+    if not model_env:
+        return {"base_url": "", "model_env": {}, "pids": pids, "readable": False}
+    return {
+        "base_url": model_env.get("ANTHROPIC_BASE_URL", ""),
+        "model_env": model_env,
+        "pids": pids,
+        "readable": True,
+    }
+
+
+def _runtime_model_override_check():
+    """Детектит env-override ЖИВОГО CC и расхождение runtime vs файлов doctor (#143).
+
+    Возвращает {status, detail}. status:
+      - "unknown" — CC не запущен / env не читается (fail-soft; info-only, как _claude_proxy_probe idle);
+      - "ok"      — runtime==api.anthropic.com, нет model-substitution, нет расхождения с файлами;
+      - "info"    — runtime override / model-substitution / runtime != files.
+    Сигналы (накапливаются в detail):
+      (a) runtime base_url override на нестандартный хост;
+      (b) ANTHROPIC_DEFAULT_* присутствуют → slot-mapping модели подменён (даже при чистом base_url);
+      (c) stale-process: runtime override есть, а файлы doctor ЧИСТЫ → ровно сценарий #143
+          (живой CC держит override после сброса настроек);
+      (d) runtime != files (оба нестандартные, но разные).
+    Канон info-only: НЕ driver (как _endpoint_override_check) — картина для диагностики (#143 п.1+4).
+    Security: detail выводит ТОЛЬКО base_url и ANTHROPIC_DEFAULT_* — никогда ANTHROPIC_API_KEY /
+    ANTHROPIC_AUTH_TOKEN (doctor доверяет тому же UID, но логи/terminal не должны содержать секреты).
+    """
+    rt = _read_runtime_endpoint_config()
+    if not rt["readable"]:
+        detail = ("Claude Code не запущен" if not rt["pids"]
+                  else f"env живого CC не читается (PID {','.join(rt['pids'])}) — возможно чужой UID/sandbox")
+        return {"status": "unknown", "detail": detail}
+
+    cfg = _read_endpoint_config()  # что видит doctor по файлам/сессии
+    files_base = cfg["base_url"]
+    runtime_base = rt["base_url"]
+    runtime_host = (urlparse(runtime_base).hostname or "").lower().rstrip(".")
+    files_host = (urlparse(files_base).hostname or "").lower().rstrip(".")
+    # model_keys — ТОЛЬКО ANTHROPIC_DEFAULT_* (base_url отдельно). Секреты в detail НЕ попадают.
+    model_keys = {k: v for k, v in rt["model_env"].items() if k.startswith("ANTHROPIC_DEFAULT_")}
+    pid_str = ",".join(rt["pids"])
+
+    signals = []
+    runtime_overridden = bool(runtime_base and runtime_host != _DEFAULT_ANTHROPIC_HOST)
+    # (a) runtime base_url override на нестандартный хост.
+    if runtime_overridden:
+        signals.append(f"runtime endpoint: {runtime_base}")
+    # (b) model substitution: ANTHROPIC_DEFAULT_*_MODEL присутствуют → slot-mapping подменён.
+    if model_keys:
+        pairs = ", ".join(f"{k}={v}" for k, v in sorted(model_keys.items()))
+        signals.append(f"model substitution: {pairs}")
+    # (c) stale-process: runtime override есть, а файлы doctor чисты → ровно сценарий #143.
+    files_clean = (not files_base) or files_host == _DEFAULT_ANTHROPIC_HOST
+    if runtime_overridden and files_clean:
+        signals.append("stale process: CC держит override после сброса настроек (runtime != files)")
+    # (d) расхождение runtime vs files даже когда оба нестандартные но разные.
+    if runtime_base and files_base and runtime_base != files_base:
+        signals.append(f"runtime != files (runtime={runtime_base}, files={files_base})")
+
+    if not signals:
+        return {"status": "ok",
+                "detail": f"runtime: стандартный endpoint, без model-substitution (PID {pid_str})"}
+    return {"status": "info", "detail": f"runtime (PID {pid_str}): " + "; ".join(signals)}
+
+
 # ============================ #134: Desktop App proxy (launchctl getenv) ============================
 
 # launchctl держит ТРИ прокси-ключа; Desktop App наследует все. Инцидент #127: SOCKS5 сидел в
@@ -922,6 +1050,16 @@ def check_all(*, active_claude=False):
     # /health (dashboard.py:990 «Мгновенный, лёгкий») и watchdog (раз в ~20с). Инвентаризация —
     # ТОЛЬКО doctor-путь, иначе лёгкий healthcheck получит DoS-поверхность + overhead.
     if active_claude:
+        # #143 runtime env живого CC: детект ANTHROPIC_BASE_URL/DEFAULT_*_MODEL override + stale-process
+        # (живой CC держит override после сброса настроек — файлы doctor слепы). info-only (как
+        # endpoint-override) — картина для диагностики (#143 п.1+4), НЕ driver. Под active_claude gate:
+        # ps eww по живым PID + чтение env = overhead/поверхность, не для лёгкого /health/watchdog.
+        rmo = _runtime_model_override_check()
+        # info-only БЕЗУСЛОВНО (как _installed_versions_check/_privoxy_log_observability_check ниже):
+        # диагностика подмены модели — картина, не сбой стека; ни ok, ни info, ни unknown не driver.
+        rmo_check = {"name": "runtime env (ANTHROPIC_* живого CC)",
+                     "ok": rmo["status"] == "ok", "info": True, "detail": rmo["detail"]}
+        checks.append(rmo_check)
         iv = _installed_versions_check()
         iv_check = {"name": "версии (codex/claude-code на диске)",
                     "ok": True, "info": True, "detail": iv["detail"]}
