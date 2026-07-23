@@ -904,9 +904,13 @@ def _runtime_model_override_check():
 
     signals = []
     ok_pids = []
+    unreadable_pids = []  # PID без распарсенного env (per-process sandbox/permission/partial ps).
     for pid in rt["pids"]:
         env = rt["per_pid"].get(pid, {})
-        if not env:  # этого PID env не прочитан (мусор) — не ok и не сигнал, просто пропускаем
+        if not env:
+            # этого PID env не прочитан. Override-сигналов по нему нет, но и evidence «standard» тоже
+            # нет — override-PID мог быть им (Codex c2: standard-PID не должен маскировать). Не ok.
+            unreadable_pids.append(pid)
             continue
         runtime_base = env.get("ANTHROPIC_BASE_URL", "")
         runtime_host = (urlparse(runtime_base).hostname or "").lower().rstrip(".")
@@ -928,13 +932,28 @@ def _runtime_model_override_check():
             ok_pids.append(pid)
 
     pid_list = ",".join(rt["pids"])
+    # Override приоритетнее (info). Но если override не найден и ХОТЯ БЫ ОДИН PID без evidence →
+    # unknown: override-PID мог быть непрочитанным, а standard-PID его бы маскировал ложным ok
+    # (verify-dont-guess: нет evidence для PID = не ok, Codex c2 false-negative fix). ok — только
+    # когда ВСЕ PID прочитаны и standard.
     if not signals:
+        if unreadable_pids:
+            return {"status": "unknown",
+                    "detail": (f"env не прочитан для PID {','.join(unreadable_pids)} "
+                               f"(sandbox/права/partial ps) — override-PID мог быть непрочитанным; "
+                               f"остальные standard: PID {','.join(ok_pids)}")}
         return {"status": "ok",
                 "detail": f"runtime: стандартный endpoint, без model-substitution (PID {pid_list})"}
     detail = f"runtime override (PID {pid_list}): " + " | ".join(signals)
+    extras = []
     if ok_pids:
-        detail += f" (остальные standard: PID {','.join(ok_pids)})"
+        extras.append(f"остальные standard: PID {','.join(ok_pids)}")
+    if unreadable_pids:
+        extras.append(f"env не прочитан: PID {','.join(unreadable_pids)}")
+    if extras:
+        detail += " (" + "; ".join(extras) + ")"
     return {"status": "info", "detail": detail}
+
 
 
 

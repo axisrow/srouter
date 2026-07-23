@@ -1274,3 +1274,43 @@ def test_runtime_check_detects_override_when_mixed_pids(monkeypatch):
         # ЛЮБОЙ override-PID (evil.example) → info, НЕ ok. standard-процесс его не маскирует.
         assert res["status"] == "info", f"[{label}] override-PID не должен маскироваться, got {res['status']}"
         assert "evil.example" in res["detail"], f"[{label}] detail должен показать overridden endpoint"
+
+
+def test_runtime_check_unknown_when_some_pid_unreadable(monkeypatch):
+    """cycle-review Codex c2: один PID без env (sandbox/permission) + другой standard → НЕ ok.
+
+    Тот же класс #143 что cycle 1, следующий слой: override-PID мог быть тем, чей env не прочитан
+    (per-process sandbox/permission failure / partial ps). Если standard-PID маскирует — ложный ok.
+    Правило: override приоритетнее (info), но если override не найден и ХОТЯ БЫ ОДИН PID без
+    evidence → unknown (verify-dont-guess: нет evidence для этого PID = не ok). Тест ОБА порядка.
+    """
+    UNREADABLE_PID, STANDARD_PID = "111", "222"
+    UNREADABLE_COMM, STANDARD_COMM = CLI_COMM, VERSION_RUNNER_COMM
+    STANDARD_ENV = "ANTHROPIC_BASE_URL=https://api.anthropic.com ANTHROPIC_API_KEY=k"
+
+    def run_once(pid_order):
+        listing = "\n".join(f"{p} {c}" for p, c in pid_order) + "\n"
+        # UNREADABLE_PID: строка процесса есть, но env пуст (ps eww не отдал ANTHROPIC_*).
+        # STANDARD_PID: standard endpoint.
+        eww = (f"{UNREADABLE_PID} /path/claude \n"            # пустой env (непрочитан)
+               f"{STANDARD_PID} /path/claude {STANDARD_ENV}\n")
+
+        def fake_run(cmd, timeout):
+            if cmd and cmd[0] == "/bin/ps":
+                if "eww" in cmd:
+                    return {"rc": 0, "out": eww, "err": "", "timeout": False}
+                return {"rc": 0, "out": listing, "err": "", "timeout": False}
+            return {"rc": 0, "out": "", "err": "", "timeout": False}
+        return fake_run
+
+    monkeypatch.setattr(health, "_read_endpoint_config",
+                        lambda: {"base_url": "", "no_proxy": "", "source": "default"})
+
+    for label, fake in [
+        ("unreadable-first", run_once([(UNREADABLE_PID, UNREADABLE_COMM), (STANDARD_PID, STANDARD_COMM)])),
+        ("unreadable-last", run_once([(STANDARD_PID, STANDARD_COMM), (UNREADABLE_PID, UNREADABLE_COMM)])),
+    ]:
+        monkeypatch.setattr(health.sys_probe, "run", fake)
+        res = health._runtime_model_override_check()
+        assert res["status"] == "unknown", \
+            f"[{label}] PID без evidence → unknown (НЕ ok; standard-PID не маскирует), got {res['status']}"
