@@ -90,10 +90,11 @@ def test_stack_restored_on_exception(monkeypatch):
 
 def test_bounded_acquire_blocking_default():
     # Нулевая регрессия: timeout_sec=0/None блокирует до успеха, идентично `with lock:`.
+    # Реально проверяем: внутри тела лок УДЕРЖИВАЕТСЯ этим контекстом, после выхода — свободен.
     lk = threading.Lock()
     with lock_hierarchy.bounded_acquire(lk, name="t", level=lock_hierarchy.LEVEL_CACHE):
-        assert not lk.locked() or lk.locked()  # внутри — держим
-    assert not lk.locked()
+        assert lk.locked() is True  # контекст держит лок внутри тела
+    assert lk.locked() is False  # и освобождает при выходе
 
 
 def test_bounded_acquire_timeout_raises():
