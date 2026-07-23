@@ -642,6 +642,23 @@ def _remove_home_bin_from_path() -> str:
         return f"PATH: не убран ({str(exc)[:80]})."
 
 
+def _codex_zsh_target_installed() -> bool:
+    """Установлен ли новый codex-srouter И валиден (is_file + executable + current-маркер)?
+
+    cycle-review cycle-2 FIX #1 (transactional coherence): zsh-migration stale-блока codex→codex-srouter
+    согласовывается с wrapper-install — мигрируем zsh только если target реально стоит. Иначе FIX A
+    сохранит рабочий legacy ~/bin/codex, а FIX B перенаправит zsh на codex-srouter (которого нет) →
+    inconsistency (`codex` зовёт несуществующий файл, притом рабочий legacy стоит). Те же критерии, что
+    new_installed_ok в _install_codex_wrappers — единый источник правды валидности target."""
+    try:
+        wrapper = _codex_wrapper_path(CODEX_CLI_WRAPPER_NAME)
+        return (wrapper.is_file()
+                and os.access(wrapper, os.X_OK)
+                and CODEX_WRAPPERS[0][2] in wrapper.read_text(encoding="utf-8"))
+    except OSError:
+        return False
+
+
 def _install_codex_zsh_function(env) -> str:
     """Добавить shell-функцию codex() в ~/.zshrc (issue #96).
 
@@ -666,17 +683,33 @@ def _install_codex_zsh_function(env) -> str:
         # голому маркеру short-circuit'ить нельзя: zsh-функция осталась бы звать удалённый legacy
         # wrapper → `codex` в интерактивном шелле ломался, притом install рапортил успех.
         # Различаем: блок зовёт текущий codex-srouter → idempotent; зовёт устаревший codex → обновляем.
-        if ZSHRC_CODEX_FUNC_MARKER_BEGIN in content and ZSHRC_CODEX_FUNC_MARKER_END in content:
+        begins = content.count(ZSHRC_CODEX_FUNC_MARKER_BEGIN)
+        ends = content.count(ZSHRC_CODEX_FUNC_MARKER_END)
+        if begins >= 1 and ends >= 1:
             if '"$HOME/bin/codex-srouter" "$@"' in content:
                 return "Codex функция: уже в ~/.zshrc (idempotent)."
+            if begins != 1 or ends != 1:
+                # cycle-review cycle-2 FIX #1c: malformed markers (дублированный/непарный begin/end).
+                # index() взял бы первый begin, span мог задеть чужой контент между ними → НЕ переписываем.
+                return ("Codex функция: повреждённый managed-маркер в ~/.zshrc "
+                        f"(begin={begins}, end={ends}) — не обновляю (проверь вручную).")
             if '"$HOME/bin/codex" "$@"' in content:
-                # Stale managed-блок (до rename): мигрируем путь codex → codex-srouter внутри блока.
+                # cycle-review cycle-2 FIX #1 (transactional coherence): мигрируем stale-блок codex → codex-srouter
+                # ТОЛЬКО если новый codex-srouter установлен и валиден. Иначе FIX A сохранит legacy ~/bin/codex
+                # (рабочий), а FIX B перенаправит zsh на codex-srouter (которого нет) → inconsistency
+                # (`codex` зовёт несуществующий файл, притом рабочий legacy стоит).
+                if not _codex_zsh_target_installed():
+                    return ("Codex функция: новый codex-srouter не установлен/не валиден — "
+                            "stale zsh-блок НЕ мигрирую (оставляю ~/bin/codex, рабочий). "
+                            "Запусти srouter install после установки codex binary.")
                 _backup(zshrc, env)  # timestamped backup перед правкой managed-блока
                 start = content.index(ZSHRC_CODEX_FUNC_MARKER_BEGIN)
                 end = content.index(ZSHRC_CODEX_FUNC_MARKER_END) + len(ZSHRC_CODEX_FUNC_MARKER_END)
                 updated_block = content[start:end].replace('"$HOME/bin/codex" "$@"',
                                                            '"$HOME/bin/codex-srouter" "$@"')
-                _write_text_atomic(zshrc, content[:start] + updated_block + content[end:])
+                # cycle-review cycle-2 FIX #1b: проверяем результат atomic-write, не рапортуем успех молча.
+                if not _write_text_atomic(zshrc, content[:start] + updated_block + content[end:]):
+                    return "Codex функция: не обновлена (ошибка atomic write ~/.zshrc)."
                 return ("Codex функция: обновлён путь в managed-блоке (codex → codex-srouter, rename #169). "
                         "Backup: .zshrc.srouter-backup-*. "
                         "ВНИМАНИЕ: существующие терминалы/codex-процессы не получат новое окружение — "
