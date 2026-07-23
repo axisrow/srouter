@@ -748,6 +748,9 @@ def test_codex_function_installed_in_zshrc(monkeypatch, tmp_path):
     env = _env(tmp_path)
     zshrc = home / ".zshrc"
     zshrc.write_text("export PATH=/usr/local/bin:$PATH\n", encoding="utf-8")
+    # precondition (cycle-3 root fix): zsh-функция codex-srouter создаётся только при валидном target.
+    srouter._install_codex_wrappers(env)
+    assert (home / "bin" / "codex-srouter").exists()
 
     note = srouter._install_codex_zsh_function(env)
 
@@ -769,6 +772,7 @@ def test_codex_function_install_idempotent(monkeypatch, tmp_path):
     env = _env(tmp_path)
     zshrc = home / ".zshrc"
     zshrc.write_text("export FOO=1\n", encoding="utf-8")
+    srouter._install_codex_wrappers(env)  # precondition: валидный target (cycle-3 root fix)
 
     srouter._install_codex_zsh_function(env)
     srouter._install_codex_zsh_function(env)
@@ -821,6 +825,7 @@ def test_codex_function_uninstall_removes_only_managed_block(monkeypatch, tmp_pa
     zshrc.write_text(
         'export PATH=/usr/local/bin:$PATH\n'
         '# user comment\n', encoding="utf-8")
+    srouter._install_codex_wrappers(env)  # precondition: валидный target (cycle-3 root fix)
     srouter._install_codex_zsh_function(env)
     assert srouter.ZSHRC_CODEX_FUNC_MARKER_BEGIN in zshrc.read_text(encoding="utf-8")
 
@@ -1250,6 +1255,71 @@ def test_install_zsh_function_malformed_markers_not_rewritten(monkeypatch, tmp_p
     content = zshrc.read_text(encoding="utf-8")
     assert content == malformed, \
         f"malformed (двойной BEGIN) → НЕ переписываем, оставляем как есть (fail-closed): {note}"
+
+
+def test_install_zsh_function_no_create_when_new_wrapper_missing(monkeypatch, tmp_path):
+    """cycle-review cycle-3 FIX #1-root (codex critical 0.99 — unified target gate): fresh-create path.
+    Если новый codex-srouter НЕ установлен И zshrc не имеет managed-блока → НЕ создавать zsh-функцию
+    (иначе она shadow'ит сохранённый legacy ~/bin/codex, зовёт несуществующий codex-srouter = та же
+    FIX A/B inconsistency, через fresh-create путь, не migration). Замкнутый инвариант: zsh-функция
+    (codex-srouter) создаётся/мигрируется/принимается ТОЛЬКО если _codex_zsh_target_installed() во ВСЕХ путях."""
+    home = _mock_home(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    zshrc = home / ".zshrc"
+    zshrc.write_text("export FOO=1\n")  # нет managed zsh блока; codex-srouter НЕ установлен
+    assert not (home / "bin" / "codex-srouter").exists()
+
+    note = srouter._install_codex_zsh_function(env)
+
+    content = zshrc.read_text(encoding="utf-8")
+    assert srouter._CODEX_FUNC_BLOCK not in content, \
+        f"fresh-create zsh-функция НЕ добавлена (target missing → не shadow'им legacy): {note}"
+    assert '"$HOME/bin/codex-srouter"' not in content, "zsh НЕ указывает на отсутствующий codex-srouter"
+
+
+def test_install_zsh_function_no_append_when_new_wrapper_missing(monkeypatch, tmp_path):
+    """cycle-review cycle-3 FIX #1-root: append path (zshrc есть, без managed-блока, без foreign codex-def) —
+    тоже не добавляем _CODEX_FUNC_BLOCK если target не установлен. Покрывает третий путь функции."""
+    home = _mock_home(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    zshrc = home / ".zshrc"
+    zshrc.write_text("export PATH=/usr/local/bin:$PATH\n# user comment\n")
+    assert not (home / "bin" / "codex-srouter").exists()
+
+    note = srouter._install_codex_zsh_function(env)
+
+    content = zshrc.read_text(encoding="utf-8")
+    assert srouter._CODEX_FUNC_BLOCK not in content, \
+        f"append zsh-функции НЕ выполнен (target missing): {note}"
+
+
+def test_install_zsh_function_reversed_markers_not_rewritten(monkeypatch, tmp_path):
+    """cycle-review cycle-3 FIX #2-root (codex critical 0.99 — ordered marker pair): реверснутые маркеры
+    (END перед BEGIN, begins==1/ends==1 проходят) → НЕ переписываем. Иначе start>end → content[start:end]
+    пустой → реконструкция ДУБЛИРУЕТ контент .zshrc (рапорт успеха). Замкнутый инвариант: требуем ровно одну
+    УПОРЯДОЧЕННУЮ пару (begin_index < end_index), target внутри неё."""
+    home = _mock_home(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    bin_dir = home / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    zshrc = home / ".zshrc"
+    reversed_block = (
+        f"{srouter.ZSHRC_CODEX_FUNC_MARKER_END}\n"      # END ПЕРВЫМ (реверс)
+        "export FOO=bar\n"
+        '  function codex {\n    "$HOME/bin/codex" "$@"\n  }\n'
+        f"{srouter.ZSHRC_CODEX_FUNC_MARKER_BEGIN}\n"    # BEGIN вторым
+    )
+    zshrc.write_text(reversed_block, encoding="utf-8")
+    # codex-srouter валиден (чтобы миграция пыталась выполниться) — но реверс маркеров должен её заблокировать.
+    srouter._install_codex_wrappers(env)
+    assert (bin_dir / "codex-srouter").exists()
+
+    note = srouter._install_codex_zsh_function(env)
+
+    content = zshrc.read_text(encoding="utf-8")
+    assert content == reversed_block, \
+        f"реверснутые маркеры → НЕ переписываем (start>end corruption): {note}"
+    assert content.count("export FOO=bar") == 1, "контент НЕ дублирован (ordered-pair guard)"
 
 
 def test_remove_also_cleans_legacy_managed_codex_wrapper(monkeypatch, tmp_path):
