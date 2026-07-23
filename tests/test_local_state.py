@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 
 import local_state
@@ -932,3 +933,341 @@ def test_routing_apply_restart_fail_recovers_xray_with_restored_config(tmp_path)
     # config на диске — старый (без telegram), но xray снова работает с ним
     cfg = json.loads(xray_p.read_text(encoding="utf-8"))
     assert "domain:telegram.org" not in cfg["routing"]["rules"][0]["domain"]
+
+
+# ============================ #139: atomic rollback + flock на xray-config ============================
+
+def test_routing_apply_rollback_is_atomic_on_state_write_failure(tmp_path, monkeypatch):
+    """Finding 1 (#139): rollback-запись при провале state-write атомарна (tmp+replace), не
+    truncate+write. Два аспекта:
+
+    (a) ENOSPC в момент rollback-replace НЕ повреждает production (валидный JSON целиком — atomic
+        rollback пишет в tmp, провал os.replace не трогает оригинал);
+    (b) провал rollback ОТРАЖЁН в err (Codex cycle-review P1): если rollback не удался, config
+        остаётся новым, state не записан → рассинхрон. Явный err="*_rollback_failed", а не маска
+        "state_write_failed" (хранитель рассинхрона в неведении). При успехе rollback — config
+        фактически == backup (telegram НЕ добавлен)."""
+    xray_p = tmp_path / "xray-config.json"
+    state_p = tmp_path / "srouter.local.json"
+    _write_xray_routing_config(xray_p, BASELINE_DOMAINS, managed=True)
+    _write(state_p, {"nodes": [], "routing": {"active": BASELINE_DOMAINS, "outbound": "reality-out",
+                                              "last_applied_hash": local_state._routing_domains_hash(BASELINE_DOMAINS)}})
+    monkeypatch.setattr(local_state, "save_state", lambda state, path=None: None)
+
+    # os.replace-вызовы внутри _atomic_write_text: 1=шаг4 modify (новый конфиг), 2=rollback к backup.
+    real_replace = os.replace
+    replace_calls = {"n": 0}
+
+    def flaky_replace(src, dst):
+        replace_calls["n"] += 1
+        if replace_calls["n"] == 2:  # rollback-replace
+            raise OSError("ENOSPC")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(local_state.os, "replace", flaky_replace)
+    r = local_state.routing_apply(
+        ["telegram.org"], action="add", adopt=False,
+        config_path=str(xray_p), state_path=state_p, runner=_ok_runner([]),
+        port_checker=_port_checker_settle_then_up(),
+    )
+    assert r["ok"] is False
+    # (b) провал rollback ЯВНО в err — не маскирован под state_write_failed
+    assert r.get("err") == "state_write_failed_rollback_failed", r
+    # (a) production НЕ повреждён: валидный JSON целиком, не truncated/пустой
+    on_disk = xray_p.read_text(encoding="utf-8")
+    assert on_disk, "production xray-config пуст после провала rollback (truncate без write)"
+    cfg = json.loads(on_disk)
+    assert isinstance(cfg, dict) and "routing" in cfg, (
+        "production xray-config повреждён rollback-записью (неатомарный truncate+write) — "
+        "ENOSPC в момент rollback оставил файл в промежуточном состоянии")
+    monkeypatch.setattr(local_state.os, "replace", real_replace)
+
+
+def test_routing_apply_rollback_restores_backup_on_state_write_failure(tmp_path, monkeypatch):
+    """Happy-rollback ветка (Codex P1 обратная сторона): при провале state-write rollback УСПЕШЕН →
+    config фактически восстановлен к backup (telegram НЕ добавлен), err="state_write_failed" (без
+    _rollback_failed). Доказывает, что rollback реально откатывает, а не просто не повреждает."""
+    xray_p = tmp_path / "xray-config.json"
+    state_p = tmp_path / "srouter.local.json"
+    _write_xray_routing_config(xray_p, BASELINE_DOMAINS, managed=True)
+    _write(state_p, {"nodes": [], "routing": {"active": BASELINE_DOMAINS, "outbound": "reality-out",
+                                              "last_applied_hash": local_state._routing_domains_hash(BASELINE_DOMAINS)}})
+    monkeypatch.setattr(local_state, "save_state", lambda state, path=None: None)
+
+    r = local_state.routing_apply(
+        ["telegram.org"], action="add", adopt=False,
+        config_path=str(xray_p), state_path=state_p, runner=_ok_runner([]),
+        port_checker=_port_checker_settle_then_up(),
+    )
+    assert r["ok"] is False
+    assert r.get("err") == "state_write_failed"
+    # rollback откатал: telegram НЕ добавлен (config == backup по доменам)
+    cfg = json.loads(xray_p.read_text(encoding="utf-8"))
+    assert "domain:telegram.org" not in cfg["routing"]["rules"][0]["domain"], (
+        "rollback при state-write-failure не откатал config к backup (telegram остался)")
+
+
+def test_routing_apply_rollback_is_atomic_on_restart_failure(tmp_path, monkeypatch):
+    """Finding 1 (#139), restart-fail ветка: rollback атомарен + провал отражён в err (Codex P1).
+    ENOSPC в rollback-replace → production валиден (не усечён), err содержит "rollback_failed"
+    (config остался новым), state НЕ откатан (иначе рассинхрон в обратную сторону), recovery идёт
+    с config как есть."""
+    xray_p = tmp_path / "xray-config.json"
+    state_p = tmp_path / "srouter.local.json"
+    _write_xray_routing_config(xray_p, BASELINE_DOMAINS, managed=True)
+    _write(state_p, {"nodes": [], "routing": {"active": BASELINE_DOMAINS, "outbound": "reality-out",
+                                              "last_applied_hash": local_state._routing_domains_hash(BASELINE_DOMAINS)}})
+
+    def failing_runner(cmd, timeout):
+        if "start" in cmd and "xray" in cmd:
+            return {"rc": 1, "out": "", "err": "xray_start_failed", "timeout": False}
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+
+    # os.replace-вызовы: 1=шаг4 modify, 2=save_state успех, 3=rollback к backup.
+    real_replace = os.replace
+    replace_calls = {"n": 0}
+
+    def flaky_replace(src, dst):
+        replace_calls["n"] += 1
+        if replace_calls["n"] == 3:  # rollback-replace после провала restart
+            raise OSError("ENOSPC")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(local_state.os, "replace", flaky_replace)
+    r = local_state.routing_apply(
+        ["telegram.org"], action="add", adopt=False,
+        config_path=str(xray_p), state_path=state_p, runner=failing_runner,
+        port_checker=_port_checker_settle_then_up(),
+    )
+    assert r["ok"] is False
+    err = r.get("err", "")
+    assert err.startswith("restart_failed"), err
+    # (Codex P1) провал rollback ЯВНО в err — config остался новым (не откатан)
+    assert "rollback_failed" in err, f"провал rollback не отражён в err: {err}"
+    # production НЕ повреждён — валидный JSON (atomic rollback пишет в tmp, провал replace не трогает)
+    on_disk = xray_p.read_text(encoding="utf-8")
+    assert on_disk, "production xray-config пуст после провала rollback (truncate без write)"
+    cfg = json.loads(on_disk)
+    assert isinstance(cfg, dict) and "routing" in cfg, (
+        "production xray-config повреждён rollback при restart-fail — ENOSPC оставил файл "
+        "в промежуточном/truncated состоянии вместо атомарного backup или нетронутого нового")
+    monkeypatch.setattr(local_state.os, "replace", real_replace)
+
+
+def test_routing_apply_state_rollback_failure_signaled_on_restart_fail(tmp_path, monkeypatch):
+    """Codex P1 round-2: в restart-fail ветке обратный save_state() (state→current_domains) может
+    вернуть None (ENOSPC) при успешном config-rollback → config старый, state НОВЫЙ → рассинхрон.
+    Раньше результат save_state игнорировался, err молчал. Теперь err содержит явный признак
+    'rollback_failed_state_kept_new' (config откатан, state остался новым)."""
+    xray_p = tmp_path / "xray-config.json"
+    state_p = tmp_path / "srouter.local.json"
+    _write_xray_routing_config(xray_p, BASELINE_DOMAINS, managed=True)
+    _write(state_p, {"nodes": [], "routing": {"active": BASELINE_DOMAINS, "outbound": "reality-out",
+                                              "last_applied_hash": local_state._routing_domains_hash(BASELINE_DOMAINS)}})
+
+    def failing_runner(cmd, timeout):
+        if "start" in cmd and "xray" in cmd:
+            return {"rc": 1, "out": "", "err": "xray_start_failed", "timeout": False}
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+
+    # state-rollback теперь byte-exact через _atomic_write_text (не save_state). Считаем вызовы:
+    # 1=шаг4 config-modify, 2=config-rollback (backup), 3=state-rollback (original_state_text).
+    # Падение на 3-м → config откатан (старый), state остаётся НОВЫМ → рассинхрон.
+    real_aw = local_state._atomic_write_text
+    aw_calls = {"n": 0}
+
+    def flaky_aw(path, text):
+        aw_calls["n"] += 1
+        if aw_calls["n"] == 3:  # state-rollback после успешного config-rollback
+            return False
+        return real_aw(path, text)
+
+    monkeypatch.setattr(local_state, "_atomic_write_text", flaky_aw)
+    r = local_state.routing_apply(
+        ["telegram.org"], action="add", adopt=False,
+        config_path=str(xray_p), state_path=state_p, runner=failing_runner,
+        port_checker=_port_checker_settle_then_up(),
+    )
+    assert r["ok"] is False
+    err = r.get("err", "")
+    assert err.startswith("restart_failed"), err
+    # state-rollback провален — ЯВНЫЙ признак в err (config откатан к backup, state остался новым)
+    assert "rollback_failed_state_kept_new" in err, (
+        f"провал state-rollback замаскирован в err (рассинхрон config↔state): {err}")
+    # config-rollback УСПЕШЕН → config == backup (telegram НЕ добавлен)
+    cfg = json.loads(xray_p.read_text(encoding="utf-8"))
+    assert "domain:telegram.org" not in cfg["routing"]["rules"][0]["domain"], (
+        "config-rollback провален, хотя должен был пройти (state был отдельной ошибкой)")
+    # changed=True — durable НЕ равен исходному (state остался новым)
+    assert r["changed"] is True
+
+
+def test_routing_apply_full_rollback_reports_changed_false_on_restart_fail(tmp_path, monkeypatch):
+    """Codex P2 round-2: при ПОЛНОМ успешном rollback (config И state откатаны) durable-состояние
+    совпадает с исходным → changed=False (не ложно сообщает об изменении). Контракт результата
+    точен, даже если CLI сначала смотрит на ok."""
+    xray_p = tmp_path / "xray-config.json"
+    state_p = tmp_path / "srouter.local.json"
+    _write_xray_routing_config(xray_p, BASELINE_DOMAINS, managed=True)
+    _write(state_p, {"nodes": [], "routing": {"active": BASELINE_DOMAINS, "outbound": "reality-out",
+                                              "last_applied_hash": local_state._routing_domains_hash(BASELINE_DOMAINS)}})
+
+    def failing_runner(cmd, timeout):
+        if "start" in cmd and "xray" in cmd:
+            return {"rc": 1, "out": "", "err": "xray_start_failed", "timeout": False}
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+
+    r = local_state.routing_apply(
+        ["telegram.org"], action="add", adopt=False,
+        config_path=str(xray_p), state_path=state_p, runner=failing_runner,
+        port_checker=_port_checker_settle_then_up(),
+    )
+    assert r["ok"] is False
+    err = r.get("err", "")
+    assert err.startswith("restart_failed"), err
+    # ПОЛНЫЙ rollback (config И state) → нет rollback_failed-признаков в err
+    assert "rollback_failed" not in err, f"ожидался полный rollback, но err сигнализирует провал: {err}"
+    # durable == исходное (config и state откатаны) → changed=False
+    assert r["changed"] is False, (
+        "changed=True при полном успешном rollback — durable не изменился, контракт лжив")
+    cfg = json.loads(xray_p.read_text(encoding="utf-8"))
+    assert "domain:telegram.org" not in cfg["routing"]["rules"][0]["domain"]
+
+
+def test_routing_apply_full_rollback_restores_legacy_state_byte_exact(tmp_path):
+    """Codex round-3 P2: legacy-state БЕЗ секции routing ({\"nodes\":[]}). Шаг-5 promote добавляет
+    секцию routing. При restart-fail полный rollback должен восстановить state BYTE-EXACT (без
+    routing-секции), а не только перезаписать routing-поля. Раньше state-rollback реконструировал
+    routing, оставляя legacy-state мутированным (добавлена секция) → changed=False лжив.
+
+    Воспроизведение: hash-drift guard не сработает (managed=True, но state без last_applied_hash —
+    stored_hash пуст, проверка пропускается). promote добавляет routing; rollback восстанавливает
+    исходный {\"nodes\":[]} byte-exact."""
+    xray_p = tmp_path / "xray-config.json"
+    state_p = tmp_path / "srouter.local.json"
+    _write_xray_routing_config(xray_p, BASELINE_DOMAINS, managed=True)
+    # legacy state БЕЗ секции routing — promotes добавит её
+    _write(state_p, {"nodes": []})
+    original_state_text = state_p.read_text(encoding="utf-8")
+
+    def failing_runner(cmd, timeout):
+        if "start" in cmd and "xray" in cmd:
+            return {"rc": 1, "out": "", "err": "xray_start_failed", "timeout": False}
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+
+    r = local_state.routing_apply(
+        ["telegram.org"], action="add", adopt=False,
+        config_path=str(xray_p), state_path=state_p, runner=failing_runner,
+        port_checker=_port_checker_settle_then_up(),
+    )
+    assert r["ok"] is False
+    assert r.get("err", "").startswith("restart_failed")
+    assert "rollback_failed" not in r.get("err", ""), r
+    # КРИТИЧНО: state восстановлен byte-exact — legacy {\"nodes\":[]} без навязанной routing-секции
+    assert state_p.read_text(encoding="utf-8") == original_state_text, (
+        "state-rollback не восстановил legacy-state byte-exact: навязанная секция routing осталась "
+        "(реконструкция полей вместо восстановления raw-снимка)")
+    assert r["changed"] is False, "changed=True при полном rollback — durable == исходное"
+
+
+def test_routing_apply_serializes_concurrent_apply_no_lost_update(tmp_path, monkeypatch):
+    """Finding 2 (#139): process-safe flock на xray-config. Два конкурирующих apply (add A, add B)
+    под блокировкой СЕРИАЛИЗУЮТСЯ — нет lost-update.
+
+    Воспроизведение race БЕЗ lock: A читает backup (step 3), но ЕЩЁ не записал new config (step 4),
+    когда B входит — B читает тот же baseline, полностью отрабатывает (записывает B.example), затем
+    A дописывает свой new config (только A.example), затирая B.example → потерян B. Чтобы вскрыть
+    именно окно между A.read и A.write, барьер ставим ВНУТРИ первого вызова _atomic_write_text потока
+    A (его step-4 modify): A держит lock, ждёт; B заходит и должен БЛОКИРОВАТЬСЯ на flock.
+    Без flock B успевает полностью выполниться в этом окне → lost-update."""
+    import threading
+    xray_p = tmp_path / "xray-config.json"
+    state_p = tmp_path / "srouter.local.json"
+    _write_xray_routing_config(xray_p, BASELINE_DOMAINS, managed=True)
+    _write(state_p, {"nodes": [], "routing": {"active": BASELINE_DOMAINS, "outbound": "reality-out",
+                                              "last_applied_hash": local_state._routing_domains_hash(BASELINE_DOMAINS)}})
+
+    # Барьер: ПЕРВЫЙ _atomic_write_text (step-4 modify потока A) открывает шлагбаум для B и ждёт
+    # release, держа lock. Это воспроизводит окно read→write: A прочитал backup, мутирует, но запись
+    # отложена. Без flock B в этом окне успевает полностью прочитать+записать+рестартнуть → lost-update.
+    a_write_entered = threading.Event()
+    a_release = threading.Event()
+    a_done = threading.Event()
+    real_atomic_write = local_state._atomic_write_text
+    write_seen = {"n": 0}
+
+    def barrier_atomic_write(path, text):
+        write_seen["n"] += 1
+        if write_seen["n"] == 1:  # step-4 modify потока A
+            a_write_entered.set()
+            a_release.wait(timeout=5.0)  # A держит lock, B пытается войти
+        return real_atomic_write(path, text)
+
+    monkeypatch.setattr(local_state, "_atomic_write_text", barrier_atomic_write)
+
+    results = {}
+    errors = {}
+
+    def apply(label):
+        try:
+            results[label] = local_state.routing_apply(
+                [f"{label}.example"], action="add", adopt=False,
+                config_path=str(xray_p), state_path=state_p,
+                runner=_ok_runner([]),
+                port_checker=_port_checker_settle_then_up(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            errors[label] = repr(exc)
+        finally:
+            if label == "A":
+                a_done.set()
+
+    th_a = threading.Thread(target=apply, args=("A",), name="apply-A")
+    th_b = threading.Thread(target=apply, args=("B",), name="apply-B")
+
+    th_a.start()
+    # A заходит, берёт flock, доходит до step-4 modify (a_write_entered). Теперь стартуем B.
+    assert a_write_entered.wait(timeout=5.0), "A не дошёл до step-4 modify за отведённое время"
+    th_b.start()
+    th_b.join(timeout=3.0)
+    # B должен БЛОКИРОВАТЬСЯ на flock (A держит lock в step-4) — не завершился и не упал.
+    assert not errors, f"apply упал исключением вместо ожидания lock: {errors}"
+    assert th_b.is_alive(), (
+        "B не заблокировался на flock — concurrent read-modify-write выполнился без сериализации, "
+        "пока A держал lock в critical section (lost-update окно не закрыто)")
+    # Отпускаем A → step-4 дописывает A.example, затем restart, отпускает lock → B входит,
+    # читает свежий config (с A.example) и добавляет B.example. lost-update нет.
+    a_release.set()
+    th_a.join(timeout=5.0)
+    th_b.join(timeout=5.0)
+    assert not errors, f"apply упал исключением: {errors}"
+
+    cfg = json.loads(xray_p.read_text(encoding="utf-8"))
+    domains = cfg["routing"]["rules"][0]["domain"]
+    assert "domain:A.example" in domains, f"домен A потерян (lost-update): {domains}"
+    assert "domain:B.example" in domains, f"домен B потерян (lost-update): {domains}"
+
+
+def test_routing_apply_lock_released_after_success(tmp_path):
+    """#139: flock обязан отпускаться после успешного apply — иначе следующий (последовательный)
+    apply зависнет навечно, что для 24/7 CLI недопустимо. Два последовательных apply без
+    перекрытия — оба завершаются за разумное время."""
+    xray_p = tmp_path / "xray-config.json"
+    state_p = tmp_path / "srouter.local.json"
+    _write_xray_routing_config(xray_p, BASELINE_DOMAINS, managed=True)
+    _write(state_p, {"nodes": [], "routing": {"active": BASELINE_DOMAINS, "outbound": "reality-out",
+                                              "last_applied_hash": local_state._routing_domains_hash(BASELINE_DOMAINS)}})
+    r1 = local_state.routing_apply(
+        ["A.example"], action="add", adopt=False,
+        config_path=str(xray_p), state_path=state_p, runner=_ok_runner([]),
+        port_checker=_port_checker_settle_then_up(),
+    )
+    r2 = local_state.routing_apply(
+        ["B.example"], action="add", adopt=False,
+        config_path=str(xray_p), state_path=state_p, runner=_ok_runner([]),
+        port_checker=_port_checker_settle_then_up(),
+    )
+    assert r1["ok"] is True and r2["ok"] is True, (r1, r2)
+    cfg = json.loads(xray_p.read_text(encoding="utf-8"))
+    domains = cfg["routing"]["rules"][0]["domain"]
+    assert "domain:A.example" in domains and "domain:B.example" in domains

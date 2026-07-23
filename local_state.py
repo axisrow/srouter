@@ -625,6 +625,69 @@ def _fsync_parent_dir(path):
         os.close(fd)
 
 
+def _atomic_write_text(path, text):
+    """Атомарная запись произвольного текста в path (tmp + flush + fsync + rename + fsync_dir).
+
+    Канон atomic-save (эталон save_state): никогда не truncate production-файл напрямую — пишем во
+    временный файл, затем atomic-rename. Если диск откажет (ENOSPC/IO-error) на любой стадии —
+    production-файл остаётся НЕТРОНУТЫМ (либо старое содержимое целиком, либо успешно заменённое
+    новое), никогда не в промежуточном/truncated состоянии. #139: единый примитив для шага modify
+    И обоих rollback-веток routing_apply, чтобы откат конфига тоже был атомарным.
+
+    Возвращает True при успехе, False при OSError/любом провале записи (не бросает)."""
+    p = Path(path)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, p)  # atomic rename
+        _fsync_parent_dir(p)
+    except OSError:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+    return True
+
+
+def _routing_config_lock(config_path):
+    """Context-manager process-safe exclusive lock на xray-config.json (flock LOCK_EX).
+
+    #139 Finding 2: serialize concurrent routing_apply (ручной `srouter routing` + install/future
+    gen_xray_config). Канон — однопользовательский CLI, не демон; реалистичный race — два
+    одновременных вызова в узкое окно read->write. flock блокирующий: второй apply ждёт отпускания
+    lock первым, не читая stale snapshot -> нет lost-update (затирания доменов). Блокировка
+    намеренно держится через restart xray, т.к. stale-snapshot замена после restart — ядро дыры.
+
+    Адаптивный lockfile: создаётся .lock рядом с config. Файл НЕ читается/не пишется как данные —
+    только flock по fd; содержимое не валидируется (наследует failure-mode flock: lock-файл может
+    остаться на диске, но это безобидно — следующий apply открывает и flock'ит его же)."""
+    import contextlib
+    import fcntl
+
+    lock_p = Path(config_path).with_name(Path(config_path).name + ".lock")
+
+    @contextlib.contextmanager
+    def _cm():
+        lock_p.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(lock_p, os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)  # блокирует до отпускания другим процессом/потоком
+            yield
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(fd)
+
+    return _cm()
+
+
 def preflight_state_write(path=None):
     """Проверить реальный atomic-write путь для state до privileged throttle apply.
 
@@ -912,6 +975,10 @@ def routing_apply(hosts, *, action="add", adopt=False, outbound=DEFAULT_ROUTING_
     state-write, restart) — откат к исходному config (и state, если restart упал после успешной
     записи state), никогда не оставляя config и state рассинхронизированными. Существующий, но
     битый state-файл никогда не заменяется дефолтом (data-loss guard).
+    Concurrency/atomicity (#139): критическая секция (read backup-snapshot → modify → restart)
+    под process-safe flock на xray-config.json — конкурирующие apply сериализуются, нет lost-update.
+    Все записи конфига (modify + ОБОИ rollback-ветки) атомарны (_atomic_write_text: tmp+fsync+rename),
+    ENOSPC/IO-error при rollback не повреждают production-файл.
 
     Возвращает {ok, changed, err}. Не бросает (fail-soft как sync_route_ip_from_xray).
     """
@@ -921,6 +988,30 @@ def routing_apply(hosts, *, action="add", adopt=False, outbound=DEFAULT_ROUTING_
     except Exception:
         install_lib = None
 
+    # ВСЯ транзакция (read config → read state → backup → modify → restart) под process-safe
+    # exclusive flock на xray-config: критическая секция начинается С ЧТЕНИЯ config, не с записи —
+    # иначе второй apply успевает закешировать stale snapshot ДО блокировки и затирает первый при
+    # своей записи (lost-update). flock сериализует конкурирующие apply (ручной `srouter routing` ×
+    # install/будущий gen_xray_config). #139 Finding 2.
+    try:
+        with _routing_config_lock(config_path):
+            return _routing_apply_locked(
+                config_path, state_path, outbound, hosts, action, adopt, runner, port_checker,
+                install_lib,
+            )
+    except OSError:
+        # lockfile не создался/не открылся — fail-closed: не мутируем config без сериализации.
+        return {"ok": False, "changed": False, "err": "config_lock_failed"}
+
+
+def _routing_apply_locked(config_path, state_path, outbound, hosts, action, adopt, runner,
+                          port_checker, install_lib):
+    """Шаги 1..6 routing_apply под _routing_config_lock. Вынесено, чтобы lock держался от чтения
+    config до завершения restart/recovery (включая все stale-snapshot-чувствительные шаги).
+
+    Внутри lock: read config/state → backup → atomic modify → state-write → restart (с atomic
+    rollback при провале). Rollback-записи атомарны (_atomic_write_text), не truncate+write —
+    #139 Finding 1. Возвращает {ok, changed, err}. Не бросает (fail-soft)."""
     # 1. читать config (fail-soft)
     try:
         data = json.loads(Path(config_path).read_text(encoding="utf-8"))
@@ -974,11 +1065,17 @@ def routing_apply(hosts, *, action="add", adopt=False, outbound=DEFAULT_ROUTING_
     if new_domains == current_domains:
         return {"ok": True, "changed": False, "err": ""}  # idempotent, restart не нужен
 
-    # 3. backup (two-phase: восстановим при ошибке restart)
+    # 3. backup (two-phase: восстановим при ошибке restart) — читаем СВЕЖИЙ config под lock.
+    #    state_text — raw-снимок state ДО любых мутаций (шаг 5 может добавить секцию routing в
+    #    legacy-state без неё; реконструкция только routing-полей при rollback оставила бы state
+    #    мутированным → byte-exact rollback через raw-снимок, как для config. Codex round-3 P2).
     config_p = Path(config_path)
     backup_text = config_p.read_text(encoding="utf-8")
+    state_p = Path(state_path) if state_path else _DEFAULT_PATH
+    state_existed = state_p.exists()
+    original_state_text = state_p.read_text(encoding="utf-8") if state_existed else ""
 
-    # 4. modify rule in-place copy + atomic write
+    # 4. modify rule in-place copy + atomic write (tmp+fsync+replace — единый _atomic_write_text)
     new_rule = dict(rule)
     new_rule["domain"] = new_domains
     new_rule[ROUTING_MARKER] = True
@@ -987,15 +1084,7 @@ def routing_apply(hosts, *, action="add", adopt=False, outbound=DEFAULT_ROUTING_
     new_data = dict(data)
     new_data["routing"] = dict(routing)
     new_data["routing"]["rules"] = new_rules
-    try:
-        tmp = config_p.with_suffix(config_p.suffix + ".tmp")
-        tmp.write_text(json.dumps(new_data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        tmp.replace(config_p)
-    except Exception:
-        try:
-            tmp.unlink(missing_ok=True)  # type: ignore[possibly-undefined]
-        except (OSError, UnboundLocalError):
-            pass
+    if not _atomic_write_text(config_p, json.dumps(new_data, ensure_ascii=False, indent=2) + "\n"):
         return {"ok": False, "changed": False, "err": "config_write_failed"}
 
     # 5. state-write ДО restart (транзакционность: если state не запишется — откатываем config и НЕ
@@ -1011,11 +1100,13 @@ def routing_apply(hosts, *, action="add", adopt=False, outbound=DEFAULT_ROUTING_
     except Exception:
         state_write_ok = False
     if not state_write_ok:
-        try:
-            config_p.write_text(backup_text, encoding="utf-8")
-        except OSError:
-            pass
-        return {"ok": False, "changed": False, "err": "state_write_failed"}
+        # atomic rollback: tmp+fsync+replace, не truncate+write (ENOSPC не повредит production).
+        # ПРОВЕРЯЕМ результат rollback (Codex P1): провал rollback-replace оставляет config новым,
+        # а state не записан → рассинхрон config↔state. Явно сообщаем rollback_failed, не маскируем
+        # под state_write_failed (иначе хранитель рассинхрона в неведении о реальном состоянии config).
+        rollback_ok = _atomic_write_text(config_p, backup_text)
+        err = "state_write_failed" if rollback_ok else "state_write_failed_rollback_failed"
+        return {"ok": False, "changed": not rollback_ok, "err": err}
 
     # 6. restart xray (fail-closed: при провале — восстановить config+state И повторно перезапустить
     #    xray СО СТАРЫМ восстановленным конфигом. _restart_component уже сделал stop к моменту провала
@@ -1027,17 +1118,34 @@ def routing_apply(hosts, *, action="add", adopt=False, outbound=DEFAULT_ROUTING_
         except Exception:
             res = {"rc": 1, "err": "restart_exception"}
         if res.get("rc") != 0 or res.get("timeout"):
-            try:
-                config_p.write_text(backup_text, encoding="utf-8")
-            except OSError:
-                pass
-            try:
-                state["routing"]["active"] = current_domains
-                state["routing"]["outbound"] = outbound
-                state["routing"]["last_applied_hash"] = _routing_domains_hash(current_domains)
-                save_state(state, state_path)
-            except Exception:
-                pass
+            # atomic rollback к backup (tmp+fsync+replace); провал записи не оставляет config
+            # усечённым/молча неоткаченным — #139 Finding 1. ПРОВЕРЯЕМ результат config-rollback
+            # (Codex P1 round-1): если rollback не удался — config остаётся новым. Тогда state НЕ
+            # откатываем (иначе рассинхрон в обратную сторону: config новый, state откатан).
+            # ПРОВЕРЯЕМ результат state-rollback (Codex P1 round-2): save_state может вернуть None
+            # (ENOSPC) → config старый, state новый → рассинхрон. Оба исхода отражаются в err,
+            # changed = False только при ПОЛНОМ успешном rollback (durable == исходное).
+            config_rollback_ok = _atomic_write_text(config_p, backup_text)
+            # state-rollback: byte-exact восстановление raw-снимка original_state_text (а не
+            # реконструкция routing-полей — иначе legacy-state без секции routing остаётся
+            # мутированным после успешной записи, changed=False лжив. Codex round-3 P2).
+            # Если state-файла изначально не было — удаляем созданный шагом-5.
+            state_rollback_ok = False
+            if config_rollback_ok:
+                try:
+                    if state_existed:
+                        state_rollback_ok = _atomic_write_text(state_p, original_state_text)
+                    else:
+                        state_p.unlink(missing_ok=True)
+                        state_rollback_ok = True
+                except OSError:
+                    state_rollback_ok = False
+            # err-признаки рассинхрона
+            note = ""
+            if not config_rollback_ok:
+                note = "; rollback_failed_config_kept_new"
+            elif not state_rollback_ok:
+                note = "; rollback_failed_state_kept_new"
             recovery_err = ""
             try:
                 recovery = install_lib._restart_component("xray", runner, port_checker=port_checker)
@@ -1045,7 +1153,10 @@ def routing_apply(hosts, *, action="add", adopt=False, outbound=DEFAULT_ROUTING_
                     recovery_err = f"; recovery_restart_failed:{recovery.get('err', 'unknown')}"
             except Exception:
                 recovery_err = "; recovery_restart_exception"
-            return {"ok": False, "changed": False,
-                    "err": f"restart_failed:{res.get('err', 'unknown')}{recovery_err}"}
+            # changed=True если что-то осталось изменённым (не полный rollback); False при полном откате
+            changed = not (config_rollback_ok and state_rollback_ok)
+            return {"ok": False, "changed": changed,
+                    "err": f"restart_failed:{res.get('err', 'unknown')}{note}{recovery_err}"}
 
     return {"ok": True, "changed": True, "err": ""}
+
