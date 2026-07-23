@@ -146,6 +146,50 @@ def test_find_managed_block_rejects_equal_markers():
         find_managed_block("same\nsame\n", "same", "same")
 
 
+# ============================ line-boundary invariant (cycle-review cycle-2 FIX, codex 0.99) ============================
+# Маркеры — shell-комментарии (# ...). Если контент ПРИКЛЕЕН к маркеру в той же строке (без newline),
+# он инертен (часть комментария). Парсер ОБЯЗАН считать это malformed-boundary → None (fail-closed):
+# иначе remove_managed_block срежет блок по байтам END-маркера, оставив glued-суффикс standalone
+# ИСПОЛНЯЕМОЙ строкой .zshrc → uninstall активирует ранее закомментированную команду (fail-open).
+# Инвариант: end_marker обязан завершаться newline или EOF; begin_marker — начинаться на line-boundary
+# (после newline или в начале content).
+def test_find_managed_block_rejects_end_with_glued_trailing_content():
+    """END-маркер + glued content без newline (ENDecho ...) → malformed → None.
+
+    Воспроизведение codex critical: END+echo инертен (часть комментария) до remove; без line-boundary
+    проверки remove оставил бы standalone исполняемую строку → fail-open активации закомментированного."""
+    content = "pre\n" + _block_text() + "echo ACTIVATED\n"  # echo приклеен к END без newline
+    assert find_managed_block(content, BEG, END) is None
+
+
+def test_find_managed_block_rejects_begin_with_glued_leading_content():
+    """Glued content перед BEGIN без newline (fooBEGIN ...) → malformed → None.
+
+    Симметрия: BEGIN обязан начинаться на line-boundary (после newline/в начале), иначе slice может
+    разрезать чужую строку."""
+    content = "prefix-text" + BEG + "\nbody\n" + END + "\n"  # prefix приклеен к BEGIN
+    assert find_managed_block(content, BEG, END) is None
+
+
+def test_find_managed_block_accepts_end_at_eof():
+    """END-маркер в самом EOF (без trailing newline) → валиден (EOF — это line-boundary)."""
+    content = "pre\n" + _block_text()  # _block_text заканчивается END, без trailing \n
+    result = find_managed_block(content, BEG, END)
+    assert result is not None  # EOF — допустимая граница для END
+
+
+def test_find_managed_block_accepts_end_followed_by_newline():
+    """END-маркер + newline (обычный install-случай) → валиден."""
+    content = "pre\n" + _block_text() + "\npost\n"
+    assert find_managed_block(content, BEG, END) is not None
+
+
+def test_find_managed_block_accepts_begin_at_content_start():
+    """BEGIN в самом начале content (без preceding newline) → валиден (старт content — line-boundary)."""
+    content = _block_text() + "\n"
+    assert find_managed_block(content, BEG, END) is not None
+
+
 # ============================ replace_managed_block ============================
 def test_replace_managed_block_swaps_span():
     """replace_managed_block заменяет блок на new_span, сохраняя окружение."""
@@ -226,20 +270,21 @@ def test_remove_managed_block_block_only_content():
     assert removed == "\n"  # before пуст → rstrip → "\n"
 
 
-def test_remove_managed_block_tight_trailing_content():
-    """Блок сразу (без \\n) следует за контентом/перед контентом — remove сшивает окружение корректно.
+def test_remove_managed_block_tight_trailing_is_fail_closed():
+    """Tight-trailing (END + glued content без newline) → find_managed_block None → remove НЕ вызывается.
 
-    Lock-тест на edge-case, не покрытый install-style append (где блок обрамлён \\n). cycle-review
-    step-9: поведение верифицировано byte-for-byte vs прежний remove-код, здесь фиксируем в suite,
-    чтобы мутация newline-cleanup (например, потеря rstrip) падала на этом случае."""
-    # pre\n + BLOCK + post (без newline между BLOCK и post).
+    cycle-review cycle-2 FIX (codex critical 0.99): ранее tight-trailing кодировал unsafe-transform —
+    END+echo (инертен, часть комментария) после remove становился standalone исполняемой строкой →
+    uninstall активировал закомментированную команду (fail-open). Теперь line-boundary invariant
+    считает tight-trailing malformed → find_managed_block возвращает None → consumer оставляет .zshrc
+    byte-for-byte нетронутым (fail-closed). Этот тест фиксирует новое безопасное поведение."""
+    # pre\n + BLOCK + post (glued к END без newline) — malformed boundary.
     content = "pre\n" + _block_text() + "post\n"
-    block = find_managed_block(content, BEG, END)
-    assert block is not None
-    removed = remove_managed_block(content, block)
-    assert BEG not in removed and END not in removed
-    # Окружение сшито: "pre\n" + "post\n" (before="pre" оставляет один \n, content[end:]="post\n").
-    assert removed == "pre\npost\n"
+    # find_managed_block обязан отвергнуть: glued-trailing → не валидный line-boundary.
+    assert find_managed_block(content, BEG, END) is None
+    # remove_managed_block не вызывается (block is None). Если бы caller вызвал — ValueError (контракт).
+    # Потребитель (srouter._remove_codex_zsh_function) видит None → возвращает «повреждённый маркер»,
+    # .zshrc остаётся нетронутым — это и есть fail-closed.
 
 
 def test_remove_managed_block_none_raises():

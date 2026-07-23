@@ -80,6 +80,19 @@ def find_managed_block(content: str, begin_marker: str, end_marker: str) -> Opti
     end_idx = content.find(end_marker)
     if not (0 <= begin_idx < end_idx):  # упорядоченность: begin строго перед end (реверс → None).
         return None
+    # cycle-review cycle-2 FIX (codex critical 0.99) — line-boundary invariant: маркеры обязаны
+    # занимать ПОЛНЫЕ строки. Маркеры — shell-комментарии (# ...); если контент glued к маркеру в той же
+    # строке (без newline), он инертен (часть комментария). Без этой проверки remove_managed_block
+    # срезал бы блок по байтам END-маркера, оставив glued-суффикс standalone ИСПОЛНЯЕМОЙ строкой →
+    # uninstall активировал бы ранее закомментированную команду (fail-open). Поэтому:
+    #   - BEGIN обязан начинаться на line-boundary: в начале content (begin_idx==0) ИЛИ сразу после \n.
+    #   - END обязан завершаться на line-boundary: за ним \n ИЛИ EOF (end_idx+len == len(content)).
+    # Иначе → None (malformed boundary, fail-closed: consumer оставляет .zshrc byte-for-byte нетронутым).
+    if begin_idx != 0 and content[begin_idx - 1] != "\n":
+        return None  # glued leading content перед BEGIN — malformed.
+    end_after = end_idx + len(end_marker)
+    if end_after != len(content) and content[end_after] != "\n":
+        return None  # glued trailing content за END (без newline/EOF) — malformed → fail-closed.
     end_idx_inclusive = end_idx + len(end_marker)
     span_text = content[begin_idx:end_idx_inclusive]
     return ManagedBlock(begin_idx=begin_idx, end_idx=end_idx,

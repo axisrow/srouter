@@ -1216,6 +1216,42 @@ def test_remove_codex_zsh_function_reversed_markers_safe_noop(monkeypatch, tmp_p
     assert content.count("export UNIQUE=line1") == 1, "контент НЕ дублирован"
 
 
+def test_remove_codex_zsh_function_tight_trailing_fail_closed(monkeypatch, tmp_path):
+    """cycle-review cycle-2 FIX (codex critical 0.99): uninstall с tight-trailing (контент glued к END-маркеру
+    без newline) — SAFE NO-OP, НЕ активирует закомментированную команду.
+
+    END-маркер — shell-комментарий (# ...). Glued-суффикс (ENDecho ACTIVATED) инертен — часть комментария.
+    Без line-boundary инварианта remove_managed_block срезал бы блок по байтам END, оставив
+    'echo ACTIVATED' standalone исполняемой строкой → uninstall активировал бы закомментированную команду
+    при следующем старте шелла (fail-open, потенциально деструктивно). Теперь line-boundary invariant
+    (централизованный в marker_block.find_managed_block) считает tight-trailing malformed → None →
+    _remove_codex_zsh_function видит block is None → отказ, .zshrc byte-for-byte нетронут."""
+    home = _mock_home(monkeypatch, tmp_path)
+    zshrc = home / ".zshrc"
+    # END-маркер + glued команда без newline (команда инертна — часть комментария END'а).
+    malformed_block = (
+        f"{srouter.ZSHRC_CODEX_FUNC_MARKER_BEGIN}\n"
+        'if (( ! ${+aliases[codex]} )); then\n'
+        '  function codex {\n'
+        '    "$HOME/bin/codex-srouter" "$@"\n'
+        '  }\n'
+        "fi\n"
+        f"{srouter.ZSHRC_CODEX_FUNC_MARKER_END}echo DESTRUCTIVE_COMMAND\n"
+    )
+    zshrc.write_text(malformed_block, encoding="utf-8")
+
+    note = srouter._remove_codex_zsh_function()
+
+    content = zshrc.read_text(encoding="utf-8")
+    assert content == malformed_block, \
+        f"tight-trailing malformed boundary → byte-for-byte safe no-op (НЕ активирует glued команду): {note}"
+    # Glued команда осталась инертной (часть END-комментария), НЕ стала standalone исполняемой строкой.
+    assert content.count("echo DESTRUCTIVE_COMMAND") == 1
+    # Ни одна строка не равна чистой исполняемой команде (она всё ещё glued к маркеру в той же строке).
+    assert "echo DESTRUCTIVE_COMMAND" not in content.split("\n"), \
+        "glued команда НЕ активирована (осталась частью комментария END-маркера)"
+
+
 def test_install_zsh_function_updates_stale_legacy_path(monkeypatch, tmp_path):
     """cycle-review FIX B (codex critical): существующий managed zsh-блок со СТАРЫМ путём ~/bin/codex
     (от установки до rename) → install ОБНОВЛЯЕТ его на ~/bin/codex-srouter.
