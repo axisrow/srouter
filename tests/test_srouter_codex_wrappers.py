@@ -1123,6 +1123,99 @@ def test_install_keeps_legacy_when_new_wrapper_not_installed(monkeypatch, tmp_pa
     assert (bin_dir / "codex").read_text(encoding="utf-8") == legacy_content, "legacy не изменён"
 
 
+def test_codex_bin_path_rejects_managed_legacy_wrapper(monkeypatch, tmp_path):
+    """cycle-review cycle-4 FIX #1 (codex critical 0.99): _codex_bin_path ОТВЕРГАЕТ любой кандидат с
+    managed-маркером (не только codex-srouter), как wrapper template делает marker-skip. Иначе legacy
+    managed ~/bin/codex (первый в PATH) misclassify как real binary → install проходит → migration удаляет
+    legacy без независимого real codex → новый codex-srouter exit 127 (runtime-resolve не находит real).
+
+    Memory issue-144-wrapper-runtime-resolve: wrapper ≠ binary, runtime-resolve. install-time gate тоже
+    обязан различать managed-wrapper от real binary — по маркеру, не по пути (маркер = единственный признак)."""
+    home = _mock_home(monkeypatch, tmp_path)
+    bin_dir = home / "bin"
+    marker = srouter.CODEX_WRAPPERS[0][2]
+    # legacy managed codex в ~/bin (первый в PATH), НЕТ независимого real codex.
+    (bin_dir / "codex").write_text(f"{marker}\n#!/bin/sh\nexec /hardcoded/old/codex\n", encoding="utf-8")
+    (bin_dir / "codex").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin:/bin")
+
+    resolved = srouter._codex_bin_path()
+
+    assert resolved != str(bin_dir / "codex"), \
+        f"managed legacy wrapper НЕ принят за real binary (маркер → reject): resolved={resolved}"
+
+
+def test_install_no_delete_legacy_when_only_managed_codex_in_path(monkeypatch, tmp_path):
+    """cycle-review cycle-4 FIX #1 (интеграционный): legacy managed ~/bin/codex — ЕДИНСТВЕННЫЙ codex в PATH
+    (нет независимого real binary). Install НЕ должен мигрировать (удалять) legacy: новый codex-srouter
+    создастся, но runtime-resolve не найдёт real codex → exit 127. Migration разрешена только когда resolver
+    нашёл НЕЗАВИСИМЫЙ real codex (без managed-маркера).
+
+    Примечание: _codex_bin_path мокаем → '' (моделируем «нет независимого real codex»; в реальном окружении
+    /opt/homebrew/bin/codex может существовать и thenбы пройти — здесь изолируем именно этот класс)."""
+    home = _mock_home(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    bin_dir = home / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    marker = srouter.CODEX_WRAPPERS[0][2]
+    legacy_content = f"{marker}\n#!/bin/sh\nexec /hardcoded/old/codex\n"
+    (bin_dir / "codex").write_text(legacy_content, encoding="utf-8")
+    (bin_dir / "codex").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin:/bin")  # legacy единственный codex в PATH
+    monkeypatch.setattr(srouter, "_codex_bin_path", lambda: "")  # НЕТ независимого real codex
+
+    note = srouter._install_codex_wrappers(env)
+
+    # legacy СОХРАНЁН (нет независимого real codex → codex-srouter не встал → migration отменена).
+    assert (bin_dir / "codex").exists(), \
+        f"legacy preserved — нет независимого real codex (resolver отверг managed): {note}"
+    assert (bin_dir / "codex").read_text(encoding="utf-8") == legacy_content
+
+
+def test_install_idempotent_current_block_validates_target(monkeypatch, tmp_path):
+    """cycle-review cycle-4 FIX #2 (codex critical 0.99): existing current block (зовёт codex-srouter) при
+    target-missing НЕ рапортует чистый успех. Строка codex-srouter проверяется ПОСЛЕ ordered_pair и
+    target-gate — иначе predсуществующий блок ведёт в никуда (target удалён), а install говорит ОК."""
+    home = _mock_home(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    zshrc = home / ".zshrc"
+    # managed current block (зовёт codex-srouter), но target НЕ установлен.
+    zshrc.write_text(srouter._CODEX_FUNC_BLOCK, encoding="utf-8")
+    assert not (home / "bin" / "codex-srouter").exists()
+
+    note = srouter._install_codex_zsh_function(env)
+
+    low = note.lower()
+    # НЕ чистый «idempotent» успех — note сигнализирует проблему target. (Слово «idempotent» может быть в
+    # диагностике «не рапортую idempotent вслепую» — поэтому проверяем отсутствие чистого успеха-маркера.)
+    assert "уже в ~/.zshrc (idempotent)" not in note, \
+        f"current block при target-missing НЕ чистый idempotent-успех: {note}"
+    assert "не установлен" in low or "не валиден" in low, \
+        f"note сигнализирует невалидный target: {note}"
+
+
+def test_remove_codex_zsh_function_reversed_markers_safe_noop(monkeypatch, tmp_path):
+    """cycle-review cycle-4 FIX #3 (claude+codex critical 0.99): uninstall с реверснутыми маркерами (END
+    перед BEGIN, count==1 каждый) — SAFE NO-OP, НЕ corruption. Иначе start>end → slice overlap → дублирование
+    контента, рапорт «убрана». Замкнутый инвариант: ordered-pair parser общий для install И remove."""
+    home = _mock_home(monkeypatch, tmp_path)
+    zshrc = home / ".zshrc"
+    reversed_block = (
+        f"{srouter.ZSHRC_CODEX_FUNC_MARKER_END}\n"      # END первым (реверс)
+        "export UNIQUE=line1\n"
+        "export UNIQUE2=line2\n"
+        f"{srouter.ZSHRC_CODEX_FUNC_MARKER_BEGIN}\n"    # BEGIN вторым
+    )
+    zshrc.write_text(reversed_block, encoding="utf-8")
+
+    note = srouter._remove_codex_zsh_function()
+
+    content = zshrc.read_text(encoding="utf-8")
+    assert content == reversed_block, \
+        f"reversed markers → byte-for-byte safe no-op (НЕ corruption): {note}"
+    assert content.count("export UNIQUE=line1") == 1, "контент НЕ дублирован"
+
+
 def test_install_zsh_function_updates_stale_legacy_path(monkeypatch, tmp_path):
     """cycle-review FIX B (codex critical): существующий managed zsh-блок со СТАРЫМ путём ~/bin/codex
     (от установки до rename) → install ОБНОВЛЯЕТ его на ~/bin/codex-srouter.
