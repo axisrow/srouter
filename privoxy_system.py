@@ -46,6 +46,20 @@ OTOOL = "/usr/bin/otool"
 INSTALL_NAME_TOOL = "/usr/bin/install_name_tool"
 CODESIGN = "/usr/bin/codesign"
 
+# #152: разрешённые privoxy-уровни логирования. Канон probe-semantics-from-primary-source —
+# уровень по privoxy user-manual (раздел 7.3 Debugging, битовые значения), НЕ по аналогии/имени.
+#   0 — выкл (ДЕФОЛТ, privacy: на диск не идёт даже производное контента);
+#   1 — show each GET/POST/CONNECT request = URLs / Common Log Format (ЧУВСТВИТЕЛЬНО: URL могут
+#       содержать токены/query — dictionary-атака, см. privacy-no-content-hash-on-disk); осознанно;
+#   2 — show each connection status (open/close/timeout) — приватно (без URL/body), ловит
+#       флап/таймауты к github через 8118; рекомендуемый уровень диагностики.
+# Намеренно НЕ включает:
+#   8 — show header parsing: пишет ЗНАЧЕНИЯ заголовков (auth/cookie) на диск → чувствительно,
+#       как 1 и 32768 (канон privacy-no-content-hash-on-disk); env-ускорение его не включает;
+#   32768 — raw-запросы с заголовками/телом — ручная правка конфига, не env-переключатель.
+PRIVOXY_DEBUG_LEVELS = frozenset({0, 1, 2})
+PRIVOXY_DEBUG_ENV = "SROUTER_PRIVOXY_DEBUG"
+
 
 @dataclass(frozen=True)
 class ProtectedLayout:
@@ -145,8 +159,15 @@ def _result(ok, *, error="", **extra):
     return {"ok": bool(ok), "error": error, **extra}
 
 
-def protected_config_text(layout=DEFAULT_LAYOUT):
-    """Минимальная конфигурация bridge-only без user-writable action/filter files."""
+def protected_config_text(layout=DEFAULT_LAYOUT, debug=0):
+    """Минимальная конфигурация bridge-only без user-writable action/filter files.
+
+    debug — уровень privoxy-логирования (issue #152): 0=выкл (ДЕФОЛТ, privacy), 1=URLs (чувствительно),
+    2=connections (приватно, ловит флап). Уровень вне whitelist PRIVOXY_DEBUG_LEVELS молча опускается
+    до 0 — env-ускорение НЕ способно включить header-parsing (8, чувствительно) или raw-запросы (32768).
+    """
+    debug = debug if debug in PRIVOXY_DEBUG_LEVELS else 0
+    debug_line = f"debug {debug}\n" if debug else ""
     return (
         f"# {PROTECTED_MARKER}\n"
         "# Управляется только: srouter privoxy ...\n"
@@ -154,6 +175,7 @@ def protected_config_text(layout=DEFAULT_LAYOUT):
         f"templdir {layout.templates_dir}\n"
         f"logdir {layout.log_dir}\n"
         "logfile logfile\n"
+        f"{debug_line}"
         "listen-address 127.0.0.1:8118\n"
         "toggle 1\n"
         "enable-remote-toggle 0\n"
@@ -177,15 +199,20 @@ def _config_directives(text):
     return directives
 
 
-def validate_protected_config(text, layout=DEFAULT_LAYOUT):
-    """Fail-closed: exact minimal contract, loopback-only and fixed upstream."""
+def validate_protected_config(text, layout=DEFAULT_LAYOUT, debug=0):
+    """Fail-closed: exact minimal contract, loopback-only and fixed upstream.
+
+    debug — ожидаемый уровень логирования (#152); expected-конфиг генерируется с тем же уровнем,
+    чтобы staged_config с `debug 2` прошёл точный exact-match. Контракт остаётся строгим
+    (got != expected); параметризуется только уровень debug.
+    """
     if not isinstance(text, str) or len(text.encode("utf-8")) > 64 * 1024:
         return _result(False, error="config_size_invalid")
     if PROTECTED_MARKER not in text:
         return _result(False, error="config_marker_missing")
     try:
         got = _config_directives(text)
-        expected = _config_directives(protected_config_text(layout))
+        expected = _config_directives(protected_config_text(layout, debug=debug))
     except ValueError as exc:
         return _result(False, error=str(exc))
     if got != expected:
@@ -311,7 +338,7 @@ def _atomic_write(path, data, *, mode, uid=0, gid=0, chown=os.chown):
                 pass
 
 
-def _safe_staged_config(path, uid, layout=DEFAULT_LAYOUT):
+def _safe_staged_config(path, uid, layout=DEFAULT_LAYOUT, debug=0):
     path = Path(path)
     try:
         info = path.lstat()
@@ -326,7 +353,7 @@ def _safe_staged_config(path, uid, layout=DEFAULT_LAYOUT):
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as exc:
         return _result(False, error=f"staged_config_unreadable: {exc}")
-    checked = validate_protected_config(text, layout)
+    checked = validate_protected_config(text, layout, debug=debug)
     if not checked["ok"]:
         return checked
     return _result(True, text=text)
@@ -657,6 +684,24 @@ def _allowed_prefix(prefix):
     return resolved if resolved in {"/opt/homebrew", "/usr/local"} else ""
 
 
+def _privoxy_debug_from_env():
+    """Уровень privoxy-логирования из SROUTER_PRIVOXY_DEBUG (issue #152, канон InstallEnv.from_env).
+
+    Возвращает int из whitelist PRIVOXY_DEBUG_LEVELS; при отсутствии/нечисле/вне whitelist → 0
+    (privacy-дефолт: логирование выкл). env-ускорение НЕ способно включить header-parsing (8,
+    чувствительно: auth/cookie заголовки на диск) или raw-запросы (32768) — только осознанные
+    диагностические уровни {1, 2} (URLs осознанно, connections приватно).
+    """
+    raw = os.environ.get(PRIVOXY_DEBUG_ENV, "").strip()
+    if not raw:
+        return 0
+    try:
+        level = int(raw)
+    except ValueError:
+        return 0
+    return level if level in PRIVOXY_DEBUG_LEVELS else 0
+
+
 def _rollback_live(snapshot, *, layout, runner, checker, chown):
     _bootout(SYSTEM_DOMAIN, SYSTEM_LABEL, runner)
     _wait_port(False, checker=checker, timeout=5)
@@ -698,8 +743,12 @@ def _rollback_live(snapshot, *, layout, runner, checker, chown):
 
 def protect_as_root(*, username, uid, prefix, staged_config, layout=DEFAULT_LAYOUT,
                     runner=_run, checker=_port_open, chown=os.chown, enforce_root=True,
-                    user_home=None, config_test_runner=_run_as_nobody):
-    """Одна root-транзакция: backup → bootout user job → install → bootstrap system → verify."""
+                    user_home=None, config_test_runner=_run_as_nobody, debug=0):
+    """Одна root-транзакция: backup → bootout user job → install → bootstrap system → verify.
+
+    debug — ожидаемый уровень логирования (#152); staged_config валидируется exact-match с тем же
+    уровнем, что и был при user-side генерации (пробрасывается через privileged-helper как --debug).
+    """
     if enforce_root and os.geteuid() != 0:
         return _result(False, error="root_required")
     identity = _valid_identity(username, int(uid))
@@ -709,7 +758,7 @@ def protect_as_root(*, username, uid, prefix, staged_config, layout=DEFAULT_LAYO
     if not prefix:
         return _result(False, error="unsupported_homebrew_prefix")
 
-    checked = _safe_staged_config(staged_config, int(uid), layout)
+    checked = _safe_staged_config(staged_config, int(uid), layout, debug=debug)
     if not checked["ok"]:
         return checked
     binary = Path(prefix) / "opt" / "privoxy" / "sbin" / "privoxy"
@@ -1221,11 +1270,15 @@ def _rollback_protection(runner, layout=DEFAULT_LAYOUT):
 
 
 def protect(*, state_path, prefix="/opt/homebrew", runner=None, require_tty=True,
-            layout=DEFAULT_LAYOUT):
+            layout=DEFAULT_LAYOUT, debug=None):
     if runner is None:
         from sys_probe import run as runner
     if require_tty and not sys.stdin.isatty():
         return _result(False, error="interactive_terminal_required")
+    # #152: уровень privoxy-логирования. По умолчанию (None) — из SROUTER_PRIVOXY_DEBUG (privacy:
+    # 0 если env не задан). Явный аргумент переопределяет env (для тестов/programmatic-call).
+    if debug is None:
+        debug = _privoxy_debug_from_env()
     current = status(runner=runner, layout=layout)
     secure = (
         current["protected"]
@@ -1258,7 +1311,7 @@ def protect(*, state_path, prefix="/opt/homebrew", runner=None, require_tty=True
     staged_config = staged_dir / "config"
     try:
         os.chmod(staged_dir, 0o700)
-        staged_config.write_text(protected_config_text(layout), encoding="utf-8")
+        staged_config.write_text(protected_config_text(layout, debug=debug), encoding="utf-8")
         os.chmod(staged_config, 0o600)
         _sudo_reset(runner)
         installed = _install_helper(runner, layout)
@@ -1270,7 +1323,8 @@ def protect(*, state_path, prefix="/opt/homebrew", runner=None, require_tty=True
              "--username", pwd.getpwuid(os.getuid()).pw_name,
              "--uid", str(os.getuid()),
              "--prefix", str(prefix),
-             "--config", str(staged_config)],
+             "--config", str(staged_config),
+             "--debug", str(debug)],
             120,
         )
         outcome = _parse_helper_output(invoked)
@@ -1362,6 +1416,7 @@ def helper_main(argv=None):
     protect_parser.add_argument("--uid", required=True, type=int)
     protect_parser.add_argument("--prefix", required=True)
     protect_parser.add_argument("--config", required=True)
+    protect_parser.add_argument("--debug", type=int, default=0)
     unprotect_parser = sub.add_parser("unprotect")
     unprotect_parser.add_argument("--restore", action="store_true")
     for name in ("start", "stop", "restart", "status"):
@@ -1370,7 +1425,7 @@ def helper_main(argv=None):
 
     if args.command == "protect":
         outcome = protect_as_root(username=args.username, uid=args.uid, prefix=args.prefix,
-                                  staged_config=args.config)
+                                  staged_config=args.config, debug=args.debug)
     elif args.command == "unprotect":
         outcome = unprotect_as_root(restore=args.restore)
     else:

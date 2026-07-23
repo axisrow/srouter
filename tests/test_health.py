@@ -13,6 +13,7 @@ _claude_proxy_probe() возвращает {status, source, detail}:
 import pytest as _pytest
 
 import health
+import privoxy_system
 
 
 # Watchdog tests must not inspect the real user's launchd domain or write real lifecycle logs.
@@ -844,3 +845,119 @@ def test_watchdog_records_launchd_lifecycle(monkeypatch, tmp_path):
     health.cmd_watchdog()
 
     assert recorded == [True]
+
+
+# ============================ #152: privoxy-log observability (doctor, info-only) ============================
+# Молчаливый privoxy (config без директивы debug → logfile пуст) — observability-дыра: ни doctor,
+# ни ручная диагностика не видят, что privoxy делает с запросами (флап к github через 8118).
+# Doctor-чек показывает картину: logfile читается без sudo? debug включён? WARN при «debug on + пуст».
+
+
+def _privoxy_tmp_layout(tmp_path, *, debug=0, logfile_bytes=b""):
+    """Собирает изолированный ProtectedLayout в tmp с конфигом (debug-уровень) и logfile заданного размера.
+
+    DEFAULT_LAYOUT — frozen dataclass, патчить атрибуты нельзя; _privoxy_log_observability_check
+    принимает layout параметром (как validate_protected_config), поэтому передаём tmp-layout напрямую.
+    """
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / "logfile").write_bytes(logfile_bytes)
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    config_path = config_dir / "config"
+    config_path.write_text(
+        privoxy_system.protected_config_text(privoxy_system.DEFAULT_LAYOUT, debug=debug),
+        encoding="utf-8",
+    )
+    return privoxy_system.ProtectedLayout(
+        config_path=config_path,
+        log_dir=log_dir,
+    )
+
+
+def test_privoxy_log_check_debug_off_info_hint(tmp_path):
+    """config без debug (молчаливый, дефолт #141) → status=ok + подсказка включить SROUTER_PRIVOXY_DEBUG=2."""
+    layout = _privoxy_tmp_layout(tmp_path, debug=0, logfile_bytes=b"")
+
+    res = health._privoxy_log_observability_check(layout=layout)
+
+    assert res["status"] == "ok"
+    assert "SROUTER_PRIVOXY_DEBUG=2" in res["detail"]
+
+
+def test_privoxy_log_check_debug_on_empty_logfile_warn(tmp_path):
+    """debug включён, но logfile пустой → WARN: логирование есть, но privoxy не пишет (rights/logrotate/level?)."""
+    layout = _privoxy_tmp_layout(tmp_path, debug=2, logfile_bytes=b"")
+
+    res = health._privoxy_log_observability_check(layout=layout)
+
+    assert res["status"] == "warn"
+    assert "пуст" in res["detail"].lower() or "empty" in res["detail"].lower()
+
+
+def test_privoxy_log_check_debug_on_nonempty_logfile_ok(tmp_path):
+    """debug включён + logfile с байтами → ok (логирование реально работает)."""
+    layout = _privoxy_tmp_layout(
+        tmp_path, debug=2, logfile_bytes=b"2026-07-23 connect github.com:443\n",
+    )
+
+    res = health._privoxy_log_observability_check(layout=layout)
+
+    assert res["status"] == "ok"
+    assert "debug 2" in res["detail"]
+
+
+def test_privoxy_log_check_degrades_when_config_unreadable(tmp_path):
+    """config/logfile не существуют → не падает, отдаёт ok/info (fail-soft, как др. чеки health)."""
+    layout = privoxy_system.ProtectedLayout(
+        config_path=tmp_path / "missing-config",
+        log_dir=tmp_path / "missing-logs",
+    )
+
+    res = health._privoxy_log_observability_check(layout=layout)
+
+    assert res["status"] in ("ok", "info", "unknown")
+    assert isinstance(res["detail"], str) and res["detail"]
+
+
+def test_privoxy_log_check_debug_1_url_level_flagged_as_sensitive(tmp_path):
+    """debug 1 = URLs (чувствительно) → ok, но detail упоминает чувствительность (privacy-сигнал)."""
+    layout = _privoxy_tmp_layout(tmp_path, debug=1, logfile_bytes=b"line\n")
+
+    res = health._privoxy_log_observability_check(layout=layout)
+
+    assert res["status"] == "ok"
+    assert "debug 1" in res["detail"]
+
+
+def test_check_all_has_privoxy_log_check_info_only(monkeypatch):
+    """privoxy-log observability чек присутствует в doctor (active_claude), info-only, не роняет вердикт."""
+    _all_up_monkey(monkeypatch, probe_status="ok")
+    # doctor-only чеки, запускающие реальные subprocess'ы — мокаем (предмет теста — wiring, не они).
+    monkeypatch.setattr(health, "_privoxy_log_observability_check",
+                        lambda **kw: {"status": "warn", "detail": "mock: debug on, logfile пуст"})
+    monkeypatch.setattr(health, "_installed_versions_check",
+                        lambda: {"status": "ok", "detail": "mock", "codex": [], "claude_code": []})
+    monkeypatch.setattr(health, "_claude_transport_probe",
+                        lambda: {"status": "unknown", "detail": "mock"})
+
+    result = health.check_all(active_claude=True)
+
+    log_check = [c for c in result["checks"] if "privoxy-log" in c["name"].lower()
+                 or "observability" in c["name"].lower()]
+    assert log_check, "privoxy-log observability чек должен быть в doctor checks"
+    assert log_check[0].get("info") is True, "info-only: не driver, не роняет вердикт"
+    # info-check не входит в drivers → не влияет на агрегированный status.
+    drivers = [c for c in result["checks"] if not c.get("info")]
+    assert log_check[0] not in drivers
+
+    result = health.check_all(active_claude=True)
+
+    log_check = [c for c in result["checks"] if "privoxy-log" in c["name"].lower()
+                 or "observability" in c["name"].lower()]
+    assert log_check, "privoxy-log observability чек должен быть в doctor checks"
+    assert log_check[0].get("info") is True, "info-only: не driver, не роняет вердикт"
+    # info-check не входит в drivers → не влияет на агрегированный status.
+    drivers = [c for c in result["checks"] if not c.get("info")]
+    assert log_check[0] not in drivers
+

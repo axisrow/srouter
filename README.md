@@ -198,6 +198,18 @@ srouter privoxy status            # read-only, без пароля
 srouter privoxy restart           # каждый раз требует пароль/Touch ID
 srouter privoxy unprotect         # защищённый откат к прежней user-службе
 
+# Observability privoxy-лога (#152): по умолчанию защищённый Privoxy МОЛЧАЛИВ (privacy — на диск
+# ничего не пишется), logfile пустой. Чтобы поймать флап/таймауты к github через 8118, включи
+# логирование connections (приватно: без URL/body) при ПЕРВИЧНОЙ защите:
+SROUTER_PRIVOXY_DEBUG=2 srouter privoxy protect --strict   # debug 2 = connections в config
+# Уровни (privoxy user-manual, битовые): 2=connections (рекомендуется),
+# 1=URLs (⚠ чувствительно: токены/query пишутся на диск — только осознанно).
+# 8 (header parsing) и 32768 (raw) НЕ доступны через env — они пишут заголовки/тело на диск.
+# СМЕНА уровня на УЖЕ защищённом privoxy: protect --strict видит службу здоровой и не трогает
+# config. Чтобы изменить debug, сначала откатись: `srouter privoxy unprotect`, затем protect
+# с новым SROUTER_PRIVOXY_DEBUG (транзакционный реконфиг без unprotect — follow-up issue).
+# `srouter doctor` покажет: debug включён? logfile пуст при включённом → WARN.
+
 # Пассивно записывать будущие попытки трогать Privoxy (#122):
 srouter privoxy audit install     # потребует пароль и Full Disk Access для /usr/bin/eslogger
 srouter privoxy audit status      # состояние аудитора, без пароля
@@ -442,6 +454,18 @@ srouter privoxy protect --strict  # one-time system-domain migration; asks for a
 srouter privoxy status            # read-only, no password
 srouter privoxy restart           # requires password/Touch ID every time
 srouter privoxy unprotect         # privileged rollback to the previous user service
+
+# Privoxy log observability (#152): by default protected Privoxy is SILENT (privacy — nothing is
+# written to disk), logfile is empty. To catch flap/timeouts to github over 8118, enable connection
+# logging (private: no URL/body) at FIRST protection:
+SROUTER_PRIVOXY_DEBUG=2 srouter privoxy protect --strict   # debug 2 = connections in config
+# Levels (privoxy user-manual, bitmask): 2=connections (recommended),
+# 1=URLs (⚠ sensitive: tokens/query are written to disk — opt-in only).
+# 8 (header parsing) and 32768 (raw) are NOT exposed via env — they write headers/body to disk.
+# CHANGING the level on an ALREADY protected privoxy: protect --strict sees a healthy service and
+# leaves the config untouched. To change debug, roll back first: `srouter privoxy unprotect`, then
+# protect with a new SROUTER_PRIVOXY_DEBUG (transactional reconfigure without unprotect is a follow-up).
+# `srouter doctor` shows: is debug on? empty logfile while on → WARN.
 
 # Passively record future attempts to mutate Privoxy (#122):
 srouter privoxy audit install     # asks for authorization; /usr/bin/eslogger needs Full Disk Access

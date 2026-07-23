@@ -650,6 +650,62 @@ def _format_versions_detail(codex_bins, claude_bins):
     return "; ".join(lines)
 
 
+def _privoxy_log_observability_check(layout=privoxy_system.DEFAULT_LAYOUT):
+    """Observability privoxy-лога под protected-mode (#152): молчалив ли privoxy? logfile жив?
+
+    privoxy #141 ставится БЕЗ директивы debug → logfile всегда пустой → не поймать флап к github
+    через 8118. Чек показывает картину (как claude-proxy/versions): не роняет вердикт, WARN живёт
+    в detail. Возвращает {status, detail}:
+      status="ok"   — debug выкл (осознанно тихий, дефолт #141) ИЛИ включён и logfile пишет;
+      status="warn" — debug включён, но logfile пустой (privoxy не пишет? rights/logrotate/level?);
+      status="info" — config/logfile не читаются без sudo (права/отсутствие) — fail-soft, не гадаем.
+
+    Канон: privacy-no-content-hash-on-disk (debug 1=URLs — помечаем как чувствительный), noisy-log-
+    better-than-no-log (молчаливый privoxy = observability-дыра, подсвечиваем подсказку SROUTER_PRIVOXY_DEBUG=2).
+    """
+    try:
+        text = layout.config_path.read_text(encoding="utf-8", errors="ignore")[:16384]
+    except OSError:
+        return {"status": "info",
+                "detail": "privoxy config не читается без sudo (protected-mode) — observability недоступна"}
+    # debug-уровень из live-конфига. _config_directives из privoxy_system: ключ→значение, skip comments.
+    try:
+        directives = privoxy_system._config_directives(text)
+    except ValueError:
+        directives = {}
+    debug_raw = directives.get("debug", "0").strip()
+    try:
+        debug = int(debug_raw)
+    except ValueError:
+        debug = 0
+
+    # logfile = logdir + "logfile logfile" (ProtectedLayout.log_dir / "logfile").
+    logfile = layout.log_dir / "logfile"
+    logfile_size = -1
+    try:
+        logfile_size = logfile.stat().st_size
+    except OSError:
+        pass  # не существует / не читается — учтём ниже
+
+    if debug == 0:
+        # Молчаливый (дефолт #141) — это осознанно, но observability-дыра при флапе. Подсказка уровня.
+        return {"status": "ok",
+                "detail": ("privoxy: debug выкл (молчаливый); для диагностики флапа/таймаутов — "
+                           "SROUTER_PRIVOXY_DEBUG=2 (connections, приватно: без URL/body)")}
+
+    sensitive = " (⚠ URLs — чувствительно: токены/query пишутся на диск)" if debug == 1 else ""
+    if logfile_size == 0:
+        return {"status": "warn",
+                "detail": (f"privoxy: debug {debug} включён{sensitive}, но logfile пуст — "
+                           f"privoxy не пишет? (rights/logrotate/level/sudo при rotate)")}
+    if logfile_size > 0:
+        return {"status": "ok",
+                "detail": f"privoxy: debug {debug} включён{sensitive}; logfile {logfile_size} байт"}
+    # logfile не существует/не читается, но debug включён — странно, но не driver.
+    return {"status": "info",
+            "detail": f"privoxy: debug {debug} включён{sensitive}, но logfile не читается (права/отсутствие)"}
+
+
 def _installed_versions_check():
     """Инвентаризация codex/claude-code binary на ДИСКЕ + их версии + обёрнут ли srouter (#145).
 
@@ -870,6 +926,12 @@ def check_all(*, active_claude=False):
         iv_check = {"name": "версии (codex/claude-code на диске)",
                     "ok": True, "info": True, "detail": iv["detail"]}
         checks.append(iv_check)
+        # Privoxy-log observability (#152): молчалив ли privoxy? debug включён? logfile пишет?
+        # info-only (не driver) — картина для диагностики флапа к github через 8118; WARN в detail.
+        plo = _privoxy_log_observability_check()
+        plo_check = {"name": "privoxy-log (observability)",
+                     "ok": plo["status"] != "warn", "info": True, "detail": plo["detail"]}
+        checks.append(plo_check)
     drivers = [c for c in checks if not c.get("info")]
     all_ok = all(c["ok"] for c in drivers)
     any_ok = any(c["ok"] for c in drivers)
