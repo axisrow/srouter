@@ -1054,6 +1054,84 @@ def test_routing_apply_rollback_is_atomic_on_restart_failure(tmp_path, monkeypat
     monkeypatch.setattr(local_state.os, "replace", real_replace)
 
 
+def test_routing_apply_state_rollback_failure_signaled_on_restart_fail(tmp_path, monkeypatch):
+    """Codex P1 round-2: в restart-fail ветке обратный save_state() (state→current_domains) может
+    вернуть None (ENOSPC) при успешном config-rollback → config старый, state НОВЫЙ → рассинхрон.
+    Раньше результат save_state игнорировался, err молчал. Теперь err содержит явный признак
+    'rollback_failed_state_kept_new' (config откатан, state остался новым)."""
+    xray_p = tmp_path / "xray-config.json"
+    state_p = tmp_path / "srouter.local.json"
+    _write_xray_routing_config(xray_p, BASELINE_DOMAINS, managed=True)
+    _write(state_p, {"nodes": [], "routing": {"active": BASELINE_DOMAINS, "outbound": "reality-out",
+                                              "last_applied_hash": local_state._routing_domains_hash(BASELINE_DOMAINS)}})
+
+    def failing_runner(cmd, timeout):
+        if "start" in cmd and "xray" in cmd:
+            return {"rc": 1, "out": "", "err": "xray_start_failed", "timeout": False}
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+
+    # Первый save_state (step-5 promote) успешен; ВТОРОЙ save_state (state-rollback) падает.
+    save_calls = {"n": 0}
+    real_save_state = local_state.save_state
+
+    def flaky_save_state(state, path=None):
+        save_calls["n"] += 1
+        if save_calls["n"] == 2:  # state-rollback после провала restart
+            return None
+        return real_save_state(state, path)
+
+    monkeypatch.setattr(local_state, "save_state", flaky_save_state)
+    r = local_state.routing_apply(
+        ["telegram.org"], action="add", adopt=False,
+        config_path=str(xray_p), state_path=state_p, runner=failing_runner,
+        port_checker=_port_checker_settle_then_up(),
+    )
+    assert r["ok"] is False
+    err = r.get("err", "")
+    assert err.startswith("restart_failed"), err
+    # state-rollback провален — ЯВНЫЙ признак в err (config откатан к backup, state остался новым)
+    assert "rollback_failed_state_kept_new" in err, (
+        f"провал state-rollback замаскирован в err (рассинхрон config↔state): {err}")
+    # config-rollback УСПЕШЕН → config == backup (telegram НЕ добавлен)
+    cfg = json.loads(xray_p.read_text(encoding="utf-8"))
+    assert "domain:telegram.org" not in cfg["routing"]["rules"][0]["domain"], (
+        "config-rollback провален, хотя должен был пройти (state был отдельной ошибкой)")
+    # changed=True — durable НЕ равен исходному (state остался новым)
+    assert r["changed"] is True
+
+
+def test_routing_apply_full_rollback_reports_changed_false_on_restart_fail(tmp_path, monkeypatch):
+    """Codex P2 round-2: при ПОЛНОМ успешном rollback (config И state откатаны) durable-состояние
+    совпадает с исходным → changed=False (не ложно сообщает об изменении). Контракт результата
+    точен, даже если CLI сначала смотрит на ok."""
+    xray_p = tmp_path / "xray-config.json"
+    state_p = tmp_path / "srouter.local.json"
+    _write_xray_routing_config(xray_p, BASELINE_DOMAINS, managed=True)
+    _write(state_p, {"nodes": [], "routing": {"active": BASELINE_DOMAINS, "outbound": "reality-out",
+                                              "last_applied_hash": local_state._routing_domains_hash(BASELINE_DOMAINS)}})
+
+    def failing_runner(cmd, timeout):
+        if "start" in cmd and "xray" in cmd:
+            return {"rc": 1, "out": "", "err": "xray_start_failed", "timeout": False}
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+
+    r = local_state.routing_apply(
+        ["telegram.org"], action="add", adopt=False,
+        config_path=str(xray_p), state_path=state_p, runner=failing_runner,
+        port_checker=_port_checker_settle_then_up(),
+    )
+    assert r["ok"] is False
+    err = r.get("err", "")
+    assert err.startswith("restart_failed"), err
+    # ПОЛНЫЙ rollback (config И state) → нет rollback_failed-признаков в err
+    assert "rollback_failed" not in err, f"ожидался полный rollback, но err сигнализирует провал: {err}"
+    # durable == исходное (config и state откатаны) → changed=False
+    assert r["changed"] is False, (
+        "changed=True при полном успешном rollback — durable не изменился, контракт лжив")
+    cfg = json.loads(xray_p.read_text(encoding="utf-8"))
+    assert "domain:telegram.org" not in cfg["routing"]["rules"][0]["domain"]
+
+
 def test_routing_apply_serializes_concurrent_apply_no_lost_update(tmp_path, monkeypatch):
     """Finding 2 (#139): process-safe flock на xray-config. Два конкурирующих apply (add A, add B)
     под блокировкой СЕРИАЛИЗУЮТСЯ — нет lost-update.

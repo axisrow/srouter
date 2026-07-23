@@ -1113,20 +1113,28 @@ def _routing_apply_locked(config_path, state_path, outbound, hosts, action, adop
             res = {"rc": 1, "err": "restart_exception"}
         if res.get("rc") != 0 or res.get("timeout"):
             # atomic rollback к backup (tmp+fsync+replace); провал записи не оставляет config
-            # усечённым/молча неоткаченным — #139 Finding 1. ПРОВЕРЯЕМ результат (Codex P1):
-            # если rollback не удался — config остаётся новым. Тогда state НЕ откатываем (иначе
-            # рассинхрон в обратную сторону: config новый, state откатан), а recovery поднимает
-            # xray с тем config, что реально на диске. Флаг config_restored сигнализирует в err.
-            rollback_ok = _atomic_write_text(config_p, backup_text)
-            if rollback_ok:
+            # усечённым/молча неоткаченным — #139 Finding 1. ПРОВЕРЯЕМ результат config-rollback
+            # (Codex P1 round-1): если rollback не удался — config остаётся новым. Тогда state НЕ
+            # откатываем (иначе рассинхрон в обратную сторону: config новый, state откатан).
+            # ПРОВЕРЯЕМ результат state-rollback (Codex P1 round-2): save_state может вернуть None
+            # (ENOSPC) → config старый, state новый → рассинхрон. Оба исхода отражаются в err,
+            # changed = False только при ПОЛНОМ успешном rollback (durable == исходное).
+            config_rollback_ok = _atomic_write_text(config_p, backup_text)
+            state_rollback_ok = False
+            if config_rollback_ok:
                 try:
                     state["routing"]["active"] = current_domains
                     state["routing"]["outbound"] = outbound
                     state["routing"]["last_applied_hash"] = _routing_domains_hash(current_domains)
-                    save_state(state, state_path)
+                    state_rollback_ok = save_state(state, state_path) is not None
                 except Exception:
-                    pass
-            rollback_note = "" if rollback_ok else "; rollback_failed_config_kept_new"
+                    state_rollback_ok = False
+            # err-признаки рассинхрона
+            note = ""
+            if not config_rollback_ok:
+                note = "; rollback_failed_config_kept_new"
+            elif not state_rollback_ok:
+                note = "; rollback_failed_state_kept_new"
             recovery_err = ""
             try:
                 recovery = install_lib._restart_component("xray", runner, port_checker=port_checker)
@@ -1134,8 +1142,10 @@ def _routing_apply_locked(config_path, state_path, outbound, hosts, action, adop
                     recovery_err = f"; recovery_restart_failed:{recovery.get('err', 'unknown')}"
             except Exception:
                 recovery_err = "; recovery_restart_exception"
-            return {"ok": False, "changed": True,
-                    "err": f"restart_failed:{res.get('err', 'unknown')}{rollback_note}{recovery_err}"}
+            # changed=True если что-то осталось изменённым (не полный rollback); False при полном откате
+            changed = not (config_rollback_ok and state_rollback_ok)
+            return {"ok": False, "changed": changed,
+                    "err": f"restart_failed:{res.get('err', 'unknown')}{note}{recovery_err}"}
 
     return {"ok": True, "changed": True, "err": ""}
 
