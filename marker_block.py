@@ -62,16 +62,22 @@ def find_managed_block(content: str, begin_marker: str, end_marker: str) -> Opti
     дублировать контент .zshrc под видом успеха).
 
     Returns:
-        ManagedBlock — если ровно одна упорядоченная пара.
+        ManagedBlock — если ровно одна упорядоченная пара целых строк.
         None         — если НЕТ ни одного маркера (begins==0 AND ends==0) ИЛИ если пара повреждена
-                       (любой другой count/order). НЕ различает «нет блока» и «повреждено» в return
-                       value — различение для диагностического сообщения оставлено caller'у через
-                       один доп. `marker in content` чек (решение = fail-closed в обоих случаях).
+                       (любой другой count/order ИЛИ маркер не занимает целую строку — partial-line).
+                       НЕ различает «нет блока» и «повреждено» в return value — различение для
+                       диагностического сообщения оставлено caller'у через один доп. `marker in content`
+                       чек (решение = fail-closed в обоих случаях).
 
-    Precondition: begin_marker != end_marker (парные маркеры обязаны различаться; вырожденный
-    begin==end ловится assert — это баг caller'а, не валидный контракт).
+    Precondition: begin_marker != end_marker (парные маркеры обязаны различаться) И ни один маркер
+    не содержит \\n (whole-line matching). Вырожденные случаи ловятся assert — это баг caller'а,
+    не валидный контракт.
     """
     assert begin_marker != end_marker, "парные маркеры обязаны различаться (begin==end — баг caller)"
+    # cycle-review cycle-3: маркер обязан быть ОДНОЙ строкой (без \n). Whole-line matching (ниже)
+    # с newline-bearing маркером бессмысленен — это невалидный контракт caller'а.
+    assert "\n" not in begin_marker and "\n" not in end_marker, \
+        "маркер обязан быть одной строкой без \\n (whole-line matching)"
     begins = content.count(begin_marker)
     ends = content.count(end_marker)
     if not (begins == 1 and ends == 1):
@@ -80,19 +86,24 @@ def find_managed_block(content: str, begin_marker: str, end_marker: str) -> Opti
     end_idx = content.find(end_marker)
     if not (0 <= begin_idx < end_idx):  # упорядоченность: begin строго перед end (реверс → None).
         return None
-    # cycle-review cycle-2 FIX (codex critical 0.99) — line-boundary invariant: маркеры обязаны
-    # занимать ПОЛНЫЕ строки. Маркеры — shell-комментарии (# ...); если контент glued к маркеру в той же
-    # строке (без newline), он инертен (часть комментария). Без этой проверки remove_managed_block
-    # срезал бы блок по байтам END-маркера, оставив glued-суффикс standalone ИСПОЛНЯЕМОЙ строкой →
-    # uninstall активировал бы ранее закомментированную команду (fail-open). Поэтому:
-    #   - BEGIN обязан начинаться на line-boundary: в начале content (begin_idx==0) ИЛИ сразу после \n.
-    #   - END обязан завершаться на line-boundary: за ним \n ИЛИ EOF (end_idx+len == len(content)).
+    # cycle-review cycle-2/cycle-3 FIX (codex critical 0.99) — WHOLE-LINE invariant: каждый маркер
+    # обязан занимать ЦЕЛУЮ строку целиком (от line-start до \n/EOF с обеих сторон). Маркеры —
+    # shell-комментарии (# ...); контент glued к маркеру в той же строке инертен (часть комментария).
+    # Cycle-2 закрыл 2 стороны (char-before-BEGIN, char-after-END); cycle-3 закрыл оставшиеся 2
+    # (char-after-BEGIN, char-before-END) — иначе partial-line marker заставлял remove_managed_block
+    # удалить intervening чужой контент .zshrc (silent data-loss без backup) ИЛИ активировать
+    # закомментированную команду (fail-open). Whole-line проверяет все 4 стороны разом:
+    #   - строка маркера = ровно marker (ничем не обрамлён в той же строке).
     # Иначе → None (malformed boundary, fail-closed: consumer оставляет .zshrc byte-for-byte нетронутым).
-    if begin_idx != 0 and content[begin_idx - 1] != "\n":
-        return None  # glued leading content перед BEGIN — malformed.
-    end_after = end_idx + len(end_marker)
-    if end_after != len(content) and content[end_after] != "\n":
-        return None  # glued trailing content за END (без newline/EOF) — malformed → fail-closed.
+    def _is_whole_line(idx: int, marker: str) -> bool:
+        # Левая граница: idx==0 (старт content) ИЛИ content[idx-1]=='\n' (после newline).
+        left_ok = (idx == 0) or (content[idx - 1] == "\n")
+        # Правая граница: за маркером '\n' ИЛИ EOF (idx+len == len(content)).
+        after = idx + len(marker)
+        right_ok = (after == len(content)) or (content[after] == "\n")
+        return left_ok and right_ok
+    if not (_is_whole_line(begin_idx, begin_marker) and _is_whole_line(end_idx, end_marker)):
+        return None  # partial-line marker (glued suffix/prefix) → malformed → fail-closed.
     end_idx_inclusive = end_idx + len(end_marker)
     span_text = content[begin_idx:end_idx_inclusive]
     return ManagedBlock(begin_idx=begin_idx, end_idx=end_idx,
