@@ -8,6 +8,8 @@ import time
 import sys_probe
 from dashboard_common import CURL, HTTP_PROXY_URL, _active_route_ip
 
+import lock_hierarchy
+
 
 __all__ = [
     "_GEO_TTL",
@@ -38,7 +40,11 @@ def _geo_lookup(ip):
     if not ip:
         return {}
     now = time.time()
-    with _geo_lock:
+    # issue #159: bounded acquire (уровень CACHE). on_timeout → {} = cache miss,
+    # как при отсутствии записи (внешний curl пересчитает). Default timeout=0 ≡ `with`.
+    with lock_hierarchy.bounded_acquire(
+        _geo_lock, name="geo", level=lock_hierarchy.LEVEL_CACHE, on_timeout=lambda: {}
+    ):
         c = _geo_cache.get(ip)
         if c and now - c["ts"] < _GEO_TTL:
             return c["data"]
@@ -55,7 +61,11 @@ def _geo_lookup(ip):
                     "lat": j.get("latitude"), "lon": j.get("longitude"), "flag": _country_flag(cc)}
         except (ValueError, TypeError):
             data = {}
-    with _geo_lock:
+    # issue #159: bounded acquire (уровень CACHE). Write-точка: on_timeout → data
+    # (пропускаем запись кэша, возвращаем свежие данные как есть; кэш обновится в следующий раз).
+    with lock_hierarchy.bounded_acquire(
+        _geo_lock, name="geo", level=lock_hierarchy.LEVEL_CACHE, on_timeout=lambda: data
+    ):
         _geo_cache[ip] = {"ts": now, "data": data}   # кэшируем даже пустой (нет retry-штормов)
     return data
 

@@ -61,6 +61,7 @@ import node_selector
 import sys_probe
 import traffic_shape  # throttle-движок (#13): зовём через атрибут (traffic_shape.apply_throttle)
 import isolate_firewall  # PF-изоляция доменов: зовём через атрибут
+import lock_hierarchy
 import git_proxy  # вкл/откл git-прокси для github (через git config --global)
 import claude_proxy  # вкл/откл HTTPS_PROXY для Claude Code (~/.claude/settings.json)
 import health  # check_all для /health эндпоинта
@@ -129,7 +130,11 @@ def gather_status():
     active_route = _active_route_context()
     active_route_ip = active_route["route_ip"]
     active_route_key = active_route["key"]
-    with _lock:
+    # issue #159: bounded acquire (уровень CACHE). Read-точка: on_timeout → None
+    # = cache miss, пробы пересчитаются ниже. Default timeout=0 ≡ `with _lock:`.
+    with lock_hierarchy.bounded_acquire(
+        _lock, name="status-cache", level=lock_hierarchy.LEVEL_CACHE, on_timeout=lambda: None
+    ):
         if (
             _cache["data"]
             and _cache.get("active_route_key") == active_route_key
@@ -159,7 +164,11 @@ def gather_status():
     out = _run_status_probe_set(probes, STATUS_PROBE_BUDGET_SEC)
     out["nodes"] = probe_nodes_snapshot()
     out["ts"] = now
-    with _lock:
+    # issue #159: bounded acquire (уровень CACHE). Write-точка: on_timeout → None
+    # (пропускаем запись кэша; следующий /api/status пересчитает).
+    with lock_hierarchy.bounded_acquire(
+        _lock, name="status-cache", level=lock_hierarchy.LEVEL_CACHE, on_timeout=lambda: None
+    ):
         _cache.update(ts=now, data=out, active_route_ip=active_route_ip, active_route_key=active_route_key)
     return out
 

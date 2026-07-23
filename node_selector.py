@@ -16,6 +16,8 @@ import local_state
 import os
 import sys_probe
 
+import lock_hierarchy
+
 
 BREW = "/opt/homebrew/bin/brew"
 XRAY_CONFIG_PATH = "/opt/homebrew/etc/xray/config.json"
@@ -471,7 +473,12 @@ def _route_gateway_from_output(out):
 
 def select_node(name, *, enabled_names, runner=None, state_path=None, config_path=XRAY_CONFIG_PATH):
     """Безопасно применить ручной active-node выбор. Функция никогда не бросает наружу."""
-    with _SELECT_LOCK:
+    # issue #159: bounded acquire + ordering-guard. Default timeout=0 ≡ `with _SELECT_LOCK:`;
+    # SROUTER_LOCK_TIMEOUT_SEC>0 → hang рестарта xray не вешает 24/7-инфру (LockAcquireTimeout
+    # пробрасывается во внешний try/except → структурированный error). Уровень SELECT=1.
+    with lock_hierarchy.bounded_acquire(
+        _SELECT_LOCK, name="select", level=lock_hierarchy.LEVEL_SELECT
+    ):
         return _select_node_locked(
             name,
             enabled_names=enabled_names,

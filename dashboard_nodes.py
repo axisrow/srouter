@@ -19,6 +19,8 @@ from dashboard_common import (
     _seconds_arg,
 )
 
+import lock_hierarchy
+
 
 __all__ = [
     "_DNS_KNOWN",
@@ -157,7 +159,11 @@ _nodes_lock = threading.Lock()
 
 
 def _store_node_probe_cache(data):
-    with _nodes_lock:
+    # issue #159: bounded acquire (уровень CACHE). Write-точка: on_timeout → None
+    # (пропускаем запись snapshot-кэша; следующий status пересчитает).
+    with lock_hierarchy.bounded_acquire(
+        _nodes_lock, name="nodes", level=lock_hierarchy.LEVEL_CACHE, on_timeout=lambda: None
+    ):
         _nodes_cache.update(ts=time.time(), data=data)
 
 
@@ -165,7 +171,14 @@ def probe_nodes_snapshot(state_path=None):
     """Быстрый snapshot для /api/status: не запускает ping/curl/geo и не тратит трафик."""
     now = time.time()
     if state_path is None:
-        with _nodes_lock:
+        # issue #159: bounded acquire (уровень CACHE). on_timeout → stale snapshot,
+        # как существующий fallback «лучше stale, чем жечь throughput» (см. ниже).
+        with lock_hierarchy.bounded_acquire(
+            _nodes_lock,
+            name="nodes",
+            level=lock_hierarchy.LEVEL_CACHE,
+            on_timeout=lambda: _nodes_cache.get("data"),
+        ):
             data = _nodes_cache.get("data")
             if data is not None and now - _nodes_cache.get("ts", 0.0) <= NODE_PROBE_TTL_SEC:
                 return data

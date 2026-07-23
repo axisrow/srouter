@@ -10,6 +10,8 @@ import time
 import hot_routes
 import local_state
 
+import lock_hierarchy
+
 
 HOT_ROUTES_UPDATE_THROTTLE_SEC = 60.0
 # In-flight guard отвечает за correctness; минимум здесь только режет ручной
@@ -123,21 +125,31 @@ def _cache_key(cache_path, log_path, top_n, ttl, bucket_size):
 
 
 def _last_entries(key):
-    with _lock:
+    # issue #159: bounded acquire (уровень CACHE). on_timeout → {} (нет кэша — caller
+    # отдаст пустой top-N, как при первом запуске).
+    with lock_hierarchy.bounded_acquire(
+        _lock, name="hotroutes", level=lock_hierarchy.LEVEL_CACHE, on_timeout=lambda: {}
+    ):
         if _probe_cache.get("key") != key:
             return {}
         return dict(_probe_cache.get("entries") or {})
 
 
 def _last_error(key):
-    with _lock:
+    # issue #159: on_timeout → "" (нет ошибки в кэше — статус "ok").
+    with lock_hierarchy.bounded_acquire(
+        _lock, name="hotroutes", level=lock_hierarchy.LEVEL_CACHE, on_timeout=lambda: ""
+    ):
         if _probe_cache.get("key") != key:
             return ""
         return _probe_cache.get("error") or ""
 
 
 def _store_entries(key, updated_at, entries, error=""):
-    with _lock:
+    # issue #159: write-точка. on_timeout → None (пропускаем запись кэша).
+    with lock_hierarchy.bounded_acquire(
+        _lock, name="hotroutes", level=lock_hierarchy.LEVEL_CACHE, on_timeout=lambda: None
+    ):
         _probe_cache.update(
             key=key,
             updated_at=updated_at,
@@ -147,7 +159,12 @@ def _store_entries(key, updated_at, entries, error=""):
 
 
 def _update_due(key, now_ts, update_interval):
-    with _lock:
+    # issue #159: КРИТИЧНО — on_timeout=lambda: False. probe_hot_routes зовёт _release_update
+    # в finally ТОЛЬКО когда _update_due вернул True; False на таймауте → update-цикл
+    # пропускается целиком, finally не срабатывает, _in_progress_updates не затронут (инвариант).
+    with lock_hierarchy.bounded_acquire(
+        _lock, name="hotroutes", level=lock_hierarchy.LEVEL_CACHE, on_timeout=lambda: False
+    ):
         if key in _in_progress_updates:
             return False
         due = _probe_cache.get("key") != key or (
@@ -159,7 +176,11 @@ def _update_due(key, now_ts, update_interval):
 
 
 def _release_update(key):
-    with _lock:
+    # issue #159: on_timeout → None (пропускаем discard; in-progress флаг при таймауте
+    # _update_due и так не установлен — discard был бы no-op).
+    with lock_hierarchy.bounded_acquire(
+        _lock, name="hotroutes", level=lock_hierarchy.LEVEL_CACHE, on_timeout=lambda: None
+    ):
         _in_progress_updates.discard(key)
 
 
