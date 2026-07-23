@@ -1070,17 +1070,19 @@ def test_routing_apply_state_rollback_failure_signaled_on_restart_fail(tmp_path,
             return {"rc": 1, "out": "", "err": "xray_start_failed", "timeout": False}
         return {"rc": 0, "out": "", "err": "", "timeout": False}
 
-    # Первый save_state (step-5 promote) успешен; ВТОРОЙ save_state (state-rollback) падает.
-    save_calls = {"n": 0}
-    real_save_state = local_state.save_state
+    # state-rollback теперь byte-exact через _atomic_write_text (не save_state). Считаем вызовы:
+    # 1=шаг4 config-modify, 2=config-rollback (backup), 3=state-rollback (original_state_text).
+    # Падение на 3-м → config откатан (старый), state остаётся НОВЫМ → рассинхрон.
+    real_aw = local_state._atomic_write_text
+    aw_calls = {"n": 0}
 
-    def flaky_save_state(state, path=None):
-        save_calls["n"] += 1
-        if save_calls["n"] == 2:  # state-rollback после провала restart
-            return None
-        return real_save_state(state, path)
+    def flaky_aw(path, text):
+        aw_calls["n"] += 1
+        if aw_calls["n"] == 3:  # state-rollback после успешного config-rollback
+            return False
+        return real_aw(path, text)
 
-    monkeypatch.setattr(local_state, "save_state", flaky_save_state)
+    monkeypatch.setattr(local_state, "_atomic_write_text", flaky_aw)
     r = local_state.routing_apply(
         ["telegram.org"], action="add", adopt=False,
         config_path=str(xray_p), state_path=state_p, runner=failing_runner,
@@ -1130,6 +1132,42 @@ def test_routing_apply_full_rollback_reports_changed_false_on_restart_fail(tmp_p
         "changed=True при полном успешном rollback — durable не изменился, контракт лжив")
     cfg = json.loads(xray_p.read_text(encoding="utf-8"))
     assert "domain:telegram.org" not in cfg["routing"]["rules"][0]["domain"]
+
+
+def test_routing_apply_full_rollback_restores_legacy_state_byte_exact(tmp_path):
+    """Codex round-3 P2: legacy-state БЕЗ секции routing ({\"nodes\":[]}). Шаг-5 promote добавляет
+    секцию routing. При restart-fail полный rollback должен восстановить state BYTE-EXACT (без
+    routing-секции), а не только перезаписать routing-поля. Раньше state-rollback реконструировал
+    routing, оставляя legacy-state мутированным (добавлена секция) → changed=False лжив.
+
+    Воспроизведение: hash-drift guard не сработает (managed=True, но state без last_applied_hash —
+    stored_hash пуст, проверка пропускается). promote добавляет routing; rollback восстанавливает
+    исходный {\"nodes\":[]} byte-exact."""
+    xray_p = tmp_path / "xray-config.json"
+    state_p = tmp_path / "srouter.local.json"
+    _write_xray_routing_config(xray_p, BASELINE_DOMAINS, managed=True)
+    # legacy state БЕЗ секции routing — promotes добавит её
+    _write(state_p, {"nodes": []})
+    original_state_text = state_p.read_text(encoding="utf-8")
+
+    def failing_runner(cmd, timeout):
+        if "start" in cmd and "xray" in cmd:
+            return {"rc": 1, "out": "", "err": "xray_start_failed", "timeout": False}
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+
+    r = local_state.routing_apply(
+        ["telegram.org"], action="add", adopt=False,
+        config_path=str(xray_p), state_path=state_p, runner=failing_runner,
+        port_checker=_port_checker_settle_then_up(),
+    )
+    assert r["ok"] is False
+    assert r.get("err", "").startswith("restart_failed")
+    assert "rollback_failed" not in r.get("err", ""), r
+    # КРИТИЧНО: state восстановлен byte-exact — legacy {\"nodes\":[]} без навязанной routing-секции
+    assert state_p.read_text(encoding="utf-8") == original_state_text, (
+        "state-rollback не восстановил legacy-state byte-exact: навязанная секция routing осталась "
+        "(реконструкция полей вместо восстановления raw-снимка)")
+    assert r["changed"] is False, "changed=True при полном rollback — durable == исходное"
 
 
 def test_routing_apply_serializes_concurrent_apply_no_lost_update(tmp_path, monkeypatch):

@@ -1065,9 +1065,15 @@ def _routing_apply_locked(config_path, state_path, outbound, hosts, action, adop
     if new_domains == current_domains:
         return {"ok": True, "changed": False, "err": ""}  # idempotent, restart не нужен
 
-    # 3. backup (two-phase: восстановим при ошибке restart) — читаем СВЕЖИЙ config под lock
+    # 3. backup (two-phase: восстановим при ошибке restart) — читаем СВЕЖИЙ config под lock.
+    #    state_text — raw-снимок state ДО любых мутаций (шаг 5 может добавить секцию routing в
+    #    legacy-state без неё; реконструкция только routing-полей при rollback оставила бы state
+    #    мутированным → byte-exact rollback через raw-снимок, как для config. Codex round-3 P2).
     config_p = Path(config_path)
     backup_text = config_p.read_text(encoding="utf-8")
+    state_p = Path(state_path) if state_path else _DEFAULT_PATH
+    state_existed = state_p.exists()
+    original_state_text = state_p.read_text(encoding="utf-8") if state_existed else ""
 
     # 4. modify rule in-place copy + atomic write (tmp+fsync+replace — единый _atomic_write_text)
     new_rule = dict(rule)
@@ -1120,14 +1126,19 @@ def _routing_apply_locked(config_path, state_path, outbound, hosts, action, adop
             # (ENOSPC) → config старый, state новый → рассинхрон. Оба исхода отражаются в err,
             # changed = False только при ПОЛНОМ успешном rollback (durable == исходное).
             config_rollback_ok = _atomic_write_text(config_p, backup_text)
+            # state-rollback: byte-exact восстановление raw-снимка original_state_text (а не
+            # реконструкция routing-полей — иначе legacy-state без секции routing остаётся
+            # мутированным после успешной записи, changed=False лжив. Codex round-3 P2).
+            # Если state-файла изначально не было — удаляем созданный шагом-5.
             state_rollback_ok = False
             if config_rollback_ok:
                 try:
-                    state["routing"]["active"] = current_domains
-                    state["routing"]["outbound"] = outbound
-                    state["routing"]["last_applied_hash"] = _routing_domains_hash(current_domains)
-                    state_rollback_ok = save_state(state, state_path) is not None
-                except Exception:
+                    if state_existed:
+                        state_rollback_ok = _atomic_write_text(state_p, original_state_text)
+                    else:
+                        state_p.unlink(missing_ok=True)
+                        state_rollback_ok = True
+                except OSError:
                     state_rollback_ok = False
             # err-признаки рассинхрона
             note = ""
