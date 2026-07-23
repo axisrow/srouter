@@ -5,7 +5,19 @@ import shlex
 
 import local_state
 import sys_probe
-from dashboard_common import *
+from dashboard_common import (
+    CHANNEL_SERVICE_KEYS,
+    CHANNEL_TARGETS,
+    CURL,
+    IFCONFIG,
+    NETWORKSETUP,
+    OSASCRIPT,
+    ROUTE,
+    _applescript_text,
+    _first,
+    _http_url,
+    _probe_options,
+)
 
 
 __all__ = [

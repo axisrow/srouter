@@ -6,7 +6,7 @@ import threading
 import time
 
 import sys_probe
-from dashboard_common import *
+from dashboard_common import CURL, HTTP_PROXY_URL, _active_route_ip
 
 
 __all__ = [
