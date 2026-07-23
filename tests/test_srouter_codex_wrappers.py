@@ -999,9 +999,11 @@ def test_install_upgrades_old_marker_wrapper_without_state_uses_current_only(mon
 # Managed находит foreign (нет маркера → «реальный codex») → exec'ает → foreign резолвит codex=managed →
 # exec'ает managed → бесконечный цикл → rc=124 (timeout).
 #
-# ФИКС: cycle-state инвариант через versioned env-сентинель (SROUTER_CODEX_WRAPPER_V1=1). При повторном
-# входе managed wrapper в ту же цепочку exec — обрыв с fail-loud диагностикой (понятный exit-код, не 124).
-# НЕ PATH-санitизация (отвергнута в issue #150: blast radius на 24/7-инфре — tools теряют ~/bin).
+# ФИКС: cycle-state инвариант через versioned env-сентинель SROUTER_CODEX_WRAPPER_V1=<pid>:<hop>.
+# При повторном входе managed wrapper в рекурсивную цепочку — обрыв с fail-loud диагностикой
+# (exit 126, не 124). Покрывает ТРИ класса рекурсии: exec-цикл (PID-match), fork-цикл (hop-ceiling),
+# и отличает от легитимного descendant (hop < ceiling). НЕ PATH-санitизация (отвергнута в issue #150:
+# blast radius на 24/7-инфре — tools теряют ~/bin).
 
 
 def _install_cycle_guard_wrapper(monkeypatch, tmp_path):
@@ -1095,6 +1097,43 @@ def test_cycle_guard_pid_scoped_not_blocking_descendant(monkeypatch, tmp_path):
     assert child_marker.exists() and child_marker.read_text(encoding="utf-8") == "ok", \
         (f"descendant codex (fork, новый PID) заблокирован ложным sentinel — regression nested-agent: "
          f"parent rc={proc.returncode}, stderr={proc.stderr!r}")
+
+
+def test_cycle_guard_fork_foreign_bounded_not_process_bomb(monkeypatch, tmp_path):
+    """#150 hop-counter инвариант (cycle-review PR #153 round-2): fork'ающий foreign-wrapper обходит
+    PID-scoped guard, но обязан bounded-обрываться, не накапливая процессы.
+
+    Foreign БЕЗ exec (`codex "$@"`; не `exec codex`) форкает codex-вызов (= managed) — каждый re-entry
+    получает новый PID → PID-check пропускает → без hop-ceiling это fork-bomb до per-user process limit
+    (process-table exhaustion, DoS на 24/7-инфре, Codex confidence 0.98). Легитимный descendant завершается
+    (real codex работает и выходит), fork-foreign — НЕТ (каждый уровень порождает следующий без лимита).
+
+    Hop-счётчик в sentinel (<pid>:<hop>): каждый fork-re-entry инкрементирует унаследованный hop; при
+    hop > CEILING → обрыв rc=126. Отличает бесконтрольную fork-рекурсию (foreign) от bounded-вложенности
+    легитимного descendant (которая «выдыхается» сама — процессы завершаются).
+    """
+    import subprocess
+    home = _mock_home(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    monkeypatch.setattr(srouter, "_codex_bin_path", lambda: str(tmp_path / "any-codex"))
+    srouter._install_codex_wrappers(env)
+    wrapper = home / "bin" / "codex"
+    real_codex = tmp_path / "realdir" / "codex"
+    real_codex.parent.mkdir(parents=True)
+    real_codex.write_text("#!/bin/sh\nprintf real > /dev/null\n", encoding="utf-8")
+    real_codex.chmod(0o755)
+    # foreign БЕЗ exec: форкает codex (= managed) и ждёт. Каждый уровень порождает следующий — не завершается.
+    foreignbin = tmp_path / "foreignbin"
+    foreignbin.mkdir()
+    (foreignbin / "codex").write_text('#!/bin/sh\ncodex "$@"; exit $?\n', encoding="utf-8")
+    (foreignbin / "codex").chmod(0o755)
+    caller_path = f"{home / 'bin'}:{foreignbin}:{tmp_path / 'realdir'}:/usr/bin:/bin"
+    proc = subprocess.run([str(wrapper), "x"],
+                          env={**os.environ, "PATH": caller_path},
+                          capture_output=True, text=True, timeout=15)
+    assert proc.returncode == 126, \
+        (f"fork-foreign должен bounded-обрываться rc=126 (hop-ceiling), не fork-bomb: "
+         f"получено rc={proc.returncode}, stderr={proc.stderr[:200]!r}")
 
 
 def test_cycle_guard_runs_real_codex_on_single_pass(monkeypatch, tmp_path):
