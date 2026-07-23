@@ -189,15 +189,16 @@ def _update_due(key, now_ts, update_interval):
 
 
 def _release_update(key):
-    # issue #159: таймаут → пропускаем discard. in-progress флаг при таймауте _update_due
-    # и так не установлен (она вернула False), discard был бы no-op; безопасно пропустить.
-    try:
-        with lock_hierarchy.bounded_acquire(
-            _lock, name="hotroutes", level=lock_hierarchy.LEVEL_CACHE
-        ):
-            _in_progress_updates.discard(key)
-    except lock_hierarchy.LockAcquireTimeout:
-        pass  # skip-discard; флаг не был установлен при таймауте _update_due
+    # issue #159 cycle-2 (Codex conf 1.0): это CLEANUP — зовётся в finally ТОЛЬКО когда
+    # _update_due вернул True (флаг УСТАНОВЛЕН). Пропустить discard на таймауте = leaked
+    # in-progress marker → будущие _update_due навсегда возвращают False → refresh hot-routes
+    # подавлен до рестарта. Поэтому cleanup ИСПОЛЬЗУЕТ UNBOUNDED blocking acquire (timeout=0):
+    # discard обязан довестись до конца; hold короткий (set.discard), hang-риск минимален.
+    # Канон srouter-critical-infra-24-7: cleanup не сдается и не оставляет мусор.
+    with lock_hierarchy.bounded_acquire(
+        _lock, name="hotroutes", level=lock_hierarchy.LEVEL_CACHE, timeout_sec=0
+    ):
+        _in_progress_updates.discard(key)
 
 
 def probe_hot_routes(state_path=None, cache_path=None, log_path=None, now=None):
