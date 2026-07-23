@@ -90,7 +90,24 @@ __all__ = [
     "_iface_is_physical",
     "_active_route_context",
     "_active_route_ip",
+    "_applescript_text",
 ]
+
+
+def _applescript_text(text):
+    """Экранировать shell-строку для вставки в `do shell script "..."`.
+
+    ЕДИНСТВЕННАЯ каноническая реализация (issue #154, эпик #107 задача P0-1).
+    Раньше дублировалась в traffic_shape / dashboard_connectivity / isolate_firewall
+    / srouter — некорректное экранирование позволяло разорвать applescript-строку
+    и выполнить произвольную команду (arbitrary command execution) через admin-мост.
+
+    Порядок replace критичен для безопасности: сначала бэкслэши, потом кавычки.
+    Если сделать наоборот, ввод `\\"` даст `\\\\"` -> две пары `\\` + голая кавычка,
+    которая снова разорвёт applescript-строку. Тесты на векторы атаки —
+    tests/test_applescript_text.py.
+    """
+    return str(text).replace("\\", "\\\\").replace('"', '\\"')
 
 
 def _first(pattern, text):

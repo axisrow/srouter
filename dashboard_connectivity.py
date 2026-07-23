@@ -341,10 +341,6 @@ def _shell_join(args):
     return " ".join(shlex.quote(str(arg)) for arg in args)
 
 
-def _applescript_text(text):
-    return str(text).replace("\\", "\\\\").replace('"', '\\"')
-
-
 def switch_channel(target):
     if target not in CHANNEL_TARGETS:
         return _channel_result(target, {"rc": None, "out": "", "err": "bad channel target", "timeout": False})

@@ -204,7 +204,7 @@ def _install_ppp_hook(env, runner) -> str:
                     .replace("__SROUTER_ROOT_DIR__", str(env.root))
                     .replace("__SROUTER_LOG_ERR__", str(env.log_err)))
         # Копирование в /etc/ppp/ip-up через osascript (требует admin, /etc/ = root).
-        from traffic_shape import _applescript_text
+        from dashboard_common import _applescript_text
         # Записать во временный файл, потом cp + chmod + chown (всё под osascript admin).
         tmp = f"/tmp/srouter-ppp-ip-up.{os.getpid()}"
         # Defence: rendered идёт в файл через printf %s (не shell-интерполяция).
@@ -226,7 +226,7 @@ def _install_ppp_hook(env, runner) -> str:
 def _remove_ppp_hook(runner) -> str:
     """Удалить /etc/ppp/ip-up (если srouter-managed). Возвращает строку-статус."""
     try:
-        from traffic_shape import _applescript_text
+        from dashboard_common import _applescript_text
         # Проверить маркер перед удалением (не трогать чужой скрипт).
         check = runner(["/bin/cat", PPP_HOOK_PATH], 5)
         if check.get("timeout") or check.get("rc") != 0:
