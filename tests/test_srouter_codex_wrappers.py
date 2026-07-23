@@ -1056,6 +1056,47 @@ def test_foreign_wrapper_recursion_cycle_breaks_not_timeout(monkeypatch, tmp_pat
     assert proc.returncode != 124, "cycle-guard обязан дать диагностику, не молчаливый 124-timeout"
 
 
+def test_cycle_guard_pid_scoped_not_blocking_descendant(monkeypatch, tmp_path):
+    """#150 PID-scoped инвариант (cycle-review PR #153): сентинель НЕ контаминирует дерево real Codex.
+
+    Булево-сентинель (=1) наследовался бы всему дереву процесса real Codex → блокировал каждый
+    descendant-вызов managed wrapper (agent/tool spawning worker) ложным exit 126, несмотря на то, что
+    это ЛЕГИТИМНЫЙ второй вход, а не цикл. Это регрессия nested-agent/orchestration (Codex confidence 0.99).
+
+    Реальный Codex при spawn worker'а делает fork()+exec() — НОВЫЙ PID, не exec() (тот же PID). Сентинель
+    хранит PID первого managed-входа ($$): exec сохраняет PID (цикл managed→foreign→managed → match →
+    обрыв), fork даёт новый PID (descendant → no match → легитимный вход, переписывает сентинель своим
+    PID). Этот тест моделирует descendant через fork (background subshell `(...)&` = новый процесс).
+    """
+    import subprocess
+    import time
+    home = _mock_home(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    monkeypatch.setattr(srouter, "_codex_bin_path", lambda: str(tmp_path / "any-codex"))
+    srouter._install_codex_wrappers(env)
+    wrapper = home / "bin" / "codex"
+    child_marker = tmp_path / "child_ran.txt"
+    real_codex_dir = tmp_path / "realdir"
+    real_codex_dir.mkdir()
+    # parent real-codex: fork'ает descendant (НОВЫЙ PID через background subshell), ждёт, exit 0.
+    # descendant зовёт managed wrapper как agent spawning worker.
+    (real_codex_dir / "codex").write_text(
+        "#!/bin/sh\n"
+        f'if [ "$1" = "--child" ]; then printf ok > {child_marker}; exit 0; fi\n'
+        f'("{wrapper}" --child) &\n'
+        f'wait\n'
+        f'exit 0\n', encoding="utf-8")
+    (real_codex_dir / "codex").chmod(0o755)
+    caller_path = f"{home / 'bin'}:{real_codex_dir}:/usr/bin:/bin"
+    proc = subprocess.run([str(wrapper)],
+                          env={**os.environ, "PATH": caller_path},
+                          capture_output=True, text=True, timeout=15)
+    time.sleep(0.3)  # descendant background может дописывать маркер
+    assert child_marker.exists() and child_marker.read_text(encoding="utf-8") == "ok", \
+        (f"descendant codex (fork, новый PID) заблокирован ложным sentinel — regression nested-agent: "
+         f"parent rc={proc.returncode}, stderr={proc.stderr!r}")
+
+
 def test_cycle_guard_runs_real_codex_on_single_pass(monkeypatch, tmp_path):
     """#150 шаг 3: на ОДНОКРАТНОМ нормальном входе (нет цикла) cycle-guard НЕ срабатывает — real Codex
     запускается, аргументы доходят. Сентинель guard'ит только повторный вход, не первый.

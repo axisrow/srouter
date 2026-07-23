@@ -58,10 +58,17 @@ fi
 # Versioned-имя (SROUTER_CODEX_WRAPPER_V1) — чтобы не столкнуться со случайной пользовательской
 # переменной без версии; смена формата → bump суффикса (V2...). НЕ PATH-санitизация (отвергнута в #150:
 # blast radius на 24/7-инфре — tools/агенты молча теряют ~/bin); сентинель = env-ФЛАГ, PATH не трогает.
-if [ "${SROUTER_CODEX_WRAPPER_V1:-0}" = "1" ]; then
+#
+# PID-scoped (а не булево): значение сентинели = PID первого managed-входа ($$). exec СОХРАНЯЕТ PID
+# (managed→foreign→managed в цикле — один и тот же процесс) → при повторном входе $$ == сохранённый PID
+# → цикл → обрыв. fork ДАЁТ новый PID (real Codex порождает descendant'а: agent/tool spawning worker) →
+# descendant зовёт managed wrapper с $$ != сохранённый PID → ЛЕГИТИМНЫЙ второй вход, НЕ цикл → продолжаем
+# и переписываем сентинель своим PID (его собственное поддерево guard'ится от его циклов). Булево-флаг
+# контаминировал бы всё дерево real Codex и блокировал каждый descendant-вызов (cycle-review PR #153).
+if [ "${SROUTER_CODEX_WRAPPER_V1:-}" != "" ] && [ "${SROUTER_CODEX_WRAPPER_V1}" = "$$" ]; then
   printf '%s\n' \
     "srouter codex wrapper: обнаружен цикл exec (managed→foreign→managed)." \
-    "SROUTER_CODEX_WRAPPER_V1 уже стоит — managed wrapper повторно вошёл в ту же цепочку exec." \
+    "SROUTER_CODEX_WRAPPER_V1=$$ — managed wrapper повторно вошёл в тот же процесс (exec сохраняет PID)." \
     "В PATH найден foreign-wrapper (без srouter-маркера), резолвящий codex обратно в наш wrapper." \
     "Обрываю цикл, чтобы избежать rc=124 (timeout). real Codex НЕ запускался." \
     "Устрани конфликт codex-обёрток в PATH (см. issue #150)." >&2
@@ -119,5 +126,5 @@ exec /usr/bin/env \
   HTTP_PROXY="$PROXY" HTTPS_PROXY="$PROXY" ALL_PROXY="$PROXY" \
   http_proxy="$PROXY" https_proxy="$PROXY" all_proxy="$PROXY" \
   NO_PROXY="$LOOPBACK" no_proxy="$LOOPBACK" \
-  SROUTER_CODEX_WRAPPER_V1=1 \
+  SROUTER_CODEX_WRAPPER_V1="$$" \
   "$_codex_bin" "$@"
