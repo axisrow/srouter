@@ -1314,3 +1314,125 @@ def test_runtime_check_unknown_when_some_pid_unreadable(monkeypatch):
         res = health._runtime_model_override_check()
         assert res["status"] == "unknown", \
             f"[{label}] PID без evidence → unknown (НЕ ok; standard-PID не маскирует), got {res['status']}"
+
+
+# ============================ #170: codex-PF изоляция (doctor видит fail-closed границу) ============================
+# PF codex kill-switch (#168) — настоящая fail-closed граница (блок прямого выхода codex в ядре).
+# Doctor обязан её ВИДЕТЬ. Источник правды — codex-lease (runtime.active_codex_isolate), тот же, что
+# у isolate_firewall.probe_codex_isolation (state-only, НЕ зовёт pfctl — требует root). Lease —
+# byte-exact canonical snapshot (#179): пишется ТОЛЬКО при подтверждённом enable_codex_isolation,
+# чистится ТОЛЬКО при подтверждённом disable → достоверен как факт «srouter загрузил sub-anchor».
+#
+# Решение пользователя (info-only для «не настроено») + гибрид (down=driver только когда граница
+# ДОЛЖНА быть активна, канон privileged-boundary-fail-closed): без pfctl (нет root) различаем
+# «не настроено» (lease пуст → unknown info) vs «активна» (lease есть → ok). Known-limitation #168:
+# эмпирическая проверка anchor'а требует sudo — недоступна в автоматическом doctor; lease = максимум
+# доступного достоверного сигнала (как probe_codex_isolation для дашборда).
+import local_state as _local_state  # noqa: E402 — source-of-truth для codex-lease
+
+_CODEX_LEASE_OK = {"token": "7", "applied_at": None}
+
+
+def _mock_codex_lease(monkeypatch, lease):
+    """Мок local_state.load_active_codex_isolate → заданный lease (None = не настроено).
+
+    Чек читает codex-lease напрямую из local_state (канон: единый source-of-truth с
+    probe_codex_isolation, не дублирует чтение). Мокаем именно источник, а не чек —
+    предмет теста логика чека (ok/unknown/ошибка), а не local_state."""
+    monkeypatch.setattr(_local_state, "load_active_codex_isolate", lambda path=None: lease)
+    # health импортирует local_state внутри чека (lazy, чтобы не тащить зависимость в модуль-уровень
+    # health.py без нужды) — мок валиден для любого способа импорта, т.к. патчит сам модуль local_state.
+
+
+def test_codex_pf_isolation_ok_when_lease_active(monkeypatch):
+    _mock_codex_lease(monkeypatch, _CODEX_LEASE_OK)
+    res = health._codex_pf_isolation_check()
+    assert res["status"] == "ok", f"lease активен → ok, got {res}"
+    assert res.get("detail"), "ok должен пояснять, что codex-PF изоляция активна"
+
+
+def test_codex_pf_isolation_unknown_when_not_configured(monkeypatch):
+    """codex-lease пуст (PF не установлен) → unknown info-only, НЕ driver.
+
+    Решение пользователя: на большинстве машин (fresh install, dev, CI) codex-PF не настроен —
+    provisioning uid 503 — follow-up #168. «Не настроено» ≠ «сломано» → не роняет вердикт.
+    """
+    _mock_codex_lease(monkeypatch, None)
+    res = health._codex_pf_isolation_check()
+    assert res["status"] == "unknown", f"lease пуст → unknown (не настроено), got {res}"
+    assert "install" in res.get("detail", "").lower() or "не настроен" in res.get("detail", "").lower(), \
+        f"detail должен подсказать как включить (srouter install), got: {res.get('detail')}"
+
+
+def test_codex_pf_isolation_unknown_on_read_error(monkeypatch):
+    """local_state бросает → unknown (fail-soft, не гадаем о причине). Канон probe: всегда dict, не бросает.
+
+    Не down (не знаем, что сломано) и не ok (не знаем, что работает) — неизвестность честнее ложного
+    вердикта на повреждённом state-файле (канон probe-semantics-from-primary-source).
+    """
+    def _boom(path=None):
+        raise RuntimeError("битый state.json")
+    monkeypatch.setattr(_local_state, "load_active_codex_isolate", _boom)
+    res = health._codex_pf_isolation_check()
+    assert res["status"] == "unknown", f"ошибка чтения → unknown (fail-soft), got {res}"
+
+
+def test_codex_pf_isolation_never_returns_down(monkeypatch):
+    """Без pfctl (нет root в doctor) чек НЕ утверждает down (не может верифицировать anchor).
+
+    Гибрид-требование «down=driver когда настроено но сломано» требует эмпирической проверки anchor'а
+    через pfctl — недоступно без sudo. Поэтому doctor не выдаёт ложный down: только ok (lease есть)
+    или unknown (lease пуст/ошибка). down остаётся documented limitation (known-limitation #168).
+    Этот тест — regression-гвард против будущей «эвристики down», которая без pfctl была бы гаданием.
+    """
+    for lease in (None, _CODEX_LEASE_OK, {"token": "0", "applied_at": None}):
+        _mock_codex_lease(monkeypatch, lease)
+        res = health._codex_pf_isolation_check()
+        assert res["status"] != "down", \
+            f"без pfctl чек не утверждает down (нечем верифицировать anchor), lease={lease}, got {res}"
+
+
+def test_check_all_has_codex_pf_isolation_check(monkeypatch):
+    """check_all содержит чек codex-PF изоляции (имя + ok-флаг + detail). Doctor её ВИДЕТ.
+
+    Существование чека в checks — основное требование #170: doctor знает про codex-PF.
+    """
+    _all_up_monkey(monkeypatch, probe_status="ok")
+    _mock_codex_lease(monkeypatch, _CODEX_LEASE_OK)
+    result = health.check_all()
+    names = [c["name"] for c in result["checks"]]
+    assert any("codex" in n.lower() and ("pf" in n.lower() or "изоляц" in n.lower()) for n in names), \
+        f"должен быть codex-PF isolation check, got: {names}"
+    pf_check = [c for c in result["checks"]
+                if "codex" in c["name"].lower() and ("pf" in c["name"].lower() or "изоляц" in c["name"].lower())][0]
+    assert pf_check.get("detail"), "чек должен иметь detail (что именно проверено)"
+
+
+def test_check_all_codex_pf_isolation_is_info_only_not_driver(monkeypatch):
+    """codex-PF чек — info-only ВСЕГДА (как versions/privoxy-log): не входит в drivers, не роняет вердикт.
+
+    Без pfctl (нет root) чек не может дать driver-down; ok/unknown — картина для doctor, не сбой стека.
+    Порты+туннель живы + codex-PF не настроен (unknown) → status=ok (не degraded).
+    """
+    _all_up_monkey(monkeypatch, probe_status="ok")
+    _mock_codex_lease(monkeypatch, None)  # codex-PF не настроен
+    result = health.check_all()
+    pf_check = [c for c in result["checks"]
+                if "codex" in c["name"].lower() and ("pf" in c["name"].lower() or "изоляц" in c["name"].lower())][0]
+    assert pf_check.get("info") is True, "info-only: не driver, не роняет агрегированный status"
+    drivers = [c for c in result["checks"] if not c.get("info")]
+    assert pf_check not in drivers, "info-check не должен входить в drivers"
+    assert result["status"] == "ok", "unknown codex-PF (info) не роняет вердикт, стек жив → ok"
+
+
+def test_check_all_ok_unchanged_when_codex_pf_not_configured(monkeypatch):
+    """РЕГРЕССИЯ: пустой codex-lease НЕ превращает зелёный стек в degraded/down.
+
+    Защита от future-change, который сделал бы чек driver'ом — на свежих установках doctor
+    не должен орать degraded из-за optional-фичи, которую юзер ещё не включил.
+    """
+    _all_up_monkey(monkeypatch, probe_status="ok")
+    _mock_codex_lease(monkeypatch, None)
+    result = health.check_all()
+    assert result["status"] == "ok", \
+        f"пустой codex-lease не должен ронять зелёный стек, got {result['status']}"

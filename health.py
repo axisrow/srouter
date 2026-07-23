@@ -473,6 +473,46 @@ def _codex_proxy_probe():
             "detail": f"runtime: codex запущен (PID {','.join(sorted(pids))}), но нет активных сокетов (idle)"}
 
 
+# ============================ #170: codex-PF изоляция (fail-closed граница) ============================
+# PF codex kill-switch (#168) — настоящая fail-closed граница: блокирует прямой выход codex
+# (UID 503) в ядре на en*/ppp*, разрешая только loopback SOCKS5 10808. Doctor обязан её ВИДЕТЬ
+# (эталон desktop-proxy-vs-managed-codex-socks5-conflict: doctor честно показывает codex-состояние).
+#
+# Источник правды — codex-lease (runtime.active_codex_isolate), тот же, что у
+# isolate_firewall.probe_codex_isolation (state-only, НЕ зовёт pfctl — требует root). Lease —
+# byte-exact canonical snapshot (канон rollback #179): пишется ТОЛЬКО при подтверждённом
+# enable_codex_isolation (srouter.py:_install_codex_isolation) и чистится ТОЛЬКО при подтверждённом
+# disable → наличие lease = достоверный факт «srouter загрузил sub-anchor com.apple/srouter_isolate/codex».
+#
+# Гибрид (канон privileged-boundary-fail-closed + решение пользователя): различаем «не настроено»
+# (lease пуст → unknown, optional фича; provisioning uid 503 — follow-up #168) vs «активна»
+# (lease есть → ok). Known-limitation: эмпирическая верификация anchor'а через pfctl требует sudo,
+# недоступного в автоматическом doctor (/dev/pf: Permission denied — verify) → чек НЕ утверждает
+# down (нечем верифицировать «настроено но сломано»); как probe_codex_isolation, отдаёт максимум
+# доступного достоверного сигнала. info-only ВСЕГДА: ok/unknown — картина для doctor, не driver.
+def _codex_pf_isolation_check():
+    """Активна ли codex-PF изоляция (sub-anchor com.apple/srouter_isolate/codex)? state-only.
+
+    Возвращает {status, detail}:
+      status="ok"      — codex-lease активен (srouter загрузил sub-anchor; kill-switch для UID 503);
+      status="unknown" — lease пуст (codex-PF не настроен — optional фича) ИЛИ ошибка чтения (fail-soft).
+
+    Никогда не возвращает down: без pfctl (нет root в doctor) нельзя верифицировать anchor →
+    «настроено но сломано» недоказуемо, гадание исключено (канон probe-semantics-from-primary-source).
+    """
+    try:
+        import local_state  # lazy: не тащим зависимость в лёгкие чеки /health/watchdog (канон root-helper)
+        lease = local_state.load_active_codex_isolate()
+    except Exception as exc:
+        return {"status": "unknown",
+                "detail": f"codex-PF изоляция: не удалось прочитать состояние ({str(exc)[:60]})"}
+    if not lease:
+        return {"status": "unknown",
+                "detail": "codex-PF изоляция не настроена (optional kill-switch; srouter install включает)"}
+    return {"status": "ok",
+            "detail": "codex-PF изоляция активна (sub-anchor загружен, kill-switch для UID 503)"}
+
+
 # ============================ #145: установленные codex/claude-code binary на диске ============================
 # Дополняет runtime-probes (lsof по ЖИВЫМ proc) инвентаризацией ДИСКА. Несколько версий — ранний
 # сигнал конфликта (#135 desktop-proxy-vs-managed-codex-socks5-conflict), но НЕ сбой стека → info-only
@@ -1091,6 +1131,13 @@ def check_all(*, active_claude=False):
     elif cx["status"] == "warn":
         cx_check["ok"] = False  # privoxy-сессия — degraded, но не «всё мертво»
     checks.append(cx_check)
+    # Codex-PF изоляция (#170): fail-closed kill-switch (#168) — блок прямого выхода codex в ядре.
+    # info-only ВСЕГДА: без pfctl (нет root в doctor) нельзя дать driver-down; ok (lease активен)
+    # vs unknown (не настроено / ошибка) — картина для doctor, не сбой стека. Не под active_claude
+    # gate: только чтение local_state (как probe_codex_isolation), лёгкое для /health/watchdog.
+    cpfi = _codex_pf_isolation_check()
+    checks.append({"name": "codex-PF изоляция (kill-switch)",
+                   "ok": cpfi["status"] == "ok", "info": True, "detail": cpfi["detail"]})
     # Установленные codex/claude-code binary на диске (#145): инвентаризация, info-only ВСЕГДА
     # (несколько версий — ранний сигнал конфликта #135, не сбой стека). unknown (ничего не установлено)
     # тоже info — не роняет вердикт. Doctor показывает картину, не угадывает.
@@ -1300,6 +1347,13 @@ def _print_report(result):
         if "codex-proxy" in failed_names:
             print("  • Codex TUI: перезапусти в НОВОМ терминале (exec zsh -l) — старая сессия не подхватила SOCKS5;")
             print("    через privoxy 8118 long-lived WS рвётся (#120); нужен SOCKS5 10808 (~/bin/codex-srouter)")
+    # codex-PF изоляция (#170) — info-only чек, но не-ok = потенциальная дыра: подсказка ВНЕ блока
+    # «Что проверить» (info не входит в failed_names). Unknown «не настроено» → optional kill-switch
+    # выключен → прямой выход codex не блокируется в ядре (возможна утечка IP мимо SOCKS5/wrapper'а).
+    cpfi = [c for c in result["checks"] if "codex-PF" in c["name"]]
+    if cpfi and not cpfi[0]["ok"]:
+        print("\ncodex-PF изоляция не активна — прямой выход codex не блокируется в ядре "
+              "(утечка IP возможна мимо SOCKS5/wrapper'а); включить: srouter install")
 
 
 def cmd_watchdog():
