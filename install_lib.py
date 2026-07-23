@@ -76,7 +76,27 @@ LAUNCHCTL = "/bin/launchctl"
 
 COMPONENTS = BREW_COMPONENTS
 CHOICES = ("adopt", "overwrite", "skip")
-PORTS = {"xray": ("tcp", 10808), "privoxy": ("tcp", 8118), "dnsmasq": ("udp", 53)}
+
+# Прокси-порты (8118/10808) — единый источник dashboard_common (issue #155/#165), НЕ локальные
+# литералы: при смене канонического порта installer должен целить в тот же порт, иначе privoxy/xray
+# стартуют на одном порту, а install-проверки и рестарты смотрят на другой → полный отказ прокси.
+# install_lib обязан работать в среде без srouter_config (install-путь): dashboard_common при
+# отсутствии конфига поднимает SystemExit (BaseException, не Exception) — ловим именно SystemExit,
+# чтобы не маскировать РЕАЛЬНЫЕ ошибки источника (SyntaxError/ImportError). Fallback = то же
+# каноническое значение; строки помечены canonical-fallback-port (гвард test_proxy_constants.py
+# разрешает их как осознанный fallback, не свежий дубликат). dnsmasq UDP 53 — НЕ прокси-порт,
+# остаётся локальным литералом (вне scope централизации прокси).
+try:
+    from dashboard_common import PRIVOXY_PORT as _PRIVOXY_PORT  # noqa: F401  (canonical-fallback-port)
+    from dashboard_common import XRAY_SOCKS_PORT as _XRAY_SOCKS_PORT  # noqa: F401  (canonical-fallback-port)
+except SystemExit:  # dashboard_common без srouter_config поднимает SystemExit (install-путь)
+    _PRIVOXY_PORT = 8118  # canonical-fallback-port
+    _XRAY_SOCKS_PORT = 10808  # canonical-fallback-port
+PORTS = {
+    "xray": ("tcp", _XRAY_SOCKS_PORT),
+    "privoxy": ("tcp", _PRIVOXY_PORT),
+    "dnsmasq": ("udp", 53),
+}
 LAUNCHAGENT_LABEL = "com.srouter.dashboard"
 LAUNCHAGENT_FILE = f"{LAUNCHAGENT_LABEL}.plist"
 LAUNCHAGENT_MARKER = "srouter-managed-launchagent-v1"

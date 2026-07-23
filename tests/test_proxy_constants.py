@@ -11,11 +11,13 @@ PRIVOXY=127.0.0.1:8118 и XRAY_SOCKS=127.0.0.1:10808 раньше дублиро
 файлы только импортируют. Никакой новой магии — просто единый импорт.
 """
 from pathlib import Path
+import re as _re
 import sys
 
 import pytest
 
 import dashboard_common
+import install_lib
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -173,6 +175,196 @@ def test_gen_xray_fallback_does_not_mask_real_import_errors():
         "gen_xray_config маскирует РЕАЛЬНУЮ ошибку импорта dashboard_common (ImportError) "
         "через except BaseException — баг источника становится невидимым на мёртвом fallback "
         f"(no-hidden-magic). stdout={result.stdout!r} stderr={result.stderr[-400:]!r}"
+    )
+
+
+# =============================================================================
+# issue #165: parity-гвард для ОСТАВШИХСЯ runtime-источников портов (shell/config).
+#
+# PR #162 (#155) централизовал Python-константы и завёл grep-гвард на `_PORT = <литерал>`.
+# Но он НЕ покрывал формы, где порт живёт ВНУТРИ строки/конфига, а не как Python-константа:
+#   - shell-скрипты (diag, launchagents) — shell не импортирует Python;
+#   - статичный install-template templates/privoxy.config;
+#   - dict-литералы (install_lib.PORTS) и f-строки генераторов (privoxy_system).
+# Сценарий отказа (из issue #165): сменили канонический порт → dashboard/health/xray
+# переключились, а installed Privoxy + клиенты + installer-проверки остались на старом →
+# полный отказ прокси. Паритет против единого источника исключает этот drift.
+#
+# Стратегия по рекомендации issue: для shell/config — parity-тест (mutation-альтернатива),
+# т.к. grep-гвард на `_PORT =` эти формы не ловит. Источник истины — dashboard_common;
+# если порт меняется там, тест указывает каждое место, обязанное следовать за ним.
+# =============================================================================
+
+# Регэкспы извлечения порта из строки. Ловят ТОЛЬКО host:port loopback (127.0.0.1:NNNN),
+# не голые числа и не placeholder'ы (USER:PASS@YOUR_VPS_IP:1080 — заглушка VPS, не канон).
+_LOOPBACK_PORT = _re.compile(r"127\.0\.0\.1:(?P<port>\d{4,5})")
+# shell `VAR_PORT="NNNN"` (или без кавычек) — голый порт-литерал без host. Ловит drift-форму,
+# которую host:port-регэксп пропускает (PRIVOXY_PORT="8118" в srouter-diag.sh). Намеренно узкий:
+# только имена, оканчивающиеся на _PORT, чтобы не цеплять произвольные числа в скриптах.
+_SHELL_PORT_VAR = _re.compile(r'(?P<name>\w*_PORT)=["\']?(?P<port>\d{4,5})["\']?\b')
+
+
+def _loopback_ports(text):
+    """Множество всех 127.0.0.1:PORT вхождений в text (только loopback, не VPS-placeholder)."""
+    return {int(m.group("port")) for m in _LOOPBACK_PORT.finditer(text)}
+
+
+def _shell_port_var_assignments(text):
+    """{varname: port} для `VAR_PORT="NNNN"` литералов в shell (drift-форма без host)."""
+    return {m.group("name"): int(m.group("port")) for m in _SHELL_PORT_VAR.finditer(text)}
+
+
+def _canonical_proxy_ports():
+    """Канонические прокси-порты из единого источника (dashboard_common)."""
+    return {dashboard_common.PRIVOXY_PORT, dashboard_common.XRAY_SOCKS_PORT}
+
+
+def test_install_lib_ports_follow_canonical_source():
+    """install_lib.PORTS (dict-литерал, не `_PORT =`) обязан брать порты из источника,
+    а не хардкодить 8118/10808. install_lib работает без srouter_config (install-путь),
+    поэтому держит canonical-fallback на то же значение — оба обязаны совпадать с источником."""
+    expected = _canonical_proxy_ports()
+    actual = {install_lib.PORTS["xray"][1], install_lib.PORTS["privoxy"][1]}
+    assert actual == expected, (
+        "install_lib.PORTS разошёлся с каноническим источником (issue #165). "
+        f"PORTS={actual}, canonical={expected}. Импортируй из dashboard_common."
+    )
+    # dnsmasq UDP 53 — НЕ прокси-порт, остаётся локальным литералом (вне scope).
+    assert install_lib.PORTS["dnsmasq"] == ("udp", 53)
+
+
+def test_privoxy_protected_config_follows_canonical_ports(tmp_path):
+    """privoxy_system.protected_config_text() — listen-address/forward-socks5t выражены через
+    источник, а не хардкод 8118/10808. Иначе privoxy слушает один порт, xray-bridge целит другой."""
+    import privoxy_system
+
+    layout = privoxy_system.ProtectedLayout(
+        helper_path=tmp_path / "h", launchdaemon_path=tmp_path / "ld",
+        config_dir=tmp_path / "c", config_path=tmp_path / "c" / "config",
+        templates_dir=tmp_path / "t", manifest_path=tmp_path / "m",
+        backup_root=tmp_path / "b", log_dir=tmp_path / "l",
+        stdout_path=tmp_path / "o", stderr_path=tmp_path / "e",
+        sudoers_path=tmp_path / "s",
+    )
+    config = privoxy_system.protected_config_text(layout)
+    expected = _canonical_proxy_ports()
+    assert _loopback_ports(config) == expected, (
+        "protected_config_text разошёлся с каноническим источником (issue #165). "
+        f"loopback-порты={_loopback_ports(config)}, canonical={expected}."
+    )
+
+
+def test_install_template_privoxy_config_follows_canonical_ports():
+    """templates/privoxy.config — статичный install-template (копируется в config при install).
+    Его listen-address/forward-socks5t обязаны совпадать с каноническим портом, иначе installed
+    Privoxy слушает не тот порт, что health/xray (drift → полный отказ прокси)."""
+    template = ROOT / "templates" / "privoxy.config"
+    assert template.exists(), "templates/privoxy.config отсутствует"
+    text = template.read_text(encoding="utf-8")
+    expected = _canonical_proxy_ports()
+    assert _loopback_ports(text) == expected, (
+        "templates/privoxy.config разошёлся с каноническим источником (issue #165). "
+        f"loopback-порты={_loopback_ports(text)}, canonical={expected}. "
+        "listen-address/forward-socks5t обязаны следовать за dashboard_common."
+    )
+
+
+# --- shell-скрипты: runtime proxy-endpoints следуют за каноническим SOCKS/HTTP портом ---
+
+def _assert_shell_proxy_endpoints_follow_canonical(script_rel, expected_port_map):
+    """Общий parity-чекер shell-скрипта против канонического источника портов.
+
+    expected_port_map: {varname: expected_canonical_port}, где varname — чистое имя переменной
+    (БЕЗ `=`), которая несёт порт. Покрываются ДВЕ формы drift-риска (issue #165):
+      1. host:port-литерал в строке: `BRIDGE="http://127.0.0.1:8118"` — ловится через loopback-регэксп;
+      2. голый порт-литерал без host: `PRIVOXY_PORT="8118"` — ловится через _SHELL_PORT_VAR.
+    Ловит drift: если кто-то поменяет порт в скрипте, но не в dashboard_common — падает.
+    """
+    script = ROOT / script_rel
+    assert script.exists(), f"{script_rel} отсутствует"
+    text = script.read_text(encoding="utf-8")
+    canonical = _canonical_proxy_ports()
+
+    # (1) ВСЕ loopback-порты скрипта обязаны быть подмножеством канонических.
+    found_loopback = _loopback_ports(text)
+    assert found_loopback <= canonical, (
+        f"{script_rel} содержит loopback-порт вне канонического набора (issue #165): "
+        f"found={found_loopback}, canonical={canonical}. "
+        "127.0.0.1:PORT обязаны совпадать с PRIVOXY_PORT/XRAY_SOCKS_PORT."
+    )
+
+    # (2) ВСЕ `*_PORT="NNNN"` литералы обязаны быть подмножеством канонических (DNSMASQ_PORT=53
+    # — НЕ прокси, отдельно whitelisted). Ловит drift-форму без host (srouter-diag PRIVOXY_PORT).
+    shell_vars = _shell_port_var_assignments(text)
+    non_proxy_port_vars = {"DNSMASQ_PORT"}  # 53 — не прокси-порт, вне scope централизации
+    for varname, port in shell_vars.items():
+        if varname in non_proxy_port_vars:
+            continue
+        assert port in canonical, (
+            f"{script_rel}: {varname}={port} — не канонический прокси-порт (issue #165), "
+            f"canonical={canonical}. Переменная обязана следовать за dashboard_common."
+        )
+
+    # (3) Контекстная привязка: каждая указанная переменная несёт именно ожидаемый канонический порт.
+    for varname, expected_port in expected_port_map.items():
+        # Форма `VAR_PORT="NNNN"` (голый порт, без host).
+        if varname in shell_vars:
+            actual = shell_vars[varname]
+            assert actual == expected_port, (
+                f"{script_rel}: {varname}={actual} должен быть {expected_port} "
+                f"(канонический {varname}, issue #165 drift)."
+            )
+            continue
+        # Иначе host:port-литерал в строке, содержащей `varname=` (BRIDGE="http://127.0.0.1:8118").
+        matching = [ln for ln in text.splitlines() if f"{varname}=" in ln and "127.0.0.1:" in ln]
+        assert matching, (
+            f"{script_rel}: нет '{varname}=' ни как VAR_PORT=\"NNNN\", ни как 127.0.0.1:PORT"
+        )
+        for line in matching:
+            ports = _loopback_ports(line)
+            assert expected_port in ports, (
+                f"{script_rel}: '{line.strip()}' ({varname}) должна нести "
+                f"канонический порт {expected_port}, а несёт {ports} (issue #165 drift)."
+            )
+
+
+def test_launchagent_codex_env_follows_canonical_socks_port():
+    """srouter-codex-env.sh выставляет GUI env PROXY=socks5h://127.0.0.1:XRAY_SOCKS_PORT.
+    Shell не импортирует Python — parity-гвард против dashboard_common.XRAY_SOCKS_PORT."""
+    _assert_shell_proxy_endpoints_follow_canonical(
+        "launchagents/srouter-codex-env.sh",
+        {"PROXY": dashboard_common.XRAY_SOCKS_PORT},
+    )
+
+
+def test_launchagent_codex_app_wrapper_follows_canonical_socks_port():
+    """srouter-codex-app-proxy-wrapper.sh: CHROMIUM_PROXY_URL=socks5://127.0.0.1:XRAY_SOCKS_PORT
+    (Chromium --proxy-server, не понимает socks5h). Parity против XRAY_SOCKS_PORT."""
+    _assert_shell_proxy_endpoints_follow_canonical(
+        "launchagents/srouter-codex-app-proxy-wrapper.sh",
+        {"CHROMIUM_PROXY_URL": dashboard_common.XRAY_SOCKS_PORT},
+    )
+
+
+def test_srouter_diag_follows_canonical_ports():
+    """srouter-diag.sh: BRIDGE=http 8118, PRIVOXY_PORT=8118, XRAY_SOCKS_PORT=10808.
+    Все три обязаны совпадать с каноническими (issue #165)."""
+    _assert_shell_proxy_endpoints_follow_canonical(
+        "srouter-diag.sh",
+        {
+            "BRIDGE": dashboard_common.PRIVOXY_PORT,
+            "PRIVOXY_PORT": dashboard_common.PRIVOXY_PORT,
+            "XRAY_SOCKS_PORT": dashboard_common.XRAY_SOCKS_PORT,
+        },
+    )
+
+
+def test_diag_proxy_follows_canonical_bridge_port():
+    """diag-proxy.sh: BRIDGE=http://127.0.0.1:8118 (privoxy). Паритет против PRIVOXY_PORT.
+    SOCKS=...:1080 — заглушка VPS (USER:PASS@YOUR_VPS_IP), НЕ loopback 127.0.0.1, гард её не трогает."""
+    _assert_shell_proxy_endpoints_follow_canonical(
+        "diag-proxy.sh",
+        {"BRIDGE": dashboard_common.PRIVOXY_PORT},
     )
 
 
