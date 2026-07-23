@@ -130,17 +130,20 @@ def gather_status():
     active_route = _active_route_context()
     active_route_ip = active_route["route_ip"]
     active_route_key = active_route["key"]
-    # issue #159: bounded acquire (уровень CACHE). Read-точка: on_timeout → None
-    # = cache miss, пробы пересчитаются ниже. Default timeout=0 ≡ `with _lock:`.
-    with lock_hierarchy.bounded_acquire(
-        _lock, name="status-cache", level=lock_hierarchy.LEVEL_CACHE, on_timeout=lambda: None
-    ):
-        if (
-            _cache["data"]
-            and _cache.get("active_route_key") == active_route_key
-            and now - _cache["ts"] < STATUS_CACHE_TTL_SEC
+    # issue #159: bounded acquire (уровень CACHE). Read-точка: таймаут = cache miss,
+    # пробы пересчитаются ниже. Default timeout=0 ≡ `with _lock:`.
+    try:
+        with lock_hierarchy.bounded_acquire(
+            _lock, name="status-cache", level=lock_hierarchy.LEVEL_CACHE
         ):
-            return _cache["data"]
+            if (
+                _cache["data"]
+                and _cache.get("active_route_key") == active_route_key
+                and now - _cache["ts"] < STATUS_CACHE_TTL_SEC
+            ):
+                return _cache["data"]
+    except lock_hierarchy.LockAcquireTimeout:
+        pass  # cache miss — пересчитаем пробы ниже
 
     probes = {
         "services": probe_services,
@@ -164,12 +167,15 @@ def gather_status():
     out = _run_status_probe_set(probes, STATUS_PROBE_BUDGET_SEC)
     out["nodes"] = probe_nodes_snapshot()
     out["ts"] = now
-    # issue #159: bounded acquire (уровень CACHE). Write-точка: on_timeout → None
-    # (пропускаем запись кэша; следующий /api/status пересчитает).
-    with lock_hierarchy.bounded_acquire(
-        _lock, name="status-cache", level=lock_hierarchy.LEVEL_CACHE, on_timeout=lambda: None
-    ):
-        _cache.update(ts=now, data=out, active_route_ip=active_route_ip, active_route_key=active_route_key)
+    # issue #159: bounded acquire (уровень CACHE). Write-точка: таймаут → пропускаем
+    # запись кэша (следующий /api/status пересчитает).
+    try:
+        with lock_hierarchy.bounded_acquire(
+            _lock, name="status-cache", level=lock_hierarchy.LEVEL_CACHE
+        ):
+            _cache.update(ts=now, data=out, active_route_ip=active_route_ip, active_route_key=active_route_key)
+    except lock_hierarchy.LockAcquireTimeout:
+        pass  # skip-write; кэш не критичен
     return out
 
 

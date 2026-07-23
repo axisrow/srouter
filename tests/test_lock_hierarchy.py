@@ -96,29 +96,10 @@ def test_bounded_acquire_blocking_default():
     assert not lk.locked()
 
 
-def test_bounded_acquire_timeout_falls_back():
-    # Занятый лок + маленький бюджет → on_timeout вызван, возвращён его результат
-    # (stale/empty-fallback как у существующих кэшей).
-    lk = threading.Lock()
-    lk.acquire()
-    try:
-        called = {"v": False}
-
-        def fallback():
-            called["v"] = True
-            return "stale"
-
-        with lock_hierarchy.bounded_acquire(
-            lk, name="t", level=lock_hierarchy.LEVEL_CACHE, timeout_sec=0.1, on_timeout=fallback
-        ) as v:
-            assert v == "stale"
-        assert called["v"] is True
-    finally:
-        lk.release()
-
-
-def test_bounded_acquire_timeout_raises_without_fallback():
-    # Таймаут без on_timeout → структурный сбой (fail-closed), не тихой hang.
+def test_bounded_acquire_timeout_raises():
+    # Таймаут ВСЕГДА → LockAcquireTimeout (fail-closed, не тихой hang). on_timeout удалён:
+    # @contextmanager не может пропустить тело вызывающего, поэтому fallback обязан быть
+    # явным try/except В CALLER, а тело НИКОГДА не выполняется без захваченного лока.
     lk = threading.Lock()
     lk.acquire()
     try:
@@ -127,6 +108,25 @@ def test_bounded_acquire_timeout_raises_without_fallback():
                 lk, name="t", level=lock_hierarchy.LEVEL_CACHE, timeout_sec=0.1
             ):
                 pass
+    finally:
+        lk.release()
+
+
+def test_bounded_acquire_body_never_runs_without_lock():
+    # КРИТИЧЕСКИЙ инвариант (регрессия, пойманная cycle-review): на таймауте тело with
+    # НЕ выполняется. Раньше on_timeout=yield-в-тело позволял телу работать без лока.
+    lk = threading.Lock()
+    lk.acquire()
+    body_ran = {"v": False}
+    try:
+        try:
+            with lock_hierarchy.bounded_acquire(
+                lk, name="t", level=lock_hierarchy.LEVEL_CACHE, timeout_sec=0.05
+            ):
+                body_ran["v"] = True  # НЕ должно выполниться — лок не захвачен
+        except lock_hierarchy.LockAcquireTimeout:
+            pass
+        assert body_ran["v"] is False, "тело выполнилось без захваченного лока!"
     finally:
         lk.release()
 
@@ -179,9 +179,41 @@ def test_watchdog_breaks_simulated_hang():
     assert result["elapsed"] < 2.0  # вышел быстро, не завис на 5с держащего потока
 
 
-# ============================ единый источник LEVEL_* (канон no-hidden-magic) ============================
+# ============================ инвариант hotroutes _update_due (регрессия Codex) ============================
 
-def test_single_source_of_lock_levels():
+def test_hotroutes_update_due_timeout_returns_false_and_skips_body(monkeypatch):
+    # РЕГРЕССИЯ (cycle-review conf 1.0): на таймауте _update_due обязан вернуть False БЕЗ
+    # выполнения тела — иначе probe_hot_routes позвал бы _release_update в finally без
+    # установленного in-progress флага. Тело НИКОГДА не выполняется без лока.
+    import dashboard_hotroutes
+    monkeypatch.setenv("SROUTER_LOCK_TIMEOUT_SEC", "0.05")
+    key = ("cache", "log", 5, 60.0, 1)
+    lk = dashboard_hotroutes._lock
+    lk.acquire()  # имитируем hold (как зависший probe)
+    dashboard_hotroutes._in_progress_updates.discard(key)
+    try:
+        due = dashboard_hotroutes._update_due(key, 1000.0, 1.0)
+        assert due is False  # таймаут → skip, не запускать update-цикл
+        assert key not in dashboard_hotroutes._in_progress_updates  # флаг НЕ установлен
+    finally:
+        lk.release()
+
+
+def test_hotroutes_release_update_timeout_is_noop(monkeypatch):
+    # На таймауте _release_update пропускает discard (флаг при таймауте _update_due и так
+    # не установлен) — не виснет, не бросает.
+    import dashboard_hotroutes
+    monkeypatch.setenv("SROUTER_LOCK_TIMEOUT_SEC", "0.05")
+    key = ("cache", "log", 5, 60.0, 1)
+    lk = dashboard_hotroutes._lock
+    lk.acquire()
+    try:
+        dashboard_hotroutes._release_update(key)  # не должно бросать
+    finally:
+        lk.release()
+
+
+# ============================ единый источник LEVEL_* (канон no-hidden-magic) ============================def test_single_source_of_lock_levels():
     # Эталон tests/test_proxy_constants.py: ОПРЕДЕЛЕНИЯ числовых уровней блокировок
     # живут ТОЛЬКО в lock_hierarchy.py. Использования (`level=lock_hierarchy.LEVEL_*`)
     # в точках вызова — норма; ловим только повторное присвоение `LEVEL_* = <int>`.

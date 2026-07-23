@@ -125,63 +125,79 @@ def _cache_key(cache_path, log_path, top_n, ttl, bucket_size):
 
 
 def _last_entries(key):
-    # issue #159: bounded acquire (уровень CACHE). on_timeout → {} (нет кэша — caller
-    # отдаст пустой top-N, как при первом запуске).
-    with lock_hierarchy.bounded_acquire(
-        _lock, name="hotroutes", level=lock_hierarchy.LEVEL_CACHE, on_timeout=lambda: {}
-    ):
-        if _probe_cache.get("key") != key:
-            return {}
-        return dict(_probe_cache.get("entries") or {})
+    # issue #159: bounded acquire (уровень CACHE). Таймаут → {} (нет кэша — caller
+    # отдаст пустой top-N, как при первом запуске). Тело НЕ выполняется без лока.
+    try:
+        with lock_hierarchy.bounded_acquire(
+            _lock, name="hotroutes", level=lock_hierarchy.LEVEL_CACHE
+        ):
+            if _probe_cache.get("key") != key:
+                return {}
+            return dict(_probe_cache.get("entries") or {})
+    except lock_hierarchy.LockAcquireTimeout:
+        return {}
 
 
 def _last_error(key):
-    # issue #159: on_timeout → "" (нет ошибки в кэше — статус "ok").
-    with lock_hierarchy.bounded_acquire(
-        _lock, name="hotroutes", level=lock_hierarchy.LEVEL_CACHE, on_timeout=lambda: ""
-    ):
-        if _probe_cache.get("key") != key:
-            return ""
-        return _probe_cache.get("error") or ""
+    # issue #159: таймаут → "" (нет ошибки в кэше — статус "ok").
+    try:
+        with lock_hierarchy.bounded_acquire(
+            _lock, name="hotroutes", level=lock_hierarchy.LEVEL_CACHE
+        ):
+            if _probe_cache.get("key") != key:
+                return ""
+            return _probe_cache.get("error") or ""
+    except lock_hierarchy.LockAcquireTimeout:
+        return ""
 
 
 def _store_entries(key, updated_at, entries, error=""):
-    # issue #159: write-точка. on_timeout → None (пропускаем запись кэша).
-    with lock_hierarchy.bounded_acquire(
-        _lock, name="hotroutes", level=lock_hierarchy.LEVEL_CACHE, on_timeout=lambda: None
-    ):
-        _probe_cache.update(
-            key=key,
-            updated_at=updated_at,
-            entries=dict(entries or {}),
-            error=error or "",
-        )
+    # issue #159: write-точка. Таймаут → пропускаем запись кэша.
+    try:
+        with lock_hierarchy.bounded_acquire(
+            _lock, name="hotroutes", level=lock_hierarchy.LEVEL_CACHE
+        ):
+            _probe_cache.update(
+                key=key,
+                updated_at=updated_at,
+                entries=dict(entries or {}),
+                error=error or "",
+            )
+    except lock_hierarchy.LockAcquireTimeout:
+        pass  # skip-write; кэш не критичен
 
 
 def _update_due(key, now_ts, update_interval):
-    # issue #159: КРИТИЧНО — on_timeout=lambda: False. probe_hot_routes зовёт _release_update
-    # в finally ТОЛЬКО когда _update_due вернул True; False на таймауте → update-цикл
-    # пропускается целиком, finally не срабатывает, _in_progress_updates не затронут (инвариант).
-    with lock_hierarchy.bounded_acquire(
-        _lock, name="hotroutes", level=lock_hierarchy.LEVEL_CACHE, on_timeout=lambda: False
-    ):
-        if key in _in_progress_updates:
-            return False
-        due = _probe_cache.get("key") != key or (
-            now_ts - float(_probe_cache.get("updated_at") or 0.0) >= update_interval
-        )
-        if due:
-            _in_progress_updates.add(key)
-        return due
+    # issue #159: КРИТИЧНО — таймаут → return False (а НЕ выполнить тело). probe_hot_routes
+    # зовёт _release_update в finally ТОЛЬКО когда _update_due вернул True; False на таймауте
+    # → update-цикл пропускается целиком, finally не срабатывает, _in_progress_updates не
+    # затронут (инвариант сохранён). Тело НИКОГДА не выполняется без захваченного лока.
+    try:
+        with lock_hierarchy.bounded_acquire(
+            _lock, name="hotroutes", level=lock_hierarchy.LEVEL_CACHE
+        ):
+            if key in _in_progress_updates:
+                return False
+            due = _probe_cache.get("key") != key or (
+                now_ts - float(_probe_cache.get("updated_at") or 0.0) >= update_interval
+            )
+            if due:
+                _in_progress_updates.add(key)
+            return due
+    except lock_hierarchy.LockAcquireTimeout:
+        return False
 
 
 def _release_update(key):
-    # issue #159: on_timeout → None (пропускаем discard; in-progress флаг при таймауте
-    # _update_due и так не установлен — discard был бы no-op).
-    with lock_hierarchy.bounded_acquire(
-        _lock, name="hotroutes", level=lock_hierarchy.LEVEL_CACHE, on_timeout=lambda: None
-    ):
-        _in_progress_updates.discard(key)
+    # issue #159: таймаут → пропускаем discard. in-progress флаг при таймауте _update_due
+    # и так не установлен (она вернула False), discard был бы no-op; безопасно пропустить.
+    try:
+        with lock_hierarchy.bounded_acquire(
+            _lock, name="hotroutes", level=lock_hierarchy.LEVEL_CACHE
+        ):
+            _in_progress_updates.discard(key)
+    except lock_hierarchy.LockAcquireTimeout:
+        pass  # skip-discard; флаг не был установлен при таймауте _update_due
 
 
 def probe_hot_routes(state_path=None, cache_path=None, log_path=None, now=None):

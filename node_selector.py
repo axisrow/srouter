@@ -474,18 +474,24 @@ def _route_gateway_from_output(out):
 def select_node(name, *, enabled_names, runner=None, state_path=None, config_path=XRAY_CONFIG_PATH):
     """Безопасно применить ручной active-node выбор. Функция никогда не бросает наружу."""
     # issue #159: bounded acquire + ordering-guard. Default timeout=0 ≡ `with _SELECT_LOCK:`;
-    # SROUTER_LOCK_TIMEOUT_SEC>0 → hang рестарта xray не вешает 24/7-инфру (LockAcquireTimeout
-    # пробрасывается во внешний try/except → структурированный error). Уровень SELECT=1.
-    with lock_hierarchy.bounded_acquire(
-        _SELECT_LOCK, name="select", level=lock_hierarchy.LEVEL_SELECT
-    ):
-        return _select_node_locked(
-            name,
-            enabled_names=enabled_names,
-            runner=runner,
-            state_path=state_path,
-            config_path=config_path,
-        )
+    # SROUTER_LOCK_TIMEOUT_SEC>0 → hang держащего _SELECT_LOCK не вешает 24/7-инфру: ловим
+    # LockAcquireTimeout (тело НЕ выполняется без лока) и отдаём структурированный error.
+    # Контракт «never throws» сохранён. Уровень SELECT=1.
+    previous = _active_name(state_path)
+    try:
+        with lock_hierarchy.bounded_acquire(
+            _SELECT_LOCK, name="select", level=lock_hierarchy.LEVEL_SELECT
+        ):
+            return _select_node_locked(
+                name,
+                enabled_names=enabled_names,
+                runner=runner,
+                state_path=state_path,
+                config_path=config_path,
+            )
+    except lock_hierarchy.LockAcquireTimeout as exc:
+        return {"ok": False, "active": previous, "step": "lock-timeout",
+                "error": f"another select in progress: {exc}"}
 
 
 def _select_node_locked(name, *, enabled_names, runner=None, state_path=None, config_path=XRAY_CONFIG_PATH):

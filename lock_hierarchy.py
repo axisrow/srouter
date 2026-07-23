@@ -147,15 +147,19 @@ def held(level, name):
 
 
 @contextlib.contextmanager
-def bounded_acquire(lock, *, name, level, timeout_sec=None, on_timeout=None):
+def bounded_acquire(lock, *, name, level, timeout_sec=None):
     """Ограниченный захват блокировки + ordering-guard-аннотация.
 
-    - timeout_sec > 0: bounded acquire; не получилось за бюджет → on_timeout() (если задан)
-      или raise LockAcquireTimeout. timeout_sec == 0/None → блокирующее поведение,
-      идентичное `with lock:` (нулевая регрессия семантики существующих локов).
-    - on_timeout: вызывается БЕЗ захвата лока; его результат выдаётся как value контекста
-      (stale/empty-fallback). Не используется для точек, где таймаут = структурный сбой.
+    - timeout_sec > 0: bounded acquire; не получилось за бюджет → raise LockAcquireTimeout
+      (тело контекста НЕ выполняется — lock не захвачен). timeout_sec == 0/None →
+      блокирующее поведение, идентичное `with lock:` (нулевая регрессия).
     - ordering-guard (held) срабатывает только при SROUTER_LOCK_ORDER_GUARD=1.
+
+    ВАЖНО (issue #159 cycle-review fix): таймаут = исключение, НЕ «выполнить тело с
+    fallback». @contextmanager физически не может пропустить тело вызывающего, поэтому
+    fallback на таймауте обязан быть явным try/except LockAcquireTimeout В CALLER (см.
+    точки применения: probe_hot_routes, probe_nodes_snapshot, gather_status, _geo_lookup,
+    select_node). Тело with НИКОГДА не выполняется без захваченного лока.
 
     Это каноническая обёртка для всех кэш-локов и _SELECT_LOCK.
     _MUTATION_LOCK НЕ оборачивается (уже non-blocking 409, трогать запрещено каноном).
@@ -169,10 +173,6 @@ def bounded_acquire(lock, *, name, level, timeout_sec=None, on_timeout=None):
         if ok is None:
             ok = True
     if not ok:
-        if on_timeout is not None:
-            # Контекст «провалился» без захвата: отдаём fallback, release не зовём.
-            yield on_timeout()
-            return
         raise LockAcquireTimeout(f"{name}: acquire timed out after {t}s")
     try:
         with held(level, name):
