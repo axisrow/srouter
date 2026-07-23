@@ -10,6 +10,8 @@ import time
 import hot_routes
 import local_state
 
+import lock_hierarchy
+
 
 HOT_ROUTES_UPDATE_THROTTLE_SEC = 60.0
 # In-flight guard отвечает за correctness; минимум здесь только режет ручной
@@ -123,43 +125,79 @@ def _cache_key(cache_path, log_path, top_n, ttl, bucket_size):
 
 
 def _last_entries(key):
-    with _lock:
-        if _probe_cache.get("key") != key:
-            return {}
-        return dict(_probe_cache.get("entries") or {})
+    # issue #159: bounded acquire (уровень CACHE). Таймаут → {} (нет кэша — caller
+    # отдаст пустой top-N, как при первом запуске). Тело НЕ выполняется без лока.
+    try:
+        with lock_hierarchy.bounded_acquire(
+            _lock, name="hotroutes", level=lock_hierarchy.LEVEL_CACHE
+        ):
+            if _probe_cache.get("key") != key:
+                return {}
+            return dict(_probe_cache.get("entries") or {})
+    except lock_hierarchy.LockAcquireTimeout:
+        return {}
 
 
 def _last_error(key):
-    with _lock:
-        if _probe_cache.get("key") != key:
-            return ""
-        return _probe_cache.get("error") or ""
+    # issue #159: таймаут → "" (нет ошибки в кэше — статус "ok").
+    try:
+        with lock_hierarchy.bounded_acquire(
+            _lock, name="hotroutes", level=lock_hierarchy.LEVEL_CACHE
+        ):
+            if _probe_cache.get("key") != key:
+                return ""
+            return _probe_cache.get("error") or ""
+    except lock_hierarchy.LockAcquireTimeout:
+        return ""
 
 
 def _store_entries(key, updated_at, entries, error=""):
-    with _lock:
-        _probe_cache.update(
-            key=key,
-            updated_at=updated_at,
-            entries=dict(entries or {}),
-            error=error or "",
-        )
+    # issue #159: write-точка. Таймаут → пропускаем запись кэша.
+    try:
+        with lock_hierarchy.bounded_acquire(
+            _lock, name="hotroutes", level=lock_hierarchy.LEVEL_CACHE
+        ):
+            _probe_cache.update(
+                key=key,
+                updated_at=updated_at,
+                entries=dict(entries or {}),
+                error=error or "",
+            )
+    except lock_hierarchy.LockAcquireTimeout:
+        pass  # skip-write; кэш не критичен
 
 
 def _update_due(key, now_ts, update_interval):
-    with _lock:
-        if key in _in_progress_updates:
-            return False
-        due = _probe_cache.get("key") != key or (
-            now_ts - float(_probe_cache.get("updated_at") or 0.0) >= update_interval
-        )
-        if due:
-            _in_progress_updates.add(key)
-        return due
+    # issue #159: КРИТИЧНО — таймаут → return False (а НЕ выполнить тело). probe_hot_routes
+    # зовёт _release_update в finally ТОЛЬКО когда _update_due вернул True; False на таймауте
+    # → update-цикл пропускается целиком, finally не срабатывает, _in_progress_updates не
+    # затронут (инвариант сохранён). Тело НИКОГДА не выполняется без захваченного лока.
+    try:
+        with lock_hierarchy.bounded_acquire(
+            _lock, name="hotroutes", level=lock_hierarchy.LEVEL_CACHE
+        ):
+            if key in _in_progress_updates:
+                return False
+            due = _probe_cache.get("key") != key or (
+                now_ts - float(_probe_cache.get("updated_at") or 0.0) >= update_interval
+            )
+            if due:
+                _in_progress_updates.add(key)
+            return due
+    except lock_hierarchy.LockAcquireTimeout:
+        return False
 
 
 def _release_update(key):
-    with _lock:
+    # issue #159 cycle-2 (Codex conf 1.0): это CLEANUP — зовётся в finally ТОЛЬКО когда
+    # _update_due вернул True (флаг УСТАНОВЛЕН). Пропустить discard на таймауте = leaked
+    # in-progress marker → будущие _update_due навсегда возвращают False → refresh hot-routes
+    # подавлен до рестарта. Поэтому cleanup ИСПОЛЬЗУЕТ UNBOUNDED blocking acquire (timeout=0):
+    # discard обязан довестись до конца; hold короткий (set.discard), hang-риск минимален.
+    # Канон srouter-critical-infra-24-7: cleanup не сдается и не оставляет мусор.
+    with lock_hierarchy.bounded_acquire(
+        _lock, name="hotroutes", level=lock_hierarchy.LEVEL_CACHE, timeout_sec=0
+    ):
         _in_progress_updates.discard(key)
 
 

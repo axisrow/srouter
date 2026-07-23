@@ -50,6 +50,7 @@ py-modules = [
     "privoxy_system",
     "privoxy_audit",
     "privileged_ops",
+    "lock_hierarchy",
 ]
 
 [tool.setuptools.package-data]
@@ -59,4 +60,5 @@ py-modules = [
 testpaths = ["tests"]
 markers = [
     "acceptance: end-to-end приёмочные тесты реального CLI srouter в Docker-полигоне (skip без SROUTER_ACCEPTANCE=1)",
+    "locks: threading/concurrency-тесты иерархии блокировок и watchdog (issue #159)",
 ]
