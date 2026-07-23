@@ -68,6 +68,13 @@ fi
 #   3. ЛЕГИТИМНЫЙ descendant (real Codex spawn'ит worker через managed wrapper): тоже fork, hop растёт,
 #      но bounded (вложенная agent-орkeстрация — единицы уровней). CEILING=16 даёт запас для любой
 #      разумной вложенности и обрывает бесконтрольную foreign-рекурсию задолго до исчерпания лимита.
+# ПОКРЫТИЕ И ГРАНИЦА (cycle-review PR #153 rounds 1-3): sentinel ловит 3 класса NATURAL-рекурсии
+# (exec-цикл, linear fork, env-inherited re-entry). Граница threat-model: env-passing — эвристика
+# передачи состояния без замкнутого инварианта (как и identity-чеки файла, см. #150), её обходят
+# НАМЕРЕННЫЕ конструкции foreign-wrapper под контролем того же UID — `env -u SROUTER_CODEX_WRAPPER_V1`
+# (стирает sentinel) и параллельный fan-out (`codex & codex &`, экспоненциальный рост дерева). Это
+# availability-класс вне natural-рекурсии #150 (нужен active malice в PATH уже контролируемого UID),
+# осознанно не покрывается best-effort layer'ом — честная fail-closed граница = PF kill-switch.
 _CE_CYCLE_CEILING=16
 if [ "${SROUTER_CODEX_WRAPPER_V1:-}" != "" ]; then
   _prev_pid="${SROUTER_CODEX_WRAPPER_V1%%:*}"
@@ -84,6 +91,10 @@ if [ "${SROUTER_CODEX_WRAPPER_V1:-}" != "" ]; then
   # Класс 2/3: новый PID (fork). Извлекаем hop унаследованного sentinel и инкрементируем.
   _prev_hop="${SROUTER_CODEX_WRAPPER_V1#*:}"
   [ "$_prev_hop" = "$SROUTER_CODEX_WRAPPER_V1" ] && _prev_hop=0   # нет ':' (старый формат) → 0
+  # Non-numeric hop guard: аномальное/манипулированное значение (не natural) → reset, не арифм.сбой.
+  case "$_prev_hop" in
+    ''|*[!0-9]*) _prev_hop=0 ;;
+  esac
   _next_hop=$((_prev_hop + 1))
   if [ "$_next_hop" -gt "$_CE_CYCLE_CEILING" ]; then
     # Класс 2: fork-рекурсия превысила потолок (foreign БЕЗ exec накапливает процессы). Обрыв.

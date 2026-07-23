@@ -1136,6 +1136,33 @@ def test_cycle_guard_fork_foreign_bounded_not_process_bomb(monkeypatch, tmp_path
          f"получено rc={proc.returncode}, stderr={proc.stderr[:200]!r}")
 
 
+def test_cycle_guard_non_numeric_hop_resets_not_crash(monkeypatch, tmp_path):
+    """#150 robustness (cycle-review PR #153 round-3 minor): аномальное/манипулированное значение sentinel
+    (non-numeric hop) не должно ронять wrapper арифметической ошибкой — reset в 0, продолжаем штатно.
+
+    Сценарий: env намеренно установлен в 'garbage' (нет ':' или non-numeric hop). Natural-пути сюда не
+    доходят (wrapper всегда пишет <pid>:<int>), но fail-loud-семантика обязана держаться и на аномалиях:
+    arith-ошибка в sh дала бы непредсказуемый exit. Guard `case` сбрасывает non-numeric → 0 → штатный вход.
+    """
+    import subprocess
+    home = _mock_home(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    monkeypatch.setattr(srouter, "_codex_bin_path", lambda: str(tmp_path / "any-codex"))
+    srouter._install_codex_wrappers(env)
+    wrapper = home / "bin" / "codex"
+    real_codex = tmp_path / "realdir" / "codex"; real_codex.parent.mkdir(parents=True)
+    real_codex.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    real_codex.chmod(0o755)
+    caller_path = f"{home / 'bin'}:{tmp_path / 'realdir'}:/usr/bin:/bin"
+    # env с аномальным sentinel (non-numeric hop) — wrapper обязан reset'нуть и продолжить, не крашнуться.
+    proc = subprocess.run([str(wrapper), "x"],
+                          env={**os.environ, "PATH": caller_path,
+                               "SROUTER_CODEX_WRAPPER_V1": "99999:not-a-number"},
+                          capture_output=True, text=True, timeout=10)
+    assert proc.returncode == 0, \
+        f"non-numeric hop должен reset'нуться → штатный запуск (не arith-краш): rc={proc.returncode}, stderr={proc.stderr!r}"
+
+
 def test_cycle_guard_runs_real_codex_on_single_pass(monkeypatch, tmp_path):
     """#150 шаг 3: на ОДНОКРАТНОМ нормальном входе (нет цикла) cycle-guard НЕ срабатывает — real Codex
     запускается, аргументы доходят. Сентинель guard'ит только повторный вход, не первый.
