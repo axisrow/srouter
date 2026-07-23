@@ -46,6 +46,20 @@ OTOOL = "/usr/bin/otool"
 INSTALL_NAME_TOOL = "/usr/bin/install_name_tool"
 CODESIGN = "/usr/bin/codesign"
 
+# Прокси-порты (8118/10808). Этот модуль — root-only helper (см. docstring модуля: «намеренно
+# использует только stdlib»). Он копируется ОДНИМ файлом в /Library/PrivilegedHelperTools и
+# исполняется изолированно через sudo — рядом НЕТ dashboard_common.py (и srouter_config.py).
+# Поэтому НЕ импортируем dashboard_common (ModuleNotFoundError убил бы helper в production —
+# regression, пойманная cycle-review PR #177). Порты держим локальными литералами; anti-drift
+# гарантирует parity-гвард tests/test_proxy_constants.py::test_privoxy_protected_config_follows_canonical_ports
+# — он эмпирически сверяет listen-address/forward-socks5t из protected_config_text с каноническим
+# источником dashboard_common (та же стратегия, что для shell/config: mutation-доказуемо ловит drift).
+# Если канонический порт меняется — parity-гвард падает и указывает сюда.
+# canonical-fallback-port: гвард PR #162 (test_single_source_defines_proxy_port_constants)
+# разрешает эти локальные литералы как осознанный fallback для helper-изоляции (НЕ свежий дубли).
+_PRIVOXY_PORT = 8118  # canonical-fallback-port (helper-изоляция: stdlib-only, без dashboard_common)
+_XRAY_SOCKS_PORT = 10808  # canonical-fallback-port (helper-изоляция: stdlib-only, без dashboard_common)
+
 # #152: разрешённые privoxy-уровни логирования. Канон probe-semantics-from-primary-source —
 # уровень по privoxy user-manual (раздел 7.3 Debugging, битовые значения), НЕ по аналогии/имени.
 #   0 — выкл (ДЕФОЛТ, privacy: на диск не идёт даже производное контента);
@@ -176,13 +190,13 @@ def protected_config_text(layout=DEFAULT_LAYOUT, debug=0):
         f"logdir {layout.log_dir}\n"
         "logfile logfile\n"
         f"{debug_line}"
-        "listen-address 127.0.0.1:8118\n"
+        f"listen-address 127.0.0.1:{_PRIVOXY_PORT}\n"
         "toggle 1\n"
         "enable-remote-toggle 0\n"
         "enable-edit-actions 0\n"
         "enforce-blocks 0\n"
         "buffer-limit 4096\n"
-        "forward-socks5t / 127.0.0.1:10808 .\n"
+        f"forward-socks5t / 127.0.0.1:{_XRAY_SOCKS_PORT} .\n"
     )
 
 
@@ -275,7 +289,7 @@ def _launchd_pid(domain, label, runner=_run):
         return None
 
 
-def _port_open(port=8118):
+def _port_open(port=_PRIVOXY_PORT):
     try:
         with socket.create_connection(("127.0.0.1", port), timeout=0.25):
             return True
@@ -1186,7 +1200,7 @@ def _promote_state(state_path, *, backup_dir, layout=DEFAULT_LAYOUT):
         previous = pending["previous"]
     detected["privoxy"] = {
         "config_path": str(layout.config_path),
-        "port": 8118,
+        "port": _PRIVOXY_PORT,
         "service": "protected-system",
         "management": {"mode": "managed", "managed": True, "provenance": "protected"},
         "protection": {
