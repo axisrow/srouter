@@ -350,8 +350,10 @@ def _assert_shell_proxy_endpoints_follow_canonical(script_rel, expected_port_map
         "127.0.0.1:PORT обязаны совпадать с PRIVOXY_PORT/XRAY_SOCKS_PORT."
     )
 
-    # (2) ВСЕ `*_PORT="NNNN"` литералы обязаны быть подмножеством канонических (DNSMASQ_PORT=53
-    # — НЕ прокси, отдельно whitelisted). Ловит drift-форму без host (srouter-diag PRIVOXY_PORT).
+    # (2) ВСЕ `*_PORT="NNNN"` литералы обязаны быть подмножеством канонических. Ловит drift-форму
+    # без host (srouter-diag PRIVOXY_PORT="8118"). non_proxy_port_vars — defensive whitelist для
+    # НЕ-прокси портов: сегодня DNSMASQ_PORT="53" не матчит \d{4,5} (2 цифры), но whitelist
+    # защищает, если значение когда-нибудь станет 4-значным (не должно давать ложный drift-fail).
     shell_vars = _shell_port_var_assignments(text)
     non_proxy_port_vars = {"DNSMASQ_PORT"}  # 53 — не прокси-порт, вне scope централизации
     for varname, port in shell_vars.items():
