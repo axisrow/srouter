@@ -158,7 +158,13 @@ def _default_runner(cmd_list, timeout):
 
 
 def _active_name(state_path=None):
-    active = local_state.active_node(path=state_path) or {}
+    # issue #159: defensive — не бросает. select_node контракт «never throws» (cycle-5):
+    # previous для timeout-fallback вычисляется снаружи внутреннего try/except _select_node_locked,
+    # поэтому чтение active обязано быть безопасным само по себе.
+    try:
+        active = local_state.active_node(path=state_path) or {}
+    except Exception:
+        return None
     return active.get("name") if isinstance(active, dict) else None
 
 
@@ -476,9 +482,11 @@ def select_node(name, *, enabled_names, runner=None, state_path=None, config_pat
     # issue #159: bounded acquire + ordering-guard. Default timeout=0 ≡ `with _SELECT_LOCK:`;
     # SROUTER_LOCK_TIMEOUT_SEC>0 → hang держащего _SELECT_LOCK не вешает 24/7-инфру: ловим
     # LockAcquireTimeout (тело НЕ выполняется без лока) и отдаём структурированный error.
-    # Контракт «never throws» сохранён. Уровень SELECT=1.
-    previous = _active_name(state_path)
+    # Контракт «never throws» сохранён ВСЕМ телом под try (включая _active_name — cycle-5).
+    # Уровень SELECT=1.
+    previous = None
     try:
+        previous = _active_name(state_path)
         with lock_hierarchy.bounded_acquire(
             _SELECT_LOCK, name="select", level=lock_hierarchy.LEVEL_SELECT
         ):
@@ -490,8 +498,9 @@ def select_node(name, *, enabled_names, runner=None, state_path=None, config_pat
                 config_path=config_path,
             )
     except lock_hierarchy.LockAcquireTimeout as exc:
-        return {"ok": False, "active": previous, "step": "lock-timeout",
-                "error": f"another select in progress: {exc}"}
+        # previous может быть None, если таймаут случился до/во время _active_name.
+        return {"ok": False, "active": previous,
+                "step": "lock-timeout", "error": f"another select in progress: {exc}"}
 
 
 def _select_node_locked(name, *, enabled_names, runner=None, state_path=None, config_path=XRAY_CONFIG_PATH):

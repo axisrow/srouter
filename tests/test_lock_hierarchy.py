@@ -259,3 +259,61 @@ def test_hotroutes_release_update_unbounded_clears_marker_under_contention(monke
         for m in define_re.finditer(text):
             offenders.append(f"{py.name}:LEVEL_{m.group(1)}")
     assert not offenders, f"уровни блокировок определены вне lock_hierarchy.py: {offenders}"
+
+
+# ============================ select_node контракт (cycle-5) ============================
+
+def test_select_node_lock_timeout_returns_structured_error(monkeypatch):
+    # issue #159: при занятом _SELECT_LOCK + SROUTER_LOCK_TIMEOUT_SEC>0 select_node обязан
+    # вернуть структурированный error (step=lock-timeout), НЕ бросать (контракт «never throws»).
+    monkeypatch.setenv("SROUTER_LOCK_TIMEOUT_SEC", "0.05")
+    held = threading.Event()
+    release = threading.Event()
+
+    def holder():
+        with node_selector._SELECT_LOCK:
+            held.set()
+            release.wait(timeout=5.0)
+
+    t = threading.Thread(target=holder)
+    t.start()
+    assert held.wait(timeout=2.0)
+    try:
+        result = node_selector.select_node("sg-1", enabled_names={"sg-1"})
+        assert result["ok"] is False
+        assert result["step"] == "lock-timeout"
+        assert "lock-timeout" in result["step"]
+    finally:
+        release.set()
+        t.join(timeout=5.0)
+
+
+def test_select_node_never_throws_even_when_state_read_fails(monkeypatch):
+    # РЕГРЕССИЯ cycle-5 (Codex conf 1.0): _active_name зовётся снаружи внутреннего try/except
+    # _select_node_locked. Если local_state.active_node бросает, select_node всё равно обязан
+    # НЕ бросать (контракт). _active_name теперь defensive.
+    def boom(*a, **k):
+        raise RuntimeError("state read failed")
+
+    monkeypatch.setattr(node_selector.local_state, "active_node", boom)
+    # _active_name не бросает → возвращает None; select_node тоже не бросает.
+    assert node_selector._active_name() is None
+    # select_node под занятым локом → timeout-path, previous=None, без бросания.
+    monkeypatch.setenv("SROUTER_LOCK_TIMEOUT_SEC", "0.05")
+    held = threading.Event()
+    release = threading.Event()
+
+    def holder():
+        with node_selector._SELECT_LOCK:
+            held.set()
+            release.wait(timeout=5.0)
+
+    t = threading.Thread(target=holder)
+    t.start()
+    assert held.wait(timeout=2.0)
+    try:
+        result = node_selector.select_node("sg-1", enabled_names={"sg-1"})
+        assert result["ok"] is False
+    finally:
+        release.set()
+        t.join(timeout=5.0)
