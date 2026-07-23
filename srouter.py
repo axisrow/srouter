@@ -635,9 +635,13 @@ def _install_codex_isolation(env, runner) -> str:
     """
     try:
         import isolate_firewall
-        r = isolate_firewall.enable_codex_isolation()
+        state_path = getattr(env, "state_path", None) if env is not None else None
+        # Переиспользуем существующий token из lease (как CLI enable-codex, isolate_firewall.py:534),
+        # иначе re-install каждый раз зовёт pfctl -E → копит leaked enable-ref'ы (cycle-review cycle 1).
+        lease = local_state.load_active_codex_isolate(path=state_path) or {}
+        r = isolate_firewall.enable_codex_isolation(token=lease.get("token"))
         if r.get("ok"):
-            local_state.save_active_codex_isolate({"token": r.get("token"), "applied_at": None})
+            local_state.save_active_codex_isolate({"token": r.get("token"), "applied_at": None}, path=state_path)
             return ("Codex PF-изоляция: sub-anchor загружен (kill-switch для UID 503). "
                     "Активация требует provisioning _srouter_codex (uid 503) — follow-up.")
         return f"Codex PF-изоляция: не включена ({r.get('err', 'unknown')})."
@@ -646,13 +650,21 @@ def _install_codex_isolation(env, runner) -> str:
 
 
 def _remove_codex_isolation(env, runner) -> str:
-    """Best-effort: снять codex-изоляцию при uninstall (flush sub-anchor + release token). Идемпотентно."""
+    """Best-effort: снять codex-изоляцию при uninstall (flush sub-anchor + release token). Идемпотентно.
+
+    state очищается ТОЛЬКО при подтверждённом disable (r.ok) — иначе leaked pfctl -E enable-ref
+    остаётся захваченным, но token стёрт → release невозможен без pfctl -d (cycle-review cycle 1,
+    канон fail-closed-proxy-down: state обязан отражать реальность).
+    """
     try:
         import isolate_firewall
-        lease = local_state.load_active_codex_isolate() or {}
+        state_path = getattr(env, "state_path", None) if env is not None else None
+        lease = local_state.load_active_codex_isolate(path=state_path) or {}
         r = isolate_firewall.disable_codex_isolation(token=lease.get("token"))
-        local_state.clear_active_codex_isolate()
-        return "Codex PF-изоляция: снята." if r.get("ok") else f"Codex PF-изоляция: частично ({r.get('err', '')})."
+        if r.get("ok"):
+            local_state.clear_active_codex_isolate(path=state_path)
+            return "Codex PF-изоляция: снята."
+        return f"Codex PF-изоляция: частично ({r.get('err', '')})."  # state сохранён — retry возможен
     except Exception as exc:
         return f"Codex PF-изоляция: не снята ({str(exc)[:80]})."
 
