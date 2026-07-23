@@ -1081,3 +1081,148 @@ def test_install_runtime_does_not_leak_secret_via_symlink_binary(tmp_path, monke
             if copied.is_file():
                 assert copied.read_text(encoding="utf-8") != "top-secret-root-content"
 
+
+# ============================ #152: privoxy observability — debug-логирование ============================
+# Молчаливый privoxy (config без директивы debug → logfile пуст) — observability-дыра: не поймать
+# флап к github через 8118. Канон: more-options-better (env SROUTER_PRIVOXY_DEBUG, не хардкод),
+# privacy-no-content-hash-on-disk (дефолт ВЫКЛ), probe-semantics-from-primary-source (уровни debug —
+# privoxy user-manual 7.3: 1=URLs чувствительно, 2=connections приватно, 8=non-blocking log).
+
+
+def test_protected_config_has_no_debug_by_default(tmp_path):
+    """Дефолт = молчаливый (privacy): без SROUTER_PRIVOXY_DEBUG директивы debug в конфиге НЕТ.
+
+    На диск не должно идти даже производное контента (privacy-no-content-hash-on-disk).
+    """
+    layout = _layout(tmp_path)
+    config = privoxy_system.protected_config_text(layout)
+    assert "debug" not in config
+    assert privoxy_system.validate_protected_config(config, layout)["ok"] is True
+
+
+def test_protected_config_debug_2_writes_connections_level(tmp_path):
+    """debug 2 = connections (open/close/timeout) — приватно, без URL/body; ловит флап/таймауты."""
+    layout = _layout(tmp_path)
+    config = privoxy_system.protected_config_text(layout, debug=2)
+    assert "debug 2\n" in config
+    assert privoxy_system.validate_protected_config(config, layout, debug=2)["ok"] is True
+
+
+def test_protected_config_debug_1_only_when_explicit(tmp_path):
+    """debug 1 = URLs (чувствительно, токены в query) — только при явном запросе, не дефолт."""
+    layout = _layout(tmp_path)
+    assert "debug 1\n" not in privoxy_system.protected_config_text(layout)
+    assert "debug 1\n" in privoxy_system.protected_config_text(layout, debug=1)
+
+
+def test_protected_config_debug_8_nonblocking_log_level(tmp_path):
+    """debug 8 = non-blocking log (компонуется с другими уровнями)."""
+    layout = _layout(tmp_path)
+    config = privoxy_system.protected_config_text(layout, debug=8)
+    assert "debug 8\n" in config
+    assert privoxy_system.validate_protected_config(config, layout, debug=8)["ok"] is True
+
+
+def test_validate_protected_config_rejects_debug_level_mismatch(tmp_path):
+    """ROOT-side дыра: staged_config с debug=2 должен валидироваться ТОЛЬКО с тем же debug.
+
+    _safe_staged_config валидирует staged_config от root; если он зовёт validate БЕЗ debug,
+    а пользователь сгенерировал с debug=2 — корректный конфиг будет отвергнут (unexpected=debug).
+    Уровень обязан пройти через privileged-helper (как --prefix).
+    """
+    layout = _layout(tmp_path)
+    staged = privoxy_system.protected_config_text(layout, debug=2)
+    # Без указания debug валидатор ждёт конфиг без debug → debug в staged = unexpected.
+    assert privoxy_system.validate_protected_config(staged, layout, debug=0)["ok"] is False
+    assert privoxy_system.validate_protected_config(staged, layout, debug=2)["ok"] is True
+
+
+def test_safe_staged_config_threads_debug_level_to_validation(tmp_path):
+    """_safe_staged_config (root-сторона) обязан пробросить debug в validate_protected_config."""
+    layout = _layout(tmp_path)
+    staged = tmp_path / "config"
+    staged.write_text(privoxy_system.protected_config_text(layout, debug=2), encoding="utf-8")
+    staged.chmod(0o600)
+
+    rejected = privoxy_system._safe_staged_config(staged, os.getuid(), layout, debug=0)
+    accepted = privoxy_system._safe_staged_config(staged, os.getuid(), layout, debug=2)
+
+    assert rejected["ok"] is False
+    assert accepted["ok"] is True
+
+
+def test_privoxy_debug_from_env_whitelist_and_default(monkeypatch):
+    """SROUTER_PRIVOXY_DEBUG → int из whitelist {1,2,8}; остальное/пусто/отсутствие → 0 (privacy)."""
+    monkeypatch.delenv("SROUTER_PRIVOXY_DEBUG", raising=False)
+    assert privoxy_system._privoxy_debug_from_env() == 0
+
+    for raw, expected in [("2", 2), ("1", 1), ("8", 8), ("", 0), ("abc", 0), ("-1", 0)]:
+        monkeypatch.setenv("SROUTER_PRIVOXY_DEBUG", raw)
+        assert privoxy_system._privoxy_debug_from_env() == expected, raw
+
+
+def test_privoxy_debug_from_env_rejects_raw_requests_level_for_privacy(monkeypatch):
+    """debug 32768 = raw-запросы с заголовками/телом — приватность НИКОГДА через env-ускорение.
+
+    Даже если пользователь поставил SROUTER_PRIVOXY_DEBUG=32768, env-парсер обязан вернуть 0:
+    raw-уровни — только осознанная ручная правка конфига, не env-переключатель «по требованию».
+    (Канон privacy-no-content-hash-on-disk: на диск не идёт даже производное контента.)
+    """
+    monkeypatch.setenv("SROUTER_PRIVOXY_DEBUG", "32768")
+    assert privoxy_system._privoxy_debug_from_env() == 0
+
+
+def test_protected_config_clamps_unknown_debug_level(tmp_path):
+    """protected_config_text с уровнем вне whitelist → ничего не пишет (не падает, не гадает)."""
+    layout = _layout(tmp_path)
+    config = privoxy_system.protected_config_text(layout, debug=32768)
+    assert "debug" not in config
+    # Конфиг остаётся валидным без-debug контрактом.
+    assert privoxy_system.validate_protected_config(config, layout)["ok"] is True
+
+
+def test_protect_passes_debug_to_generated_config_and_helper(tmp_path, monkeypatch):
+    """protect() читает SROUTER_PRIVOXY_DEBUG, пишет debug в staged_config И передаёт --debug в helper."""
+    layout = _layout(tmp_path)
+    state_path = tmp_path / "state.json"
+    _write_state(state_path, {"service": "homebrew-user"})
+    monkeypatch.setattr(
+        privoxy_system, "_install_helper",
+        lambda runner, selected_layout: {"ok": True, "error": ""},
+    )
+    monkeypatch.setenv("SROUTER_PRIVOXY_DEBUG", "2")
+    captured = {}
+
+    def runner(cmd, timeout):
+        # staged_config пишется protect() в /private/tmp; ловим helper-argv.
+        if "protect" in cmd:
+            staged_arg = cmd[cmd.index("--config") + 1]
+            captured["staged_debug"] = "debug 2" in Path(staged_arg).read_text(encoding="utf-8")
+            captured["helper_debug"] = "--debug" in cmd and cmd[cmd.index("--debug") + 1] == "2"
+            return {"rc": 0, "out": '{"ok":true,"error":"","backup_dir":"/backup"}',
+                    "err": "", "timeout": False}
+        if "unprotect" in cmd:
+            return {"rc": 0, "out": '{"ok":true,"error":"","restored":true}',
+                    "err": "", "timeout": False}
+        if "-n" in cmd:
+            return {"rc": 1, "out": "", "err": "password required", "timeout": False}
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+
+    # status: при входе в protect — не защищён (ветка установки пишет staged_config),
+    # после применения — secure (постпроверка проходит, protect возвращает ok).
+    statuses = iter([
+        {"protected": False, "loaded": False, "port_up": True, "owner": "",
+         "config_writable": None, "binary_writable": None, "assets_writable": False},
+        {"protected": True, "loaded": True, "port_up": True, "owner": "nobody",
+         "config_writable": False, "binary_writable": False, "assets_writable": False,
+         "user_shadow_loaded": False},
+    ])
+    monkeypatch.setattr(privoxy_system, "status", lambda **kwargs: next(statuses))
+
+    privoxy_system.protect(
+        state_path=state_path, runner=runner, require_tty=False, layout=layout,
+    )
+
+    assert captured["staged_debug"] is True
+    assert captured["helper_debug"] is True
+
