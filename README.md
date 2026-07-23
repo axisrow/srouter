@@ -342,7 +342,8 @@ python3 isolate_firewall.py status       # текущее состояние
 PF-изоляция режет в ядре — если что-то пошло не так, **вернуть сеть одной командой**:
 
 ```bash
-sudo pfctl -a "com.apple/srouter_isolate" -F all   # снять правила изоляции
+sudo pfctl -a "com.apple/srouter_isolate" -F all          # снять доменную изоляцию
+sudo pfctl -a "com.apple/srouter_isolate/codex" -F all    # снять codex-изоляцию (sub-anchor)
 ```
 
 Если не помогло (или anchor не виноват), **полностью выключить PF** (ядерный вариант, возвращает
@@ -358,6 +359,19 @@ sudo pfctl -d                                     # выключить PF цел
 **Ограничения:** блок по IP (не SNI — SNI потребует TUN/Mihomo, отложено); подсети на старте режут
 чуть шире (соседние Anthropic-домены напрямую отрезаны, через прокси работают); IP меняются →
 обновление каждые 6 ч (устаревший IP в таблице безвреден — мы блокируем, не разрешаем).
+
+### 🔒 PF codex-изоляция (kill-switch)
+
+codex — отдельная fail-closed граница в том же PF-ядре, но в **sub-anchor**
+`com.apple/srouter_isolate/codex` (ортогональна доменной изоляции выше). Правила режут **прямой
+выход codex** (под системным UID 503) на en*/ppp* в ядре, разрешая только loopback SOCKS5
+`127.0.0.1:10808` (→ xray → VPS). Любой обход wrapper'а (rename PATH, прямой путь к binary,
+foreign-wrapper) нерелевантен — пакет всё равно дропнется на физическом интерфейсе.
+
+**Статус:** правила валидны и загружаются install-тайм. **Активация требует provisioning** — создания
+системного пользователя `_srouter_codex` (uid 503) и запуска codex под ним (`sudo -u`). До этого
+(отдельный follow-up) ни один процесс не идёт под uid 503, поэтому правила синтаксически активны,
+но не матчат трафик. Снять вручную — `sudo pfctl -a "com.apple/srouter_isolate/codex" -F all`.
 
 
 ---
@@ -588,7 +602,8 @@ once srouter resolves concrete IPs, the block narrows to exact addresses.
 PF isolation cuts at the kernel — if something went wrong, **restore the network with one command**:
 
 ```bash
-sudo pfctl -a "com.apple/srouter_isolate" -F all   # remove isolation rules
+sudo pfctl -a "com.apple/srouter_isolate" -F all        # remove domain isolation rules
+sudo pfctl -a "com.apple/srouter_isolate/codex" -F all  # remove codex isolation (sub-anchor)
 ```
 
 If that doesn't help (or the anchor isn't at fault), **disable PF entirely** (nuclear option, restores
@@ -604,6 +619,19 @@ it, and re-enable PF (`sudo pfctl -E`) before isolating again.
 **Limitations:** blocks by IP (not SNI — SNI needs TUN/Mihomo, deferred); subnets at boot cut slightly
 wider (neighboring Anthropic domains are direct-blocked, but work via proxy); IPs change → refresh
 every 6 h (a stale IP in the table is harmless — we block, not permit).
+
+### 🔒 PF codex isolation (kill-switch)
+
+codex is a separate fail-closed boundary in the same PF kernel, but in a **sub-anchor**
+`com.apple/srouter_isolate/codex` (orthogonal to the domain isolation above). The rules cut codex
+**direct egress** (running under system UID 503) on en*/ppp* at the kernel, allowing only loopback
+SOCKS5 `127.0.0.1:10808` (→ xray → VPS). Any wrapper bypass (PATH rename, direct binary path,
+foreign wrapper) is irrelevant — the packet is dropped at the physical interface regardless.
+
+**Status:** the rules are valid and loaded at install time. **Activation requires provisioning** —
+creating the system user `_srouter_codex` (uid 503) and launching codex under it (`sudo -u`). Until
+that follow-up lands, no process runs under uid 503, so the rules are syntactically active but match
+no traffic. Remove manually with `sudo pfctl -a "com.apple/srouter_isolate/codex" -F all`.
 
 
 ## Integrations

@@ -625,6 +625,38 @@ def _remove_codex_zsh_function() -> str:
         return f"Codex функция: не убрана ({str(exc)[:80]})."
 
 
+def _install_codex_isolation(env, runner) -> str:
+    """Best-effort: включить PF codex-изоляцию (sub-anchor com.apple/srouter_isolate/codex).
+
+    PF kill-switch — настоящая fail-closed граница codex (epic #166, issue #168): блокирует
+    прямой выход UID 503 в ядре, разрешает только loopback SOCKS5 10808. Best-effort для install
+    (как остальные codex-шаги) — сбой не валит install. Known-limitation: без provisioning
+    (создание _srouter_codex uid 503 — follow-up) правила валидны и загружены, но не матчат трафик.
+    """
+    try:
+        import isolate_firewall
+        r = isolate_firewall.enable_codex_isolation()
+        if r.get("ok"):
+            local_state.save_active_codex_isolate({"token": r.get("token"), "applied_at": None})
+            return ("Codex PF-изоляция: sub-anchor загружен (kill-switch для UID 503). "
+                    "Активация требует provisioning _srouter_codex (uid 503) — follow-up.")
+        return f"Codex PF-изоляция: не включена ({r.get('err', 'unknown')})."
+    except Exception as exc:
+        return f"Codex PF-изоляция: сбой ({str(exc)[:80]})."
+
+
+def _remove_codex_isolation(env, runner) -> str:
+    """Best-effort: снять codex-изоляцию при uninstall (flush sub-anchor + release token). Идемпотентно."""
+    try:
+        import isolate_firewall
+        lease = local_state.load_active_codex_isolate() or {}
+        r = isolate_firewall.disable_codex_isolation(token=lease.get("token"))
+        local_state.clear_active_codex_isolate()
+        return "Codex PF-изоляция: снята." if r.get("ok") else f"Codex PF-изоляция: частично ({r.get('err', '')})."
+    except Exception as exc:
+        return f"Codex PF-изоляция: не снята ({str(exc)[:80]})."
+
+
 def cmd_install(args) -> int:
     """Полная установка стека: brew-сервисы + конфиги + DNS + LaunchAgent.
 
@@ -713,6 +745,7 @@ def cmd_install(args) -> int:
         codex_func_note = _install_codex_zsh_function(env)
         env_note = _install_launchctl_env(env, runner)
         path_note = _ensure_home_bin_in_path(env)
+        codex_iso_note = _install_codex_isolation(env, runner)
         # Marker-migration table (issue #112 Часть 4): регистрируем текущие маркеры wrappers/zshrc/codenv
         # в state.known_markers. При будущей смене версии маркера old останется как legacy → следующий
         # install мигрирует old→current. Без регистрации install использует только current (safe fallback).
@@ -735,6 +768,7 @@ def cmd_install(args) -> int:
               f"{codex_func_note}\n"
               f"{env_note}\n"
               f"{path_note}\n"
+              f"{codex_iso_note}\n"
               f"Дашборд: http://127.0.0.1:8787  (srouter status — проверить)")
         return 0
     blocked = ", ".join(result.get("blocked") or ["unknown"])
@@ -832,6 +866,7 @@ def cmd_uninstall(args) -> int:
     env_status = _remove_launchctl_env(runner)
     env_note = ". " + env_status["note"]
     path_note = ". " + _remove_home_bin_from_path()
+    codex_iso_note = ". " + _remove_codex_isolation(env, runner)
 
     # env-cleanup fail-closed (issue #94 DEFECT A): мёртвый прокси остался в gui-домене → НЕ успех,
     # даже если всё остальное прошло. Раньше env_note просто конкатенировался в сообщение → fail-open
@@ -848,7 +883,8 @@ def cmd_uninstall(args) -> int:
           + codex_note
           + codex_func_note
           + env_note
-          + path_note)
+          + path_note
+          + codex_iso_note)
     # leftover per-имённо (issue #110): «частично» без деталей = новый обман. Оператор должен видеть,
     # КАКИЕ конфиги srouter ставил, но не откатил (следующий install авторазрешит их как reclaimable
     # с backup, либо потребует решения если они foreign).

@@ -42,6 +42,7 @@ import ipaddress
 import local_state
 import sys_probe
 import traffic_shape  # переиспользуем osascript-мост, валидаторы, парсер токена
+from dashboard_common import XRAY_SOCKS_PORT  # единый источник порта SOCKS5 (issue #155)
 from dashboard_common import _applescript_text  # единый канон экранирования (issue #154)
 
 # ============================ константы (shell-safe) ============================
@@ -76,6 +77,27 @@ DEFAULT_DOMAINS = ("api.anthropic.com", "console.anthropic.com", "claude.ai")
 
 # Порты блокировки: только HTTP/HTTPS (CloudFront IP хостят много доменов).
 DEFAULT_PORTS = (80, 443)
+
+# ============================ codex-изоляция (epic #166, issue #168) ============================
+# PF kill-switch для codex: прямой выход codex (под системным UID 503) режется в ядре PF,
+# разрешён только loopback SOCKS5 (127.0.0.1:10808 → xray → VPS). Это настоящая fail-closed
+# граница — любой способ обхода wrapper'а (rename PATH, Go-exec.LookPath, foreign-wrapper)
+# нерелевантен: пакет всё равно дропнется на en*. Схема B дизайна #167 (блок по source-UID).
+#
+# Числовой UID (НЕ имя): pfctl ОТКАЗЫВАЕТСЯ парсить `user _srouter_codex` — «unknown user»
+# (имя должно существовать в системе на момент parse, verify-dont-guess). Числовой `user 503`
+# pfctl парсит БЕЗ существования пользователя → ruleset можно загрузить СЕЙЧАС; он активируется
+# автоматически после provisioning (создание _srouter_codex uid 503 — follow-up, как #124 из #112).
+# Known-limitation: без процесса под uid 503 правила валидны, но не матчат трафик.
+CODEX_USER = "503"                                # числовой UID (pfctl парсит без существования user)
+CODEX_USER_NAME = "_srouter_codex"                # имя для provisioning (follow-up), НЕ в PF-правиле
+CODEX_SOCKS_TABLE = "srouter_codex_loopback"      # { 127.0.0.1, ::1 } — loopback whitelist
+SOCKS5_PORT = str(XRAY_SOCKS_PORT)                # "10808" — единый источник (issue #155)
+# Sub-anchor: codex-ruleset грузится ВНЕ родительского anchor, чтобы доменная
+# enable_isolation/disable_isolation (через -f - / -F all) НЕ перетирали его (zero cross-cutting).
+# man pf.conf: anchors вкладываются через '/'. Родительский ruleset обязан содержать
+# `anchor "codex"` — иначе sub-anchor НИКОГДА не вычисляется (см. _strict/_working_ruleset).
+CODEX_ANCHOR = ANCHOR + "/codex"
 
 _TIMEOUT_SEC = 60
 
@@ -183,6 +205,7 @@ def _strict_ruleset():
     return (
         f"table <{STRICT_TABLE}> {{ {subnets} }}\n"
         f"block drop out quick on {_ifaces_spec()} proto tcp to <{STRICT_TABLE}> port {ports}\n"
+        f'anchor "codex"\n'  # делегировать в sub-anchor codex-изоляции (иначе он не вычисляется)
     )
 
 
@@ -192,6 +215,26 @@ def _working_ruleset(ports=DEFAULT_PORTS):
     return (
         f"table <{TABLE}> {{ }}\n"
         f"block drop out quick on {_ifaces_spec()} proto tcp to <{TABLE}> port {ports_spec}\n"
+        f'anchor "codex"\n'  # делегировать в sub-anchor codex-изоляции (иначе он не вычисляется)
+    )
+
+
+def _codex_ruleset():
+    """PF-ruleset codex-изоляции (схема B дизайна #167, epic #166).
+
+    Whitelist loopback SOCKS5 для UID 503 + block всего прямого выхода на en*/ppp*.
+    Числовой `user 503` парсится pfctl без существования пользователя → загружается сейчас,
+    активируется после provisioning (создание _srouter_codex uid 503, follow-up). Без процесса
+    под этим UID правила валидны, но не матчат трафик (known-limitation).
+    """
+    return (
+        f"table <{CODEX_SOCKS_TABLE}> persist {{ 127.0.0.1 ::1 }}\n"
+        # Порядок параметров PF — каноничный (man pf.conf): proto → to <table> → port → user.
+        # user обязан идти ПОСЛЕ to/port (иначе syntax error — verify pfctl -vn). Числовой UID
+        # 503 парсится без существования пользователя.
+        f"pass out quick on lo0 proto tcp to <{CODEX_SOCKS_TABLE}> port {SOCKS5_PORT} "
+        f"user {CODEX_USER} keep state\n"
+        f"block drop out quick on {_ifaces_spec()} proto tcp user {CODEX_USER}\n"
     )
 
 
@@ -350,6 +393,56 @@ def disable_isolation(token=None):
         return _reject(f"disable_isolation failed: {exc}")
 
 
+# ============================ публичный API: codex-изоляция (epic #166) ============================
+def enable_codex_isolation(token=None):
+    """Загрузить codex-ruleset в sub-anchor com.apple/srouter_isolate/codex.
+
+    Канон как enable_strict: pfctl -E (token, дубль в stderr) && загрузка ruleset. Sub-anchor
+    НЕ перетирается операциями родителя (доменная enable/disable_isolation). Не бросает.
+    Возвращает dict (ok/cancelled/rc/token/out/err/timeout).
+    """
+    try:
+        ruleset = _codex_ruleset()
+        tok = _valid_token(token)
+        if tok is not None:
+            # токен уже захвачен — только загрузить ruleset (без повторного -E).
+            shell_cmd = f"printf '{_applescript_text(ruleset)}' | {PFCTL} -a \"{CODEX_ANCHOR}\" -f -"
+        else:
+            # -E (token, дубль в stderr) && загрузка ruleset. fail-fast.
+            shell_cmd = (
+                f"t=$({PFCTL} -E 2>&1) || exit $?; "
+                f"printf '%s\\n' \"$t\"; printf '%s\\n' \"$t\" 1>&2; "
+                f"printf '{_applescript_text(ruleset)}' | {PFCTL} -a \"{CODEX_ANCHOR}\" -f -"
+            )
+        res = _admin_run(shell_cmd)
+        new_token = tok or _parse_token(res.get("out")) or _parse_token(res.get("err"))
+        res["token"] = new_token
+        if res["ok"] and not new_token:
+            res["ok"] = False
+            res["err"] = ("pf включён, но release-token не получен — enable-ref может течь; "
+                          + (res["err"] or "")).rstrip("; ")
+        return res
+    except Exception as exc:
+        return {**_reject(f"enable_codex_isolation failed: {exc}"), "token": None}
+
+
+def disable_codex_isolation(token=None):
+    """Снять codex-ruleset: flush sub-anchor + освободить enable-ref (если token валиден).
+
+    attempt-all, идемпотентно. Flush'ит ТОЛЬКО codex sub-anchor (родительский с доменными
+    правилами не трогает). Не бросает.
+    """
+    try:
+        steps = [f'{PFCTL} -a "{CODEX_ANCHOR}" -F all']  # сброс правил + таблиц codex sub-anchor
+        tok = _valid_token(token)
+        if tok is not None:
+            steps.append(f"{PFCTL} -X {tok}")
+        body = "; ".join(f"{step} || rc=1" for step in steps)
+        return _admin_run(f"rc=0; {body}; exit $rc")
+    except Exception as exc:
+        return _reject(f"disable_codex_isolation failed: {exc}")
+
+
 # ============================ probe (state-only, без привилегий) ============================
 def probe_isolation(state_path=None):
     """Статус изоляции для дашборда. НЕ зовёт pfctl (требует root) — только state.
@@ -383,9 +476,28 @@ def probe_isolation(state_path=None):
                 "domains": [], "ips": {}, "unresolved": [], "ports": list(DEFAULT_PORTS)}
 
 
+def probe_codex_isolation(state_path=None):
+    """Статус codex-изоляции для дашборда. НЕ зовёт pfctl (требует root) — только state.
+
+    Читает codex-lease (runtime.active_codex_isolate). status (ok|down|unknown), token,
+    applied_at. probe-канон: всегда dict со status, не бросает.
+
+    Known-limitation: status=ok означает «ruleset загружен в sub-anchor», НЕ «codex
+    реально заблокирован» — последнее требует процесса под uid 503 (provisioning, follow-up).
+    """
+    try:
+        lease = local_state.load_active_codex_isolate(path=state_path)
+        if not lease:
+            return {"status": "down", "token": None, "applied_at": None}
+        return {"status": "ok", "token": str(lease.get("token")),
+                "applied_at": lease.get("applied_at")}
+    except Exception as exc:
+        return {"status": "unknown", "token": None, "applied_at": None, "error": str(exc)}
+
+
 # ============================ CLI (для launchd jobs) ============================
 def main(argv=None):
-    """CLI для launchd: enable/disable/refresh/enable-strict/disable-strict/status."""
+    """CLI для launchd: enable/disable/refresh/enable-strict/disable-strict/status + codex."""
     import argparse
     p = argparse.ArgumentParser(prog="isolate_firewall", description="PF-изоляция Proxy-доменов.")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -398,6 +510,10 @@ def main(argv=None):
     pr = sub.add_parser("refresh", help="Re-dig + -T replace.")
     pr.add_argument("--state", default=None)
     sub.add_parser("status", help="Статус (state-only).").add_argument("--state", default=None)
+    # codex-изоляция (epic #166): sub-anchor com.apple/srouter_isolate/codex.
+    sub.add_parser("enable-codex", help="Включить PF codex-изоляцию (sub-anchor, kill-switch).")
+    sub.add_parser("disable-codex", help="Снять codex-изоляцию (flush sub-anchor).")
+    sub.add_parser("status-codex", help="Статус codex-изоляции (state-only).").add_argument("--state", default=None)
     args = p.parse_args(argv)
 
     if args.cmd == "enable-strict":
@@ -410,6 +526,24 @@ def main(argv=None):
     if args.cmd == "status":
         print(probe_isolation(getattr(args, "state", None)))
         return 0
+    if args.cmd == "status-codex":
+        print(probe_codex_isolation(getattr(args, "state", None)))
+        return 0
+    if args.cmd == "enable-codex":
+        import time
+        lease = local_state.load_active_codex_isolate(path=getattr(args, "state", None)) or {}
+        r = enable_codex_isolation(token=lease.get("token"))
+        if r.get("ok"):
+            local_state.save_active_codex_isolate(
+                {"token": r.get("token"), "applied_at": time.time()})
+        print(f"enable-codex: ok={r.get('ok')} token={r.get('token')}")
+        return 0 if r.get("ok") else 2
+    if args.cmd == "disable-codex":
+        lease = local_state.load_active_codex_isolate(path=getattr(args, "state", None)) or {}
+        r = disable_codex_isolation(token=lease.get("token"))
+        if r.get("ok"):
+            local_state.clear_active_codex_isolate(path=getattr(args, "state", None))
+        return 0 if r.get("ok") else 2
     # enable/disable/refresh — читают lease из state для token/доменов
     lease = local_state.load_active_isolate(path=getattr(args, "state", None)) or {}
     cfg = local_state.load_state(path=getattr(args, "state", None)) or {}

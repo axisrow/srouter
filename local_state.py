@@ -506,6 +506,70 @@ def clear_active_isolate(path=None):
     return save_state(state, path) is not None
 
 
+def _valid_active_codex_isolate(entry):
+    """True если entry — валидный codex-isolate-lease (PF codex-изоляция, issue #168).
+
+    Отдельный от _valid_active_isolate: codex-изоляция по source-UID (не по доменам),
+    поэтому НЕ содержит domains/ports/phase — только token (pfctl -X, числовой) и
+    applied_at (опциональный снимок). fail-closed: невалидное → None (нет мусорного token).
+    """
+    if not isinstance(entry, dict):
+        return False
+    token = entry.get("token")
+    if isinstance(token, bool) or not (
+        (isinstance(token, int) and token >= 0) or (isinstance(token, str) and token.isdigit())
+    ):
+        return False
+    applied_at = entry.get("applied_at")
+    if applied_at is not None and not isinstance(applied_at, (int, float, str)):
+        return False
+    return True
+
+
+def load_active_codex_isolate(path=None):
+    """Активный codex-isolate-lease или None. Fail-safe: битая запись → None."""
+    state = load_state(path)
+    runtime = state.get("runtime") if isinstance(state, dict) else {}
+    if not isinstance(runtime, dict):
+        return None
+    entry = runtime.get("active_codex_isolate")
+    return entry if _valid_active_codex_isolate(entry) else None
+
+
+def save_active_codex_isolate(entry, path=None):
+    """Записать codex-isolate-lease в runtime.active_codex_isolate. Возвращает entry|None.
+
+    fail-closed: невалидное НЕ пишем (иначе disable получит мусорный token). Atomic.
+    """
+    if not _valid_active_codex_isolate(entry):
+        return None
+    state, readable = _load_state_checked(path)
+    if not readable:
+        return None
+    runtime = state.get("runtime")
+    if not isinstance(runtime, dict):
+        runtime = {}
+    runtime["active_codex_isolate"] = {
+        "token": str(entry.get("token")),
+        "applied_at": entry.get("applied_at"),
+    }
+    state["runtime"] = runtime
+    return None if save_state(state, path) is None else runtime["active_codex_isolate"]
+
+
+def clear_active_codex_isolate(path=None):
+    """Сброс runtime.active_codex_isolate в None (после disable_codex_isolation). Идемпотентно."""
+    state, readable = _load_state_checked(path)
+    if not readable:
+        return False
+    runtime = state.get("runtime")
+    if not isinstance(runtime, dict):
+        runtime = {}
+    runtime["active_codex_isolate"] = None
+    state["runtime"] = runtime
+    return save_state(state, path) is not None
+
+
 # Safe-default state: секции v1 (#2). probes — эталонные defaults (G3);
 # реальную запись делает #5 setup/check на реальной машине.
 _DEFAULT_STATE = {
@@ -543,7 +607,7 @@ _DEFAULT_STATE = {
     # НЕ policy: держим отдельно от traffic_guard.domains (одно-pipe'овый движок,
     # один активный throttle за раз). Секретов нет; Reality-ключи/конфиги не трогаем.
     "runtime": {"last_apply": None, "last_error": None, "active_throttle": None,
-                 "active_isolate": None},
+                 "active_isolate": None, "active_codex_isolate": None},
     # auto_route_sync — opt-in split-route до VPS через en0 (мимо VPN). Top-level ключ (читается
     # node_selector._auto_route_sync_enabled строго is True). По умолчанию ON — «пофигу VPN»:
     # watchdog (ensure_split_route) держит route через физический шлюз при любом состоянии VPN.
