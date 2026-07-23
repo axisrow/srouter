@@ -56,6 +56,7 @@ from sys_probe import run
 
 import claude_proxy  # вкл/откл HTTPS_PROXY для Claude Code (~/.claude/settings.json)
 import health  # doctor-проверки стека
+import marker_block  # централизованный marker-парсер (#176): find/replace/remove_managed_block + classification
 import privoxy_audit  # пассивный root-owned аудит lifecycle-команд Privoxy (#122)
 import privoxy_system  # root-gated system LaunchDaemon для Privoxy (#122)
 import privileged_ops  # единая osascript/sudo-обёртка + whitelist (#156)
@@ -309,11 +310,10 @@ def _looks_like_managed_codex_wrapper(path: str) -> bool:
     «managed wrapper», НЕ путь/имя (memory issue-144: wrapper ≠ binary). cycle-review cycle-4 FIX #1:
     install-time resolver обязан различать managed-wrapper от real binary по маркеру — иначе legacy
     ~/bin/codex (managed) misclassify как real binary → migration удаляет его без независимого real codex
-    → новый codex-srouter exit 127. Тот же marker-skip, что wrapper template делает в runtime-резолве."""
-    try:
-        return CODEX_WRAPPERS[0][2] in Path(path).read_text(encoding="utf-8")
-    except OSError:
-        return False
+    → новый codex-srouter exit 127. Тот же marker-skip, что wrapper template делает в runtime-резолве.
+
+    #176: marker-in-content classification централизован в marker_block.is_managed_artifact."""
+    return marker_block.is_managed_artifact(path, CODEX_WRAPPERS[0][2])
 
 
 def _codex_bin_path() -> str:
@@ -650,12 +650,12 @@ def _codex_zsh_target_installed() -> bool:
     согласовывается с wrapper-install — мигрируем zsh только если target реально стоит. Иначе FIX A
     сохранит рабочий legacy ~/bin/codex, а FIX B перенаправит zsh на codex-srouter (которого нет) →
     inconsistency (`codex` зовёт несуществующий файл, притом рабочий legacy стоит). Те же критерии, что
-    new_installed_ok в _install_codex_wrappers — единый источник правды валидности target."""
+    new_installed_ok в _install_codex_wrappers — единый источник правды валидности target.
+
+    #176: тело (is_file + X_OK + marker в содержимом) централизовано в marker_block.validate_target_installed."""
     try:
         wrapper = _codex_wrapper_path(CODEX_CLI_WRAPPER_NAME)
-        return (wrapper.is_file()
-                and os.access(wrapper, os.X_OK)
-                and CODEX_WRAPPERS[0][2] in wrapper.read_text(encoding="utf-8"))
+        return marker_block.validate_target_installed(wrapper, CODEX_WRAPPERS[0][2])
     except OSError:
         return False
 
@@ -674,6 +674,10 @@ def _install_codex_zsh_function(env) -> str:
     Marker-gate (парные begin/end) + backup через install_lib._backup + atomic write — тот же
     канон, что _ensure_home_bin_in_path. Fail-closed: чужой alias codex/function codex без нашего
     маркера → НЕ добавляем блок (не перекрываем молча).
+
+    #176: ordered-pair marker-parsing централизован в marker_block.find_managed_block (единственный
+    источник инварианта «ровно одна упорядоченная пара» — замыкает cycle-3/cycle-4 класс дыр разом).
+    Никакого count/find/ordered_pair вне marker_block: здесь только find → block, inspect span, replace.
     """
     try:
         from install_lib import _backup
@@ -684,25 +688,25 @@ def _install_codex_zsh_function(env) -> str:
         # голому маркеру short-circuit'ить нельзя: zsh-функция осталась бы звать удалённый legacy
         # wrapper → `codex` в интерактивном шелле ломался, притом install рапортил успех.
         # Различаем: блок зовёт текущий codex-srouter → idempotent; зовёт устаревший codex → обновляем.
-        begins = content.count(ZSHRC_CODEX_FUNC_MARKER_BEGIN)
-        ends = content.count(ZSHRC_CODEX_FUNC_MARKER_END)
-        begin_idx = content.find(ZSHRC_CODEX_FUNC_MARKER_BEGIN)
-        end_idx = content.find(ZSHRC_CODEX_FUNC_MARKER_END)
-        # cycle-review cycle-3/cycle-4: замкнутый инвариант маркеров — ровно одна УПОРЯДОЧЕННАЯ пара
-        # (begin перед end), не только count==1. Реверснутые/дублированные → fail-closed (иначе start>end →
-        # пустой span → реконструкция дублирует контент .zshrc, рапорт успеха). Проверяется ПЕРВЫМ — ДО любой
-        # проверки current/stale строки (cycle-4 FIX #2: строка по всему content не должна обходить инвариант).
-        ordered_pair = begins == 1 and ends == 1 and 0 <= begin_idx < end_idx
-        if begins >= 1 or ends >= 1:
-            # Любой маркер присутствует → требуем ровно одну упорядоченную пару, иначе fail-closed.
-            if not ordered_pair:
-                return ("Codex функция: повреждённый managed-маркер в ~/.zshrc "
-                        f"(begin={begins}, end={ends}, ordered={ordered_pair}) — не обновляю (проверь вручную).")
-            # Инспектируем target-строку ТОЛЬКО внутри валидированного span (не по всему content — cycle-4 FIX #2).
-            span = content[begin_idx:end_idx + len(ZSHRC_CODEX_FUNC_MARKER_END)]
+        block = marker_block.find_managed_block(content,
+                                                ZSHRC_CODEX_FUNC_MARKER_BEGIN,
+                                                ZSHRC_CODEX_FUNC_MARKER_END)
+        any_marker = (ZSHRC_CODEX_FUNC_MARKER_BEGIN in content
+                      or ZSHRC_CODEX_FUNC_MARKER_END in content)
+        if any_marker and block is None:
+            # Маркеры присутствуют, но не образуют ровно одну упорядоченную пару → fail-closed
+            # (реверснутые/дублированные: count для диагностического сообщения, решение = отказ).
+            begins = content.count(ZSHRC_CODEX_FUNC_MARKER_BEGIN)
+            ends = content.count(ZSHRC_CODEX_FUNC_MARKER_END)
+            return ("Codex функция: повреждённый managed-маркер в ~/.zshrc "
+                    f"(begin={begins}, end={ends}) — не обновляю (проверь вручную).")
+        if block is not None:
+            # Инспектируем target-строку ТОЛЬКО внутри валидированного span (cycle-4 FIX #2:
+            # строка по всему content не должна обходить инвариант — берём span_text из find_managed_block).
+            span = block.span_text
             if '"$HOME/bin/codex-srouter" "$@"' in span:
                 # cycle-review cycle-4 FIX #2: current-блок принимаем «idempotent» ТОЛЬКО после target-gate.
-                # Иначе predсуществующий блок (target удалён) ведёт в никуда, а install рапортует ОК.
+                # Иначе предсуществующий блок (target удалён) ведёт в никуда, а install рапортует ОК.
                 if not _codex_zsh_target_installed():
                     return ("Codex функция: managed-блок зовёт codex-srouter, но target не установлен/не валиден — "
                             "проверь ~/bin/codex-srouter (блок не трогаю, не рапортую idempotent вслепую).")
@@ -713,15 +717,14 @@ def _install_codex_zsh_function(env) -> str:
                 # (рабочий), а zsh перенаправится на codex-srouter (которого нет) → inconsistency.
                 if not _codex_zsh_target_installed():
                     return ("Codex функция: новый codex-srouter не установлен/не валиден — "
-                            "stale zsh-блок НЕ мигрирую (оставляю ~/bin/codex, рабочий). "
+                            "stale zsh-блок НЕ мигрирую (оставляя ~/bin/codex, рабочий). "
                             "Запусти srouter install после установки codex binary.")
                 _backup(zshrc, env)  # timestamped backup перед правкой managed-блока
-                start = begin_idx
-                end = end_idx + len(ZSHRC_CODEX_FUNC_MARKER_END)
                 updated_block = span.replace('"$HOME/bin/codex" "$@"',
                                              '"$HOME/bin/codex-srouter" "$@"')
+                new_content = marker_block.replace_managed_block(content, block, updated_block)
                 # проверяем результат atomic-write, не рапортуем успех молча (cycle-2 FIX #1b).
-                if not _write_text_atomic(zshrc, content[:start] + updated_block + content[end:]):
+                if not _write_text_atomic(zshrc, new_content):
                     return "Codex функция: не обновлена (ошибка atomic write ~/.zshrc)."
                 return ("Codex функция: обновлён путь в managed-блоке (codex → codex-srouter, rename #169). "
                         "Backup: .zshrc.srouter-backup-*. "
@@ -729,9 +732,10 @@ def _install_codex_zsh_function(env) -> str:
                         "перезапусти их (exec zsh -l, затем закрыть/открыть TUI).")
             # Managed-маркер есть, но target-строка не распознана (модифицированный блок) — не трогаем (fail-closed).
             return "Codex функция: уже в ~/.zshrc (idempotent)."
-        # cycle-review cycle-3 FIX #1-root (unified target gate): fresh-create/append path. zsh-функция
-        # (codex-srouter) создаётся ТОЛЬКО если target установлен и валиден. Иначе она shadow'ит сохранённый
-        # legacy ~/bin/codex (FIX A) и зовёт несуществующий codex-srouter — та же inconsistency через fresh-create.
+        # block is None AND not any_marker → fresh-create/append path. cycle-review cycle-3 FIX #1-root
+        # (unified target gate): zsh-функция (codex-srouter) создаётся ТОЛЬКО если target установлен и
+        # валиден. Иначе она shadow'ит сохранённый legacy ~/bin/codex (FIX A) и зовёт несуществующий
+        # codex-srouter — та же inconsistency через fresh-create.
         # Замкнутый инвариант: _codex_zsh_target_installed() — единый gate ДЛЯ ВСЕХ путей (migration/create/append).
         if not _codex_zsh_target_installed():
             return ("Codex функция: новый codex-srouter не установлен/не валиден — "
@@ -767,6 +771,9 @@ def _remove_codex_zsh_function() -> str:
     Удаляет ТОЛЬКО парный begin…end блок (включая function-определение внутри). Чужой контент
     (export PATH, комментарии, чужой alias/function codex — если появился позже) НЕ трогаем.
     Если маркеры непарные (повреждённое состояние) — fail-closed: отказ, не широкое удаление.
+
+    #176: ordered-pair marker-parsing + newline-cleanup централизованы в marker_block
+    (find_managed_block → block; remove_managed_block → slice + rstrip "\n", byte-for-byte как прежде).
     """
     try:
         zshrc = _zshrc_path()
@@ -778,21 +785,19 @@ def _remove_codex_zsh_function() -> str:
         # cycle-review cycle-4 FIX #3: тот же ordered-pair инвариант, что в install (cycle-3). Ровно одна
         # УПОРЯДОЧЕННАЯ пара (begin перед end). Реверснутые/дублированные → safe no-op, НЕ corruption
         # (иначе start>end → slice overlap → дублирование контента .zshrc, рапорт «убрана»).
-        begins = content.count(ZSHRC_CODEX_FUNC_MARKER_BEGIN)
-        ends = content.count(ZSHRC_CODEX_FUNC_MARKER_END)
-        begin_idx = content.find(ZSHRC_CODEX_FUNC_MARKER_BEGIN)
-        end_idx = content.find(ZSHRC_CODEX_FUNC_MARKER_END)
-        ordered_pair = begins == 1 and ends == 1 and 0 <= begin_idx < end_idx
-        if not ordered_pair:
+        # Замкнут в marker_block.find_managed_block (None = повреждено/непарно).
+        block = marker_block.find_managed_block(content,
+                                                ZSHRC_CODEX_FUNC_MARKER_BEGIN,
+                                                ZSHRC_CODEX_FUNC_MARKER_END)
+        if block is None:
+            begins = content.count(ZSHRC_CODEX_FUNC_MARKER_BEGIN)
+            ends = content.count(ZSHRC_CODEX_FUNC_MARKER_END)
             return ("Codex функция: не удалена — повреждённый маркер "
-                    f"(begin={begins}, end={ends}, ordered={ordered_pair}), проверь ~/.zshrc вручную.")
-        start = begin_idx
-        end = end_idx + len(ZSHRC_CODEX_FUNC_MARKER_END)
-        # Зачистить окружающие пустые строки (мы добавляли \n\n перед блоком при install).
-        before = content[:start].rstrip("\n")
-        out = before + ("\n" if before else "") + content[end:]
+                    f"(begin={begins}, end={ends}), проверь ~/.zshrc вручную.")
+        # remove_managed_block: slice блока + зачистка окружающих \n (мы добавляли \n\n перед блоком при install).
+        new_content = marker_block.remove_managed_block(content, block)
         # проверяем результат atomic-write, не рапортуем успех молча (cycle-4 симметрия с install).
-        if not _write_text_atomic(zshrc, out.rstrip() + "\n"):
+        if not _write_text_atomic(zshrc, new_content):
             return "Codex функция: не убрана (ошибка atomic write ~/.zshrc)."
         return "Codex функция: убрана из ~/.zshrc."
     except Exception as exc:
