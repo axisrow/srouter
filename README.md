@@ -183,13 +183,15 @@ srouter install
 #   • настраивает прокси для Claude Code и git (github.com);
 #   • изолирует Codex тремя живыми путями + будущей fail-closed границей: SOCKS5-wrappers
 #     (~/bin/codex-srouter + codex-app-proxy, zsh-функция — CLI/Chromium-оболочка App),
-#     LaunchAgent com.srouter.codenv (#189/#190 — gui-SOCKS5 env для Rust app-server ChatGPT.app),
+#     LaunchAgent com.srouter.codenv (#189/#190 — gui-SOCKS5 env для Rust app-server ChatGPT.app;
+#     setenv не ретроактивен — запущенный до install ChatGPT.app требует полного перезапуска Cmd+Q),
 #     scoped VSCode http.proxy (#185 — расширение openai.chatgpt; только если install обновил
 #     существующий settings.json редактора) — все три минуют privoxy, направляя Codex напрямую в xray;
 #     + PF kill-switch в ядре (#168) как будущая fail-closed граница (режет прямой TCP-выход codex на
 #     en0–en6/ppp0–ppp1, разрешая loopback SOCKS5 по TCP); install создаёт пользователя uid 503 (#186),
-#     но правила пока дормантны — активируются после полной активации (запуск codex под uid 503 через
-#     sudo -u + доменная изоляция + TCP на en/ppp, отдельный follow-up);
+#     но правила пока дормантны — активируются после полной активации (запуск codex под uid 503
+#     НЕЗАВИСИМО от wrapper'а (не sudo -u в wrapper, а напр. launchd-служба) + доменная изоляция + TCP
+#     на en/ppp, отдельный follow-up);
 #   • показывает план и спрашивает подтверждение.
 srouter status         # проверить, что демон работает (http://127.0.0.1:8787)
 srouter doctor         # диагностика: порты + туннель + Claude-proxy (✅/❌)
@@ -356,7 +358,7 @@ binary/exec.LookPath), поэтому границей служит именно
 | Инструмент | Подключение |
 |---|---|
 | **Claude Code** | `HTTPS_PROXY=http://127.0.0.1:8118` в `~/.claude/settings.json` (privoxy HTTP; SOCKS5 CC не умеет) |
-| **Codex CLI/App** | **напрямую SOCKS5 в xray** (`socks5h://127.0.0.1:10808`) тремя живыми путями, минуя privoxy: wrappers (CLI + `--proxy-server` для Chromium-оболочки App), LaunchAgent `com.srouter.codenv` (gui-SOCKS5 env для Rust app-server ChatGPT.app, #189/#190), scoped VSCode `http.proxy` (расширение `openai.chatgpt`, #185; только если install обновил существующий settings.json); + **PF kill-switch в ядре** (#168) как будущая fail-closed граница (режет прямой TCP-выход codex на en0–en6/ppp0–ppp1, разрешая loopback SOCKS5 по TCP; пока дормантен — пользователь uid 503 уже создаётся install (#186), активируется после полной активации: запуск codex под uid 503 через sudo -u + доменная изоляция + TCP на en/ppp, отдельный follow-up). privoxy портит WS-стриминг Codex (`Reconnecting`/`request timed out`); `[network] proxy_url` в `~/.codex/config.toml` мёртв в codex 0.146 (управляет execution-scoped sandbox-прокси для субпроцессов, не клиентом) — поэтому wrappers в `~/bin/codex-srouter` (CLI, имя `codex-srouter` убирает коллизию wrapper↔real-binary #169) + `~/bin/codex-app-proxy` (App Chromium) + `com.srouter.codenv` (Rust app-server) + scoped VSCode `http.proxy` (расширение). Запускать Codex **App** через `~/bin/codex-app-proxy`, а не иконку Dock (Dock не передаёт `--proxy-server`). См. раздел «Изоляция Codex». |
+| **Codex CLI/App** | **напрямую SOCKS5 в xray** (`socks5h://127.0.0.1:10808`) тремя живыми путями, минуя privoxy: wrappers (CLI + `--proxy-server` для Chromium-оболочки App), LaunchAgent `com.srouter.codenv` (gui-SOCKS5 env для Rust app-server ChatGPT.app, #189/#190; setenv не ретроактивен — запущенный до install ChatGPT.app перезапустите Cmd+Q), scoped VSCode `http.proxy` (расширение `openai.chatgpt`, #185; только если install обновил существующий settings.json); + **PF kill-switch в ядре** (#168) как будущая fail-closed граница (режет прямой TCP-выход codex на en0–en6/ppp0–ppp1, разрешая loopback SOCKS5 по TCP; пока дормантен — пользователь uid 503 уже создаётся install (#186), активируется после полной активации: запуск codex под uid 503 **независимо от wrapper'а** (не sudo -u в wrapper) + доменная изоляция + TCP на en/ppp, отдельный follow-up). privoxy портит WS-стриминг Codex (`Reconnecting`/`request timed out`); `[network] proxy_url` в `~/.codex/config.toml` мёртв в codex 0.146 (управляет execution-scoped sandbox-прокси для субпроцессов, не клиентом) — поэтому wrappers в `~/bin/codex-srouter` (CLI, имя `codex-srouter` убирает коллизию wrapper↔real-binary #169) + `~/bin/codex-app-proxy` (App Chromium) + `com.srouter.codenv` (Rust app-server) + scoped VSCode `http.proxy` (расширение). Запускать Codex **App** через `~/bin/codex-app-proxy`, а не иконку Dock (Dock не передаёт `--proxy-server`). См. раздел «Изоляция Codex». |
 | **git / gh** | домены GitHub в вайтлисте узла → резолв и трафик через ускоритель |
 | **Браузер** | системный SOCKS5 `127.0.0.1:10808` (вайтлист разруливает сам) |
 
@@ -541,13 +543,15 @@ srouter install
 #   • configures proxy for Claude Code and git (github.com);
 #   • isolates Codex via three live paths plus a future fail-closed boundary: SOCKS5 wrappers
 #     (~/bin/codex-srouter + codex-app-proxy, zsh function — CLI / App Chromium shell), the
-#     com.srouter.codenv LaunchAgent (#189/#190 — gui-SOCKS5 env for ChatGPT.app's Rust app-server),
-#     and scoped VSCode http.proxy (#185 — the openai.chatgpt extension; only if install updated an
-#     existing editor settings.json) — all three bypass privoxy, routing Codex straight to xray;
-#     + a PF kill-switch in the kernel (#168) as the future fail-closed boundary (cuts codex direct
-#     TCP egress on en0–en6/ppp0–ppp1, allowing TCP to loopback SOCKS5); install creates the uid 503
-#     user (#186), but the rules stay dormant — they activate after full activation (launching codex
-#     under uid 503 via sudo -u + domain isolation + TCP on en/ppp, a separate follow-up);
+#     com.srouter.codenv LaunchAgent (#189/#190 — gui-SOCKS5 env for ChatGPT.app's Rust app-server;
+#     setenv is non-retroactive — a ChatGPT.app already running before install needs a full Cmd+Q
+#     restart), and scoped VSCode http.proxy (#185 — the openai.chatgpt extension; only if install
+#     updated an existing editor settings.json) — all three bypass privoxy, routing Codex straight to
+#     xray; + a PF kill-switch in the kernel (#168) as the future fail-closed boundary (cuts codex
+#     direct TCP egress on en0–en6/ppp0–ppp1, allowing TCP to loopback SOCKS5); install creates the
+#     uid 503 user (#186), but the rules stay dormant — they activate after full activation (launching
+#     codex under uid 503 INDEPENDENTLY of the wrapper, not via wrapper sudo -u — e.g. a launchd
+#     service; + domain isolation + TCP on en/ppp, a separate follow-up);
 #   • prints a plan and asks for confirmation.
 srouter status         # check the daemon is up (http://127.0.0.1:8787)
 srouter doctor         # diagnostics: ports + tunnel + Claude-proxy (✅/❌)
@@ -819,7 +823,7 @@ remove it).
 | Tool | Wiring |
 |---|---|
 | **Claude Code** | `HTTPS_PROXY=http://127.0.0.1:8118` in `~/.claude/settings.json` |
-| **Codex** | **straight to xray** (`socks5h://127.0.0.1:10808`) via three live paths that bypass privoxy: wrappers (CLI + `--proxy-server` for the App Chromium shell), the `com.srouter.codenv` LaunchAgent (gui-SOCKS5 env for ChatGPT.app's Rust app-server, #189/#190), and scoped VSCode `http.proxy` (the `openai.chatgpt` extension, #185; only if install updated an existing settings.json); + **a PF kill-switch in the kernel** (#168) as the future fail-closed boundary (cuts codex direct TCP egress on en0–en6/ppp0–ppp1, allowing TCP to loopback SOCKS5; dormant today — the uid 503 user is already created by install (#186), and activation requires full activation: launching codex under uid 503 (sudo -u) + domain isolation + TCP on en/ppp, a separate follow-up). `[network] proxy_url` in `~/.codex/config.toml` is dead in codex 0.146 (it configures the execution-scoped sandbox proxy for spawned `codex` subprocesses, not the client) — hence wrappers + codenv + VSCode http.proxy. See the "Codex isolation" section. |
+| **Codex** | **straight to xray** (`socks5h://127.0.0.1:10808`) via three live paths that bypass privoxy: wrappers (CLI + `--proxy-server` for the App Chromium shell), the `com.srouter.codenv` LaunchAgent (gui-SOCKS5 env for ChatGPT.app's Rust app-server, #189/#190; setenv is non-retroactive — restart an already-running ChatGPT.app with Cmd+Q), and scoped VSCode `http.proxy` (the `openai.chatgpt` extension, #185; only if install updated an existing settings.json); + **a PF kill-switch in the kernel** (#168) as the future fail-closed boundary (cuts codex direct TCP egress on en0–en6/ppp0–ppp1, allowing TCP to loopback SOCKS5; dormant today — the uid 503 user is already created by install (#186), and activation requires full activation: launching codex under uid 503 **independently of the wrapper** (not via wrapper sudo -u) + domain isolation + TCP on en/ppp, a separate follow-up). `[network] proxy_url` in `~/.codex/config.toml` is dead in codex 0.146 (it configures the execution-scoped sandbox proxy for spawned `codex` subprocesses, not the client) — hence wrappers + codenv + VSCode http.proxy. See the "Codex isolation" section. |
 | **git / gh** | GitHub domains whitelisted on the node |
 | **Browser** | system SOCKS5 `127.0.0.1:10808` |
 
