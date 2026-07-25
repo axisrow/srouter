@@ -39,6 +39,13 @@ def _all_up_monkey(monkeypatch, *, probe_status="ok", probe_detail="runtime: к�
     monkeypatch.setattr(health, "_codex_proxy_probe",
                         lambda: {"status": codex_status, "source": "runtime" if codex_status != "unknown" else "n/a",
                                  "detail": codex_detail})
+    # issue #189: _codex_app_proxy_check и _desktop_proxy_check тоже дёргают ps/launchctl — мокаем
+    # unknown (info-only), иначе реальный ps найдёт живой ChatGPT.app/CC на dev-машине и драйвит
+    # вердикт (как _claude_proxy_probe/_codex_proxy_probe выше).
+    monkeypatch.setattr(health, "_codex_app_proxy_check",
+                        lambda: {"status": "unknown", "source": "n/a", "detail": "App не запущен (mock)"})
+    monkeypatch.setattr(health, "_desktop_proxy_check",
+                        lambda: {"status": "unknown", "detail": "launchctl (mock)"})
 
 
 # ============================ _claude_proxy_probe (детект lsof) ============================
@@ -260,6 +267,9 @@ def test_check_all_down_when_everything_dead(monkeypatch):
     # codex-proxy тоже мокаем (иначе реальный ps/lsof найдёт живой codex → ok → не down).
     monkeypatch.setattr(health, "_codex_proxy_probe",
                         lambda: {"status": "down", "source": "runtime", "detail": "runtime"})
+    # issue #189: _codex_app_proxy_check тоже дёргает ps — мокаем (иначе живой ChatGPT.app → ok → не down).
+    monkeypatch.setattr(health, "_codex_app_proxy_check",
+                        lambda: {"status": "down", "source": "gui-env", "detail": "down"})
 
     result = health.check_all()
     assert result["status"] == "down"
@@ -567,9 +577,10 @@ def test_desktop_proxy_ok_when_only_http(monkeypatch):
 
 
 def test_desktop_proxy_down_when_socks5_in_https_proxy(monkeypatch):
-    """SOCKS5 в HTTPS_PROXY → down (Desktop App не поддерживает SOCKS5)."""
+    """SOCKS5 в HTTPS_PROXY → down (чужой SOCKS5, не codenv — Desktop App не поддерживает SOCKS5)."""
     monkeypatch.setattr(health, "_read_proxy_sources",
                         lambda: {"desktop_keys": {"HTTPS_PROXY": "socks5h://127.0.0.1:10808"}})
+    monkeypatch.setattr(health, "_codenv_managed", lambda: False)
     res = health._desktop_proxy_check()
     assert res["status"] == "down"
     assert "socks" in res["detail"].lower() or "SOCKS5" in res["detail"]
@@ -580,15 +591,17 @@ def test_desktop_proxy_down_when_socks5_in_http_proxy(monkeypatch):
     HTTP_PROXY, doctor (читая только HTTPS_PROXY) говорил ✅."""
     monkeypatch.setattr(health, "_read_proxy_sources",
                         lambda: {"desktop_keys": {"HTTP_PROXY": "socks5h://127.0.0.1:10808"}})
+    monkeypatch.setattr(health, "_codenv_managed", lambda: False)
     res = health._desktop_proxy_check()
     assert res["status"] == "down"
     assert "HTTP_PROXY" in res["detail"]
 
 
 def test_desktop_proxy_down_when_socks5_in_all_proxy(monkeypatch):
-    """SOCKS5 в ALL_PROXY → down (SOCKS5 в любом ключе — мина)."""
+    """SOCKS5 в ALL_PROXY → down (чужой SOCKS5 в любом ключе — мина)."""
     monkeypatch.setattr(health, "_read_proxy_sources",
                         lambda: {"desktop_keys": {"ALL_PROXY": "socks5h://127.0.0.1:10808"}})
+    monkeypatch.setattr(health, "_codenv_managed", lambda: False)
     res = health._desktop_proxy_check()
     assert res["status"] == "down"
 
@@ -614,13 +627,14 @@ def test_desktop_proxy_unknown_when_no_launchctl(monkeypatch):
 
 
 def test_desktop_proxy_down_shadows_socks5_even_with_http(monkeypatch):
-    """HTTPS_PROXY=HTTP + HTTP_PROXY=SOCKS5 → down (не угадываем selector; SOCKS5 — мина).
+    """HTTPS_PROXY=HTTP + HTTP_PROXY=SOCKS5 → down (чужой SOCKS5, не угадываем selector; SOCKS5 — мина).
 
     У приложений разный selector приоритетов (Claude/Node/Electron), мы его НЕ моделируем —
     SOCKS5 в любом ключе = конфиг грязный/опасный → down. Фиксирует границу обобщения #134."""
     monkeypatch.setattr(health, "_read_proxy_sources",
                         lambda: {"desktop_keys": {"HTTPS_PROXY": "http://127.0.0.1:8118",
                                                   "HTTP_PROXY": "socks5h://127.0.0.1:10808"}})
+    monkeypatch.setattr(health, "_codenv_managed", lambda: False)
     res = health._desktop_proxy_check()
     assert res["status"] == "down"
 
@@ -653,6 +667,34 @@ def test_desktop_proxy_warns_on_settings_vs_launchctl_mismatch(monkeypatch):
     assert "http://127.0.0.1:8118" in res["detail"]
 
 
+def test_desktop_proxy_info_when_socks5_and_codenv_managed(monkeypatch):
+    """SOCKS5 в launchctl + codenv-managed plist → info (намеренный codenv #189), НЕ driver-шум.
+
+    Архитектурный конфликт #189/#127: codenv SOCKS5 лечит ChatGPT.app Rust app-server, но ломает
+    Claude Desktop App. doctor показывает факт в detail, но НЕ роняет вердикт — иначе нормальная
+    установка с codenv вечно degraded (шум, как PR #135 для PF).
+    """
+    monkeypatch.setattr(health, "_read_proxy_sources",
+                        lambda: {"desktop_keys": {"ALL_PROXY": "socks5h://127.0.0.1:10808"}})
+    monkeypatch.setattr(health, "_codenv_managed", lambda: True)
+    res = health._desktop_proxy_check()
+    assert res["status"] == "info", f"codenv SOCKS5 → info (не driver-шум); got {res}"
+    assert "codenv" in res["detail"].lower(), f"detail объясняет codenv-tradeoff; got {res}"
+
+
+def test_desktop_proxy_down_when_socks5_foreign_no_codenv(monkeypatch):
+    """SOCKS5 в launchctl БЕЗ codenv-managed → down (чужой корпоративный SOCKS5, инцидент #127-класс).
+
+    Регрессия: codenv-aware НЕ должно глушить ИСТИННЫЙ инцидент — чужой SOCKS5 (не наш codenv) ломает
+    Claude Desktop App, это настоящий down-driver.
+    """
+    monkeypatch.setattr(health, "_read_proxy_sources",
+                        lambda: {"desktop_keys": {"HTTPS_PROXY": "socks5h://10.0.0.1:1080"}})
+    monkeypatch.setattr(health, "_codenv_managed", lambda: False)
+    res = health._desktop_proxy_check()
+    assert res["status"] == "down", f"чужой SOCKS5 (не codenv) → down (#127); got {res}"
+
+
 def test_desktop_proxy_silent_when_settings_matches_launchctl(monkeypatch):
     """settings.json HTTPS_PROXY == launchctl HTTPS_PROXY → ok, без WARN о расхождении."""
     monkeypatch.setattr(health, "_read_proxy_sources",
@@ -672,10 +714,13 @@ def test_desktop_proxy_no_mismatch_check_when_cli_proxy_unset(monkeypatch):
 
 
 def test_desktop_proxy_socks5_down_takes_priority_over_mismatch(monkeypatch):
-    """SOCKS5 в launchctl (down) важнее расхождения с CLI — down не маскируется в warn."""
+    """SOCKS5 в launchctl (down) важнее расхождения с CLI — down не маскируется в warn.
+
+    Чужой SOCKS5 (не codenv) — down приоритетнее warn-расхождения."""
     monkeypatch.setattr(health, "_read_proxy_sources",
                         lambda: {"desktop_keys": {"HTTPS_PROXY": "socks5h://127.0.0.1:10808"},
                                 "cli_proxy": "http://127.0.0.1:8118"})
+    monkeypatch.setattr(health, "_codenv_managed", lambda: False)
     res = health._desktop_proxy_check()
     assert res["status"] == "down"
 

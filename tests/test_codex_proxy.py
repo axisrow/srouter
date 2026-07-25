@@ -34,14 +34,30 @@ def _lsof_line(pid, local_eph, target_port, state="ESTABLISHED"):
 
 
 def _fake(ps_out, lsof_out, lsof_timeout=False):
-    """fake_run для monkeypatch: ps отдаёт ps_out, lsof — lsof_out (или timeout)."""
+    """fake_run для monkeypatch: ps отдаёт ps_out, lsof — lsof_out (или timeout).
+
+    lsof уважает -p <pids> фильтр (реальный `lsof -p 22415` отдаёт только строки PID 22415) —
+    фильтруем lsof_out по PID в fields[1] для запрошенных -p PID'ов. Иначе тест скармливает probe
+    строки ВСЕХ codex-PID (вкл. App-PID, который probe запросил бы отдельным lsof), маскируя логику.
+    """
     def fake_run(cmd, timeout):
         if cmd and cmd[0] == "/bin/ps":
             return {"rc": 0, "out": ps_out, "err": "", "timeout": False}
         if cmd and cmd[0] == "/usr/sbin/lsof":
             if lsof_timeout:
                 return {"rc": None, "out": "", "err": "timeout", "timeout": True}
-            return {"rc": 0, "out": lsof_out, "err": "", "timeout": False}
+            # Фильтр по -p <pids>: реальные lsof отдаёт только запрошенные PID.
+            p_arg = "-p" in cmd
+            wanted = set()
+            if p_arg:
+                idx = cmd.index("-p")
+                if idx + 1 < len(cmd):
+                    wanted = set(cmd[idx + 1].split(","))
+            if not p_arg or not wanted:
+                return {"rc": 0, "out": lsof_out, "err": "", "timeout": False}
+            filt = "\n".join(ln for ln in lsof_out.splitlines()
+                            if ln.split()[1:2] and ln.split()[1] in wanted)
+            return {"rc": 0, "out": filt + ("\n" if filt else ""), "err": "", "timeout": False}
         return {"rc": 0, "out": "", "err": "", "timeout": False}
     return fake_run
 
@@ -209,3 +225,68 @@ def test_codex_probe_rejects_codex_helpers(monkeypatch):
     monkeypatch.setattr(health.sys_probe, "run", _fake(ps, lsof))
     res = health._codex_proxy_probe()
     assert res["status"] == "unknown", f"helpers НЕ matчатся как codex-binary; got {res}"
+
+
+# ============================ issue #189: разделение App-codex vs CLI-codex ============================
+# Эмпирика: ChatGPT.app (com.openai.codex) бандлит свой Rust-binary по пути
+# /Applications/ChatGPT.app/Contents/Resources/codex — basename 'codex' → МАТЧИТСЯ _CODEX_BIN_RE.
+# Этот Rust app-server — основной WS-трафик к chatgpt.com, берёт прокси ТОЛЬКО из launchd gui-env
+# (codenv), не из CLI-shell-env. _codex_proxy_probe (TUI/CLI-чек) НЕ должен его учитывать — App-PID
+# уходит в отдельный _codex_app_proxy_check (driver для gui-env). Иначе: App-PID без прокси (gui-env
+# пуст) + CLI-PID на SOCKS5 → ложный mixed; App-PID на direct → ложный down в TUI-чеке.
+APP_CODEX_COMM = "/Applications/ChatGPT.app/Contents/Resources/codex"  # Rust app-server ChatGPT.app
+
+
+def test_codex_probe_excludes_app_pids(monkeypatch):
+    """App-PID (ChatGPT.app Resources/codex) НЕ попадает в TUI-вердикт: CLI на 10808 → ok, не mixed.
+
+    Реальный баг #189: App-PID (Rust app-server, без прокси → direct external-ESTABLISHED) + CLI-PID
+    на 10808 → has_good AND has_bad → ложный mixed в TUI-чеке. App-PID уходит в _codex_app_proxy_check,
+    TUI-чек смотрит только на CLI-PID → ok.
+    """
+    ps = f"22415 {CODEX_BIN_COMM}\n60826 {APP_CODEX_COMM}\n"
+    # CLI через SOCKS5; App-PID на external (direct ESTABLISHED — реальное состояние ChatGPT.app без прокси)
+    lsof = (_lsof_line("22415", 54000, 10808)
+            + "codex 60826 axisrow 32u IPv4 0xABC 0t0 "
+              "TCP 192.168.1.17:55607->31.13.95.48:443 (ESTABLISHED)\n")
+    monkeypatch.setattr(health.sys_probe, "run", _fake(ps, lsof))
+    res = health._codex_proxy_probe()
+    assert res["status"] == "ok", f"App-PID (direct) исключён из TUI → CLI ok, не mixed; got {res}"
+
+
+def test_codex_probe_unknown_when_only_app_pids(monkeypatch):
+    """Только App-PID (ChatGPT.app) запущен → TUI/CLI-чек = unknown (info-only), App уходит в свой чек.
+
+    Реальный баг #189: App-PID на external-ESTABLISHED (direct) → TUI-чек давал down «codex идёт
+    напрямую», diagnostics указывал на ChatGPT.app PID (issue пишет «VSCode PID 56748» — тот же класс
+    бага: нерелевантный App-PID в TUI-чеке вместо реальной проблемы). Теперь App-PID вообще не
+    рассматривается TUI-чеком → unknown «codex CLI/TUI не запущен».
+    """
+    ps = f"60826 {APP_CODEX_COMM}\n"
+    # App-PID на external-ESTABLISHED direct — без разделения даёт down в TUI-чеке
+    lsof = ("codex 60826 axisrow 32u IPv4 0xABC 0t0 "
+            "TCP 192.168.1.17:55607->31.13.95.48:443 (ESTABLISHED)\n")
+    monkeypatch.setattr(health.sys_probe, "run", _fake(ps, lsof))
+    res = health._codex_proxy_probe()
+    assert res["status"] == "unknown", f"только App-PID → TUI-чек unknown (info); got {res}"
+
+
+def test_codex_probe_still_detects_cli_mixed(monkeypatch):
+    """Регрессия #120/#121: разделение App/CLI НЕ сломало multi-session-детект CLI.
+
+    Два CLI-PID на 10808 и 8118 → mixed (C2: direct-сессия не маскируется SOCKS-сессией).
+    """
+    ps = f"22415 {CODEX_BIN_COMM}\n26279 {CODEX_BIN_COMM}\n"
+    lsof = _lsof_line("22415", 54000, 10808) + _lsof_line("26279", 54001, 8118)
+    monkeypatch.setattr(health.sys_probe, "run", _fake(ps, lsof))
+    res = health._codex_proxy_probe()
+    assert res["status"] == "mixed", f"CLI multi-session → mixed (регрессия #121); got {res}"
+
+
+def test_is_codex_app_comm_matches_chatgpt_app(monkeypatch):
+    """_is_codex_app_comm детектит ChatGPT.app/Codex.app path-сегмент (Rust app-server)."""
+    assert health._is_codex_app_comm("/Applications/ChatGPT.app/Contents/Resources/codex") is True
+    assert health._is_codex_app_comm("/Applications/Codex.app/Contents/MacOS/Codex") is True
+    assert health._is_codex_app_comm(CODEX_BIN_COMM) is False, "CLI brew-codex НЕ app-context"
+    assert health._is_codex_app_comm("/Users/me/.vscode/extensions/openai.chatgpt-1.0/bin/codex") is False
+    assert health._is_codex_app_comm("") is False

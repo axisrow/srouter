@@ -371,6 +371,26 @@ def _claude_transport_probe(proxy=None):
 # cycle 2 cleanup: общий substring 'codex' over-matched helpers → matcher по basename (точно).
 _CODEX_BIN_RE = re.compile(r"(^|/)codex(?:-(?:aarch64|x86_64)-apple-darwin)?$")
 
+# Issue #189: ChatGPT.app (com.openai.codex) бандлит свой Rust-binary по пути
+# /Applications/ChatGPT.app/Contents/Resources/codex — basename 'codex' → МАТЧИТСЯ _CODEX_BIN_RE.
+# Этот Rust app-server — основной WS-трафик к chatgpt.com, берёт прокси ТОЛЬКО из launchd gui-env
+# (codenv), НЕ из CLI-shell-env → другой контекст, чем CLI codex (TUI/terminal). _codex_proxy_probe
+# (TUI-чек) его НЕ учитывает; App-PID уходит в отдельный _codex_app_proxy_check (driver для gui-env).
+# Разделение по path-сегменту .app/ (comm = полный путь): /ChatGPT.app/ или /Codex.app/ → App-context.
+_CODEX_APP_PATH_RE = re.compile(r"/(?:ChatGPT|Codex)\.app/", re.IGNORECASE)
+
+
+def _is_codex_app_comm(comm):
+    """Codex.app/ChatGPT.app-bundled codex (Rust app-server, launchd-env контекст)?
+
+    По path-сегменту .app/ в полном comm (ps -axo comm= отдаёт путь). App-PID — другой контекст
+    прокси, чем CLI-codex: наследует launchd gui-env (codenv), а не shell-env. Детект нужен, чтобы
+    _codex_proxy_probe (TUI/CLI-чек) исключил App-PID (иначе ложный mixed/down на нерелевантном PID —
+    баг «❌ на VSCode PID 56748» #189). path-сегмент стабильнее bundle-id: comm не отдаёт signing_id,
+    а /ChatGPT.app/ (com.openai.codex ребрендинг) и /Codex.app/ оба покрыты одним regex.
+    """
+    return bool(comm and _CODEX_APP_PATH_RE.search(comm))
+
 
 def _is_codex_binary_comm(comm):
     """Является ли comm основным codex-binary? По basename: 'codex' или 'codex-<arch>-apple-darwin'.
@@ -401,19 +421,30 @@ def _codex_proxy_probe():
       status="unknown" — codex не запущен ИЛИ lsof timeout (info-only, не роняет вердикт).
     """
     # 1. PID'ы codex-binary. ps -axo comm= отдаёт полный путь — матчим по vendor-binary-path.
+    # Issue #189: делим на CLI-PID (TUI/terminal-контекст) и App-PID (ChatGPT.app launchd-контекст).
+    # App-PID (Rust app-server, /ChatGPT.app/.../codex) — другой контекст прокси (codenv gui-env, не
+    # shell-env) → уходит в отдельный _codex_app_proxy_check. Иначе App-PID direct (без codenv) +
+    # CLI на SOCKS5 → ложный mixed; только-App direct → ложный down в TUI-чеке (баг «❌ на VSCode PID»).
     r = sys_probe.run([PS, "-axo", "pid=,comm="], timeout=3)
     if r.get("timeout"):
         return {"status": "unknown", "source": "n/a", "detail": "timeout ps"}
-    pids = []
+    cli_pids, app_pids = [], []
     for line in (r.get("out") or "").splitlines():
         parts = line.split(None, 1)
         if len(parts) < 2:
             continue
         pid_s, comm = parts[0].strip(), parts[1].strip()
-        if pid_s.isdigit() and _is_codex_binary_comm(comm):
-            pids.append(pid_s)
-    if not pids:
-        return {"status": "unknown", "source": "n/a", "detail": "codex не запущен"}
+        if not (pid_s.isdigit() and _is_codex_binary_comm(comm)):
+            continue
+        (app_pids if _is_codex_app_comm(comm) else cli_pids).append(pid_s)
+    if not cli_pids:
+        # App-PID есть, но CLI/TUI-codex не запущен — это не TUI-сцена. App уходит в свой чек;
+        # TUI-чек = unknown (info-only), не роняет вердикт (как claude-proxy когда CC не запущен).
+        app_hint = (f" (App-codex PID {','.join(app_pids)} → см. codex-app-proxy check)"
+                    if app_pids else "")
+        return {"status": "unknown", "source": "n/a",
+                "detail": f"codex CLI/TUI не запущен{app_hint}"}
+    pids = cli_pids
 
     # 2. Один lsof на ВСЕ PID'ы (батч). Классифицируем по ->127.0.0.1:PORT (как claude-proxy).
     lr = sys_probe.run([LSOF, "-nP", "-p", ",".join(pids)], timeout=3)
@@ -1046,6 +1077,22 @@ def _read_proxy_sources():
     return {"desktop_keys": desktop_keys, "cli_proxy": cli_proxy}
 
 
+def _codenv_managed():
+    """codenv LaunchAgent srouter-managed? Читает plist на маркер CODEX_ENV_MARKER (fail-soft).
+
+    Архитектурный конфликт #189/#127: codenv ставит SOCKS5 в gui-домен (нужно ChatGPT.app Rust
+    app-server), но тот же SOCKS5 ломает Claude Desktop App (#127). _desktop_proxy_check отличает
+    «наш codenv» (намеренный tradeoff → info, не driver-шум) от «чужой корпоративный SOCKS5» (→ down).
+    Codenv-managed = plist ~/Library/LaunchAgents/com.srouter.codenv.plist содержит CODEX_ENV_MARKER.
+    Ошибка чтения/отсутствие → False (fail-safe: трактуем как чужой → down, не глушим инцидент #127).
+    """
+    try:
+        plist = Path.home() / "Library" / "LaunchAgents" / f"{_CODENV_LABEL}.plist"
+        return plist.exists() and _CODENV_MARKER in plist.read_text(encoding="utf-8")
+    except OSError:
+        return False
+
+
 def _desktop_proxy_check():
     """Прокси Desktop App (launchctl getenv) — SOCKS5 в любом ключе → down (#127/#134).
 
@@ -1054,6 +1101,12 @@ def _desktop_proxy_check():
     мина (вспыхнет при смене конфига) → down. Scheme-классификация через urlparse (эталон #127,
     не подстрока — иначе http://socks.example.com даст ложный down). detail перечисляет все
     найденные ключи «как есть».
+
+    issue #189 codenv-aware: SOCKS5 от srouter-managed codenv (для ChatGPT.app Rust app-server) —
+    намеренный tradeoff (лечит ChatGPT.app #189, ломает Claude Desktop App #127). doctor показывает
+    факт в detail, но НЕ роняет вердикт (status="info") — иначе нормальная установка с codenv вечно
+    degraded (шум, как PR #135 для PF). Чужой SOCKS5 (не codenv) → по-прежнему down (#127-инцидент).
+
     Расхождение settings.json (CLI) vs launchctl HTTPS_PROXY (Desktop) → warn (issue #134 п.2):
     один клиент может работать, другой сломан, а без этого сравнения doctor молчит (#127-класс).
     down (уже сломанный SOCKS5) важнее warn (потенциальное расхождение) — проверяется первым.
@@ -1070,6 +1123,12 @@ def _desktop_proxy_check():
                   if urlparse(v).scheme.lower() in {"socks", "socks5", "socks5h"}}
     if socks_keys:
         bad = ", ".join(f"{k}={v}" for k, v in socks_keys.items())
+        # issue #189: srouter-managed codenv SOCKS5 — намеренный (лечит ChatGPT.app). info, не driver-шум.
+        if _codenv_managed():
+            return {"status": "info",
+                    "detail": (f"SOCKS5 в launchctl ({bad}) = srouter codenv (#189 для ChatGPT.app Rust "
+                               f"app-server). Claude Desktop App ломается на SOCKS5 (#127), но CC CLI "
+                               f"через ~/.claude/settings.json не затронут. Намеренный tradeoff.")}
         return {"status": "down",
                 "detail": f"SOCKS5 в launchctl ({bad}) — Desktop App UnsupportedProxyProtocol (#127)"}
     # Расхождение CLI (settings.json) vs Desktop (launchctl HTTPS_PROXY) — оба заданы и различны.
@@ -1081,6 +1140,111 @@ def _desktop_proxy_check():
     # Только HTTP-прокси, без расхождения → ok, перечисляем все найденные ключи.
     found = ", ".join(f"{k}={v}" for k, v in keys.items())
     return {"status": "ok", "detail": f"Desktop App proxy (launchctl): {found}"}
+
+
+# ============================ #189: ChatGPT.app Rust app-server proxy (launchctl gui-env) =========
+
+# codenv LaunchAgent label/marker — ДУБЛИРОВАНЫ из srouter.py (CODEX_ENV_LABEL/MARKER :273-274).
+# health.py НЕ импортирует srouter.py (CLI-слой, тащит argparse/apply_install). Парity-гвард: при
+# смене маркера в srouter.py — обновить тут (как _CODEX_WRAPPER_MARKER health.py:485 ↔ srouter.py).
+_CODENV_LABEL = "com.srouter.codenv"
+_CODENV_MARKER = "srouter-managed-codex-env-v1"
+
+
+def _read_gui_proxy_env():
+    """Прокси в launchd GUI-домене (где codenv ставит SOCKS5) — через `launchctl print gui/<uid>`.
+
+    launchctl getenv читает ТОЛЬКО caller-context (`Usage: getenv <key>` — НЕ принимает домен), молча
+    игнорируя домен-аргумент → из SSH/cron/AO-shell даёт НЕ gui, а из GUI-терминала совпадает случайно.
+    codenv-факт = факт о GUI-домене (видит ChatGPT.app launchd-process), не о терминале doctor'а →
+    единственный домен-осознанный источник = `launchctl print gui/<uid>` блок `environment = {...}`.
+
+    Возвращает {keys: {KEY: value}, verifiable: bool}. timeout → verifiable=False (fail-closed: не
+    различимо «пусто» vs «не смогли спросить», не выдумываем false-down). Парсим только LAUNCHCTL_PROXY_KEYS
+    (HTTPS_PROXY/HTTP_PROXY/ALL_PROXY) — остальные env-ключи не касаются прокси.
+    """
+    domain = f"gui/{os.getuid()}"
+    lc = sys_probe.run([LAUNCHCTL, "print", domain], timeout=3)
+    if lc.get("timeout"):
+        return {"keys": {}, "verifiable": False}  # fail-closed
+    keys = {}
+    in_env = False
+    for line in (lc.get("out") or "").splitlines():
+        stripped = line.strip()
+        if stripped == "environment = {":
+            in_env = True
+            continue
+        if in_env:
+            # конец блока — строка из одного '}' (отступ launchctl print).
+            if stripped == "}":
+                break
+            # формат: '\t\tKEY => value' (как отдаёт launchctl print).
+            if " => " in stripped:
+                k, _, v = stripped.partition(" => ")
+                k = k.strip()
+                if k in LAUNCHCTL_PROXY_KEYS and v.strip():
+                    keys[k] = v.strip()
+    return {"keys": keys, "verifiable": True}
+
+
+def _codex_app_proxy_check():
+    """ChatGPT.app Rust app-server без прокси (codenv снят/битый) → down DRIVER (issue #189).
+
+    Эмпирика (verify, lsof per-process): ChatGPT.app = Electron-оболочка над Rust-бинарником. Rust
+    app-server (/Applications/ChatGPT.app/.../codex, основной WS к wss://chatgpt.com) НЕ уважает
+    системный SOCKS (Rust reqwest без SystemConfiguration), берёт ТОЛЬКО env SOCKS5 из launchd gui-домена
+    (codenv LaunchAgent). codenv снят/битый (plist-шаблон с placeholder'ами после #185 деактивации
+    install) → gui-env пуст → Rust app-server напрямую → GFW рвёт ('failed to connect... TimedOut').
+
+    Чек: (1) App-codex активен (ps по _is_codex_app_comm); (2) gui-env через _read_gui_proxy_env.
+      status="down"    — App активен, gui-env пуст (codenv не загружен) — DRIVER;
+      status="warn"    — App активен, gui-env только HTTP (privoxy рвёт WS #120) — DRIVER;
+      status="ok"      — App активен, gui-env SOCKS5 (codenv работает) — DRIVER;
+      status="unknown" — App не запущен ИЛИ gui-env не верифицируем — info-only (fail-closed).
+    App-PID здесь, НЕ в _codex_proxy_probe (TUI-чек исключил App-PID, чтобы не давать ложный mixed/down
+    на нерелевантном PID — баг «❌ на VSCode PID 56748»).
+    """
+    # 1. App-codex процессы активны?
+    r = sys_probe.run([PS, "-axo", "pid=,comm="], timeout=3)
+    if r.get("timeout"):
+        return {"status": "unknown", "source": "n/a", "detail": "timeout ps"}
+    app_pids = []
+    for line in (r.get("out") or "").splitlines():
+        parts = line.split(None, 1)
+        if len(parts) < 2:
+            continue
+        pid_s, comm = parts[0].strip(), parts[1].strip()
+        if pid_s.isdigit() and _is_codex_binary_comm(comm) and _is_codex_app_comm(comm):
+            app_pids.append(pid_s)
+    if not app_pids:
+        return {"status": "unknown", "source": "n/a",
+                "detail": "ChatGPT.app/Codex.app не запущен — Rust app-server не активен"}
+
+    # 2. gui-env (codenv).
+    gui = _read_gui_proxy_env()
+    if not gui.get("verifiable"):
+        return {"status": "unknown", "source": "n/a",
+                "detail": f"launchctl gui-env не отвечает — ручная проверка: "
+                          f"launchctl getenv gui/$(id -u) HTTPS_PROXY (App PID {','.join(app_pids)})"}
+    keys = gui.get("keys") or {}
+    pid_hint = f"PID {','.join(app_pids)}"
+
+    if not keys:
+        return {"status": "down", "source": "gui-env",
+                "detail": (f"ChatGPT.app Rust app-server без прокси: launchctl gui-env пуст — codenv "
+                           f"не загружен/битый ({pid_hint}). WS к chatgpt.com рвётся (GFW). "
+                           f"Восстановить: srouter install (codenv)")}
+    socks_keys = {k: v for k, v in keys.items()
+                  if urlparse(v).scheme.lower() in {"socks", "socks5", "socks5h"}}
+    if socks_keys:
+        found = ", ".join(f"{k}={v}" for k, v in socks_keys.items())
+        return {"status": "ok", "source": "gui-env",
+                "detail": f"ChatGPT.app Rust app-server через SOCKS5 (codenv gui-env: {found}, {pid_hint})"}
+    # gui-env задан, но без SOCKS5 (только HTTP/privoxy) → warn (long-lived WS порвётся #120).
+    found = ", ".join(f"{k}={v}" for k, v in keys.items())
+    return {"status": "warn", "source": "gui-env",
+            "detail": (f"ChatGPT.app Rust app-server через HTTP прокси без SOCKS5 ({found}, {pid_hint}) — "
+                       f"privoxy рвёт long-lived WS (#120). codenv должен ставить SOCKS5")}
 
 
 # ============================ #185: scoped SOCKS5 для codex через VSCode http.proxy ============================
@@ -1164,7 +1328,9 @@ def check_all(*, active_claude=False):
     # расхождение (driver degraded — реальный сигнал несоответствия, не info-only).
     dp = _desktop_proxy_check()
     dp_check = {"name": "desktop proxy (launchctl)", "ok": dp["status"] == "ok", "detail": dp["detail"]}
-    if dp["status"] == "unknown":
+    # unknown (launchctl пуст) ИЛИ info (codenv SOCKS5 — намеренный tradeoff #189, не инцидент #127)
+    # → info-only, не driver (не роняет вердикт на нормальной установке с codenv).
+    if dp["status"] in ("unknown", "info"):
         dp_check["info"] = True
     checks.append(dp_check)
     # Codex-маршрут (#120): warn (privoxy 8118) — driver degraded (WS порвётся); down — driver;
@@ -1178,6 +1344,18 @@ def check_all(*, active_claude=False):
     elif cx["status"] == "warn":
         cx_check["ok"] = False  # privoxy-сессия — degraded, но не «всё мертво»
     checks.append(cx_check)
+    # ChatGPT.app Rust app-server proxy (#189): App-codex без прокси (codenv снят/битый) → down DRIVER.
+    # App-PID исключён из cx_check выше (TUI-чек) — здесь отдельный driver для gui-env/codenv-состояния.
+    # unknown (App не запущен / gui-env не верифицируем) — info-only (fail-closed, как claude-proxy).
+    # НЕ под active_claude gate — чек лёгкий (ps + launchctl getenv), нужен в /health и watchdog.
+    ap = _codex_app_proxy_check()
+    ap_check = {"name": "codex-app-proxy (ChatGPT.app gui-env SOCKS5)",
+                "ok": ap["status"] == "ok", "detail": ap["detail"]}
+    if ap["status"] == "unknown":
+        ap_check["info"] = True
+    elif ap["status"] == "warn":
+        ap_check["ok"] = False  # App на privoxy — degraded (WS порвётся #120)
+    checks.append(ap_check)
     # VSCode scoped SOCKS5 (#185): codex-расширение openai.chatgpt через http.proxy. info-only ВСЕГДА
     # (как endpoint-override) — VSCode может быть не установлен, srouter-stack от этого не падает.
     # down (http.proxy=privoxy/чужой — рвёт WS) показываем в detail, но НЕ driver: это scoped-диагностика
