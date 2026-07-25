@@ -302,13 +302,17 @@ binary/exec.LookPath), поэтому границей служит именно
   (Chromium flag; env не дублирует). **Codex.app запускать через него, а не иконку Dock**
   (Dock не передаёт `--proxy-server`).
 - **LaunchAgent `com.srouter.codenv` (восстановлен, #189/#190)** — глобальный env
-  (`socks5h://127.0.0.1:10808` + `NO_PROXY=localhost,127.0.0.1,::1`) через plist с
-  `EnvironmentVariables` (RunAtLoad + StartInterval=300, переживает ребут). Нужен для **Rust
-  app-server ChatGPT.app/Codex.app** (основной WS к `wss://chatgpt.com`): он не уважает ни системный
-  SOCKS (только Chromium-оболочка), ни `[network] proxy_url` (мёртв в codex 0.146) — только env SOCKS5.
-  **Claude Code не конфликтует** (#130 снят): CC CLI читает прокси из `~/.claude/settings.json`, а не из
-  launchd gui-env. ⚠️ Побочный эффект: gui-SOCKS5 ломает **Claude Desktop App** (#127, не CC CLI) —
-  `srouter doctor` покажет; митигация отдельной историей.
+  (`socks5h://127.0.0.1:10808` + `NO_PROXY=localhost,127.0.0.1,::1`) в launchd gui-домен: агент
+  (RunAtLoad + StartInterval=300, переживает ребут) запускает скрипт `srouter-codex-env.sh`, который
+  делает `launchctl setenv` (сам по себе setenv ребут не переживает — поэтому периодический Refresh).
+  Нужен для **Rust app-server ChatGPT.app/Codex.app** (основной WS к `wss://chatgpt.com`): он не уважает
+  ни системный SOCKS (только Chromium-оболочка), ни `[network] proxy_url` (мёртв в codex 0.146) — только
+  env SOCKS5. **Claude Code не конфликтует** (#130 снят): CC CLI читает прокси из
+  `~/.claude/settings.json`, а не из launchd gui-env. ⚠️ **setenv не ретроактивен**: если ChatGPT.app уже
+  запущен на момент install, его Rust app-server останется с прямыми сокетами (stale) — полностью
+  перезапустите ChatGPT.app (Cmd+Q из Dock, не «закрыть окно»); `srouter doctor` детектит stale-App.
+  ⚠️ Побочный эффект: gui-SOCKS5 ломает **Claude Desktop App** (#127, не CC CLI) — `srouter doctor`
+  покажет; митигация отдельной историей.
 - **VSCode `http.proxy` (scoped, #185)** — `socks5h://127.0.0.1:10808` в настройке VSCode/Cursor.
   **Комплементарен codenv**: расширение `openai.chatgpt` в Code/Cursor — отдельный клиент от ChatGPT.app;
   строит `HTTP_PROXY`/`HTTPS_PROXY` **в env порождаемого codex-процесса**, не трогая Claude Code.
@@ -657,13 +661,17 @@ optimization (they route traffic through the right channel without relying on th
   (Chromium flag; no env duplication). **Launch Codex.app via this, not the Dock icon** (Dock doesn't
   pass `--proxy-server`).
 - **LaunchAgent `com.srouter.codenv` (restored, #189/#190)** — global env
-  (`socks5h://127.0.0.1:10808` + `NO_PROXY=localhost,127.0.0.1,::1`) via a plist with
-  `EnvironmentVariables` (RunAtLoad + StartInterval=300, survives reboot). Required for the **Rust
-  app-server of ChatGPT.app/Codex.app** (the main WS to `wss://chatgpt.com`): it honors neither system
-  SOCKS (only the Chromium shell does) nor `[network] proxy_url` (dead in codex 0.146) — only env SOCKS5.
-  **Claude Code does not conflict** (#130 resolved): the CC CLI reads its proxy from
-  `~/.claude/settings.json`, not launchd gui-env. ⚠️ Side effect: gui-SOCKS5 breaks the **Claude Desktop
-  App** (#127, not the CC CLI) — `srouter doctor` will show it; mitigation is a separate story.
+  (`socks5h://127.0.0.1:10808` + `NO_PROXY=localhost,127.0.0.1,::1`) into the launchd gui-domain: the
+  agent (RunAtLoad + StartInterval=300, survives reboot) runs `srouter-codex-env.sh`, which calls
+  `launchctl setenv` (setenv alone does not survive reboot — hence the periodic refresh). Required for
+  the **Rust app-server of ChatGPT.app/Codex.app** (the main WS to `wss://chatgpt.com`): it honors
+  neither system SOCKS (only the Chromium shell does) nor `[network] proxy_url` (dead in codex 0.146) —
+  only env SOCKS5. **Claude Code does not conflict** (#130 resolved): the CC CLI reads its proxy from
+  `~/.claude/settings.json`, not launchd gui-env. ⚠️ **setenv is not retroactive**: if ChatGPT.app is
+  already running at install time, its Rust app-server keeps its direct sockets (stale) — fully restart
+  ChatGPT.app (Cmd+Q from the Dock, not "close window"); `srouter doctor` detects a stale App. ⚠️ Side
+  effect: gui-SOCKS5 breaks the **Claude Desktop App** (#127, not the CC CLI) — `srouter doctor` will
+  show it; mitigation is a separate story.
 - **VSCode `http.proxy` (scoped, #185)** — `socks5h://127.0.0.1:10808` in the VSCode/Cursor setting.
   **Complementary to codenv**: the `openai.chatgpt` extension in Code/Cursor is a separate client from
   ChatGPT.app; it builds `HTTP_PROXY`/`HTTPS_PROXY` **in the env of the spawned codex process**, leaving
