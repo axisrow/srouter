@@ -941,22 +941,32 @@ def cmd_install(args) -> int:
         # минуя privoxy (портит WS-стриминг). Функция (#96) гарантирует победу над brew в PATH.
         codex_note = _install_codex_wrappers(env)
         codex_func_note = _install_codex_zsh_function(env)
+        # issue #189: codenv (LaunchAgent com.srouter.codenv) ВОССТАНОВЛЕН в install.
+        # Эмпирика (verify, lsof per-process ChatGPT.app): ChatGPT.app = Electron-оболочка над
+        # Rust-бинарником — ДВА стека. Chromium-оболочка уважает СИСТЕМНЫЙ SOCKS (scutil) — работает.
+        # Rust app-server (/Resources/codex, основной WS к wss://chatgpt.com) НЕ уважает системный SOCKS,
+        # берёт ТОЛЬКО env SOCKS5 → без env идёт напрямую → GFW рвёт (error_kind=TimedOut в logs_2.sqlite).
+        # config.toml [network] proxy_url МЁРТВ в codex 0.146. Единственный путь для Rust app-server =
+        # env SOCKS5 в launchd gui-домене → codenv (RunAtLoad + StartInterval=300, переживает ребут).
+        # РАНЬШЕ (PR #187/#185) codenv деактивировали из-за #130 (CC SOCKS5-несовместимость), НО эмпирика
+        # #189 опровергает конфликт: CC CLI читает прокси из ~/.claude/settings.json (claude_proxy.py),
+        # НЕ из launchd gui-env → месяц коэкзиста CC+Codex это подтверждает (codenv был загружен весь месяц).
+        # Корень «error 5» #189: PR #187 деактивировал install-codenv, но plist на диске остался как
+        # placeholder-шаблон (не отрендерен) → job перезагрузился с __SROUTER_CODENV_PATH__ → error 5 →
+        # env не применялся → сломалось после обеда. Восстановление = правильный рендер plist тут.
+        codenv_note = _install_launchctl_env(env, runner)
         # issue #185: scoped SOCKS5 для codex-расширения openai.chatgpt через VSCode http.proxy.
-        # РАНЬШЕ тут звался _install_launchctl_env (грузил com.srouter.codenv = глобальный SOCKS5 в
-        # gui-домене launchd) — но это ломает Claude Code (#130: CC не поддерживает SOCKS5), поэтому
-        # LaunchAgent НЕ загружался (мёртвый механизм). Scoped-путь (verify из extension.js расширения):
-        # VSCode-настройка http.proxy → расширение строит HTTP_PROXY/HTTPS_PROXY В ENV ПОРОЖДАЕМОГО
-        # codex-процессА ({...process.env,...n}), CC (отдельный процесс, свой ~/.claude/settings.json)
-        # НЕ затрагивается. gui-SOCKS5 LaunchAgent ДЕАКТИВИРОВАН в install; _remove_launchctl_env остался
-        # в uninstall для чистки残留ного codenv от старых установок (симметрия). Функцию _install_launchctl_env
-        # НЕ удаляем — переиспользуется если scoped-путь окажется недостаточен (сравнение с PF, вариант 2 #186).
+        # Отдельный клиент от ChatGPT.app (расширение в Code/Cursor, не GUI-приложение). Комплементарен
+        # codenv: codenv покрывает Rust app-server ChatGPT.app, VSCode http.proxy — расширение. CC
+        # (отдельный процесс, свой ~/.claude/settings.json) НЕ затрагивается ни одним из них.
         vp = vscode_proxy.enable()
         if vp.get("ok"):
-            env_note = ("Codex env: scoped SOCKS5 прописан в VSCode http.proxy (Code/Cursor) — "
-                        "расширение openai.chatgpt гонит codex через SOCKS5, CC не затрагивается (#185)."
-                        + (f" Пути: {', '.join(vp.get('paths') or [])}" if vp.get("paths") else ""))
+            vp_note = ("scoped SOCKS5 в VSCode http.proxy (Code/Cursor) — расширение openai.chatgpt, "
+                       "CC не затрагивается (#185)"
+                       + (f" Пути: {', '.join(vp.get('paths') or [])}" if vp.get("paths") else ""))
         else:
-            env_note = f"Codex env: scoped VSCode http.proxy не установлен ({vp.get('err', 'unknown')})."
+            vp_note = f"scoped VSCode http.proxy не установлен ({vp.get('err', 'unknown')})."
+        env_note = f"{codenv_note} VSCode: {vp_note}"
         path_note = _ensure_home_bin_in_path(env)
         codex_iso_note = _install_codex_isolation(env, runner)
         # Marker-migration table (issue #112 Часть 4): регистрируем текущие маркеры wrappers/zshrc/codenv

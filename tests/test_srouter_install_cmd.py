@@ -138,14 +138,20 @@ def test_cmd_install_foreign_conflict_still_blocks_non_tty(monkeypatch, capsys):
     assert "конфликт" in err, "stderr объясняет: конфликт требует ручного разрешения"
 
 
-# ============================ issue #185: scoped SOCKS5 через VSCode http.proxy (не gui-SOCKS5) ========
-# Глобальный SOCKS5 в gui-домене (com.srouter.codenv, _install_launchctl_env) ломает Claude Code
-# (#130 — CC не поддерживает SOCKS5). Scoped-решение: VSCode http.proxy=socks5h://10808 — расширение
-# openai.chatgpt читает его и строит HTTP_PROXY/HTTPS_PROXY в env ПОРОЖДАЕМОГО codex-процессА (verify
-# из extension.js), CC не затрагивается. Каноничный фикс: cmd_install вызывает vscode_proxy.enable(),
-# а НЕ _install_launchctl_env (gui-SOCKS5 деактивирован).
-def test_cmd_install_activates_vscode_proxy_not_gui_socks5(monkeypatch):
-    """issue #185: install → vscode_proxy.enable() вызван, _install_launchctl_env НЕ вызван."""
+# ============================ issue #189: codenv (gui-env SOCKS5) ВОССТАНОВЛЕН + VSCode scoped =====
+# Эмпирика #189 (verify, lsof per-process): ChatGPT.app = Electron-оболочка над Rust-бинарником —
+# ДВА независимых сетевых стека. (1) Chromium-оболочка → уважает СИСТЕМНЫЙ SOCKS (scutil) — работает.
+# (2) Rust app-server (/Resources/codex, основной WS к chatgpt.com) → НЕ уважает системный SOCKS,
+# берёт ТОЛЬКО env SOCKS5 → без env идёт напрямую → GFW рвёт (error_kind=TimedOut в logs_2.sqlite).
+# config.toml [network] proxy_url МЁРТВ в codex 0.146. Единственный путь для Rust app-server =
+# env SOCKS5 в launchd gui-домене → com.srouter.codenv LaunchAgent (_install_launchctl_env).
+# codenv НЕ ломает Claude Code (#130 снят): CC CLI читает прокси из ~/.claude/settings.json
+# (claude_proxy.py), НЕ из launchd gui-env → месяц коэкзиста CC+Codex это подтверждает.
+# VSCode http.proxy (#185) остаётся для codex-расширения openai.chatgpt (отдельный клиент) — они
+# КОМПЛЕМЕНТАРНЫ (разные клиенты/стеки), НЕ взаимоисключающи. cmd_install вызывает ОБА.
+def test_cmd_install_activates_codenv_and_vscode_proxy(monkeypatch):
+    """issue #189: install → _install_launchctl_env (codenv для Rust app-server) И vscode_proxy.enable()
+    (scoped для расширения) — ОБА вызваны. Они покрывают разных клиентов, не конфликтуют."""
     _stub_cmd_install_internals(monkeypatch, apply_ok=True, tty=False)
     calls = {"vscode_enable": 0, "launchctl_env": 0}
     monkeypatch.setattr(srouter, "vscode_proxy",
@@ -156,8 +162,11 @@ def test_cmd_install_activates_vscode_proxy_not_gui_socks5(monkeypatch):
     rc = srouter.cmd_install(_args(yes=True))
 
     assert rc == 0
-    assert calls["vscode_enable"] == 1, "install обязан активировать scoped VSCode http.proxy (#185)"
-    assert calls["launchctl_env"] == 0, (
-        "install НЕ должен грузить gui-SOCKS5 LaunchAgent — он ломает Claude Code (#130). "
-        "Scoped-путь через VSCode http.proxy заменяет глобальный."
+    assert calls["launchctl_env"] == 1, (
+        "install обязан грузить codenv LaunchAgent (gui-env SOCKS5) — без него Rust app-server "
+        "ChatGPT.app идёт напрямую и GFW рвёт WS к chatgpt.com (#189)."
+    )
+    assert calls["vscode_enable"] == 1, (
+        "install обязан активировать scoped VSCode http.proxy (#185) для codex-расширения "
+        "openai.chatgpt — отдельный клиент от ChatGPT.app."
     )
