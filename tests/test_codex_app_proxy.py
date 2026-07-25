@@ -22,14 +22,14 @@ SOCKS5 = "socks5h://127.0.0.1:10808"
 PRIVOXY = "http://127.0.0.1:8118"
 
 
-def _fake(ps_out, gui_env_text="", gui_verifiable=True, lsof_out=""):
+def _fake(ps_out, gui_env_text="", gui_verifiable=True, lsof_out="", lsof_rc=0, lsof_timeout=False):
     """fake_run: ps → ps_out; launchctl print gui/<uid> → gui_env_text; lsof -p <app_pids> → lsof_out.
 
     _read_gui_proxy_env парсит `launchctl print gui/<uid>` блок `environment = { ... }` (getenv НЕ
     принимает домен-аргумент — Usage: getenv <key> — молча игнорирует домен, давая пусто/ложный down).
     gui_env_text = сырой текст environment-блока (для имитации print-вывода). gui_verifiable=False →
     timeout launchctl (fail-closed → unknown, не false-down).
-    lsof_out = lsof-вывод для App-PID (runtime-маршрут — _codex_app_proxy_check добавил после cycle-1).
+    lsof_out = lsof-вывод для App-PID (runtime-маршрут). lsof_rc≠0 / lsof_timeout → lsof-сбой (не ok).
     """
     def fake_run(cmd, timeout):
         if cmd and cmd[0] == "/bin/ps":
@@ -39,7 +39,9 @@ def _fake(ps_out, gui_env_text="", gui_verifiable=True, lsof_out=""):
                 return {"rc": None, "out": "", "err": "timeout", "timeout": True}
             return {"rc": 0, "out": gui_env_text, "err": "", "timeout": False}
         if cmd and cmd[0] == "/usr/sbin/lsof":
-            return {"rc": 0, "out": lsof_out, "err": "", "timeout": False}
+            if lsof_timeout:
+                return {"rc": None, "out": "", "err": "timeout", "timeout": True}
+            return {"rc": lsof_rc, "out": lsof_out, "err": "", "timeout": False}
         return {"rc": 0, "out": "", "err": "", "timeout": False}
     return fake_run
 
@@ -54,6 +56,12 @@ def _lsof_socks(pid):
     """lsof-строка: App-PID через SOCKS5 10808 (как должно быть при рабочем codenv + свежем App)."""
     return (f"codex {pid} axisrow 32u IPv4 0xABC 0t0 "
             f"TCP 127.0.0.1:55607->127.0.0.1:10808 (ESTABLISHED)\n")
+
+
+def _lsof_privoxy(pid):
+    """lsof-строка: App-PID через privoxy 8118 (HTTP, рвёт long-lived WS #120 — НЕ SOCKS5)."""
+    return (f"codex {pid} axisrow 32u IPv4 0xABC 0t0 "
+            f"TCP 127.0.0.1:55607->127.0.0.1:8118 (ESTABLISHED)\n")
 
 
 def _gui_env(keys):
@@ -110,6 +118,48 @@ def test_app_proxy_down_when_stale_app_direct_despite_gui_socks5(monkeypatch):
     detail = res["detail"].lower()
     assert "перезапуст" in detail or "restart" in detail or "direct" in detail, \
         f"detail объясняет: нужен рестарт App (setenv не ретроактивен); got {res}"
+
+
+def test_app_proxy_unknown_when_app_idle_no_socks_socket(monkeypatch):
+    """App активен + gui-env SOCKS5, но lsof НЕ показал 10808 (idle/нет ESTABLISHED) → unknown, НЕ ok.
+
+    Cycle-2 finding: ok требовал positive SOCKS5 evidence. Пустой/idle lsof → нет доказательства
+    маршрута → нельзя утверждать ok (App может быть сломан/переподключается). fail-closed: unknown.
+    """
+    ps = f"60826 {APP_CODEX_COMM}\n"
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _fake(ps, _gui_env({"HTTPS_PROXY": SOCKS5, "ALL_PROXY": SOCKS5}),
+                              lsof_out=""))  # idle — нет ESTABLISHED
+    res = health._codex_app_proxy_check()
+    assert res["status"] == "unknown", f"idle App (нет SOCKS-сокета) → unknown, не ok; got {res}"
+
+
+def test_app_proxy_warn_when_app_via_privoxy_not_socks(monkeypatch):
+    """App активен + gui-env SOCKS5, но lsof показывает privoxy 8118 (НЕ SOCKS5) → warn, НЕ ok.
+
+    Cycle-2 finding: ESTABLISHED к другому localhost-прокси (8118) ≠ SOCKS5-маршрут. privoxy рвёт
+    long-lived WS (#120) → warn (degraded), не ok. App выбрал privoxy вместо SOCKS5 (stale env).
+    """
+    ps = f"60826 {APP_CODEX_COMM}\n"
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _fake(ps, _gui_env({"HTTPS_PROXY": SOCKS5, "ALL_PROXY": SOCKS5}),
+                              lsof_out=_lsof_privoxy("60826")))
+    res = health._codex_app_proxy_check()
+    assert res["status"] == "warn", f"App через privoxy (не SOCKS5) → warn, не ok; got {res}"
+
+
+def test_app_proxy_unknown_when_lsof_nonzero_rc(monkeypatch):
+    """App активен + gui-env SOCKS5, но lsof rc≠0 (сбой, НЕ timeout) → unknown, НЕ ok.
+
+    Cycle-2 finding: lsof-сбой (rc≠0, пустой out) — не timeout, но и не доказательство маршрута.
+    Нельзя утверждать ok без positive SOCKS5 evidence → fail-closed: unknown.
+    """
+    ps = f"60826 {APP_CODEX_COMM}\n"
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _fake(ps, _gui_env({"HTTPS_PROXY": SOCKS5, "ALL_PROXY": SOCKS5}),
+                              lsof_out="", lsof_rc=1))
+    res = health._codex_app_proxy_check()
+    assert res["status"] == "unknown", f"lsof rc≠0 → unknown (fail-closed), не ok; got {res}"
 
 
 def test_app_proxy_ok_when_socks_in_all_proxy_only(monkeypatch):
