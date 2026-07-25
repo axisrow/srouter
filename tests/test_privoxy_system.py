@@ -1442,3 +1442,52 @@ def test_install_helper_rejects_when_installed_helper_digest_mismatch(tmp_path, 
     assert result["ok"] is False
     assert "helper_digest_mismatch" in result["error"]
 
+
+def test_install_helper_fail_closed_when_staged_substituted_after_mkstemp(tmp_path, monkeypatch):
+    """#148 variant 3 (Codex observation): staged user-owned в окне [mkstemp .. sudo install].
+
+    _stage_helper_bytes вызывается в user-процессе `protect()` (НЕ root) → mkstemp
+    создаёт USER-owned staged в /private/tmp. В окне до `sudo install staged dst`
+    тот же UID может подменить staged attacker-bytes. _install_helper обязан ловить
+    это через post-install digest-check: install копирует (подменённый) staged
+    байт-в-байт в root-owned helper, digest helper сравнивается с expected-digest
+    честно прочитанного __file__ — расхождение = fail-closed, attacker-bytes никогда
+    не становятся валидным root-owned helper'ом.
+
+    Симуляция: runner перехватывает sudo install, читает staged-путь из argv,
+    переписывает staged attacker-bytes (моделируя same-UID подмену в окне), затем
+    копирует подмену в helper_path (как сделал бы /usr/bin/install).
+    """
+    layout = _layout(tmp_path)
+
+    def runner(cmd, timeout):
+        if privoxy_system.INSTALL in cmd:
+            m_idx = cmd.index("-m")
+            staged_path = Path(cmd[m_idx + 2])
+            # Моделируем подмену staged attacker'ом (same-UID, в окне до sudo install).
+            assert staged_path.exists(), "staged temp должен существовать к моменту install"
+            staged_path.write_bytes(b"#!/bin/sh\n# attacker-substituted-staged\n")
+            # /usr/bin/install копирует staged байт-в-байт в helper_path.
+            layout.helper_path.parent.mkdir(parents=True, exist_ok=True)
+            layout.helper_path.write_bytes(staged_path.read_bytes())
+            return {"rc": 0, "out": "", "err": "", "timeout": False}
+        if privoxy_system.MKDIR in cmd:
+            layout.helper_path.parent.mkdir(parents=True, exist_ok=True)
+            return {"rc": 0, "out": "", "err": "", "timeout": False}
+        if "/bin/rm" in cmd:
+            # fail-closed cleanup: симулируем sudo rm — реально удаляем helper_path.
+            try:
+                layout.helper_path.unlink()
+            except OSError:
+                pass
+            return {"rc": 0, "out": "", "err": "", "timeout": False}
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+
+    result = privoxy_system._install_helper(runner, layout)
+
+    # post-install digest-check ловит staged-substitution → fail-closed.
+    assert result["ok"] is False
+    assert result["error"] == "helper_digest_mismatch"
+    # helper_path удалён (fail-closed cleanup) — attacker-bytes не остаются как helper.
+    assert not layout.helper_path.exists()
+

@@ -1351,7 +1351,7 @@ def _sudo_reset(runner):
 
 
 def _install_helper(runner, layout=DEFAULT_LAYOUT):
-    """Установка root-owned helper через fd-pinning (TOCTOU-свободно, #148 variant 3).
+    """Установка root-owned helper через fd-pinning + post-install digest (TOCTOU-свободно, #148 variant 3).
 
     Прежний код проверял marker на __file__ и затем звал `sudo install __file__ dst` —
     /usr/bin/install ПОВТОРНО открывал тот же pathname под sudo. Атакующий атомарно
@@ -1359,16 +1359,26 @@ def _install_helper(runner, layout=DEFAULT_LAYOUT):
     install клал attacker-bytes как root-owned helper 0755, который protect сразу
     запускал через sudo → произвольное root-выполнение.
 
-    Фикс: (1) открыть __file__ через O_NOFOLLOW — marker проверяется на bytes ТОГО ЖЕ
-    объекта, что пойдёт в install; (2) вычислить digest этих bytes; (3) записать bytes
-    в root-owned temp (mkstemp в /private/tmp, fchmod/fchown по fd) — это
-    «зафиксированные digest-проверенные bytes»; (4) install копирует temp, НЕ __file__
-    (переоткрытие pathname под sudo безопасно — temp-имя непредсказуемо и root-owned);
-    (5) после install сверить digest установленного helper — расхождение = fail-closed
-    (откат установки + отказ).
+    Фикс: (1) открыть __file__ через O_NOFOLLOW — marker и expected-digest вычисляются
+    на bytes ТОГО ЖЕ fd (TOCTOU-окна между проверкой и использованием нет); (2) записать
+    эти bytes в staged temp (mkstemp, непредсказуемое имя); (3) `sudo install staged dst`
+    копирует staged, НЕ __file__ — pathname __file__ больше не ре-открывается под sudo;
+    (4) post-install digest-check: прочитанный через O_NOFOLLOW установленный helper
+    обязан совпадать с expected-digest. Расхождение → fail-closed (удаление + отказ).
+
+    ВАЖНО (observation Codex): staged создаётся в user-процессе `protect()` (НЕ root),
+    поэтому mkstemp-файл user-owned/writable. В окне [mkstemp .. sudo install] тот же
+    UID может подменить staged. Эта подмена ПОЙМАНА post-install digest-check (шаг 4):
+    install копирует staged байт-в-байт в root-owned dst, digest dst сравнивается с
+    digest честно прочитанного __file__ — расхождение = fail-closed, attacker-bytes
+    никогда не становятся валидным helper'ом. В user-процессе создать root-owned объект
+    без sudo невозможно, поэтому post-install digest — единственная полная защита этого
+    окна; она покрывает его полностью (preimage sha256 практичен только при совпадении
+    с __file__-bytes, т.е. без эскалации). Race-тест
+    test_install_helper_fail_closed_when_staged_substituted_after_mkstemp фиксирует инвариант.
     """
-    # (1) marker-check на bytes зафиксированного fd, не на path (path-based _managed_file
-    # проверял бы объект, который install переоткроет — TOCTOU window).
+    # (1) marker + expected-digest на bytes зафиксированного fd, не на path (path-based
+    # _managed_file проверял бы объект, который install переоткроет — TOCTOU window).
     helper_bytes, expected_digest = _read_helper_bytes_pinned()
     if helper_bytes is None:
         return _result(False, error="helper_source_marker_missing")
@@ -1379,12 +1389,13 @@ def _install_helper(runner, layout=DEFAULT_LAYOUT):
     parent = runner([SUDO, MKDIR, "-p", str(layout.helper_path.parent)], 30)
     if parent.get("rc") != 0:
         return _result(False, error=(parent.get("err") or "helper_parent_failed")[:240])
-    # (2)+(3): зафиксированные digest-проверенные bytes в root-owned temp.
+    # (2): зафиксированные digest-проверенные bytes в staged temp (user-owned в окне,
+    # но post-check ниже ловит любую подмену — см. docstring).
     staged = _stage_helper_bytes(helper_bytes)
     if staged is None:
         return _result(False, error="helper_stage_failed")
     try:
-        # (4) install копирует temp, не __file__ — pathname не ре-открывается под sudo.
+        # (3) install копирует staged, не __file__ — pathname __file__ не ре-открывается под sudo.
         installed = runner(
             [SUDO, INSTALL, "-o", "root", "-g", "wheel", "-m", "0755",
              str(staged), str(layout.helper_path)],
@@ -1392,8 +1403,9 @@ def _install_helper(runner, layout=DEFAULT_LAYOUT):
         )
         if installed.get("rc") != 0:
             return _result(False, error=(installed.get("err") or "helper_install_failed")[:240])
-        # (5) post-install digest-check: установленный helper обязан совпадать с
-        # зафиксированными bytes. Расхождение (вторичная подмена helper_path) → fail-closed.
+        # (4) post-install digest-check: установленный helper обязан совпадать с
+        # expected-digest честно прочитанного __file__. Расхождение (подмена staged в
+        # окне ИЛИ вторичная подмена helper_path) → fail-closed.
         installed_digest = _digest_fd_nofollow(layout.helper_path)
         if installed_digest is None or installed_digest != expected_digest:
             _remove_via_runner(runner, layout.helper_path)
@@ -1465,10 +1477,15 @@ def _digest_fd_nofollow(path):
 
 
 def _stage_helper_bytes(data):
-    """Записать helper bytes в root-owned temp в /private/tmp (fd-pinning: fchmod/fchown по fd).
+    """Записать helper bytes в staged temp в /private/tmp (fd-pinning: fchmod/fchown по fd).
 
-    temp живёт в root-writable /private/tmp (НЕ user-controlled), имя непредсказуемо
-    (mkstemp O_EXCL). Возвращает Path temp или None при ошибке.
+    temp живёт в /private/tmp (sticky), имя непредсказуемо (mkstemp O_EXCL). ВАЖНО
+    (#148): _stage_helper_bytes вызывается в user-процессе `protect()`, НЕ под sudo —
+    поэтому mkstemp создаёт USER-owned файл (fchown no-op'ит под non-root). staged
+    user-owned/writable в окне [mkstemp .. sudo install]. Эта подмена НЕ небезопасна:
+    post-install digest-check в _install_helper ловит любое расхождение staged↔__file__
+    (install копирует staged байт-в-байт, digest dst сравнивается с честным __file__).
+    Возвращает Path temp или None при ошибке.
     """
     fd, tmp_name = tempfile.mkstemp(prefix="srouter-helper-", suffix=".py", dir="/private/tmp")
     temp = Path(tmp_name)
