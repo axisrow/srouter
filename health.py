@@ -1039,6 +1039,49 @@ def _desktop_proxy_check():
     return {"status": "ok", "detail": f"Desktop App proxy (launchctl): {found}"}
 
 
+# ============================ #185: scoped SOCKS5 для codex через VSCode http.proxy ============================
+
+def _vscode_proxy_check():
+    """Scoped SOCKS5 для codex-расширения openai.chatgpt через VSCode `http.proxy` (#185).
+
+    Расширение openai.chatgpt запускает свой codex-binary (мимо wrapper), наследует HTTP_PROXY=privoxy
+    из ~/.claude/settings.json → privoxy рвёт WS (#96/#120). Scoped-фикс: VSCode http.proxy=socks5h://10808
+    → расширение строит HTTP_PROXY/HTTPS_PROXY В ENV codex-процессА (verify из extension.js), CC не трогает.
+    Чек читает user-settings.json (Code+Cursor) и сверяет http.proxy.
+
+    Возвращает {status, detail}:
+      ok      — хотя бы один существующий settings.json содержит http.proxy == socks5h://10808;
+      unknown — ни одного settings.json нет (редактор не установлен) — info-only (как desktop-proxy);
+      down    — http.proxy есть, но НЕ socks5 (privoxy/HTTP рвёт WS #120, или чужой корпоративный) — driver.
+    Чек ВСЕГДА info-only (как endpoint-override): VSCode может быть не установлен, srouter-stack от этого
+    не падает. ok/down — картина scoped-маршрута codex для диагностики, не driver агрегированного вердикта.
+    """
+    try:
+        import vscode_proxy
+    except Exception:
+        return {"status": "unknown", "detail": "vscode_proxy недоступен — check пропущен"}
+    st = vscode_proxy.status()
+    paths = st.get("paths") or {}
+    present = {p: info for p, info in paths.items() if info.get("present")}
+    if not present:
+        return {"status": "unknown",
+                "detail": "VSCode/Cursor user-settings не найдены — редактор не установлен (scoped http.proxy неприменим)"}
+    # Хотя бы один с правильным SOCKS5 → ok (пользователь может пользоваться любым редактором).
+    socks_ok = [p for p, info in present.items()
+                if urlparse(info.get("proxy", "")).scheme.lower() in {"socks", "socks5", "socks5h"}]
+    if socks_ok:
+        names = ", ".join(Path(p).parent.parent.name for p in socks_ok)  # 'Code' / 'Cursor'
+        return {"status": "ok", "detail": f"VSCode http.proxy=SOCKS5 10808 ({names}) — codex расширения гонит через xray (#185)"}
+    # http.proxy задан, но НЕ socks5 → down (privoxy/HTTP рвёт WS, или чужой прокси мимо xray).
+    bad = ", ".join(f"{Path(p).parent.parent.name}={info['proxy']}" for p, info in present.items() if info.get("proxy"))
+    if bad:
+        return {"status": "down",
+                "detail": f"VSCode http.proxy НЕ SOCKS5 ({bad}) — codex рвёт WS через privoxy/чужой (#120)"}
+    # Файлы есть, http.proxy не задан совсем → unknown (scoped не настроен, но не сломан — info-only).
+    return {"status": "unknown",
+            "detail": "VSCode http.proxy не задан — codex расширения наследует privoxy из env (рвёт WS #120), scoped не активирован"}
+
+
 def check_all(*, active_claude=False):
     """Все проверки стека. {status: ok|degraded|down, checks: [{name, ok, detail?, info?}]}.
 
@@ -1091,6 +1134,14 @@ def check_all(*, active_claude=False):
     elif cx["status"] == "warn":
         cx_check["ok"] = False  # privoxy-сессия — degraded, но не «всё мертво»
     checks.append(cx_check)
+    # VSCode scoped SOCKS5 (#185): codex-расширение openai.chatgpt через http.proxy. info-only ВСЕГДА
+    # (как endpoint-override) — VSCode может быть не установлен, srouter-stack от этого не падает.
+    # down (http.proxy=privoxy/чужой — рвёт WS) показываем в detail, но НЕ driver: это scoped-диагностика
+    # одного клиента (codex-расширение), не общий вердикт стека. Runtime-маршрут codex ловит cx_check выше.
+    vp = _vscode_proxy_check()
+    vp_check = {"name": "codex vscode-proxy (http.proxy)",
+                "ok": vp["status"] != "down", "info": True, "detail": vp["detail"]}
+    checks.append(vp_check)
     # Установленные codex/claude-code binary на диске (#145): инвентаризация, info-only ВСЕГДА
     # (несколько версий — ранний сигнал конфликта #135, не сбой стека). unknown (ничего не установлено)
     # тоже info — не роняет вердикт. Doctor показывает картину, не угадывает.

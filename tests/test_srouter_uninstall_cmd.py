@@ -46,6 +46,9 @@ def _stub_cmd_uninstall_internals(monkeypatch, *, env_ok, leftover=None, tty=Tru
     monkeypatch.setattr(srouter, "_remove_active_split_route", lambda *a, **k: 0)
     monkeypatch.setattr(srouter, "claude_proxy",
                         SimpleNamespace(disable=lambda: {"ok": True}))
+    # issue #185: scoped SOCKS5 через VSCode http.proxy — disable симметричен enable в install.
+    monkeypatch.setattr(srouter, "vscode_proxy",
+                        SimpleNamespace(disable=lambda: {"ok": True}))
     monkeypatch.setattr(srouter, "_remove_ppp_hook", lambda *a, **k: "")
     monkeypatch.setattr(srouter, "_remove_codex_wrappers", lambda: "")
     if hasattr(srouter, "_remove_codex_zsh_function"):
