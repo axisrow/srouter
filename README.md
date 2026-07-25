@@ -183,10 +183,12 @@ srouter install
 #   • настраивает прокси для Claude Code и git (github.com);
 #   • изолирует Codex двумя слоями: SOCKS5-wrappers (~/bin/codex-srouter + codex-app-proxy, zsh-функция)
 #     и scoped VSCode http.proxy (#185) — чтобы Codex ходил напрямую в xray, минуя privoxy — это
-#     текущая живая защита; + PF kill-switch в ядре (#168) как будущая fail-closed граница (режет
-#     прямой TCP-выход codex на en0–en6/ppp0–ppp1, разрешая loopback SOCKS5 по TCP); install создаёт
-#     пользователя uid 503 (#186), но правила пока дормантны — активируются после полной активации
-#     (запуск codex под uid 503 через sudo -u + доменная изоляция + TCP на en/ppp, отдельный follow-up);
+#     текущая живая защита (wrappers — всегда; VSCode guard — только если install обновил существующий
+#     settings.json редактора, иначе повторить install после установки редактора); + PF kill-switch в
+#     ядре (#168) как будущая fail-closed граница (режет прямой TCP-выход codex на en0–en6/ppp0–ppp1,
+#     разрешая loopback SOCKS5 по TCP); install создаёт пользователя uid 503 (#186), но правила пока
+#     дормантны — активируются после полной активации (запуск codex под uid 503 через sudo -u + доменная
+#     изоляция + TCP на en/ppp, отдельный follow-up);
 #   • показывает план и спрашивает подтверждение.
 srouter status         # проверить, что демон работает (http://127.0.0.1:8787)
 srouter doctor         # диагностика: порты + туннель + Claude-proxy (✅/❌)
@@ -343,7 +345,7 @@ binary/exec.LookPath), поэтому границей служит именно
 | Инструмент | Подключение |
 |---|---|
 | **Claude Code** | `HTTPS_PROXY=http://127.0.0.1:8118` в `~/.claude/settings.json` (privoxy HTTP; SOCKS5 CC не умеет) |
-| **Codex CLI/App** | **напрямую SOCKS5 в xray** (`socks5h://127.0.0.1:10808`) через wrappers + scoped VSCode `http.proxy` (#185), минуя privoxy — текущая живая защита; + **PF kill-switch в ядре** (#168) как будущая fail-closed граница (режет прямой TCP-выход codex на en0–en6/ppp0–ppp1, разрешая loopback SOCKS5 по TCP; пока дормантен — пользователь uid 503 уже создаётся install (#186), активируется после полной активации: запуск codex под uid 503 (sudo -u) + доменная изоляция + TCP на en/ppp, отдельный follow-up). privoxy портит WS-стриминг Codex (`Reconnecting`/`request timed out`); для клиента Codex↔`chatgpt.com` работает только env (`[network] proxy_url` в `~/.codex/config.toml` управляет execution-scoped sandbox-прокси для субпроцессов, не клиентом) — поэтому wrappers в `~/bin/codex-srouter` (CLI, имя `codex-srouter` убирает коллизию wrapper↔real-binary #169) + `~/bin/codex-app-proxy` (App, `--proxy-server` для Chromium) + scoped VSCode `http.proxy` для расширения openai.chatgpt (CC не затрагивается). Запускать Codex **App** через `~/bin/codex-app-proxy`, а не иконку Dock (Dock не передаёт `--proxy-server`). См. раздел «Изоляция Codex». |
+| **Codex CLI/App** | **напрямую SOCKS5 в xray** (`socks5h://127.0.0.1:10808`) через wrappers + scoped VSCode `http.proxy` (#185), минуя privoxy — текущая живая защита (wrappers — всегда; VSCode guard — только если install обновил существующий settings.json редактора); + **PF kill-switch в ядре** (#168) как будущая fail-closed граница (режет прямой TCP-выход codex на en0–en6/ppp0–ppp1, разрешая loopback SOCKS5 по TCP; пока дормантен — пользователь uid 503 уже создаётся install (#186), активируется после полной активации: запуск codex под uid 503 (sudo -u) + доменная изоляция + TCP на en/ppp, отдельный follow-up). privoxy портит WS-стриминг Codex (`Reconnecting`/`request timed out`); для клиента Codex↔`chatgpt.com` работает только env (`[network] proxy_url` в `~/.codex/config.toml` управляет execution-scoped sandbox-прокси для субпроцессов, не клиентом) — поэтому wrappers в `~/bin/codex-srouter` (CLI, имя `codex-srouter` убирает коллизию wrapper↔real-binary #169) + `~/bin/codex-app-proxy` (App, `--proxy-server` для Chromium) + scoped VSCode `http.proxy` для расширения openai.chatgpt (CC не затрагивается). Запускать Codex **App** через `~/bin/codex-app-proxy`, а не иконку Dock (Dock не передаёт `--proxy-server`). См. раздел «Изоляция Codex». |
 | **git / gh** | домены GitHub в вайтлисте узла → резолв и трафик через ускоритель |
 | **Браузер** | системный SOCKS5 `127.0.0.1:10808` (вайтлист разруливает сам) |
 
@@ -528,11 +530,12 @@ srouter install
 #   • configures proxy for Claude Code and git (github.com);
 #   • isolates Codex in two layers: SOCKS5 wrappers (~/bin/codex-srouter + codex-app-proxy, zsh
 #     function) and scoped VSCode http.proxy (#185) (so Codex goes straight to xray, bypassing
-#     privoxy) — the current live guard; + a PF kill-switch in the kernel (#168) as the future
-#     fail-closed boundary (cuts codex direct TCP egress on en0–en6/ppp0–ppp1, allowing TCP to
-#     loopback SOCKS5); install creates the uid 503 user (#186), but the rules stay dormant — they
-#     activate after full activation (launching codex under uid 503 via sudo -u + domain isolation +
-#     TCP on en/ppp, a separate follow-up);
+#     privoxy) — the current live guard (wrappers always; VSCode guard only if install updated an
+#     existing editor settings.json — otherwise rerun install after installing the editor); + a PF
+#     kill-switch in the kernel (#168) as the future fail-closed boundary (cuts codex direct TCP
+#     egress on en0–en6/ppp0–ppp1, allowing TCP to loopback SOCKS5); install creates the uid 503 user
+#     (#186), but the rules stay dormant — they activate after full activation (launching codex under
+#     uid 503 via sudo -u + domain isolation + TCP on en/ppp, a separate follow-up);
 #   • prints a plan and asks for confirmation.
 srouter status         # check the daemon is up (http://127.0.0.1:8787)
 srouter doctor         # diagnostics: ports + tunnel + Claude-proxy (✅/❌)
@@ -794,7 +797,7 @@ remove it).
 | Tool | Wiring |
 |---|---|
 | **Claude Code** | `HTTPS_PROXY=http://127.0.0.1:8118` in `~/.claude/settings.json` |
-| **Codex** | env for the Codex↔`chatgpt.com` client (`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`, e.g. `socks5h://127.0.0.1:10808` via wrappers + scoped VSCode `http.proxy` #185) — the current live guard; + **a PF kill-switch in the kernel** (#168) as the future fail-closed boundary (cuts codex direct TCP egress on en0–en6/ppp0–ppp1, allowing TCP to loopback SOCKS5; dormant today — the uid 503 user is already created by install (#186), and activation requires full activation: launching codex under uid 503 (sudo -u) + domain isolation + TCP on en/ppp, a separate follow-up). `[network] proxy_url` in `~/.codex/config.toml` does NOT drive that client — it configures the execution-scoped sandbox proxy for spawned `codex` subprocesses. See the "Codex isolation" section. |
+| **Codex** | env for the Codex↔`chatgpt.com` client (`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`, e.g. `socks5h://127.0.0.1:10808` via wrappers + scoped VSCode `http.proxy` #185) — the current live guard (wrappers always; VSCode guard only if install updated an existing editor settings.json); + **a PF kill-switch in the kernel** (#168) as the future fail-closed boundary (cuts codex direct TCP egress on en0–en6/ppp0–ppp1, allowing TCP to loopback SOCKS5; dormant today — the uid 503 user is already created by install (#186), and activation requires full activation: launching codex under uid 503 (sudo -u) + domain isolation + TCP on en/ppp, a separate follow-up). `[network] proxy_url` in `~/.codex/config.toml` does NOT drive that client — it configures the execution-scoped sandbox proxy for spawned `codex` subprocesses. See the "Codex isolation" section. |
 | **git / gh** | GitHub domains whitelisted on the node |
 | **Browser** | system SOCKS5 `127.0.0.1:10808` |
 
