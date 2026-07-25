@@ -25,13 +25,16 @@ JSON read-modify-write (не строками), сохраняя все суще
 import json
 import os
 from pathlib import Path
+from urllib.parse import urlparse
 
 # Прокси codex = SOCKS5 xray 10808. Единый источник правды (issue #155) — dashboard_common.
-# except BaseException (НЕ Exception): dashboard_common raise SystemExit при отсутствии srouter_config.py,
-# SystemExit не ловится Exception → fallback должен сработать и для него (канон srouter.py:245).
+# except SystemExit (НЕ BaseException): dashboard_common при отсутствии srouter_config.py поднимает
+# SystemExit (BaseException) → except Exception его пропустит, fallback не сработает в install-пути.
+# Ловим именно SystemExit, НЕ BaseException — иначе глотаем реальные ImportError/SyntaxError в самом
+# dashboard_common (канон gen_xray_config.py:34 после PR #162; memory systemexit-breaks-except-...).
 try:
     from dashboard_common import SOCKS_PROXY_URL as _PROXY  # socks5h://127.0.0.1:10808
-except BaseException:
+except SystemExit:
     _PROXY = "socks5h://127.0.0.1:10808"
 PROXY = _PROXY  # контракт для тестов/health
 
@@ -120,7 +123,6 @@ def enable():
     Не трогает другие настройки (read-modify-write). Контракт: PROXY обязан быть socks5-схемы
     (#120 — privoxy/HTTP рвёт WS; #127-класс регрессии).
     """
-    from urllib.parse import urlparse
     scheme = urlparse(PROXY).scheme.lower()
     if scheme not in {"socks", "socks5", "socks5h"}:
         return {"ok": False, "err": f"unsupported proxy scheme for codex (need socks5): {scheme or 'missing'}",
