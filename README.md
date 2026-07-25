@@ -268,18 +268,22 @@ Codex (CLI и App) нестабилен через privoxy (8118, HTTP-CONNECT) 
 не умеет). Реализовано **двумя слоями** — настоящая граница и best-effort переход:
 
 **1. PF kill-switch — будущая fail-closed граница (основной механизм, #168).** Правила в ядре PF режут
-**прямой TCP-выход codex** (под системным UID 503) на физических интерфейсах `en0`–`en6`, `ppp0`–`ppp1`
-и разрешают TCP на loopback SOCKS5 `127.0.0.1:10808` (→ xray → VPS); UDP и неучтённые интерфейсы правилом
-не покрываются. Обход wrapper'а (rename в PATH, прямой путь к binary, чужой wrapper, Go `exec.LookPath`
-в AO worktree) на этих интерфейсах нерелевантен — совпавший пакет дропнется в ядре. Это более сильная
-граница, чем wrappers, **но не абсолютная** (см. ниже). ⚠️ **Сейчас это dormant foundation, НЕ активная
-защита.** Install уже создаёт пользователя `_srouter_codex` uid 503 (#186), но для реальной блокировки
-нужно ещё: (а) запуск codex под этим UID (`sudo -u _srouter_codex` в wrapper — отдельный follow-up,
-пока codex бежит под 501 и UID-блок не матчит), (б) включённая доменная PF-изоляция (без её родительской
+**прямой TCP-выход codex, запущенного под системным UID 503**, на физических интерфейсах `en0`–`en6`,
+`ppp0`–`ppp1` и разрешают TCP на loopback SOCKS5 `127.0.0.1:10808` (→ xray → VPS); UDP и неучтённые
+интерфейсы правилом не покрываются. Это более сильная граница, чем wrappers, **но не абсолютная** (см.
+ниже). ⚠️ **Сейчас это dormant foundation, НЕ активная защита.** Install уже создаёт пользователя
+`_srouter_codex` uid 503 (#186), но для реальной блокировки нужно ещё: (а) запуск codex под этим UID
+(`sudo -u _srouter_codex` в wrapper — отдельный follow-up, пока codex бежит под 501 и PF-правило его
+**не видит**: правило матчит только `user 503`), (б) включённая доменная PF-изоляция (без её родительской
 директивы `anchor "codex"` sub-anchor не вычисляется), (в) трафик по TCP через `en0`–`en6`/`ppp0`–`ppp1`
-(`utun`-туннели намеренно исключены — блок убил бы прокси; высшие `en*`/`ppp*` и UDP не покрыты). Значит
-**прямо сейчас** единственная живая защита от прямого выхода — wrappers/env (слой 2). Полные детали — в
-разделе «🔒 PF codex-изоляция» ниже.
+(`utun`-туннели намеренно исключены — блок убил бы прокси; высшие `en*`/`ppp*` и UDP не покрыты).
+
+**Важно про обход wrapper'а:** PF защищает **только процесс под UID 503**. Пока назначение этого UID
+идёт через сам wrapper (`sudo -u`, follow-up), обход wrapper'а (прямой binary, Go `exec.LookPath` в AO
+worktree, чужой wrapper) оставляет codex под 501 — **вне PF**. Так что утверждение «обход wrapper'а
+нерелевантен» станет верным **только** когда codex принудительно запускается под 503 независимо от
+wrapper (например, launchd-служба, а не wrapper-команда). Значит **прямо сейчас** единственная живая
+защита от прямого выхода — wrappers/scoped-env (слой 2). Полные детали — в разделе «🔒 PF codex-изоляция».
 
 **2. SOCKS5-wrappers — defense-in-depth / best-effort переход.** Прокладки, которые выставляют
 codex'у env на SOCKS5, чтобы трафик шёл правильным путём *до того*, как PF его всё равно защитит.
@@ -297,8 +301,11 @@ binary/exec.LookPath), поэтому границей служит именно
 - **VSCode `http.proxy` (scoped)** — `socks5h://127.0.0.1:10808` в настройке VSCode/Cursor
   (`#185`). Расширение `openai.chatgpt` читает её и строит `HTTP_PROXY`/`HTTPS_PROXY` **в env
   порождаемого codex-процесса**, не трогая Claude Code (отдельный процесс со своим
-  `~/.claude/settings.json`). *(Прежде здесь был глобальный LaunchAgent `com.srouter.codenv` — он
-  **деактивирован**: gui-SOCKS5 ломал Claude Code, #130. `uninstall` ещё чистит его legacy-след.)*
+  `~/.claude/settings.json`). ⚠️ Install правит **только существующий** `settings.json` редактора и
+  **не создаёт** его сам — если VSCode/Cursor отсутствуют на момент install, guard не активен
+  (`srouter doctor` покажет); повторите `srouter install` после установки редактора.
+  *(Прежде здесь был глобальный LaunchAgent `com.srouter.codenv` — он **деактивирован**: gui-SOCKS5
+  ломал Claude Code, #130. `uninstall` ещё чистит его legacy-след.)*
 - **`~/bin` в `~/.zshrc`** — чтобы wrapper был раньше системного codex в PATH.
 
 Всё ставит/убирает `srouter install`/`uninstall` (marker-gate: чужой wrapper/плагин не трогает).
@@ -314,19 +321,21 @@ binary/exec.LookPath), поэтому границей служит именно
 > Почему не отдельный WS-proxy env? `WS_PROXY`/`WSS_PROXY` тоже игнорируются (проверено в 0.142.5).
 > Профиль `openai-http` с `supports_websockets=false` даёт 401 с ChatGPT-подпиской. Поэтому — SOCKS5
 > напрямую, единый рабочий путь. **Гарантию блокировки прямого TCP-выхода codex на en0–en6/ppp0–ppp1
-> даст PF kill-switch после полной активации (запуск codex под uid 503 через `sudo -u` + доменная
-> изоляция + TCP на en/ppp; пользователь uid 503 уже создаётся install, #186), а не wrappers или env**
-> (env/wrapper можно обойти PATH; PF — нет). Пока эта активация не завершена (follow-up — `sudo -u`),
+> даст PF kill-switch — но только когда codex запущен под uid 503 независимо от wrapper'а (не командой
+> wrapper'а `sudo -u`, а, например, launchd-службой), плюс доменная изоляция и TCP на en/ppp; пользователь
+> uid 503 уже создаётся install, #186.** env/wrapper обходятся PATH; PF сильнее — но лишь для процесса
+> под 503. Пока эта активация не завершена (follow-up — независимый запуск под 503),
 > единственная живая защита от прямого выхода — wrappers/env (слой 2).
 
 > **Обход wrappers и статус изоляции.** Ранее wrapper был единственным слоем, и его обходы были
 > дырами: в AO worktree claude-code (Go) резолвит codex через Go `exec.LookPath`, который
 > игнорирует zsh-функции и берёт `/opt/homebrew/bin/codex` (real binary), а wrapper не зовётся.
-> После полной активации PF (запуск codex под uid 503 + доменная изоляция) такой обход на TCP/en·ppp лишь
-> означает «трафик пошёл мимо wrappers» — но PF всё равно дропнет TCP на en0–en6/ppp0–ppp1
-> (UDP/utun/высшие en·ppp вне покрытия).
-> **Пока PF дормантен** он не активен, поэтому обход wrapper'а в AO worktree сегодня = дыра, и фикс —
-> на стороне AO (`ALL_PROXY=socks5h://127.0.0.1:10808` в env воркера). Для AO-воркеров всё же лучше
+> PF закроет такой обход **только если** codex запущен под uid 503 **независимо от wrapper'а**
+> (например, launchd-службой, а не командой wrapper'а): тогда обход wrapper'а не меняет UID и PF
+> дропнет TCP на en0–en6/ppp0–ppp1. Но пока назначение uid 503 — через тот же wrapper (`sudo -u`,
+> follow-up), обход wrapper'а оставляет codex под 501 = вне PF. То есть обход wrapper'а = дыра и
+> **до**, и **после** текущего follow-up, пока запуск под 503 не стал независимым от wrapper.
+> Фикс на стороне AO — `ALL_PROXY=socks5h://127.0.0.1:10808` в env воркера. Для AO-воркеров всё же лучше
 > держать `ALL_PROXY`, чтобы трафик шёл по нужному каналу сразу.
 
 ## Интеграции
@@ -405,10 +414,11 @@ sudo pfctl -d                                     # выключить PF цел
 codex — отдельная fail-closed граница в том же PF-ядре, но в **sub-anchor**
 `com.apple/srouter_isolate/codex` (живёт под доменной изоляцией выше — вычисляется только при её
 активной родительской директиве, см. ограничения ниже). После активации правила режут **прямой
-TCP-выход codex** (под системным UID 503) на физических интерфейсах `en0`–`en6`, `ppp0`–`ppp1` и
-разрешают TCP на loopback SOCKS5 `127.0.0.1:10808` (→ xray → VPS); UDP и неучтённые интерфейсы правилом
-не покрываются. Обход wrapper'а (rename PATH, прямой путь к binary, foreign-wrapper) нерелевантен —
-совпавший пакет дропнется на этих интерфейсах.
+TCP-выход codex, запущенного под системным UID 503**, на физических интерфейсах `en0`–`en6`,
+`ppp0`–`ppp1` и разрешают TCP на loopback SOCKS5 `127.0.0.1:10808` (→ xray → VPS); UDP и неучтённые
+интерфейсы правилом не покрываются. PF матчит **только** трафик `user 503` — обход wrapper'а (rename
+PATH, прямой binary, чужой wrapper), оставляющий codex под 501, **не покрывается**, пока запуск под 503
+не станет независимым от wrapper (см. known-limitations).
 
 **Статус:** install **автоматически создаёт** системного пользователя `_srouter_codex` (uid 503,
 не-логин: `UserShell=/usr/bin/false`, `NFSHomeDirectory=/var/empty`, dedicated gid 503) и грузит
@@ -603,19 +613,24 @@ privoxy — it can't do SOCKS5). This is implemented in **two layers** — a rea
 best-effort transition:
 
 **1. PF kill-switch — the future fail-closed boundary (primary mechanism, #168).** Kernel PF rules cut
-codex **direct TCP egress** (running under system UID 503) on the physical interfaces `en0`–`en6`,
+**direct TCP egress of codex running under system UID 503** on the physical interfaces `en0`–`en6`,
 `ppp0`–`ppp1` and allow TCP to loopback SOCKS5 `127.0.0.1:10808` (→ xray → VPS); UDP and unlisted
-interfaces are not covered. A wrapper bypass (PATH rename, direct binary path, foreign wrapper, Go
-`exec.LookPath` in an AO worktree) on those interfaces is irrelevant — a matching packet is dropped in
-the kernel. This is a stronger boundary than wrappers, **but not absolute** (see below). ⚠️ **Right now
-this is a dormant foundation, NOT an active guard.** Install already creates the user `_srouter_codex`
-uid 503 (#186), but real blocking still needs: (a) launching codex under that UID (`sudo -u
-_srouter_codex` in the wrapper — a separate follow-up; codex still runs under 501 so the UID block does
-not match), (b) domain PF isolation enabled (without its parent directive `anchor "codex"` the
-sub-anchor is never evaluated), (c) traffic over TCP on `en0`–`en6`/`ppp0`–`ppp1` (`utun` tunnels are
-intentionally excluded — a block would kill the proxy; higher `en*`/`ppp*` and UDP are not covered). So
-**today** the single live guard against direct egress is the wrappers/env (layer 2). Full details in the
-"🔒 PF codex isolation" section below.
+interfaces are not covered. This is a stronger boundary than wrappers, **but not absolute** (see below).
+⚠️ **Right now this is a dormant foundation, NOT an active guard.** Install already creates the user
+`_srouter_codex` uid 503 (#186), but real blocking still needs: (a) launching codex under that UID
+(`sudo -u _srouter_codex` in the wrapper — a separate follow-up; codex still runs under 501 so the PF
+rule does **not** see it — the rule matches only `user 503`), (b) domain PF isolation enabled (without
+its parent directive `anchor "codex"` the sub-anchor is never evaluated), (c) traffic over TCP on
+`en0`–`en6`/`ppp0`–`ppp1` (`utun` tunnels are intentionally excluded — a block would kill the proxy;
+higher `en*`/`ppp*` and UDP are not covered).
+
+**Important about wrapper bypass:** PF protects **only a process running under UID 503**. While that
+UID is assigned by the wrapper itself (`sudo -u`, follow-up), a wrapper bypass (direct binary, Go
+`exec.LookPath` in an AO worktree, foreign wrapper) leaves codex under 501 — **outside PF**. So the
+claim "a wrapper bypass is irrelevant" becomes true **only** once codex is launched under 503
+independently of the wrapper (e.g. a launchd service, not a wrapper command). So **today** the single
+live guard against direct egress is the wrappers/scoped env (layer 2). Full details in the "🔒 PF codex
+isolation" section below.
 
 **2. SOCKS5 wrappers — defense-in-depth / best-effort transition.** Shims that set Codex's env to
 SOCKS5 so traffic takes the correct path *before* PF guards it anyway. Wrappers **are not the
@@ -633,8 +648,11 @@ optimization (they route traffic through the right channel without relying on th
 - **VSCode `http.proxy` (scoped)** — `socks5h://127.0.0.1:10808` in the VSCode/Cursor setting
   (`#185`). The `openai.chatgpt` extension reads it and builds `HTTP_PROXY`/`HTTPS_PROXY` **in the env
   of the spawned codex process**, leaving Claude Code untouched (a separate process with its own
-  `~/.claude/settings.json`). *(A global LaunchAgent `com.srouter.codenv` used to live here — it is
-  **disabled**: the gui-SOCKS5 broke Claude Code, #130. `uninstall` still cleans its legacy trace.)*
+  `~/.claude/settings.json`). ⚠️ Install only edits an **existing** editor `settings.json` and **does
+  not create** one itself — if VSCode/Cursor is absent at install time, the guard is not active
+  (`srouter doctor` will show this); re-run `srouter install` after installing the editor.
+  *(A global LaunchAgent `com.srouter.codenv` used to live here — it is **disabled**: the gui-SOCKS5
+  broke Claude Code, #130. `uninstall` still cleans its legacy trace.)*
 - **`~/bin` in `~/.zshrc`** — so the wrapper precedes the system codex in PATH.
 
 All installed/removed by `srouter install`/`uninstall` (marker-gate: a foreign wrapper/plugin is left
@@ -650,18 +668,23 @@ lease, does not call `pfctl`, and does not verify codex actually runs under uid 
 > Why not a separate WS-proxy env? `WS_PROXY`/`WSS_PROXY` are also ignored (verified in 0.142.5).
 > The `openai-http` profile with `supports_websockets=false` 401s on a ChatGPT subscription. So —
 > SOCKS5 directly, the one working path. **The guarantee of blocking codex direct TCP egress on
-> en0–en6/ppp0–ppp1 will come from the PF kill-switch after full activation (launching codex under
-> uid 503 via `sudo -u` + domain isolation + TCP on en/ppp; the uid 503 user is already created by
-> install, #186), not from wrappers or env** (env/wrappers are bypassable via PATH; PF is not). Until
-> that activation lands (follow-up — `sudo -u`), the only live guard against direct egress is the
+> en0–en6/ppp0–ppp1 will come from the PF kill-switch — but only once codex is launched under uid 503
+> independently of the wrapper (not via the wrapper's own `sudo -u` — e.g. a launchd service), plus
+> domain isolation and TCP on en/ppp; the uid 503 user is already created by install, #186.** env/wrappers
+> are bypassable via PATH; PF is stronger — but only for a process under 503. Until that activation lands
+> (follow-up — independent launch under 503), the only live guard against direct egress is the
 > wrappers/env (layer 2).
 
 > **Wrapper bypass and the isolation status.** Previously the wrapper was the only layer, so its
 > bypasses were holes: in an AO worktree, claude-code (Go) resolves `codex` via Go `exec.LookPath`,
 > which ignores zsh functions and picks `/opt/homebrew/bin/codex` (the real binary), so the wrapper is
-> never called. After full PF activation (launching codex under uid 503 + domain isolation) such a bypass on TCP/en·ppp
-> only means "traffic skipped the wrappers" — but PF still drops its TCP on en0–en6/ppp0–ppp1 (UDP/utun/higher en·ppp out of scope).
-> **While PF is dormant** it is not active, so a wrapper bypass in an AO worktree today is a hole, and
+> never called. PF closes such a bypass **only if** codex is running under uid 503 **independently of
+> the wrapper** (e.g. a launchd service, not a wrapper command): then bypassing the wrapper doesn't
+> change the UID and PF drops the TCP on en0–en6/ppp0–ppp1. But while the uid 503 assignment goes
+> through the same wrapper (`sudo -u`, follow-up), a wrapper bypass leaves codex under 501 = outside PF.
+> So a wrapper bypass is a hole **both before and after** the current follow-up, until launching under
+> 503 becomes wrapper-independent. The fix is on the AO side — `ALL_PROXY=socks5h://127.0.0.1:10808` in
+> the worker env. AO workers should still
 > the fix is on the AO side (`ALL_PROXY=socks5h://127.0.0.1:10808` in the worker env). AO workers
 > should still keep `ALL_PROXY` so traffic takes the right channel immediately.
 
@@ -732,10 +755,11 @@ every 6 h (a stale IP in the table is harmless — we block, not permit).
 codex is a separate fail-closed boundary in the same PF kernel, but in a **sub-anchor**
 `com.apple/srouter_isolate/codex` (it lives under the domain isolation above — it is only evaluated
 when the latter's parent directive is active, see the limitations below). Once active, the rules cut
-codex **direct TCP egress** (running under system UID 503) on the physical interfaces `en0`–`en6`,
+**direct TCP egress of codex running under system UID 503** on the physical interfaces `en0`–`en6`,
 `ppp0`–`ppp1` and allow TCP to loopback SOCKS5 `127.0.0.1:10808` (→ xray → VPS); UDP and unlisted
-interfaces are not covered. A wrapper bypass (PATH rename, direct binary path, foreign wrapper) is
-irrelevant — a matching packet is dropped on those interfaces.
+interfaces are not covered. PF matches **only** `user 503` traffic — a wrapper bypass (PATH rename,
+direct binary, foreign wrapper) that leaves codex under 501 is **not covered**, until launching under
+503 becomes independent of the wrapper (see known-limitations).
 
 **Status:** install **automatically creates** the system user `_srouter_codex` (uid 503, non-login:
 `UserShell=/usr/bin/false`, `NFSHomeDirectory=/var/empty`, dedicated gid 503) and loads the ruleset
