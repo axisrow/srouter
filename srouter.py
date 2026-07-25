@@ -55,6 +55,7 @@ from install_lib import (
 from sys_probe import run
 
 import claude_proxy  # вкл/откл HTTPS_PROXY для Claude Code (~/.claude/settings.json)
+import vscode_proxy  # issue #185: scoped SOCKS5 для codex-расширения через VSCode http.proxy
 import health  # doctor-проверки стека
 import privoxy_audit  # пассивный root-owned аудит lifecycle-команд Privoxy (#122)
 import privoxy_system  # root-gated system LaunchDaemon для Privoxy (#122)
@@ -929,7 +930,22 @@ def cmd_install(args) -> int:
         # минуя privoxy (портит WS-стриминг). Функция (#96) гарантирует победу над brew в PATH.
         codex_note = _install_codex_wrappers(env)
         codex_func_note = _install_codex_zsh_function(env)
-        env_note = _install_launchctl_env(env, runner)
+        # issue #185: scoped SOCKS5 для codex-расширения openai.chatgpt через VSCode http.proxy.
+        # РАНЬШЕ тут звался _install_launchctl_env (грузил com.srouter.codenv = глобальный SOCKS5 в
+        # gui-домене launchd) — но это ломает Claude Code (#130: CC не поддерживает SOCKS5), поэтому
+        # LaunchAgent НЕ загружался (мёртвый механизм). Scoped-путь (verify из extension.js расширения):
+        # VSCode-настройка http.proxy → расширение строит HTTP_PROXY/HTTPS_PROXY В ENV ПОРОЖДАЕМОГО
+        # codex-процессА ({...process.env,...n}), CC (отдельный процесс, свой ~/.claude/settings.json)
+        # НЕ затрагивается. gui-SOCKS5 LaunchAgent ДЕАКТИВИРОВАН в install; _remove_launchctl_env остался
+        # в uninstall для чистки残留ного codenv от старых установок (симметрия). Функцию _install_launchctl_env
+        # НЕ удаляем — переиспользуется если scoped-путь окажется недостаточен (сравнение с PF, вариант 2 #186).
+        vp = vscode_proxy.enable()
+        if vp.get("ok"):
+            env_note = ("Codex env: scoped SOCKS5 прописан в VSCode http.proxy (Code/Cursor) — "
+                        "расширение openai.chatgpt гонит codex через SOCKS5, CC не затрагивается (#185)."
+                        + (f" Пути: {', '.join(vp.get('paths') or [])}" if vp.get("paths") else ""))
+        else:
+            env_note = f"Codex env: scoped VSCode http.proxy не установлен ({vp.get('err', 'unknown')})."
         path_note = _ensure_home_bin_in_path(env)
         codex_iso_note = _install_codex_isolation(env, runner)
         # Marker-migration table (issue #112 Часть 4): регистрируем текущие маркеры wrappers/zshrc/codenv
@@ -1042,6 +1058,10 @@ def cmd_uninstall(args) -> int:
     # 5) Снять HTTPS_PROXY для Claude Code — privoxy больше не запущен, прокси бессмысленен.
     cp = claude_proxy.disable()
     cp_note = ". Claude Code HTTPS_PROXY снят." if cp.get("ok") else ""
+    # 5b) issue #185: снять scoped SOCKS5 из VSCode http.proxy (симметрично install). Чужой http.proxy
+    # не трогаем (fail-closed provenance — vscode_proxy.disable сверяет значение).
+    vp = vscode_proxy.disable()
+    cp_note += ". VSCode codex http.proxy снят." if vp.get("ok") else ". VSCode codex http.proxy не снят."
 
     # 6) Удалить ppp-hook (/etc/ppp/ip-up) — мгновенный split-route больше не нужен.
     ppp_note = ". " + _remove_ppp_hook(runner)

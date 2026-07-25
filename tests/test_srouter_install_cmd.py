@@ -52,6 +52,9 @@ def _stub_cmd_install_internals(monkeypatch, *, apply_ok=True, tty=True):
         monkeypatch.setattr(srouter, "_install_codex_zsh_function", lambda env: "")
     monkeypatch.setattr(srouter, "_install_launchctl_env", lambda env, runner: "")
     monkeypatch.setattr(srouter, "_ensure_home_bin_in_path", lambda env: "")
+    # issue #185: scoped SOCKS5 через VSCode http.proxy (вместо gui-SOCKS5, который ломал CC #130).
+    monkeypatch.setattr(srouter, "vscode_proxy",
+                        SimpleNamespace(enable=lambda: {"ok": True, "paths": []}))
     # issue #168: PF codex-изоляция (sub-anchor). Лезет в реальный pfctl/osascript — мокаем.
     if hasattr(srouter, "_install_codex_isolation"):
         monkeypatch.setattr(srouter, "_install_codex_isolation", lambda env, runner: "")
@@ -133,3 +136,28 @@ def test_cmd_install_foreign_conflict_still_blocks_non_tty(monkeypatch, capsys):
                      f"получил rc={rc}")
     err = capsys.readouterr().err.lower()
     assert "конфликт" in err, "stderr объясняет: конфликт требует ручного разрешения"
+
+
+# ============================ issue #185: scoped SOCKS5 через VSCode http.proxy (не gui-SOCKS5) ========
+# Глобальный SOCKS5 в gui-домене (com.srouter.codenv, _install_launchctl_env) ломает Claude Code
+# (#130 — CC не поддерживает SOCKS5). Scoped-решение: VSCode http.proxy=socks5h://10808 — расширение
+# openai.chatgpt читает его и строит HTTP_PROXY/HTTPS_PROXY в env ПОРОЖДАЕМОГО codex-процессА (verify
+# из extension.js), CC не затрагивается. Каноничный фикс: cmd_install вызывает vscode_proxy.enable(),
+# а НЕ _install_launchctl_env (gui-SOCKS5 деактивирован).
+def test_cmd_install_activates_vscode_proxy_not_gui_socks5(monkeypatch):
+    """issue #185: install → vscode_proxy.enable() вызван, _install_launchctl_env НЕ вызван."""
+    _stub_cmd_install_internals(monkeypatch, apply_ok=True, tty=False)
+    calls = {"vscode_enable": 0, "launchctl_env": 0}
+    monkeypatch.setattr(srouter, "vscode_proxy",
+                        SimpleNamespace(enable=lambda: (calls.__setitem__("vscode_enable", 1), {"ok": True})[1]))
+    monkeypatch.setattr(srouter, "_install_launchctl_env",
+                        lambda env, runner: (calls.__setitem__("launchctl_env", 1), "")[1])
+
+    rc = srouter.cmd_install(_args(yes=True))
+
+    assert rc == 0
+    assert calls["vscode_enable"] == 1, "install обязан активировать scoped VSCode http.proxy (#185)"
+    assert calls["launchctl_env"] == 0, (
+        "install НЕ должен грузить gui-SOCKS5 LaunchAgent — он ломает Claude Code (#130). "
+        "Scoped-путь через VSCode http.proxy заменяет глобальный."
+    )
