@@ -1169,10 +1169,13 @@ def _read_gui_proxy_env():
         return {"keys": {}, "verifiable": False}  # fail-closed
     keys = {}
     in_env = False
+    found_block = False  # блок environment найден? Иначе out без блока (несуществующий домен/иной
+                        # формат) → НЕ верим, не выдумываем false-down «codenv снят» (fail-closed).
     for line in (lc.get("out") or "").splitlines():
         stripped = line.strip()
         if stripped == "environment = {":
             in_env = True
+            found_block = True
             continue
         if in_env:
             # конец блока — строка из одного '}' (отступ launchctl print).
@@ -1184,6 +1187,11 @@ def _read_gui_proxy_env():
                 k = k.strip()
                 if k in LAUNCHCTL_PROXY_KEYS and v.strip():
                     keys[k] = v.strip()
+    if not found_block:
+        # out без блока environment (несуществующий домен: launchctl print gui/<bad> отдаёт rc=0 +
+        # 'Bad request. Could not find domain'). Не различимо «домен недоступен» от «codenv снят»
+        # → unknown (fail-closed), НЕ false-down.
+        return {"keys": {}, "verifiable": False}
     return {"keys": keys, "verifiable": True}
 
 

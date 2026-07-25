@@ -113,6 +113,21 @@ def test_app_proxy_unknown_when_gui_env_unverifiable(monkeypatch):
     assert res["status"] == "unknown", f"gui-env не верифицируем → unknown (fail-closed); got {res}"
 
 
+def test_app_proxy_unknown_when_no_environment_block(monkeypatch):
+    """App активен + launchctl print НЕ содержит блока environment → unknown (fail-closed, не false-down).
+
+    Edge-case (cycle-review): `launchctl print gui/999999` (несуществующий домен) отдаёт rc=0 с
+    'out=Bad request. Could not find domain...', НЕ stderr. Парсер без блока environment = НЕ ВЕРИМ
+    (не различимо «домен недоступен/формат иной» от «codenv снят») → verifiable=False → unknown.
+    Иначе: пустой out (нет блока) → keys={} → false-down «codenv не загружен» на ровном месте.
+    Отличие от down-теста: там блок environment ЕСТЬ, но ключей proxy нет (реальное codenv-снятие).
+    """
+    ps = f"60826 {APP_CODEX_COMM}\n"
+    monkeypatch.setattr(health.sys_probe, "run", _fake(ps, gui_env_text="Bad request.\nCould not find domain for user\n"))
+    res = health._codex_app_proxy_check()
+    assert res["status"] == "unknown", f"нет блока environment → unknown (fail-closed); got {res}"
+
+
 def test_app_proxy_detects_chatgpt_app_path(monkeypatch):
     """App-PID по /ChatGPT.app/.../codex детектится (регрессия: раньше смешивался с CLI в TUI-чеке)."""
     # CLI-codex PID НЕ должен считаться App (он в TUI-чеке, не здесь)
