@@ -1483,7 +1483,7 @@ def main(argv=None):
                 print(f"uninstall apply выполнен частично: конфиги оставлены ({names}) — не найден backup/маркер.",
                       file=sys.stderr)
                 return 2
-            print("uninstall apply завершён: изменены только подтверждённые srouter-managed категории.")
+            print("uninstall apply завершён успешно: изменены подтверждённые srouter-managed категории.")
             return 0
         print("uninstall apply остановлен: " + ", ".join(result.get("blocked") or ["unknown"]), file=sys.stderr)
         return 2
@@ -1495,7 +1495,7 @@ def main(argv=None):
         install_launchagent = False
     result = apply_install(env=env, confirm=args.yes, choices=choices, install_launchagent=install_launchagent)
     if result["ok"]:
-        print("apply завершён: изменения записаны только после явного подтверждения.")
+        print("apply завершён успешно: изменения сохранены (подтверждено через --yes).")
         return 0
     print("apply остановлен: " + ", ".join(result.get("blocked") or ["unknown"]), file=sys.stderr)
     if "plan" in result:
