@@ -763,6 +763,50 @@ def _installed_versions_check():
     return {"status": "ok", "detail": detail, "codex": codex_bins, "claude_code": claude_bins}
 
 
+# ============================ #186: PF codex kill-switch (provisioning uid 503) ============================
+def _codex_isolation_check():
+    """Статус PF codex kill-switch — настоящая fail-closed граница (epic #166, #186).
+
+    info-only для ВСЕХ «незамкнутых» состояний (НЕ driver — иначе doctor всегда degraded на
+    нормальных установках, где codex идёт под user-UID 501, паттерн шума PR #135). ok — только
+    при реальном процессе под UID 503. Возвращает {status, detail}, status: info|ok. НЕ бросает.
+
+    Состояния:
+      - нет lease (probe_codex_isolation.status != 'ok') → info «не установлен (по выбору)».
+      - lease ok, НО probe_codex_user не provisioned → info «инфра загружена, UID не создан».
+      - lease ok + user provisioned, НО нет процесса под UID 503 → info «PF standby, sudo -u = follow-up»
+        (wrapper в проде НЕ запускает codex под uid 503 — осознанный scope #186).
+      - lease ok + user provisioned + процесс под UID 503 → ok «real fail-closed активна».
+
+    ps -u <uid> для без-процесса UID → rc=1 + пустой out (verify-dont-guess); has_proc требует
+    rc=0 И непустой out (консервативно: сбой ps → info, не ложный ok).
+    """
+    try:
+        import isolate_firewall
+        lease = isolate_firewall.probe_codex_isolation()
+        if lease.get("status") != "ok":
+            return {"status": "info",
+                    "detail": "PF codex kill-switch не установлен (lease отсутствует) — по выбору."}
+        user = isolate_firewall.probe_codex_user()
+        if not user.get("provisioned"):
+            return {"status": "info",
+                    "detail": "PF codex-изоляция: sub-anchor загружен, НО _srouter_codex (uid 503) "
+                              "не создан → правила не матчат. Переустановите (install) для provisioning."}
+        # ps -u <uid>: rc=0 + непустой вывод → процесс под этим UID есть.
+        r = sys_probe.run([PS, "-u", isolate_firewall.CODEX_USER, "-o", "pid=,comm="], timeout=3)
+        has_proc = (not r.get("timeout")) and r.get("rc") == 0 and bool((r.get("out") or "").strip())
+        if has_proc:
+            return {"status": "ok",
+                    "detail": f"PF codex kill-switch активен: lease ok + uid "
+                              f"{isolate_firewall.CODEX_USER} provisioned + процесс под этим UID "
+                              f"работает (real fail-closed)."}
+        return {"status": "info",
+                "detail": f"PF codex kill-switch готов, но codex не запущен под uid "
+                          f"{isolate_firewall.CODEX_USER} (sudo -u) — продакшн-запуск = follow-up."}
+    except Exception as exc:
+        return {"status": "info", "detail": f"codex-isolation check: сбой ({str(exc)[:80]})."}
+
+
 # ============================ #129: endpoint-override detection ============================
 
 _DEFAULT_ANTHROPIC_HOST = "api.anthropic.com"
@@ -1170,6 +1214,17 @@ def check_all(*, active_claude=False):
         plo_check = {"name": "privoxy-log (observability)",
                      "ok": plo["status"] != "warn", "info": True, "detail": plo["detail"]}
         checks.append(plo_check)
+        # PF codex kill-switch (#186): info-only ВСЕГДА (не driver) — незамкнутая граница на
+        # нормальных установках (codex под user-UID 501, sudo -u = follow-up) — НЕ роняет вердикт
+        # (избегаем шума как PR #135). ok только при реальном процессе под UID 503.
+        # gate под active_claude (doctor-only): dscl + ps = overhead/поверхность, не для лёгкого
+        # /health/watchdog (как _installed_versions_check / _runtime_model_override_check).
+        ci = _codex_isolation_check()
+        ci_check = {"name": "codex-isolation (PF kill-switch)",
+                    "ok": ci["status"] == "ok", "detail": ci["detail"]}
+        if ci["status"] == "info":
+            ci_check["info"] = True
+        checks.append(ci_check)
     drivers = [c for c in checks if not c.get("info")]
     all_ok = all(c["ok"] for c in drivers)
     any_ok = any(c["ok"] for c in drivers)

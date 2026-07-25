@@ -373,10 +373,19 @@ codex — отдельная fail-closed граница в том же PF-ядр
 `127.0.0.1:10808` (→ xray → VPS). Любой обход wrapper'а (rename PATH, прямой путь к binary,
 foreign-wrapper) нерелевантен — пакет всё равно дропнется на физическом интерфейсе.
 
-**Статус:** правила валидны и загружаются install-тайм. **Активация требует provisioning** — создания
-системного пользователя `_srouter_codex` (uid 503) и запуска codex под ним (`sudo -u`). До этого
-(отдельный follow-up) ни один процесс не идёт под uid 503, поэтому правила синтаксически активны,
-но не матчат трафик. Снять вручную — `sudo pfctl -a "com.apple/srouter_isolate/codex" -F all`.
+**Статус:** install **автоматически создаёт** системного пользователя `_srouter_codex` (uid 503,
+не-логин: `UserShell=/usr/bin/false`, `NFSHomeDirectory=/var/empty`, dedicated gid 503) — после
+этого PF-правила (матч по `user 503`) начинают работать. Doctor показывает состояние через чек
+`codex-isolation (PF kill-switch)`.
+
+**Known-limitation (follow-up):** codex пока запускается под пользовательским UID (501), а не под
+503 — PF-правила активны в standby (матчат только трафик UID 503, которого пока ни один процесс
+не генерирует). Интеграция `sudo -u _srouter_codex` в wrapper — отдельный follow-up. **Codex.app
+(GUI/Cocoa)** не покрывается (изоляция под не-логин UID проблематична для Cocoa-app, дизайн #167 §7 R1) —
+только codex CLI.
+
+Снять вручную: `sudo pfctl -a "com.apple/srouter_isolate/codex" -F all` (правила PF) и/или
+`sudo dscl . -delete /Users/_srouter_codex` (системный пользователь, если uninstall не удалил).
 
 
 ---
@@ -638,10 +647,19 @@ codex is a separate fail-closed boundary in the same PF kernel, but in a **sub-a
 SOCKS5 `127.0.0.1:10808` (→ xray → VPS). Any wrapper bypass (PATH rename, direct binary path,
 foreign wrapper) is irrelevant — the packet is dropped at the physical interface regardless.
 
-**Status:** the rules are valid and loaded at install time. **Activation requires provisioning** —
-creating the system user `_srouter_codex` (uid 503) and launching codex under it (`sudo -u`). Until
-that follow-up lands, no process runs under uid 503, so the rules are syntactically active but match
-no traffic. Remove manually with `sudo pfctl -a "com.apple/srouter_isolate/codex" -F all`.
+**Status:** install **automatically creates** the system user `_srouter_codex` (uid 503, non-login:
+`UserShell=/usr/bin/false`, `NFSHomeDirectory=/var/empty`, dedicated gid 503) — after that the PF
+rules (matching by `user 503`) become effective. Doctor surfaces the state via the
+`codex-isolation (PF kill-switch)` check.
+
+**Known-limitation (follow-up):** codex still runs under your user UID (501), not 503 — the PF rules
+are active in standby (they match only uid 503 traffic, which no process currently generates). Wiring
+`sudo -u _srouter_codex` into the wrapper is a separate follow-up. **Codex.app (GUI/Cocoa)** is not
+covered (isolation under a non-login UID is problematic for a Cocoa app, design #167 §7 R1) —
+codex CLI only.
+
+Remove manually: `sudo pfctl -a "com.apple/srouter_isolate/codex" -F all` (PF rules) and/or
+`sudo dscl . -delete /Users/_srouter_codex` (system user, if uninstall did not remove it).
 
 
 ## Integrations

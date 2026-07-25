@@ -38,6 +38,7 @@ ipaddress round-trip). Домены в shell НЕ попадают — dig вы�
 Функции не бросают: при сбое возвращают структированный dict.
 """
 import ipaddress
+import re
 
 import local_state
 import sys_probe
@@ -90,9 +91,19 @@ DEFAULT_PORTS = (80, 443)
 # автоматически после provisioning (создание _srouter_codex uid 503 — follow-up, как #124 из #112).
 # Known-limitation: без процесса под uid 503 правила валидны, но не матчат трафик.
 CODEX_USER = "503"                                # числовой UID (pfctl парсит без существования user)
-CODEX_USER_NAME = "_srouter_codex"                # имя для provisioning (follow-up), НЕ в PF-правиле
+CODEX_USER_NAME = "_srouter_codex"                # имя для provisioning (issue #186), НЕ в PF-правиле
 CODEX_SOCKS_TABLE = "srouter_codex_loopback"      # { 127.0.0.1, ::1 } — loopback whitelist
 SOCKS5_PORT = str(XRAY_SOCKS_PORT)                # "10808" — единый источник (issue #155)
+# Provisioning _srouter_codex (uid 503) — issue #186. Активация PF kill-switch: правила (user 503)
+# матчат трафик ТОЛЬКО когда системный пользователь с этим UID существует. Создаётся install-тайм
+# через dscl + osascript admin-мост (канон _admin_run). dedicated gid == uid (канон демонов Apple:
+# _assetcache uid=235 gid=235) — изолированный принцип, не даёт членства в broad-группах.
+# Не-логин: UserShell=/usr/bin/false, NFSHomeDirectory=/var/empty (эталон nobody).
+CODEX_USER_GID = "503"                            # PrimaryGroupID — dedicated gid == uid
+CODEX_USER_REALNAME = "srouter codex"             # RealName (Системные настройки)
+CODEX_USER_SHELL = "/usr/bin/false"               # не-login (эталон nobody)
+CODEX_USER_HOME = "/var/empty"                    # без HOME (эталон nobody)
+DSCL = "/usr/bin/dscl"                            # абсолютный путь (shell-safe, канон _admin_run)
 # Sub-anchor: codex-ruleset грузится ВНЕ родительского anchor, чтобы доменная
 # enable_isolation/disable_isolation (через -f - / -F all) НЕ перетирали его (zero cross-cutting).
 # man pf.conf: anchors вкладываются через '/'. Родительский ruleset обязан содержать
@@ -108,6 +119,54 @@ _parse_token = traffic_shape._parse_token
 _isolate_result = traffic_shape._shape_result   # та же форма (ok/cancelled/rc/out/err/timeout)
 _reject = traffic_shape._reject
 # _applescript_text импортирован сверху из dashboard_common (канон, issue #154).
+
+# ============================ валидаторы provisioning (issue #186) ============================
+# shell-safe имена/uid для dscl-команд (как _valid_port/_valid_token: str|None, строгий boundary).
+# dscl create/delete собирается ТОЛЬКО из констант + этих validated значений — никаких
+# пользовательских строк в shell (канон privileged-boundary-fail-closed, no-hidden-magic).
+_USER_NAME_RE = re.compile(r"^[_A-Za-z][_A-Za-z0-9]*$")   # leading _|letter, далее [_A-Za-z0-9]
+_UID_RE = re.compile(r"^[0-9]+$")
+
+
+def _valid_user_name(name):
+    """Имя dscl-записи в shell-safe форме или None. Только [_A-Za-z0-9], leading _|letter.
+
+    Никаких метасимволов/пробелов — иначе path-injection в dscl create/delete /Users/<name>.
+    """
+    if isinstance(name, str) and _USER_NAME_RE.fullmatch(name):
+        return name
+    return None
+
+
+def _valid_uid(uid):
+    """Числовой UID в shell-safe форме (строка цифр) или None. Rejects bool (как _valid_port)."""
+    if isinstance(uid, bool):
+        return None
+    if isinstance(uid, int):
+        return str(uid) if uid > 0 else None
+    if isinstance(uid, str) and _UID_RE.fullmatch(uid):
+        return uid
+    return None
+
+
+# RealName может содержать пробел (отображается в Системных настройках, как «Asset Cache» у
+# _assetcache). Пробел/метасимвол НЕЛЬЗЯ вставлять в shell-cmd как-есть — shell-split превратит
+# «RealName srouter codex» в multi-valued свойство (man dscl: create key val... — несколько val).
+# Поэтому: валидируем (только буквы/цифры/пробел, никаких shell-метасимволов) И квотим shlex.quote
+# при подстановке (канон _admin_run: shell_cmd из констант+validated, без неявного split).
+_REALNAME_RE = re.compile(r"^[A-Za-z0-9 _.\-]+$")
+
+
+def _valid_realname(name):
+    """RealName в shell-safe форме или None. Буквы/цифры/пробел/_.- — никаких метасимволов.
+
+    Возвращает shlex.quote-нутое значение (готовое к подстановке в shell-cmd) или None.
+    Даже валидное multi-word значение обязано квотиться — иначе пробел = shell-split.
+    """
+    import shlex
+    if isinstance(name, str) and _REALNAME_RE.fullmatch(name):
+        return shlex.quote(name)
+    return None
 
 
 def _admin_run(shell_cmd):
@@ -495,6 +554,135 @@ def probe_codex_isolation(state_path=None):
         return {"status": "unknown", "token": None, "applied_at": None, "error": str(exc)}
 
 
+# ============================ provisioning _srouter_codex (uid 503) — issue #186 ============================
+# Активация PF kill-switch: правила (user 503) матчат трафик ТОЛЬКО когда системный пользователь
+# с этим UID существует (см. known-limitation в _codex_ruleset). Provisioning создаёт его через
+# dscl + osascript admin-мост (канон _admin_run: shell_cmd из констант+validated, НЕ через
+# privileged_ops.is_allowed whitelist — dscl там нет, и расширять whitelist не нужно, абсолютный
+# путь DSCL подходит для прямого моста как PFCTL/OSASCRIPT выше). Идемпотентно, fail-closed.
+def probe_codex_user():
+    """БЕЗ привилегий: существует ли _srouter_codex с UID 503? Возвращает dict.
+
+    dscl . -read читает локальный узел БЕЗ root (verify-dont-guess). Парсит 'UniqueID: 503'.
+    probe-канон: всегда dict, не бросает. provisioned=True ТОЛЬКО при точном совпадении UID
+    (строгий boundary, не «имя-достаточно» — fail-closed на wrong-uid).
+    Возвращает {provisioned: bool, uid: str|None, name: str|None, gid: str|None, error?}.
+    """
+    try:
+        name = _valid_user_name(CODEX_USER_NAME)
+        uid = _valid_uid(CODEX_USER)
+        if not name or not uid:
+            return {"provisioned": False, "uid": None, "name": None, "gid": None,
+                    "error": "константы codex-user невалидны"}
+        r = sys_probe.run([DSCL, ".", "-read", f"/Users/{name}", "UniqueID", "PrimaryGroupID"],
+                          timeout=5)
+        if r.get("timeout") or r.get("rc") != 0:
+            return {"provisioned": False, "uid": None, "name": None, "gid": None}
+        found_uid = None
+        found_gid = None
+        for line in (r.get("out") or "").splitlines():
+            line = line.strip()
+            if line.startswith("UniqueID:"):
+                found_uid = line.split(":", 1)[1].strip()
+            elif line.startswith("PrimaryGroupID:"):
+                found_gid = line.split(":", 1)[1].strip()
+        provisioned = (found_uid == uid)
+        return {"provisioned": provisioned,
+                "uid": found_uid if provisioned else None,
+                "name": name if provisioned else None,
+                "gid": found_gid if provisioned else None}
+    except Exception as exc:
+        return {"provisioned": False, "uid": None, "name": None, "gid": None, "error": str(exc)}
+
+
+def _uid_in_use(uid):
+    """БЕЗ привилегий: True если uid занят ЛЮБЫМ пользователем (кроме нашего имени).
+
+    dscl . -list /Users UniqueID читает локальный узел без root. fail-closed: при timeout/
+    сбое/невалидном uid → True (не создаём поверх неизвестного). Наше имя (уже provisioned)
+    легитимно и НЕ считается занятием.
+    """
+    try:
+        u = _valid_uid(uid)
+        if not u:
+            return True  # невалидный uid → fail-closed «занят»
+        r = sys_probe.run([DSCL, ".", "-list", "/Users", "UniqueID"], timeout=5)
+        if r.get("timeout") or r.get("rc") != 0:
+            return True  # не смогли проверить → не создаём
+        for line in (r.get("out") or "").splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[-1] == u:
+                if parts[0] == CODEX_USER_NAME:
+                    continue  # наше имя — легитимно (уже provisioned)
+                return True
+        return False
+    except Exception:
+        return True  # fail-closed
+
+
+def provision_codex_user():
+    """Идемпотентное создание _srouter_codex (UID 503) через osascript admin-мост.
+
+    1. probe_codex_user() → если уже provisioned с правильным UID → no-op ok.
+    2. _uid_in_use(503) → если занят ЧУЖИМ именем → fail-closed reject (НЕ перезаписываем).
+    3. Иначе одна osascript-инвокация: dscl-create цепочка (fail-fast &&), все значения из констант.
+
+    Канон _admin_run: shell_cmd собран ТОЛЬКО из констант (DSCL, CODEX_USER_*) и validated
+    значений (record из _valid_user_name → только [_A-Za-z0-9/]). Пользовательских строк в shell
+    нет (нет вектора атаки). Возвращает dict формы _isolate_result (ok/cancelled/rc/out/err/timeout).
+    Порядок UniqueID первым семантически яснее (объявляет идентификатор); dscl create свойств
+    идемпотентен → при partial-fail re-install добивает (сходится).
+    """
+    try:
+        existing = probe_codex_user()
+        if existing.get("provisioned"):
+            return {"ok": True, "cancelled": False, "rc": 0, "out": "",
+                    "err": "already provisioned", "timeout": False}
+        # fail-closed: UID занят другим пользователем → не перезаписывать.
+        if _uid_in_use(CODEX_USER):
+            return {**_reject(f"UID {CODEX_USER} занят другим пользователем — provisioning отменён"),
+                    "cancelled": False}
+        name = _valid_user_name(CODEX_USER_NAME)
+        uid = _valid_uid(CODEX_USER)
+        gid = _valid_uid(CODEX_USER_GID)
+        realname = _valid_realname(CODEX_USER_REALNAME)  # shlex.quote — пробел safe (канон _admin_run)
+        if not (name and uid and gid and realname):
+            return _reject("константы codex-user невалидны")
+        record = f"/Users/{name}"
+        steps = [
+            f"{DSCL} . -create {record} UniqueID {uid}",
+            f"{DSCL} . -create {record} PrimaryGroupID {gid}",
+            f"{DSCL} . -create {record} UserShell {CODEX_USER_SHELL}",
+            f"{DSCL} . -create {record} RealName {realname}",
+            f"{DSCL} . -create {record} NFSHomeDirectory {CODEX_USER_HOME}",
+        ]
+        shell_cmd = " && ".join(steps)
+        return _admin_run(shell_cmd)
+    except Exception as exc:
+        return _reject(f"provision_codex_user failed: {exc}")
+
+
+def deprovision_codex_user():
+    """Идемпотентное удаление _srouter_codex через osascript admin-мост.
+
+    probe_codex_user() → если не provisioned → no-op ok. Иначе одна osascript-инвокация:
+    dscl . -delete /Users/_srouter_codex (record delete — вся запись). Идемпотентно:
+    на гонку (delete кем-то между probe и delete) — repeatable. Возвращает dict _isolate_result.
+    """
+    try:
+        existing = probe_codex_user()
+        if not existing.get("provisioned"):
+            return {"ok": True, "cancelled": False, "rc": 0, "out": "",
+                    "err": "not provisioned", "timeout": False}
+        name = _valid_user_name(CODEX_USER_NAME)
+        if not name:
+            return _reject("константа codex-user name невалидна")
+        shell_cmd = f"{DSCL} . -delete /Users/{name}"
+        return _admin_run(shell_cmd)
+    except Exception as exc:
+        return _reject(f"deprovision_codex_user failed: {exc}")
+
+
 # ============================ CLI (для launchd jobs) ============================
 def main(argv=None):
     """CLI для launchd: enable/disable/refresh/enable-strict/disable-strict/status + codex."""
@@ -514,6 +702,10 @@ def main(argv=None):
     sub.add_parser("enable-codex", help="Включить PF codex-изоляцию (sub-anchor, kill-switch).")
     sub.add_parser("disable-codex", help="Снять codex-изоляцию (flush sub-anchor).")
     sub.add_parser("status-codex", help="Статус codex-изоляции (state-only).").add_argument("--state", default=None)
+    # provisioning _srouter_codex (uid 503) — issue #186: активация PF kill-switch.
+    sub.add_parser("provision-codex-user", help="Создать системного пользователя _srouter_codex (uid 503) — активация PF.")
+    sub.add_parser("deprovision-codex-user", help="Удалить _srouter_codex (uid 503).")
+    sub.add_parser("status-codex-user", help="Статус provisioning _srouter_codex (uid 503, без привилегий).")
     args = p.parse_args(argv)
 
     if args.cmd == "enable-strict":
@@ -543,6 +735,17 @@ def main(argv=None):
         r = disable_codex_isolation(token=lease.get("token"))
         if r.get("ok"):
             local_state.clear_active_codex_isolate(path=getattr(args, "state", None))
+        return 0 if r.get("ok") else 2
+    if args.cmd == "status-codex-user":
+        print(probe_codex_user())
+        return 0
+    if args.cmd == "provision-codex-user":
+        r = provision_codex_user()
+        print(f"provision-codex-user: ok={r.get('ok')} {r.get('err') or ''}")
+        return 0 if r.get("ok") else 2
+    if args.cmd == "deprovision-codex-user":
+        r = deprovision_codex_user()
+        print(f"deprovision-codex-user: ok={r.get('ok')} {r.get('err') or ''}")
         return 0 if r.get("ok") else 2
     # enable/disable/refresh — читают lease из state для token/доменов
     lease = local_state.load_active_isolate(path=getattr(args, "state", None)) or {}

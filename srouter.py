@@ -801,35 +801,44 @@ def _remove_codex_zsh_function() -> str:
 
 
 def _install_codex_isolation(env, runner) -> str:
-    """Best-effort: включить PF codex-изоляцию (sub-anchor com.apple/srouter_isolate/codex).
+    """Best-effort: provisioning _srouter_codex (uid 503) + включить PF codex-изоляцию.
 
-    PF kill-switch — настоящая fail-closed граница codex (epic #166, issue #168): блокирует
-    прямой выход UID 503 в ядре, разрешает только loopback SOCKS5 10808. Best-effort для install
-    (как остальные codex-шаги) — сбой не валит install. Known-limitation: без provisioning
-    (создание _srouter_codex uid 503 — follow-up) правила валидны и загружены, но не матчат трафик.
+    PF kill-switch — настоящая fail-closed граница codex (epic #166, issue #168/#186): блокирует
+    прямой выход UID 503 в ядре, разрешает только loopback SOCKS5 10808. Правила (user 503) матчат
+    трафик ТОЛЬКО когда системный пользователь с этим UID существует → provisioning создаёт его
+    ДО загрузки правил (UID готов к моменту apply → правила активны сразу, без окна «валидны но
+    не матчат»). Best-effort (как остальные codex-шаги) — сбой provisioning НЕ валит install.
+    Known-limitation (follow-up): запуск codex под uid 503 (sudo -u в wrapper) — отдельный PR.
     """
     try:
         import isolate_firewall
         state_path = getattr(env, "state_path", None) if env is not None else None
-        # Переиспользуем существующий token из lease (как CLI enable-codex, isolate_firewall.py:534),
-        # иначе re-install каждый раз зовёт pfctl -E → копит leaked enable-ref'ы (cycle-review cycle 1).
+        # 1) Provisioning UID 503 ДО enable (канон fail-closed: правила активны сразу после загрузки).
+        prov = isolate_firewall.provision_codex_user()
+        prov_note = "" if prov.get("ok") else f" provisioning не удался ({prov.get('err', 'unknown')});"
+        # 2) Переиспользуем существующий token из lease (как CLI enable-codex, isolate_firewall.py:534),
+        #    иначе re-install каждый раз зовёт pfctl -E → копит leaked enable-ref'ы (cycle-review cycle 1).
         lease = local_state.load_active_codex_isolate(path=state_path) or {}
         r = isolate_firewall.enable_codex_isolation(token=lease.get("token"))
         if r.get("ok"):
             local_state.save_active_codex_isolate({"token": r.get("token"), "applied_at": None}, path=state_path)
-            return ("Codex PF-изоляция: sub-anchor загружен (kill-switch для UID 503). "
-                    "Активация требует provisioning _srouter_codex (uid 503) — follow-up.")
-        return f"Codex PF-изоляция: не включена ({r.get('err', 'unknown')})."
+            return ("Codex PF-изоляция: sub-anchor загружен + _srouter_codex (uid 503) создан "
+                    f"(kill-switch активен).{prov_note} "
+                    "Запуск codex под uid 503 (sudo -u) — follow-up.")
+        return f"Codex PF-изоляция: не включена ({r.get('err', 'unknown')}).{prov_note}"
     except Exception as exc:
         return f"Codex PF-изоляция: сбой ({str(exc)[:80]})."
 
 
 def _remove_codex_isolation(env, runner) -> str:
-    """Best-effort: снять codex-изоляцию при uninstall (flush sub-anchor + release token). Идемпотентно.
+    """Best-effort: снять codex-изоляцию при uninstall (flush sub-anchor + release token) +
+    deprovision _srouter_codex (uid 503). Идемпотентно.
 
     state очищается ТОЛЬКО при подтверждённом disable (r.ok) — иначе leaked pfctl -E enable-ref
     остаётся захваченным, но token стёрт → release невозможен без pfctl -d (cycle-review cycle 1,
-    канон fail-closed-proxy-down: state обязан отражать реальность).
+    канон fail-closed-proxy-down: state обязан отражать реальность). Deprovision пользователя —
+    ПОСЛЕ успешного disable+clear (правила сняты → субъект правила больше не нужен; симметрия
+    state-lifecycle: не трогаем пользователя при незавершённом disable, repeatable).
     """
     try:
         import isolate_firewall
@@ -838,7 +847,9 @@ def _remove_codex_isolation(env, runner) -> str:
         r = isolate_firewall.disable_codex_isolation(token=lease.get("token"))
         if r.get("ok"):
             local_state.clear_active_codex_isolate(path=state_path)
-            return "Codex PF-изоляция: снята."
+            deprov = isolate_firewall.deprovision_codex_user()  # best-effort, идемпотентно
+            deprov_note = "" if deprov.get("ok") else f" пользователь не удалён ({deprov.get('err', '')});"
+            return f"Codex PF-изоляция: снята.{deprov_note}"
         return f"Codex PF-изоляция: частично ({r.get('err', '')})."  # state сохранён — retry возможен
     except Exception as exc:
         return f"Codex PF-изоляция: не снята ({str(exc)[:80]})."

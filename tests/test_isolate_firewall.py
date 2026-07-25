@@ -236,3 +236,224 @@ def test_codex_isolate_lease_rejects_invalid(tmp_path):
     assert local_state.save_active_codex_isolate({"applied_at": 1}, path=p) is None  # нет token
     assert local_state.save_active_codex_isolate({"token": "abc"}, path=p) is None  # нечисловой token
     assert local_state.load_active_codex_isolate(path=p) is None
+
+
+# ============================ (f) provisioning _srouter_codex UID 503 (issue #186) ============================
+# PF codex kill-switch активируется ТОЛЬКО когда системный пользователь _srouter_codex (uid 503)
+# существует — иначе PF-правила (user 503) валидны, но не матчат ни один пакет. Provisioning
+# (создание пользователя через dscl + osascript admin-мост) делает kill-switch реальной границей.
+# Канон: _admin_run (osascript из констант), НЕ privileged_ops.is_allowed whitelist (dscl там нет).
+import os
+import re
+
+_USER_NAME_RE = re.compile(r"^[_A-Za-z][_A-Za-z0-9]*$")
+
+
+def _seq_run(handlers):
+    """Фейк sys_probe.run для multi-call flow: handlers — список (matcher_fn, result_dict).
+
+    matcher_fn(cmd_list) → True если этот вызов должен вернуть result. Первый match выигрывает;
+    fallback — пустой rc=0. Так моделируем probe(dscl read)→list(dscl list)→create(osascript).
+    """
+    def fake_run(cmd_list, timeout=None):
+        for match, result in handlers:
+            if match(cmd_list):
+                return dict(result)
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+    return fake_run
+
+
+def _is_dscl_read(cmd_list):
+    return "dscl" in " ".join(cmd_list) and "-read" in cmd_list
+
+
+def _is_dscl_list(cmd_list):
+    return "dscl" in " ".join(cmd_list) and "-list" in cmd_list
+
+
+def _is_osascript(cmd_list):
+    return "osascript" in " ".join(cmd_list)
+
+
+def test_provision_codex_user_creates_via_dscl_create_chain(monkeypatch):
+    """provision шлёт osascript с dscl-create цепочкой (UniqueID/PrimaryGroupID/UserShell/RealName/NFSHomeDirectory),
+    соединённой fail-fast &&. Все значения из констант (shell-safe)."""
+    captured = []
+    seq = _seq_run([
+        (_is_dscl_read, {"rc": 56, "out": "", "err": "eDSRecordNotFound", "timeout": False}),
+        (_is_dscl_list, {"rc": 0, "out": "", "err": "", "timeout": False}),
+        (_is_osascript, {"rc": 0, "out": "", "err": "", "timeout": False}),
+    ])
+
+    def tracking(cmd_list, timeout=None):
+        captured.append(cmd_list)
+        return seq(cmd_list, timeout)
+    monkeypatch.setattr(isolate_firewall.sys_probe, "run", tracking)
+    r = isolate_firewall.provision_codex_user()
+    assert r["ok"], r
+    shell_text = " ".join(part for argv in captured for part in argv).replace('\\"', '"')
+    assert "dscl" in shell_text and "-create" in shell_text, shell_text
+    assert "/Users/_srouter_codex" in shell_text, shell_text
+    assert "UniqueID 503" in shell_text, shell_text
+    assert "PrimaryGroupID 503" in shell_text, shell_text
+    assert "UserShell /usr/bin/false" in shell_text, shell_text
+    assert "NFSHomeDirectory /var/empty" in shell_text, shell_text
+    assert "RealName" in shell_text, shell_text
+    # cycle-review fix: RealName с пробелом ОБЯЗАН квотиться (shlex.quote), иначе shell-split
+    # превратит «RealName srouter codex» в multi-valued свойство (man dscl: create key val...).
+    # Канон _admin_run: shell_cmd из констант+validated, без неявного split.
+    assert "'srouter codex'" in shell_text or "srouter codex" not in \
+        shell_text.replace("'srouter codex'", ""), \
+        f"RealName с пробелом квочен (shlex.quote), не raw-shell-split: {shell_text}"
+    # fail-fast цепочка
+    assert "&&" in shell_text, "create-шаги соединены fail-fast &&"
+
+
+def test_provision_codex_user_idempotent_when_already_provisioned(monkeypatch):
+    """Если probe → provisioned, _admin_run (osascript create) НЕ зовётся (no-op)."""
+    exploded = {"called": False}
+
+    def boom(cmd_list, timeout=None):
+        exploded["called"] = True
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+    monkeypatch.setattr(isolate_firewall, "probe_codex_user",
+                        lambda: {"provisioned": True, "uid": "503", "name": "_srouter_codex", "gid": "503"})
+    monkeypatch.setattr(isolate_firewall.sys_probe, "run", boom)
+    r = isolate_firewall.provision_codex_user()
+    assert r["ok"], r
+    assert not exploded["called"], "при already-provisioned osascript create НЕ зовётся"
+
+
+def test_provision_codex_user_failclosed_when_uid_taken(monkeypatch):
+    """UID 503 занят другим пользователем → fail-closed: ok=False, dscl create НЕ зовётся."""
+    monkeypatch.setattr(isolate_firewall, "probe_codex_user",
+                        lambda: {"provisioned": False, "uid": None, "name": None, "gid": None})
+    monkeypatch.setattr(isolate_firewall, "_uid_in_use", lambda uid: True)
+    create_called = {"v": False}
+    orig = isolate_firewall._admin_run
+    monkeypatch.setattr(isolate_firewall, "_admin_run",
+                        lambda cmd: create_called.update(v=True) or {"rc": 1, "out": "", "err": "x", "timeout": False})
+    r = isolate_firewall.provision_codex_user()
+    assert not r["ok"], r
+    assert "занят" in (r.get("err") or "").lower() or "занят" in str(r), r
+    assert not create_called["v"], "dscl create НЕ зовётся при занятом UID (fail-closed до выполнения)"
+
+
+def test_deprovision_codex_user_calls_dscl_delete(monkeypatch):
+    """deprovision шлёт osascript с dscl -delete /Users/_srouter_codex."""
+    monkeypatch.setattr(isolate_firewall, "probe_codex_user",
+                        lambda: {"provisioned": True, "uid": "503", "name": "_srouter_codex", "gid": "503"})
+    captured = []
+    monkeypatch.setattr(isolate_firewall.sys_probe, "run",
+                        lambda cmd, timeout=None: captured.append(cmd) or {"rc": 0, "out": "", "err": "", "timeout": False})
+    r = isolate_firewall.deprovision_codex_user()
+    assert r["ok"], r
+    shell_text = " ".join(part for argv in captured for part in argv).replace('\\"', '"')
+    assert "dscl" in shell_text and "-delete" in shell_text, shell_text
+    assert "/Users/_srouter_codex" in shell_text, shell_text
+
+
+def test_deprovision_codex_user_idempotent_when_not_provisioned(monkeypatch):
+    """Не provisioned → no-op ok, osascript delete НЕ зовётся."""
+    monkeypatch.setattr(isolate_firewall, "probe_codex_user",
+                        lambda: {"provisioned": False, "uid": None, "name": None, "gid": None})
+    called = {"v": False}
+    monkeypatch.setattr(isolate_firewall.sys_probe, "run",
+                        lambda cmd, timeout=None: called.update(v=True) or {"rc": 0, "out": "", "err": "", "timeout": False})
+    r = isolate_firewall.deprovision_codex_user()
+    assert r["ok"], r
+    assert not called["v"], "при not-provisioned osascript delete НЕ зовётся"
+
+
+def test_probe_codex_user_parses_dscl_read(monkeypatch):
+    """probe парсит 'UniqueID: 503' → provisioned=True, uid=='503'."""
+    monkeypatch.setattr(isolate_firewall.sys_probe, "run", _spy_run([],
+                        rc=0, out="UniqueID: 503\nPrimaryGroupID: 503\n"))
+    r = isolate_firewall.probe_codex_user()
+    assert r["provisioned"] is True, r
+    assert r.get("uid") == "503", r
+
+
+def test_probe_codex_user_down_when_record_missing(monkeypatch):
+    """rc!=0 (eDSRecordNotFound) → provisioned=False."""
+    monkeypatch.setattr(isolate_firewall.sys_probe, "run",
+                        _spy_run([], rc=56, err="eDSRecordNotFound"))
+    r = isolate_firewall.probe_codex_user()
+    assert r["provisioned"] is False, r
+
+
+def test_probe_codex_user_rejects_wrong_uid(monkeypatch):
+    """Имя существует, но UniqueID != 503 → provisioned=False (fail-closed, не «почти»)."""
+    monkeypatch.setattr(isolate_firewall.sys_probe, "run", _spy_run([],
+                        rc=0, out="UniqueID: 504\nPrimaryGroupID: 503\n"))
+    r = isolate_firewall.probe_codex_user()
+    assert r["provisioned"] is False, "wrong uid → False (строгий match, не имя-достаточно)"
+
+
+def test_codex_user_constants_shell_safe():
+    """Гвард регрессий: константы provisioning shell-safe (как test_codex_ruleset_constants_shell_safe)."""
+    assert isolate_firewall.CODEX_USER_GID.isdigit(), "GID обязан быть числом"
+    assert isolate_firewall.CODEX_USER == isolate_firewall.CODEX_USER_GID, "канон: dedicated gid == uid"
+    assert isolate_firewall.CODEX_USER_SHELL == "/usr/bin/false", "не-login shell (эталон nobody)"
+    assert isolate_firewall.CODEX_USER_HOME == "/var/empty", "нет HOME (эталон nobody)"
+    # RealName: буквы/пробел, без shell-метасимволов
+    assert re.fullmatch(r"[_A-Za-z0-9 /]+", isolate_firewall.CODEX_USER_REALNAME), \
+        "RealName без метасимволов (только буквы/цифры/пробел)"
+    assert isolate_firewall.DSCL == "/usr/bin/dscl", "абсолютный путь dscl"
+
+
+def test_valid_user_name_rejects_shell_metachars():
+    """Гвард: _valid_user_name rejects метасимволы/leading-digit, принимает канон-имя."""
+    assert isolate_firewall._valid_user_name("_srouter_codex") == "_srouter_codex"
+    assert isolate_firewall._valid_user_name("codex") == "codex"
+    assert isolate_firewall._valid_user_name("a;rm -rf") is None, "shell-метасимвол rejected"
+    assert isolate_firewall._valid_user_name("503abc") is None, "leading digit rejected"
+    assert isolate_firewall._valid_user_name("") is None
+    assert isolate_firewall._valid_user_name("a$b") is None
+
+
+def test_valid_uid_rejects_nonnumeric():
+    """Гвард: _valid_uid — только цифры, rejects bool/буквы."""
+    assert isolate_firewall._valid_uid("503") == "503"
+    assert isolate_firewall._valid_uid(503) == "503"
+    assert isolate_firewall._valid_uid(True) is None, "bool rejected (isinstance bool)"
+    assert isolate_firewall._valid_uid("abc") is None
+    assert isolate_firewall._valid_uid("") is None
+    assert isolate_firewall._valid_uid("503a") is None
+
+
+def test_valid_realname_quotes_multivord_and_rejects_metachars():
+    """cycle-review fix: RealName с пробелом квотится (shlex.quote), метасимволы rejected.
+
+    Без квотинга «RealName srouter codex» → shell-split → multi-valued свойство (man dscl).
+    Канон _admin_run: shell_cmd без неявного split. shlex.quote даёт 'srouter codex' (single-quoted).
+    """
+    assert isolate_firewall._valid_realname("srouter codex") == "'srouter codex'", \
+        "multi-word RealName квочится shlex.quote"
+    assert isolate_firewall._valid_realname("codex") == "codex", \
+        "single-word без пробела — без кавычек (shlex не квотит простые)"
+    assert isolate_firewall._valid_realname("srouter; rm -rf /") is None, "shell-метасимвол rejected"
+    assert isolate_firewall._valid_realname("codex$(x)") is None, "command-substitution rejected"
+    assert isolate_firewall._valid_realname("") is None
+    assert isolate_firewall._valid_realname(None) is None
+
+
+@unittest.skipUnless(os.environ.get("SROUTER_TEST_SUDO"),
+                     "требует sudo/osascript — ручной замер эмпирики (issue #186)")
+def test_provision_codex_user_real_roundtrip():
+    """Эмпирика (verify-dont-guess): реальный provision→probe→deprovision через osascript admin-мост.
+
+    Skip в CI (нужен GUI sudo). Ручной запуск: SROUTER_TEST_SUDO=1 pytest -k real_roundtrip.
+    Доказывает, что dscl create/delete цепочка работает на реальной машине, и PF-rules (user 503)
+    начинают матчить после создания пользователя.
+    """
+    p = isolate_firewall.provision_codex_user()
+    assert p["ok"], f"provision failed: {p}"
+    try:
+        probe = isolate_firewall.probe_codex_user()
+        assert probe["provisioned"] is True, f"probe после provision: {probe}"
+        assert probe["uid"] == "503", probe
+    finally:
+        d = isolate_firewall.deprovision_codex_user()
+        assert d["ok"], f"deprovision failed: {d}"
+    assert isolate_firewall.probe_codex_user()["provisioned"] is False, "cleanup: пользователь удалён"

@@ -1314,3 +1314,109 @@ def test_runtime_check_unknown_when_some_pid_unreadable(monkeypatch):
         res = health._runtime_model_override_check()
         assert res["status"] == "unknown", \
             f"[{label}] PID без evidence → unknown (НЕ ok; standard-PID не маскирует), got {res['status']}"
+
+
+# ============================ #186 codex-isolation PF kill-switch check ============================
+# Doctor-чек PF codex kill-switch: info-only для всех «незамкнутых» состояний (no-lease /
+# lease+no-user / lease+user+no-proc), ok только при реальном процессе под UID 503. НЕ driver
+# (избегаем шума на нормальных установках, как PR #135). Gate под active_claude (doctor-only).
+def _codex_iso_probes(monkeypatch, *, lease_status, provisioned, ps_out="", ps_rc=1):
+    """Мок isolate_firewall.probe_codex_isolation/probe_codex_user + ps для _codex_isolation_check.
+
+    lease_status: probe_codex_isolation()['status'] ('ok'|'down').
+    provisioned: probe_codex_user()['provisioned'].
+    ps_out/ps_rc: вывод `ps -u 503` (rc=0+out → процесс есть; rc=1+пусто → нет).
+    """
+    import isolate_firewall
+
+    def fake_probe_lease(state_path=None):
+        return {"status": lease_status, "token": "5", "applied_at": 1} if lease_status == "ok" \
+            else {"status": lease_status, "token": None, "applied_at": None}
+
+    def fake_probe_user():
+        return ({"provisioned": True, "uid": "503", "name": "_srouter_codex", "gid": "503"}
+                if provisioned else {"provisioned": False, "uid": None, "name": None, "gid": None})
+    monkeypatch.setattr(isolate_firewall, "probe_codex_isolation", fake_probe_lease)
+    monkeypatch.setattr(isolate_firewall, "probe_codex_user", fake_probe_user)
+
+    def fake_run(cmd, timeout, **kwargs):
+        if cmd and cmd[0] == "/bin/ps" and "-u" in cmd:
+            return {"rc": ps_rc, "out": ps_out, "err": "", "timeout": False}
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+    monkeypatch.setattr(health.sys_probe, "run", fake_run)
+
+
+def test_codex_isolation_check_info_when_no_lease(monkeypatch):
+    """Нет lease → info (не установлен по выбору, не сбой стека)."""
+    _codex_iso_probes(monkeypatch, lease_status="down", provisioned=False)
+    assert health._codex_isolation_check()["status"] == "info"
+
+
+def test_codex_isolation_check_info_when_lease_no_user(monkeypatch):
+    """Lease ok, но UID не provisioned → info (инфра загружена, матчить нечего)."""
+    _codex_iso_probes(monkeypatch, lease_status="ok", provisioned=False)
+    assert health._codex_isolation_check()["status"] == "info"
+
+
+def test_codex_isolation_check_info_when_lease_user_no_proc(monkeypatch):
+    """Lease ok + user provisioned, но НЕТ процесса под UID 503 → info (PF standby, sudo -u = follow-up).
+
+    ps -u 503 для без-процесса UID → rc=1, пустой out (verify-dont-guess)."""
+    _codex_iso_probes(monkeypatch, lease_status="ok", provisioned=True,
+                      ps_out="", ps_rc=1)
+    assert health._codex_isolation_check()["status"] == "info"
+
+
+def test_codex_isolation_check_ok_when_proc_under_uid(monkeypatch):
+    """Lease + user + процесс под UID 503 → ok (real fail-closed активна)."""
+    _codex_iso_probes(monkeypatch, lease_status="ok", provisioned=True,
+                      ps_out=" 1234 /usr/local/bin/codex\n", ps_rc=0)
+    assert health._codex_isolation_check()["status"] == "ok"
+
+
+def test_codex_isolation_check_info_when_ps_timeout(monkeypatch):
+    """ps timeout → fail-soft info (не ложный ok, не падение)."""
+    import isolate_firewall
+    monkeypatch.setattr(isolate_firewall, "probe_codex_isolation",
+                        lambda state_path=None: {"status": "ok", "token": "5", "applied_at": 1})
+    monkeypatch.setattr(isolate_firewall, "probe_codex_user",
+                        lambda: {"provisioned": True, "uid": "503", "name": "_srouter_codex", "gid": "503"})
+    monkeypatch.setattr(health.sys_probe, "run",
+                        lambda cmd, timeout, **kw: {"rc": 0, "out": "", "err": "", "timeout": True})
+    assert health._codex_isolation_check()["status"] == "info"
+
+
+def test_check_all_codex_isolation_gated_under_active_claude(monkeypatch):
+    """check_all: codex-isolation чек ТОЛЬКО при active_claude=True (doctor-only), info НЕ driver.
+
+    Проверяем gate + info-исключение из drivers (НЕ агрегатный status — он зависит от других
+    doctor-чеков на машине). Инвариант: info-only codex-isolation не входит в drivers → не влияет
+    на вердикт (избегаем шума как PR #135)."""
+    _codex_iso_probes(monkeypatch, lease_status="down", provisioned=False)
+    _all_up_monkey(monkeypatch, probe_status="ok", codex_status="ok")
+
+    # active_claude=False (лёгкий /health/watchdog) — чека codex-isolation НЕТ.
+    result = health.check_all(active_claude=False)
+    names = [c["name"] for c in result["checks"]]
+    assert not any("codex-isolation" in n for n in names), \
+        f"лёгкий путь НЕ должен нести codex-isolation чек (overhead); checks={names}"
+
+    # active_claude=True (doctor) — чек есть, info-only → НЕ driver (исключён из drivers).
+    result = health.check_all(active_claude=True)
+    ci = next(c for c in result["checks"] if "codex-isolation" in c["name"])
+    assert ci.get("info") is True, "codex-isolation info-only (НЕ driver — avoid шума)"
+    drivers = [c for c in result["checks"] if not c.get("info")]
+    assert ci not in drivers, "info-only codex-isolation исключён из drivers (не роняет вердикт)"
+
+
+def test_check_all_codex_isolation_ok_is_driver(monkeypatch):
+    """При реальном процессе под UID 503 → ok=driver (НЕ info-only), но не падает статус ниже degraded."""
+    _codex_iso_probes(monkeypatch, lease_status="ok", provisioned=True,
+                      ps_out=" 1234 codex\n", ps_rc=0)
+    _all_up_monkey(monkeypatch, probe_status="ok", codex_status="ok")
+    result = health.check_all(active_claude=True)
+    ci = next(c for c in result["checks"] if "codex-isolation" in c["name"])
+    assert ci["ok"] is True, "real fail-closed активна → ok"
+    assert not ci.get("info"), "ok — НЕ info-only (driver)"
+    drivers = [c for c in result["checks"] if not c.get("info")]
+    assert ci in drivers, "ok codex-isolation входит в drivers (real fail-closed = driver)"
