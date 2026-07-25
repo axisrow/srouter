@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -306,16 +307,40 @@ def _wait_port(expected, *, checker=_port_open, timeout=8.0, interval=0.1):
     return state == expected
 
 
+def _fchown_if_privileged(fd, uid, gid):
+    """fchown по fd ТОЛЬКО под root. fd-pinning (#148): метаданные выставляются по fd,
+    а не по пути — закрывает TOCTOU arbitrary-chown (path-based chown следует symlink).
+
+    Под non-root (тесты без sudo) fchown(0,0) дал бы EPERM и пропускается: реальный
+    chown невозможен без привилегий, security-инвариант не нарушается (production
+    helper всегда работает под root через sudo — там fchown обязателен и выполнится).
+    """
+    if os.geteuid() != 0:
+        return
+    os.fchown(fd, uid, gid)
+
+
 def _atomic_write(path, data, *, mode, uid=0, gid=0, chown=os.chown):
     """Race-free atomic write: непредсказуемое temp-имя + O_EXCL + fchmod/fchown по fd.
 
     Прежний temp `.name.tmp-PID` был предсказуем и жил в user-writable директории (при restore
     user_plist это ~/Library/LaunchAgents) — атакующий подкладывал symlink с этим именем на
     произвольный root-path, и open(temp, "wb") + chmod + chown, следуя symlink, писали/меняли
-    владельца цели (arbitrary root file write). Теперь: tempfile.mkstemp даёт криптографически
-    случайное имя и создаёт файл атомарно с O_EXCL; fstat/fchmod/fchown работают по fd, а не
-    по пути — TOCTOU-окна для подмены temp нет.
+    владельца цели (arbitrary root file write). tempfile.mkstemp даёт криптографически
+    случайное имя и создаёт файл атомарно с O_EXCL. КРИТИЧНО (#148): fchmod/fchown работают
+    по fd, а НЕ по пути. Прежний код закрывал fd через fdopen и затем звал os.chmod(temp)/
+    chown(temp) по пути — между fd-close и chmod/chown владелец parent-каталога мог
+    переименовать temp и поставить symlink с тем же именем на произвольную цель, и
+    os.chmod/chown (по умолчанию следующие symlink) меняли владельца цели (arbitrary chown).
+    Теперь fd держится открытым до конца и метаданные выставляются по fd (TOCTOU-окна нет).
+    os.replace(temp, path) безопасен по имени: temp-имя непредсказуемо, атакующий не может
+    его подменить; path — финальная цель, переименование атомарно и не даёт arbitrary chown.
+
+    Параметр `chown` сохранён в сигнатуре для обратной совместимости вызовов; fd-pinning
+    делает его избыточным (используется os.fchown). Под non-root (тесты без sudo) fchown(0,0)
+    дал бы EPERM и пропускается — под root (production) chown обязателен.
     """
+    del chown  # fd-pinning: chown делается через os.fchown(fd), path-based хук более не нужен.
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(
@@ -323,33 +348,34 @@ def _atomic_write(path, data, *, mode, uid=0, gid=0, chown=os.chown):
     )
     temp = Path(tmp_name)
     try:
-        with os.fdopen(fd, "wb", closefd=True) as handle:
-            fd = -1  # fdopen приняла владение fd.
+        # НЕ передаём closefd=True — fd должен жить для fchmod/fchown после flush.
+        with os.fdopen(fd, "wb", closefd=False) as handle:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
-        # Права по пути к temp допустимы: temp уже создан эксклюзивно со случайным именем,
-        # атакующий не знает его и не может подменить. fchmod/fchown были бы строже, но
-        # mkstemp не возвращает стабильно пригодный fd после закрытия; chmod/chown по
-        # непредсказуемому пути безопасны в этой модели угроз.
-        os.chmod(temp, mode)
-        chown(temp, uid, gid)
+        # Метаданные — по fd, а не по пути. fchmod/fchown не следуют symlink и не
+        # делают path-resolution: даже если temp-путь подменён symlink'ом на чужую
+        # цель, fd всё ещё указывает на оригинальный regular-файл mkstemp (#148).
+        os.fchmod(fd, mode)
+        _fchown_if_privileged(fd, uid, gid)
+        # Переименование по имени безопасно: temp-имя непредсказуемо (атакующий не
+        # знает его), path — финальная цель; rename атомарен и не открывает
+        # TOCTOU-окно для arbitrary chown.
         os.replace(temp, path)
         temp = None  # успех — не удалять в finally.
         return True
     except OSError:
         if temp is not None:
             try:
-                temp.unlink(missing_ok=True)
+                os.unlink(temp)
             except OSError:
                 pass
         return False
     finally:
-        if fd >= 0:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
 def _safe_staged_config(path, uid, layout=DEFAULT_LAYOUT, debug=0):
@@ -561,43 +587,110 @@ def _copy_file_nofollow(src, dst, *, mode, chown=os.chown, max_size=64 * 1024 * 
     return _atomic_write(dst, data, mode=mode, uid=0, gid=0, chown=chown)
 
 
-def _copy_tree_nofollow(src, dst, *, dir_mode=0o755, file_mode=0o644, chown=os.chown):
-    """Race-free копирование дерева без разыменования symlink (одним проходом).
+def _read_fd_regular(fd, *, max_size=8 * 1024 * 1024):
+    """Прочитать regular-файл по fd (TOCTOU-свободно: fd уже открыт).
 
-    Прежний _copy_templates звал _reject_symlinks_in_tree (отдельный lstat-проход) и затем
-    copytree — между ними TOCTOU-окно. Здесь дерево копируется fd-relative за один проход:
-    root открывается через os.open(O_NOFOLLOW|O_DIRECTORY) (отказ, если root сам symlink),
-    каждый элемент — через openat-эквивалент (os.open имени внутри уже открытой директории с
-    O_NOFOLLOW); symlink или non-regular элемент → отказ всего копирования до записи содержимого.
+    fstat по fd не делает path-resolution. Размер/тип проверяются по fstat того же fd,
+    что и читается — окна для подмены нет (используется в fd-tree-traversal, #148).
     """
-    src = Path(src)
-    dst = Path(dst)
-    # root дерева не должен быть symlink.
-    try:
-        root_info = src.lstat()
-    except OSError:
-        return False
-    if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
-        return False
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode):
+        raise RuntimeError(f"fd_not_regular:mode={oct(info.st_mode)}")
+    if info.st_size > max_size:
+        raise RuntimeError(f"fd_too_large:{info.st_size}")
+    return _read_all_fd(fd, info.st_size)
+
+
+def _read_all_fd(fd, expected_size):
+    """Прочитать всё содержимое fd чанками (fd уже past-stat, контент мог измениться —
+    читаем до EOF, но отсекаем runaway-рост после fstat)."""
+    chunks = []
+    total = 0
+    while True:
+        chunk = os.read(fd, 1 << 20)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > expected_size + (1 << 20):
+            # Файл вырос после fstat (гонка записи) — не копировать растущий объект.
+            raise RuntimeError(f"fd_grew_after_stat:{total}>{expected_size}")
+    return b"".join(chunks)
+
+
+def _copy_tree_fd(src_fd, dst, *, dir_mode, file_mode):
+    """fd-relative рекурсивное копирование дерева (TOCTOU-свободно, #148).
+
+    src_fd — уже открытый O_NOFOLLOW|O_DIRECTORY дескриптор корня. Каждый элемент
+    открывается через openat (os.open с dir_fd=src_fd) с O_NOFOLLOW: путь `name`
+    разрешается относительно зафиксированного src_fd, а НЕ повторным разрешением
+    полного src/name. Даже если атакующий атомарно подменит src-каталог на symlink
+    между lstat-root и перечислением — openat берёт name из уже открытого src_fd,
+    повторного path-resolution нет. symlink/non-regular child отвергается O_NOFOLLOW.
+
+    dst (root-owned protected зона) НЕ user-controlled: path-based mkdir/chmod/chown
+    на dst безопасны и не открывают TOCTOU (атакующий не контролирует dst-путь).
+    """
     dst.mkdir(parents=True, exist_ok=True)
     os.chmod(dst, dir_mode)
-    chown(dst, 0, 0)
-    for entry in sorted(os.listdir(src)):
-        src_entry = src / entry
-        dst_entry = dst / entry
-        info = src_entry.lstat()
-        if stat.S_ISLNK(info.st_mode):
-            return False  # symlink внутри дерева — отказ до копирования содержимого.
-        if stat.S_ISDIR(info.st_mode):
-            if not _copy_tree_nofollow(src_entry, dst_entry, dir_mode=dir_mode,
-                                       file_mode=file_mode, chown=chown):
-                return False
-        elif stat.S_ISREG(info.st_mode):
-            if not _copy_file_nofollow(src_entry, dst_entry, mode=file_mode, chown=chown):
-                return False
-        else:
-            return False  # non-regular (fifo/socket/device) — отказ.
+    if os.geteuid() == 0:
+        os.chown(dst, 0, 0)
+    for name in sorted(os.listdir(src_fd)):
+        child_fd = os.open(
+            name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=src_fd,
+        )
+        try:
+            info = os.fstat(child_fd)
+            dst_child = dst / name
+            if stat.S_ISDIR(info.st_mode):
+                if not _copy_tree_fd(child_fd, dst_child, dir_mode=dir_mode,
+                                     file_mode=file_mode):
+                    return False
+            elif stat.S_ISREG(info.st_mode):
+                try:
+                    data = _read_fd_regular(child_fd)
+                except RuntimeError:
+                    return False
+                if not _atomic_write(dst_child, data, mode=file_mode):
+                    return False
+            else:
+                return False  # non-regular (symlink уже отсечён O_NOFOLLOW; fifo/socket/device) — отказ.
+        finally:
+            os.close(child_fd)
     return True
+
+
+def _copy_tree_nofollow(src, dst, *, dir_mode=0o755, file_mode=0o644, chown=os.chown):
+    """Race-free копирование дерева без разыменования symlink (полный fd-pinning, #148).
+
+    Прежний _copy_templates звал _reject_symlinks_in_tree (отдельный lstat-проход) и затем
+    copytree — между ними TOCTOU-окно. Дальнейшая fd-relative версия делала src.lstat()
+    корня и затем os.listdir(src)/src_entry.lstat() ПО ПУТИ — между lstat(root) и listdir
+    атакующий атомарно подменял src на symlink к root-only дереву, и listdir по пути шёл
+    по symlink, читая чужое содержимое как 0644 world-readable.
+
+    Теперь: root открывается ОДНИМ syscall os.open(O_NOFOLLOW|O_DIRECTORY) (отказ, если
+    root сам symlink), перечисление — os.listdir(dir_fd), каждый child — через openat
+    (os.open с dir_fd=root_fd, O_NOFOLLOW). Повторного path-resolution полного src-пути
+    нет нигде — TOCTOU-окно между проверкой и travers'ом закрыто.
+    """
+    del chown  # fd-pinning: владельца dst выставляет _fchown_if_privileged_dir, path-based хук не нужен.
+    src = Path(src)
+    dst = Path(dst)
+    try:
+        root_fd = os.open(
+            str(src),
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+    except OSError:
+        return False  # root — symlink/не-каталог/нет файла (O_NOFOLLOW|O_DIRECTORY отвергает одним syscall).
+    try:
+        return _copy_tree_fd(root_fd, dst, dir_mode=dir_mode, file_mode=file_mode)
+    finally:
+        os.close(root_fd)
 
 
 def _backup_existing(path, backup_dir, name, *, chown=os.chown):
@@ -1258,22 +1351,153 @@ def _sudo_reset(runner):
 
 
 def _install_helper(runner, layout=DEFAULT_LAYOUT):
-    source = Path(__file__).resolve()
-    if not _managed_file(source, HELPER_MARKER):
+    """Установка root-owned helper через fd-pinning (TOCTOU-свободно, #148 variant 3).
+
+    Прежний код проверял marker на __file__ и затем звал `sudo install __file__ dst` —
+    /usr/bin/install ПОВТОРНО открывал тот же pathname под sudo. Атакующий атомарно
+    заменял файл во время password-prompt: Python шёл по безопасному control flow, а
+    install клал attacker-bytes как root-owned helper 0755, который protect сразу
+    запускал через sudo → произвольное root-выполнение.
+
+    Фикс: (1) открыть __file__ через O_NOFOLLOW — marker проверяется на bytes ТОГО ЖЕ
+    объекта, что пойдёт в install; (2) вычислить digest этих bytes; (3) записать bytes
+    в root-owned temp (mkstemp в /private/tmp, fchmod/fchown по fd) — это
+    «зафиксированные digest-проверенные bytes»; (4) install копирует temp, НЕ __file__
+    (переоткрытие pathname под sudo безопасно — temp-имя непредсказуемо и root-owned);
+    (5) после install сверить digest установленного helper — расхождение = fail-closed
+    (откат установки + отказ).
+    """
+    # (1) marker-check на bytes зафиксированного fd, не на path (path-based _managed_file
+    # проверял бы объект, который install переоткроет — TOCTOU window).
+    helper_bytes, expected_digest = _read_helper_bytes_pinned()
+    if helper_bytes is None:
         return _result(False, error="helper_source_marker_missing")
-    if layout.helper_path.exists() and not _managed_file(layout.helper_path, HELPER_MARKER):
+    # foreign-helper guard: helper_path — target (root-owned), path-based допустимо,
+    # но читаем через O_NOFOLLOW для консистентности.
+    if layout.helper_path.exists() and not _helper_has_marker_fd(layout.helper_path):
         return _result(False, error="foreign_privileged_helper")
     parent = runner([SUDO, MKDIR, "-p", str(layout.helper_path.parent)], 30)
     if parent.get("rc") != 0:
         return _result(False, error=(parent.get("err") or "helper_parent_failed")[:240])
-    installed = runner(
-        [SUDO, INSTALL, "-o", "root", "-g", "wheel", "-m", "0755",
-         str(source), str(layout.helper_path)],
-        30,
-    )
-    if installed.get("rc") != 0:
-        return _result(False, error=(installed.get("err") or "helper_install_failed")[:240])
-    return _result(True)
+    # (2)+(3): зафиксированные digest-проверенные bytes в root-owned temp.
+    staged = _stage_helper_bytes(helper_bytes)
+    if staged is None:
+        return _result(False, error="helper_stage_failed")
+    try:
+        # (4) install копирует temp, не __file__ — pathname не ре-открывается под sudo.
+        installed = runner(
+            [SUDO, INSTALL, "-o", "root", "-g", "wheel", "-m", "0755",
+             str(staged), str(layout.helper_path)],
+            30,
+        )
+        if installed.get("rc") != 0:
+            return _result(False, error=(installed.get("err") or "helper_install_failed")[:240])
+        # (5) post-install digest-check: установленный helper обязан совпадать с
+        # зафиксированными bytes. Расхождение (вторичная подмена helper_path) → fail-closed.
+        installed_digest = _digest_fd_nofollow(layout.helper_path)
+        if installed_digest is None or installed_digest != expected_digest:
+            _remove_via_runner(runner, layout.helper_path)
+            return _result(False, error="helper_digest_mismatch")
+        return _result(True)
+    finally:
+        try:
+            os.unlink(staged)
+        except OSError:
+            pass
+
+
+def _read_helper_bytes_pinned():
+    """Открыть __file__ через O_NOFOLLOW, прочитать bytes, проверить marker и вычислить digest.
+
+    marker-check и digest делаются на bytes одного и того же fd — TOCTOU-окна между
+    проверкой и использованием нет. Возвращает (bytes, digest) или (None, None) если
+    файл не regular / нет marker'а.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(__file__, flags)
+    except OSError:
+        return None, None
+    try:
+        try:
+            data = _read_fd_regular(fd, max_size=4 * 1024 * 1024)
+        except RuntimeError:
+            return None, None
+    finally:
+        os.close(fd)
+    if HELPER_MARKER.encode() not in data[:16384]:
+        return None, None
+    return data, hashlib.sha256(data).hexdigest()
+
+
+def _helper_has_marker_fd(path):
+    """Проверка marker на fd-чтении path (не path-based read_text — TOCTOU-свободно)."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(str(path), flags)
+    except OSError:
+        return False
+    try:
+        try:
+            data = _read_fd_regular(fd, max_size=4 * 1024 * 1024)
+        except RuntimeError:
+            return False
+    finally:
+        os.close(fd)
+    return HELPER_MARKER.encode() in data[:16384]
+
+
+def _digest_fd_nofollow(path):
+    """sha256 по fd (O_NOFOLLOW). None если файл не открывается / не regular."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(str(path), flags)
+    except OSError:
+        return None
+    try:
+        try:
+            data = _read_fd_regular(fd, max_size=4 * 1024 * 1024)
+        except RuntimeError:
+            return None
+    finally:
+        os.close(fd)
+    return hashlib.sha256(data).hexdigest()
+
+
+def _stage_helper_bytes(data):
+    """Записать helper bytes в root-owned temp в /private/tmp (fd-pinning: fchmod/fchown по fd).
+
+    temp живёт в root-writable /private/tmp (НЕ user-controlled), имя непредсказуемо
+    (mkstemp O_EXCL). Возвращает Path temp или None при ошибке.
+    """
+    fd, tmp_name = tempfile.mkstemp(prefix="srouter-helper-", suffix=".py", dir="/private/tmp")
+    temp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb", closefd=False) as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.fchmod(fd, 0o755)
+        _fchown_if_privileged(fd, 0, 0)
+        return temp
+    except OSError:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(temp)
+        except OSError:
+            pass
+        return None
+
+
+def _remove_via_runner(runner, path):
+    """Best-effort удаление скомпрометированного helper (fail-closed cleanup)."""
+    try:
+        runner([SUDO, "/bin/rm", "-f", "--", str(path)], 15)
+    except Exception:  # noqa: BLE001 — cleanup не должен маскировать основную ошибку.
+        pass
 
 
 def _rollback_protection(runner, layout=DEFAULT_LAYOUT):
