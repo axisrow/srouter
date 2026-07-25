@@ -181,8 +181,8 @@ srouter install
 #   • настраивает DNS, устанавливает LaunchAgent дашборда и watchdog;
 #   • ставит ppp-hook для мгновенного split-route при VPN;
 #   • настраивает прокси для Claude Code и git (github.com);
-#   • изолирует Codex двумя слоями: SOCKS5-wrappers (~/bin/codex-srouter + codex-app-proxy) и
-#     глобальный env через LaunchAgent (чтобы Codex ходил напрямую в xray, минуя privoxy) — это
+#   • изолирует Codex двумя слоями: SOCKS5-wrappers (~/bin/codex-srouter + codex-app-proxy, zsh-функция)
+#     и scoped VSCode http.proxy (#185) — чтобы Codex ходил напрямую в xray, минуя privoxy — это
 #     текущая живая защита; + PF kill-switch в ядре (#168) как будущая fail-closed граница (режет
 #     прямой TCP-выход codex на en0–en6/ppp0–ppp1, разрешая loopback SOCKS5 по TCP); install создаёт
 #     пользователя uid 503 (#186), но правила пока дормантны — активируются после полной активации
@@ -294,9 +294,11 @@ binary/exec.LookPath), поэтому границей служит именно
 - **`~/bin/codex-app-proxy`** — wrapper App: `open -na Codex.app --args --proxy-server=socks5://...`
   (Chromium flag; env не дублирует). **Codex.app запускать через него, а не иконку Dock**
   (Dock не передаёт `--proxy-server`).
-- **LaunchAgent `com.srouter.codenv`** — глобальный env (`socks5h://...` + `NO_PROXY=localhost,127.0.0.1,::1`)
-  через plist с `EnvironmentVariables` (переживает ребут). Эмпирически: Claude.app/ChatGPT.app на
-  System Settings SOCKS, global env их не ломает.
+- **VSCode `http.proxy` (scoped)** — `socks5h://127.0.0.1:10808` в настройке VSCode/Cursor
+  (`#185`). Расширение `openai.chatgpt` читает её и строит `HTTP_PROXY`/`HTTPS_PROXY` **в env
+  порождаемого codex-процесса**, не трогая Claude Code (отдельный процесс со своим
+  `~/.claude/settings.json`). *(Прежде здесь был глобальный LaunchAgent `com.srouter.codenv` — он
+  **деактивирован**: gui-SOCKS5 ломал Claude Code, #130. `uninstall` ещё чистит его legacy-след.)*
 - **`~/bin` в `~/.zshrc`** — чтобы wrapper был раньше системного codex в PATH.
 
 Всё ставит/убирает `srouter install`/`uninstall` (marker-gate: чужой wrapper/плагин не трогает).
@@ -332,7 +334,7 @@ binary/exec.LookPath), поэтому границей служит именно
 | Инструмент | Подключение |
 |---|---|
 | **Claude Code** | `HTTPS_PROXY=http://127.0.0.1:8118` в `~/.claude/settings.json` (privoxy HTTP; SOCKS5 CC не умеет) |
-| **Codex CLI/App** | **напрямую SOCKS5 в xray** (`socks5h://127.0.0.1:10808`) через wrappers + LaunchAgent env, минуя privoxy — текущая живая защита; + **PF kill-switch в ядре** (#168) как будущая fail-closed граница (режет прямой TCP-выход codex на en0–en6/ppp0–ppp1, разрешая loopback SOCKS5 по TCP; пока дормантен — пользователь uid 503 уже создаётся install (#186), активируется после полной активации: запуск codex под uid 503 (sudo -u) + доменная изоляция + TCP на en/ppp, отдельный follow-up). privoxy портит WS-стриминг Codex (`Reconnecting`/`request timed out`); для клиента Codex↔`chatgpt.com` работает только env (`[network] proxy_url` в `~/.codex/config.toml` управляет execution-scoped sandbox-прокси для субпроцессов, не клиентом) — поэтому wrappers в `~/bin/codex-srouter` (CLI, имя `codex-srouter` убирает коллизию wrapper↔real-binary #169) + `~/bin/codex-app-proxy` (App, `--proxy-server` для Chromium) + глобальный env через `com.srouter.codenv` LaunchAgent (переживает ребут). Запускать Codex **App** через `~/bin/codex-app-proxy`, а не иконку Dock (Dock не передаёт `--proxy-server`). См. раздел «Изоляция Codex». |
+| **Codex CLI/App** | **напрямую SOCKS5 в xray** (`socks5h://127.0.0.1:10808`) через wrappers + scoped VSCode `http.proxy` (#185), минуя privoxy — текущая живая защита; + **PF kill-switch в ядре** (#168) как будущая fail-closed граница (режет прямой TCP-выход codex на en0–en6/ppp0–ppp1, разрешая loopback SOCKS5 по TCP; пока дормантен — пользователь uid 503 уже создаётся install (#186), активируется после полной активации: запуск codex под uid 503 (sudo -u) + доменная изоляция + TCP на en/ppp, отдельный follow-up). privoxy портит WS-стриминг Codex (`Reconnecting`/`request timed out`); для клиента Codex↔`chatgpt.com` работает только env (`[network] proxy_url` в `~/.codex/config.toml` управляет execution-scoped sandbox-прокси для субпроцессов, не клиентом) — поэтому wrappers в `~/bin/codex-srouter` (CLI, имя `codex-srouter` убирает коллизию wrapper↔real-binary #169) + `~/bin/codex-app-proxy` (App, `--proxy-server` для Chromium) + scoped VSCode `http.proxy` для расширения openai.chatgpt (CC не затрагивается). Запускать Codex **App** через `~/bin/codex-app-proxy`, а не иконку Dock (Dock не передаёт `--proxy-server`). См. раздел «Изоляция Codex». |
 | **git / gh** | домены GitHub в вайтлисте узла → резолв и трафик через ускоритель |
 | **Браузер** | системный SOCKS5 `127.0.0.1:10808` (вайтлист разруливает сам) |
 
@@ -401,21 +403,23 @@ sudo pfctl -d                                     # выключить PF цел
 ### 🔒 PF codex-изоляция (kill-switch)
 
 codex — отдельная fail-closed граница в том же PF-ядре, но в **sub-anchor**
-`com.apple/srouter_isolate/codex` (ортогональна доменной изоляции выше). После активации правила
-режут **прямой TCP-выход codex** (под системным UID 503) на физических интерфейсах
-`en0`–`en6`, `ppp0`–`ppp1` и разрешают TCP на loopback SOCKS5 `127.0.0.1:10808` (→ xray → VPS); UDP и неучтённые интерфейсы правилом не покрываются.
-Обход wrapper'а (rename PATH, прямой путь к binary, foreign-wrapper) нерелевантен — совпавший
-пакет дропнется на этих интерфейсах.
+`com.apple/srouter_isolate/codex` (живёт под доменной изоляцией выше — вычисляется только при её
+активной родительской директиве, см. ограничения ниже). После активации правила режут **прямой
+TCP-выход codex** (под системным UID 503) на физических интерфейсах `en0`–`en6`, `ppp0`–`ppp1` и
+разрешают TCP на loopback SOCKS5 `127.0.0.1:10808` (→ xray → VPS); UDP и неучтённые интерфейсы правилом
+не покрываются. Обход wrapper'а (rename PATH, прямой путь к binary, foreign-wrapper) нерелевантен —
+совпавший пакет дропнется на этих интерфейсах.
 
 **Статус:** install **автоматически создаёт** системного пользователя `_srouter_codex` (uid 503,
-не-логин: `UserShell=/usr/bin/false`, `NFSHomeDirectory=/var/empty`, dedicated gid 503) — после
-этого PF-правила (матч по `user 503`) начинают работать. Doctor показывает состояние через чек
-`codex-isolation (PF kill-switch)`.
+не-логин: `UserShell=/usr/bin/false`, `NFSHomeDirectory=/var/empty`, dedicated gid 503) и грузит
+ruleset в sub-anchor (матч по `user 503`). Это **инфраструктура**, но не активная защита — см.
+known-limitations ниже (пока ни одно условие не выполнено, ни один codex-процесс не защищён).
+Doctor показывает состояние через чек `codex-isolation (PF kill-switch)`.
 
 **Known-limitations (почему пока standby, не полная kill-switch):**
 
-1. **Codex ещё бежит под пользовательским UID (501), не под 503** — PF-правила активны в standby
-   (матчат только трафик UID 503, которого пока ни один процесс не генерирует). Интеграция
+1. **Codex ещё бежит под пользовательским UID (501), не под 503** — PF-правила загружены, но
+   простаивают (матчат только трафик UID 503, которого пока ни один процесс не генерирует). Интеграция
    `sudo -u _srouter_codex` в wrapper — отдельный follow-up.
 2. **Codex.app (GUI/Cocoa)** не покрывается (изоляция под не-логин UID проблематична для Cocoa-app,
    дизайн #167 §7 R1) — только codex CLI.
@@ -512,12 +516,13 @@ srouter install
 #   • sets DNS, installs the dashboard LaunchAgent and watchdog;
 #   • sets up ppp-hook for instant split-route on VPN up;
 #   • configures proxy for Claude Code and git (github.com);
-#   • isolates Codex in two layers: SOCKS5 wrappers (~/bin/codex-srouter + codex-app-proxy) and
-#     global env via a LaunchAgent (so Codex goes straight to xray, bypassing privoxy) — the current
-#     live guard; + a PF kill-switch in the kernel (#168) as the future fail-closed boundary (cuts
-#     codex direct TCP egress on en0–en6/ppp0–ppp1, allowing TCP to loopback SOCKS5); install creates
-#     the uid 503 user (#186), but the rules stay dormant — they activate after full activation
-#     (launching codex under uid 503 via sudo -u + domain isolation + TCP on en/ppp, a separate follow-up);
+#   • isolates Codex in two layers: SOCKS5 wrappers (~/bin/codex-srouter + codex-app-proxy, zsh
+#     function) and scoped VSCode http.proxy (#185) (so Codex goes straight to xray, bypassing
+#     privoxy) — the current live guard; + a PF kill-switch in the kernel (#168) as the future
+#     fail-closed boundary (cuts codex direct TCP egress on en0–en6/ppp0–ppp1, allowing TCP to
+#     loopback SOCKS5); install creates the uid 503 user (#186), but the rules stay dormant — they
+#     activate after full activation (launching codex under uid 503 via sudo -u + domain isolation +
+#     TCP on en/ppp, a separate follow-up);
 #   • prints a plan and asks for confirmation.
 srouter status         # check the daemon is up (http://127.0.0.1:8787)
 srouter doctor         # diagnostics: ports + tunnel + Claude-proxy (✅/❌)
@@ -625,9 +630,11 @@ optimization (they route traffic through the right channel without relying on th
 - **`~/bin/codex-app-proxy`** — App wrapper: `open -na Codex.app --args --proxy-server=socks5://...`
   (Chromium flag; no env duplication). **Launch Codex.app via this, not the Dock icon** (Dock doesn't
   pass `--proxy-server`).
-- **LaunchAgent `com.srouter.codenv`** — global env (`socks5h://...` + `NO_PROXY=localhost,127.0.0.1,::1`) via a
-  plist with `EnvironmentVariables` (survives reboot). Empirically: Claude.app/ChatGPT.app use System
-  Settings SOCKS, so the global env doesn't break them.
+- **VSCode `http.proxy` (scoped)** — `socks5h://127.0.0.1:10808` in the VSCode/Cursor setting
+  (`#185`). The `openai.chatgpt` extension reads it and builds `HTTP_PROXY`/`HTTPS_PROXY` **in the env
+  of the spawned codex process**, leaving Claude Code untouched (a separate process with its own
+  `~/.claude/settings.json`). *(A global LaunchAgent `com.srouter.codenv` used to live here — it is
+  **disabled**: the gui-SOCKS5 broke Claude Code, #130. `uninstall` still cleans its legacy trace.)*
 - **`~/bin` in `~/.zshrc`** — so the wrapper precedes the system codex in PATH.
 
 All installed/removed by `srouter install`/`uninstall` (marker-gate: a foreign wrapper/plugin is left
@@ -723,20 +730,22 @@ every 6 h (a stale IP in the table is harmless — we block, not permit).
 ### 🔒 PF codex isolation (kill-switch)
 
 codex is a separate fail-closed boundary in the same PF kernel, but in a **sub-anchor**
-`com.apple/srouter_isolate/codex` (orthogonal to the domain isolation above). Once active, the rules
-cut codex **direct TCP egress** (running under system UID 503) on the physical interfaces
-`en0`–`en6`, `ppp0`–`ppp1` and allow only loopback SOCKS5 `127.0.0.1:10808` (→ xray → VPS). A wrapper
-bypass (PATH rename, direct binary path, foreign wrapper) is irrelevant — a matching packet is dropped
-on those interfaces.
+`com.apple/srouter_isolate/codex` (it lives under the domain isolation above — it is only evaluated
+when the latter's parent directive is active, see the limitations below). Once active, the rules cut
+codex **direct TCP egress** (running under system UID 503) on the physical interfaces `en0`–`en6`,
+`ppp0`–`ppp1` and allow TCP to loopback SOCKS5 `127.0.0.1:10808` (→ xray → VPS); UDP and unlisted
+interfaces are not covered. A wrapper bypass (PATH rename, direct binary path, foreign wrapper) is
+irrelevant — a matching packet is dropped on those interfaces.
 
 **Status:** install **automatically creates** the system user `_srouter_codex` (uid 503, non-login:
-`UserShell=/usr/bin/false`, `NFSHomeDirectory=/var/empty`, dedicated gid 503) — after that the PF
-rules (matching by `user 503`) become effective. Doctor surfaces the state via the
-`codex-isolation (PF kill-switch)` check.
+`UserShell=/usr/bin/false`, `NFSHomeDirectory=/var/empty`, dedicated gid 503) and loads the ruleset
+into the sub-anchor (matching by `user 503`). This is **infrastructure**, not an active guard — see
+the known-limitations below (until any condition is met, no codex process is protected). Doctor
+surfaces the state via the `codex-isolation (PF kill-switch)` check.
 
 **Known-limitations (why standby today, not a full kill-switch):**
 
-1. **Codex still runs under your user UID (501), not 503** — the PF rules are active in standby (they
+1. **Codex still runs under your user UID (501), not 503** — the PF rules are loaded but idle (they
    match only uid 503 traffic, which no process currently generates). Wiring
    `sudo -u _srouter_codex` into the wrapper is a separate follow-up.
 2. **Codex.app (GUI/Cocoa)** is not covered (isolation under a non-login UID is problematic for a
@@ -761,7 +770,7 @@ remove it).
 | Tool | Wiring |
 |---|---|
 | **Claude Code** | `HTTPS_PROXY=http://127.0.0.1:8118` in `~/.claude/settings.json` |
-| **Codex** | env for the Codex↔`chatgpt.com` client (`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`, e.g. `socks5h://127.0.0.1:10808` via wrappers + LaunchAgent) — the current live guard; + **a PF kill-switch in the kernel** (#168) as the future fail-closed boundary (cuts codex direct TCP egress on en0–en6/ppp0–ppp1, allowing TCP to loopback SOCKS5; dormant today — the uid 503 user is already created by install (#186), and activation requires full activation: launching codex under uid 503 (sudo -u) + domain isolation + TCP on en/ppp, a separate follow-up). `[network] proxy_url` in `~/.codex/config.toml` does NOT drive that client — it configures the execution-scoped sandbox proxy for spawned `codex` subprocesses. See the "Codex isolation" section. |
+| **Codex** | env for the Codex↔`chatgpt.com` client (`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`, e.g. `socks5h://127.0.0.1:10808` via wrappers + scoped VSCode `http.proxy` #185) — the current live guard; + **a PF kill-switch in the kernel** (#168) as the future fail-closed boundary (cuts codex direct TCP egress on en0–en6/ppp0–ppp1, allowing TCP to loopback SOCKS5; dormant today — the uid 503 user is already created by install (#186), and activation requires full activation: launching codex under uid 503 (sudo -u) + domain isolation + TCP on en/ppp, a separate follow-up). `[network] proxy_url` in `~/.codex/config.toml` does NOT drive that client — it configures the execution-scoped sandbox proxy for spawned `codex` subprocesses. See the "Codex isolation" section. |
 | **git / gh** | GitHub domains whitelisted on the node |
 | **Browser** | system SOCKS5 `127.0.0.1:10808` |
 
