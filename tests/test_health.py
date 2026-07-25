@@ -695,6 +695,22 @@ def test_desktop_proxy_down_when_socks5_foreign_no_codenv(monkeypatch):
     assert res["status"] == "down", f"чужой SOCKS5 (не codenv) → down (#127); got {res}"
 
 
+def test_codenv_managed_no_crash_on_binary_plist(monkeypatch, tmp_path):
+    """_codenv_managed НЕ крашится на бинарном/повреждённом plist → False (fail-safe).
+
+    Cycle-review finding: Path.read_text(encoding=utf-8) на бинарном plist кидает UnicodeDecodeError
+    (наследник ValueError, НЕ OSError). except OSError его пропускал → crash через _desktop_proxy_check
+    → check_all (fail-open, нарушение srouter-critical-infra-24-7). codenv plist обычно XML, но может
+    быть binary (plutil -convert binary1) или повреждён — один файл не должен ронять весь doctor.
+    """
+    plist = tmp_path / "Library" / "LaunchAgents" / f"{health._CODENV_LABEL}.plist"
+    plist.parent.mkdir(parents=True)
+    plist.write_bytes(b"\xff\xfe\x00\x01binary-plist-not-utf8")  # невалидный UTF-8
+    monkeypatch.setattr(health.Path, "home", lambda: tmp_path)
+    # НЕ должно бросать — fail-safe False (трактуем как «не наш codenv» → down для чужого SOCKS5).
+    assert health._codenv_managed() is False
+
+
 def test_desktop_proxy_silent_when_settings_matches_launchctl(monkeypatch):
     """settings.json HTTPS_PROXY == launchctl HTTPS_PROXY → ok, без WARN о расхождении."""
     monkeypatch.setattr(health, "_read_proxy_sources",

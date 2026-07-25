@@ -1089,7 +1089,10 @@ def _codenv_managed():
     try:
         plist = Path.home() / "Library" / "LaunchAgents" / f"{_CODENV_LABEL}.plist"
         return plist.exists() and _CODENV_MARKER in plist.read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, ValueError):
+        # OSError — нет файла/прав; ValueError — UnicodeDecodeError на бинарном/повреждённом plist
+        # (codenv plist обычно XML, но может быть binary plutil-convert или битым). НЕ Exception —
+        # иначе маскирует баги (канон systemexit-breaks-except-exception-fallback). Fail-safe False.
         return False
 
 
