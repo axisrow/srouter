@@ -149,6 +149,26 @@ def _valid_uid(uid):
     return None
 
 
+# RealName может содержать пробел (отображается в Системных настройках, как «Asset Cache» у
+# _assetcache). Пробел/метасимвол НЕЛЬЗЯ вставлять в shell-cmd как-есть — shell-split превратит
+# «RealName srouter codex» в multi-valued свойство (man dscl: create key val... — несколько val).
+# Поэтому: валидируем (только буквы/цифры/пробел, никаких shell-метасимволов) И квотим shlex.quote
+# при подстановке (канон _admin_run: shell_cmd из констант+validated, без неявного split).
+_REALNAME_RE = re.compile(r"^[A-Za-z0-9 _.\-]+$")
+
+
+def _valid_realname(name):
+    """RealName в shell-safe форме или None. Буквы/цифры/пробел/_.- — никаких метасимволов.
+
+    Возвращает shlex.quote-нутое значение (готовое к подстановке в shell-cmd) или None.
+    Даже валидное multi-word значение обязано квотиться — иначе пробел = shell-split.
+    """
+    import shlex
+    if isinstance(name, str) and _REALNAME_RE.fullmatch(name):
+        return shlex.quote(name)
+    return None
+
+
 def _admin_run(shell_cmd):
     """Привилегированный запуск shell_cmd через osascript admin-мост (канон traffic_shape).
 
@@ -625,14 +645,15 @@ def provision_codex_user():
         name = _valid_user_name(CODEX_USER_NAME)
         uid = _valid_uid(CODEX_USER)
         gid = _valid_uid(CODEX_USER_GID)
-        if not (name and uid and gid):
+        realname = _valid_realname(CODEX_USER_REALNAME)  # shlex.quote — пробел safe (канон _admin_run)
+        if not (name and uid and gid and realname):
             return _reject("константы codex-user невалидны")
         record = f"/Users/{name}"
         steps = [
             f"{DSCL} . -create {record} UniqueID {uid}",
             f"{DSCL} . -create {record} PrimaryGroupID {gid}",
             f"{DSCL} . -create {record} UserShell {CODEX_USER_SHELL}",
-            f"{DSCL} . -create {record} RealName {CODEX_USER_REALNAME}",
+            f"{DSCL} . -create {record} RealName {realname}",
             f"{DSCL} . -create {record} NFSHomeDirectory {CODEX_USER_HOME}",
         ]
         shell_cmd = " && ".join(steps)

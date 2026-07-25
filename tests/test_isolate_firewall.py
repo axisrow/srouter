@@ -299,6 +299,12 @@ def test_provision_codex_user_creates_via_dscl_create_chain(monkeypatch):
     assert "UserShell /usr/bin/false" in shell_text, shell_text
     assert "NFSHomeDirectory /var/empty" in shell_text, shell_text
     assert "RealName" in shell_text, shell_text
+    # cycle-review fix: RealName с пробелом ОБЯЗАН квотиться (shlex.quote), иначе shell-split
+    # превратит «RealName srouter codex» в multi-valued свойство (man dscl: create key val...).
+    # Канон _admin_run: shell_cmd из констант+validated, без неявного split.
+    assert "'srouter codex'" in shell_text or "srouter codex" not in \
+        shell_text.replace("'srouter codex'", ""), \
+        f"RealName с пробелом квочен (shlex.quote), не raw-shell-split: {shell_text}"
     # fail-fast цепочка
     assert "&&" in shell_text, "create-шаги соединены fail-fast &&"
 
@@ -414,6 +420,22 @@ def test_valid_uid_rejects_nonnumeric():
     assert isolate_firewall._valid_uid("abc") is None
     assert isolate_firewall._valid_uid("") is None
     assert isolate_firewall._valid_uid("503a") is None
+
+
+def test_valid_realname_quotes_multivord_and_rejects_metachars():
+    """cycle-review fix: RealName с пробелом квотится (shlex.quote), метасимволы rejected.
+
+    Без квотинга «RealName srouter codex» → shell-split → multi-valued свойство (man dscl).
+    Канон _admin_run: shell_cmd без неявного split. shlex.quote даёт 'srouter codex' (single-quoted).
+    """
+    assert isolate_firewall._valid_realname("srouter codex") == "'srouter codex'", \
+        "multi-word RealName квочится shlex.quote"
+    assert isolate_firewall._valid_realname("codex") == "codex", \
+        "single-word без пробела — без кавычек (shlex не квотит простые)"
+    assert isolate_firewall._valid_realname("srouter; rm -rf /") is None, "shell-метасимвол rejected"
+    assert isolate_firewall._valid_realname("codex$(x)") is None, "command-substitution rejected"
+    assert isolate_firewall._valid_realname("") is None
+    assert isolate_firewall._valid_realname(None) is None
 
 
 @unittest.skipUnless(os.environ.get("SROUTER_TEST_SUDO"),
