@@ -1249,6 +1249,22 @@ def _codex_app_proxy_check():
                   if urlparse(v).scheme.lower() in {"socks", "socks5", "socks5h"}}
     if socks_keys:
         found = ", ".join(f"{k}={v}" for k, v in socks_keys.items())
+        # cycle-review #190 round 1: gui-env SOCKS5 ≠ live-маршрут App-PID. launchctl setenv НЕ
+        # ретроактивен — Rust app-server, запущенный ДО codenv install, держит старый direct-маршрут,
+        # пока gui-env уже обновлён. lsof по App-PID подтверждает реальный маршрут (как _codex_proxy_probe).
+        # Без этого — false-ok (check видит SOCKS5 gui-env, App реально идёт напрямую → GFW рвёт).
+        route = _app_pids_route(app_pids)
+        if route.get("external"):
+            ext = ",".join(sorted(route["external"]))
+            return {"status": "down", "source": "runtime",
+                    "detail": (f"ChatGPT.app Rust app-server НАПРЯМУЮ (gui-env SOCKS5 есть, но App PID {ext} "
+                               f"держит external-сокеты) — STALE App: запущен ДО codenv, setenv не ретроактивен. "
+                               f"Полностью перезапусти ChatGPT.app (Cmd+Q из Dock, не закрыть окно). "
+                               f"codenv gui-env: {found}")}
+        if route.get("verifiable") is False:
+            return {"status": "unknown", "source": "runtime",
+                    "detail": (f"lsof App-PID не отвечает — runtime-маршрут не верифицируем (gui-env SOCKS5: "
+                               f"{found}, {pid_hint}). Ручная проверка: lsof -nP -p {','.join(app_pids)}")}
         return {"status": "ok", "source": "gui-env",
                 "detail": f"ChatGPT.app Rust app-server через SOCKS5 (codenv gui-env: {found}, {pid_hint})"}
     # gui-env задан, но без SOCKS5 (только HTTP/privoxy) → warn (long-lived WS порвётся #120).
@@ -1256,6 +1272,30 @@ def _codex_app_proxy_check():
     return {"status": "warn", "source": "gui-env",
             "detail": (f"ChatGPT.app Rust app-server через HTTP прокси без SOCKS5 ({found}, {pid_hint}) — "
                        f"privoxy рвёт long-lived WS (#120). codenv должен ставить SOCKS5")}
+
+
+def _app_pids_route(app_pids):
+    """Runtime-маршрут App-PID по lsof-сокетам (как _codex_proxy_probe, но для App-PID).
+
+    cycle-review #190 round 1: _codex_app_proxy_check не может полагаться только на gui-env (setenv
+    не ретроактивен → stale App). lsof по App-PID классифицирует РЕАЛЬНЫЙ маршрут: external-ESTABLISHED
+    (direct, без localhost) = App идёт напрямую, несмотря на gui-env SOCKS5.
+    Возвращает {external: set(pids), socks: set(pids), verifiable: bool}. timeout → verifiable=False.
+    """
+    lr = sys_probe.run([LSOF, "-nP", "-p", ",".join(app_pids)], timeout=3)
+    if lr.get("timeout"):
+        return {"external": set(), "socks": set(), "verifiable": False}
+    external, socks = set(), set()
+    for line in (lr.get("out") or "").splitlines():
+        if "TCP" not in line or "ESTABLISHED" not in line:
+            continue
+        fields = line.split()
+        pid = fields[1] if len(fields) > 1 else ""
+        if f"->127.0.0.1:{XRAY_PORT}" in line:
+            socks.add(pid)
+        elif "->127.0.0.1:" not in line:
+            external.add(pid)  # external ESTABLISHED — direct, без localhost-прокси
+    return {"external": external, "socks": socks, "verifiable": True}
 
 
 # ============================ #185: scoped SOCKS5 для codex через VSCode http.proxy ============================

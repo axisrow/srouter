@@ -22,13 +22,14 @@ SOCKS5 = "socks5h://127.0.0.1:10808"
 PRIVOXY = "http://127.0.0.1:8118"
 
 
-def _fake(ps_out, gui_env_text="", gui_verifiable=True):
-    """fake_run: ps → ps_out; launchctl print gui/<uid> → gui_env_text (блок environment).
+def _fake(ps_out, gui_env_text="", gui_verifiable=True, lsof_out=""):
+    """fake_run: ps → ps_out; launchctl print gui/<uid> → gui_env_text; lsof -p <app_pids> → lsof_out.
 
     _read_gui_proxy_env парсит `launchctl print gui/<uid>` блок `environment = { ... }` (getenv НЕ
     принимает домен-аргумент — Usage: getenv <key> — молча игнорирует домен, давая пусто/ложный down).
     gui_env_text = сырой текст environment-блока (для имитации print-вывода). gui_verifiable=False →
     timeout launchctl (fail-closed → unknown, не false-down).
+    lsof_out = lsof-вывод для App-PID (runtime-маршрут — _codex_app_proxy_check добавил после cycle-1).
     """
     def fake_run(cmd, timeout):
         if cmd and cmd[0] == "/bin/ps":
@@ -37,8 +38,22 @@ def _fake(ps_out, gui_env_text="", gui_verifiable=True):
             if not gui_verifiable:
                 return {"rc": None, "out": "", "err": "timeout", "timeout": True}
             return {"rc": 0, "out": gui_env_text, "err": "", "timeout": False}
+        if cmd and cmd[0] == "/usr/sbin/lsof":
+            return {"rc": 0, "out": lsof_out, "err": "", "timeout": False}
         return {"rc": 0, "out": "", "err": "", "timeout": False}
     return fake_run
+
+
+def _lsof_external(pid, port=443):
+    """lsof-строка: App-PID держит external ESTABLISHED (direct, без localhost-прокси)."""
+    return (f"codex {pid} axisrow 32u IPv4 0xABC 0t0 "
+            f"TCP 192.168.1.17:55607->31.13.95.48:{port} (ESTABLISHED)\n")
+
+
+def _lsof_socks(pid):
+    """lsof-строка: App-PID через SOCKS5 10808 (как должно быть при рабочем codenv + свежем App)."""
+    return (f"codex {pid} axisrow 32u IPv4 0xABC 0t0 "
+            f"TCP 127.0.0.1:55607->127.0.0.1:10808 (ESTABLISHED)\n")
 
 
 def _gui_env(keys):
@@ -69,21 +84,41 @@ def test_app_proxy_down_when_app_running_and_gui_env_empty(monkeypatch):
 
 
 def test_app_proxy_ok_when_app_running_and_gui_socks5(monkeypatch):
-    """App-codex активен + gui-env SOCKS5 → ok: codenv работает, Rust app-server через 10808."""
+    """App-codex активен + gui-env SOCKS5 + lsof подтверждает 10808 → ok: свежий App, codenv работает."""
     ps = f"60826 {APP_CODEX_COMM}\n"
     monkeypatch.setattr(health.sys_probe, "run",
-                        _fake(ps, _gui_env({"HTTPS_PROXY": SOCKS5, "HTTP_PROXY": SOCKS5, "ALL_PROXY": SOCKS5})))
+                        _fake(ps, _gui_env({"HTTPS_PROXY": SOCKS5, "HTTP_PROXY": SOCKS5, "ALL_PROXY": SOCKS5}),
+                              lsof_out=_lsof_socks("60826")))
     res = health._codex_app_proxy_check()
-    assert res["status"] == "ok", f"App активен + gui SOCKS5 → ok (codenv работает); got {res}"
+    assert res["status"] == "ok", f"App активен + gui SOCKS5 + lsof 10808 → ok; got {res}"
+
+
+def test_app_proxy_down_when_stale_app_direct_despite_gui_socks5(monkeypatch):
+    """STALE App (запущен ДО codenv install) + gui-env SOCKS5 + lsof external → down, НЕ ok.
+
+    Cycle-1 finding: launchctl setenv НЕ ретроактивен — Rust app-server, запущенный до codenv, держит
+    старый прямой маршрут, пока gui-env уже обновлён. Чек по одному gui-env давал ложный ok (false-ok).
+    lsof App-PID показывает external ESTABLISHED → down с диагнозом «перезапусти ChatGPT.app».
+    App-PID исключён из _codex_proxy_probe (TUI) → этот чек единственный, кто видит App direct-сокеты.
+    """
+    ps = f"60826 {APP_CODEX_COMM}\n"
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _fake(ps, _gui_env({"HTTPS_PROXY": SOCKS5, "ALL_PROXY": SOCKS5}),
+                              lsof_out=_lsof_external("60826")))
+    res = health._codex_app_proxy_check()
+    assert res["status"] == "down", f"stale App direct (gui SOCKS5, lsof external) → down, не ok; got {res}"
+    detail = res["detail"].lower()
+    assert "перезапуст" in detail or "restart" in detail or "direct" in detail, \
+        f"detail объясняет: нужен рестарт App (setenv не ретроактивен); got {res}"
 
 
 def test_app_proxy_ok_when_socks_in_all_proxy_only(monkeypatch):
-    """codenv ставит ALL_PROXY=socks5h — достаточно для Rust app-server (как CLI-тест подтвердил)."""
+    """codenv ставит ALL_PROXY=socks5h + lsof подтверждает 10808 → ok (свежий App)."""
     ps = f"60826 {APP_CODEX_COMM}\n"
     monkeypatch.setattr(health.sys_probe, "run",
-                        _fake(ps, _gui_env({"ALL_PROXY": SOCKS5})))
+                        _fake(ps, _gui_env({"ALL_PROXY": SOCKS5}), lsof_out=_lsof_socks("60826")))
     res = health._codex_app_proxy_check()
-    assert res["status"] == "ok", f"ALL_PROXY SOCKS5 → ok; got {res}"
+    assert res["status"] == "ok", f"ALL_PROXY SOCKS5 + lsof 10808 → ok; got {res}"
 
 
 def test_app_proxy_warn_when_app_running_and_gui_http_only(monkeypatch):
