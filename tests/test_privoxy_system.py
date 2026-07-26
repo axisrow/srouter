@@ -1244,3 +1244,250 @@ def test_protect_passes_debug_to_generated_config_and_helper(tmp_path, monkeypat
     assert captured["staged_debug"] is True
     assert captured["helper_debug"] is True
 
+
+# ---------------------------------------------------------------------------
+# #148: полный fd-pinning против root TOCTOU в privoxy_system path-операциях.
+# Три класса (arbitrary chown / templates re-resolution / helper-install root exec)
+# имеют единую причину — path-based metadata/traversal операции после fd-open.
+# Каждый race-тест моделирует состояние ПОСЛЕ TOCTOU-подмены (канон always-tdd:
+# тест падает на дыру, зелёнит на fd-pinning; без него fd-pinning легко написать
+# с новой TOCTOU).
+# ---------------------------------------------------------------------------
+
+
+def test_atomic_write_pins_fd_against_post_mkstemp_symlink_swap(tmp_path, monkeypatch):
+    """#148 variant 1: arbitrary chown через temp-подмену после mkstemp.
+
+    _atomic_write открывает temp через tempfile.mkstemp (fd), но затем делала
+    os.chmod(temp)/chown(temp) ПО ПУТИ — после того, как fd уже закрыт fdopen'ом.
+    Владелец parent-каталога (при restore user_plist это ~/Library/LaunchAgents)
+    наблюдает создание root-файла, rename'ит его и ставит symlink с тем же именем
+    на произвольную цель → chmod/chown по пути следуют symlink → arbitrary chown
+    цели на uid/gid атакующего.
+
+    Симуляция: после mkstemp подменяем temp-путь на symlink (состояние ПОСЛЕ race).
+    Path-based chmod/chown попадут в цель symlink (проверено эмпирически: os.chmod
+    следует symlink). fd-pinned fchmod/fchown по fd цели НЕ касаются.
+    """
+    secret = tmp_path / "victim-secret"
+    secret.write_text("must-not-be-chowned", encoding="utf-8")
+    secret.chmod(0o600)
+    secret_uid, secret_gid = secret.stat().st_uid, secret.stat().st_gid
+    target = tmp_path / "dst"
+    real_mkstemp = privoxy_system.tempfile.mkstemp
+
+    def racing_mkstemp(*args, **kwargs):
+        fd, tmp_name = real_mkstemp(*args, **kwargs)
+        # Состояние ПОСЛЕ race: атакующий переименовал свежесозданный temp и
+        # подложил symlink с тем же именем на жертву. fd всё ещё указывает на
+        # оригинальный regular-файл (атакующий его переименовал, не удалил).
+        os.rename(tmp_name, tmp_name + ".stolen")
+        os.symlink(secret, tmp_name)
+        return fd, tmp_name
+
+    monkeypatch.setattr(privoxy_system.tempfile, "mkstemp", racing_mkstemp)
+    seen = {}
+    monkeypatch.setattr(
+        privoxy_system.os, "chmod",
+        lambda path, mode: seen.setdefault("chmod_path", str(path)),
+    )
+
+    ok = privoxy_system._atomic_write(
+        target, b"payload", mode=0o644,
+        uid=secret_uid, gid=secret_gid,
+        chown=lambda path, uid, gid: seen.setdefault("chown_path", str(path)),
+    )
+
+    # fd-pinned реализация НИКОГДА не должна дойти до path-based chmod/chown:
+    # fchmod/fchown работают по fd и не следуют symlink. Видеть symlink-имя здесь
+    # = уязвимость к arbitrary chown.
+    assert ok is True
+    assert "chmod_path" not in seen, (
+        "path-based chmod после fd-close оставляет TOCTOU; нужен fchmod по fd"
+    )
+    assert "chown_path" not in seen, (
+        "path-based chown после fd-close оставляет TOCTOU; нужен fchown по fd"
+    )
+    # Жертва не тронута (нет arbitrary chown целевого файла).
+    assert secret.stat().st_mode & 0o777 == 0o600
+
+
+def test_copy_tree_nofollow_traverses_by_dirfd_without_path_resolution(tmp_path, monkeypatch):
+    """#148 variant 2: templates TOCTOU — повторное path-resolution в tree-traversal.
+
+    _copy_tree_nofollow делала src.lstat() корня, затем os.listdir(src) и
+    src_entry.lstat() ПО ПУТИ. Между lstat(root) и перечислением каталог
+    (Homebrew templates, user-writable) атомарно подменяется symlink'ом на
+    root-only дерево → root копирует чужие regular-файлы как 0644 world-readable.
+
+    Симуляция: src_root пуст (lstat-root проходит как dir), но к моменту
+    path-based listdir(src) атакующий уже заменил его на symlink к чужому дереву.
+    Path-based listdir(src) следует symlink и вернёт ['leaked'] → уязвимый код
+    скопирует чужой файл в dst. fd-based os.listdir(dir_fd) — dir_fd открыт с
+    O_NOFOLLOW|O_DIRECTORY ДО подмены и повторного path-resolution не делает
+    (позиционный аргумент = integer fd, не путь) → вернёт [] для пустого корня.
+    """
+    foreign = tmp_path / "root-only-tree"
+    foreign.mkdir()
+    (foreign / "leaked").write_text("top-secret-root-content", encoding="utf-8")
+    src_root = tmp_path / "templates"
+    src_root.mkdir()  # пустой — lstat-root проходит, race-окно открыто
+    real_listdir = privoxy_system.os.listdir
+
+    def racing_listdir(path, *args, **kwargs):
+        # dir_fd-форма (positional arg = int) — повторного path-resolution нет,
+        # гонка её не касается. path-форма (str/bytes/Path) повторно разрешает
+        # путь — именно здесь уязвимый код попадает в подменённый symlink.
+        if isinstance(path, int):
+            return real_listdir(path, *args, **kwargs)
+        sp = str(os.fspath(path)).rstrip("/")
+        if sp == str(src_root) and src_root.is_dir() and not src_root.is_symlink():
+            src_root.rmdir()  # пустой — детерминированно
+            src_root.symlink_to(foreign)
+        return real_listdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(privoxy_system.os, "listdir", racing_listdir)
+    dst = tmp_path / "protected-templates"
+    ok = privoxy_system._copy_tree_nofollow(
+        src_root, dst, chown=lambda path, uid, gid: None,
+    )
+
+    # fd-pinned traversal открывает root через O_NOFOLLOW|O_DIRECTORY один раз и
+    # перечисляет через dir_fd — повторного path-resolution нет, подмена src_root
+    # на symlink между lstat и listdir не даёт attacker-дерева.
+    assert ok is True
+    leaked = dst / "leaked"
+    assert not leaked.exists(), (
+        "path-based listdir в tree-traversal следует symlink — нужен dir_fd"
+    )
+
+
+def test_install_helper_feeds_install_pinned_bytes_not_reopened_pathname(tmp_path, monkeypatch):
+    """#148 variant 3: root code execution через helper-install (самый опасный).
+
+    _install_helper проверяла marker на __file__, но /usr/bin/install повторно
+    открывал тот же pathname под sudo. Атакующий атомарно заменяет файл во время
+    password-prompt: Python идёт по безопасному control flow, а install кладёт
+    attacker-bytes как root-owned helper 0755, который protect сразу запускает
+    через sudo → произвольное root-выполнение.
+
+    Фикс: до sudo открыть __file__ через O_NOFOLLOW, прочитать bytes, проверить
+    marker, вычислить digest; кормить install ЗАФИКСИРОВАННЫМИ bytes (root-owned
+    temp), не переоткрытием pathname; после install сверить digest helper'а.
+
+    Этот тест требует, чтобы argv install получал src, НЕ равный __file__:
+    install должен копировать зафиксированный root-owned файл (не сам __file__).
+    Симметрично: на уязвимом коде src == Path(__file__).resolve() = re-open pathname.
+    """
+    layout = _layout(tmp_path)
+    captured = {"install_src": None, "install_bytes": b""}
+
+    # __file__ модуля — валидный helper (содержит HELPER_MARKER в начале файла).
+    self_path = Path(privoxy_system.__file__)
+
+    def runner(cmd, timeout):
+        if privoxy_system.INSTALL in cmd:
+            # install -o root -g wheel -m 0755 <SRC> <DST> — SRC должен быть
+            # зафиксированным root-owned temp, НЕ __file__ (иначе TOCTOU под sudo).
+            m_idx = cmd.index("-m")
+            captured["install_src"] = cmd[m_idx + 2]  # элемент после -m 0755
+            # Зафиксируем bytes немедленно — staged temp удалится в finally _install_helper.
+            staged_path = Path(captured["install_src"])
+            captured["install_bytes"] = staged_path.read_bytes()
+            # Симулируем успех install: пишем в helper_path «установленные» bytes.
+            layout.helper_path.parent.mkdir(parents=True, exist_ok=True)
+            layout.helper_path.write_bytes(captured["install_bytes"])
+            return {"rc": 0, "out": "", "err": "", "timeout": False}
+        if privoxy_system.MKDIR in cmd:
+            layout.helper_path.parent.mkdir(parents=True, exist_ok=True)
+            return {"rc": 0, "out": "", "err": "", "timeout": False}
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+
+    result = privoxy_system._install_helper(runner, layout)
+
+    assert result["ok"] is True, result
+    # install-fed src обязан отличаться от __file__ — иначе pathname ре-открывается
+    # под sudo и открывает TOCTOU window.
+    assert captured["install_src"] is not None, "install не вызван"
+    assert Path(captured["install_src"]).resolve() != self_path.resolve(), (
+        "install кормится pathname __file__ → TOCTOU под sudo; нужны "
+        "зафиксированные digest-проверенные bytes"
+    )
+    # Зафиксированные bytes проходят marker-проверку (т.е. helper валиден).
+    assert privoxy_system.HELPER_MARKER.encode() in captured["install_bytes"][:16384]
+
+
+def test_install_helper_rejects_when_installed_helper_digest_mismatch(tmp_path, monkeypatch):
+    """#148 variant 3 fail-closed: digest после install обязан совпадать.
+
+    Даже если install взял зафиксированные bytes, между install и постпроверкой
+    attacker мог подменить helper_path (например через второй race в helper_path).
+    post-install digest-check обязан отвергнуть расхождение и fail-closed.
+    """
+    layout = _layout(tmp_path)
+
+    def runner(cmd, timeout):
+        if privoxy_system.INSTALL in cmd:
+            # Симулируем подмену: install «успешен», но в helper_path лежит
+            # НЕ зафиксированные bytes, а attacker-подмена.
+            layout.helper_path.parent.mkdir(parents=True, exist_ok=True)
+            layout.helper_path.write_text("#!/bin/sh\n# attacker-bytes\n", encoding="utf-8")
+            return {"rc": 0, "out": "", "err": "", "timeout": False}
+        if privoxy_system.MKDIR in cmd:
+            layout.helper_path.parent.mkdir(parents=True, exist_ok=True)
+            return {"rc": 0, "out": "", "err": "", "timeout": False}
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+
+    result = privoxy_system._install_helper(runner, layout)
+    assert result["ok"] is False
+    assert "helper_digest_mismatch" in result["error"]
+
+
+def test_install_helper_fail_closed_when_staged_substituted_after_mkstemp(tmp_path, monkeypatch):
+    """#148 variant 3 (Codex observation): staged user-owned в окне [mkstemp .. sudo install].
+
+    _stage_helper_bytes вызывается в user-процессе `protect()` (НЕ root) → mkstemp
+    создаёт USER-owned staged в /private/tmp. В окне до `sudo install staged dst`
+    тот же UID может подменить staged attacker-bytes. _install_helper обязан ловить
+    это через post-install digest-check: install копирует (подменённый) staged
+    байт-в-байт в root-owned helper, digest helper сравнивается с expected-digest
+    честно прочитанного __file__ — расхождение = fail-closed, attacker-bytes никогда
+    не становятся валидным root-owned helper'ом.
+
+    Симуляция: runner перехватывает sudo install, читает staged-путь из argv,
+    переписывает staged attacker-bytes (моделируя same-UID подмену в окне), затем
+    копирует подмену в helper_path (как сделал бы /usr/bin/install).
+    """
+    layout = _layout(tmp_path)
+
+    def runner(cmd, timeout):
+        if privoxy_system.INSTALL in cmd:
+            m_idx = cmd.index("-m")
+            staged_path = Path(cmd[m_idx + 2])
+            # Моделируем подмену staged attacker'ом (same-UID, в окне до sudo install).
+            assert staged_path.exists(), "staged temp должен существовать к моменту install"
+            staged_path.write_bytes(b"#!/bin/sh\n# attacker-substituted-staged\n")
+            # /usr/bin/install копирует staged байт-в-байт в helper_path.
+            layout.helper_path.parent.mkdir(parents=True, exist_ok=True)
+            layout.helper_path.write_bytes(staged_path.read_bytes())
+            return {"rc": 0, "out": "", "err": "", "timeout": False}
+        if privoxy_system.MKDIR in cmd:
+            layout.helper_path.parent.mkdir(parents=True, exist_ok=True)
+            return {"rc": 0, "out": "", "err": "", "timeout": False}
+        if "/bin/rm" in cmd:
+            # fail-closed cleanup: симулируем sudo rm — реально удаляем helper_path.
+            try:
+                layout.helper_path.unlink()
+            except OSError:
+                pass
+            return {"rc": 0, "out": "", "err": "", "timeout": False}
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+
+    result = privoxy_system._install_helper(runner, layout)
+
+    # post-install digest-check ловит staged-substitution → fail-closed.
+    assert result["ok"] is False
+    assert result["error"] == "helper_digest_mismatch"
+    # helper_path удалён (fail-closed cleanup) — attacker-bytes не остаются как helper.
+    assert not layout.helper_path.exists()
+
