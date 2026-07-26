@@ -676,7 +676,7 @@ def _copy_tree_nofollow(src, dst, *, dir_mode=0o755, file_mode=0o644, chown=os.c
     (os.open с dir_fd=root_fd, O_NOFOLLOW). Повторного path-resolution полного src-пути
     нет нигде — TOCTOU-окно между проверкой и travers'ом закрыто.
     """
-    del chown  # fd-pinning: владельца dst выставляет _fchown_if_privileged_dir, path-based хук не нужен.
+    del chown  # fd-pinning: владельца dst выставляет _copy_tree_fd (inline os.chown под root), path-based хук не нужен.
     src = Path(src)
     dst = Path(dst)
     try:
