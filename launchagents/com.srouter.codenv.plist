@@ -3,8 +3,10 @@
 <!-- Codex global SOCKS5 env: launchctl setenv SOCKS5 в GUI-домен launchd (видят все GUI-приложения).
      RunAtLoad (при входе/ребут) + каждые 5мин (переживает ребут — launchctl setenv сам по себе нет).
      Скрипт srouter-codex-env.sh выставляет HTTP_PROXY/HTTPS_PROXY/ALL_PROXY=socks5h://127.0.0.1:10808
-     + NO_PROXY=localhost,127.0.0.1,::1. Claude.app/ChatGPT.app на System Settings SOCKS — global env
-     их не ломает. -->
+     + NO_PROXY=localhost,127.0.0.1,::1,z.ai,.z.ai (loopback для Codex→moonbridge + z.ai напрямую
+     для moonbridge→api.z.ai — z.ai не за GFW, доступен при мёртвом VPS, issue #195).
+     Moonbridge = локальный Transform-прокси Codex.app (слушает loopback), ходит к api.z.ai как клиент.
+     Claude.app/ChatGPT.app на System Settings SOCKS — global env их не ломает. -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">

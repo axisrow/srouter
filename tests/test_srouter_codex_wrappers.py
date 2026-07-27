@@ -116,17 +116,20 @@ def test_install_marker_gate_foreign_not_touched(monkeypatch, tmp_path):
 
 def test_cli_launcher_renders_configured_proxy(monkeypatch, tmp_path):
     """Launcher рендерит __SROUTER_CODEX_PROXY_URL__/__SROUTER_CODEX_NO_PROXY__ из модульных
-    констант, а не хардкодит 10808. Меняем источник — меняется launcher (#96, anti-drift)."""
+    констант, а не хардкодит 10808. Меняем источник — меняется launcher (#96, anti-drift).
+
+    CLI-wrapper рендерит CODEX_NO_PROXY_LOOPBACK (loopback-only, БЕЗ z.ai — санитизация #96),
+    НЕ CODEX_NO_PROXY (z.ai релевантен только launchctl-gui moonbridge)."""
     _mock_home(monkeypatch, tmp_path)
     env = _env(tmp_path)
     monkeypatch.setattr(srouter, "_CODEX_PROXY_URL", "socks5h://127.0.0.1:99999")
-    monkeypatch.setattr(srouter, "CODEX_NO_PROXY", "localhost,internal")
+    monkeypatch.setattr(srouter, "CODEX_NO_PROXY_LOOPBACK", "localhost,internal")
 
     srouter._install_codex_wrappers(env)
     cli_text = (Path.home() / "bin" / _cli_wrapper_name()).read_text(encoding="utf-8")
 
     assert "127.0.0.1:99999" in cli_text, "launcher использует отрендеренный _CODEX_PROXY_URL"
-    assert "internal" in cli_text, "launcher использует отрендеренный CODEX_NO_PROXY"
+    assert "internal" in cli_text, "launcher использует отрендеренный CODEX_NO_PROXY_LOOPBACK"
     assert "10808" not in cli_text, "launcher НЕ хардкодит 10808 литералом"
 
 
@@ -2037,3 +2040,95 @@ def test_install_warns_about_uncovered_entry_points(monkeypatch, tmp_path):
     assert ("абсолют" in low or "напрям" in low or "не покрыт" in low
             or "не перехват" in low or "не обёрнут" in low), \
         f"install WARN про необёрнутые точки входа: {note}"
+
+
+# ============================ z.ai в launchctl-gui NO_PROXY (issue #195) ============================
+# z.ai доступен напрямую (мимо SOCKS5/xray/VPS) — не за GFW. moonbridge (Codex.app helper,
+# ~/.codex/moon-bridge/, слушает 127.0.0.1:38440) как клиент ходит к api.z.ai, унаследовав gui-env.
+# Codex→moonbridge = loopback (уже в NO_PROXY); moonbridge→api.z.ai = внешний хост → нужен z.ai
+# в launchctl-gui NO_PROXY, иначе moonbridge идёт SOCKS5→xray→VPS и ДОХНЕТ при мёртвом VPS (#194).
+# Канон: zai-direct-no-proxy, srouter-critical-infra-24-7 (VPS-смерть не должна валить z.ai).
+# ОБА варианта z.ai,.z.ai: z.ai = точное совпадение хоста, .z.ai = любой поддомен (*.z.ai).
+def test_codex_no_proxy_includes_zai():
+    """CODEX_NO_PROXY (единый источник launchctl-gui NO_PROXY) содержит z.ai И .z.ai.
+
+    Без .z.ai — поддомены api.z.ai/api-coding.z.ai НЕ матчатся NO_PROXY (curl-семантика:
+    'z.ai' без точки = только точный хост, '.z.ai' = wildcard поддоменов). Покрытие и корня,
+    и поддоменов нужно moonbridge'у (ходит к api.z.ai/api/coding/paas/...).
+    """
+    np = srouter.CODEX_NO_PROXY
+    hosts = {h.strip().lower() for h in np.split(",") if h.strip()}
+    assert "z.ai" in hosts, f"CODEX_NO_PROXY должен содержать 'z.ai' (точный хост): {np}"
+    assert ".z.ai" in hosts, f"CODEX_NO_PROXY должен содержать '.z.ai' (поддомены): {np}"
+
+
+def test_codex_no_proxy_preserves_loopback():
+    """z.ai добавляется К loopback, не заменяет его: localhost/127.0.0.1/::1 остаются.
+
+    Loopback нужен Codex→moonbridge (слушает на 127.0.0.1), z.ai — moonbridge→api.z.ai. Оба класса
+    хостов обязательны в одном NO_PROXY."""
+    np = srouter.CODEX_NO_PROXY
+    hosts = {h.strip().lower() for h in np.split(",") if h.strip()}
+    for lb in ("localhost", "127.0.0.1", "::1"):
+        assert lb in hosts, f"loopback '{lb}' сохранён в CODEX_NO_PROXY: {np}"
+
+
+def test_codenv_env_script_setenv_zai_direct():
+    """srouter-codex-env.sh делает launchctl setenv NO_PROXY с z.ai,.z.ai — regression-гвард.
+
+    Скрипт НЕ рендерится через плейсхолдеры (_install_generic_launchagent копирует script_path
+    as-is) → хардкод в файле = то, что реально выполнит LaunchAgent. Если рассинхрон с CODEX_NO_PROXY
+    — launchctl getenv NO_PROXY не получит z.ai (issue #195 корень)."""
+    script = Path(__file__).resolve().parent.parent / "launchagents" / "srouter-codex-env.sh"
+    text = script.read_text(encoding="utf-8")
+    # NO_PROXY присваивается литералом (не из env) и setenv'ится в gui-домен.
+    assert "launchctl setenv NO_PROXY" in text, "скрипт выставляет NO_PROXY в gui-домен"
+    # Извлечь присвоенное значение NO_PROXY="..." и проверить z.ai,.z.ai.
+    import re
+    m = re.search(r'NO_PROXY="([^"]*)"', text)
+    assert m, f"NO_PROXY=\"...\" литерал присутствует в скрипте: {text!r}"
+    hosts = {h.strip().lower() for h in m.group(1).split(",") if h.strip()}
+    assert "z.ai" in hosts and ".z.ai" in hosts, \
+        f"srouter-codex-env.sh NO_PROXY содержит z.ai,.z.ai (рассинхрон с CODEX_NO_PROXY = баг #195): {m.group(1)}"
+
+
+def test_codenv_env_script_synced_with_codex_no_proxy():
+    """srouter-codex-env.sh NO_PROXY-литерал = srouter.CODEX_NO_PROXY (единый источник правды).
+
+    drift-гвард: правим ТОЛЬКО CODEX_NO_PROXY, скрипт обязан ему соответствовать. Два источника
+    правды для одной границы = гарантированная утечка (канон loose-validator-recurring-leak)."""
+    import re
+    script = Path(__file__).resolve().parent.parent / "launchagents" / "srouter-codex-env.sh"
+    text = script.read_text(encoding="utf-8")
+    m = re.search(r'NO_PROXY="([^"]*)"', text)
+    assert m, "NO_PROXY=\"...\" литерал в скрипте"
+    script_hosts = {h.strip().lower() for h in m.group(1).split(",") if h.strip()}
+    const_hosts = {h.strip().lower() for h in srouter.CODEX_NO_PROXY.split(",") if h.strip()}
+    assert script_hosts == const_hosts, (
+        f"NO_PROXY drift: скрипт={sorted(script_hosts)} ≠ CODEX_NO_PROXY={sorted(const_hosts)} "
+        f"(править единый источник srouter.CODEX_NO_PROXY)"
+    )
+
+
+def test_codenv_plist_comment_mentions_zai():
+    """com.srouter.codenv.plist комментарий описывает реальный NO_PROXY (z.ai,.z.ai).
+
+    Документация в plist = контракт для оператора; устаревший комментарий вводит в заблуждение
+    (как #165 — parity требует sync docs со значением)."""
+    plist = Path(__file__).resolve().parent.parent / "launchagents" / "com.srouter.codenv.plist"
+    text = plist.read_text(encoding="utf-8")
+    assert "z.ai" in text, f"plist комментарий описывает z.ai в NO_PROXY: {plist.name}"
+
+
+def test_cli_wrapper_loopback_only_no_zai():
+    """CLI-wrapper (~/bin/codex-srouter) рендерит CODEX_NO_PROXY_LOOPBACK — БЕЗ z.ai.
+
+    Две разные границы: launchctl-gui (moonbridge→api.z.ai напрямую) vs CLI-codex (managed SOCKS5).
+    CLI-codex идёт через xray→VPS — z.ai в его NO_PROXY ломал бы #96 (санитизация унаследованного
+    privoxy-окружения: NO_PROXY должен быть loopback-only). Regression-гвард против слияния
+    CODEX_NO_PROXY (z.ai) и CODEX_NO_PROXY_LOOPBACK обратно в одну константу (канон
+    route-scope-not-shared-validator — общая константа для разных границ = гарантированная утечка)."""
+    assert "z.ai" not in srouter.CODEX_NO_PROXY_LOOPBACK, \
+        f"CLI-wrapper NO_PROXY loopback-only, БЕЗ z.ai: {srouter.CODEX_NO_PROXY_LOOPBACK}"
+    assert "z.ai" in srouter.CODEX_NO_PROXY, \
+        f"launchctl-gui NO_PROXY содержит z.ai (moonbridge): {srouter.CODEX_NO_PROXY}"
