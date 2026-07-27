@@ -29,6 +29,8 @@ LSOF = "/usr/sbin/lsof"
 PS = "/bin/ps"
 OSASCRIPT = "/usr/bin/osascript"
 LAUNCHCTL = "/bin/launchctl"
+ROUTE = "/sbin/route"      # route -n get default — есть ли default route (issue #203)
+IFCONFIG = "/sbin/ifconfig"  # активный iface с inet — второй эшелон (issue #203)
 
 # Прокси = privoxy (8118). Берём из dashboard_common если доступен; fallback на хардкод,
 # чтобы модуль не падал в среде без srouter_config (как git_proxy/claude_proxy).
@@ -118,6 +120,99 @@ def _tunnel_up():
         details.append(detail)
     # ни один таргет не ответил живым HTTP < 500 → туннель/прокси down (не origin одного вендора)
     return False, "; ".join(details)
+
+
+# ============================ #203: активный сетевой интерфейс/маршрут (нет сети vs VPS мёртв) ============================
+# Эпик #201 ситуация 1: doctor не различал «нет сети вообще» (Wi-Fi/eth выкл, нет default route)
+# от «VPS мёртв». _upstream_vps_reachable (#196) делает TCP-probe до VPS → при отсутствии сети
+# TCP тоже timeout → ложно «VPS мёртв». Этот чек — ПЕРВЫЙ в каскаде (нет сети → VPS → локальный
+# прокси → ...), перехватывает «нет сети» ДО VPS-probe, чтобы doctor сказал точную причину.
+# Канон: verify-dont-guess (прямая причина — маршрут/интерфейс), probe-semantics-from-primary-source
+# (man route + эмпирика: rc!=0 + "not in table" = нет default route), sys_probe #35 (no-hidden-magic).
+
+# IPv4 loopback-префикс — inet 127.x.x.x отбрасываем (это не внешний путь). Не urlsplit/ipaddress:
+# ifconfig отдаёт CIDR-суффиксом ('inet 127.0.0.1'), host-часть сравниваем как строку (как
+# node_selector._route_iface_from_output — раздел ':', первый токен). Маркер primary-source-loopback.
+_LOOPBACK_INET_PREFIX = "127."
+
+
+def _route_default_interface():
+    """Имя интерфейса default route из `route -n get default`, или '' если default route'а нет.
+
+    Переиспользует парсинг 'interface:' канона node_selector._route_iface_from_output (один формат
+    macOS `route get`, один источник). Эмпирика (verify): default route есть → rc=0 + 'interface: en0';
+    нет → rc!=0 (man route: 'not in table'). timeout/сбой запуска route — не таймаут сети (как
+    sys_probe.run контракт), трактуется как «default route неприменим» → ''. Не бросает.
+    """
+    try:
+        raw = sys_probe.run([ROUTE, "-n", "get", "default"], timeout=3) or {}
+    except Exception:
+        return ""
+    if raw.get("timeout") or raw.get("rc") != 0:
+        return ""
+    out = raw.get("out") or ""
+    for line in out.splitlines():
+        key, sep, value = line.strip().partition(":")
+        if sep and key.strip().lower() == "interface":
+            return (value.strip().split() or [""])[0]
+    return ""
+
+
+def _inet_interface():
+    """Имя первого интерфейса с inet (не loopback) из `ifconfig`, или '' если такого нет.
+
+    Второй эшелон детекта: route сброшен/кэш протух, но физический iface ещё держит inet → сеть
+    активна. Парсим ifconfig построчно: блок интерфейса = 'name: flags=...', затем '\tinet <ip>'.
+    Отбрасываем loopback (127.x — _LOOPBACK_INET_PREFIX) — он есть всегда, не доказывает внешний
+    путь. Эмпирика (verify, ifconfig на macOS): en0 + 'inet 192.168.1.17' → внешний; lo0 + inet
+    127.0.0.1 → loopback (отбрасываем); awdl0 active без inet → не считает (нет IPv4). Не бросает.
+    """
+    try:
+        raw = sys_probe.run([IFCONFIG], timeout=3) or {}
+    except Exception:
+        return ""
+    if raw.get("timeout"):
+        return ""
+    cur_iface = ""
+    for line in (raw.get("out") or "").splitlines():
+        stripped = line.strip()
+        # Заголовок блока интерфейса: 'en0: flags=...' — имя до ':' в начале непустой строки без \t.
+        if stripped and not line.startswith("\t") and ":" in stripped:
+            cur_iface = stripped.split(":", 1)[0].strip()
+            continue
+        # '\tinet <ip> netmask ...' — IPv4-адрес текущего iface.
+        if stripped.startswith("inet ") and cur_iface:
+            ip = stripped.split()[1] if len(stripped.split()) > 1 else ""
+            if ip and not ip.startswith(_LOOPBACK_INET_PREFIX):
+                return cur_iface
+    return ""
+
+
+def _network_interface_up():
+    """Есть ли активный сетевой путь наружу (default route ИЛИ iface с inet не-loopback).
+
+    Каскад эпика #201, ситуация 1: «нет сети» vs «VPS мёртв». Проверяется ПЕРВЫМ (до
+    _upstream_vps_reachable #196), чтобы отсутствие интернета не читалось как «VPS мёртв»
+    (TCP-probe до VPS при мёртвой сети тоже timeout → ложный диагноз).
+
+    Два эшелона (канон verify-dont-guess — прямая причина):
+      1. route -n get default → interface: есть default route (как node_selector._route_iface_from_output);
+      2. ifconfig → iface с inet (не loopback) — маршрут сброшен, но iface ещё держит адрес.
+    up = ЭШЕЛОН 1 ИЛИ ЭШЕЛОН 2. Оба пусты → нет сети.
+
+    Возвращает {up: bool, detail}:
+      up=True   — сеть активна (detail: через какой iface/route);
+      up=False  — нет сети (detail: «нет активного интерфейса/маршрута — подключи интернет»).
+    Не бросает (probe-канон, как _upstream_vps_reachable/_port_up).
+    """
+    iface = _route_default_interface()
+    if iface:
+        return {"up": True, "detail": f"сеть активна: default route через {iface}"}
+    inet_iface = _inet_interface()
+    if inet_iface:
+        return {"up": True, "detail": f"сеть активна: интерфейс {inet_iface} с IP (default route отсутствует)"}
+    return {"up": False,
+            "detail": "нет активного сетевого интерфейса/маршрута — подключи интернет (Wi-Fi/eth)"}
 
 
 # #194: прямой TCP-probe до upstream VPS endpoint (минуя прокси). socket.create_connection
@@ -1565,16 +1660,30 @@ def check_all(*, active_claude=False):
     checks.append({"name": f"dashboard ({DASHBOARD_PORT})", "ok": _port_up(DASHBOARD_PORT)})
     tun_ok, tun_detail = _tunnel_up()
     checks.append({"name": "туннель (api.anthropic.com через прокси)", "ok": tun_ok, "detail": tun_detail})
+    # #203: активный сетевой интерфейс/маршрут — ПЕРВЫЙ чек каскада (нет сети → VPS → локальный
+    # прокси → ...). Эпик #201 ситуация 1: doctor не различал «нет сети» (Wi-Fi/eth выкл, нет
+    # default route) от «VPS мёртв» — TCP-probe VPS при мёртвой сети тоже timeout → ложный диагноз.
+    # _network_interface_up ПЕРЕД VPS-probe перехватывает «нет сети» и даёт точную причину. DRIVER
+    # только когда сети НЕТ (up=False): это совсем другая причина, чем «VPS мёртв» — подключи интернет.
+    # up=True → info-only (картина, не роняет вердикт, как endpoint-override/versions). Каскад:
+    # нет сети подавляет VPS-чек (info, не нагромождает «VPS мёртв» поверх «нет сети»). Канон:
+    # verify-dont-guess (прямая причина), srouter-critical-infra-24-7 (точный диагноз = быстрая починка).
+    net = _network_interface_up()
+    net_check = {"name": "сеть (default route / активный интерфейс)",
+                 "ok": net["up"], "detail": net["detail"]}
+    if net["up"]:
+        net_check["info"] = True  # сеть есть — не driver (как endpoint-override)
+    checks.append(net_check)
     # #194: прямой TCP-probe до upstream VPS endpoint (минуя прокси). Различение «VPS мёртв» vs
     # «локальный прокси упал» — оба дают connection-failed через прокси, но прямой TCP доказывает
-    # состояние VPS. DRIVER только когда туннель fail И VPS down (гарантирует DOWN — VPS-смерть =
+    # состояние VPS. DRIVER только когда СЕТЬ ЕСТЬ И туннель fail И VPS down (гарантирует DOWN — VPS-смерть =
     # critical-infra #194, не DEGRADED). VPS ok при туннель-fail → info «проблема в локальном
     # прокси, VPS жив» (туннель-чек уже driver). Туннель ok → info (VPS-доступность не релевантна).
     # placeholder TEST-NET / нет узла → info (картина, не сбой). Канон: verify-don't-guess.
     vps = _upstream_vps_reachable()
     vps_check = {"name": "upstream VPS (TCP-коннект до endpoint, минуя прокси)",
                  "ok": True, "info": True, "detail": vps["detail"]}
-    if not tun_ok and vps["status"] == "down":
+    if net["up"] and not tun_ok and vps["status"] == "down":
         # VPS мёртв + туннель fail → driver: усиливаем до DOWN (не маскируем в degraded).
         vps_check["ok"] = False
         vps_check["info"] = False
@@ -1705,7 +1814,9 @@ def check_all(*, active_claude=False):
     # privoxy/xray open + VPS unreachable + туннель fail = upstream VPS мёртв (DOWN, не DEGRADED).
     # Канон: srouter-critical-infra-24-7 + fail-closed. Без этого — живые порты маскируют
     # VPS-смерть в degraded (регрессия #194). vps-driver ok=False = VPS точно мёртв (не placeholder/нет-узла — те info).
-    if not tun_ok and vps["status"] == "down":
+    # #203: net["up"] гвард — при мёртвой сети VPS-down НЕ абсолютный DOWN-override (TCP-timeout =
+    # следствие «нет сети», не «VPS мёртв»). «Нет сети» уже driver через net_check выше.
+    if net["up"] and not tun_ok and vps["status"] == "down":
         status = "down"
     return {"status": status, "checks": checks}
 
@@ -1864,6 +1975,11 @@ def _print_report(result):
     if result["status"] != "ok":
         print("\nЧто проверить:")
         failed_names = " ".join(c["name"] for c in result["checks"] if not c["ok"] and not c.get("info"))
+        if "сеть" in failed_names:
+            # #203: нет активного интерфейса/маршрута — самая первичная причина (до VPS/прокси).
+            # Не «VPS мёртв» и не «локальный прокси» — подключи интернет. Чинить первым.
+            print("  • сеть: нет активного сетевого интерфейса/маршрута — подключи интернет (Wi-Fi/eth).")
+            print("    Это НЕ «VPS мёртв» и НЕ «локальный прокси упал» — сначала восстановь сеть.")
         if "privoxy" in failed_names:
             if privoxy_system.protection_present():
                 print("  • Privoxy защищён: выполни `srouter privoxy status`, затем вручную "

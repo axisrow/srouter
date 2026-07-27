@@ -411,6 +411,180 @@ def test_vps_unreachable_does_not_mask_down_into_degraded(monkeypatch):
     assert vps["ok"] is False and not vps.get("info"), "VPS-unreachable — driver (не маскирует down)"
 
 
+# ============================ #203: активный сетевой интерфейс/маршрут (нет сети vs VPS мёртв) ============================
+# Корень: doctor не различал «нет сети вообще» (Wi-Fi/eth выкл, нет default route) от «VPS мёртв».
+# _upstream_vps_reachable (#196) делает TCP-probe до VPS → при отсутствии сети TCP тоже timeout →
+# ложно «VPS мёртв». _network_interface_up() проверяет ПЕРВЫМ (каскад ситуации #1 эпика #201):
+# route -n get default → interface:, ИЛИ ifconfig → iface с inet (не loopback). Нет сети → driver
+# «нет активного сетевого интерфейса/маршрута — подключи интернет», НЕ «VPS мёртв».
+#
+# Контракт _network_interface_up() -> {up: bool, detail}:
+#   up=True   — есть default route (interface: в `route -n get default`) ИЛИ активный iface с inet;
+#   up=False  — нет default route И нет iface с inet (не loopback) → нет сети.
+# Канон: verify-dont-guess (прямая причина — маршрут/интерфейс, не догадка по TCP-timeout VPS),
+# sys_probe #35 (no-hidden-magic), probe-semantics-from-primary-source (man route + эмпирика).
+ROUTE = "/sbin/route"
+IFCONFIG = "/sbin/ifconfig"
+
+# Реальный вывод `route -n get default` на macOS при живой сети (эмпирика): rc=0 + interface:.
+_ROUTE_DEFAULT_UP = (
+    "   route to: default\n"
+    "destination: default\n"
+    "       mask: default\n"
+    "  interface: en0\n"
+)
+# Нет default route: macOS отдаёт rc!=0 + "not in table" (man route). out может быть пустым.
+_ROUTE_DEFAULT_NONE = {"rc": 1, "out": "route: writing to routing socket: not in table\n",
+                       "err": "not in table", "timeout": False}
+
+# Реальный вывод ifconfig при живой сети: en0 active + inet 192.168.1.17; lo0 = loopback (inet 127.0.0.1).
+_IFCONFIG_UP = (
+    "lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384\n"
+    "\tinet 127.0.0.1 netmask 0xff000000\n"
+    "en0: flags=8863<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST> mtu 1500\n"
+    "\tinet 192.168.1.17 netmask 0xffffff00 broadcast 192.168.1.255\n"
+    "\tstatus: active\n"
+)
+# Нет сети: только loopback (все физические интерфейсы без inet/down).
+_IFCONFIG_LOOPBACK_ONLY = (
+    "lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384\n"
+    "\tinet 127.0.0.1 netmask 0xff000000\n"
+    "en0: flags=8802<BROADCAST,SIMPLEX,MULTICAST> mtu 1500\n"
+    "\tstatus: inactive\n"
+)
+
+
+def _mock_route_ifconfig(monkeypatch, *, route_result, ifconfig_result=None):
+    """Подменить sys_probe.run для route -n get default и ifconfig (канон node_selector mock).
+
+    route_result — dict (как sys_probe.run) ИЛИ None (route не должен вызываться).
+    ifconfig_result — dict ИЛИ None (ifconfig не должен вызываться).
+    """
+    def fake_run(cmd, timeout):
+        if cmd[:3] == [ROUTE, "-n", "get"]:
+            if route_result is None:
+                raise AssertionError("route -n get default не должно вызываться в этом сценарии")
+            return route_result
+        if cmd[:1] == [IFCONFIG]:
+            if ifconfig_result is None:
+                raise AssertionError("ifconfig не должно вызываться в этом сценарии")
+            return ifconfig_result
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+    monkeypatch.setattr(health.sys_probe, "run", fake_run)
+
+
+def test_network_up_when_default_route_present(monkeypatch):
+    """ДЫРА #203: route -n get default отдал interface: → сеть есть (up=True), ifconfig не нужен.
+
+    Первый эшелон детекта: default route присутствует → интерфейс/маршрут активен. ifconfig НЕ
+    должен дёргаться (есть route — этого достаточно, как node_selector._route_iface_from_output).
+    """
+    _mock_route_ifconfig(monkeypatch,
+                         route_result={"rc": 0, "out": _ROUTE_DEFAULT_UP, "err": "", "timeout": False},
+                         ifconfig_result=None)  # не должен вызываться
+    r = health._network_interface_up()
+    assert r["up"] is True, "default route есть → сеть активна"
+    assert "en0" in r["detail"], "detail объясняет: маршрут через en0"
+
+
+def test_network_up_via_ifconfig_when_no_default_route_but_iface_has_inet(monkeypatch):
+    """ДЫРА #203: default route отсутствует, НО ifconfig показал iface с inet → сеть есть.
+
+    Второй эшелон: route сброшен/кэш протух, но физический интерфейс ещё держит inet → сеть
+    активна. route rc!=0 → проваливаемся в ifconfig, находим en0 с inet → up=True.
+    """
+    _mock_route_ifconfig(monkeypatch,
+                         route_result=_ROUTE_DEFAULT_NONE,
+                         ifconfig_result={"rc": 0, "out": _IFCONFIG_UP, "err": "", "timeout": False})
+    r = health._network_interface_up()
+    assert r["up"] is True, "нет default route, но iface с inet → сеть активна (второй эшелон)"
+
+
+def test_network_down_when_no_default_route_and_loopback_only(monkeypatch):
+    """ДЫРА #203 (КЛЮЧЕВОЙ): нет default route + ifconfig только loopback → НЕТ СЕТИ (up=False).
+
+    Раньше doctor шёл в _upstream_vps_reachable → TCP timeout → ложно «VPS мёртв». Теперь
+    _network_interface_up первым говорит «нет активного интерфейса/маршрута» — это совсем другая
+    причина (подключи Wi-Fi/eth), не «VPS мёртв».
+    """
+    _mock_route_ifconfig(monkeypatch,
+                         route_result=_ROUTE_DEFAULT_NONE,
+                         ifconfig_result={"rc": 0, "out": _IFCONFIG_LOOPBACK_ONLY, "err": "", "timeout": False})
+    r = health._network_interface_up()
+    assert r["up"] is False, "нет route + только loopback → НЕТ СЕТИ"
+    assert "нет" in r["detail"].lower() or "интерфейс" in r["detail"].lower() or "маршрут" in r["detail"].lower(), \
+        "detail объясняет: нет активного интерфейса/маршрута (НЕ «VPS мёртв»)"
+
+
+def test_network_down_takes_precedence_over_vps_dead_in_check_all(monkeypatch):
+    """ДЫРА #203 (КАСКАД): нет сети → driver «нет сети», doctor НЕ лжёт «VPS мёртв».
+
+    Сценарий эпика #201 ситуация 1: Wi-Fi выкл. Все порты живы (privoxy/xray/dashboard локально),
+    но туннель fail (нечего гнать — нет сети). VPS-probe (#196) тоже дал бы timeout → ложно
+    «VPS мёртв». _network_interface_up ПЕРЕД VPS-probe перехватывает: нет сети → точная причина
+    «подключи интернет», VPS-чек подавляется (info-only, не «VPS мёртв» поверх «нет сети»).
+    """
+    _all_up_monkey(monkeypatch)  # порты живы; claude/codex/app/desktop — info/ok
+    monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed"))
+    # route + ifconfig: нет сети
+    monkeypatch.setattr(health.sys_probe, "run", lambda cmd, timeout:
+                        _ROUTE_DEFAULT_NONE if cmd[:3] == [ROUTE, "-n", "get"]
+                        else {"rc": 0, "out": _IFCONFIG_LOOPBACK_ONLY, "err": "", "timeout": False}
+                        if cmd[:1] == [IFCONFIG]
+                        else {"rc": 0, "out": "", "err": "", "timeout": False})
+    # VPS-probe (#196) ДАЖЕ ЕСЛИ бы звался — unreachable; но он не должен давать driver «VPS мёртв».
+    _mock_active_node(monkeypatch, {"name": "vps-1", "endpoint_host": "198.51.100.7", "port": 443})
+    _mock_vps_tcp(monkeypatch, reachable=False)
+    result = health.check_all()
+    net = [c for c in result["checks"] if "сеть" in c["name"].lower() or "интерфейс" in c["name"].lower() or "маршрут" in c["name"].lower()][0]
+    assert net["ok"] is False, "нет сети — driver (ok=False)"
+    assert not net.get("info"), "нет сети — НЕ info (driver, точная причина)"
+    assert "VPS" not in net["detail"], "detail НЕ «VPS мёртв» — это «нет сети» (другая причина)"
+    # VPS-чек при «нет сети» — info (подавлен, не нагромождает «VPS мёртв» поверх «нет сети»).
+    vps = [c for c in result["checks"] if "vps" in c["name"].lower() and "upstream" in c["name"].lower()][0]
+    assert vps.get("info") is True, "нет сети → VPS-чек подавлен (info), не водитель «VPS мёртв»"
+
+
+def test_network_up_proceeds_to_vps_probe_in_check_all(monkeypatch):
+    """ДЫРА #203: сеть есть → VPS-чек НЕ подавляется (proceeds to VPS-probe как обычно).
+
+    Контр-гвард к test выше: когда сеть активна, _network_interface_up не должен маскировать
+    реальную VPS-смерть. VPS-unreachable при живой сети → по-прежнему driver DOWN (#196).
+    """
+    _all_up_monkey(monkeypatch)
+    monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed"))
+    monkeypatch.setattr(health.sys_probe, "run", lambda cmd, timeout:
+                        {"rc": 0, "out": _ROUTE_DEFAULT_UP, "err": "", "timeout": False}
+                        if cmd[:3] == [ROUTE, "-n", "get"]
+                        else {"rc": 0, "out": "", "err": "", "timeout": False})
+    _mock_active_node(monkeypatch, {"name": "vps-1", "endpoint_host": "198.51.100.7", "port": 443})
+    _mock_vps_tcp(monkeypatch, reachable=False)
+    result = health.check_all()
+    net = [c for c in result["checks"] if "сеть" in c["name"].lower() or "интерфейс" in c["name"].lower() or "маршрут" in c["name"].lower()][0]
+    assert net["ok"] is True, "сеть есть → net-чек ok (не роняет вердикт)"
+    vps = [c for c in result["checks"] if "vps" in c["name"].lower() and "upstream" in c["name"].lower()][0]
+    assert vps["ok"] is False and not vps.get("info"), "сеть есть + VPS unreachable → VPS-чек driver (не подавлен)"
+    assert result["status"] == "down", "сеть есть + VPS мёртв → DOWN (#196 контракт сохранён)"
+
+
+def test_network_check_is_info_only_when_up(monkeypatch):
+    """net-чек при up=True — info-only (не роняет вердикт, картина для диагностики).
+
+    Когда сеть активна, нет причины её подсвечивать как driver. ok=True + info=True → не участвует
+    в агрегации drivers (как endpoint-override/versions). Driver net-чек становится ТОЛЬКО при up=False.
+    """
+    _all_up_monkey(monkeypatch, probe_status="ok")
+    monkeypatch.setattr(health, "_tunnel_up", lambda: (True, "HTTP 200"))
+    monkeypatch.setattr(health.sys_probe, "run", lambda cmd, timeout:
+                        {"rc": 0, "out": _ROUTE_DEFAULT_UP, "err": "", "timeout": False}
+                        if cmd[:3] == [ROUTE, "-n", "get"]
+                        else {"rc": 0, "out": "", "err": "", "timeout": False})
+    result = health.check_all()
+    assert result["status"] == "ok", "всё живо → ok (net-чек не роняет)"
+    net = [c for c in result["checks"] if "сеть" in c["name"].lower() or "интерфейс" in c["name"].lower() or "маршрут" in c["name"].lower()][0]
+    assert net.get("info") is True, "сеть активна → info-only (не driver)"
+
+
 # ============================ _tunnel_up HTTP semantics (issue #82, класс #3) ============================
 def _tunnel_curl_returning(code_out):
     """Мок sys_probe.run для _tunnel_up: curl -w %{http_code} печатает заданный код (любой URL)."""
