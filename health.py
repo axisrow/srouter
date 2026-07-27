@@ -21,6 +21,7 @@ from urllib.parse import urlparse
 
 import sys_probe
 import privoxy_system
+import local_state
 
 # Абсолютные пути: launchd/GUI PATH их не содержит (канон проекта).
 CURL = "/usr/bin/curl"
@@ -117,6 +118,81 @@ def _tunnel_up():
         details.append(detail)
     # ни один таргет не ответил живым HTTP < 500 → туннель/прокси down (не origin одного вендора)
     return False, "; ".join(details)
+
+
+# #194: прямой TCP-probe до upstream VPS endpoint (минуя прокси). socket.create_connection
+# НЕ знает про HTTP_PROXY/HTTPS_PROXY env — это голый TCP до host:port, в обход privoxy/xray.
+# timeout подобран > connect-timeout curl-туннеля (4с) — probe должен ответить быстрее, чем
+# _tunnel_up сдаться, чтобы различение «VPS мёртв» vs «локальный прокси упал» было осмысленным.
+VPS_TCP_PROBE_TIMEOUT = 3.0
+
+# TEST-NET 203.0.113.0/24 (RFC 5737) — документационные адреса, НЕ маршрутизируются в интернете.
+# Встречаются в srouter_config.example.py / незаменённых шаблонах. Прямой TCP-probe до них ничего
+# не доказывает (пакеты уходят в никуда) — это placeholder, не мёртвый VPS. Детект ДО пробы.
+_TESTNET_203_PREFIX = "203.0.113."
+
+
+def _vps_endpoint(node):
+    """(host, port) VPS-endpoint из узла. port из node['port'], default 443 (Reality на TLS).
+
+    Источник порта = тот же, что gen_xray_config._safe_port(node.get('port'), default=443): единый
+    контракт порта узла (канон — единый источник). host = endpoint_host (не route_ip: route_ip —
+    рабочий IP из xray/resolve, может расходиться; endpoint_host = то, что пользователь настроил).
+    Возвращает (host, port) или (None, None) если узла/хоста нет / хост невалиден. Не бросает.
+    """
+    if not isinstance(node, dict):
+        return None, None
+    host = node.get("endpoint_host")
+    if not isinstance(host, str) or not host or not local_state._is_valid_host(host):
+        return None, None
+    try:
+        port = int(node.get("port"))
+    except (TypeError, ValueError):
+        port = 443  # как gen_xray_config._safe_port default — Reality на TLS 443
+    if not (1 <= port <= 65535):
+        port = 443
+    return host, port
+
+
+def _upstream_vps_reachable(node=None):
+    """Прямой TCP-probe до upstream VPS endpoint (БЕЗ прокси) — различение #194.
+
+    _tunnel_up() бьёт через прокси к API-таргетам → connection-failed без различения «VPS мёртв»
+    vs «локальный прокси (privoxy/xray) упал». Этот чек = socket.create_connection (TCP) до
+    active_node().endpoint_host:port напрямую, минуя прокси (sys_probe.port_open). Канон:
+    verify-don't-guess — прямая причина, не догадка (эталон sys_probe #35).
+
+    Возвращает {status, detail}:
+      ok   — TCP-connect успешен (VPS жив);
+      down — TCP timeout/refused (VPS мёртв);
+      warn — placeholder TEST-NET 203.0.113.x (нельзя реально зондировать test-IP);
+      info — нет активного узла / нет endpoint_host.
+    Не бросает (probe-канон).
+    """
+    if node is None:
+        try:
+            node = local_state.active_node() or {}
+        except Exception:
+            node = {}
+    host, port = _vps_endpoint(node)
+    if host is None:
+        return {"status": "info",
+                "detail": "нет активного узла / endpoint_host (VPS-probe неприменим)"}
+    # Placeholder TEST-NET — детект ДО пробы: TCP до 203.0.113.x ничего не доказывает.
+    if host.startswith(_TESTNET_203_PREFIX) and host.count(".") == 3:
+        return {"status": "warn",
+                "detail": f"endpoint {host}:{port} — placeholder TEST-NET 203.0.113.x (RFC 5737), "
+                          f"не маршрутизируется; замени на реальный VPS-адрес"}
+    try:
+        reachable = sys_probe.port_open(host, port, timeout=VPS_TCP_PROBE_TIMEOUT)
+    except Exception:
+        reachable = False
+    if reachable:
+        return {"status": "ok",
+                "detail": f"VPS reachable: TCP-коннект до {host}:{port} (VPS жив)"}
+    return {"status": "down",
+            "detail": f"VPS недоступен: TCP timeout/refused до {host}:{port} "
+                      f"(VPS мёртв? заплачен/запущен?)"}
 
 
 def _is_claude_code_comm(comm):
@@ -1366,6 +1442,20 @@ def check_all(*, active_claude=False):
     checks.append({"name": f"dashboard ({DASHBOARD_PORT})", "ok": _port_up(DASHBOARD_PORT)})
     tun_ok, tun_detail = _tunnel_up()
     checks.append({"name": "туннель (api.anthropic.com через прокси)", "ok": tun_ok, "detail": tun_detail})
+    # #194: прямой TCP-probe до upstream VPS endpoint (минуя прокси). Различение «VPS мёртв» vs
+    # «локальный прокси упал» — оба дают connection-failed через прокси, но прямой TCP доказывает
+    # состояние VPS. DRIVER только когда туннель fail И VPS down (гарантирует DOWN — VPS-смерть =
+    # critical-infra #194, не DEGRADED). VPS ok при туннель-fail → info «проблема в локальном
+    # прокси, VPS жив» (туннель-чек уже driver). Туннель ok → info (VPS-доступность не релевантна).
+    # placeholder TEST-NET / нет узла → info (картина, не сбой). Канон: verify-don't-guess.
+    vps = _upstream_vps_reachable()
+    vps_check = {"name": "upstream VPS (TCP-коннект до endpoint, минуя прокси)",
+                 "ok": True, "info": True, "detail": vps["detail"]}
+    if not tun_ok and vps["status"] == "down":
+        # VPS мёртв + туннель fail → driver: усиливаем до DOWN (не маскируем в degraded).
+        vps_check["ok"] = False
+        vps_check["info"] = False
+    checks.append(vps_check)
     # Claude Code РЕАЛЬНО использует прокси? runtime (lsof), не файл. unknown (CC не запущен) →
     # info-only, не driver: проверять «CC юзает прокси» бессмысленно, если CC не работает.
     cp = _claude_proxy_probe()
@@ -1470,6 +1560,13 @@ def check_all(*, active_claude=False):
     all_ok = all(c["ok"] for c in drivers)
     any_ok = any(c["ok"] for c in drivers)
     status = "ok" if all_ok else ("degraded" if any_ok else "down")
+    # #194: VPS-смерть — абсолютный триггер DOWN (минуя degraded). Даже при живых локальных
+    # портах мёртвый upstream VPS = весь стек бесполезен (нет куда гонять трафик). Таблица issue:
+    # privoxy/xray open + VPS unreachable + туннель fail = upstream VPS мёртв (DOWN, не DEGRADED).
+    # Канон: srouter-critical-infra-24-7 + fail-closed. Без этого — живые порты маскируют
+    # VPS-смерть в degraded (регрессия #194). vps-driver ok=False = VPS точно мёртв (не placeholder/нет-узла — те info).
+    if not tun_ok and vps["status"] == "down":
+        status = "down"
     return {"status": status, "checks": checks}
 
 
@@ -1637,6 +1734,11 @@ def _print_report(result):
             print("  • xray: brew services restart xray  (или srouter install)")
         if "туннель" in failed_names:
             print("  • туннель: проверь узел (srouter status / дашборд nodes), возможно узел недоступен")
+        if "upstream VPS" in failed_names:
+            # #194: VPS точно мёртв (прямой TCP-probe не прошёл) — НЕ чинить локальный прокси,
+            # проблема не в нём. VPS-смерть = critical-infra DOWN.
+            print("  • upstream VPS: прямой TCP-зонд до endpoint не прошёл — VPS мёртв (не локальный прокси!).")
+            print("    Проверь: заплачен/запущен ли VPS, не упал ли хостинг, верный ли endpoint_host:port в узле")
         if "dashboard" in failed_names:
             print("  • дашборд: srouter restart")
         if "claude-proxy" in failed_names:
