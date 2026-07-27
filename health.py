@@ -103,22 +103,29 @@ def _privoxy_service_target():
 
 
 def _service_running(label, domain=None):
-    """Запущен ли launchd-сервис по `launchctl print <domain>/<label>` — state=running?
+    """Состояние launchd-сервена по `launchctl print <domain>/<label>` — tri-state (#204 cycle-review P1).
 
-    Единый источник правды для service-status: работает и для system-daemon (protected privoxy),
-    и для user-agent (brew). НЕ brew services info — он слеп к protected privoxy (#204). running iff
-    rc=0 (job загружен) AND state-поле = "running" (через _launchd_field, как _launchd_job_snapshot).
-    launchctl print отдаёт '\tstate = running;' для активного; 'state = waiting'/etc → не running.
+    Возвращает ОДНО из:
+      "running"     — job загружен (rc=0) AND state="running";
+      "not_running" — launchctl ОТВЕТИЛ, но сервис не Running: rc!=0 (job не загружен) ИЛИ state!=running
+                      (waiting/exiting/etc). Подтверждённый сигнал — doctor может диагностировать зомби/крах.
+      "unknown"     — НЕ ответил: launchctl timeout. Не различимо «не работает» от «не спросили» →
+                      fail-closed: НЕ трактуем как not_running (cycle-review P1: иначе port-open+timeout
+                      давало ложный зомби с советом restart на живом прокси).
 
-    Не бросает (fail-soft). timeout/не загружен/state != running → False. Канон verify-don't-guess:
-    не угадываем running по pid (KeepAlive-restart может держать pid при state=exiting).
+    Единый источник правды: работает и для system-daemon (protected privoxy), и для user-agent (brew).
+    НЕ brew services info — он слеп к protected privoxy (#204). Канон verify-don't-guess: state-поле,
+    не pid (KeepAlive-restart может держать pid при state=exiting).
     """
     domain = domain or f"gui/{os.getuid()}"
     r = sys_probe.run([LAUNCHCTL, "print", f"{domain}/{label}"], timeout=3)
-    if r.get("timeout") or r.get("rc") != 0:
-        return False
+    if r.get("timeout"):
+        return "unknown"  # fail-closed: не утверждаем not_running без ответа launchctl
+    if r.get("rc") != 0:
+        # launchctl ответил ошибкой (job не загружен) — это подтверждённый not_running (сервис снят).
+        return "not_running"
     state = _launchd_field(r.get("out") or "", "state")
-    return state == "running"
+    return "running" if state == "running" else "not_running"
 
 
 def _local_proxy_up():
@@ -126,9 +133,13 @@ def _local_proxy_up():
 
     Различение #201/#204 ситуаций (verify-don't-guess — service-status, не догадка по порту):
       - port closed → КРАХ (демон не слушает — упал/не стартовал);
-      - port open + service not-running → ЗОМБИ (orphan держит порт, launchd-сервис не Running);
+      - port open + service not_running → ЗОМБИ (orphan держит порт, launchd-сервис не Running);
+      - port open + service unknown → НЕ зомби (fail-closed: launchctl не ответил — вердикт по port-open,
+        с пометкой «service-status не верифицирован»). cycle-review P1: иначе timeout давал ложный зомби;
       - оба компонента port-up + running → ok.
     Возвращает {status, detail}: ok / down (с причиной крах vs зомби + какой компонент). Не бросает.
+    unknown по service-status НЕ роняет ok (port-open = прокси принимает соединения), но помечается
+    в detail (observability — noisy-log-better-than-no-log).
     """
     privoxy_label, privoxy_domain = _privoxy_service_target()
     components = [
@@ -136,24 +147,33 @@ def _local_proxy_up():
         ("xray", XRAY_PORT, XRAY_BREW_LABEL, f"gui/{os.getuid()}"),
     ]
     problems = []
+    unverified = []
     for name, port, label, domain in components:
         port_open = _port_up(port)
-        running = _service_running(label, domain)
-        if not port_open and running:
-            # порт не слушается, но launchd считает Running → демон стартовал, но bind упал (крах
-            # процесса под живым job'ом). Это КРАХ-форма (трафик не идёт), не зомби.
-            problems.append(f"{name} крах (port {port} closed, но сервис Running — bind упал)")
-        elif not port_open and not running:
-            problems.append(f"{name} крах (port {port} closed, сервис не Running — restart)")
-        elif port_open and not running:
+        svc = _service_running(label, domain)
+        if not port_open:
+            # порт не слушается → КРАХ независимо от service-status (трафик не идёт).
+            if svc == "running":
+                # launchd считает Running, но порт не слушается → bind упал под живым job'ом (крах процесса).
+                problems.append(f"{name} крах (port {port} closed, но сервис Running — bind упал)")
+            else:
+                hint = "сервис не Running" if svc == "not_running" else "service-status unknown"
+                problems.append(f"{name} крах (port {port} closed, {hint} — restart)")
+        elif svc == "not_running":
+            # port open + ПОДТВЕРЖДЁННО не Running → зомби (orphan/launchd рассинхрон).
             problems.append(f"{name} зомби (port {port} слушается, но сервис не Running — orphan/launchd)")
+        elif svc == "unknown":
+            # port open, но launchctl не ответил → НЕ зомби (fail-closed), помечаем для observability.
+            unverified.append(name)
     if problems:
         restart_hint = "brew services restart privoxy xray" if not privoxy_system.protection_present() \
             else "srouter privoxy restart (protected-mode)"
         return {"status": "down",
                 "detail": f"локальный прокси упал: {'; '.join(problems)}. Restart: {restart_hint}"}
-    return {"status": "ok",
-            "detail": f"локальный прокси жив: privoxy 8118 + xray 10808 port-up + service-running"}
+    detail = "локальный прокси жив: privoxy 8118 + xray 10808 port-up + service-running"
+    if unverified:
+        detail += f" (⚠ service-status не верифицирован для {', '.join(unverified)} — launchctl timeout)"
+    return {"status": "ok", "detail": detail}
 
 
 def _tunnel_target_up(url):
