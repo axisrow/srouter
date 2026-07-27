@@ -80,6 +80,102 @@ def _port_up(port):
     return bool((r.get("out") or "").strip())
 
 
+# ============================ #204: локальный прокси service-status ============================
+# Ситуация #3 эпика #201: различать «локальный прокси упал» (privoxy/xray краш/зомби) от «VPS мёртв»
+# (#194 — есть) и «туннель сломан». _port_up (TCP-listen) сам по себе не различает «демон слушает»
+# от «порт занят orphan'ом» → зомби даёт ложный ok. Service-status (launchd state=running) = ЯВНЫЙ
+# сигнал. НЕ используем `brew services info` (issue #201 предлагает): protected-mode privoxy = system
+# daemon com.srouter.privoxy, brew его НЕ видит → ложный зомби на нормальной protected-установке.
+# Единый источник launchctl print для protected (system) И brew-mode (gui), как _collect_launchd_lifecycle.
+
+# Re-export privoxy system label — тесты (test_health #204) и единый источник для _local_proxy_up.
+PRIVOXY_SYSTEM_LABEL = privoxy_system.SYSTEM_LABEL  # com.srouter.privoxy
+PRIVOXY_BREW_LABEL = privoxy_system.USER_LABEL      # homebrew.mxcl.privoxy
+XRAY_BREW_LABEL = "homebrew.mxcl.xray"
+
+
+def _privoxy_service_target():
+    """(label, domain) для launchctl print privoxy в ТЕКУЩЕМ режиме. protected → system-daemon,
+    brew-mode → user-agent. Тот же выбор, что _collect_launchd_lifecycle (health.py:1658)."""
+    if privoxy_system.protection_present():
+        return PRIVOXY_SYSTEM_LABEL, "system"
+    return PRIVOXY_BREW_LABEL, f"gui/{os.getuid()}"
+
+
+def _service_running(label, domain=None):
+    """Состояние launchd-сервена по `launchctl print <domain>/<label>` — tri-state (#204 cycle-review P1).
+
+    Возвращает ОДНО из:
+      "running"     — job загружен (rc=0) AND state="running";
+      "not_running" — launchctl ОТВЕТИЛ, но сервис не Running: rc!=0 (job не загружен) ИЛИ state!=running
+                      (waiting/exiting/etc). Подтверждённый сигнал — doctor может диагностировать зомби/крах.
+      "unknown"     — НЕ ответил: launchctl timeout. Не различимо «не работает» от «не спросили» →
+                      fail-closed: НЕ трактуем как not_running (cycle-review P1: иначе port-open+timeout
+                      давало ложный зомби с советом restart на живом прокси).
+
+    Единый источник правды: работает и для system-daemon (protected privoxy), и для user-agent (brew).
+    НЕ brew services info — он слеп к protected privoxy (#204). Канон verify-don't-guess: state-поле,
+    не pid (KeepAlive-restart может держать pid при state=exiting).
+    """
+    domain = domain or f"gui/{os.getuid()}"
+    r = sys_probe.run([LAUNCHCTL, "print", f"{domain}/{label}"], timeout=3)
+    if r.get("timeout"):
+        return "unknown"  # fail-closed: не утверждаем not_running без ответа launchctl
+    if r.get("rc") != 0:
+        # launchctl ответил ошибкой (job не загружен) — это подтверждённый not_running (сервис снят).
+        return "not_running"
+    state = _launchd_field(r.get("out") or "", "state")
+    return "running" if state == "running" else "not_running"
+
+
+def _local_proxy_up():
+    """Локальный прокси жив? privoxy + xray port-open AND service-running (#204).
+
+    Различение #201/#204 ситуаций (verify-don't-guess — service-status, не догадка по порту):
+      - port closed → КРАХ (демон не слушает — упал/не стартовал);
+      - port open + service not_running → ЗОМБИ (orphan держит порт, launchd-сервис не Running);
+      - port open + service unknown → НЕ зомби (fail-closed: launchctl не ответил — вердикт по port-open,
+        с пометкой «service-status не верифицирован»). cycle-review P1: иначе timeout давал ложный зомби;
+      - оба компонента port-up + running → ok.
+    Возвращает {status, detail}: ok / down (с причиной крах vs зомби + какой компонент). Не бросает.
+    unknown по service-status НЕ роняет ok (port-open = прокси принимает соединения), но помечается
+    в detail (observability — noisy-log-better-than-no-log).
+    """
+    privoxy_label, privoxy_domain = _privoxy_service_target()
+    components = [
+        ("privoxy", PRIVOXY_PORT, privoxy_label, privoxy_domain),
+        ("xray", XRAY_PORT, XRAY_BREW_LABEL, f"gui/{os.getuid()}"),
+    ]
+    problems = []
+    unverified = []
+    for name, port, label, domain in components:
+        port_open = _port_up(port)
+        svc = _service_running(label, domain)
+        if not port_open:
+            # порт не слушается → КРАХ независимо от service-status (трафик не идёт).
+            if svc == "running":
+                # launchd считает Running, но порт не слушается → bind упал под живым job'ом (крах процесса).
+                problems.append(f"{name} крах (port {port} closed, но сервис Running — bind упал)")
+            else:
+                hint = "сервис не Running" if svc == "not_running" else "service-status unknown"
+                problems.append(f"{name} крах (port {port} closed, {hint} — restart)")
+        elif svc == "not_running":
+            # port open + ПОДТВЕРЖДЁННО не Running → зомби (orphan/launchd рассинхрон).
+            problems.append(f"{name} зомби (port {port} слушается, но сервис не Running — orphan/launchd)")
+        elif svc == "unknown":
+            # port open, но launchctl не ответил → НЕ зомби (fail-closed), помечаем для observability.
+            unverified.append(name)
+    if problems:
+        restart_hint = "brew services restart privoxy xray" if not privoxy_system.protection_present() \
+            else "srouter privoxy restart (protected-mode)"
+        return {"status": "down",
+                "detail": f"локальный прокси упал: {'; '.join(problems)}. Restart: {restart_hint}"}
+    detail = "локальный прокси жив: privoxy 8118 + xray 10808 port-up + service-running"
+    if unverified:
+        detail += f" (⚠ service-status не верифицирован для {', '.join(unverified)} — launchctl timeout)"
+    return {"status": "ok", "detail": detail}
+
+
 def _tunnel_target_up(url):
     """Один таргет через прокси: (ok, detail). Живой = сервер ответил HTTP < 500
     (sys_probe.tunnel_code_up). 000/timeout/5xx — не жив. Не бросает."""
@@ -1688,6 +1784,29 @@ def check_all(*, active_claude=False):
         vps_check["ok"] = False
         vps_check["info"] = False
     checks.append(vps_check)
+    # #204: локальный прокси (privoxy/xray) service-status — различение «локальный прокси упал»
+    # (#201 ситуация 3) от «VPS мёртв» (#194) / «туннель сломан». _port_up чеки выше (privoxy/xray)
+    # уже driver по TCP-listen; этот чек добавляет ЯВНЫЙ signal (зомби: port-open + service
+    # not-running — orphan держит порт, launchd-сервис упал). DRIVER когда туннель fail (проблема
+    # актуальна); туннель ok → info-only (порты живы, сервис-статус не роняет вердикт когда канал и
+    # так работает). Канон: verify-don't-guess — service-status launchctl print, не brew services info
+    # (последний слеп к protected privoxy system-daemon → ложный зомби на нормальной установке).
+    lp = _local_proxy_up()
+    lp_check = {"name": "локальный прокси (privoxy/xray service-status)",
+                "ok": lp["status"] == "ok", "detail": lp["detail"]}
+    if tun_ok:
+        # туннель жив → сервис-статус не driver (порт-чеки выше уже валидны). Зомби при живом канале
+        # — картина (например orphan на старом порту), не сбой: показываем в detail, не роняем.
+        lp_check["info"] = True
+    elif lp["status"] == "down" and vps["status"] == "ok":
+        # туннель fail + VPS жив + локальный прокси down → ТОЧНАЯ причина: прокси упал, не VPS.
+        # Усиливаем до driver-down (ситуация #3 #201). VPS жив (#194) исключает upstream-смерть.
+        lp_check["ok"] = False
+    elif lp["status"] == "down":
+        # туннель fail + прокси down, но VPS статус не ok (info/down/placeholder) — прокси-down
+        # всё равно driver (туннель fail уже driver выше; этот чек объясняет причину локально).
+        lp_check["ok"] = False
+    checks.append(lp_check)
     # Claude Code РЕАЛЬНО использует прокси? runtime (lsof), не файл. unknown (CC не запущен) →
     # info-only, не driver: проверять «CC юзает прокси» бессмысленно, если CC не работает.
     cp = _claude_proxy_probe()
@@ -1995,6 +2114,11 @@ def _print_report(result):
             # проблема не в нём. VPS-смерть = critical-infra DOWN.
             print("  • upstream VPS: прямой TCP-зонд до endpoint не прошёл — VPS мёртв (не локальный прокси!).")
             print("    Проверь: заплачен/запущен ли VPS, не упал ли хостинг, верный ли endpoint_host:port в узле")
+        if "локальный прокси" in failed_names:
+            # #204: privoxy/xray service-status down (крах/зомби). VPS жив → проблема локальная.
+            print("  • локальный прокси упал (privoxy/xray): brew services restart privoxy xray")
+            if privoxy_system.protection_present():
+                print("    (protected-mode: srouter privoxy restart вместо brew)")
         if "dashboard" in failed_names:
             print("  • дашборд: srouter restart")
         if "claude-proxy" in failed_names:

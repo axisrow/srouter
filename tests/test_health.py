@@ -54,6 +54,10 @@ def _all_up_monkey(monkeypatch, *, probe_status="ok", probe_detail="runtime: к�
     # драйвит вердикт недетерминированно. В этих тестах VPS-чек НЕ предмет проверки → info-заглушка.
     import local_state
     monkeypatch.setattr(local_state, "active_node", lambda path=None: {})
+    # #204: _local_proxy_up дёргает launchctl print (через _service_running) — мокаем running=True,
+    # иначе реальный launchd на dev-машине (protected/brew-mode, живой/мёртвый privoxy/xray)
+    # драйвит вердикт недетерминированно. _port_up уже мокаем True выше → ok по контракту.
+    monkeypatch.setattr(health, "_service_running", lambda label, domain=None: "running")
 
 
 # ============================ _claude_proxy_probe (детект lsof) ============================
@@ -583,6 +587,142 @@ def test_network_check_is_info_only_when_up(monkeypatch):
     assert result["status"] == "ok", "всё живо → ok (net-чек не роняет)"
     net = [c for c in result["checks"] if "сеть" in c["name"].lower() or "интерфейс" in c["name"].lower() or "маршрут" in c["name"].lower()][0]
     assert net.get("info") is True, "сеть активна → info-only (не driver)"
+
+
+# ============================ #204: локальный прокси (privoxy/xray) service-status ============================
+# Ситуация #3 эпика #201: туннель fail без различения «VPS мёртв» (#194 — есть) vs «локальный прокси
+# упал». _local_proxy_up() комбинирует _port_up (TCP-listen) + _service_running (launchd-state):
+#   - port closed → «крах» (демон не слушает, упал/не стартовал);
+#   - port open + service not-running → «зомби» (порт занят чем-то, но launchd-сервис не Running);
+#   - оба up → ok.
+# Канон: verify-don't-guess — service-status это ЯВНЫЙ сигнал (brew services info Running?),
+# не догадка по port-open. Не используем `brew services info` (protected-mode privoxy = system
+# daemon com.srouter.privoxy, brew его не видит → ложный зомби) — единый источник launchctl print
+# для protected И brew-mode (как _launchd_job_snapshot health.py:_collect_launchd_lifecycle).
+
+def test_local_proxy_ok_when_ports_up_and_services_running(monkeypatch):
+    """Оба порта слушаются + оба сервиса Running → ok. Нормальное состояние стека."""
+    monkeypatch.setattr(health, "_port_up", lambda port: True)
+    monkeypatch.setattr(health, "_service_running", lambda label, domain=None: "running")
+    result = health._local_proxy_up()
+    assert result["status"] == "ok", "порты up + сервисы running → ok"
+
+
+def test_local_proxy_down_when_port_closed(monkeypatch):
+    """ДЫРА #204: privoxy port closed → down «крах» (демон не слушает). Раньше _port_up сам по себе
+    молчал о причине. Теперь service-status объясняет: порт не слушается = прокси упал/не стартовал."""
+    monkeypatch.setattr(health, "_port_up",
+                        lambda port: False if port == health.PRIVOXY_PORT else True)
+    monkeypatch.setattr(health, "_service_running", lambda label, domain=None: "running")
+    result = health._local_proxy_up()
+    assert result["status"] == "down", "privoxy port closed → down (крах)"
+    assert "крах" in result["detail"].lower() or "port" in result["detail"].lower() \
+        or "closed" in result["detail"].lower(), "detail объясняет: крах (port закрыт)"
+
+
+def test_local_proxy_zombie_when_port_open_but_service_not_running(monkeypatch):
+    """ДЫРА #204: port open + service NOT running → ЗОМБИ. Порт слушается (кем-то), но launchd-сервис
+    не Running → privoxy-процесс отвалился от launchd (orphan) либо порт занят чужим. Раньше
+    port-open давал ложный ok. Теперь service-status ловит несоответствие."""
+    monkeypatch.setattr(health, "_port_up", lambda port: True)
+    def fake_running(label, domain=None):
+        return "not_running" if label == health.PRIVOXY_SYSTEM_LABEL or label == "homebrew.mxcl.privoxy" else "running"
+    monkeypatch.setattr(health, "_service_running", fake_running)
+    result = health._local_proxy_up()
+    assert result["status"] == "down", "port open + service not-running → down (зомби)"
+    assert "зомби" in result["detail"].lower() or "not-running" in result["detail"].lower() \
+        or "not running" in result["detail"].lower(), "detail объясняет: зомби (service not-running)"
+
+
+def test_local_proxy_down_when_xray_port_closed(monkeypatch):
+    """xray port closed → down (крах xray). Оба компонента проверяются, не только privoxy."""
+    monkeypatch.setattr(health, "_port_up",
+                        lambda port: False if port == health.XRAY_PORT else True)
+    monkeypatch.setattr(health, "_service_running", lambda label, domain=None: "running")
+    result = health._local_proxy_up()
+    assert result["status"] == "down", "xray port closed → down"
+    assert "xray" in result["detail"].lower(), "detail указывает xray"
+
+
+def test_local_proxy_not_zombie_when_launchctl_times_out(monkeypatch):
+    """ДЫРА #204 (cycle-review Codex P1): launchctl print timeout -> service-status НЕ верифицируем.
+    Канон fail-closed (как _read_gui_proxy_env): не различимо not-running от не-спросили.
+    Раньше _service_running возвращал bool -> timeout->False -> port-open+False ложно зомби (с
+    советом restart!). Теперь _service_running tri-state; при unknown НЕ утверждаем зомби —
+    вердикт по port-open (ok, если порт слушается), с пометкой «service-status не верифицирован».
+    privoxy реально работает (держит 8118), просто launchctl не ответил — НЕ роняем в зомби."""
+    monkeypatch.setattr(health, "_port_up", lambda port: True)
+    monkeypatch.setattr(health, "_service_running", lambda label, domain=None: "unknown")
+    result = health._local_proxy_up()
+    assert result["status"] == "ok", "timeout launchctl + port-open -> ok, НЕ ложный зомби"
+    assert "зомби" not in result["detail"].lower(), \
+        "timeout != зомби (fail-closed: не утверждаем без service-evidence)"
+
+
+def test_local_proxy_zombie_requires_confirmed_not_running(monkeypatch):
+    """Зомби требует ПОДТВЕРЖДЁННОГО not-running (state!=running, rc=0), не timeout/unknown.
+    Регресс-гвард P1: только not_running (launchctl ответил, state waiting/exited) -> зомби."""
+    monkeypatch.setattr(health, "_port_up", lambda port: True)
+    monkeypatch.setattr(health, "_service_running", lambda label, domain=None: "not_running"
+                        if (label == health.PRIVOXY_SYSTEM_LABEL or label == "homebrew.mxcl.privoxy")
+                        else "running")
+    result = health._local_proxy_up()
+    assert result["status"] == "down", "port-open + confirmed not-running -> down (зомби)"
+    assert "зомби" in result["detail"].lower()
+
+
+
+# Интеграция в check_all: DRIVER когда туннель fail (проблема в локальном прокси, VPS жив/н/д).
+# Туннель ok → info (картина, не driver — порты уже driver через _port_up чеки выше).
+
+def test_local_proxy_driver_down_when_tunnel_fail_and_port_closed(monkeypatch):
+    """ДЫРА #204: туннель fail + локальный прокси down (port closed) → driver. Раньше туннель-fail
+    без причины. Теперь _local_proxy_up объясняет: «локальный прокси упал — restart»."""
+    _all_up_monkey(monkeypatch)  # порты/claude/codex/app/desktop — ok/info, не роняют
+    monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed"))
+    # VPS жив (info-only, не маскирует локальный прокси) — различение от ситуации #2 (#194):
+    _mock_active_node(monkeypatch, {"name": "vps-1", "endpoint_host": "198.51.100.7", "port": 443})
+    _mock_vps_tcp(monkeypatch, reachable=True)
+    # порты закрыты (крах) + сервисы (мок running из _all_up_monkey не релевантен — port-down = крах):
+    monkeypatch.setattr(health, "_port_up", lambda port: False)
+    result = health.check_all()
+    assert result["status"] in ("degraded", "down"), "туннель fail + прокси down → не ok"
+    lp = [c for c in result["checks"] if "локальн" in c["name"].lower() or "proxy-up" in c["name"].lower()
+          or "local proxy" in c["name"].lower()][0]
+    assert lp["ok"] is False, "локальный прокси down → driver (ok=False)"
+    assert not lp.get("info"), "down — НЕ info (driver)"
+
+
+def test_local_proxy_info_when_tunnel_ok(monkeypatch):
+    """Туннель ok → _local_proxy_up = info-only (порты уже driver через _port_up чеки; сервис-статус
+    не роняет вердикт когда канал и так жив). Канон: info-only когда проблема не актуальна."""
+    _all_up_monkey(monkeypatch, probe_status="ok")
+    # порты up + сервисы running (мок _all_up_monkey) → _local_proxy_up ok:
+    result = health.check_all()
+    assert result["status"] == "ok", "всё живо → ok"
+    lp = [c for c in result["checks"] if "локальн" in c["name"].lower() or "local proxy" in c["name"].lower()
+          or "proxy-up" in c["name"].lower()][0]
+    assert lp.get("info") is True, "туннель ok → local-proxy чек info-only"
+
+
+def test_service_running_uses_system_domain_for_protected_privoxy(monkeypatch):
+    """protected-mode (privoxy_system.protection_present) → privoxy label=com.srouter.privoxy,
+    domain=system. brew services info его НЕ видит → единый источник launchctl print (как
+    _collect_launchd_lifecycle health.py:1658). Проверяем что _service_running зовётся с system
+    domain для protected, gui для brew-mode."""
+    calls = []
+
+    def fake_run(cmd, timeout):
+        calls.append(cmd)
+        # rc=0 + state=running → running True (формат launchctl print).
+        return {"rc": 0, "out": "\tstate = running;\n\tpid = 1234;\n", "err": "", "timeout": False}
+
+    monkeypatch.setattr(health.sys_probe, "run", fake_run)
+    monkeypatch.setattr(health.privoxy_system, "protection_present", lambda: True)
+    health._service_running(health.privoxy_system.SYSTEM_LABEL, domain="system")
+    # проверяем что launchctl print system/<label>:
+    assert any("print" in c and "system/" in " ".join(c) for c in calls), \
+        "protected → launchctl print system/<label>"
 
 
 # ============================ _tunnel_up HTTP semantics (issue #82, класс #3) ============================
