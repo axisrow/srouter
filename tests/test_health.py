@@ -11,6 +11,7 @@ _claude_proxy_probe() возвращает {status, source, detail}:
   status="unknown" — только SOCKS TCP socket, idle, timeout или CC не запущен.
 """
 import pytest as _pytest
+import pytest  # noqa: ICN003 — pytest.fail/raises в тестах ниже (#194)
 
 import health
 import privoxy_system
@@ -46,6 +47,11 @@ def _all_up_monkey(monkeypatch, *, probe_status="ok", probe_detail="runtime: к�
                         lambda: {"status": "unknown", "source": "n/a", "detail": "App не запущен (mock)"})
     monkeypatch.setattr(health, "_desktop_proxy_check",
                         lambda: {"status": "unknown", "detail": "launchctl (mock)"})
+    # #194: _upstream_vps_reachable дёргает local_state.active_node + sys_probe.port_open — мокаем
+    # «нет узла» (info-only), иначе реальный srouter.local.json на dev-машине (+ живой/мёртвый VPS)
+    # драйвит вердикт недетерминированно. В этих тестах VPS-чек НЕ предмет проверки → info-заглушка.
+    import local_state
+    monkeypatch.setattr(local_state, "active_node", lambda path=None: {})
 
 
 # ============================ _claude_proxy_probe (детект lsof) ============================
@@ -273,6 +279,134 @@ def test_check_all_down_when_everything_dead(monkeypatch):
 
     result = health.check_all()
     assert result["status"] == "down"
+
+
+# ============================ #194: upstream VPS прямой TCP-probe (минуя прокси) ============================
+# Корень (_tunnel_up бьёт через прокси к API-таргетам): connection-failed без различения «VPS мёртв»
+# vs «локальный прокси упал». _upstream_vps_reachable() = socket.create_connection до
+# active_node().endpoint_host:port БЕЗ прокси (sys_probe.port_open) — точно говорит «VPS мёртв».
+#
+# Контракт _upstream_vps_reachable() -> {status, detail}:
+#   ok   — TCP-connect успешен (VPS жив);
+#   down — TCP timeout/refused (VPS мёртв);
+#   warn — placeholder TEST-NET 203.0.113.x (нельзя реально зондировать);
+#   info — нет активного узла / нет endpoint_host.
+# Интеграция в check_all: driver-усилитель ТОЛЬКО когда туннель fail + VPS down (гарантирует DOWN,
+# не DEGRADED); VPS ok при туннель-fail → info «локальный прокси сломан (VPS жив)»; туннель ok → info.
+def _mock_active_node(monkeypatch, node):
+    """Подменить local_state.active_node() заданным узлом ({} = нет узла)."""
+    import local_state
+    monkeypatch.setattr(local_state, "active_node", lambda path=None: node)
+
+
+def _mock_vps_tcp(monkeypatch, reachable):
+    """Подменить прямой TCP-probe до VPS endpoint (минуя прокси). reachable=True/False."""
+    monkeypatch.setattr(health.sys_probe, "port_open", lambda host, port, timeout=1.0: reachable)
+
+
+def test_vps_unreachable_when_tunnel_fail_is_driver_down(monkeypatch):
+    """ДЫРА #194: порты живы + туннель fail + VPS TCP-unreachable → DOWN (upstream VPS мёртв).
+
+    Раньше connection-failed без различения. Теперь прямой TCP-probe доказывает «VPS мёртв»
+    → driver-чек роняет вердикт в down (не degraded). VPS-смерть = critical-infra DOWN (#194).
+    """
+    _all_up_monkey(monkeypatch)  # порты + claude/codex/app/desktop — info/ok (не роняют)
+    monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed"))
+    _mock_active_node(monkeypatch, {"name": "vps-1", "endpoint_host": "198.51.100.7", "port": 443})
+    _mock_vps_tcp(monkeypatch, reachable=False)
+    result = health.check_all()
+    assert result["status"] == "down", "VPS TCP-unreachable + туннель fail → DOWN (VPS мёртв)"
+    vps = [c for c in result["checks"] if "vps" in c["name"].lower() and "upstream" in c["name"].lower()][0]
+    assert vps["ok"] is False, "VPS-unreachable — driver (ok=False)"
+    assert not vps.get("info"), "VPS-unreachable при туннель-fail — НЕ info (driver)"
+    assert "VPS" in vps["detail"] or "endpoint" in vps["detail"], "detail объясняет: VPS мёртв"
+
+
+def test_vps_reachable_when_tunnel_fail_distinguishes_local_proxy(monkeypatch):
+    """ДЫРА #194: порты живы + туннель fail + VPS reachable → «локальный прокси сломан (VPS жив)».
+
+    Прямой TCP-probe доказывает VPS жив → проблема НЕ в VPS. doctor различает: туннель-fail
+    из-за локального прокси/туннеля, а не мёртвого VPS. VPS-чек = info (картина, не driver
+    поверх туннель-fail — туннель уже driver). Канон: verify-don't-guess (прямая причина).
+    """
+    _all_up_monkey(monkeypatch)
+    monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed"))
+    _mock_active_node(monkeypatch, {"name": "vps-1", "endpoint_host": "198.51.100.7", "port": 443})
+    _mock_vps_tcp(monkeypatch, reachable=True)
+    result = health.check_all()
+    # туннель-fail уже driver → status не ok. VPS жив → это не «всё мёртво».
+    assert result["status"] in ("degraded", "down"), "туннель-fail → не ok"
+    vps = [c for c in result["checks"] if "vps" in c["name"].lower() and "upstream" in c["name"].lower()][0]
+    assert vps.get("info") is True, "VPS-reachable при туннель-fail — info (различение, не driver)"
+    assert "жив" in vps["detail"].lower() or "reachable" in vps["detail"].lower(), \
+        "detail говорит: VPS жив (проблема в локальном прокси/туннеле)"
+
+
+def test_vps_reachable_when_tunnel_ok_is_info(monkeypatch):
+    """Туннель ok + VPS reachable → ok; VPS-чек info-only (VPS-доступность не релевантна когда туннель жив)."""
+    _all_up_monkey(monkeypatch, probe_status="ok")
+    monkeypatch.setattr(health, "_tunnel_up", lambda: (True, "HTTP 200"))
+    _mock_active_node(monkeypatch, {"name": "vps-1", "endpoint_host": "198.51.100.7", "port": 443})
+    _mock_vps_tcp(monkeypatch, reachable=True)
+    result = health.check_all()
+    assert result["status"] == "ok", "всё живо → ok"
+    vps = [c for c in result["checks"] if "vps" in c["name"].lower() and "upstream" in c["name"].lower()][0]
+    assert vps.get("info") is True, "туннель ok → VPS-чек info-only (не driver)"
+
+
+def test_vps_no_active_node_is_info_only(monkeypatch):
+    """Нет активного узла (active_node() = {}) → VPS-чек info-only, не роняет вердикт."""
+    _all_up_monkey(monkeypatch, probe_status="ok")
+    _mock_active_node(monkeypatch, {})  # нет узла
+    _mock_vps_tcp(monkeypatch, reachable=True)  # не должно даже дёргаться
+    result = health.check_all()
+    assert result["status"] == "ok", "нет узла → не роняет вердикт"
+    vps = [c for c in result["checks"] if "vps" in c["name"].lower() and "upstream" in c["name"].lower()][0]
+    assert vps.get("info") is True, "нет узла → info-only"
+
+
+def test_vps_placeholder_testnet_203_0_113_is_warn(monkeypatch):
+    """Placeholder TEST-NET 203.0.113.x (RFC 5737) → warn: нельзя реально зондировать test-IP.
+
+    Тестовая конфигурация / пример конфига содержит незаменённый placeholder — прямой TCP-probe
+    до 203.0.113.x ничего не доказывает (адреса не маршрутизируются). Doctor предупреждает о
+    placeholder, не врёт «VPS мёртв» и не падает. status=warn, чек info (placeholder — не сбой стека).
+    """
+    _all_up_monkey(monkeypatch, probe_status="ok")
+    monkeypatch.setattr(health, "_tunnel_up", lambda: (True, "HTTP 200"))
+    _mock_active_node(monkeypatch, {"name": "example", "endpoint_host": "203.0.113.7", "port": 443})
+    # port_open не должно вызываться для placeholder (детект до пробы).
+    monkeypatch.setattr(health.sys_probe, "port_open",
+                        lambda host, port, timeout=1.0: pytest.fail("placeholder не должен зондироваться"))
+    vps_status = health._upstream_vps_reachable()
+    assert vps_status["status"] == "warn", "placeholder 203.0.113.x → warn (нельзя зондировать)"
+    result = health.check_all()
+    assert result["status"] == "ok", "placeholder — warn, не роняет вердикт (туннель жив)"
+    vps_check = [c for c in result["checks"] if "vps" in c["name"].lower() and "upstream" in c["name"].lower()][0]
+    assert vps_check.get("info") is True, "placeholder — info-only (не driver)"
+
+
+def test_vps_unreachable_does_not_mask_down_into_degraded(monkeypatch):
+    """REGRESSION-гвард #194: VPS-unreachable при «всё мертво» НЕ превращает down в degraded.
+
+    Защита от будущей регрессии: если кто-то сделает VPS-чек driver-ok=True (или info) при
+    unreachable — проверка упадёт. status обязан остаться down, VPS-чек — driver ok=False.
+    """
+    monkeypatch.setattr(health, "_port_up", lambda port: False)
+    monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed"))
+    monkeypatch.setattr(health, "_claude_proxy_probe",
+                        lambda: {"status": "down", "source": "runtime", "detail": "runtime"})
+    monkeypatch.setattr(health, "_desktop_proxy_check", lambda: {"status": "down", "detail": "down"})
+    monkeypatch.setattr(health, "_codex_proxy_probe",
+                        lambda: {"status": "down", "source": "runtime", "detail": "runtime"})
+    monkeypatch.setattr(health, "_codex_app_proxy_check",
+                        lambda: {"status": "down", "source": "gui-env", "detail": "down"})
+    _mock_active_node(monkeypatch, {"name": "vps-1", "endpoint_host": "198.51.100.7", "port": 443})
+    _mock_vps_tcp(monkeypatch, reachable=False)
+    result = health.check_all()
+    assert result["status"] == "down", "всё мёртво + VPS unreachable → DOWN, не DEGRADED"
+    vps = [c for c in result["checks"] if "vps" in c["name"].lower() and "upstream" in c["name"].lower()][0]
+    assert vps["ok"] is False and not vps.get("info"), "VPS-unreachable — driver (не маскирует down)"
 
 
 # ============================ _tunnel_up HTTP semantics (issue #82, класс #3) ============================
