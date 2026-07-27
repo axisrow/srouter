@@ -1429,6 +1429,59 @@ def _vscode_proxy_check():
             "detail": "VSCode http.proxy не задан — codex расширения наследует privoxy из env (рвёт WS #120), scoped не активирован"}
 
 
+# ============================ #199: gh/git VPS-независимый dev-workflow ============================
+
+# Подсказка-текст «env -u» — единый литерал, чтобы doctor и README говорили одно и то же
+# (канон — единый источник правды; никто не должен расшифровывать прокси-env по-разному).
+GH_DIRECT_HINT = ("gh/git работают напрямую: `env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY "
+                  "-u NO_PROXY -u no_proxy <gh|git> ...` — github TCP напрямую открыт (GFW не режет "
+                  "TCP-слой), gh Go-стек обходит GFW TLS-блокировку (verify 2026-07-27). "
+                  "git pull https напрямую НЕ работает (LibreSSL режется) → clone через `gh repo clone`/`gh api`; "
+                  "альтернатива — ssh:22 (github SSH открыт напрямую). VPS-независимо (#199).")
+
+
+def _github_direct_check():
+    """Подсказка VPS-независимого dev-workflow для gh/git (issue #199). info-only ВСЕГДА.
+
+    Диагноз #199 (verify, эмпирически): github доступен напрямую через gh — Go HTTP/TLS-стек gh
+    обходит GFW TLS-блокировку (в отличие от curl/git на LibreSSL + системном resolver). Но если в
+    ~/.gitconfig включён scoped git-прокси `http.https://github.com.proxy → privoxy 8118` (git_proxy),
+    то git pull/push идёт ЧЕРЕЗ прокси → зависит от VPS: мёртвый VPS = git timeout (выглядело как
+    «флап gh»). Подсказка: для VPS-независимости снимать прокси-env через `env -u`.
+
+    Предикт = статичный git-config (verify-don't-guess — не догадки о таймаутах, а проверяемый
+    факт конфигурации). Чек info-only ВСЕГДА (как endpoint-override): git-proxy-настройка — это
+    scoped-конфиг, не сбой стека; warn/ok/unknown НЕ роняют агрегированный вердикт — это картина
+    для диагностики dev-workflow, не driver. Канон: verify-don't-guess, srouter-critical-infra-24-7
+    (dev-workflow не должен зависеть от VPS — github-операции переживают смерть VPS).
+
+    Возвращает {status, detail}:
+      ok      — git-config github-proxy выключен (github уже идёт напрямую);
+      warn    — git-config ВКЛЮЧЁН (scoped github → privoxy) → git зависит от VPS, подсказка env -u;
+      unknown — git_proxy.status unknown/ошибка (git config timeout/недоступен).
+    Не бросает (probe-канон).
+    """
+    try:
+        import git_proxy
+        st = git_proxy.status()
+    except Exception:
+        return {"status": "unknown", "detail": "git_proxy недоступен — check пропущен"}
+    # isinstance ДО .get: git_proxy.status может вернуть None/не-dict (мусор) — .get упал бы
+    # (probe-канон: чек не бросает). git_proxy.status при timeout отдаёт {status:"unknown"} — это
+    # НЕ «git-proxy выключен» (enabled=False без status — другое; ниже разделяем).
+    if not isinstance(st, dict) or st.get("status") == "unknown":
+        return {"status": "unknown",
+                "detail": "git config недоступен (timeout) — github-direct check пропущен"}
+    enabled = bool(st.get("enabled"))
+    if not enabled:
+        return {"status": "ok",
+                "detail": "git github-proxy выключен — github идёт напрямую (VPS-независимо). "
+                          "Если gh/git timeout через прокси: " + GH_DIRECT_HINT}
+    return {"status": "warn",
+            "detail": f"git github-proxy ВКЛЮЧЁН ({st.get('proxy') or 'privoxy 8118'}) → "
+                      f"git pull/push зависит от VPS. " + GH_DIRECT_HINT}
+
+
 def check_all(*, active_claude=False):
     """Все проверки стека. {status: ok|degraded|down, checks: [{name, ok, detail?, info?}]}.
 
@@ -1517,6 +1570,14 @@ def check_all(*, active_claude=False):
     vp_check = {"name": "codex vscode-proxy (http.proxy)",
                 "ok": vp["status"] != "down", "info": True, "detail": vp["detail"]}
     checks.append(vp_check)
+    # gh/git VPS-независимый dev-workflow (#199): github доступен напрямую через gh (Go-стек обходит
+    # GFW TLS); scoped git-proxy → privoxy делает git pull/push VPS-зависимым. info-only ВСЕГДА (как
+    # endpoint-override) — это образовательная подсказка для dev-workflow, не сбой стека: warn
+    # (git-proxy ВКЛ) подсказывает env -u, не роняя вердикт. Лёгкий чек (git config --get, как git_proxy).
+    gh = _github_direct_check()
+    gh_check = {"name": "gh/git direct (github env -u)",
+                "ok": gh["status"] != "warn", "info": True, "detail": gh["detail"]}
+    checks.append(gh_check)
     # Установленные codex/claude-code binary на диске (#145): инвентаризация, info-only ВСЕГДА
     # (несколько версий — ранний сигнал конфликта #135, не сбой стека). unknown (ничего не установлено)
     # тоже info — не роняет вердикт. Doctor показывает картину, не угадывает.

@@ -20,6 +20,7 @@ This repository is the v1 monorepo for `srouter`: the local macOS client, Flask 
 - `python3 -m py_compile dashboard.py srouter_config.example.py` is the quick syntax check.
 - Build system / package metadata: `pyproject.toml` (setuptools backend, PEP 621). Install the console entry point with `python3 -m pip install --upgrade pip` (needs pip ≥ 21.3 for PEP 660 editable install), then `pip install -e .` — this exposes the `srouter` command.
 - Test runner: `pytest` (declared in `[project.optional-dependencies].dev`). Run the suite with `pytest` from the repo root after `pip install -e '.[dev]'`.
+- **gh / git to github.com — always direct** (`env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u NO_PROXY -u no_proxy`), never via proxy/VPS (#199): github TCP is directly reachable and `gh`'s Go stack bypasses GFW TLS blocking, so this is VPS-independent. `git pull`/`clone` over https is cut by GFW (LibreSSL + system resolver) → use `gh repo clone`/`gh api` or SSH (`git@github.com:`, port 22 is open directly). `srouter doctor` shows this as the `gh/git direct` check with an `env -u` hint.
 
 ## Coding Style & Naming Conventions
 

@@ -359,7 +359,7 @@ binary/exec.LookPath), поэтому границей служит именно
 |---|---|
 | **Claude Code** | `HTTPS_PROXY=http://127.0.0.1:8118` в `~/.claude/settings.json` (privoxy HTTP; SOCKS5 CC не умеет) |
 | **Codex CLI/App** | **напрямую SOCKS5 в xray** (`socks5h://127.0.0.1:10808`) тремя живыми путями, минуя privoxy: wrappers (CLI + `--proxy-server` для Chromium-оболочки App), LaunchAgent `com.srouter.codenv` (gui-SOCKS5 env для Rust app-server ChatGPT.app, #189/#190; setenv не ретроактивен — запущенный до install ChatGPT.app перезапустите Cmd+Q), scoped VSCode `http.proxy` (расширение `openai.chatgpt`, #185; только если install обновил существующий settings.json); + **PF kill-switch в ядре** (#168) как будущая fail-closed граница (режет прямой TCP-выход codex на en0–en6/ppp0–ppp1, разрешая loopback SOCKS5 по TCP; пока дормантен — пользователь uid 503 уже создаётся install (#186), активируется после полной активации: запуск codex под uid 503 **независимо от wrapper'а** (не sudo -u в wrapper) + доменная изоляция + TCP на en/ppp, отдельный follow-up). privoxy портит WS-стриминг Codex (`Reconnecting`/`request timed out`); `[network] proxy_url` в `~/.codex/config.toml` мёртв в codex 0.146 (управляет execution-scoped sandbox-прокси для субпроцессов, не клиентом) — поэтому wrappers в `~/bin/codex-srouter` (CLI, имя `codex-srouter` убирает коллизию wrapper↔real-binary #169) + `~/bin/codex-app-proxy` (App Chromium) + `com.srouter.codenv` (Rust app-server) + scoped VSCode `http.proxy` (расширение). Запускать Codex **App** через `~/bin/codex-app-proxy`, а не иконку Dock (Dock не передаёт `--proxy-server`). См. раздел «Изоляция Codex». |
-| **git / gh** | домены GitHub в вайтлисте узла → резолв и трафик через ускоритель |
+| **git / gh** | scoped git-прокси `http.https://github.com.proxy → privoxy 8118` (`git_proxy.py`); но gh работает **напрямую** через Go-стек (GFW не режет) → для VPS-независимости запускайте `gh`/`git` через `env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY` (см. раздел «gh / git: прямой доступ») |
 | **Браузер** | системный SOCKS5 `127.0.0.1:10808` (вайтлист разруливает сам) |
 
 ## Откат
@@ -370,6 +370,46 @@ srouter uninstall      # полный откат к дефолту:
 #   сбрасывает DNS (networksetup ... Empty), удаляет LaunchAgent, watchdog, ppp-hook,
 #   split-route до VPS, Claude Code/git-прокси, Codex SOCKS5-wrappers + env + PATH.
 ```
+
+## gh / git: прямой доступ (`env -u`), не через прокси (#199)
+
+`gh` и `git` к github.com **всегда запускайте с прямым доступом**, снимая прокси-env — это
+**VPS-независимый** dev-workflow: github-операции переживают смерть VPS (24/7 resilience).
+
+**Эмпирический диагноз (verify, 2026-07-27):** github TCP напрямую открыт (`nc github.com 443`
+= OPEN — GFW не режет TCP-слой). Разница стеков решает исход:
+
+| Путь | Результат | Причина |
+|---|---|---|
+| `gh api user` напрямую (`env -u` прокси) | ✅ работает (3/3) | **gh (Go)** — свой HTTP/TLS-стек + resolver, обходит GFW TLS-блокировку |
+| `curl https://api.github.com` напрямую | ❌ timeout (5/5) | LibreSSL + системный resolver → GFW-заблокированный IP, TLS режется |
+| `gh`/`git` через прокси (`HTTP_PROXY=8118` → VPS) | ❌ timeout когда VPS мёртв | зависит от VPS; выглядело как «флап gh» |
+
+То, что казалось флапом `gh` = смешанные сценарии: то через прокси (наследуется из env caller'а),
+то напрямую — в зависимости от `HTTP_PROXY` в окружении.
+
+**Рекомендация — всегда `env -u`:**
+
+```bash
+# gh / git с прямым доступом (снять прокси-env):
+env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u NO_PROXY -u no_proxy gh pr merge 123
+env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u NO_PROXY -u no_proxy gh issue create ...
+env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u NO_PROXY -u no_proxy git fetch
+
+# gh работает напрямую (Go-стек). git pull по https напрямую НЕ работает (LibreSSL режется),
+# но gh — да → для clone/fetch используй gh, не git:
+gh repo clone axisrow/srouter        # ✅ работает напрямую (через gh-стек)
+git clone https://github.com/...     # ❌ режется GFW через системный resolver
+
+# Альтернатива: SSH-remote (github:22 открыт напрямую — nc github.com 22 = OPEN),
+# требует SSH-ключ в github:  git clone git@github.com:axisrow/srouter.git
+```
+
+**Связь с srouter:** `srouter install` ставит scoped git-прокси `http.https://github.com.proxy →
+privoxy 8118` (`git_proxy.py`) — он направляет `git` к github через ускоритель. Это полезно, когда
+ускоритель жив, но делает `git` **VPS-зависимым**. Для VPS-независимых операций снимайте прокси-env
+через `env -u` (gh-стек обходит GFW и без ускорителя). `srouter doctor` показывает этот чек
+(`gh/git direct`) с подсказкой `env -u`, когда git-proxy включён — info-only, не роняет вердикт.
 
 ## PF-изоляция доменов (опционально)
 
@@ -726,6 +766,47 @@ srouter uninstall      # full rollback to defaults:
 #   split-route to the VPS, Claude Code/git proxy, Codex SOCKS5-wrappers + env + PATH.
 ```
 
+## gh / git: direct access (`env -u`), not via proxy (#199)
+
+Always run `gh` and `git` against github.com **with direct access**, unsetting the proxy env —
+this is a **VPS-independent** dev-workflow: github operations survive a dead VPS (24/7 resilience).
+
+**Empirical diagnosis (verify, 2026-07-27):** github TCP is directly reachable (`nc github.com 443`
+= OPEN — the GFW does not cut the TCP layer). The stack decides the outcome:
+
+| Path | Result | Reason |
+|---|---|---|
+| `gh api user` direct (`env -u` proxy) | ✅ works (3/3) | **gh (Go)** — its own HTTP/TLS stack + resolver, bypasses GFW TLS blocking |
+| `curl https://api.github.com` direct | ❌ timeout (5/5) | LibreSSL + system resolver → GFW-blocked IP, TLS cut |
+| `gh`/`git` via proxy (`HTTP_PROXY=8118` → VPS) | ❌ timeout when VPS is dead | depends on VPS; looked like "gh flapping" |
+
+What looked like `gh` flapping = mixed scenarios: sometimes via proxy (inherited from the caller's
+env), sometimes direct — depending on `HTTP_PROXY` in the environment.
+
+**Recommendation — always `env -u`:**
+
+```bash
+# gh / git with direct access (unset proxy env):
+env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u NO_PROXY -u no_proxy gh pr merge 123
+env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u NO_PROXY -u no_proxy gh issue create ...
+env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u NO_PROXY -u no_proxy git fetch
+
+# gh works direct (Go stack). git pull over https does NOT (LibreSSL is cut),
+# but gh does → for clone/fetch use gh, not git:
+gh repo clone axisrow/srouter        # ✅ works direct (via gh stack)
+git clone https://github.com/...     # ❌ cut by GFW via the system resolver
+
+# Alternative: SSH remote (github:22 is open directly — nc github.com 22 = OPEN),
+# requires an SSH key in github:  git clone git@github.com:axisrow/srouter.git
+```
+
+**Relation to srouter:** `srouter install` sets a scoped git proxy `http.https://github.com.proxy →
+privoxy 8118` (`git_proxy.py`) — it routes `git` to github through the accelerator. That's useful
+when the accelerator is alive, but it makes `git` **VPS-dependent**. For VPS-independent operations,
+unset the proxy env via `env -u` (the gh stack bypasses the GFW without the accelerator too).
+`srouter doctor` surfaces this check (`gh/git direct`) with an `env -u` hint when the git proxy is
+enabled — info-only, it does not lower the verdict.
+
 ## PF domain isolation (optional)
 
 **Goal:** packets to Proxy domains (`api.anthropic.com`, `console.anthropic.com`, `claude.ai`)
@@ -824,7 +905,7 @@ remove it).
 |---|---|
 | **Claude Code** | `HTTPS_PROXY=http://127.0.0.1:8118` in `~/.claude/settings.json` |
 | **Codex** | **straight to xray** (`socks5h://127.0.0.1:10808`) via three live paths that bypass privoxy: wrappers (CLI + `--proxy-server` for the App Chromium shell), the `com.srouter.codenv` LaunchAgent (gui-SOCKS5 env for ChatGPT.app's Rust app-server, #189/#190; setenv is non-retroactive — restart an already-running ChatGPT.app with Cmd+Q), and scoped VSCode `http.proxy` (the `openai.chatgpt` extension, #185; only if install updated an existing settings.json); + **a PF kill-switch in the kernel** (#168) as the future fail-closed boundary (cuts codex direct TCP egress on en0–en6/ppp0–ppp1, allowing TCP to loopback SOCKS5; dormant today — the uid 503 user is already created by install (#186), and activation requires full activation: launching codex under uid 503 **independently of the wrapper** (not via wrapper sudo -u) + domain isolation + TCP on en/ppp, a separate follow-up). `[network] proxy_url` in `~/.codex/config.toml` is dead in codex 0.146 (it configures the execution-scoped sandbox proxy for spawned `codex` subprocesses, not the client) — hence wrappers + codenv + VSCode http.proxy. See the "Codex isolation" section. |
-| **git / gh** | GitHub domains whitelisted on the node |
+| **git / gh** | scoped git proxy `http.https://github.com.proxy → privoxy 8118` (`git_proxy.py`); but gh works **direct** via its Go stack (GFW does not cut it) → for VPS-independence run `gh`/`git` with `env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY` (see "gh / git: direct access") |
 | **Browser** | system SOCKS5 `127.0.0.1:10808` |
 
 ---
