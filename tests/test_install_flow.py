@@ -173,6 +173,140 @@ def test_adopt_conflict_marks_component_unmanaged_and_does_not_write_config(tmp_
     assert state["detected_environment"]["privoxy"]["management"] == {"mode": "adopted", "managed": False}
 
 
+# ============================ #200: защита apply от перезаписи рабочего xray placeholder'ом ============================
+# srouter.local.json (active_node) держит placeholder test-IP 203.0.113.x, а существующий xray config
+# (managed, от прошлой генерации) держит РЕАЛЬНЫЙ VPS-address. gen_xray_config.generate_config генерит
+# из local_state.active_node() → apply перезаписал бы рабочий xray placeholder'ом и сломал прокси
+# (когда VPS оживёт). Защита: detect drift (placeholder + реальный в xray) → BLOCK до записи config.
+
+def _write_managed_xray_with_vless(config_path, address):
+    """Managed xray config (с srouter.marker) + vless-outbound на address — как gen_xray_config пишет.
+
+    managed-маркер => build_plan НЕ считает foreign-conflict (apply доходит до write_config).
+    """
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(json.dumps({
+        "srouter": {"marker": install_lib.MARKER, "managed": True},
+        "outbounds": [
+            {"tag": "direct", "protocol": "freedom"},
+            {"tag": "active", "protocol": "vless",
+             "settings": {"vnext": [{"address": address, "port": 443}]}},
+        ],
+    }), encoding="utf-8")
+
+
+def test_apply_blocks_placeholder_overwrite_of_real_xray_config(tmp_path):
+    """ТДД #200-4: apply НЕ перезаписывает рабочий xray config (реальный address) placeholder'ом.
+
+    Существующий xray config managed с реальным VPS 85.136.181.198; state — placeholder 203.0.113.10.
+    Apply обязан BLOCK с понятной причиной, НЕ трогая рабочий config (srouter-critical-infra-24-7).
+    """
+    env = _env(tmp_path)
+    xray_cfg = env.component_paths("xray")["config"]
+    _write_managed_xray_with_vless(xray_cfg, "85.136.181.198")
+    env.state_path.write_text(json.dumps({
+        "nodes": [{"name": "sg-1", "endpoint_host": "203.0.113.10",
+                   "route_ip": "203.0.113.10", "enabled": True}],
+        "active_node": {"name": "sg-1", "pending": None},
+    }), encoding="utf-8")
+
+    result = install_lib.apply_install(
+        env=env,
+        confirm=True,
+        choices={"privoxy": "skip", "dnsmasq": "skip"},
+        runner=FakeRunner(),
+        port_checker=lambda *_: False,
+        install_launchagent=False,
+    )
+
+    assert result["ok"] is False
+    assert "xray_endpoint_overwrite_blocked" in result["blocked"]
+    # РАБОЧИЙ xray config НЕ тронут — реальный address на месте
+    cfg = json.loads(xray_cfg.read_text(encoding="utf-8"))
+    vnext = [o for o in cfg["outbounds"] if o.get("protocol") == "vless"][0]["settings"]["vnext"]
+    assert vnext[0]["address"] == "85.136.181.198"
+
+
+def test_apply_allows_placeholder_when_no_real_xray_config(tmp_path):
+    """Свежая инсталляция: xray config отсутствует → apply генерит из placeholder (нечего ломать).
+
+    Блок защиты НЕ срабатывает без существующего рабочего config (fresh install — норма).
+    """
+    env = _env(tmp_path)
+    # xray config НЕ существует
+    env.state_path.write_text(json.dumps({
+        "nodes": [{"name": "sg-1", "endpoint_host": "203.0.113.10",
+                   "route_ip": "203.0.113.10", "enabled": True}],
+        "active_node": {"name": "sg-1", "pending": None},
+    }), encoding="utf-8")
+
+    runner = FakeRunner()
+    result = install_lib.apply_install(
+        env=env,
+        confirm=True,
+        choices={"privoxy": "skip", "dnsmasq": "skip"},
+        runner=runner,
+        port_checker=_port_checker_managed_up(runner.calls),
+        install_launchagent=False,
+    )
+
+    assert result["ok"] is True, result
+    # config сгенерирован (placeholder допустим — нет рабочего config для защиты)
+    assert env.component_paths("xray")["config"].exists()
+
+
+def test_apply_allows_overwrite_when_endpoints_synced(tmp_path):
+    """local.json endpoint == xray address → synced, apply НЕ блокирует (регенерация безопасна)."""
+    env = _env(tmp_path)
+    xray_cfg = env.component_paths("xray")["config"]
+    _write_managed_xray_with_vless(xray_cfg, "85.136.181.198")
+    env.state_path.write_text(json.dumps({
+        "nodes": [{"name": "sg-1", "endpoint_host": "85.136.181.198",
+                   "route_ip": "85.136.181.198", "enabled": True}],
+        "active_node": {"name": "sg-1", "pending": None},
+    }), encoding="utf-8")
+
+    runner = FakeRunner()
+    result = install_lib.apply_install(
+        env=env,
+        confirm=True,
+        choices={"privoxy": "skip", "dnsmasq": "skip"},
+        runner=runner,
+        port_checker=_port_checker_managed_up(runner.calls),
+        install_launchagent=False,
+    )
+
+    assert result["ok"] is True, result
+
+
+def test_apply_force_overrides_placeholder_block(tmp_path):
+    """--force / force=True обходит блок (пользователь осознанно перезаписывает рабочий config).
+
+    Канон more-options-better: блокировка — не абсолют, escape-hatch через явный flag (как adopt).
+    """
+    env = _env(tmp_path)
+    xray_cfg = env.component_paths("xray")["config"]
+    _write_managed_xray_with_vless(xray_cfg, "85.136.181.198")
+    env.state_path.write_text(json.dumps({
+        "nodes": [{"name": "sg-1", "endpoint_host": "203.0.113.10",
+                   "route_ip": "203.0.113.10", "enabled": True}],
+        "active_node": {"name": "sg-1", "pending": None},
+    }), encoding="utf-8")
+
+    runner = FakeRunner()
+    result = install_lib.apply_install(
+        env=env,
+        confirm=True,
+        choices={"privoxy": "skip", "dnsmasq": "skip"},
+        runner=runner,
+        port_checker=_port_checker_managed_up(runner.calls),
+        install_launchagent=False,
+        force_endpoint_overwrite=True,
+    )
+
+    assert result["ok"] is True, result
+
+
 def test_overwrite_conflict_backs_up_and_writes_managed_config(tmp_path):
     env = _env(tmp_path)
     config_path = env.component_paths("privoxy")["config"]

@@ -974,6 +974,59 @@ def _endpoint_override_check():
     return {"status": "info", "detail": f"endpoint override: {base} (нестандартный endpoint)"}
 
 
+# ============================ #200: рассинхрон endpoint local.json ↔ xray config ============================
+# Doctor видит РЕАЛЬНЫЙ endpoint (из рабочего xray config), не placeholder из local.json. Когда
+# active_node.endpoint_host — test-IP 203.0.113.x (RFC 5737), а рабочий xray config держит реальный
+# VPS-address — это рассинхрон источника правды: local.json (canonical) врёт, xray — правда. Канон
+# verify-dont-guess (показываем реальный, не placeholder), srouter-is-configurator (local.json=canonical).
+# Чек info-only (как endpoint-override): картина для диагностики + подсказка `srouter sync`, не сбой стека.
+# Path-константы module-level — чтобы тесты могли перенаправить в tmp через monkeypatch (канон #155/#165).
+_ENDPOINT_SYNC_STATE_PATH = None  # None → local_state default (рядом с модулем)
+_ENDPOINT_SYNC_XRAY_PATH = local_state.XRAY_CONFIG_PATH
+
+
+def _endpoint_xray_sync_check(state_path=None, xray_config_path=None):
+    """Детектит рассинхрон endpoint_host (local.json) ↔ address (рабочий xray config) — #200.
+
+    Возвращает {status, detail}:
+      ok   — endpoint активного узла (canonical state) == address из xray (синхрон);
+      warn — рассинхрон: local.json — placeholder test-IP, а xray держит реальный address. detail
+             показывает РЕАЛЬНЫЙ endpoint (из xray) и подсказку `srouter sync` (импорт в local.json);
+      info — нет xray config (fresh install) / нет активного узла (apply не настроен).
+    Канон: local.json = canonical источник, но рабочий xray — runtime-истина. apply-защита (#200
+    в install_lib) блокирует перезапись рабочего config placeholder'ом; doctor показывает картину.
+    Не бросает (probe-канон: compare_endpoint_with_xray сам fail-soft).
+    """
+    sp = state_path or _ENDPOINT_SYNC_STATE_PATH
+    xp = xray_config_path or _ENDPOINT_SYNC_XRAY_PATH
+    cmp = local_state.compare_endpoint_with_xray(state_path=sp, xray_config_path=xp)
+    local, xray, placeholder = cmp["local"], cmp["xray"], cmp["placeholder"]
+    # нет активного узла в local.json → endpoint не настроен через srouter; sync-чек неприменим
+    # (даже если рабочий xray есть — apply не использует local.json без узла). info, не warn.
+    if not local:
+        return {"status": "info",
+                "detail": "нет активного узла / endpoint_host в local.json (sync-чек неприменим)"}
+    # нет рабочего xray config → local.json единственный источник (fresh install), дрейфа нет.
+    if not xray:
+        return {"status": "info",
+                "detail": f"endpoint {local}: рабочий xray config отсутствует (fresh install) — "
+                          f"sync-чек неприменим, local.json — единственный источник"}
+    if cmp["synced"]:
+        return {"status": "ok",
+                "detail": f"endpoint синхронизирован: local.json == xray == {local}"}
+    # рассинхрон: показываем РЕАЛЬНЫЙ endpoint из xray (не placeholder), warn + подсказка sync
+    if placeholder:
+        return {"status": "warn",
+                "detail": (f"рассинхрон: local.json endpoint_host={local} (placeholder TEST-NET), "
+                           f"рабочий xray config держит РЕАЛЬНЫЙ address={xray}. "
+                           f"Doctor/apply видят реальный ({xray}). Запусти `srouter sync` "
+                           f"(импорт address из xray в local.json) или проверь active_node.")}
+    # оба реальных, но разные — detect-only, без авто-sync (выбор пользователя)
+    return {"status": "warn",
+            "detail": (f"рассинхрон: local.json endpoint_host={local}, рабочий xray={xray} "
+                       f"(оба реальные). `srouter sync` НЕ применит — реши вручную, какой правдив.")}
+
+
 # ============================ #143: runtime env живого CC-процесса (ps eww) ============================
 # Сценарий #143: CC запустился с ANTHROPIC_BASE_URL / ANTHROPIC_DEFAULT_*_MODEL override; затем
 # пользователь сбросил settings.json/shell/launchctl на стандартные, а ЖИВОЙ процесс сохранил env.
@@ -1477,6 +1530,15 @@ def check_all(*, active_claude=False):
     if eo["status"] == "info":
         eo_check["info"] = True
     checks.append(eo_check)
+    # endpoint-xray sync (#200): рассинхрон active_node (local.json) ↔ рабочий xray config.
+    # info-only ВСЕГДА (как endpoint-override) — картина для диагностики + подсказка `srouter sync`,
+    # не сбой стека (прокси может работать через реальный xray, пока local.json — placeholder).
+    # warn (рассинхрон) показываем в detail, но НЕ driver: apply-защита (#200 в install_lib) —
+    # настоящая fail-closed граница от перезаписи; doctor лишь подсвечивает расхождение.
+    exs = _endpoint_xray_sync_check()
+    exs_check = {"name": "endpoint (local.json ↔ xray sync)", "ok": exs["status"] != "warn",
+                 "info": True, "detail": exs["detail"]}
+    checks.append(exs_check)
     # Desktop App proxy (#134): SOCKS5 в launchctl = broken Desktop App; warn = CLI/Desktop
     # расхождение (driver degraded — реальный сигнал несоответствия, не info-only).
     dp = _desktop_proxy_check()
