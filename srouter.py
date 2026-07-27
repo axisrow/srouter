@@ -919,6 +919,7 @@ def cmd_install(args) -> int:
     result = apply_install(
         env=env, confirm=True, choices=choices,
         runner=runner, install_launchagent=True,
+        force_endpoint_overwrite=getattr(args, "force_endpoint_overwrite", False),
     )
     if result.get("ok"):
         # Claude Code обязан ходить через прокси (изоляция режет api.anthropic.com напрямую).
@@ -1001,6 +1002,10 @@ def cmd_install(args) -> int:
         return 0
     blocked = ", ".join(result.get("blocked") or ["unknown"])
     print(f"install остановлен: {blocked}", file=sys.stderr)
+    if "xray_endpoint_overwrite_blocked" in (result.get("blocked") or []):
+        # #200: apply заблокировал перезапись рабочего xray config placeholder'ом. Подсказка — sync.
+        if result.get("error"):
+            print(f"  {result['error']}", file=sys.stderr)
     if "plan" in result:
         print(format_plan(result["plan"]), file=sys.stderr)
     return 2
@@ -1263,6 +1268,51 @@ def cmd_doctor(args) -> int:
     return 0 if result["status"] == "ok" else 1
 
 
+def cmd_sync(args) -> int:
+    """Синхронизировать endpoint активного узла из РАБОЧЕГО xray config в srouter.local.json (#200).
+
+    Единый источник правды: local.json = canonical state, но рабочий xray config держит РЕАЛЬНЫЙ
+    VPS-address (gen_xray_config пишет туда resolve_route_ip). Если local.json — placeholder test-IP
+    (203.0.113.x, RFC 5737), а xray — реальный, это рассинхрон: gen_xray генерит из active_node() →
+    `srouter apply` заблокирован (#200 защита от перезаписи). sync импортит реальный address из xray
+    в local.json, делая canonical state правдивым. НЕ авто-overwrite когда local уже реальный (detect-only).
+    """
+    state_path = getattr(args, "state", None)
+    xray_config = getattr(args, "xray_config", None) or local_state.XRAY_CONFIG_PATH
+
+    # Сначала покажем состояние (compare) — даже если sync неприменим, пользователь видит причину.
+    cmp = local_state.compare_endpoint_with_xray(state_path=state_path, xray_config_path=xray_config)
+    local, xray, placeholder = cmp["local"], cmp["xray"], cmp["placeholder"]
+    if not local:
+        print("sync: нет активного узла / endpoint_host в local.json — нечего синхронизировать.",
+              file=sys.stderr)
+        return 1
+    if not xray:
+        print(f"sync: рабочий xray config ({xray_config}) не найден / без vless-address — "
+              f"нечего импортировать (local.json endpoint={local}).", file=sys.stderr)
+        return 1
+    if cmp["synced"]:
+        print(f"sync: уже синхронизировано — local.json endpoint == xray == {local}.")
+        return 0
+    if not placeholder:
+        # оба реальных, но разные — выбор пользователя, sync не подменяет молча.
+        print(f"sync: рассинхрон без placeholder — local.json={local} (реальный), xray={xray} (реальный). "
+              f"`srouter sync` НЕ перезаписывает реальный endpoint вручную. Реши, какой правдив, "
+              f"и отредактируй local.json (или xray) осознанно.", file=sys.stderr)
+        return 1
+
+    # local — placeholder, xray — реальный → импорт.
+    r = local_state.sync_endpoint_from_xray(xray_config_path=xray_config, path=state_path)
+    if not r["ok"]:
+        print(f"sync: не удалось импортировать endpoint из xray в local.json "
+              f"(state unreadable / узел не найден). local={local}, xray={xray}.", file=sys.stderr)
+        return 1
+    print(f"sync: импортирован реальный endpoint из рабочего xray в local.json: "
+          f"{local} (placeholder) → {r['endpoint']} (реальный).")
+    print("  local.json теперь canonical-правдив; `srouter apply` больше не заблокирован (#200).")
+    return 0
+
+
 def cmd_privoxy(args) -> int:
     """Ручное root-gated управление защищённым Privoxy (#122)."""
     action = getattr(args, "privoxy_action", None)
@@ -1502,7 +1552,21 @@ def build_parser() -> argparse.ArgumentParser:
         if name in ("install", "uninstall"):
             p.add_argument("-y", "--yes", action="store_true",
                            help="Подтвердить без интерактивного промпта (конфликты всё равно блокируют).")
+        if name == "install":
+            p.add_argument("--force-endpoint-overwrite", action="store_true",
+                           help="Обойти #200 защиту: перезаписать рабочий xray config placeholder'ом "
+                                "(осознанно; обычно запусти `srouter sync` вместо этого).")
         p.set_defaults(func=fn)
+
+    # sync (#200): импорт endpoint активного узла из РАБОЧЕГО xray config в srouter.local.json,
+    # когда local.json — placeholder test-IP, а xray — реальный VPS. Чинит рассинхрон источника
+    # правды и снимает блок apply (#200 защита от перезаписи рабочего xray placeholder'ом).
+    p_sync = sub.add_parser(
+        "sync", help="Импорт endpoint из рабочего xray в local.json (рассинхрон placeholder). #200.")
+    p_sync.add_argument("--state", default=None, help="Путь к srouter.local.json.")
+    p_sync.add_argument("--xray-config", default=local_state.XRAY_CONFIG_PATH,
+                        help="Путь к production xray-config.json.")
+    p_sync.set_defaults(func=cmd_sync)
 
     # routing (#136): управление routing-доменами production xray-config. Отдельная подкоманда —
     # свои sub-subcommands (add-domain/remove-domain/list). НЕ "route" (конфликт с split-route).

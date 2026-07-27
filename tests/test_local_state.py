@@ -1271,3 +1271,165 @@ def test_routing_apply_lock_released_after_success(tmp_path):
     cfg = json.loads(xray_p.read_text(encoding="utf-8"))
     domains = cfg["routing"]["rules"][0]["domain"]
     assert "domain:A.example" in domains and "domain:B.example" in domains
+
+
+# ============================ #200: рассинхрон endpoint local.json ↔ xray config ============================
+# Единый источник правды: srouter.local.json — canonical state. Но РАБОЧИЙ xray config
+# (туда gen_xray_config._vless_outbound пишет resolve_route_ip) может держать реальный VPS-адрес,
+# пока local.json остался placeholder'ом (test-IP 203.0.113.x, RFC 5737). В таком окне gen_xray_config
+# генерит из local_state.active_node() → `srouter apply` ПЕРЕЗАПИШЕТ рабочий xray config placeholder'ом
+# и сломает реально работающий прокси. Эталон read-xray: _read_xray_vless_address / sync_route_ip_from_xray.
+
+def test_is_testnet_placeholder_detects_203():
+    """TEST-NET 203.0.113.0/24 (RFC 5737) — документационные адреса, placeholder."""
+    assert local_state._is_testnet_placeholder("203.0.113.10")
+    assert local_state._is_testnet_placeholder("203.0.113.250")
+    # реальный адрес — НЕ placeholder
+    assert not local_state._is_testnet_placeholder("85.136.181.198")
+    assert not local_state._is_testnet_placeholder("1.1.1.1")
+    assert not local_state._is_testnet_placeholder("vps.example.com")
+
+
+def test_endpoint_xray_sync_ok_when_matching(tmp_path):
+    """ТДД #200-1: local.json endpoint == xray address → synced=True (ok)."""
+    state_p = tmp_path / "srouter.local.json"
+    xray_p = tmp_path / "xray-config.json"
+    _write_xray_config(xray_p, "85.136.181.198")
+    _write(state_p, {"nodes": [{"name": "sg-1", "endpoint_host": "85.136.181.198",
+                                 "route_ip": "85.136.181.198", "enabled": True}],
+                     "active_node": {"name": "sg-1", "pending": None}})
+    cmp = local_state.compare_endpoint_with_xray(state_path=state_p, xray_config_path=xray_p)
+    assert cmp["synced"] is True
+    assert cmp["local"] == "85.136.181.198"
+    assert cmp["xray"] == "85.136.181.198"
+    assert cmp["placeholder"] is False
+
+
+def test_endpoint_xray_sync_detects_drift_local_placeholder(tmp_path):
+    """ТДД #200-2: local.json placeholder + xray реальный → synced=False, drift, placeholder=True.
+
+    Канон verify-dont-guess: реальный адрес — в xray, doctor/apply должны видеть ЕГО, не placeholder.
+    """
+    state_p = tmp_path / "srouter.local.json"
+    xray_p = tmp_path / "xray-config.json"
+    _write_xray_config(xray_p, "85.136.181.198")
+    _write(state_p, {"nodes": [{"name": "sg-1", "endpoint_host": "203.0.113.10",
+                                 "route_ip": "203.0.113.10", "enabled": True}],
+                     "active_node": {"name": "sg-1", "pending": None}})
+    cmp = local_state.compare_endpoint_with_xray(state_path=state_p, xray_config_path=xray_p)
+    assert cmp["synced"] is False
+    assert cmp["local"] == "203.0.113.10"
+    assert cmp["xray"] == "85.136.181.198"
+    assert cmp["placeholder"] is True  # local — test-IP
+
+
+def test_endpoint_xray_sync_detects_drift_both_real_mismatch(tmp_path):
+    """local реальный + xray реальный, но разные → synced=False, placeholder=False.
+
+    Не placeholder-случай: адреса поменялись вручную в обоих местах. Тоже рассинхрон, но без
+    авто-sync (оба «реальные», выбор за пользователем — detect-only, не молчаливый overwrite).
+    """
+    state_p = tmp_path / "srouter.local.json"
+    xray_p = tmp_path / "xray-config.json"
+    _write_xray_config(xray_p, "85.136.181.198")
+    _write(state_p, {"nodes": [{"name": "sg-1", "endpoint_host": "93.184.216.34",
+                                 "route_ip": "93.184.216.34", "enabled": True}],
+                     "active_node": {"name": "sg-1", "pending": None}})
+    cmp = local_state.compare_endpoint_with_xray(state_path=state_p, xray_config_path=xray_p)
+    assert cmp["synced"] is False
+    assert cmp["placeholder"] is False
+    assert cmp["local"] == "93.184.216.34"
+    assert cmp["xray"] == "85.136.181.198"
+
+
+def test_endpoint_xray_sync_no_xray_config(tmp_path):
+    """xray-конфига нет (нетк/битый) → synced=True (нечего сравнивать), xray=''.
+
+    Канон: при отсутствии xray config local.json — единственный источник, блокировки apply НЕТ.
+    Не бросает, не падает на fresh-инсталляции.
+    """
+    state_p = tmp_path / "srouter.local.json"
+    xray_p = tmp_path / "missing.json"
+    _write(state_p, {"nodes": [{"name": "sg-1", "endpoint_host": "203.0.113.10",
+                                 "route_ip": "203.0.113.10", "enabled": True}],
+                     "active_node": {"name": "sg-1", "pending": None}})
+    cmp = local_state.compare_endpoint_with_xray(state_path=state_p, xray_config_path=xray_p)
+    assert cmp["synced"] is True  # без xray — нет дрейфа
+    assert cmp["xray"] == ""
+    assert cmp["local"] == "203.0.113.10"
+
+
+def test_endpoint_xray_sync_no_active_node(tmp_path):
+    """Нет активного узла / нет endpoint_host → synced=True, local=''.
+
+    Без узла не с чем сравнивать; apply на пустом state не блокируется.
+    """
+    state_p = tmp_path / "srouter.local.json"
+    xray_p = tmp_path / "xray-config.json"
+    _write_xray_config(xray_p, "85.136.181.198")
+    _write(state_p, {"nodes": [], "active_node": {"name": None, "pending": None}})
+    cmp = local_state.compare_endpoint_with_xray(state_path=state_p, xray_config_path=xray_p)
+    assert cmp["synced"] is True
+    assert cmp["local"] == ""
+
+
+def test_sync_endpoint_from_xray_imports_real_into_placeholder(tmp_path):
+    """ТДД #200-3: srouter sync импортит реальный address из xray в local.json endpoint_host.
+
+    Только когда local — placeholder: единый источник правды = local.json canonical, но реальный
+    рабочий адрес — в xray (вписан вручную / старая генерация). sync делает local.json правдивым.
+    """
+    state_p = tmp_path / "srouter.local.json"
+    xray_p = tmp_path / "xray-config.json"
+    _write_xray_config(xray_p, "85.136.181.198")
+    _write(state_p, {"nodes": [{"name": "sg-1", "endpoint_host": "203.0.113.10",
+                                 "route_ip": "203.0.113.10", "enabled": True}],
+                     "active_node": {"name": "sg-1", "pending": None}})
+    r = local_state.sync_endpoint_from_xray(xray_config_path=xray_p, path=state_p)
+    assert r["ok"] is True
+    assert r["endpoint"] == "85.136.181.198"
+    node = local_state.get_node("sg-1", path=state_p)
+    assert node["endpoint_host"] == "85.136.181.198"  # local.json теперь правдив
+    assert node["route_ip"] == "85.136.181.198"  # route_ip синхронно (resolve == endpoint для IP)
+
+
+def test_sync_endpoint_from_xray_noop_when_already_synced(tmp_path):
+    """local уже = xray → ok, changed=False (idempotent, state не тронут)."""
+    state_p = tmp_path / "srouter.local.json"
+    xray_p = tmp_path / "xray-config.json"
+    _write_xray_config(xray_p, "85.136.181.198")
+    _write(state_p, {"nodes": [{"name": "sg-1", "endpoint_host": "85.136.181.198",
+                                 "route_ip": "85.136.181.198", "enabled": True}],
+                     "active_node": {"name": "sg-1", "pending": None}})
+    r = local_state.sync_endpoint_from_xray(xray_config_path=xray_p, path=state_p)
+    assert r["ok"] is True
+    assert r.get("changed") is False
+
+
+def test_sync_endpoint_from_xray_refuses_when_local_real_mismatch(tmp_path):
+    """local реальный (НЕ placeholder), xray другой реальный → ok=False (НЕ авто-overwrite).
+
+    Оба «настоящие» адреса → это выбор пользователя, sync не подменяет молча. Detect-only.
+    Канон privileged-boundary / no-hidden-magic: не угадываем, какой «правильнее».
+    """
+    state_p = tmp_path / "srouter.local.json"
+    xray_p = tmp_path / "xray-config.json"
+    _write_xray_config(xray_p, "85.136.181.198")
+    _write(state_p, {"nodes": [{"name": "sg-1", "endpoint_host": "93.184.216.34",
+                                 "route_ip": "93.184.216.34", "enabled": True}],
+                     "active_node": {"name": "sg-1", "pending": None}})
+    r = local_state.sync_endpoint_from_xray(xray_config_path=xray_p, path=state_p)
+    assert r["ok"] is False
+    # local.json НЕ тронут
+    assert local_state.get_node("sg-1", path=state_p)["endpoint_host"] == "93.184.216.34"
+
+
+def test_sync_endpoint_from_xray_no_xray_or_node(tmp_path):
+    """xray-конфига нет / узла нет → ok=False (fail-soft), state не тронут. Не бросает."""
+    state_p = tmp_path / "srouter.local.json"
+    xray_p = tmp_path / "missing.json"
+    _write(state_p, {"nodes": [{"name": "sg-1", "endpoint_host": "203.0.113.10",
+                                 "route_ip": "203.0.113.10", "enabled": True}],
+                     "active_node": {"name": "sg-1", "pending": None}})
+    assert local_state.sync_endpoint_from_xray(xray_config_path=xray_p, path=state_p)["ok"] is False
+    assert local_state.get_node("sg-1", path=state_p)["endpoint_host"] == "203.0.113.10"

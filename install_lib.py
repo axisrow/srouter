@@ -937,7 +937,7 @@ def _write_state_after_apply(env, plan, modes, backups, launchagent_action=None)
     return ""
 
 
-def apply_install(env=None, *, confirm=False, choices=None, runner=run, port_checker=port_open, install_launchagent=True):
+def apply_install(env=None, *, confirm=False, choices=None, runner=run, port_checker=port_open, install_launchagent=True, force_endpoint_overwrite=False):
     """Применить план. Без confirm или без выбора по конфликту ничего не пишет."""
     env = env or InstallEnv.from_env()
     choices = choices or {}
@@ -1003,6 +1003,24 @@ def apply_install(env=None, *, confirm=False, choices=None, runner=run, port_che
             if not backup:
                 return {"ok": False, "blocked": [f"{name}_backup_failed"], "actions": actions, "plan": plan}
             backups[name] = backup
+        # #200: защита от перезаписи рабочего xray config placeholder'ом. gen_xray_config генерит из
+        # local_state.active_node() — если state держит placeholder test-IP 203.0.113.x, а существующий
+        # РАБОЧИЙ xray config — реальный VPS-address (вписан руками / старая генерация), apply перезаписал
+        # бы рабочий config placeholder'ом и сломал прокси (когда VPS оживёт). srouter-critical-infra-24-7:
+        # лучше заблокировать apply, чем затереть рабочий конфиг. force_endpoint_overwrite — осознанный
+        # escape-hatch (как adopt для foreign-config): пользователь подтверждает перезапись.
+        if name == "xray" and mode == "managed" and not force_endpoint_overwrite:
+            cmp = local_state.compare_endpoint_with_xray(
+                state_path=env.state_path, xray_config_path=config_path
+            )
+            if cmp["placeholder"] and not cmp["synced"] and cmp["xray"]:
+                return {"ok": False, "blocked": ["xray_endpoint_overwrite_blocked"],
+                        "error": (f"active_node endpoint_host={cmp['local']!r} — placeholder, а рабочий "
+                                  f"xray config держит реальный address {cmp['xray']!r}. apply перезапишет "
+                                  f"рабочий xray placeholder'ом и сломает прокси. "
+                                  f"Запусти `srouter sync` (импорт address из xray в local.json) "
+                                  f"или --force-endpoint-overwrite для осознанной перезаписи."),
+                        "actions": actions, "plan": plan}
         if not _write_component_config(name, env):
             return {"ok": False, "blocked": [f"{name}_config_write_failed"], "actions": actions, "plan": plan}
         restart = _restart_component(name, runner, port_checker=port_checker)

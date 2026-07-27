@@ -10,6 +10,8 @@ _claude_proxy_probe() возвращает {status, source, detail}:
   status="down"    — CC имеет внешний direct socket;
   status="unknown" — только SOCKS TCP socket, idle, timeout или CC не запущен.
 """
+import json
+
 import pytest as _pytest
 
 import health
@@ -1481,3 +1483,103 @@ def test_check_all_codex_isolation_ok_is_driver(monkeypatch):
     assert not ci.get("info"), "ok — НЕ info-only (driver)"
     drivers = [c for c in result["checks"] if not c.get("info")]
     assert ci in drivers, "ok codex-isolation входит в drivers (real fail-closed = driver)"
+
+
+# ============================ #200: рассинхрон endpoint local.json ↔ xray config (doctor) ============================
+# Doctor видит РЕАЛЬНЫЙ endpoint (из рабочего xray config), не placeholder из local.json. Когда
+# local.json держит test-IP 203.0.113.x, а xray — реальный VPS — это рассинхрон источника правды.
+# verify-dont-guess: doctor показывает реальный адрес + WARN «local.json рассинхронизирован».
+# Чек info-only (как endpoint-override) — не роняет вердикт стека, картина для диагностики.
+
+def _xray_with_vless(address):
+    """JSON-текст рабочего xray-config с vless-outbound на address (как _write_xray_config в test_local_state)."""
+    return json.dumps({"outbounds": [
+        {"tag": "direct", "protocol": "freedom"},
+        {"tag": "active", "protocol": "vless",
+         "settings": {"vnext": [{"address": address, "port": 443}]}},
+    ]})
+
+
+def test_endpoint_xray_sync_check_ok_when_synced(tmp_path, monkeypatch):
+    """ТДД #200-1: local.json endpoint == xray address → ok (синхрон)."""
+    state_p = tmp_path / "srouter.local.json"
+    xray_p = tmp_path / "xray-config.json"
+    state_p.write_text(json.dumps({
+        "nodes": [{"name": "sg-1", "endpoint_host": "85.136.181.198",
+                   "route_ip": "85.136.181.198", "enabled": True}],
+        "active_node": {"name": "sg-1", "pending": None},
+    }), encoding="utf-8")
+    xray_p.write_text(_xray_with_vless("85.136.181.198"), encoding="utf-8")
+
+    chk = health._endpoint_xray_sync_check(state_path=str(state_p), xray_config_path=str(xray_p))
+    assert chk["status"] == "ok", chk
+
+
+def test_endpoint_xray_sync_check_warn_shows_real_endpoint_on_drift(tmp_path):
+    """ТДД #200-5: local.json placeholder + xray реальный → warn, detail показывает РЕАЛЬНЫЙ endpoint.
+
+    Канон verify-dont-guess: doctor показывает реальный адрес из xray (85.136.181.198), не placeholder
+    (203.0.113.10), и предупреждает о рассинхроне.
+    """
+    state_p = tmp_path / "srouter.local.json"
+    xray_p = tmp_path / "xray-config.json"
+    state_p.write_text(json.dumps({
+        "nodes": [{"name": "sg-1", "endpoint_host": "203.0.113.10",
+                   "route_ip": "203.0.113.10", "enabled": True}],
+        "active_node": {"name": "sg-1", "pending": None},
+    }), encoding="utf-8")
+    xray_p.write_text(_xray_with_vless("85.136.181.198"), encoding="utf-8")
+
+    chk = health._endpoint_xray_sync_check(state_path=str(state_p), xray_config_path=str(xray_p))
+    assert chk["status"] == "warn", chk
+    detail = chk["detail"]
+    assert "85.136.181.198" in detail, "detail показывает РЕАЛЬНЫЙ endpoint из xray"
+    assert "203.0.113.10" in detail, "detail упоминает placeholder из local.json"
+    assert "рассинхрон" in detail.lower() or "sync" in detail.lower()
+
+
+def test_endpoint_xray_sync_check_info_when_no_xray_config(tmp_path):
+    """xray-конфига нет → info (нечего сравнивать, fresh install). Не падает."""
+    state_p = tmp_path / "srouter.local.json"
+    xray_p = tmp_path / "missing.json"
+    state_p.write_text(json.dumps({
+        "nodes": [{"name": "sg-1", "endpoint_host": "203.0.113.10", "enabled": True}],
+        "active_node": {"name": "sg-1", "pending": None},
+    }), encoding="utf-8")
+
+    chk = health._endpoint_xray_sync_check(state_path=str(state_p), xray_config_path=str(xray_p))
+    assert chk["status"] == "info", chk
+
+
+def test_endpoint_xray_sync_check_info_when_no_active_node(tmp_path):
+    """Нет активного узла → info (apply ещё не настроен)."""
+    state_p = tmp_path / "srouter.local.json"
+    xray_p = tmp_path / "xray-config.json"
+    state_p.write_text(json.dumps({
+        "nodes": [], "active_node": {"name": None, "pending": None},
+    }), encoding="utf-8")
+    xray_p.write_text(_xray_with_vless("85.136.181.198"), encoding="utf-8")
+
+    chk = health._endpoint_xray_sync_check(state_path=str(state_p), xray_config_path=str(xray_p))
+    assert chk["status"] == "info", chk
+
+
+def test_endpoint_xray_sync_check_is_info_only_in_check_all(tmp_path, monkeypatch):
+    """Чек интегрирован в check_all как info-only (не driver — картина, не сбой стека)."""
+    import local_state
+    _all_up_monkey(monkeypatch, probe_status="ok")
+    # pointing local_state + xray-config path в tmp через monkeypatch
+    state_p = tmp_path / "srouter.local.json"
+    xray_p = tmp_path / "xray-config.json"
+    state_p.write_text(json.dumps({
+        "nodes": [{"name": "sg-1", "endpoint_host": "203.0.113.10", "enabled": True}],
+        "active_node": {"name": "sg-1", "pending": None},
+    }), encoding="utf-8")
+    xray_p.write_text(_xray_with_vless("85.136.181.198"), encoding="utf-8")
+    monkeypatch.setattr(health, "_ENDPOINT_SYNC_STATE_PATH", str(state_p))
+    monkeypatch.setattr(health, "_ENDPOINT_SYNC_XRAY_PATH", str(xray_p))
+
+    result = health.check_all()
+    es = next((c for c in result["checks"] if "endpoint" in c["name"].lower() and "xray" in c["name"].lower()), None)
+    assert es is not None, "check_all содержит endpoint-xray-sync check"
+    assert es.get("info") is True, "endpoint-xray-sync check — info-only (не driver)"

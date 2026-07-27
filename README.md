@@ -195,6 +195,7 @@ srouter install
 #   • показывает план и спрашивает подтверждение.
 srouter status         # проверить, что демон работает (http://127.0.0.1:8787)
 srouter doctor         # диагностика: порты + туннель + Claude-proxy (✅/❌)
+srouter sync           # импорт endpoint из рабочего xray в local.json (рассинхрон placeholder, #200)
 
 # Управление демоном дашборда (стек не трогается):
 srouter start          # запустить демон (если LaunchAgent уже установлен)
@@ -555,6 +556,7 @@ srouter install
 #   • prints a plan and asks for confirmation.
 srouter status         # check the daemon is up (http://127.0.0.1:8787)
 srouter doctor         # diagnostics: ports + tunnel + Claude-proxy (✅/❌)
+srouter sync           # import endpoint from the live xray into local.json (placeholder drift, #200)
 
 # Dashboard daemon control (the stack is untouched):
 srouter start          # start the daemon (if the LaunchAgent is already installed)
