@@ -20,6 +20,7 @@ This repository is the v1 monorepo for `srouter`: the local macOS client, Flask 
 - `python3 -m py_compile dashboard.py srouter_config.example.py` is the quick syntax check.
 - Build system / package metadata: `pyproject.toml` (setuptools backend, PEP 621). Install the console entry point with `python3 -m pip install --upgrade pip` (needs pip ≥ 21.3 for PEP 660 editable install), then `pip install -e .` — this exposes the `srouter` command.
 - Test runner: `pytest` (declared in `[project.optional-dependencies].dev`). Run the suite with `pytest` from the repo root after `pip install -e '.[dev]'`.
+- **gh / git to github.com — direct, never via proxy/VPS** (#199), but `gh` and `git` are **different proxy stacks** with **different commands**: `gh` reads env proxy (`HTTP_PROXY`/`http_proxy`, both cases — Go `httpproxy` fallback) → unset both cases with `env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy gh ...`; `git` over https reads git-config `http.https://github.com.proxy` (scoped, `git_proxy.py`) which `env -u` does **NOT** touch → use `git -c http.https://github.com.proxy= fetch|pull|push`. `gh repo clone` delegates to git → scoped config applies, so a VPS-independent clone needs `git -c ...proxy=` (or `gh api`, or SSH `git@github.com:` — port 22 is open directly). github TCP is directly reachable and `gh`'s Go stack bypasses GFW TLS blocking, so this is VPS-independent. `srouter doctor` shows this as the `gh/git direct` check with both commands.
 
 ## Coding Style & Naming Conventions
 
