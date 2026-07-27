@@ -1009,18 +1009,35 @@ def apply_install(env=None, *, confirm=False, choices=None, runner=run, port_che
         # бы рабочий config placeholder'ом и сломал прокси (когда VPS оживёт). srouter-critical-infra-24-7:
         # лучше заблокировать apply, чем затереть рабочий конфиг. force_endpoint_overwrite — осознанный
         # escape-hatch (как adopt для foreign-config): пользователь подтверждает перезапись.
+        # cycle-review Codex critical 0.94: блокируем и когда СУЩЕСТВУЮЩИЙ xray config unreadable/no_active
+        # (битый JSON / без active) при placeholder local — это НЕ fresh install (config существует),
+        # перезапись + restart превратит recoverable on-disk corruption в outage. xray_status=absent
+        # (= fresh install, файла нет) — единственный случай, где apply свободен.
         if name == "xray" and mode == "managed" and not force_endpoint_overwrite:
             cmp = local_state.compare_endpoint_with_xray(
                 state_path=env.state_path, xray_config_path=config_path
             )
-            if cmp["placeholder"] and not cmp["synced"] and cmp["xray"]:
-                return {"ok": False, "blocked": ["xray_endpoint_overwrite_blocked"],
-                        "error": (f"active_node endpoint_host={cmp['local']!r} — placeholder, а рабочий "
-                                  f"xray config держит реальный address {cmp['xray']!r}. apply перезапишет "
-                                  f"рабочий xray placeholder'ом и сломает прокси. "
-                                  f"Запусти `srouter sync` (импорт address из xray в local.json) "
-                                  f"или --force-endpoint-overwrite для осознанной перезаписи."),
-                        "actions": actions, "plan": plan}
+            if cmp["placeholder"] and not cmp["synced"]:
+                xray_status = cmp.get("xray_status", "absent")
+                if xray_status == "absent":
+                    pass  # fresh install — нечего ломать, apply свободен
+                elif xray_status in ("unreadable", "no_active"):
+                    return {"ok": False, "blocked": ["xray_endpoint_overwrite_blocked"],
+                            "error": (f"active_node endpoint_host={cmp['local']!r} — placeholder, а "
+                                      f"СУЩЕСТВУЮЩИЙ xray config {config_path} — {xray_status} (битый/без "
+                                      f"active). xray ещё может крутить ранее загруженный реальный endpoint; "
+                                      f"apply перезапишет config placeholder'ом + restart → outage. "
+                                      f"Почини xray config или --force-endpoint-overwrite для осознанной "
+                                      f"перезаписи."),
+                            "actions": actions, "plan": plan}
+                else:  # ok + drift: рабочий xray держит реальный address, отличающийся от placeholder local
+                    return {"ok": False, "blocked": ["xray_endpoint_overwrite_blocked"],
+                            "error": (f"active_node endpoint_host={cmp['local']!r} — placeholder, а рабочий "
+                                      f"xray config держит реальный address {cmp['xray']!r}. apply перезапишет "
+                                      f"рабочий xray placeholder'ом и сломает прокси. "
+                                      f"Запусти `srouter sync` (импорт address из xray в local.json) "
+                                      f"или --force-endpoint-overwrite для осознанной перезаписи."),
+                            "actions": actions, "plan": plan}
         if not _write_component_config(name, env):
             return {"ok": False, "blocked": [f"{name}_config_write_failed"], "actions": actions, "plan": plan}
         restart = _restart_component(name, runner, port_checker=port_checker)

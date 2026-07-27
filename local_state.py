@@ -916,28 +916,51 @@ def resolve_route_ip(node, path=None):
 XRAY_CONFIG_PATH = "/opt/homebrew/etc/xray/config.json"
 
 
-def _read_xray_vless_address(config_path=XRAY_CONFIG_PATH):
-    """Прочитать address Reality-узла из РЕАБОЧЕГО xray-конфига (outbounds → vless → vnext[0].address).
+def read_xray_active_address(config_path=XRAY_CONFIG_PATH):
+    """Прочитать address АКТИВНОГО Reality-узла из рабочего xray-конфига с различением состояний.
 
-    xray-конфиг = источник истины: gen_xray_config._vless_outbound пишет туда resolve_route_ip(node).
-    Если state рассинхронизирован (placeholder), xray держит реальный рабочий IP. Не бросает.
-    Возвращает address (строка) или '' при отсутствии/сбое/битом JSON.
+    Возвращает {status, address}:
+      - absent    — файла нет (fresh install): применять fresh-install-логику (нечего ломать);
+      - unreadable — файл существует, но битый (не JSON / не dict): fail-closed, НЕ fresh install;
+      - no_active — валидный JSON, но нет outbound с tag="active" (или без валидного address);
+      - ok        — address активного outbound'а.
+    Канон verify-dont-guess + fail-closed (cycle-review Codex critical 0.94): absent и unreadable
+    РАЗНЫЕ состояния — раньше оба давали '' → apply-гард считал битый рабочий config fresh-install'ом
+    и перезаписывал его (outage). Не бросает (probe-канон).
     """
+    p = Path(config_path)
+    if not p.exists():
+        return {"status": "absent", "address": ""}
     try:
-        data = json.loads(Path(config_path).read_text(encoding="utf-8"))
+        data = json.loads(p.read_text(encoding="utf-8"))
     except Exception:
-        return ""
+        return {"status": "unreadable", "address": ""}
     if not isinstance(data, dict):
-        return ""
+        return {"status": "unreadable", "address": ""}
+    # АКТИВНЫЙ outbound = tag=="active" (канон gen_xray_config: active_outbound = _vless_outbound(active, "active")).
+    # cycle-review Codex critical 0.98: gen_xray_config эмиттит probe-out-* vless ПЕРЕД active → первый
+    # vless = probe-узел (чужой endpoint). Выбор по tag=active, а не «первый vless», иначе sync/compare/
+    # guard работают с endpoint probe-узла, не active (sync импортил бы чужой endpoint в active-узел).
     for ob in data.get("outbounds") or []:
-        if not isinstance(ob, dict) or ob.get("protocol") != "vless":
+        if not isinstance(ob, dict) or ob.get("tag") != "active":
             continue
         vnext = (ob.get("settings") or {}).get("vnext") or []
         if vnext and isinstance(vnext[0], dict):
             addr = vnext[0].get("address")
             if isinstance(addr, str) and _is_valid_host(addr):
-                return addr
-    return ""
+                return {"status": "ok", "address": addr}
+    # active-outbound есть, но без валидного address; ИЛИ active-outbound'а нет вовсе
+    return {"status": "no_active", "address": ""}
+
+
+def _read_xray_vless_address(config_path=XRAY_CONFIG_PATH):
+    """Прочитать address АКТИВНОГО Reality-узла из рабочего xray-конфига. Возвращает '' если не ok.
+
+    Тонкая обёртка над read_xray_active_address для backwards-compat (sync_route_ip_from_xray #136,
+    consumer'ы, которым нужен просто address). Для новой логики #200 использовать read_xray_active_address
+    (различает absent/unreadable/no_active — нужно для apply fail-closed). Не бросает.
+    """
+    return read_xray_active_address(config_path)["address"]
 
 
 def sync_route_ip_from_xray(name, xray_config_path=XRAY_CONFIG_PATH, path=None):
@@ -1024,22 +1047,32 @@ def compare_endpoint_with_xray(state_path=None, xray_config_path=XRAY_CONFIG_PAT
 
     xray config — runtime-истина (gen_xray_config пишет туда resolve_route_ip(node)). Если state
     рассинхронизирован (placeholder), xray держит реальный рабочий IP. Возвращает:
-      {synced: bool, local: str, xray: str, placeholder: bool}
+      {synced: bool, local: str, xray: str, placeholder: bool, xray_status: str}
       - local   — endpoint_host активного узла ('' если нет);
-      - xray    — address из xray vless-outbound ('' если xray-конфига нет/бит/без vless);
+      - xray    — address из tag=active outbound ('' если нет/бит/без active);
+      - xray_status — absent (fresh install) / unreadable (битый, fail-closed) / no_active / ok;
       - placeholder — local — TEST-NET 203.0.113.x (auto-sync применим);
-      - synced  — True когда нет дрейфа: нет xray (нечего сравнивать) ИЛИ local == xray.
+      - synced  — True когда нет дрейфа: xray absent (fresh install, нечего ломать) ИЛИ local==xray.
+                  False на unreadable/no_active (apply должен иметь шанс fail-closed, cycle-review
+                  Codex critical 0.94) ИЛИ когда local != xray.
     Не бросает (probe-канон). Применяется и в apply-защите, и в doctor.
     """
     local = active_endpoint_host(state_path)
-    xray = _read_xray_vless_address(xray_config_path)
-    if not local or not xray:
-        # нет хотя бы одной стороны — дрейф не определён, считаем synced (нечего блокировать):
-        # fresh install (нет xray) и пустой state (нет узла) — нормальные стартовые состояния.
-        return {"synced": True, "local": local, "xray": xray,
-                "placeholder": _is_testnet_placeholder(local)}
-    return {"synced": local == xray, "local": local, "xray": xray,
-            "placeholder": _is_testnet_placeholder(local)}
+    xr = read_xray_active_address(xray_config_path)
+    xray_status, xray = xr["status"], xr["address"]
+    base = {"local": local, "xray": xray, "placeholder": _is_testnet_placeholder(local),
+            "xray_status": xray_status}
+    # absent xray (fresh install) — нечего сравнивать/ломать → synced (apply свободен).
+    if xray_status == "absent":
+        return {**base, "synced": True}
+    # unreadable/no_active существующего config — НЕ fresh install: synced=False, чтобы apply-гард
+    # мог fail-closed (пользователь решает, через --force или чинит config), а не молча перезаписывал.
+    if xray_status != "ok":
+        return {**base, "synced": False}
+    # ok: synced если совпадает (нет local — тоже synced: нет узла, не с чем сравнивать active).
+    if not local:
+        return {**base, "synced": True}
+    return {**base, "synced": local == xray}
 
 
 def sync_endpoint_from_xray(xray_config_path=XRAY_CONFIG_PATH, path=None):
@@ -1049,6 +1082,11 @@ def sync_endpoint_from_xray(xray_config_path=XRAY_CONFIG_PATH, path=None):
     Единый источник правды = local.json canonical: sync делает его правдивым (перезаписывает placeholder
     реальным address из xray). После этого и gen_xray, и apply читают консистентный endpoint.
 
+    Target-узел резолвится ЧЕРЕЗ active_node() — ровно тот же объект, что compare_endpoint_with_xray и
+    apply-гард считают активным (cycle-review /review medium): раньше sync искал по active_node.name
+    литерально и мог писать endpoint в disabled-узел (имя=disabled), пока active_node() брал fallback
+    enabled-узел → sync «успешен», но compare всё ещё видит placeholder → бесконечный цикл.
+
     НЕ авто-overwrite когда local уже реальный (НЕ placeholder) и расходится с xray: оба «настоящие»
     адреса — выбор пользователя, detect-only (compare_endpoint_with_xray), не молчаливая подмена
     (канон no-hidden-magic / privileged-boundary: не угадываем, какой «правильнее»).
@@ -1056,8 +1094,9 @@ def sync_endpoint_from_xray(xray_config_path=XRAY_CONFIG_PATH, path=None):
     Возвращает {ok: bool, endpoint: str, changed: bool}. ok=False если xray-конфига нет / узла нет /
     local не placeholder. Не бросает (fail-soft как sync_route_ip_from_xray).
     """
-    address = _read_xray_vless_address(xray_config_path)
-    if not address:
+    xr = read_xray_active_address(xray_config_path)
+    address = xr["address"]
+    if xr["status"] != "ok" or not address:
         return {"ok": False, "endpoint": "", "changed": False}
     try:
         state, readable = _load_state_checked(path)
@@ -1066,17 +1105,16 @@ def sync_endpoint_from_xray(xray_config_path=XRAY_CONFIG_PATH, path=None):
     except Exception:
         return {"ok": False, "endpoint": "", "changed": False}
 
-    active = state.get("active_node")
+    # Резолв target через active_node() — единственный источник правды «какой узел активен».
+    # active_node() уже внутри делает read state (тот же path); но нам нужна мутируемая ссылка на
+    # запись в state["nodes"], чтобы save_state записал изменение. Поэтому ищем запись по имени
+    # активного узла (после active_node()-резолва), НЕ по литеральному active_node.name из state.
+    active = active_node(path) if path else active_node()
     active_name = active.get("name") if isinstance(active, dict) else None
+    if not active_name:
+        return {"ok": False, "endpoint": "", "changed": False}
     nodes = _nodes_from_state(state)
-    target = None
-    for n in nodes:
-        if isinstance(n, dict) and n.get("name") == active_name:
-            target = n
-            break
-    # active_name не разрешается явно — fallback как active_node(): первый enabled.
-    if target is None and nodes:
-        target = next((n for n in nodes if isinstance(n, dict) and n.get("enabled") is True), None)
+    target = next((n for n in nodes if isinstance(n, dict) and n.get("name") == active_name), None)
     if target is None:
         return {"ok": False, "endpoint": "", "changed": False}
 
