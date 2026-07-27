@@ -1431,13 +1431,29 @@ def _vscode_proxy_check():
 
 # ============================ #199: gh/git VPS-независимый dev-workflow ============================
 
-# Подсказка-текст «env -u» — единый литерал, чтобы doctor и README говорили одно и то же
-# (канон — единый источник правды; никто не должен расшифровывать прокси-env по-разному).
-GH_DIRECT_HINT = ("gh/git работают напрямую: `env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY "
-                  "-u NO_PROXY -u no_proxy <gh|git> ...` — github TCP напрямую открыт (GFW не режет "
-                  "TCP-слой), gh Go-стек обходит GFW TLS-блокировку (verify 2026-07-27). "
-                  "git pull https напрямую НЕ работает (LibreSSL режется) → clone через `gh repo clone`/`gh api`; "
-                  "альтернатива — ssh:22 (github SSH открыт напрямую). VPS-независимо (#199).")
+# Подсказка-текст для VPS-независимого gh/git — единый литерал, чтобы doctor и README говорили
+# одно (канон — единый источник правды). РАЗДЕЛЯЕТ стеки: gh (Go, env-прокси) и git (git-config
+# scoped proxy) — это РАЗНЫЕ источники прокси, им нужны РАЗНЫЕ команды (cycle-1 FIX Codex critical).
+#
+# Эмпирика (verify 2026-07-27): github TCP напрямую открыт (GFW не режет TCP); gh Go-стек обходит
+# GFW TLS. НО прокси-источников два:
+#   1. env: srouter ставит И uppercase (HTTP_PROXY), И lowercase (http_proxy) — Go httpproxy
+#      fallback читает оба регистра. Снимать надо ВСЕ: HTTP_PROXY/http_proxy, HTTPS_PROXY/https_proxy,
+#      ALL_PROXY/all_proxy, NO_PROXY/no_proxy.
+#   2. git-config: `http.https://github.com.proxy` (git_proxy.enable) — env -u его НЕ трогает
+#      (verify: `git config --get-urlmatch` после env -u = 127.0.0.1:8118, прокси активен).
+#      Снимается `git -c http.https://github.com.proxy= <cmd>` (переопределение на лету, пустое).
+# gh repo clone делегирует внутреннему git → scoped git-config применяется к clone (не чистый gh-путь).
+GH_DIRECT_HINT = (
+    "gh (Go-стек) и git-over-https — РАЗНЫЕ стеки прокси, разные команды (verify 2026-07-27):\n"
+    "  • gh: `env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u NO_PROXY -u http_proxy -u https_proxy "
+    "-u all_proxy -u no_proxy gh ...` — снять env-прокси ОБА регистра (Go fallback на lowercase).\n"
+    "  • git over https: env -u НЕ трогает scoped git-config `http.https://github.com.proxy` → "
+    "`git -c http.https://github.com.proxy= fetch|pull|push` (пустое значение перекрывает config).\n"
+    "  • gh repo clone делегирует git → scoped config применяется; clone VPS-независим ТОЛЬКО через "
+    "`git -c http.https://github.com.proxy=` (или `gh api`, или ssh:22 — github SSH открыт напрямую).\n"
+    "github TCP напрямую открыт; gh Go-стек обходит GFW TLS (curl/git LibreSSL — нет). VPS-независимо (#199)."
+)
 
 
 def _github_direct_check():
@@ -1447,7 +1463,8 @@ def _github_direct_check():
     обходит GFW TLS-блокировку (в отличие от curl/git на LibreSSL + системном resolver). Но если в
     ~/.gitconfig включён scoped git-прокси `http.https://github.com.proxy → privoxy 8118` (git_proxy),
     то git pull/push идёт ЧЕРЕЗ прокси → зависит от VPS: мёртвый VPS = git timeout (выглядело как
-    «флап gh»). Подсказка: для VPS-независимости снимать прокси-env через `env -u`.
+    «флап gh»). Подсказка РАЗДЕЛЯЕТ стеки (cycle-1 FIX): gh → снять env-прокси (оба регистра) через
+    `env -u`; git-over-https → env -u НЕ трогает git-config, нужен `git -c http.https://github.com.proxy=`.
 
     Предикт = статичный git-config (verify-don't-guess — не догадки о таймаутах, а проверяемый
     факт конфигурации). Чек info-only ВСЕГДА (как endpoint-override): git-proxy-настройка — это

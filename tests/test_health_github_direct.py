@@ -17,8 +17,6 @@ srouter-critical-infra-24-7 (dev-workflow не должен зависеть о�
   status="warn"    — git-config ВКЛЮЧЁН → git зависит от VPS, подсказка env -u;
   status="unknown" — git_proxy.status unknown (git config timeout/ошибка).
 """
-import pytest
-
 import git_proxy
 import health
 
@@ -60,6 +58,46 @@ def test_warn_detail_mentions_gh_go_stack_and_vps_independence(monkeypatch):
     # Канон verify-don't-guess: подсказка называет эмпирически проверенный механизм, не догадку.
     assert "gh" in detail
     assert "vps" in detail or "напрямую" in detail
+
+
+def test_hint_distinguishes_gh_env_vs_git_config_stack(monkeypatch):
+    """#199 cycle-1 FIX (Codex critical): gh и git — РАЗНЫЕ стеки прокси, разные команды.
+
+    gh (Go) читает env-прокси (HTTP_PROXY/http_proxy — оба регистра, Go httpproxy fallback).
+    git-over-https читает git-config `http.https://github.com.proxy` — env -u его НЕ трогает
+    (verify: `git config --get-urlmatch` после env -u = 127.0.0.1:8118, прокси активен).
+    Значит подсказка НЕ может обещать одну команду `env -u` для обоих:
+      - для gh: env -u должен снимать И uppercase, И lowercase (http_proxy/https_proxy/all_proxy);
+      - для git-over-https: нужен `git -c http.https://github.com.proxy=` (переопределение config).
+    Без `git -c` подсказка лживо обещает VPS-независимость git, оставляя его на прокси — ровно
+    тот сбой, который PR должен переживать. Тест кодирует РАЗДЕЛЕНИЕ стеков, не одну команду.
+    """
+    monkeypatch.setattr(git_proxy, "status",
+                        lambda: {"enabled": True, "proxy": "http://127.0.0.1:8118",
+                                 "key": "http.https://github.com.proxy"})
+    res = health._github_direct_check()
+    detail = res["detail"].lower()
+    # gh-путь: env -u должен снимать lowercase env тоже (Go fallback на http_proxy/https_proxy).
+    assert "http_proxy" in detail, "env -u обязан снимать lowercase http_proxy (Go httpproxy fallback)"
+    # git-путь: env -u НЕ трогает git-config → нужен git -c (переопределение scoped proxy).
+    assert "git -c" in detail, "git-over-https: env -u не трогает git-config → нужен git -c ...proxy="
+
+
+def test_hint_does_not_promise_gh_repo_clone_is_proxy_free(monkeypatch):
+    """#199 cycle-1 FIX: gh repo clone делегирует внутреннему git → scoped git-config применяется.
+
+    Codex: клонирование через gh не использует Go-транспорт gh для самого fetch — gh зовёт git,
+    который читает http.https://github.com.proxy. Подсказка не должна описывать gh repo clone как
+    VPS-независимый путь только на gh-стеке.
+    """
+    monkeypatch.setattr(git_proxy, "status",
+                        lambda: {"enabled": True, "proxy": "http://127.0.0.1:8118",
+                                 "key": "http.https://github.com.proxy"})
+    res = health._github_direct_check()
+    # Если hint упоминает clone/gh repo clone, он обязан сопровождать git -c (иначе ложь).
+    detail = res["detail"].lower()
+    if "clone" in detail or "gh repo" in detail:
+        assert "git -c" in detail, "clone через gh делегирует git → нужен git -c для scoped proxy"
 
 
 def test_unknown_when_git_proxy_status_unknown(monkeypatch):
