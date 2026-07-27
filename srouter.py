@@ -248,8 +248,19 @@ try:
     from dashboard_common import SOCKS_PROXY_URL as _CODEX_PROXY_URL
 except BaseException:
     _CODEX_PROXY_URL = "socks5h://127.0.0.1:10808"
-CODEX_NO_PROXY = "localhost,127.0.0.1,::1"
+# NO_PROXY для launchctl-gui env: loopback (Codex→moonbridge на loopback и локальные сервисы)
+# + z.ai,.z.ai (moonbridge→api.z.ai — внешний хост, доступен напрямую мимо SOCKS5/xray/VPS).
+# z.ai НЕ за GFW: при мёртвом VPS (#194) moonbridge-клиент обязан достучаться к api.z.ai напрямую,
+# иначе codex ломается. ОБА варианта: z.ai = точный хост, .z.ai = поддомены (api.z.ai и др.).
+# Канон: zai-direct-no-proxy, srouter-critical-infra-24-7 (VPS-смерть не валит z.ai-трафик).
+CODEX_NO_PROXY = "localhost,127.0.0.1,::1,z.ai,.z.ai"
+# NO_PROXY для CLI-wrapper (~/bin/codex-srouter) — ТОЛЬКО loopback, БЕЗ z.ai. CLI-codex идёт через
+# SOCKS5 (managed путь, xray→VPS) — его NO_PROXY = санитизация унаследованного privoxy-окружения
+# (#96 core), НЕ provider-direct. z.ai-прямой-доступ релевантен moonbridge (GUI launchctl-gui выше),
+# а не CLI-codex. Две разные границы = две константы (канон route-scope-not-shared-validator).
+CODEX_NO_PROXY_LOOPBACK = "localhost,127.0.0.1,::1"
 # (env-key, value) — единый список для install/setenv и uninstall/unsetenv (синхронны всегда).
+# Значение нужно только для setenv (launchctl-gui); unsetenv итерирует по ключам.
 CODEX_LAUNCHCTL_ENV = tuple((k, _CODEX_PROXY_URL) for k in
                             ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
                              "http_proxy", "https_proxy", "all_proxy")) \
@@ -362,13 +373,15 @@ def _install_one_wrapper(env, wrapper_path: Path, template_name: str, marker: st
         if not codex_bin:
             return f"Codex {wrapper_path.name}: codex binary не найден — wrapper не установлен (установи codex)."
         template = (env.root / "launchagents" / template_name).read_text(encoding="utf-8")
-        # Рендер плейсхолдеров из единого источника правды (_CODEX_PROXY_URL/CODEX_NO_PROXY), не хардкод
-        # литералов. CLI-wrapper (srouter-codex-cli-wrapper.sh) использует только эти два: реальный codex
-        # он РАНТАЙМ-резолвит по PATH минуя себя (#144, подход A), абсолютный путь НЕ вшивается. App-wrapper
-        # плейсхолдеров прокси не содержит (.replace на отсутствующей подстроке — no-op).
+        # Рендер плейсхолдеров из единого источника правды, не хардкод литералов. CLI-wrapper
+        # (srouter-codex-cli-wrapper.sh) использует _CODEX_PROXY_URL + CODEX_NO_PROXY_LOOPBACK
+        # (loopback-only, БЕЗ z.ai — это санитизация #96, не provider-direct; z.ai релевантен только
+        # launchctl-gui CODEX_NO_PROXY для moonbridge). Реальный codex он РАНТАЙМ-резолвит по PATH
+        # минуя себя (#144, подход A), абсолютный путь НЕ вшивается. App-wrapper плейсхолдеров прокси
+        # не содержит (.replace на отсутствующей подстроке — no-op).
         rendered = (template
                     .replace("__SROUTER_CODEX_PROXY_URL__", _CODEX_PROXY_URL)
-                    .replace("__SROUTER_CODEX_NO_PROXY__", CODEX_NO_PROXY))
+                    .replace("__SROUTER_CODEX_NO_PROXY__", CODEX_NO_PROXY_LOOPBACK))
         wrapper_path.parent.mkdir(parents=True, exist_ok=True)
         if not _write_text_atomic(wrapper_path, rendered):
             return f"Codex {wrapper_path.name}: не записан (ошибка atomic write)."

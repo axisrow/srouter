@@ -9,9 +9,12 @@
 # делает `unsetenv gui/<uid> <key>` с ЯВНЫМ доменом (он бежит из процесса cmd_uninstall, чей
 # caller-context может быть user/<uid> из SSH/cron — issue #94 DEFECT A).
 # Эмпирически: Claude.app/ChatGPT.app на System Settings SOCKS, global env их не ломает.
-# NO_PROXY=loopback — локальные сервисы (MCP/healthcheck) мимо прокси.
+# NO_PROXY=loopback (Codex→moonbridge на loopback, локальные сервисы MCP/healthcheck)
+#   + z.ai,.z.ai (moonbridge→api.z.ai напрямую — z.ai НЕ за GFW, доступен мимо SOCKS5/xray/VPS).
+#   При мёртвом VPS (#194) moonbridge обязан достучаться к api.z.ai напрямую, иначе codex ломается.
+#   Канон: zai-direct-no-proxy, srouter-critical-infra-24-7.
 PROXY="socks5h://127.0.0.1:10808"
-NO_PROXY="localhost,127.0.0.1,::1"
+NO_PROXY="localhost,127.0.0.1,::1,z.ai,.z.ai"
 for key in HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy; do
   launchctl setenv "$key" "$PROXY"
 done
