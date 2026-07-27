@@ -16,6 +16,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import tempfile
 from urllib.parse import urlparse
 
@@ -309,6 +310,51 @@ def _network_interface_up():
         return {"up": True, "detail": f"сеть активна: интерфейс {inet_iface} с IP (default route отсутствует)"}
     return {"up": False,
             "detail": "нет активного сетевого интерфейса/маршрута — подключи интернет (Wi-Fi/eth)"}
+
+
+# #205: тестовый домен для DNS-резолва. Стабильный, widely-resolved, не GFW-target (как
+# TUNNEL_TARGETS). НЕ endpoint_host узла: endpoint может быть IP (Reality), и резолв IP не
+# проверит DNS-стек — нужен именно домен. Канон: verify-dont-guess (прямая причина — resolve).
+DNS_PROBE_HOST = "github.com"
+
+
+def _resolve_host(host):
+    """socket.getaddrinfo обёртка для тестируемости (mock по имени на модуле health).
+
+    Возвращает True если резолв дал хотя бы один адрес, False при gaierror/OSError. Не бросает.
+    getaddrinfo не принимает timeout kwarg — резолв bounded системным resolver timeout (на macOS
+    через mDNSResponder обычно <1с). Обёртка (а не socket напрямую) даёт детерминированный mock в
+    тестах, как _mock_vps_tcp подменяет sys_probe.port_open (канон no-hidden-magic).
+    """
+    try:
+        socket.getaddrinfo(host, 443)
+        return True
+    except Exception:
+        return False
+
+
+def _dns_up():
+    """DNS-стек резолвит домены? Каскад эпика #201 ситуация #4, МЕЖДУ #203 (нет сети) и #196 (VPS).
+
+    _upstream_vps_reachable (#196) зовёт sys_probe.port_open → socket.create_connection, которая
+    САМА резолвит hostname endpoint'а. При сломанном DNS (упал dnsmasq/resolver) resolve падает с
+    gaierror → port_open=False → ложно «VPS мёртв». Этот чек = socket.getaddrinfo тестового домена
+    (НЕ endpoint: Reality-IP резолв не проверит DNS). Проверяется ПОСЛЕ #203 (сеть есть) и ДО #196
+    (VPS), чтобы сломанный резолв не маскировался в «VPS мёртв»: gaierror ≠ VPS-смерть. Канон:
+    verify-dont-guess (прямая причина — resolve-ошибка), probe-semantics-from-primary-source
+    (getaddrinfo NXDOMAIN → socket.gaierror, подкласс OSError — подтверждено эмпирически).
+
+    Возвращает {up: bool, detail}:
+      up=True   — домен отрезолвился (DNS работает);
+      up=False  — getaddrinfo gaierror/timeout — DNS не резолвит (проверь dnsmasq/resolver).
+    Не бросает (probe-канон, как _network_interface_up/_upstream_vps_reachable).
+    """
+    if _resolve_host(DNS_PROBE_HOST):
+        return {"up": True, "detail": f"DNS резолвит: {DNS_PROBE_HOST} (резолвер работает)"}
+    return {"up": False,
+            "detail": f"DNS не резолвит {DNS_PROBE_HOST} — проверь dnsmasq/resolver "
+                      f"(домены не разрешаются)"}
+
 
 
 # #194: прямой TCP-probe до upstream VPS endpoint (минуя прокси). socket.create_connection
@@ -1770,17 +1816,34 @@ def check_all(*, active_claude=False):
     if net["up"]:
         net_check["info"] = True  # сеть есть — не driver (как endpoint-override)
     checks.append(net_check)
+    # #205: DNS-резолв — ВТОРОЙ чек каскада (после «нет сети» #203, ПЕРЕД VPS-probe #196). Эпик #201
+    # ситуация 4: сломанный DNS (упал dnsmasq/resolver) → _upstream_vps_reachable ложно «VPS мёртв»
+    # (port_open сам резолвит hostname → gaierror → unreachable). _dns_up ПЕРЕД VPS-probe перехватывает:
+    # DNS не резолвит → точная причина «проверь резолвер», VPS-чек подавляется (info, не нагромождает
+    # «VPS мёртв» поверх «DNS сломан»). DRIVER только когда DNS НЕ резолвит (up=False). up=True →
+    # info-only (картина, не роняет вердикт, как net-up/endpoint-override). Каскад: нет сети
+    # подавляет DNS (бессмысленно резолвить без сети), DNS подавляет VPS (gaierror ≠ VPS-смерть).
+    # Канон: verify-dont-guess (прямая причина — resolve-ошибка), probe-semantics-from-primary-source.
+    dns = _dns_up()
+    dns_check = {"name": "DNS (резолв тестового домена)",
+                 "ok": dns["up"], "detail": dns["detail"]}
+    if dns["up"] or not net["up"]:
+        # DNS работает → info-only (картина). НЕТ СЕТИ → тоже info (подавлен): резолв без сети
+        # бессмысленен, первичная причина уже «нет сети» (net_check driver) — не нагромождаем
+        # «DNS сломан» поверх «нет сети» (канон каскада #203→#205, как VPS-чек подавляется нет-сети).
+        dns_check["info"] = True
+    checks.append(dns_check)
     # #194: прямой TCP-probe до upstream VPS endpoint (минуя прокси). Различение «VPS мёртв» vs
     # «локальный прокси упал» — оба дают connection-failed через прокси, но прямой TCP доказывает
-    # состояние VPS. DRIVER только когда СЕТЬ ЕСТЬ И туннель fail И VPS down (гарантирует DOWN — VPS-смерть =
-    # critical-infra #194, не DEGRADED). VPS ok при туннель-fail → info «проблема в локальном
+    # состояние VPS. DRIVER только когда СЕТЬ ЕСТЬ И DNS РЕЗОЛВИТ И туннель fail И VPS down
+    # (гарантирует DOWN — VPS-смерть = critical-infra #194, не DEGRADED). VPS ok при туннель-fail → info «проблема в локальном
     # прокси, VPS жив» (туннель-чек уже driver). Туннель ok → info (VPS-доступность не релевантна).
     # placeholder TEST-NET / нет узла → info (картина, не сбой). Канон: verify-don't-guess.
     vps = _upstream_vps_reachable()
     vps_check = {"name": "upstream VPS (TCP-коннект до endpoint, минуя прокси)",
                  "ok": True, "info": True, "detail": vps["detail"]}
-    if net["up"] and not tun_ok and vps["status"] == "down":
-        # VPS мёртв + туннель fail → driver: усиливаем до DOWN (не маскируем в degraded).
+    if net["up"] and dns["up"] and not tun_ok and vps["status"] == "down":
+        # VPS мёртв + туннель fail + сеть есть + DNS работает → driver: усиливаем до DOWN.
         vps_check["ok"] = False
         vps_check["info"] = False
     checks.append(vps_check)
@@ -1935,7 +1998,7 @@ def check_all(*, active_claude=False):
     # VPS-смерть в degraded (регрессия #194). vps-driver ok=False = VPS точно мёртв (не placeholder/нет-узла — те info).
     # #203: net["up"] гвард — при мёртвой сети VPS-down НЕ абсолютный DOWN-override (TCP-timeout =
     # следствие «нет сети», не «VPS мёртв»). «Нет сети» уже driver через net_check выше.
-    if net["up"] and not tun_ok and vps["status"] == "down":
+    if net["up"] and dns["up"] and not tun_ok and vps["status"] == "down":
         status = "down"
     return {"status": status, "checks": checks}
 
@@ -2109,6 +2172,11 @@ def _print_report(result):
             print("  • xray: brew services restart xray  (или srouter install)")
         if "туннель" in failed_names:
             print("  • туннель: проверь узел (srouter status / дашборд nodes), возможно узел недоступен")
+        if "DNS" in failed_names:
+            # #205: DNS точно сломан (getaddrinfo не резолвил) — НЕ чинить VPS/локальный прокси,
+            # проблема в резолвере. Домены не разрешаются = всё выглядит connection-failed.
+            print("  • DNS: домены не резолвятся — проверь dnsmasq/resolver (это НЕ «VPS мёртв»).")
+            print("    Проверь: запущен ли dnsmasq (brew services restart dnsmasq), /etc/resolv.conf, системный DNS")
         if "upstream VPS" in failed_names:
             # #194: VPS точно мёртв (прямой TCP-probe не прошёл) — НЕ чинить локальный прокси,
             # проблема не в нём. VPS-смерть = critical-infra DOWN.
