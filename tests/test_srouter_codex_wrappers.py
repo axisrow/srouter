@@ -261,11 +261,21 @@ def _fake_runner():
     `launchctl print <domain>/<label>` → rc=113 (service-not-found = НЕ загружен): _remove_launchctl_env
     в чистом окружении видит подтверждённую выгрузку → удаляет plist. Иначе default rc=0 читался бы как
     «жив» → C оставлял бы plist + poll крутил settle (домен-осознанная проверка, cycle-review #93).
+
+    `launchctl print gui/<uid>` (БЕЗ label — issue #191 env-верификация через health._read_gui_proxy_env)
+    отдаётся отдельно: пустой блок environment={} (verifiable=True, keys={}) — «всё снято», раз
+    unsetenv (через asuser, issue #191) должен был реально снять переменные в честном сценарии.
     """
     calls = []
     def runner(cmd, timeout):
         calls.append(list(cmd))
         if len(cmd) > 1 and cmd[1] == "print":
+            target = cmd[2] if len(cmd) > 2 else ""
+            # голый домен gui/<uid> (issue #191 env-верификация через health._read_gui_proxy_env) —
+            # без "/CODEX_ENV_LABEL" суффикса → пустой блок environment (всё снято, unsetenv сработал).
+            if target and srouter.CODEX_ENV_LABEL not in target:
+                return {"rc": 0, "out": "environment = {\n}\n", "err": "", "timeout": False}
+            # <domain>/<label> — agent-статус: НЕ загружен.
             return {"rc": 113, "out": "", "err": "Could not find service", "timeout": False}
         return {"rc": 0, "out": "", "err": "", "timeout": False}
     runner.calls = calls
@@ -290,6 +300,44 @@ def test_install_launchctl_env_writes_plist(monkeypatch, tmp_path):
     assert "srouter-codex-env.sh" in plist_text
     # bootstrap вызван (_launchd_reload).
     assert any(len(c) > 1 and c[1] == "bootstrap" for c in runner.calls), "bootstrap вызван"
+
+
+def test_install_launchctl_env_warn_uses_print_not_broken_getenv_domain_arg(monkeypatch, tmp_path):
+    """issue #191: WARN о чужом GUI-прокси должен реально видеть gui-домен, а не молчать всегда.
+
+    Старый код (`getenv gui/<uid> HTTP_PROXY`) эмпирически игнорирует домен-аргумент (Usage: getenv
+    <key> — ровно один позиционный аргумент, второй молча отбрасывается) → val ВСЕГДА пуст → WARN
+    никогда не срабатывает, даже если в gui реально висит чужой (не-srouter) прокси. На честной модели
+    (print gui/<uid> реально видит чужой прокси) старый код это пропускает — RED. Фикс должен
+    переиспользовать health._read_gui_proxy_env (print-based, единственный домен-осознанный источник).
+    """
+    home = _mock_home(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    calls = []
+    foreign_proxy = "http://10.0.0.5:3128"
+
+    def runner(cmd, timeout):
+        calls.append(list(cmd))
+        sub = cmd[1] if len(cmd) > 1 else ""
+        if sub == "print":
+            target = cmd[2] if len(cmd) > 2 else ""
+            if target and srouter.CODEX_ENV_LABEL not in target:
+                # честный gui-домен: реальный чужой HTTP_PROXY уже висит там.
+                return {"rc": 0,
+                        "out": f"environment = {{\n\t\tHTTP_PROXY => {foreign_proxy}\n}}\n",
+                        "err": "", "timeout": False}
+            return {"rc": 113, "out": "", "err": "Could not find service", "timeout": False}
+        if sub == "getenv":
+            # РЕАЛЬНОЕ launchctl: домен-аргумент молча игнорируется, второй arg отброшен → пусто.
+            return {"rc": 0, "out": "", "err": "", "timeout": False}
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+
+    note = srouter._install_launchctl_env(env, runner)
+
+    assert "ВНИМАНИЕ" in note and foreign_proxy in note, (
+        f"чужой прокси реально висит в gui-домене (эмпирика #191: print его видит, "
+        f"getenv gui/<uid> KEY — нет) — WARN должен сработать: {note}"
+    )
 
 
 def test_install_launchctl_env_marker_gate_foreign(monkeypatch, tmp_path):
@@ -323,9 +371,11 @@ def test_remove_launchctl_env_bootouts_and_unlinks(monkeypatch, tmp_path):
     assert "снят" in note.lower()
     assert not plist.exists(), "plist удалён"
     assert any(len(c) > 1 and c[1] == "bootout" for c in runner.calls), "bootout вызван"
-    # unsetenv для всех proxy-ключей с gui-доменным таргетом (env ставил скрипт setenv при загрузке
-    # в gui-домене; c[2] = домен gui/<uid>, c[3] = ключ — issue #94 DEFECT A).
-    unsetenvs = {c[3] for c in runner.calls if len(c) > 1 and c[1] == "unsetenv"}
+    # unsetenv для всех proxy-ключей через `launchctl asuser <uid> launchctl unsetenv KEY` (issue #191:
+    # голый `unsetenv gui/<uid> KEY` эмпирически молча игнорирует домен — asuser реально исполняет
+    # команду в bootstrap-контексте gui-пользователя, man launchctl).
+    unsetenvs = {c[5] for c in runner.calls
+                 if len(c) > 5 and c[1] == "asuser" and c[4] == "unsetenv"}
     assert {"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"} <= unsetenvs
 
 
@@ -464,12 +514,17 @@ def test_remove_launchctl_env_keeps_plist_on_domain_mismatch(monkeypatch, tmp_pa
     assert not any(len(c) > 1 and c[1] == "unsetenv" for c in calls), "не выгружен → нет unsetenv"
 
 
-# ============================ сайт A: gui-domain unsetenv + verify + fail-closed (issue #94 DEFECT A) ============================
+# ============================ сайт A: gui-domain unsetenv + verify + fail-closed (issue #94 DEFECT A,
+# переписано issue #191 — см. ниже) ============================
 # `launchctl setenv/unsetenv/getenv` оперируют «caller's context» (man launchctl). setenv делает
 # LaunchAgent-скрипт, запущенный launchd ВНУТРИ gui-домена → переменные в gui-домене. uninstall бежит
-# из процесса cmd_uninstall (caller-context может быть user/<uid> из SSH/cron). unsetenv без домена
-# снимает НЕ в gui → gui-домен остаётся с мёртвым 127.0.0.1:10808. Граница: unsetenv gui/<uid> <key>
-# (доменный таргет принимается), верифицировать getenv gui/<uid> <key> → пусто, fail-closed иначе.
+# из процесса cmd_uninstall (caller-context может быть user/<uid> из SSH/cron). Изначальный фикс #94
+# предполагал, что `unsetenv gui/<uid> <key>` / `getenv gui/<uid> <key>` честно принимают домен —
+# ОПРОВЕРГНУТО эмпирически (issue #191, 2026-07-28): `Usage: launchctl getenv <key>` — ровно ОДИН
+# позиционный аргумент; вызов с двумя трактует первый как имя переменной, второй молча игнорируется.
+# Рабочий домен-осознанный путь — `launchctl asuser <uid> launchctl unsetenv <key>` (man: asuser
+# исполняет команду в bootstrap-контексте target-пользователя) + верификация через
+# `launchctl print gui/<uid>` (health._read_gui_proxy_env, единственный источник правды о gui-домене).
 # Статус пробрасывается в cmd_uninstall (раньше env_note конкатенировался в строку → fail-open).
 import install_lib
 
@@ -478,158 +533,161 @@ def _gui_domain():
     return f"gui/{install_lib.os.getuid()}"
 
 
-def _domain_aware_runner(*, unsetenv_rc=0, getenv_remaining=None, getenv_timeout=None,
-                         print_loaded=False):
-    """runner для gui-domain unsetenv: unsetenv/getenv по доменному таргету.
+# ============================ issue #191: getenv/unsetenv С доменным аргументом молча не работают ============
+# Эмпирически подтверждено на реальной машине (не гипотеза): `launchctl getenv <arg1> <arg2>` — Usage
+# ровно ОДИН позиционный аргумент ("Usage: launchctl getenv <key>", rc=64 без него). При вызове
+# `getenv gui/501 HTTP_PROXY` launchctl берёт ПЕРВЫЙ аргумент ("gui/501") как имя переменной, ВТОРОЙ
+# ("HTTP_PROXY") молча игнорируется — доказано напрямую: `setenv gui/501 marker_value_xyz` +
+# `getenv gui/501` вернул "marker_value_xyz". Тот же паттерн — `unsetenv gui/501 HTTP_PROXY` unset'ит
+# несуществующую переменную "gui/501", реальный HTTP_PROXY в gui-домене остаётся нетронутым. Старый
+# _remove_launchctl_env верил rc=0 + пустому getenv-выводу как «снято» — ложноположительно ВСЕГДА
+# (пустой вывод получается из-за игнорируемого домена, а не из-за реального снятия). Рабочий путь:
+# `launchctl asuser <uid> launchctl unsetenv <key>` (man: bootstrap-контекст target-пользователя) +
+# верификация `launchctl print gui/<uid>` (блок `environment = {...}`, как health._read_gui_proxy_env).
+def _real_launchctl_runner(gui_env, *, print_missing_service=True, print_timeout=False,
+                           asuser_works=True):
+    """Честная модель РЕАЛЬНОГО launchctl (эмпирически проверено 2026-07-28, не гипотеза):
 
-    unsetenv_rc: rc на `unsetenv gui/<uid> <key>` (0=ок, 1=сбой).
-    getenv_remaining: множество ключей, которые getenv ВИДИТ после unsetenv (переменная НЕ снята —
-      fail-open сценарий). Если ключ не в множестве → getenv вернёт пустой вывод (снято).
-    getenv_timeout: множество ключей, на которых getenv ТАЙМАУТИТ (rc=None, timeout=True) —
-      верификация не смогла спросить gui-домен. fail-closed сценарий: нельзя считать «снято».
-    print_loaded: True → print rc=0 (агент жив, до bootout-poll); по умолчанию rc=113 (выгружен).
+    - gui_env: dict, представляющий истинное состояние переменных в gui-домене (единственный
+      источник правды — читается только через `print gui/<uid>` в блоке environment={...}).
+    - `getenv <arg1> [arg2]` / голый `unsetenv <arg1> [arg2]`: игнорирует arg2 полностью, трактует
+      arg1 как имя переменной; такой переменной в этой модели никогда нет → ВСЕГДА rc=0 + пустой out,
+      независимо от gui_env — НЕ меняет gui_env.
+    - `asuser <uid> launchctl unsetenv <key>`: рабочий путь (man launchctl — bootstrap-контекст
+      target-пользователя) — реально удаляет <key> из gui_env, если asuser_works=True.
+    - `print gui/<uid>`: единственная команда, реально читающая gui_env → рендерит блок environment.
+      print_timeout=True → timeout (fail-closed сценарий верификации).
     """
     calls = []
-    remaining = set(getenv_remaining or ())
-    timeout_keys = set(getenv_timeout or ())
 
     def runner(cmd, timeout):
         calls.append(list(cmd))
         sub = cmd[1] if len(cmd) > 1 else ""
         if sub == "print":
-            if print_loaded:
-                return {"rc": 0, "out": f"{srouter.CODEX_ENV_LABEL} = {{ state = running }}",
-                        "err": "", "timeout": False}
-            return {"rc": 113, "out": "", "err": "Could not find service", "timeout": False}
-        if sub == "unsetenv":
-            return {"rc": unsetenv_rc, "out": "", "err": "" if unsetenv_rc == 0 else "boom",
-                    "timeout": False}
-        if sub == "getenv":
-            key = cmd[-1]
-            if key in timeout_keys:
+            if print_timeout:
                 return {"rc": None, "out": "", "err": "timeout", "timeout": True}
-            val = "socks5h://127.0.0.1:10808" if key in remaining else ""
-            return {"rc": 0, "out": val, "err": "", "timeout": False}
+            if print_missing_service and len(cmd) > 2 and "com.srouter.codenv" in cmd[2]:
+                return {"rc": 113, "out": "", "err": "Could not find service", "timeout": False}
+            lines = ["environment = {"]
+            for k, v in gui_env.items():
+                lines.append(f"\t\t{k} => {v}")
+            lines.append("}")
+            return {"rc": 0, "out": "\n".join(lines), "err": "", "timeout": False}
+        if sub == "asuser" and len(cmd) >= 6 and cmd[4] == "unsetenv":
+            if asuser_works:
+                gui_env.pop(cmd[5], None)
+            return {"rc": 0, "out": "", "err": "", "timeout": False}
+        if sub in ("getenv", "unsetenv"):
+            # РЕАЛЬНОЕ launchctl: arg2 (реальный ключ) молча игнорируется — gui_env НЕ меняется,
+            # getenv не видит реальный ключ (спросили про несуществующую "gui/<uid>"-переменную).
+            return {"rc": 0, "out": "", "err": "", "timeout": False}
         return {"rc": 0, "out": "", "err": "", "timeout": False}
 
     runner.calls = calls
     return runner
 
 
-def _unsetenv_calls(calls):
-    return [c for c in calls if len(c) > 1 and c[1] == "unsetenv"]
-
-
-def _getenv_calls(calls):
-    return [c for c in calls if len(c) > 1 and c[1] == "getenv"]
-
-
-def test_remove_launchctl_env_unsetenv_targets_gui_domain(monkeypatch, tmp_path):
-    """DEFECT A: unsetenv вызывается с ЯВНЫМ доменным таргетом `gui/<uid>`, НЕ голым ключом.
-
-    setenv-скрипт LaunchAgent кладёт переменные в gui-домен (caller-context = gui). uninstall из
-    cmd_uninstall бежит в caller-context (user/<uid> из SSH/cron) — unsetenv без домена снял бы не
-    там. На коде до фикса (unsetenv <key>) этот тест ПАДАЕТ: cmd[2] = ключ, нет домена.
-    """
+def test_remove_launchctl_env_unsetenv_via_asuser_succeeds_on_real_model(monkeypatch, tmp_path):
+    """GREEN (issue #191): на честной модели `asuser <uid> launchctl unsetenv <key>` реально снимает
+    переменные из gui-домена (эмпирически рабочий путь) — код рапортует успех и удаляет plist."""
     home = _mock_home(monkeypatch, tmp_path)
     srouter._install_launchctl_env(_env(tmp_path), _fake_runner())
-    runner = _domain_aware_runner()
+    gui_env = {"HTTP_PROXY": "socks5h://127.0.0.1:10808", "HTTPS_PROXY": "socks5h://127.0.0.1:10808"}
+    runner = _real_launchctl_runner(gui_env)
+
+    status = srouter._remove_launchctl_env(runner)
+
+    assert status["ok"] is True, f"asuser реально снял переменные — ожидаем успех: {status['note']}"
+    assert "снят" in status["note"].lower()
+    plist = home / "Library" / "LaunchAgents" / f"{srouter.CODEX_ENV_LABEL}.plist"
+    assert not plist.exists(), "plist удалён после подтверждённого снятия"
+
+
+def test_remove_launchctl_env_asuser_targets_real_key_not_domain_string(monkeypatch, tmp_path):
+    """issue #191: unsetenv-вызов — `launchctl asuser <uid> launchctl unsetenv <key>`, где <key> —
+    реальное имя переменной (HTTP_PROXY/…), а НЕ строка домена (в отличие от опровергнутого
+    `unsetenv gui/<uid> <key>`, где launchctl видит только первый позиционный аргумент)."""
+    home = _mock_home(monkeypatch, tmp_path)
+    srouter._install_launchctl_env(_env(tmp_path), _fake_runner())
+    runner = _real_launchctl_runner({})
+    uid = str(install_lib.os.getuid())
+
+    srouter._remove_launchctl_env(runner)
+
+    asuser_calls = [c for c in runner.calls if len(c) > 1 and c[1] == "asuser"]
+    assert asuser_calls, "asuser вызван хотя бы раз"
+    keys = {c[5] for c in asuser_calls if len(c) > 5 and c[2] == uid and c[4] == "unsetenv"}
+    assert {"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"} <= keys, \
+        f"каждый proxy-ключ снимается через asuser <uid> launchctl unsetenv <key>: {asuser_calls}"
+
+
+def test_remove_launchctl_env_verifies_via_print_gui_domain(monkeypatch, tmp_path):
+    """issue #191: верификация снятия идёт через `launchctl print gui/<uid>` (health._read_gui_proxy_env),
+    НЕ через `getenv gui/<uid> <key>` (опровергнуто — молча игнорирует домен)."""
+    home = _mock_home(monkeypatch, tmp_path)
+    srouter._install_launchctl_env(_env(tmp_path), _fake_runner())
+    runner = _real_launchctl_runner({"HTTP_PROXY": "socks5h://127.0.0.1:10808"})
     expected_domain = _gui_domain()
 
-    note = srouter._remove_launchctl_env(runner)["note"]
+    srouter._remove_launchctl_env(runner)
 
-    assert "снят" in note.lower(), f"ожидаем успех: {note}"
-    calls = _unsetenv_calls(runner.calls)
-    assert calls, "unsetenv вызван хотя бы раз"
-    for cmd in calls:
-        assert len(cmd) >= 4 and cmd[2] == expected_domain, \
-            f"unsetenv таргетит gui-домен явно: ожидалось cmd[2]=={expected_domain}, получено {cmd}"
+    print_calls = [c for c in runner.calls
+                   if len(c) > 2 and c[1] == "print" and c[2] == expected_domain]
+    assert print_calls, f"print {expected_domain} (без label) вызван для верификации env: {runner.calls}"
+    getenv_calls = [c for c in runner.calls if len(c) > 1 and c[1] == "getenv"]
+    assert not getenv_calls, "getenv БОЛЬШЕ не используется для верификации (опровергнутый путь #191)"
 
 
-def test_remove_launchctl_env_verifies_unsetenv_via_getenv(monkeypatch, tmp_path):
-    """DEFECT A: после unsetenv — верификация `getenv gui/<uid> <key>` (пусто = подтверждено снято).
-
-    unsetenv без verify = loose-валидатор (rc игнорируется, переменная могла остаться). Граница
-    валидируется строгим первоисточником: getenv gui/<uid> (тот же домен, что setenv-скрипт).
-    """
+def test_remove_launchctl_env_fails_closed_when_asuser_leaves_leftover(monkeypatch, tmp_path):
+    """issue #191 fail-closed: asuser unsetenv не снял ключ (asuser_works=False — симулирует любой сбой
+    рабочего пути) → print gui/<uid> реально видит переменную → status.ok is False."""
     home = _mock_home(monkeypatch, tmp_path)
     srouter._install_launchctl_env(_env(tmp_path), _fake_runner())
-    runner = _domain_aware_runner()  # getenv возвращает пусто для всех ключей (снято)
-    expected_domain = _gui_domain()
-
-    note = srouter._remove_launchctl_env(runner)["note"]
-
-    assert "снят" in note.lower(), f"ожидаем успех: {note}"
-    getenvs = _getenv_calls(runner.calls)
-    assert getenvs, "getenv верификация вызвана"
-    verified_keys = {c[-1] for c in getenvs}
-    assert {"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"} <= verified_keys, \
-        "каждый proxy-ключ верифицирован getenv"
-    for cmd in getenvs:
-        assert cmd[2] == expected_domain, f"getenv таргетит gui-домен: {cmd}"
-
-
-def test_remove_launchctl_env_fails_closed_when_var_not_removed(monkeypatch, tmp_path):
-    """DEFECT A fail-closed: getenv показывает переменную ЖИВОЙ после unsetenv → статус НЕ «снят».
-
-    unsetenv «отработал» (rc=0), но getenv gui/<uid> HTTP_PROXY всё ещё видит socks5h://127.0.0.1:10808
-    (домен-mismatch / launchd не снял). Без верификации cmd_uninstall вернул бы success → мёртвый
-    прокси в gui. Теперь: статус сигнализирует проблему, cmd_uninstall пробрасывает в rc≠0.
-    """
-    home = _mock_home(monkeypatch, tmp_path)
-    srouter._install_launchctl_env(_env(tmp_path), _fake_runner())
-    runner = _domain_aware_runner(getenv_remaining={"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
-                                                    "http_proxy", "https_proxy", "all_proxy",
-                                                    "NO_PROXY", "no_proxy"})
-
-    status = srouter._remove_launchctl_env(runner)
-    note = status["note"]
-
-    assert status["ok"] is False, f"переменная осталась в gui → fail-closed (ok=False): {note}"
-    assert "gui" in note.lower() and "остались" in note.lower(), \
-        f"статус сигнализирует проблему (env не снят в gui): {note}"
-
-
-def test_remove_launchctl_env_fails_closed_when_getenv_timeout(monkeypatch, tmp_path):
-    """DEFECT A fail-closed верификации: getenv ТАЙМАУТИТ → НЕ считать «снято», ok=False.
-
-    Внутренний цикл-review #94: первоначальный фикс считал пустой out = «снято» всегда. Но getenv
-    при timeout/OSError (rc=None) возвращает пустой out — это НЕ «переменной нет», а «не смогли
-    спросить». Считать это «снято» = fail-open (переменная могла остаться в gui). Канон: сбой
-    верификации → unverifiable → fail-closed (ok=False). На коде без этого фикса тест ПАДАЕТ.
-    """
-    home = _mock_home(monkeypatch, tmp_path)
-    srouter._install_launchctl_env(_env(tmp_path), _fake_runner())
-    runner = _domain_aware_runner(getenv_timeout={"HTTP_PROXY"})  # getenv не ответил
+    runner = _real_launchctl_runner({"HTTP_PROXY": "socks5h://127.0.0.1:10808"}, asuser_works=False)
 
     status = srouter._remove_launchctl_env(runner)
 
-    assert status["ok"] is False, f"getenv timeout → unverifiable → fail-closed: {status['note']}"
-    assert "подтверждено" in status["note"].lower() or "не" in status["note"].lower(), \
-        f"статус отличает unverifiable от снято: {status['note']}"
+    assert status["ok"] is False, f"переменная реально осталась в gui → fail-closed: {status['note']}"
+    assert "gui" in status["note"].lower() and "остались" in status["note"].lower()
+    plist = home / "Library" / "LaunchAgents" / f"{srouter.CODEX_ENV_LABEL}.plist"
+    assert plist.exists(), "plist оставлен как контроль (env не подтверждённо снят)"
 
 
-def test_remove_launchctl_env_returns_structured_status_ok(monkeypatch, tmp_path):
-    """DEFECT A: _remove_launchctl_env возвращает структурированный статус {ok:bool} для cmd_uninstall.
+def test_remove_launchctl_env_fails_closed_when_print_verification_times_out(monkeypatch, tmp_path):
+    """issue #191 fail-closed верификации: `print gui/<uid>` таймаутит → НЕ считать «снято».
 
-    Раньше возвращалась только строка-статус → cmd_uninstall конкатенировал в сообщение → fail-open
-    (env не снят, но rc=0). Теперь ok=False пробрасывается в ненулевой rc cmd_uninstall.
+    Канон verify-dont-guess: сбой верификации ≠ подтверждённый успех. Пустой результат печати из-за
+    timeout — это «не смогли спросить», а не «переменной нет» (симметрично getenv-fail-closed из #94,
+    но теперь bound к print, реальному домен-осознанному источнику).
     """
     home = _mock_home(monkeypatch, tmp_path)
     srouter._install_launchctl_env(_env(tmp_path), _fake_runner())
-    runner = _domain_aware_runner()  # getenv → пусто (всё снято)
+    runner = _real_launchctl_runner({}, print_timeout=True)
 
     status = srouter._remove_launchctl_env(runner)
 
-    assert isinstance(status, dict), "статус — структурированный dict {ok:bool, note:str}"
+    assert status["ok"] is False, f"print timeout → unverifiable → fail-closed: {status['note']}"
+    plist = home / "Library" / "LaunchAgents" / f"{srouter.CODEX_ENV_LABEL}.plist"
+    assert plist.exists(), "plist оставлен — верификация не подтвердила снятие"
+
+
+def test_remove_launchctl_env_returns_structured_status_ok_real_model(monkeypatch, tmp_path):
+    """_remove_launchctl_env возвращает {ok: True} на честной модели, где asuser реально снял env."""
+    home = _mock_home(monkeypatch, tmp_path)
+    srouter._install_launchctl_env(_env(tmp_path), _fake_runner())
+    runner = _real_launchctl_runner({"HTTP_PROXY": "socks5h://127.0.0.1:10808"})
+
+    status = srouter._remove_launchctl_env(runner)
+
+    assert isinstance(status, dict)
     assert status.get("ok") is True
 
 
-def test_remove_launchctl_env_returns_structured_status_not_ok(monkeypatch, tmp_path):
-    """DEFECT A: переменная не снята → status.ok is False (cmd_uninstall пробрасывает в rc≠0)."""
+def test_remove_launchctl_env_returns_structured_status_not_ok_real_model(monkeypatch, tmp_path):
+    """_remove_launchctl_env возвращает {ok: False} когда переменная реально осталась в gui-домене."""
     home = _mock_home(monkeypatch, tmp_path)
     srouter._install_launchctl_env(_env(tmp_path), _fake_runner())
-    runner = _domain_aware_runner(getenv_remaining={"HTTP_PROXY"})
+    runner = _real_launchctl_runner({"HTTP_PROXY": "socks5h://127.0.0.1:10808"}, asuser_works=False)
 
     status = srouter._remove_launchctl_env(runner)
 
