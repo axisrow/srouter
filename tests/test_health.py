@@ -35,7 +35,7 @@ def _all_up_monkey(monkeypatch, *, probe_status="ok", probe_detail="runtime: к�
     (True, HTTP 404) полагалось на «любой не-000 = жив» — после фикса #82 семантика строгая
     (5xx=down, 2xx/3xx/4xx=up), 404 остаётся up, но 200 читается однозначнее как здоровый."""
     monkeypatch.setattr(health, "_port_up", lambda port: True)
-    monkeypatch.setattr(health, "_tunnel_up", lambda: (True, "HTTP 200"))
+    monkeypatch.setattr(health, "_tunnel_up", lambda: (True, "HTTP 200", False))
     monkeypatch.setattr(health, "_claude_proxy_probe",
                         lambda: {"status": probe_status, "source": "runtime" if probe_status != "unknown" else "n/a",
                                  "detail": probe_detail})
@@ -275,7 +275,7 @@ def test_check_all_has_claude_proxy_check(monkeypatch):
 def test_check_all_down_when_everything_dead(monkeypatch):
     """Всё мертво → down (не degraded, не ok)."""
     monkeypatch.setattr(health, "_port_up", lambda port: False)
-    monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed"))
+    monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed", False))
     monkeypatch.setattr(health, "_claude_proxy_probe",
                         lambda: {"status": "down", "source": "runtime", "detail": "runtime"})
     monkeypatch.setattr(health, "_desktop_proxy_check",
@@ -323,7 +323,7 @@ def test_vps_unreachable_when_tunnel_fail_is_driver_down(monkeypatch):
     → driver-чек роняет вердикт в down (не degraded). VPS-смерть = critical-infra DOWN (#194).
     """
     _all_up_monkey(monkeypatch)  # порты + claude/codex/app/desktop — info/ok (не роняют)
-    monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed"))
+    monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed", False))
     _mock_active_node(monkeypatch, {"name": "vps-1", "endpoint_host": "198.51.100.7", "port": 443})
     _mock_vps_tcp(monkeypatch, reachable=False)
     result = health.check_all()
@@ -342,7 +342,7 @@ def test_vps_reachable_when_tunnel_fail_distinguishes_local_proxy(monkeypatch):
     поверх туннель-fail — туннель уже driver). Канон: verify-don't-guess (прямая причина).
     """
     _all_up_monkey(monkeypatch)
-    monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed"))
+    monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed", False))
     _mock_active_node(monkeypatch, {"name": "vps-1", "endpoint_host": "198.51.100.7", "port": 443})
     _mock_vps_tcp(monkeypatch, reachable=True)
     result = health.check_all()
@@ -357,7 +357,7 @@ def test_vps_reachable_when_tunnel_fail_distinguishes_local_proxy(monkeypatch):
 def test_vps_reachable_when_tunnel_ok_is_info(monkeypatch):
     """Туннель ok + VPS reachable → ok; VPS-чек info-only (VPS-доступность не релевантна когда туннель жив)."""
     _all_up_monkey(monkeypatch, probe_status="ok")
-    monkeypatch.setattr(health, "_tunnel_up", lambda: (True, "HTTP 200"))
+    monkeypatch.setattr(health, "_tunnel_up", lambda: (True, "HTTP 200", False))
     _mock_active_node(monkeypatch, {"name": "vps-1", "endpoint_host": "198.51.100.7", "port": 443})
     _mock_vps_tcp(monkeypatch, reachable=True)
     result = health.check_all()
@@ -385,7 +385,7 @@ def test_vps_placeholder_testnet_203_0_113_is_warn(monkeypatch):
     placeholder, не врёт «VPS мёртв» и не падает. status=warn, чек info (placeholder — не сбой стека).
     """
     _all_up_monkey(monkeypatch, probe_status="ok")
-    monkeypatch.setattr(health, "_tunnel_up", lambda: (True, "HTTP 200"))
+    monkeypatch.setattr(health, "_tunnel_up", lambda: (True, "HTTP 200", False))
     _mock_active_node(monkeypatch, {"name": "example", "endpoint_host": "203.0.113.7", "port": 443})
     # port_open не должно вызываться для placeholder (детект до пробы).
     monkeypatch.setattr(health.sys_probe, "port_open",
@@ -405,7 +405,7 @@ def test_vps_unreachable_does_not_mask_down_into_degraded(monkeypatch):
     unreachable — проверка упадёт. status обязан остаться down, VPS-чек — driver ok=False.
     """
     monkeypatch.setattr(health, "_port_up", lambda port: False)
-    monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed"))
+    monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed", False))
     monkeypatch.setattr(health, "_claude_proxy_probe",
                         lambda: {"status": "down", "source": "runtime", "detail": "runtime"})
     monkeypatch.setattr(health, "_desktop_proxy_check", lambda: {"status": "down", "detail": "down"})
@@ -538,7 +538,7 @@ def test_network_down_takes_precedence_over_vps_dead_in_check_all(monkeypatch):
     «подключи интернет», VPS-чек подавляется (info-only, не «VPS мёртв» поверх «нет сети»).
     """
     _all_up_monkey(monkeypatch)  # порты живы; claude/codex/app/desktop — info/ok
-    monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed"))
+    monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed", False))
     # route + ifconfig: нет сети
     monkeypatch.setattr(health.sys_probe, "run", lambda cmd, timeout:
                         _ROUTE_DEFAULT_NONE if cmd[:3] == [ROUTE, "-n", "get"]
@@ -565,7 +565,7 @@ def test_network_up_proceeds_to_vps_probe_in_check_all(monkeypatch):
     реальную VPS-смерть. VPS-unreachable при живой сети → по-прежнему driver DOWN (#196).
     """
     _all_up_monkey(monkeypatch)
-    monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed"))
+    monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed", False))
     monkeypatch.setattr(health.sys_probe, "run", lambda cmd, timeout:
                         {"rc": 0, "out": _ROUTE_DEFAULT_UP, "err": "", "timeout": False}
                         if cmd[:3] == [ROUTE, "-n", "get"]
@@ -587,7 +587,7 @@ def test_network_check_is_info_only_when_up(monkeypatch):
     в агрегации drivers (как endpoint-override/versions). Driver net-чек становится ТОЛЬКО при up=False.
     """
     _all_up_monkey(monkeypatch, probe_status="ok")
-    monkeypatch.setattr(health, "_tunnel_up", lambda: (True, "HTTP 200"))
+    monkeypatch.setattr(health, "_tunnel_up", lambda: (True, "HTTP 200", False))
     monkeypatch.setattr(health.sys_probe, "run", lambda cmd, timeout:
                         {"rc": 0, "out": _ROUTE_DEFAULT_UP, "err": "", "timeout": False}
                         if cmd[:3] == [ROUTE, "-n", "get"]
@@ -688,7 +688,7 @@ def test_local_proxy_driver_down_when_tunnel_fail_and_port_closed(monkeypatch):
     """ДЫРА #204: туннель fail + локальный прокси down (port closed) → driver. Раньше туннель-fail
     без причины. Теперь _local_proxy_up объясняет: «локальный прокси упал — restart»."""
     _all_up_monkey(monkeypatch)  # порты/claude/codex/app/desktop — ok/info, не роняют
-    monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed"))
+    monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed", False))
     # VPS жив (info-only, не маскирует локальный прокси) — различение от ситуации #2 (#194):
     _mock_active_node(monkeypatch, {"name": "vps-1", "endpoint_host": "198.51.100.7", "port": 443})
     _mock_vps_tcp(monkeypatch, reachable=True)
@@ -791,7 +791,7 @@ def test_dns_fail_masks_vps_dead_in_check_all(monkeypatch):
     когда резолв не работает). Канон: verify-dont-guess (gaierror ≠ VPS-смерть).
     """
     _all_up_monkey(monkeypatch)  # порты живы; claude/codex/app/desktop — info/ok
-    monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed"))
+    monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed", False))
     # сеть есть (route default → en0) — мок sys_probe.run, как #203-каскадные тесты.
     monkeypatch.setattr(health.sys_probe, "run", lambda cmd, timeout:
                         {"rc": 0, "out": _ROUTE_DEFAULT_UP, "err": "", "timeout": False}
@@ -821,7 +821,7 @@ def test_network_down_suppresses_dns_check_in_check_all(monkeypatch):
     VPS-чек), «нет сети» остаётся единственным driver. Канон: verify-dont-guess (первичная причина).
     """
     _all_up_monkey(monkeypatch)  # порты живы; _resolve_host замокан True, но ниже переопределим
-    monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed"))
+    monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed", False))
     # НЕТ сети: route rc!=0 + ifconfig только loopback (как test_network_down_* из #203)
     monkeypatch.setattr(health.sys_probe, "run", lambda cmd, timeout:
                         _ROUTE_DEFAULT_NONE if cmd[:3] == [ROUTE, "-n", "get"]
@@ -847,7 +847,7 @@ def test_dns_ok_proceeds_to_vps_probe_in_check_all(monkeypatch):
     VPS-смерть. VPS-unreachable при живой сети + работающем DNS → по-прежнему driver DOWN (#196).
     """
     _all_up_monkey(monkeypatch)
-    monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed"))
+    monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed", False))
     monkeypatch.setattr(health.sys_probe, "run", lambda cmd, timeout:
                         {"rc": 0, "out": _ROUTE_DEFAULT_UP, "err": "", "timeout": False}
                         if cmd[:3] == [ROUTE, "-n", "get"]
@@ -870,7 +870,7 @@ def test_dns_check_is_info_only_when_up(monkeypatch):
     при up=False.
     """
     _all_up_monkey(monkeypatch, probe_status="ok")
-    monkeypatch.setattr(health, "_tunnel_up", lambda: (True, "HTTP 200"))
+    monkeypatch.setattr(health, "_tunnel_up", lambda: (True, "HTTP 200", False))
     monkeypatch.setattr(health.sys_probe, "run", lambda cmd, timeout:
                         {"rc": 0, "out": _ROUTE_DEFAULT_UP, "err": "", "timeout": False}
                         if cmd[:3] == [ROUTE, "-n", "get"]
@@ -906,7 +906,7 @@ def test_tunnel_up_5xx_is_down(monkeypatch):
     """503 от мёртвого/сбойного upstream за прокси → туннель НЕ жив. ДЫРА: watchdog слепнет,
     считая 5xx за 'жив' (code != '000')."""
     monkeypatch.setattr(health.sys_probe, "run", _tunnel_curl_returning("503"))
-    ok, detail = health._tunnel_up()
+    ok, detail, _ = health._tunnel_up()
     assert ok is False, f"5xx = мёртвый upstream за туннелем, а не 'жив', detail={detail}"
     assert "503" in detail
 
@@ -914,7 +914,7 @@ def test_tunnel_up_5xx_is_down(monkeypatch):
 def test_tunnel_up_502_is_down(monkeypatch):
     """502 Bad Gateway (типовой ответ сбойного прокси/upstream) → down."""
     monkeypatch.setattr(health.sys_probe, "run", _tunnel_curl_returning("502"))
-    ok, _ = health._tunnel_up()
+    ok, _, _ = health._tunnel_up()
     assert ok is False
 
 
@@ -922,7 +922,7 @@ def test_tunnel_up_404_is_up(monkeypatch):
     """404 (реальный ответ api.anthropic.com/ на '/') = канал жив: сервер ответил через туннель.
     Легит-случай, не ломаем: watchdog не должен ложно паниковать на 404."""
     monkeypatch.setattr(health.sys_probe, "run", _tunnel_curl_returning("404"))
-    ok, detail = health._tunnel_up()
+    ok, detail, _ = health._tunnel_up()
     assert ok is True, f"404 от живого сервера = туннель жив, detail={detail}"
     assert "404" in detail
 
@@ -930,14 +930,14 @@ def test_tunnel_up_404_is_up(monkeypatch):
 def test_tunnel_up_200_is_up(monkeypatch):
     """200 — очевидно жив (не ломаем)."""
     monkeypatch.setattr(health.sys_probe, "run", _tunnel_curl_returning("200"))
-    ok, _ = health._tunnel_up()
+    ok, _, _ = health._tunnel_up()
     assert ok is True
 
 
 def test_tunnel_up_000_is_down(monkeypatch):
     """000 на всех таргетах — соединения нет (не ломаем существующее)."""
     monkeypatch.setattr(health.sys_probe, "run", _tunnel_curl_returning("000"))
-    ok, detail = health._tunnel_up()
+    ok, detail, _ = health._tunnel_up()
     assert ok is False
     assert "connection-failed" in detail
 
@@ -946,7 +946,7 @@ def test_tunnel_up_timeout_is_down(monkeypatch):
     """timeout на всех таргетах → down (не ломаем)."""
     monkeypatch.setattr(health.sys_probe, "run",
                         lambda cmd, timeout: {"rc": None, "out": "", "err": "timeout", "timeout": True})
-    ok, detail = health._tunnel_up()
+    ok, detail, _ = health._tunnel_up()
     assert ok is False
     assert "timeout" in detail
 
@@ -960,7 +960,7 @@ def test_tunnel_up_origin_5xx_one_vendor_stays_up(monkeypatch):
     up = a OR o) — health обязан вести себя так же."""
     monkeypatch.setattr(health.sys_probe, "run",
                         _tunnel_curl_per_target({"anthropic": "503", "openai": "421"}))
-    ok, detail = health._tunnel_up()
+    ok, detail, _ = health._tunnel_up()
     assert ok is True, f"origin-503 одного вендора при живом втором = туннель жив, detail={detail}"
 
 
@@ -968,7 +968,7 @@ def test_tunnel_up_origin_5xx_other_vendor_stays_up(monkeypatch):
     """Симметрично: OpenAI 500, Anthropic 200 → жив (второй таргет спасает)."""
     monkeypatch.setattr(health.sys_probe, "run",
                         _tunnel_curl_per_target({"anthropic": "200", "openai": "500"}))
-    ok, _ = health._tunnel_up()
+    ok, _, _ = health._tunnel_up()
     assert ok is True
 
 
@@ -976,7 +976,7 @@ def test_tunnel_up_both_5xx_is_down(monkeypatch):
     """Оба таргета 5xx → down: это уже не origin одного вендора, а сбой прокси/туннеля."""
     monkeypatch.setattr(health.sys_probe, "run",
                         _tunnel_curl_per_target({"anthropic": "503", "openai": "502"}))
-    ok, detail = health._tunnel_up()
+    ok, detail, _ = health._tunnel_up()
     assert ok is False, f"оба 5xx = сбой канала, не origin, detail={detail}"
 
 
@@ -984,7 +984,7 @@ def test_tunnel_up_both_000_is_down(monkeypatch):
     """Оба таргета 000 (нет соединения ни к кому) → down."""
     monkeypatch.setattr(health.sys_probe, "run",
                         _tunnel_curl_per_target({"anthropic": "000", "openai": "000"}))
-    ok, detail = health._tunnel_up()
+    ok, detail, _ = health._tunnel_up()
     assert ok is False
 
 
@@ -992,9 +992,218 @@ def test_tunnel_up_first_target_down_second_up(monkeypatch):
     """Первый таргет не отвечает (000), второй жив (200) → туннель жив (фолбэк работает)."""
     monkeypatch.setattr(health.sys_probe, "run",
                         _tunnel_curl_per_target({"anthropic": "000", "openai": "200"}))
-    ok, _ = health._tunnel_up()
+    ok, _, _ = health._tunnel_up()
     assert ok is True
 
+
+# ============================ #207: vendor outage ============================
+# Оба таргета HTTP 5xx = канал жив, оба вендора лежат.
+# TCP-fail/timeout = сеть/VPS, не vendor.
+
+
+def test_tunnel_up_both_5xx_vendor_outage_detail(monkeypatch):
+    """Оба таргета 5xx -> down, detail vendor outage (не VPS)."""
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _tunnel_curl_per_target({"anthropic": "503", "openai": "502"}))
+    ok, detail, _ = health._tunnel_up()
+    assert ok is False
+    assert health.VENDOR_OUTAGE_MARKER in detail, f"got: {detail}"
+
+
+def test_tunnel_up_one_5xx_other_ok_no_vendor_outage(monkeypatch):
+    """Один 5xx + другой ok = up, не vendor outage."""
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _tunnel_curl_per_target({"anthropic": "503", "openai": "200"}))
+    ok, detail, _ = health._tunnel_up()
+    assert ok is True
+    assert health.VENDOR_OUTAGE_MARKER not in detail
+
+
+def test_tunnel_up_tcp_fail_not_vendor_outage(monkeypatch):
+    """Оба 000 (TCP-fail) = down, НЕ vendor outage."""
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _tunnel_curl_per_target({"anthropic": "000", "openai": "000"}))
+    ok, detail, _ = health._tunnel_up()
+    assert ok is False
+    assert health.VENDOR_OUTAGE_MARKER not in detail
+    assert "connection-failed" in detail
+
+
+def test_tunnel_up_timeout_not_vendor_outage(monkeypatch):
+    """Оба timeout = down, НЕ vendor outage."""
+    monkeypatch.setattr(health.sys_probe, "run",
+        lambda cmd, timeout: {"rc": None, "out": "", "err": "", "timeout": True})
+    ok, detail, _ = health._tunnel_up()
+    assert ok is False
+    assert health.VENDOR_OUTAGE_MARKER not in detail
+
+
+def test_tunnel_up_mixed_5xx_and_tcp_not_vendor_outage(monkeypatch):
+    """Один 5xx + один TCP-fail = down, НЕ vendor outage."""
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _tunnel_curl_per_target({"anthropic": "503", "openai": "000"}))
+    ok, detail, _ = health._tunnel_up()
+    assert ok is False
+    assert health.VENDOR_OUTAGE_MARKER not in detail
+
+
+
+# --- #207 check_all cascade: vendor outage distinguishes от «VPS мёртв» ---
+# Каскад: ...→сеть(#203)→VPS(#196)→туннель→vendor outage(#207, HTTP-level).
+# При vendor outage: сеть жива, VPS жив (TCP-коннект проходит), local-proxy жив,
+# но туннель 5xx на обоих таргетах. Tunnel-check detail = «vendor outage»,
+# VPS/local-proxy НЕ driver (они живы). Канон: verify-dont-guess, noisy-log-better-than-no-log.
+
+def _vendor_outage_check_all(monkeypatch, codes=("503", "502")):
+    """Общая setup для #207 vendor-outage тестов: живые порты/CC/codex + оба вендора 5xx +
+    сеть/VPS/local-proxy живы → возвращаем check_all() result (туннель = vendor outage).
+
+    codes — HTTP-коды двух вендоров (detuplу в detail). Мокаем _tunnel_up целиком (как
+    _all_up_monkey для живого туннеля) — return-контракт #207 (ok, detail, is_vendor_outage).
+    """
+    _all_up_monkey(monkeypatch, probe_status="ok")
+    detail = f"{health.VENDOR_OUTAGE_MARKER} — оба вендора лежат, канал жив ("              + "; ".join(f"upstream-error HTTP {code}" for code in codes) + ")"
+    monkeypatch.setattr(health, "_tunnel_up", lambda: (False, detail, True))
+    monkeypatch.setattr(health, "_route_default_interface", lambda: "en0")
+    _mock_active_node(monkeypatch, {"name": "vps-1", "endpoint_host": "198.51.100.7", "port": 443})
+    _mock_vps_tcp(monkeypatch, reachable=True)
+    return health.check_all()
+
+
+def test_check_all_vendor_outage_distinguishes_from_vps_dead(monkeypatch):
+    """Оба vendor 5xx + VPS жив + сеть жива → tunnel-check «vendor outage», VPS не driver.
+
+    Регресс-гвард #207: при vendor outage doctor НЕ должен врать «VPS мёртв» (VPS-чек info,
+    жив) — tunnel-check драйвит down с точной причиной «vendor outage».
+    """
+    result = _vendor_outage_check_all(monkeypatch)
+    tun = [c for c in result["checks"] if "туннель" in c["name"]][0]
+    assert tun["ok"] is False, "оба vendor 5xx → tunnel down"
+    assert health.VENDOR_OUTAGE_MARKER in tun["detail"], f"detail должен сказать vendor outage, got: {tun['detail']}"
+    assert tun.get("category") == "vendor-outage", "vendor outage помечен структурно в category"
+    # VPS жив → info-only (НЕ driver). При vendor outage VPS НЕ мёртв — канал проходит до вендора.
+    vps = [c for c in result["checks"] if "vps" in c["name"].lower() and "upstream" in c["name"].lower()][0]
+    assert vps.get("info") is True, "VPS жив при vendor outage → info (не driver «VPS мёртв»)"
+    assert vps["ok"] is True
+
+
+def test_check_all_vendor_outage_detail_surfaces_in_report(monkeypatch):
+    """Vendor outage: detail чётко говорит «оба вендора лежат, канал жив» (noisy-log)."""
+    result = _vendor_outage_check_all(monkeypatch, codes=("500", "503"))
+    tun = [c for c in result["checks"] if "туннель" in c["name"]][0]
+    assert "канал жив" in tun["detail"], f"detail должен подчеркнуть что канал жив, got: {tun['detail']}"
+    assert "503" in tun["detail"] or "500" in tun["detail"], "detail должен содержать HTTP-коды вендоров"
+
+
+def test_print_report_vendor_outage_says_likely_vendor(monkeypatch, capsys):
+    """#207: doctor _print_report при vendor outage говорит «вероятно вендор» (не ваша инфра).
+
+    Регресс-гвард: ранее при любом туннель-fail doctor советовал «проверь узел». При vendor
+    outage узел/VPS/прокси ЖИВЫ — совет чинить узел вводит в заблуждение. Канон:
+    verify-dont-guess (формулировка «вероятно», не категорично), noisy-log-better-than-no-log.
+    """
+    result = _vendor_outage_check_all(monkeypatch)
+    health._print_report(result)
+    out = capsys.readouterr().out
+    assert health.VENDOR_OUTAGE_MARKER in out, f"отчёт должен назвать vendor outage, got:\n{out}"
+    assert "вероятно" in out.lower(), f"должен сказать «вероятно вендор» (не категорично), got:\n{out}"
+    assert "не ваша инфраструктура" in out.lower(), f"должен сказать что проблема не у пользователя, got:\n{out}"
+    # НЕ должен советовать «проверь узел» (узел жив при vendor outage).
+    assert "проверь узел" not in out, f"не должен вести чинить узел при vendor outage, got:\n{out}"
+
+
+def test_print_report_tunnel_fail_no_vendor_outage_advises_node(monkeypatch, capsys):
+    """#207 negative: реальный туннель-fail (connection-failed, НЕ 5xx) → совет «проверь узел».
+
+    Регресс-гвард: vendor outage-ветка не должна маскировать настоящий туннель-fail.
+    """
+    _all_up_monkey(monkeypatch, probe_status="ok")
+    monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed", False))
+    monkeypatch.setattr(health, "_route_default_interface", lambda: "en0")
+    _mock_active_node(monkeypatch, {"name": "vps-1", "endpoint_host": "198.51.100.7", "port": 443})
+    _mock_vps_tcp(monkeypatch, reachable=False)
+    result = health.check_all()
+    health._print_report(result)
+    out = capsys.readouterr().out
+    assert "проверь узел" in out, f"туннель-fail (не vendor) → совет проверить узел, got:\n{out}"
+    assert health.VENDOR_OUTAGE_MARKER not in out
+
+
+
+# --- #207 edge-cases (Codex cycle-review P1#2, P2#4): vacuous-truth guard + no-response/bad-code ---
+def _tunnel_curl_raw_per_target(responses):
+    """Мок sys_probe.run с RAW-ответом per-URL: {"anthropic": {"out": "", "timeout": False}, ...}.
+
+    В отличие от _tunnel_curl_per_target (только http-код), позволяет задать no-response (out="")
+    и bad-code (out="garbage"). Таргет распознаётся по подстроке URL. Неизвестный → 000.
+    """
+    def fake_run(cmd, timeout):
+        url = cmd[-1] if cmd else ""
+        for key, resp in responses.items():
+            if key in url:
+                return {"rc": 0, "out": resp.get("out", ""), "err": "", "timeout": resp.get("timeout", False)}
+        return {"rc": 0, "out": "000", "err": "", "timeout": False}
+    return fake_run
+
+
+def test_tunnel_up_empty_targets_not_vendor_outage(monkeypatch):
+    """P1#2 (Codex): пустой TUNNEL_TARGETS НЕ должен давать ложный vendor outage (all([])=True).
+
+    Регресс-гвард vacuous-truth: ранний `if not TUNNEL_TARGETS: return ..., False` защищает от
+    ложного маркера при пустом кортеже (production-константа непустая, но guard явный).
+    """
+    monkeypatch.setattr(health, "TUNNEL_TARGETS", ())
+    ok, detail, is_vendor_outage = health._tunnel_up()
+    assert ok is False
+    assert is_vendor_outage is False
+    assert health.VENDOR_OUTAGE_MARKER not in detail, f"пустые targets не vendor outage, got: {detail}"
+
+
+def test_tunnel_up_both_no_response_not_vendor_outage(monkeypatch):
+    """P2#4: оба таргета no-response (пустой out) → down, НЕ vendor outage."""
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _tunnel_curl_raw_per_target({"anthropic": {"out": ""}, "openai": {"out": ""}}))
+    ok, detail, _ = health._tunnel_up()
+    assert ok is False
+    assert health.VENDOR_OUTAGE_MARKER not in detail, f"no-response не vendor outage, got: {detail}"
+    assert "no-response" in detail
+
+
+def test_tunnel_up_both_bad_code_not_vendor_outage(monkeypatch):
+    """P2#4: оба таргета bad-code (нечисловой) → down, НЕ vendor outage."""
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _tunnel_curl_raw_per_target({"anthropic": {"out": "garbage"}, "openai": {"out": "XYZ"}}))
+    ok, detail, _ = health._tunnel_up()
+    assert ok is False
+    assert health.VENDOR_OUTAGE_MARKER not in detail, f"bad-code не vendor outage, got: {detail}"
+
+
+def test_tunnel_up_5xx_and_no_response_not_vendor_outage(monkeypatch):
+    """P2#4: один 5xx + один no-response → down, НЕ vendor outage (не все 5xx)."""
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _tunnel_curl_raw_per_target({"anthropic": {"out": "503"}, "openai": {"out": ""}}))
+    ok, detail, _ = health._tunnel_up()
+    assert ok is False
+    assert health.VENDOR_OUTAGE_MARKER not in detail, f"5xx+no-response не vendor outage, got: {detail}"
+
+
+def test_tunnel_up_5xx_and_bad_code_not_vendor_outage(monkeypatch):
+    """P2#4: один 5xx + один bad-code → down, НЕ vendor outage."""
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _tunnel_curl_raw_per_target({"anthropic": {"out": "503"}, "openai": {"out": "garbage"}}))
+    ok, detail, _ = health._tunnel_up()
+    assert ok is False
+    assert health.VENDOR_OUTAGE_MARKER not in detail, f"5xx+bad-code не vendor outage, got: {detail}"
+
+
+def test_check_all_vendor_outage_status_is_down_not_ok(monkeypatch):
+    """P2#5 (Codex): vendor outage → result status down/degraded (НЕ ok). Канал до вендора мёртв.
+
+    Vendor outage = агенты не могут работать = реальный сбой для пользователя (srouter-critical-infra-24-7).
+    Tunnel-check driver-down даёт НЕ-ok вердикт — это намеренно, не маскируем в ok.
+    """
+    result = _vendor_outage_check_all(monkeypatch)
+    assert result["status"] != "ok", f"vendor outage не ok (канал до вендора мёртв), got: {result['status']}"
 
 # ============================ #129: endpoint-override detection (ANTHROPIC_BASE_URL) ============================
 # Doctor должен детектить нестандартный ANTHROPIC_BASE_URL + NO_PROXY masking.

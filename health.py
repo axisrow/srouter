@@ -55,6 +55,12 @@ DASHBOARD_PORT = 8787
 # одного вендора (Anthropic лежит, но канал жив) не должен читаться как «туннель упал».
 TUNNEL_TARGETS = ("https://api.anthropic.com/", "https://api.openai.com/")
 
+# #207: маркер vendor outage в detail _tunnel_up — единый источник правды для человекочитаемого
+# префикса (канон issue #155: константа, не разбросанные подстроки). Программный дискриминатор
+# едёт структурно (check["category"]=="vendor-outage" в check_all, см. _tunnel_up return 3-tuple),
+# а НЕ парсом этой строки — канон loose-validator-recurring-leak. Маркер — только display-текст.
+VENDOR_OUTAGE_MARKER = "vendor outage"
+
 # State watchdog'а (переход ok→down, чтобы не спамить). /tmp не переживает ребут — приемлемо:
 # после ребута fresh state, первый прогон без нотификации если уже down.
 WATCHDOG_STATE = Path("/tmp/srouter-watchdog.last")
@@ -178,25 +184,30 @@ def _local_proxy_up():
 
 
 def _tunnel_target_up(url):
-    """Один таргет через прокси: (ok, detail). Живой = сервер ответил HTTP < 500
-    (sys_probe.tunnel_code_up). 000/timeout/5xx — не жив. Не бросает."""
+    """Один таргет через прокси: (ok, detail, kind). Живой = сервер ответил HTTP < 500
+    (sys_probe.tunnel_code_up). 000/timeout/5xx — не жив. Не бросает.
+
+    kind — структурный дискриминатор провала (канон loose-validator-recurring-leak: не парсим
+    его из detail-строки). Один из: ok | timeout | no-response | connection-failed | bad-code |
+    upstream-error. #207: upstream-error = HTTP 5xx (сервер ответил через туннель → канал жив,
+    но сам вендор лежит); прочие = curl не достучался (сеть/VPS)."""
     r = sys_probe.run([CURL, "-sS", "-o", "/dev/null", "-x", _PROXY,
                        "--connect-timeout", "4", "--max-time", "8",
                        "-w", "%{http_code}", url], timeout=10)
     if r.get("timeout"):
-        return False, "timeout"
+        return False, "timeout", "timeout"
     code = (r.get("out") or "").strip()
     if not code:
-        return False, "no-response"
+        return False, "no-response", "no-response"
     if code == "000":
-        return False, "connection-failed"
+        return False, "connection-failed", "connection-failed"
     try:
         code_int = int(code)
     except ValueError:
-        return False, f"bad-code {code}"
+        return False, f"bad-code {code}", "bad-code"
     if not sys_probe.tunnel_code_up(code_int):
-        return False, f"upstream-error HTTP {code}"
-    return True, f"HTTP {code}"
+        return False, f"upstream-error HTTP {code}", "upstream-error"
+    return True, f"HTTP {code}", "ok"
 
 
 def _tunnel_up():
@@ -207,16 +218,28 @@ def _tunnel_up():
     «туннель упал», иначе watchdog поднимет ложную тревогу (issue #82). Единая семантика 5xx=down
     сохраняется, но применяется per-target, а решение — по обоим.
     НЕ блокируется PF — прокси-трафик через loopback, PF режет только en*/ppp*.
-    Возвращает (ok: bool, detail: str — http-код живого таргета или причины провалов).
+    #207: если ВСЕ таргеты дали HTTP 5xx (kind=="upstream-error" — сервер ответил через туннель,
+    значит канал жив, но сами вендоры лежат) → detail = «vendor outage», is_vendor_outage=True.
+    Это различает HTTP-level vendor-down от network/VPS-death (timeout/connection-failed/...).
+    Возвращает (ok, detail, is_vendor_outage). is_vendor_outage — структурный сигнал (не parse
+    detail-строки), consumer'ы (check_all → _print_report) читают его, а не подстроку.
     """
-    details = []
+    if not TUNNEL_TARGETS:
+        return False, "no tunnel targets", False
+    details, kinds = [], []
     for url in TUNNEL_TARGETS:
-        ok, detail = _tunnel_target_up(url)
+        ok, detail, kind = _tunnel_target_up(url)
         if ok:
-            return True, detail  # любой живой таргет = туннель жив (как up = a OR o)
+            return True, detail, False  # любой живой таргет = туннель жив (как up = a OR o)
         details.append(detail)
-    # ни один таргет не ответил живым HTTP < 500 → туннель/прокси down (не origin одного вендора)
-    return False, "; ".join(details)
+        kinds.append(kind)
+    # ни один таргет не ответил живым HTTP < 500 → туннель/прокси down.
+    # #207: vendor outage = ВСЕ kind'и upstream-error (HTTP 5xx, канал жив). Структурный
+    # дискриминатор по kind, не parse detail-строки (канон loose-validator-recurring-leak).
+    is_vendor_outage = all(k == "upstream-error" for k in kinds)
+    if is_vendor_outage:
+        return False, f"{VENDOR_OUTAGE_MARKER} — оба вендора лежат, канал жив ({'; '.join(details)})", True
+    return False, "; ".join(details), False
 
 
 # ============================ #203: активный сетевой интерфейс/маршрут (нет сети vs VPS мёртв) ============================
@@ -1800,8 +1823,15 @@ def check_all(*, active_claude=False):
     checks.append({"name": f"privoxy ({PRIVOXY_PORT})", "ok": _port_up(PRIVOXY_PORT)})
     checks.append({"name": f"xray ({XRAY_PORT})", "ok": _port_up(XRAY_PORT)})
     checks.append({"name": f"dashboard ({DASHBOARD_PORT})", "ok": _port_up(DASHBOARD_PORT)})
-    tun_ok, tun_detail = _tunnel_up()
-    checks.append({"name": "туннель (api.anthropic.com через прокси)", "ok": tun_ok, "detail": tun_detail})
+    tun_ok, tun_detail, tun_vendor_outage = _tunnel_up()
+    # #207: vendor outage (оба вендора HTTP 5xx = канал жив, вендоры лежат) структурно помечаем
+    # в check["category"] (как vps_check["info"] / lp_check["info"] ниже) — _print_report читает
+    # поле, а не парсит detail-строку. Каскад #201: ...→сеть→VPS→туннель→vendor outage. При vendor
+    # outage туннель driver-down, но VPS/local-proxy чеки ниже остаются info (они живы).
+    tun_check = {"name": "туннель (api.anthropic.com через прокси)", "ok": tun_ok, "detail": tun_detail}
+    if tun_vendor_outage:
+        tun_check["category"] = "vendor-outage"
+    checks.append(tun_check)
     # #203: активный сетевой интерфейс/маршрут — ПЕРВЫЙ чек каскада (нет сети → VPS → локальный
     # прокси → ...). Эпик #201 ситуация 1: doctor не различал «нет сети» (Wi-Fi/eth выкл, нет
     # default route) от «VPS мёртв» — TCP-probe VPS при мёртвой сети тоже timeout → ложный диагноз.
@@ -2171,7 +2201,18 @@ def _print_report(result):
         if "xray" in failed_names:
             print("  • xray: brew services restart xray  (или srouter install)")
         if "туннель" in failed_names:
-            print("  • туннель: проверь узел (srouter status / дашборд nodes), возможно узел недоступен")
+            # #207: vendor outage (оба вендора 5xx, канал/узел/VPS живы) → совет ждать вендора,
+            # не чинить узел. Канон: verify-dont-guess (5xx доказывает ответ через туннель, не
+            # источник; но при живых VPS/local-proxy вероятен вендор), noisy-log-better-than-no-log.
+            tun_check = next((c for c in result["checks"] if "туннель" in c["name"]), None)
+            if tun_check and tun_check.get("category") == "vendor-outage":
+                print("  • туннель: vendor outage — оба вендора (Anthropic + OpenAI) отвечают 5xx, "
+                      "при живых узле/VPS/локальном прокси. Вероятно, лежит сам вендор (не ваша "
+                      "инфраструктура).")
+                print("    Проверь статусные страницы (status.anthropic.com / status.openai.com), "
+                      "подожди восстановления. Узел и локальный прокси трогать не нужно.")
+            else:
+                print("  • туннель: проверь узел (srouter status / дашборд nodes), возможно узел недоступен")
         if "DNS" in failed_names:
             # #205: DNS точно сломан (getaddrinfo не резолвил) — НЕ чинить VPS/локальный прокси,
             # проблема в резолвере. Домены не разрешаются = всё выглядит connection-failed.
