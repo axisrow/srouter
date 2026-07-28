@@ -2348,13 +2348,15 @@ def _print_report(result):
             print("    Проверь: заплачен/запущен ли VPS, не упал ли хостинг, верный ли endpoint_host:port в узле")
         # #206: GFW режет домен избирательно. Чек info-only (не driver) → не в failed_names; сканируем
         # checks напрямую по имени + ok=False (status=="gfw"). GFW — scoped-диагностика домена:
-        # VPS/прокси НЕ виноваты, github режется по TLS-fingerprint. Подсказка — прокси/VPS для домена.
-        # Канон: verify-dont-guess (точная причина — прямой curl доказал: github режется, z.ai ок).
+        # VPS/прокси НЕ виноваты, режущийся домен блокируется по TLS-fingerprint. Подсказка — прокси/VPS
+        # для домена. Конкретные имена доменов НЕ хардкодим тут (как раньше «github»): detail чека уже
+        # generic по GFW_PROBE_DOMAINS — если список расширится (anthropic и др.), совет останется верным.
+        # Канон: verify-dont-guess (точная причина — прямой curl: target режется, контрольный z.ai ок).
         gfw_check = next((c for c in result["checks"] if "GFW per-domain" in c["name"]), None)
         if gfw_check and not gfw_check["ok"]:
-            print("  • GFW режет домен: github не отвечает напрямую (timeout/reset), но z.ai — отвечает.")
-            print("    Это НЕ «VPS мёртв» и НЕ «локальный прокси» — GFW избирательно блокирует github по TLS.")
-            print("    Решение: гони github через прокси/VPS (gh: env -u снимает scoped git-proxy; "
+            print(f"  • GFW режет домен: {gfw_check.get('detail', 'домен')} — это НЕ «VPS мёртв» и НЕ "
+                  f"«локальный прокси» (GFW избирательно блокирует по TLS, контрольный домен отвечает).")
+            print("    Решение: гони режущийся домен через прокси/VPS (gh: env -u снимает scoped git-proxy; "
                   "git: git -c http.https://github.com.proxy=).")
         if "локальный прокси" in failed_names:
             # #204: privoxy/xray service-status down (крах/зомби). VPS жив → проблема локальная.
