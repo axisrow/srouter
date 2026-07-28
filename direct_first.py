@@ -26,11 +26,20 @@ LOOPBACK_NO_PROXY = "localhost,127.0.0.1,::1"
 # при install) — z.ai остаётся direct безусловно (resilience, канон srouter-critical-infra-24-7).
 BUILTIN_FALLBACK_NO_PROXY = "localhost,127.0.0.1,::1,z.ai,.z.ai"
 
+# Резервный лимит на количество candidate-доменов (BUILTIN + user direct_domains). detect() бьёт
+# per-domain честный curl СЕРИАЛЬНО (без concurrency) с connect_timeout/max_time по несколько
+# секунд — bulk-paste/ошибочный конфиг с тысячами доменов иначе блокирует периодический env-refresh
+# (codenv StartInterval=300) на часы. Канон srouter-critical-infra-24-7: скорость восстановления/
+# отзывчивость важнее полноты покрытия — BUILTIN z.ai всегда попадает в срез (добавляется первым).
+MAX_CANDIDATE_DOMAINS = 50
+
 
 def candidate_domains(path=None):
     """BUILTIN z.ai + validated user `direct_domains` (srouter.local.json), деduped (lowercase),
-    порядок сохранён. Невалидные (shell-metachars) отбрасываются через local_state._is_valid_host
-    (канон loose-validator-recurring-leak — один shell-safe валидатор, не новый). Не бросает."""
+    порядок сохранён, срезано до MAX_CANDIDATE_DOMAINS. Невалидные (shell-metachars, leading dot)
+    отбрасываются через local_state._is_valid_host + leading-dot guard (симметрично
+    local_state._normalize_traffic_guard_domain — канон loose-validator-recurring-leak: один
+    shell-safe валидатор + одна и та же dot-семантика, не новый расходящийся валидатор). Не бросает."""
     try:
         state = local_state.load_state(path)
         user_domains = state.get("direct_domains") if isinstance(state, dict) else None
@@ -40,10 +49,15 @@ def candidate_domains(path=None):
         user_domains = []
     seen, out = set(), []
     for host in (*BUILTIN_DIRECT_DOMAINS, *user_domains):
+        if len(out) >= MAX_CANDIDATE_DOMAINS:
+            break
         if not isinstance(host, str):
             continue
         h = host.strip()
-        if not h or not local_state._is_valid_host(h):
+        # leading dot ('.example.com') не отбрасывается _is_valid_host (символ '.' разрешён), но
+        # build_no_proxy добавляет f'.{h}' — для leading-dot host это дало бы '..example.com'
+        # (malformed NO_PROXY). Симметрично local_state._normalize_traffic_guard_domain.
+        if not h or h.startswith(".") or not local_state._is_valid_host(h):
             continue
         if h.lower() in seen:
             continue
@@ -91,7 +105,11 @@ def build_no_proxy(reachable_hosts):
             seen.add(h.lower())
             out.append(h)
     for host in (*BUILTIN_DIRECT_DOMAINS, *reachable_hosts):
-        h = host.strip().rstrip(".").lower()
+        # rstrip trailing dots И lstrip leading dots — defense-in-depth: candidate_domains уже
+        # отбрасывает leading-dot хосты, но build_no_proxy может быть вызван напрямую с сырым
+        # списком (тесты, будущие вызывающие). Без lstrip('.') host='.example.com' дал бы
+        # f'.{h}' == '..example.com' (malformed NO_PROXY entry).
+        h = host.strip().strip(".").lower()
         if not h:
             continue
         for candidate in (h, f".{h}"):

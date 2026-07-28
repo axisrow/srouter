@@ -47,6 +47,30 @@ def test_candidate_domains_never_raises_on_broken_state(tmp_path):
     assert "z.ai" in domains
 
 
+def test_candidate_domains_leading_dot_rejected(tmp_path):
+    """Асимметрия с local_state._normalize_traffic_guard_domain (rejects leading dot/double-dot):
+    _is_valid_host пропускает '.example.com', но build_no_proxy делает f'.{h}' → '..example.com'
+    (malformed NO_PROXY entry). candidate_domains обязан отбросить leading-dot ДО build_no_proxy."""
+    p = tmp_path / "srouter.local.json"
+    p.write_text(json.dumps({"schema_version": 1, "direct_domains": [".example.com", "ok.example.com"]}),
+                 encoding="utf-8")
+    domains = direct_first.candidate_domains(path=p)
+    assert ".example.com" not in domains
+    assert "ok.example.com" in domains
+
+
+def test_candidate_domains_capped_at_max(tmp_path):
+    """Резервный лимит (MAX_CANDIDATE_DOMAINS) — bulk-paste/ошибочный конфиг с тысячами доменов
+    не должен блокировать периодический env-refresh (сериальный curl-цикл, канон
+    srouter-critical-infra-24-7: скорость восстановления/responsiveness > полнота покрытия)."""
+    many = [f"host{i}.example.com" for i in range(direct_first.MAX_CANDIDATE_DOMAINS + 50)]
+    p = tmp_path / "srouter.local.json"
+    p.write_text(json.dumps({"schema_version": 1, "direct_domains": many}), encoding="utf-8")
+    domains = direct_first.candidate_domains(path=p)
+    assert len(domains) <= direct_first.MAX_CANDIDATE_DOMAINS
+    assert "z.ai" in domains, "BUILTIN z.ai не должен быть вытеснен лимитом"
+
+
 # ============================ direct_reachable (делегирует sys_probe.direct_probe) ============================
 
 def test_direct_reachable_delegates_to_sys_probe(monkeypatch):
@@ -134,6 +158,13 @@ def test_build_no_proxy_zai_always_included_even_if_not_in_reachable():
 def test_build_no_proxy_empty_list_still_has_loopback_and_zai():
     s = direct_first.build_no_proxy([])
     assert s.startswith("localhost,127.0.0.1,::1,")
+
+
+def test_build_no_proxy_never_produces_double_dot():
+    """Defense-in-depth: даже если leading-dot host просочился мимо candidate_domains (прямой
+    вызов build_no_proxy с сырым списком), результат не должен содержать '..' (malformed NO_PROXY)."""
+    s = direct_first.build_no_proxy([".example.com"])
+    assert ".." not in s, f"NO_PROXY не должен содержать двойную точку: {s}"
 
 
 # ============================ no_proxy_string ============================
