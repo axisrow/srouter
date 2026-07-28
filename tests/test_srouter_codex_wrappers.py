@@ -2088,6 +2088,44 @@ def test_codenv_env_script_calls_direct_first():
     assert "no_proxy_string" in text
 
 
+def test_codenv_env_script_sets_proxy_before_blocking_probe():
+    """#197 cycle-review (Codex critical): PROXY-переменные (launchctl setenv HTTP_PROXY ...) ДОЛЖНЫ
+    выставляться ДО блокирующего direct_first.no_proxy_string() probe.
+
+    Boot-race: no_proxy_string() делает serial curl per-domain (до MAX_CANDIDATE_DOMAINS x max_time
+    ≈ сотни секунд worst-case). При RunAtLoad на буте launchctl-env пуст; если PROXY-переменные
+    ставятся ПОСЛЕ probe, GUI-процессы (Codex.app/ChatGPT.app), стартующие в окне probe, унаследуют
+    ОТСУТСТВИЕ SOCKS-прокси → прямой egress под GFW (утечка реального IP + недоступность vendor).
+    launchctl setenv не ретроактивен → уже запущенные процессы не чинятся при последующем setenv.
+
+    Инвариант (канон fail-closed-proxy-down, srouter-critical-infra-24-7): PROXY-переменные попадают
+    в launchctl-env НЕМЕДЛЕННО, окно без них минимально. Единственный сетевой вызов (probe) не должен
+    задерживать установку PROXY — он нужен только для NO_PROXY (логически независим от PROXY-vars)."""
+    script = Path(__file__).resolve().parent.parent / "launchagents" / "srouter-codex-env.sh"
+    # Только строки кода (без комментариев) — иначе якоря цепляются за текст docstring-комментария.
+    code_lines = [ln for ln in script.read_text(encoding="utf-8").splitlines()
+                  if not ln.lstrip().startswith("#")]
+
+    def _first_line(substr):
+        for i, ln in enumerate(code_lines):
+            if substr in ln:
+                return i
+        return -1
+
+    # Установка PROXY-переменных: цикл `for key in HTTP_PROXY ...; do launchctl setenv "$key" ...`.
+    proxy_setenv_line = _first_line('launchctl setenv "$key"')
+    assert proxy_setenv_line != -1, "скрипт должен выставлять PROXY-переменные через launchctl setenv"
+    # Блокирующий probe = присвоение NO_PROXY из вызова no_proxy_string() (serial curl).
+    probe_line = _first_line("no_proxy_string")
+    assert probe_line != -1, "скрипт вызывает direct_first.no_proxy_string() для динамического NO_PROXY"
+    assert proxy_setenv_line < probe_line, (
+        "PROXY-переменные (launchctl setenv HTTP_PROXY) ДОЛЖНЫ выставляться ДО блокирующего "
+        "direct_first.no_proxy_string() probe — иначе GUI-процессы в окне probe при загрузке "
+        "унаследуют отсутствие прокси → прямой egress под GFW (Codex critical #197 cycle-review). "
+        f"proxy_setenv@code-line{proxy_setenv_line} должен быть < probe@code-line{probe_line}"
+    )
+
+
 def test_codenv_env_script_fallback_contains_zai_direct():
     """srouter-codex-env.sh fallback (Python/detect недоступен) содержит z.ai,.z.ai — regression-гвард
     #195: даже при сбое Python NO_PROXY не должен потерять z.ai (канон srouter-critical-infra-24-7,

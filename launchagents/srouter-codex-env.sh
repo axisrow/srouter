@@ -19,15 +19,29 @@
 # исключая класс багов «плейсхолдер не отрендерен» (PR #189 error 5 регрессия).
 # При сбое Python/detect (сеть недоступна на install, srouter_config.py отсутствует и т.д.) →
 # fallback на BUILTIN (z.ai всегда direct — канон zai-direct-no-proxy, srouter-critical-infra-24-7).
+#
+# ПОРЯДОК КРИТИЧЕН (#197 cycle-review, boot-race): PROXY-переменные + conservative fallback NO_PROXY
+# выставляются СРАЗУ, ДО блокирующего direct_first.no_proxy_string() probe. no_proxy_string() бьёт
+# serial curl per-domain (до MAX_CANDIDATE_DOMAINS × max_time ≈ сотни секунд worst-case); при
+# RunAtLoad на буте launchctl-env пуст — если бы PROXY ставился ПОСЛЕ probe, GUI-процессы
+# (Codex.app/ChatGPT.app), стартующие в окне probe, унаследовали бы отсутствие SOCKS → прямой egress
+# под GFW (утечка реального IP). launchctl setenv не ретроактивен → уже запущенные не чинятся.
+# Инвариант fail-closed-proxy-down: окно без прокси = 0. probe нужен ТОЛЬКО для NO_PROXY (логически
+# независим от PROXY-vars) → сначала ставим прокси+безопасный NO_PROXY, потом уточняем NO_PROXY.
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 PYTHON_BIN="${SROUTER_PYTHON:-/usr/bin/python3}"
 PROXY="socks5h://127.0.0.1:10808"
-NO_PROXY="$("$PYTHON_BIN" -c "import sys; sys.path.insert(0, '$ROOT_DIR'); import direct_first; print(direct_first.no_proxy_string())" 2>/dev/null)"
-if [ -z "$NO_PROXY" ]; then
-  NO_PROXY="localhost,127.0.0.1,::1,z.ai,.z.ai"
-fi
+FALLBACK_NO_PROXY="localhost,127.0.0.1,::1,z.ai,.z.ai"
+# 1) PROXY-переменные + conservative NO_PROXY — НЕМЕДЛЕННО (без сетевого ожидания), fail-closed.
 for key in HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy; do
   launchctl setenv "$key" "$PROXY"
 done
-launchctl setenv NO_PROXY "$NO_PROXY"
-launchctl setenv no_proxy "$NO_PROXY"
+launchctl setenv NO_PROXY "$FALLBACK_NO_PROXY"
+launchctl setenv no_proxy "$FALLBACK_NO_PROXY"
+# 2) Динамический NO_PROXY — ПОСЛЕ (блокирующий probe). Обновляет ТОЛЬКО NO_PROXY; PROXY уже стоит.
+#    Пустой результат (Python/detect сбой) → оставляем conservative fallback, уже выставленный выше.
+NO_PROXY="$("$PYTHON_BIN" -c "import sys; sys.path.insert(0, '$ROOT_DIR'); import direct_first; print(direct_first.no_proxy_string())" 2>/dev/null)"
+if [ -n "$NO_PROXY" ]; then
+  launchctl setenv NO_PROXY "$NO_PROXY"
+  launchctl setenv no_proxy "$NO_PROXY"
+fi
