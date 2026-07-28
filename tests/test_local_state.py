@@ -647,6 +647,22 @@ def test_default_state_has_auto_route_sync_true():
     assert local_state._DEFAULT_STATE.get("auto_route_sync") is True
 
 
+# ============================ #197: direct_domains в _DEFAULT_STATE (direct-first NO_PROXY) ============================
+def test_default_state_has_direct_domains_section():
+    """direct_domains — opt-in список user-доменов для direct_first.candidate_domains (пустой по
+    умолчанию — BUILTIN z.ai всегда добавляется в direct_first, не отсюда)."""
+    assert local_state._DEFAULT_STATE.get("direct_domains") == []
+
+
+def test_load_state_missing_direct_domains_key_defaults_to_empty(tmp_path):
+    """Старый srouter.local.json (до #197, без ключа direct_domains) → загрузка не падает,
+    секция подставляется дефолтом (обратная совместимость, schema_version остаётся 1)."""
+    p = tmp_path / "old.json"
+    p.write_text(json.dumps({"schema_version": 1, "nodes": []}), encoding="utf-8")
+    state = local_state.load_state(path=p)
+    assert state["direct_domains"] == []
+
+
 # ============================ #136: routing-domains в production xray-config (hybrid adopt) ============================
 # srouter управляет routing.rules секцией reality-out: adopt существующего rule (маркер _srouter_managed),
 # домены хранит в state (active+hash), two-phase apply (backup→validate→restart→promote). НЕ захватывает

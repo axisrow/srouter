@@ -9,12 +9,23 @@
 # делает `unsetenv gui/<uid> <key>` с ЯВНЫМ доменом (он бежит из процесса cmd_uninstall, чей
 # caller-context может быть user/<uid> из SSH/cron — issue #94 DEFECT A).
 # Эмпирически: Claude.app/ChatGPT.app на System Settings SOCKS, global env их не ломает.
-# NO_PROXY=loopback (Codex→moonbridge на loopback, локальные сервисы MCP/healthcheck)
-#   + z.ai,.z.ai (moonbridge→api.z.ai напрямую — z.ai НЕ за GFW, доступен мимо SOCKS5/xray/VPS).
-#   При мёртвом VPS (#194) moonbridge обязан достучаться к api.z.ai напрямую, иначе codex ломается.
-#   Канон: zai-direct-no-proxy, srouter-critical-infra-24-7.
+#
+# #197 direct-first: NO_PROXY динамический — direct_first.no_proxy_string() честным прямым
+# TLS-test'ом (мимо прокси) проверяет candidate-домены (z.ai BUILTIN + user direct_domains из
+# srouter.local.json), reachable → в NO_PROXY. Периодичность = этот же LaunchAgent (StartInterval
+# 300с) — отдельный re-check-агент не нужен, GFW-флап подхватывается на следующем прогоне.
+# Скрипт НЕ рендерится при install (запускается in-place из env.root/launchagents/, как
+# health.py у watchdog) — сам резолвит ROOT_DIR через dirname (родитель launchagents/ = env.root),
+# исключая класс багов «плейсхолдер не отрендерен» (PR #189 error 5 регрессия).
+# При сбое Python/detect (сеть недоступна на install, srouter_config.py отсутствует и т.д.) →
+# fallback на BUILTIN (z.ai всегда direct — канон zai-direct-no-proxy, srouter-critical-infra-24-7).
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+PYTHON_BIN="${SROUTER_PYTHON:-/usr/bin/python3}"
 PROXY="socks5h://127.0.0.1:10808"
-NO_PROXY="localhost,127.0.0.1,::1,z.ai,.z.ai"
+NO_PROXY="$("$PYTHON_BIN" -c "import sys; sys.path.insert(0, '$ROOT_DIR'); import direct_first; print(direct_first.no_proxy_string())" 2>/dev/null)"
+if [ -z "$NO_PROXY" ]; then
+  NO_PROXY="localhost,127.0.0.1,::1,z.ai,.z.ai"
+fi
 for key in HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy; do
   launchctl setenv "$key" "$PROXY"
 done

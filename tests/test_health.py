@@ -1150,6 +1150,94 @@ def test_print_report_gfw_cut_advises_proxy_for_domain(monkeypatch, capsys):
     assert "github" in out.lower(), f"отчёт должен назвать режущийся домен (github), got:\n{out}"
 
 
+# ============================ #197: direct-first check в check_all (info-only, gate под active_claude) ============================
+def _mock_direct_first(monkeypatch, *, reachable=None, blocked=None, raises=False):
+    """Подменить health._direct_first_check для детерминированного теста."""
+    if raises:
+        def _fake():
+            raise RuntimeError("direct_first import boom")
+        monkeypatch.setattr(health, "_direct_first_check", lambda: {"status": "unknown",
+                             "detail": "direct-first detect недоступен — check пропущен"})
+        return
+    reachable = reachable or []
+    blocked = blocked or []
+    if reachable and not blocked:
+        status, detail = "ok", f"direct-first: {', '.join(reachable)} → напрямую (NO_PROXY)"
+    elif reachable:
+        status, detail = "info", f"direct: {', '.join(reachable)}; через прокси: {', '.join(blocked)}"
+    else:
+        status, detail = "info", f"direct-first: все candidate через прокси ({', '.join(blocked)})"
+    monkeypatch.setattr(health, "_direct_first_check", lambda: {"status": status, "detail": detail})
+
+
+def test_direct_first_check_info_only_in_check_all(monkeypatch):
+    """#197: direct-first чек в check_all — info-only ВСЕГДА (картина, не driver).
+
+    Даже когда часть candidate-доменов идёт через прокси, это не роняет вердикт стека — direct-first
+    это resilience-оптимизация (переживает смерть VPS для direct-доменов), не health-инвариант.
+    """
+    _all_up_monkey(monkeypatch, probe_status="ok")
+    monkeypatch.setattr(health, "_tunnel_up", lambda: (True, "HTTP 200", False))
+    _mock_direct_first(monkeypatch, reachable=["z.ai"], blocked=[])
+    _mock_doctor_only_checks(monkeypatch)
+    result = health.check_all(active_claude=True)
+    df = next((c for c in result["checks"] if "direct-first" in c["name"].lower()), None)
+    assert df is not None, "check_all(active_claude=True) содержит direct-first check"
+    assert df.get("info") is True, "direct-first чек info-only (не driver)"
+    drivers = [c for c in result["checks"] if not c.get("info")]
+    assert df not in drivers, "info-only direct-first исключён из drivers (не роняет вердикт)"
+
+
+def test_direct_first_check_absent_in_light_health(monkeypatch):
+    """Регресс-гвард: лёгкий check_all() (без active_claude) НЕ делает direct-first чек.
+
+    /health (dashboard) и watchdog — лёгкие. direct_first.detect() делает прямой curl per-domain =
+    сетевой overhead, не для лёгкого пути (тот же паттерн, что GFW per-domain #206).
+    """
+    _all_up_monkey(monkeypatch, probe_status="ok")
+    _mock_direct_first(monkeypatch, reachable=["z.ai"], blocked=[])
+    result = health.check_all()  # БЕЗ active_claude — лёгкий путь
+    names = " ".join(c["name"] for c in result["checks"])
+    assert "direct-first" not in names.lower(), \
+        f"лёгкий путь НЕ должен нести direct-first чек (overhead); checks={names}"
+
+
+def test_direct_first_check_ok_when_all_reachable(monkeypatch):
+    _all_up_monkey(monkeypatch, probe_status="ok")
+    monkeypatch.setattr(health, "_tunnel_up", lambda: (True, "HTTP 200", False))
+    _mock_direct_first(monkeypatch, reachable=["z.ai"], blocked=[])
+    _mock_doctor_only_checks(monkeypatch)
+    result = health.check_all(active_claude=True)
+    df = next(c for c in result["checks"] if "direct-first" in c["name"].lower())
+    assert df["ok"] is True
+
+
+def test_direct_first_check_info_when_some_blocked(monkeypatch):
+    _all_up_monkey(monkeypatch, probe_status="ok")
+    monkeypatch.setattr(health, "_tunnel_up", lambda: (True, "HTTP 200", False))
+    _mock_direct_first(monkeypatch, reachable=["z.ai"], blocked=["cut.example.com"])
+    _mock_doctor_only_checks(monkeypatch)
+    result = health.check_all(active_claude=True)
+    df = next(c for c in result["checks"] if "direct-first" in c["name"].lower())
+    assert df["ok"] is False  # status != ok, но всё равно info-only (не driver — проверено выше)
+    assert df.get("info") is True
+
+
+def test_direct_first_check_wraps_exceptions_as_unknown(monkeypatch):
+    """direct_first.detect() бросил → _direct_first_check не падает, статус unknown (не мок чека
+    самого себя — проверяем реальный try/except внутри _direct_first_check, канон probe-контракта:
+    не бросает наружу)."""
+    import direct_first as direct_first_mod
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(direct_first_mod, "detect", boom)
+    r = health._direct_first_check()
+    assert r["status"] == "unknown"
+    assert "недоступен" in r["detail"]
+
+
 # ============================ _tunnel_up HTTP semantics (issue #82, класс #3) ============================
 def _tunnel_curl_returning(code_out):
     """Мок sys_probe.run для _tunnel_up: curl -w %{http_code} печатает заданный код (любой URL)."""
