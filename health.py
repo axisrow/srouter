@@ -209,13 +209,19 @@ def _direct_domain_probe(host):
     Канон zai-direct-no-proxy: probe БЕЗ прокси (иначе github-through-VPS = «VPS мёртв», та же
     подмена, что git-proxy #199 маскировал «флап gh»).
 
-    Семантика reachable = HTTP < 500 (как sys_probe.tunnel_code_up для туннеля): 404/421 = сервер
-    ответил = канал работает. timeout/000 = режется/нет ответа. Не бросает (probe-канон).
+    Семантика reachable = ЛЮБОЙ HTTP-ответ сервера (включая 5xx): GFW даёт timeout/reset, НЕ
+    HTTP-ответ → сам факт HTTP-кода доказывает достижимость (домен не режется). 404/421/5xx = сервер
+    ответил = канал работает. timeout/000 = режется/нет ответа. kind разделяет «здоров» (HTTP<500, ok)
+    от «ответил, но лежит» (5xx, upstream-error) — та же дискриминация, что _tunnel_target_up #207.
+    Не бросает (probe-канон). Consumer (_gfw_domain_check) смотрит ТОЛЬКО на reachable (для GFW-вердикта
+    важен факт ответа, не здоровье) — но kind точный для observability/detail (noisy-log).
 
     Возвращает {"reachable": bool, "kind": str}:
       reachable=True,  kind="ok"                  — сервер ответил HTTP < 500 (домен доступен напрямую);
+      reachable=True,  kind="upstream-error"      — сервер ответил HTTP 5xx (домен достижим, GFW НЕ режет,
+                                                    но сам лежит — vendor down, не «ok»; как #207);
       reachable=False, kind="timeout"             — curl timeout (GFW режет / нет ответа);
-      reachable=False, kind="connection-failed"   — curl 000/no-response (reset/соединение не установлено).
+      reachable=False, kind="connection-failed"   — curl 000/no-response/мусор (reset/не установлено).
     """
     # env -u всех proxy-vars (оба регистра) — прямой путь минуя privoxy/xray. Список = тот же, что
     # _claude_transport_once clean_keys + GH_DIRECT_HINT #199 (единый контракт «снять прокси»).
@@ -242,8 +248,11 @@ def _direct_domain_probe(host):
     if sys_probe.tunnel_code_up(code_int):
         return {"reachable": True, "kind": "ok"}  # HTTP < 500 — сервер ответил, канал работает
     # HTTP 5xx напрямую (без прокси) — сервер ответил, но лежит сам: канал до домена работает, GFW
-    # НЕ режет. reachable=True (домен достижим), 5xx = проблема вендора, не GFW (#207-семантика).
-    return {"reachable": True, "kind": "ok"}
+    # НЕ режет (GFW даёт timeout/reset, не HTTP-ответ). reachable=True (домен достижим — для GFW-вердикта
+    # важно «ответил вообще», не «здоров»), но kind="upstream-error" (НЕ "ok"): 5xx = vendor down, не
+    # чистый ok. Та же структурная дискриминация, что _tunnel_target_up #207 (kind="upstream-error" для
+    # 5xx), и согласовано с sys_probe.tunnel_code_up (5xx = мёртвый канал). cycle-review #206.
+    return {"reachable": True, "kind": "upstream-error"}
 
 
 def _gfw_domain_check(domains=GFW_PROBE_DOMAINS, control=GFW_CONTROL_DOMAIN):

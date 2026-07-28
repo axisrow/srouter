@@ -968,6 +968,23 @@ def test_direct_domain_probe_connection_failed_is_cut(monkeypatch):
     assert r["kind"] == "connection-failed"
 
 
+def test_direct_domain_probe_5xx_reachable_but_upstream_error(monkeypatch):
+    """ДЫРА #206 (cycle-review): прямой curl HTTP 5xx → reachable=True (домен ответил, GFW НЕ режет),
+    но kind="upstream-error" (НЕ "ok").
+
+    GFW даёт timeout/reset, НЕ HTTP-ответ → 5xx доказывает достижимость (не GFW-блокировка). НО 5xx —
+    не «ok»: сервер ответил, но сам лежит (vendor down). Канон sys_probe.tunnel_code_up (5xx = мёртвый
+    канал) + #207 паттерн (_tunnel_target_up отдаёт kind="upstream-error" для 5xx, не "ok").
+    cycle-review score 85: docstring говорит «reachable = HTTP < 500», но код возвращал kind="ok" для
+    5xx — противоречие. reachable=True сохраняется (домен достижим для GFW-вердикта), kind разделяет.
+    """
+    monkeypatch.setattr(health.sys_probe, "run",
+                        lambda cmd, timeout, env=None: {"rc": 0, "out": "503", "err": "", "timeout": False})
+    r = health._direct_domain_probe("github.com")
+    assert r["reachable"] is True, "5xx = сервер ответил → домен достижим (GFW НЕ режет)"
+    assert r["kind"] == "upstream-error", "5xx ≠ ok: kind=upstream-error (как #207 _tunnel_target_up)"
+
+
 def test_direct_domain_probe_strips_proxy_env(monkeypatch):
     """ДЫРА #206 (канон zai-direct-no-proxy): прямой curl идёт МИНУЯ прокси (env -u).
 
