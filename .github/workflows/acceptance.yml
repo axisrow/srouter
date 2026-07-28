@@ -22,10 +22,25 @@ jobs:
             -t srouter-acceptance \
             .
 
-      - name: Run acceptance tests
+      - name: Run acceptance tests (in-container)
         run: |
           docker run --rm \
             -e SROUTER_ACCEPTANCE=1 \
             -e PYTHONUNBUFFERED=1 \
             srouter-acceptance \
             pytest tests/acceptance/ -v
+
+      # Docker-native .dockerignore canary (issue #116) — host-side тест: собирает
+      # docker/canary.Dockerfile ПРЯМО НА РАННЕРЕ (не внутри acceptance-контейнера, где нет docker
+      # CLI/daemon). ubuntu-latest раннеры поставляются с preinstalled Docker + Python. Без этого
+      # шага canary всегда skip'ался бы в CI (docker недоступен внутри контейнера) — единственным
+      # активным guard'ом оставался бы ручной regex-parse .dockerignore, чего PR #220 явно хотел избежать.
+      - name: Set up Python for host-side canary test
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run Docker-native .dockerignore canary (host-side)
+        run: |
+          pip install pytest
+          pytest tests/acceptance/test_dockerignore_secrets.py -v

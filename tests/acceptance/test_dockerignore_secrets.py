@@ -157,24 +157,38 @@ def canary_image():
     Ни один путь из _SECRET_PATHS не должен существовать ДО теста (иначе рискуем утащить
     настоящий локальный секрет разработчика в docker build или удалить его в finally) —
     fail-closed: если хоть один уже существует, skip (не создаём/не удаляем чужие файлы).
+    `is_symlink()` ОБЯЗАТЕЛЕН отдельно от `exists()` (Codex review PR #220): dangling symlink
+    (цель удалена/недоступна) — `exists()` следует симлинку и вернёт False, а `write_text()` ниже
+    тоже следует симлинку и перезаписал бы ЧУЖОЙ файл вне репозитория по месту назначения ссылки.
     """
     if not _docker_available():
         pytest.skip("Docker недоступен в этом окружении (docker CLI/daemon)")
 
-    preexisting = [p for p in _SECRET_PATHS if (_ROOT / p).exists()]
+    preexisting = [p for p in _SECRET_PATHS if (_ROOT / p).exists() or (_ROOT / p).is_symlink()]
     if preexisting:
         pytest.skip(
             f"secret-пути уже существуют на диске (реальные локальные файлы?): {preexisting}. "
             f"Canary не трогает существующие файлы — пропуск, чтобы не рисковать чужими секретами."
         )
 
-    created = []
+    created_files = []
+    created_dirs = []
     try:
         for rel in _SECRET_PATHS:
             target = _ROOT / rel
-            target.parent.mkdir(parents=True, exist_ok=True)
+            # Только реально созданные этим тестом директории идут в created_dirs (Codex review
+            # PR #220): unconditional rmdir() до этого фикса удалял pre-existing пустую директорию
+            # (напр. server/rendered/), даже если её создал не этот тест.
+            parent = target.parent
+            missing_parents = []
+            p = parent
+            while not p.exists() and p != _ROOT:
+                missing_parents.append(p)
+                p = p.parent
+            parent.mkdir(parents=True, exist_ok=True)
+            created_dirs.extend(reversed(missing_parents))
             target.write_text("canary-secret-should-not-be-in-image\n", encoding="utf-8")
-            created.append(target)
+            created_files.append(target)
 
         build = subprocess.run(
             [
@@ -191,12 +205,13 @@ def canary_image():
         )
         yield _CANARY_IMAGE
     finally:
-        for target in created:
+        for target in created_files:
             target.unlink(missing_ok=True)
-        # Подчистить опустевшие созданные поддиректории (server/rendered/), не трогая server/.
-        rendered_dir = _ROOT / "server" / "rendered"
-        if rendered_dir.exists() and not any(rendered_dir.iterdir()):
-            rendered_dir.rmdir()
+        # Удалить ТОЛЬКО директории, реально созданные этим тестом (не трогать pre-existing пустые
+        # директории вроде server/rendered/, если они уже были на диске до теста).
+        for d in created_dirs:
+            if d.exists() and not any(d.iterdir()):
+                d.rmdir()
         subprocess.run(["docker", "rmi", "-f", _CANARY_IMAGE], capture_output=True)
 
 

@@ -12,9 +12,11 @@
 + Linux + /srouter-acceptance-sentinel + изолированный HOME) — см. docstring там для полного
 обоснования канона privileged-boundary-fail-closed.
 """
+import json
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -126,6 +128,11 @@ def test_conflict_resolution_via_explicit_choice(tmp_path, choice):
     - adopt: чужой config остаётся как есть, srouter «усыновляет» (управляет без перезаписи).
     - skip: компонент вообще не трогается apply'ем.
     Все три — реальный `python3 install_lib.py apply` subprocess, не FakeRunner/юнит-мок.
+
+    Scope: покрывает только happy-path одного apply-вызова (single-process, без сбоя посередине).
+    Crash-window сценарии вокруг in-place overwrite (сбой между backup и promote, повторный install
+    после partial-write) — отдельный WAL-durability эпик issue #124 (вынесен из cycle-review #114/#119
+    Часть 3), не в scope этого полигона.
     """
     env = _cli_env(tmp_path)
     _write_foreign_xray_config(tmp_path)
@@ -146,19 +153,35 @@ def test_conflict_resolution_via_explicit_choice(tmp_path, choice):
         f"stderr:\n{apply.stderr.decode(errors='replace')}"
     )
 
+    # management.mode в state различает adopt/skip (оба не трогают содержимое config.json —
+    # проверка только содержимого не отличила бы одно от другого, Codex review PR #220).
+    state = json.loads(Path(env["SROUTER_STATE_PATH"]).read_text(encoding="utf-8"))
+    xray_management = state.get("detected_environment", {}).get("xray", {}).get("management", {})
+
     if choice == "overwrite":
         backups = list(xray_config.parent.glob("config.json.srouter-backup-*"))
         assert backups, "overwrite должен создать backup чужого конфига (issue #110/#111 контракт)"
         assert xray_config.read_text(encoding="utf-8") != original_content, (
             "overwrite должен заменить содержимое config.json на srouter-managed"
         )
+        assert xray_management.get("mode") == "managed", (
+            f"overwrite должен записать management.mode=managed, получено: {xray_management}"
+        )
     elif choice == "skip":
         assert xray_config.read_text(encoding="utf-8") == original_content, (
             "skip НЕ должен трогать содержимое чужого config.json"
         )
+        assert xray_management.get("mode") == "skipped", (
+            f"skip должен записать management.mode=skipped (не adopted/managed), "
+            f"получено: {xray_management}"
+        )
     elif choice == "adopt":
         assert xray_config.read_text(encoding="utf-8") == original_content, (
             "adopt НЕ перезаписывает содержимое (усыновление «как есть», без backup/overwrite)"
+        )
+        assert xray_management.get("mode") == "adopted", (
+            f"adopt должен записать management.mode=adopted (не skipped/managed), "
+            f"получено: {xray_management}"
         )
 
 

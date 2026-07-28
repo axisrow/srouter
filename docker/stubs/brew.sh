@@ -36,11 +36,29 @@ _service_addr() {
 }
 
 _stop_listener() {
+  # kill сам по себе асинхронен (SIGTERM доставлен != процесс мёртв != порт свободен). restart
+  # (stop+start подряд) без ожидания реальной смерти — гонка: новый bind может упасть на ещё-живой
+  # старый listener. Poll `kill -0` (сигнал существования, не завершает) до реальной смерти —
+  # тот же verify-dont-guess канон, что install_lib.py::_restart_component использует для
+  # port_checker (poll вместо фиксированного sleep). SO_REUSEADDR (port_listener.py) — вторая
+  # линия защиты, не замена этому ожиданию.
+  #
+  # PID-identity guard (Codex review PR #220): raw PID в pidfile без верификации — если listener
+  # умер сам по себе (bind-фейл, crash), а ОС успела переиспользовать его PID для другого процесса
+  # (контейнер долгоживущий/много циклов), kill убьёт чужой процесс. Проверяем cmdline через /proc
+  # (Linux-специфично — образ на Debian/python:slim, всегда Linux) перед kill.
   name="$1"
   pidfile="$_PORT_DIR/$name.pid"
   if [ -f "$pidfile" ]; then
     pid="$(cat "$pidfile" 2>/dev/null)"
-    [ -n "$pid" ] && kill "$pid" 2>/dev/null
+    if [ -n "$pid" ] && [ -r "/proc/$pid/cmdline" ] \
+       && grep -q "port_listener.py" "/proc/$pid/cmdline" 2>/dev/null; then
+      kill "$pid" 2>/dev/null
+      for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.1
+      done
+    fi
     rm -f "$pidfile"
   fi
 }
@@ -73,11 +91,7 @@ case "$sub" in
         echo "Name      Status  User  File  Log  Plist"
         exit 0
         ;;
-      start)
-        _start_listener "$name"
-        exit 0
-        ;;
-      restart|run)
+      start|restart|run)
         _start_listener "$name"
         exit 0
         ;;

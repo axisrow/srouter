@@ -27,17 +27,29 @@ def main():
     proto, port_s, pidfile = sys.argv[1], sys.argv[2], sys.argv[3]
     port = int(port_s)
 
-    tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    tcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    tcp_sock.bind(("127.0.0.1", port))
-    tcp_sock.listen(5)
-    tcp_sock.setblocking(False)
+    # bind/listen может упасть (порт занят / EACCES) — без явного лога caller (brew.sh) видит
+    # только «pidfile не появился» (poll timeout), причина теряется (канон: шумный лог лучше
+    # отсутствия лога). brew.sh нohup'ит stdout/stderr в /dev/null — печатаем и в stderr (на случай
+    # запуска не через brew.sh), и best-effort в pidfile-соседний .err для post-mortem.
+    try:
+        tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        tcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        tcp_sock.bind(("127.0.0.1", port))
+        tcp_sock.listen(5)
+        tcp_sock.setblocking(False)
 
-    udp_sock = None
-    if proto == "udp":
-        udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        udp_sock.bind(("127.0.0.1", port))
-        udp_sock.setblocking(False)
+        udp_sock = None
+        if proto == "udp":
+            udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            udp_sock.bind(("127.0.0.1", port))
+            udp_sock.setblocking(False)
+    except OSError as exc:
+        msg = f"port_listener: bind {proto}/{port} failed: {exc}"
+        print(msg, file=sys.stderr)
+        with open(f"{pidfile}.err", "w", encoding="utf-8") as f:
+            f.write(msg + "\n")
+        sys.exit(1)
 
     readers = [tcp_sock] + ([udp_sock] if udp_sock else [])
 
