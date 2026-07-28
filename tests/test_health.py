@@ -1058,11 +1058,12 @@ def _vendor_outage_check_all(monkeypatch, codes=("503", "502")):
     """Общая setup для #207 vendor-outage тестов: живые порты/CC/codex + оба вендора 5xx +
     сеть/VPS/local-proxy живы → возвращаем check_all() result (туннель = vendor outage).
 
-    codes — HTTP-коды двух вендоров (detuplу в detail). Мокаем _tunnel_up целиком (как
+    codes — HTTP-коды двух вендоров (попадают в detail). Мокаем _tunnel_up целиком (как
     _all_up_monkey для живого туннеля) — return-контракт #207 (ok, detail, is_vendor_outage).
     """
     _all_up_monkey(monkeypatch, probe_status="ok")
-    detail = f"{health.VENDOR_OUTAGE_MARKER} — оба вендора лежат, канал жив ("              + "; ".join(f"upstream-error HTTP {code}" for code in codes) + ")"
+    joined = "; ".join(f"upstream-error HTTP {code}" for code in codes)
+    detail = f"{health.VENDOR_OUTAGE_MARKER} — оба вендора лежат, канал жив ({joined})"
     monkeypatch.setattr(health, "_tunnel_up", lambda: (False, detail, True))
     monkeypatch.setattr(health, "_route_default_interface", lambda: "en0")
     _mock_active_node(monkeypatch, {"name": "vps-1", "endpoint_host": "198.51.100.7", "port": 443})
