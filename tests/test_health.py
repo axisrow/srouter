@@ -1884,6 +1884,93 @@ def test_codenv_managed_no_crash_on_binary_plist(monkeypatch, tmp_path):
     assert health._codenv_managed() is False
 
 
+# ============ issue #192: _codenv_managed — маркер в plist НЕДОСТАТОЧЕН, нужен реально-loaded ============
+#
+# До фикса _codenv_managed() определял managed ТОЛЬКО по маркеру на диске. Stale-plist сценарий
+# (codenv когда-то был, bootout без удаления plist) → маркер остаётся, job в launchd уже нет →
+# _codenv_managed() всё равно True → _desktop_proxy_check классифицирует ЧУЖОЙ SOCKS5 как info
+# вместо down → инцидент #127 молча замаскирован. Фикс: managed = маркер В PLIST И job ЗАГРУЖЕН
+# (install_lib._launchd_is_loaded, домен-осознанный `launchctl print`, rc=0 loaded/113 not-found/
+# иначе unknown fail-safe). Поверх текущего компромисса (info для активного codenv-SOCKS5, #135) —
+# не вместо него: активный codenv по-прежнему должен давать info, не down.
+
+def _write_codenv_plist(tmp_path, monkeypatch, *, with_marker=True):
+    plist = tmp_path / "Library" / "LaunchAgents" / f"{health._CODENV_LABEL}.plist"
+    plist.parent.mkdir(parents=True)
+    body = health._CODENV_MARKER if with_marker else "not-a-marker"
+    plist.write_text(body, encoding="utf-8")
+    monkeypatch.setattr(health.Path, "home", lambda: tmp_path)
+
+
+def test_codenv_managed_false_on_stale_plist_marker_present_not_loaded(monkeypatch, tmp_path):
+    """Маркер в plist ЕСТЬ, но job НЕ загружен в launchd (rc=113) → False (инцидент #127 не заглушен).
+
+    Stale-plist сценарий: codenv когда-то стоял, потом bootout без удаления plist. Пользователь
+    ставит ЧУЖОЙ SOCKS5 вручную. До фикса маркер-на-диске давал managed=True → _desktop_proxy_check
+    молчал про чужой SOCKS5 (info вместо down). После фикса — только маркер+loaded=True даёт managed.
+    """
+    _write_codenv_plist(tmp_path, monkeypatch, with_marker=True)
+    runner = lambda cmd, timeout: {"rc": 113, "out": "", "err": "Could not find service",
+                                    "timeout": False}
+    assert health._codenv_managed(runner=runner) is False
+
+
+def test_codenv_managed_true_when_marker_and_loaded(monkeypatch, tmp_path):
+    """Маркер в plist ЕСТЬ и job загружен (rc=0) → True (канон #135 сохранён — активный codenv видим)."""
+    _write_codenv_plist(tmp_path, monkeypatch, with_marker=True)
+    runner = lambda cmd, timeout: {"rc": 0, "out": "com.srouter.codenv = { state = running }",
+                                    "err": "", "timeout": False}
+    assert health._codenv_managed(runner=runner) is True
+
+
+def test_codenv_managed_false_when_no_plist(monkeypatch, tmp_path):
+    """Нет plist вообще → False, независимо от launchd-состояния (как раньше)."""
+    monkeypatch.setattr(health.Path, "home", lambda: tmp_path)
+    runner = lambda cmd, timeout: {"rc": 0, "out": "", "err": "", "timeout": False}
+    assert health._codenv_managed(runner=runner) is False
+
+
+def test_codenv_managed_false_when_launchctl_unknown(monkeypatch, tmp_path):
+    """Маркер в plist ЕСТЬ, но launchctl print timeout/unknown (rc=None) → False (fail-safe).
+
+    Не выдумываем managed=True без доказательства loaded — та же fail-safe семантика, что
+    install_lib._launchd_is_loaded: неизвестное состояние НЕ трактуется как «загружен».
+    """
+    _write_codenv_plist(tmp_path, monkeypatch, with_marker=True)
+    runner = lambda cmd, timeout: {"rc": None, "out": "", "err": "timeout", "timeout": True}
+    assert health._codenv_managed(runner=runner) is False
+
+
+def test_codenv_managed_desktop_proxy_down_on_stale_plist_foreign_socks5(monkeypatch, tmp_path):
+    """Интеграционный регресс-гард: stale-plist (маркер есть, НЕ loaded) + чужой SOCKS5 → down.
+
+    Фиксирует именно сценарий инцидента #127 из issue #192: до фикса _desktop_proxy_check видел
+    маркер на диске и классифицировал чужой SOCKS5 как info (замаскированный инцидент). Мокаем
+    sys_probe.run (default runner _codenv_managed без явного runner) — реальная интеграция без
+    инъекции, как её увидит _desktop_proxy_check в проде.
+    """
+    _write_codenv_plist(tmp_path, monkeypatch, with_marker=True)
+    monkeypatch.setattr(health.sys_probe, "run",
+                        lambda cmd, timeout=3, **kw: {"rc": 113, "out": "", "err": "",
+                                                       "timeout": False})
+    monkeypatch.setattr(health, "_read_proxy_sources",
+                        lambda: {"desktop_keys": {"HTTPS_PROXY": "socks5h://10.0.0.1:1080"}})
+    res = health._desktop_proxy_check()
+    assert res["status"] == "down", f"stale-plist + чужой SOCKS5 → down (#127); got {res}"
+
+
+def test_codenv_managed_desktop_proxy_info_when_actually_loaded(monkeypatch, tmp_path):
+    """Интеграционный гард канона #135: маркер + реально loaded → info, не down."""
+    _write_codenv_plist(tmp_path, monkeypatch, with_marker=True)
+    monkeypatch.setattr(health.sys_probe, "run",
+                        lambda cmd, timeout=3, **kw: {"rc": 0, "out": "state = running",
+                                                       "err": "", "timeout": False})
+    monkeypatch.setattr(health, "_read_proxy_sources",
+                        lambda: {"desktop_keys": {"ALL_PROXY": "socks5h://127.0.0.1:10808"}})
+    res = health._desktop_proxy_check()
+    assert res["status"] == "info", f"активный codenv (loaded) → info (канон #135); got {res}"
+
+
 def test_desktop_proxy_silent_when_settings_matches_launchctl(monkeypatch):
     """settings.json HTTPS_PROXY == launchctl HTTPS_PROXY → ok, без WARN о расхождении."""
     monkeypatch.setattr(health, "_read_proxy_sources",

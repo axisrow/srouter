@@ -20,9 +20,10 @@ import socket
 import tempfile
 from urllib.parse import urlparse
 
-import sys_probe
-import privoxy_system
 import local_state
+import privoxy_system
+import sys_probe
+from install_lib import _launchd_domain, _launchd_is_loaded
 
 # Абсолютные пути: launchd/GUI PATH их не содержит (канон проекта).
 CURL = "/usr/bin/curl"
@@ -1569,23 +1570,38 @@ def _read_proxy_sources():
     return {"desktop_keys": desktop_keys, "cli_proxy": cli_proxy}
 
 
-def _codenv_managed():
-    """codenv LaunchAgent srouter-managed? Читает plist на маркер CODEX_ENV_MARKER (fail-soft).
+def _codenv_managed(runner=None):
+    """codenv LaunchAgent srouter-managed? Маркер в plist (provenance) И реально loaded в launchd.
 
     Архитектурный конфликт #189/#127: codenv ставит SOCKS5 в gui-домен (нужно ChatGPT.app Rust
     app-server), но тот же SOCKS5 ломает Claude Desktop App (#127). _desktop_proxy_check отличает
     «наш codenv» (намеренный tradeoff → info, не driver-шум) от «чужой корпоративный SOCKS5» (→ down).
-    Codenv-managed = plist ~/Library/LaunchAgents/com.srouter.codenv.plist содержит CODEX_ENV_MARKER.
-    Ошибка чтения/отсутствие → False (fail-safe: трактуем как чужой → down, не глушим инцидент #127).
+
+    issue #192: маркер на диске один — НЕДОСТАТОЧЕН. Stale-plist сценарий: codenv когда-то стоял,
+    потом bootout БЕЗ удаления plist (маркер остаётся навсегда), пользователь ставит ЧУЖОЙ SOCKS5
+    вручную — маркер-only читал бы это как managed=True → info, молча маскируя инцидент #127.
+    managed = маркер В plist (provenance) AND job РЕАЛЬНО загружен в launchd (install_lib.
+    _launchd_is_loaded — домен-осознанный `launchctl print`, rc=0 loaded/113 not-found/иначе
+    unknown fail-safe). Только оба условия дают True; unknown (None) НЕ трактуется как loaded —
+    не выдумываем managed без доказательства (та же fail-safe семантика, что и сам _launchd_is_loaded).
+
+    runner: опциональный (cmd, timeout) -> {rc, out, err, timeout} для _launchd_is_loaded — по
+    умолчанию sys_probe.run (as-is для health.py doctor-чеков), инъекция для тестов.
+    Ошибка чтения plist/отсутствие → False (fail-safe: трактуем как чужой → down, не глушим #127).
     """
     try:
         plist = Path.home() / "Library" / "LaunchAgents" / f"{_CODENV_LABEL}.plist"
-        return plist.exists() and _CODENV_MARKER in plist.read_text(encoding="utf-8")
+        has_marker = plist.exists() and _CODENV_MARKER in plist.read_text(encoding="utf-8")
     except (OSError, ValueError):
         # OSError — нет файла/прав; ValueError — UnicodeDecodeError на бинарном/повреждённом plist
         # (codenv plist обычно XML, но может быть binary plutil-convert или битым). НЕ Exception —
         # иначе маскирует баги (канон systemexit-breaks-except-exception-fallback). Fail-safe False.
         return False
+    if not has_marker:
+        return False
+    run = runner if runner is not None else sys_probe.run
+    loaded = _launchd_is_loaded(_CODENV_LABEL, domain=_launchd_domain(), runner=run)
+    return loaded is True
 
 
 def _desktop_proxy_check():
