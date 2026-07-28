@@ -49,6 +49,10 @@ def _all_up_monkey(monkeypatch, *, probe_status="ok", probe_detail="runtime: к�
                         lambda: {"status": "unknown", "source": "n/a", "detail": "App не запущен (mock)"})
     monkeypatch.setattr(health, "_desktop_proxy_check",
                         lambda: {"status": "unknown", "detail": "launchctl (mock)"})
+    # #205: _dns_up дёргает _resolve_host (socket.getaddrinfo github.com) — мокаем резолв ok, иначе
+    # реальный DNS dev-машины (особенно в sandbox без сети) драйвит DNS-чек недетерминированно и
+    # ломает старые #196/#203 тесты (DNS-down стал бы driver). #205-тесты переопределяют своим _mock_dns.
+    monkeypatch.setattr(health, "_resolve_host", lambda host: True)
     # #194: _upstream_vps_reachable дёргает local_state.active_node + sys_probe.port_open — мокаем
     # «нет узла» (info-only), иначе реальный srouter.local.json на dev-машине (+ живой/мёртвый VPS)
     # драйвит вердикт недетерминированно. В этих тестах VPS-чек НЕ предмет проверки → info-заглушка.
@@ -282,6 +286,8 @@ def test_check_all_down_when_everything_dead(monkeypatch):
     # issue #189: _codex_app_proxy_check тоже дёргает ps — мокаем (иначе живой ChatGPT.app → ok → не down).
     monkeypatch.setattr(health, "_codex_app_proxy_check",
                         lambda: {"status": "down", "source": "gui-env", "detail": "down"})
+    # #205: _dns_up дёргает реальный getaddrinfo — мокаем (детерминизм; «всё мёртво» → DNS-down ok).
+    _mock_dns(monkeypatch, resolves=False)
 
     result = health.check_all()
     assert result["status"] == "down"
@@ -409,6 +415,9 @@ def test_vps_unreachable_does_not_mask_down_into_degraded(monkeypatch):
                         lambda: {"status": "down", "source": "gui-env", "detail": "down"})
     _mock_active_node(monkeypatch, {"name": "vps-1", "endpoint_host": "198.51.100.7", "port": 443})
     _mock_vps_tcp(monkeypatch, reachable=False)
+    # #205: VPS-driver гвард требует net["up"] and dns["up"] (gaierror ≠ VPS-смерть). Мокаем DNS-up,
+    # чтобы VPS-unreachable остался driver ok=False (семантика: сеть+DNS есть, VPS точно мёртв).
+    _mock_dns(monkeypatch, resolves=True)
     result = health.check_all()
     assert result["status"] == "down", "всё мёртво + VPS unreachable → DOWN, не DEGRADED"
     vps = [c for c in result["checks"] if "vps" in c["name"].lower() and "upstream" in c["name"].lower()][0]
@@ -723,6 +732,154 @@ def test_service_running_uses_system_domain_for_protected_privoxy(monkeypatch):
     # проверяем что launchctl print system/<label>:
     assert any("print" in c and "system/" in " ".join(c) for c in calls), \
         "protected → launchctl print system/<label>"
+
+# ============================ #205: DNS-резолв (DNS сломан vs VPS мёртв) ============================
+# Корень: _upstream_vps_reachable (#196) зовёт sys_probe.port_open → socket.create_connection,
+# которая САМА резолвит hostname endpoint'а. Сломанный DNS (упал dnsmasq/resolver) → gaierror →
+# port_open=False → ложно «VPS мёртв». _dns_up() = socket.getaddrinfo тестового домена (НЕ endpoint:
+# Reality-IP резолв не проверит DNS-стек). Проверяется МЕЖДУ #203 (нет сети) и #196 (VPS): нет сети
+# подавляет DNS (бессмысленно резолвить без сети), DNS подавляет VPS (gaierror ≠ VPS-смерть). Нет
+# резолва → driver «DNS сломан», НЕ «VPS».
+#
+# Контракт _dns_up() -> {up: bool, detail}:
+#   up=True   — getaddrinfo отдал адрес (DNS работает);
+#   up=False  — gaierror/OSError/timeout — DNS не резолвит (проверь dnsmasq/resolver).
+# Канон: verify-dont-guess (прямая причина — resolve-ошибка), probe-semantics-from-primary-source
+# (getaddrinfo NXDOMAIN → socket.gaierror, подкласс OSError — подтверждено эмпирически).
+
+
+def _mock_dns(monkeypatch, *, resolves):
+    """Подменить health._resolve_host (обёртка socket.getaddrinfo) для детерминированного теста.
+
+    resolves=True/False — имитация успешного резолва / gaierror. Мокаем обёртку (а не socket
+    напрямую), чтобы тест не зависел от реального DNS dev-машины и был детерминирован (как
+    _mock_vps_tcp подменяет sys_probe.port_open, а не socket.create_connection).
+    """
+    monkeypatch.setattr(health, "_resolve_host", lambda host: resolves)
+
+
+def test_dns_up_when_resolve_ok(monkeypatch):
+    """ДЫРА #205: getaddrinfo отдал адрес → up=True, detail объясняет «DNS резолвит»."""
+    _mock_dns(monkeypatch, resolves=True)
+    r = health._dns_up()
+    assert r["up"] is True, "резолв успешен → DNS работает"
+    assert "резолв" in r["detail"].lower(), "detail объясняет: DNS резолвит"
+
+
+def test_dns_down_when_resolve_fail(monkeypatch):
+    """ДЫРА #205 (КЛЮЧЕВОЙ): getaddrinfo gaierror → up=False, detail «DNS не резолвит» (НЕ «VPS»).
+
+    Раньше сломанный DNS проваливался в _upstream_vps_reachable → port_open(gaierror)=False → ложно
+    «VPS мёртв». Теперь _dns_up говорит «DNS не резолвит — проверь резолвер» — это совсем другая
+    причина (перезапусти dnsmasq/resolver), не «VPS мёртв».
+    """
+    _mock_dns(monkeypatch, resolves=False)
+    r = health._dns_up()
+    assert r["up"] is False, "gaierror → DNS не резолвит"
+    assert "VPS" not in r["detail"], "detail НЕ «VPS мёртв» — это DNS (другая причина)"
+    assert "резолв" in r["detail"].lower() or "dns" in r["detail"].lower(), \
+        "detail объясняет: DNS не резолвит"
+
+
+def test_dns_fail_masks_vps_dead_in_check_all(monkeypatch):
+    """ДЫРА #205 (КАСКАД): DNS не резолвит → driver «DNS», VPS-чек подавлен (info), НЕ «VPS мёртв».
+
+    Сценарий эпика #201 ситуация 4: dnsmasq/resolver упал. Сеть есть (#203 ok), DNS сломан,
+    туннель fail (endpoint не резолвится), VPS-probe (#196) даже если бы звался — unreachable
+    (gaierror маскирует реальное состояние VPS). Без фикса VPS-down давал бы driver DOWN (ложный
+    «VPS мёртв»). С фиксом: DNS-down = driver, VPS-чек = info (подавлен — нельзя обвинять VPS,
+    когда резолв не работает). Канон: verify-dont-guess (gaierror ≠ VPS-смерть).
+    """
+    _all_up_monkey(monkeypatch)  # порты живы; claude/codex/app/desktop — info/ok
+    monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed"))
+    # сеть есть (route default → en0) — мок sys_probe.run, как #203-каскадные тесты.
+    monkeypatch.setattr(health.sys_probe, "run", lambda cmd, timeout:
+                        {"rc": 0, "out": _ROUTE_DEFAULT_UP, "err": "", "timeout": False}
+                        if cmd[:3] == [ROUTE, "-n", "get"]
+                        else {"rc": 0, "out": "", "err": "", "timeout": False})
+    # DNS сломан
+    _mock_dns(monkeypatch, resolves=False)
+    # VPS-probe (#196) ДАЖЕ ЕСЛИ бы звался — unreachable; но он не должен давать driver «VPS мёртв».
+    _mock_active_node(monkeypatch, {"name": "vps-1", "endpoint_host": "vps.example.com", "port": 443})
+    _mock_vps_tcp(monkeypatch, reachable=False)
+    result = health.check_all()
+    dns = [c for c in result["checks"] if "DNS" in c["name"]][0]
+    assert dns["ok"] is False, "DNS сломан — driver (ok=False)"
+    assert not dns.get("info"), "DNS сломан — НЕ info (driver, точная причина)"
+    assert "VPS" not in dns["detail"], "detail НЕ «VPS мёртв» — это DNS (другая причина)"
+    # VPS-чек при сломанном DNS — info (подавлен, не нагромождает «VPS мёртв» поверх «DNS сломан»).
+    vps = [c for c in result["checks"] if "vps" in c["name"].lower() and "upstream" in c["name"].lower()][0]
+    assert vps.get("info") is True, "DNS сломан → VPS-чек подавлен (info), не водитель «VPS мёртв»"
+
+
+def test_network_down_suppresses_dns_check_in_check_all(monkeypatch):
+    """ДЫРА #205 (КАСКАД сверху): нет сети → DNS-чек подавлен (info), единственный driver «нет сети».
+
+    Сценарий: Wi-Fi выкл (#203 net-down) И DNS тоже не резолвит (gaierror — без сети резолвер всё
+    равно не ответит). Без гварда net["up"] оба чека стали бы driver — «нет сети» И «DNS сломан»,
+    две причины вместо одной первичной. Каскад #203→#205: нет сети подавляет DNS (как подавляет
+    VPS-чек), «нет сети» остаётся единственным driver. Канон: verify-dont-guess (первичная причина).
+    """
+    _all_up_monkey(monkeypatch)  # порты живы; _resolve_host замокан True, но ниже переопределим
+    monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed"))
+    # НЕТ сети: route rc!=0 + ifconfig только loopback (как test_network_down_* из #203)
+    monkeypatch.setattr(health.sys_probe, "run", lambda cmd, timeout:
+                        _ROUTE_DEFAULT_NONE if cmd[:3] == [ROUTE, "-n", "get"]
+                        else {"rc": 0, "out": _IFCONFIG_LOOPBACK_ONLY, "err": "", "timeout": False}
+                        if cmd[:1] == [IFCONFIG]
+                        else {"rc": 0, "out": "", "err": "", "timeout": False})
+    # DNS тоже не резолвит (без сети резолвер всё равно не ответит)
+    _mock_dns(monkeypatch, resolves=False)
+    _mock_active_node(monkeypatch, {"name": "vps-1", "endpoint_host": "vps.example.com", "port": 443})
+    _mock_vps_tcp(monkeypatch, reachable=False)
+    result = health.check_all()
+    net = [c for c in result["checks"] if "сеть" in c["name"].lower() or "маршрут" in c["name"].lower()][0]
+    assert net["ok"] is False and not net.get("info"), "нет сети — driver (первичная причина)"
+    # DNS-чек при «нет сети» — info (подавлен): не нагромождаем «DNS сломан» поверх «нет сети».
+    dns = [c for c in result["checks"] if "DNS" in c["name"]][0]
+    assert dns.get("info") is True, "нет сети → DNS-чек подавлен (info), единственный driver «нет сети»"
+
+
+def test_dns_ok_proceeds_to_vps_probe_in_check_all(monkeypatch):
+    """ДЫРА #205: DNS работает → VPS-чек НЕ подавляется (proceeds to VPS-probe как обычно).
+
+    Контр-гвард к тесту выше: когда DNS работает, _dns_up не должен маскировать реальную
+    VPS-смерть. VPS-unreachable при живой сети + работающем DNS → по-прежнему driver DOWN (#196).
+    """
+    _all_up_monkey(monkeypatch)
+    monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed"))
+    monkeypatch.setattr(health.sys_probe, "run", lambda cmd, timeout:
+                        {"rc": 0, "out": _ROUTE_DEFAULT_UP, "err": "", "timeout": False}
+                        if cmd[:3] == [ROUTE, "-n", "get"]
+                        else {"rc": 0, "out": "", "err": "", "timeout": False})
+    _mock_dns(monkeypatch, resolves=True)
+    _mock_active_node(monkeypatch, {"name": "vps-1", "endpoint_host": "198.51.100.7", "port": 443})
+    _mock_vps_tcp(monkeypatch, reachable=False)
+    result = health.check_all()
+    vps = [c for c in result["checks"] if "vps" in c["name"].lower() and "upstream" in c["name"].lower()][0]
+    assert vps["ok"] is False and not vps.get("info"), \
+        "DNS ok + VPS unreachable → VPS-чек driver (не подавлен)"
+    assert result["status"] == "down", "DNS ok + VPS мёртв → DOWN (#196 контракт сохранён)"
+
+
+def test_dns_check_is_info_only_when_up(monkeypatch):
+    """DNS-чек при up=True — info-only (не роняет вердикт, картина для диагностики).
+
+    Когда DNS работает, нет причины подсвечивать его как driver. ok=True + info=True → не участвует
+    в агрегации drivers (как net-up/endpoint-override/versions). Driver DNS-чек становится ТОЛЬКО
+    при up=False.
+    """
+    _all_up_monkey(monkeypatch, probe_status="ok")
+    monkeypatch.setattr(health, "_tunnel_up", lambda: (True, "HTTP 200"))
+    monkeypatch.setattr(health.sys_probe, "run", lambda cmd, timeout:
+                        {"rc": 0, "out": _ROUTE_DEFAULT_UP, "err": "", "timeout": False}
+                        if cmd[:3] == [ROUTE, "-n", "get"]
+                        else {"rc": 0, "out": "", "err": "", "timeout": False})
+    _mock_dns(monkeypatch, resolves=True)
+    result = health.check_all()
+    assert result["status"] == "ok", "всё живо → ok (DNS-чек не роняет)"
+    dns = [c for c in result["checks"] if "DNS" in c["name"]][0]
+    assert dns.get("info") is True, "DNS работает → info-only (не driver)"
 
 
 # ============================ _tunnel_up HTTP semantics (issue #82, класс #3) ============================
