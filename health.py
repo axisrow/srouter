@@ -183,6 +183,119 @@ def _local_proxy_up():
     return {"status": "ok", "detail": detail}
 
 
+# ============================ #206: GFW per-domain (github режется vs нет сети/VPS) ============================
+# Эпик #201 ситуация 5: GFW избирателен — режет конкретные домены (github) по TLS-fingerprint, а
+# другие (z.ai) пропускает. Doctor сваливал это в «туннель fail» / «VPS мёртв». _gfw_domain_check =
+# ПРЯМОЙ curl к доменам БЕЗ прокси (env -u): timeout/reset/connection-failed = режется; HTTP < 500 =
+# не режется (даже 404 = живой ответ, канал работает — та же семантика, что sys_probe.tunnel_code_up).
+# Канон: verify-dont-guess (прямая причина — прямой curl минуя прокси), zai-direct-no-proxy (z.ai —
+# канонически НЕ GFW-target, moonbridge ходит напрямую → эталон «домен не режется»), noisy-log.
+
+# Домены для per-domain GFW-теста. github — типичный GFW-target (issue #199: TLS-блокировка системного
+# curl/LibreSSL). api.z.ai — контрольный: канонически НЕ режется (zai-direct-no-proxy, memory). Если
+# github режется, а z.ai нет → GFW избирателен; если ОБА режутся → не GFW (нет сети/VPS, первичная
+# причина выше в каскаде #203/#196). Список — упорядоченный ([target..., control]): первый режущийся
+# при живом контроле = диагноз. НЕ endpoint_host узла: GFW-блокировка доменная, не по IP-маршруту VPS.
+GFW_PROBE_DOMAINS = ("github.com",)
+GFW_CONTROL_DOMAIN = "api.z.ai"  # канонически не GFW-target (zai-direct-no-proxy)
+
+
+def _direct_domain_probe(host):
+    """Прямой curl к host МИНУЯ прокси (env -u) — достигается ли домен без туннеля?
+
+    #206 per-domain GFW-тест. curl с очищенным proxy-env (как _claude_transport_once clean_keys +
+    GH_DIRECT_HINT #199): домен не идёт через privoxy/xray → VPS, доказывает РЕАЛЬНУЮ достижимость
+    напрямую. GFW режет по TLS-fingerprint → timeout/connection-reset; живой домен отвечает HTTP.
+    Канон zai-direct-no-proxy: probe БЕЗ прокси (иначе github-through-VPS = «VPS мёртв», та же
+    подмена, что git-proxy #199 маскировал «флап gh»).
+
+    Семантика reachable = ЛЮБОЙ HTTP-ответ сервера (включая 5xx): GFW даёт timeout/reset, НЕ
+    HTTP-ответ → сам факт HTTP-кода доказывает достижимость (домен не режется). 404/421/5xx = сервер
+    ответил = канал работает. timeout/000 = режется/нет ответа. kind разделяет «здоров» (HTTP<500, ok)
+    от «ответил, но лежит» (5xx, upstream-error) — та же дискриминация, что _tunnel_target_up #207.
+    Не бросает (probe-канон). Consumer (_gfw_domain_check) смотрит ТОЛЬКО на reachable (для GFW-вердикта
+    важен факт ответа, не здоровье) — но kind точный для observability/detail (noisy-log).
+
+    Возвращает {"reachable": bool, "kind": str}:
+      reachable=True,  kind="ok"                  — сервер ответил HTTP < 500 (домен доступен напрямую);
+      reachable=True,  kind="upstream-error"      — сервер ответил HTTP 5xx (домен достижим, GFW НЕ режет,
+                                                    но сам лежит — vendor down, не «ok»; как #207);
+      reachable=False, kind="timeout"             — curl timeout (GFW режет / нет ответа);
+      reachable=False, kind="connection-failed"   — curl 000/no-response/мусор (reset/не установлено).
+    """
+    # env -u всех proxy-vars (оба регистра) — прямой путь минуя privoxy/xray. Список = тот же, что
+    # _claude_transport_once clean_keys + GH_DIRECT_HINT #199 (единый контракт «снять прокси»).
+    env = os.environ.copy()
+    for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+                "http_proxy", "https_proxy", "all_proxy", "no_proxy"):
+        env.pop(key, None)
+    # https:// + путь '/' — GFW режет на TLS-handshake к корню; -I (HEAD) лёгкий. connect-timeout как
+    # _tunnel_target_up (4с) — probe должен ответить быстрее, чем сдаться; max-time 8с — общий бюджет.
+    r = sys_probe.run([CURL, "-sS", "-o", "/dev/null", "-I",
+                       "--connect-timeout", "4", "--max-time", "8",
+                       "-w", "%{http_code}", f"https://{host}/"],
+                      timeout=10, env=env)
+    if r.get("timeout"):
+        return {"reachable": False, "kind": "timeout"}
+    code = (r.get("out") or "").strip()
+    if not code or code == "000":
+        return {"reachable": False, "kind": "connection-failed"}
+    try:
+        code_int = int(code)
+    except ValueError:
+        # нечисловой код = curl не достучался корректно (мусор) — трактуем как connection-failed.
+        return {"reachable": False, "kind": "connection-failed"}
+    if sys_probe.tunnel_code_up(code_int):
+        return {"reachable": True, "kind": "ok"}  # HTTP < 500 — сервер ответил, канал работает
+    # HTTP 5xx напрямую (без прокси) — сервер ответил, но лежит сам: канал до домена работает, GFW
+    # НЕ режет (GFW даёт timeout/reset, не HTTP-ответ). reachable=True (домен достижим — для GFW-вердикта
+    # важно «ответил вообще», не «здоров»), но kind="upstream-error" (НЕ "ok"): 5xx = vendor down, не
+    # чистый ok. Та же структурная дискриминация, что _tunnel_target_up #207 (kind="upstream-error" для
+    # 5xx), и согласовано с sys_probe.tunnel_code_up (5xx = мёртвый канал). cycle-review #206.
+    return {"reachable": True, "kind": "upstream-error"}
+
+
+def _gfw_domain_check(domains=GFW_PROBE_DOMAINS, control=GFW_CONTROL_DOMAIN):
+    """Per-domain GFW-тест: режется ли конкретный домен избирательно (github vs z.ai)?
+
+    #206. Прямой curl к каждому домену из `domains` + контрольному `control`. Вердикт:
+      gfw  — SOME домен из `domains` НЕ reachable И контрольный reachable → GFW режет избирательно;
+      ok   — все домены reachable (ничто не режется);
+      info — контрольный тоже НЕ reachable → НЕ GFW (нет сети/VPS — первичная причина выше в каскаде
+             #203 сеть/#196 VPS; GFW избирателен, «всё режется» = не GFW-блокировка), или нет доменов.
+    Каскад #201: ...→сеть(#203)→DNS(#205)→VPS(#196)→прокси(#204)→GFW per-domain(этот). GFW-чек
+    info-only ВСЕГДА (картина для конкретного домена, не сбой стека — как endpoint-override/
+    _github_direct_check): режется → подсказка «нужен прокси/VPS для домена», не роняет вердикт.
+    Канон: verify-dont-guess (прямая причина — прямой curl), zai-direct-no-proxy (control = z.ai).
+
+    Возвращает {status, detail}: status = gfw | ok | info. Не бросает (probe-канон).
+    """
+    if not domains:
+        return {"status": "info", "detail": "нет доменов для GFW-теста (check пропущен)"}
+    ctrl = _direct_domain_probe(control)
+    if not ctrl["reachable"]:
+        # контрольный домен (z.ai, канонически не GFW-target) тоже режется → НЕ GFW: более общая
+        # причина (нет сети/VPS/нет маршрута), которая уже ловится выше в каскаде. Не обвиняем GFW.
+        return {"status": "info",
+                "detail": f"контрольный домен {control} тоже не отвечает напрямую ({ctrl['kind']}) — "
+                          f"это НЕ GFW (нет сети/VPS, первичная причина выше в каскаде)"}
+    cut = []
+    for host in domains:
+        r = _direct_domain_probe(host)
+        if not r["reachable"]:
+            cut.append((host, r["kind"]))
+    if not cut:
+        targets = ", ".join(domains)
+        return {"status": "ok",
+                "detail": f"домены напрямую reachable: {targets} + контрольный {control} "
+                          f"(GFW не режет избирательно)"}
+    names = ", ".join(h for h, _ in cut)
+    return {"status": "gfw",
+            "detail": f"домен(ы) {names} режется GFW ({'; '.join(f'{h}: {k}' for h, k in cut)}) — "
+                      f"контрольный {control} отвечает напрямую (zai-direct-no-proxy). Нужен "
+                      f"прокси/VPS для {names}: github/gh через прокси (env -u снимает scoped git-proxy)"}
+
+
 def _tunnel_target_up(url):
     """Один таргет через прокси: (ok, detail, kind). Живой = сервер ответил HTTP < 500
     (sys_probe.tunnel_code_up). 000/timeout/5xx — не жив. Не бросает.
@@ -2020,6 +2133,16 @@ def check_all(*, active_claude=False):
         if ci["status"] == "info":
             ci_check["info"] = True
         checks.append(ci_check)
+        # #206 GFW per-domain: github режется GFW избирательно (z.ai проходит напрямую) — различение
+        # от «VPS мёртв»/«туннель fail». info-only ВСЕГДА (как _github_direct_check) — картина для
+        # конкретного домена, не сбой стека: режется → подсказка «нужен прокси/VPS для домена», не
+        # роняет вердикт. gate под active_claude (doctor-only): _direct_domain_probe делает прямой
+        # curl к github/z.ai = сетевой overhead/поверхность, не для лёгкого /health/watchdog (как
+        # _installed_versions_check/_codex_isolation_check). Каскад #201: ...→VPS→прокси→GFW per-domain.
+        gfw = _gfw_domain_check()
+        gfw_check = {"name": "GFW per-domain (github vs z.ai прямой curl)",
+                     "ok": gfw["status"] != "gfw", "info": True, "detail": gfw["detail"]}
+        checks.append(gfw_check)
     drivers = [c for c in checks if not c.get("info")]
     all_ok = all(c["ok"] for c in drivers)
     any_ok = any(c["ok"] for c in drivers)
@@ -2226,6 +2349,18 @@ def _print_report(result):
             # проблема не в нём. VPS-смерть = critical-infra DOWN.
             print("  • upstream VPS: прямой TCP-зонд до endpoint не прошёл — VPS мёртв (не локальный прокси!).")
             print("    Проверь: заплачен/запущен ли VPS, не упал ли хостинг, верный ли endpoint_host:port в узле")
+        # #206: GFW режет домен избирательно. Чек info-only (не driver) → не в failed_names; сканируем
+        # checks напрямую по имени + ok=False (status=="gfw"). GFW — scoped-диагностика домена:
+        # VPS/прокси НЕ виноваты, режущийся домен блокируется по TLS-fingerprint. Подсказка — прокси/VPS
+        # для домена. Конкретные имена доменов НЕ хардкодим тут (как раньше «github»): detail чека уже
+        # generic по GFW_PROBE_DOMAINS — если список расширится (anthropic и др.), совет останется верным.
+        # Канон: verify-dont-guess (точная причина — прямой curl: target режется, контрольный z.ai ок).
+        gfw_check = next((c for c in result["checks"] if "GFW per-domain" in c["name"]), None)
+        if gfw_check and not gfw_check["ok"]:
+            print(f"  • GFW режет домен: {gfw_check.get('detail', 'домен')} — это НЕ «VPS мёртв» и НЕ "
+                  f"«локальный прокси» (GFW избирательно блокирует по TLS, контрольный домен отвечает).")
+            print("    Решение: гони режущийся домен через прокси/VPS (gh: env -u снимает scoped git-proxy; "
+                  "git: git -c http.https://github.com.proxy=).")
         if "локальный прокси" in failed_names:
             # #204: privoxy/xray service-status down (крах/зомби). VPS жив → проблема локальная.
             print("  • локальный прокси упал (privoxy/xray): brew services restart privoxy xray")

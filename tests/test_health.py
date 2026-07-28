@@ -11,6 +11,7 @@ _claude_proxy_probe() возвращает {status, source, detail}:
   status="unknown" — только SOCKS TCP socket, idle, timeout или CC не запущен.
 """
 import json
+import os
 
 import pytest as _pytest
 import pytest  # noqa: ICN003 — pytest.fail/raises в тестах ниже (#194)
@@ -911,6 +912,242 @@ def test_dns_check_is_info_only_when_up(monkeypatch):
     assert result["status"] == "ok", "всё живо → ok (DNS-чек не роняет)"
     dns = [c for c in result["checks"] if "DNS" in c["name"]][0]
     assert dns.get("info") is True, "DNS работает → info-only (не driver)"
+
+
+# ============================ #206: GFW per-domain (github режется vs нет сети/VPS) ============================
+# Корень: GFW избирателен — режет конкретные домены (github) по TLS-fingerprint, другие (z.ai) —
+# пропускает. Doctor сваливал это в «туннель fail» / «VPS мёртв». _gfw_domain_check = ПРЯМОЙ curl к
+# доменам (env -u, минуя прокси): timeout/reset/connection-failed = режется; HTTP < 500 = не режется
+# (даже 404 = живой ответ сервера, канал до домена работает — та же семантика, что sys_probe.tunnel_code_up).
+# Вердикт: github режется И z.ai ок → «github режется GFW». Оба режутся → НЕ GFW (нет сети/VPS —
+# первичная причина уже выше в каскаде). z.ai — канонически НЕ GFW-target (zai-direct-no-proxy, moonbridge).
+# Каскад #201: ...→сеть(#203)→DNS(#205)→VPS(#196)→прокси(#204)→GFW per-domain(этот). info-only ВСЕГДА
+# (картина для конкретного домена, не сбой стека): режется → подсказка «нужен прокси/VPS для домена».
+# Канон: verify-dont-guess (прямая причина — прямой curl минуя прокси), zai-direct-no-proxy (z.ai —
+# эталон «не режется»), noisy-log-better-than-no-log (точная причина в detail).
+#
+# Контракт _direct_domain_probe(host) -> {"reachable": bool, "kind": str}: reachable=True если сервер
+# ответил HTTP < 500 (канал до домена работает). kind: ok | timeout | connection-failed (для detail).
+# Контракт _gfw_domain_check(domains) -> {status, detail}: status = gfw | ok | info.
+#   gfw  — SOME домен режется (timeout/connection-failed) И контрольный (z.ai) не режется → «режется GFW»;
+#   ok   — все домены reachable (ничто не режется);
+#   info — контрольный z.ai тоже режется → НЕ GFW (нет сети/VPS), или нечем сравнить.
+
+def _mock_domain_probe(monkeypatch, results):
+    """Подменить health._direct_domain_probe (обёртка прямого curl env -u) для детерминированного теста.
+
+    results: {host: {"reachable": bool, "kind": str}} — имитация ответа прямого curl per-домен.
+    Мокаем обёртку (а не sys_probe.run напрямую), чтобы тест не зависел от реального GFW dev-машины
+    и был детерминирован (как _mock_dns подменяет _resolve_host, а не socket.getaddrinfo).
+    """
+    def _fake(host):
+        r = results.get(host)
+        if r is None:
+            return {"reachable": True, "kind": "ok"}  # неизвестный домен — по умолчанию reachable
+        return dict(r)
+    monkeypatch.setattr(health, "_direct_domain_probe", _fake)
+
+
+def _mock_doctor_only_checks(monkeypatch):
+    """Заглушить doctor-only чеки, запускающие реальные subprocess'ы (npm/brew/claude/dscl/ps eww).
+
+    Предмет check_all-тестов GFW — wiring (чек присутствует/info-only), не эти тяжёлые пробы.
+    Без моков active_claude-путь тормозит на реальных binary-сканированиях/transport-probe (как
+    test_check_all_has_privoxy_log_check_info_only мокает их же). Канон: детерминизм тестов.
+    """
+    monkeypatch.setattr(health, "_installed_versions_check",
+                        lambda: {"status": "ok", "detail": "mock", "codex": [], "claude_code": []})
+    monkeypatch.setattr(health, "_claude_transport_probe",
+                        lambda: {"status": "unknown", "detail": "mock"})
+    monkeypatch.setattr(health, "_runtime_model_override_check",
+                        lambda: {"status": "ok", "detail": "mock"})
+    monkeypatch.setattr(health, "_privoxy_log_observability_check",
+                        lambda **kw: {"status": "ok", "detail": "mock"})
+    monkeypatch.setattr(health, "_codex_isolation_check",
+                        lambda: {"status": "info", "detail": "mock"})
+
+
+def test_direct_domain_probe_http_response_is_reachable(monkeypatch):
+    """ДЫРА #206: прямой curl (env -u) к домену ответил HTTP < 500 → reachable (не режется).
+
+    Даже 404 = живой ответ: канал до домена работает (та же семантика, что sys_probe.tunnel_code_up
+    для туннеля — 4xx это ЖИВОЙ канал). GFW даёт timeout/reset/connection-failed, НЕ HTTP-ответ.
+    """
+    # curl отдал HTTP 404 → сервер ответил → reachable
+    monkeypatch.setattr(health.sys_probe, "run",
+                        lambda cmd, timeout, env=None: {"rc": 0, "out": "404", "err": "", "timeout": False})
+    r = health._direct_domain_probe("github.com")
+    assert r["reachable"] is True, "HTTP 404 = сервер ответил → канал работает (не режется)"
+    assert r["kind"] == "ok"
+
+
+def test_direct_domain_probe_timeout_is_cut(monkeypatch):
+    """ДЫРА #206: прямой curl timeout → НЕ reachable (режется / нет ответа)."""
+    monkeypatch.setattr(health.sys_probe, "run",
+                        lambda cmd, timeout, env=None: {"rc": None, "out": "", "err": "", "timeout": True})
+    r = health._direct_domain_probe("github.com")
+    assert r["reachable"] is False, "timeout → домен не отвечает напрямую"
+    assert "timeout" in r["kind"], "kind маркирует timeout"
+
+
+def test_direct_domain_probe_connection_failed_is_cut(monkeypatch):
+    """ДЫРА #206: прямой curl 000 (connection-failed/reset) → НЕ reachable (режется)."""
+    monkeypatch.setattr(health.sys_probe, "run",
+                        lambda cmd, timeout, env=None: {"rc": 0, "out": "000", "err": "", "timeout": False})
+    r = health._direct_domain_probe("github.com")
+    assert r["reachable"] is False, "000 = соединение не установлено → режется/сброшено"
+    assert r["kind"] == "connection-failed"
+
+
+def test_direct_domain_probe_5xx_reachable_but_upstream_error(monkeypatch):
+    """ДЫРА #206 (cycle-review): прямой curl HTTP 5xx → reachable=True (домен ответил, GFW НЕ режет),
+    но kind="upstream-error" (НЕ "ok").
+
+    GFW даёт timeout/reset, НЕ HTTP-ответ → 5xx доказывает достижимость (не GFW-блокировка). НО 5xx —
+    не «ok»: сервер ответил, но сам лежит (vendor down). Канон sys_probe.tunnel_code_up (5xx = мёртвый
+    канал) + #207 паттерн (_tunnel_target_up отдаёт kind="upstream-error" для 5xx, не "ok").
+    cycle-review score 85: docstring говорит «reachable = HTTP < 500», но код возвращал kind="ok" для
+    5xx — противоречие. reachable=True сохраняется (домен достижим для GFW-вердикта), kind разделяет.
+    """
+    monkeypatch.setattr(health.sys_probe, "run",
+                        lambda cmd, timeout, env=None: {"rc": 0, "out": "503", "err": "", "timeout": False})
+    r = health._direct_domain_probe("github.com")
+    assert r["reachable"] is True, "5xx = сервер ответил → домен достижим (GFW НЕ режет)"
+    assert r["kind"] == "upstream-error", "5xx ≠ ok: kind=upstream-error (как #207 _tunnel_target_up)"
+
+
+def test_direct_domain_probe_strips_proxy_env(monkeypatch):
+    """ДЫРА #206 (канон zai-direct-no-proxy): прямой curl идёт МИНУЯ прокси (env -u).
+
+    Регресс-гвард: probe БЕЗ прокси доказывает реальную достижимость домена. Если прокси-env
+    останется, github пойдёт через privoxy/xray → VPS, и «режется GFW» станет «VPS мёртв» (та же
+    подмена, что #199 git-proxy маскировал). Мок ловит env-аргумент sys_probe.run.
+    """
+    captured = {}
+
+    def _fake_run(cmd, timeout, env=None):
+        captured["env"] = env
+        return {"rc": 0, "out": "404", "err": "", "timeout": False}
+    monkeypatch.setattr(health.sys_probe, "run", _fake_run)
+    monkeypatch.setattr(os, "environ", {"HTTPS_PROXY": "http://127.0.0.1:8118",
+                                        "HTTP_PROXY": "http://127.0.0.1:8118",
+                                        "ALL_PROXY": "http://127.0.0.1:8118",
+                                        "NO_PROXY": "localhost"})
+    health._direct_domain_probe("github.com")
+    env = captured.get("env") or {}
+    for key in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "https_proxy", "http_proxy", "all_proxy"):
+        assert key not in env, f"прямой curl минует прокси: {key} не должен попасть в env"
+
+
+def test_gfw_check_github_cut_zai_ok_is_gfw(monkeypatch):
+    """ДЫРА #206 (КЛЮЧЕВОЙ): github timeout + z.ai ok → «github режется GFW».
+
+    Сценарий эпика #201 ситуация 5: GFW режет github (TLS-fingerprint), z.ai пропускает (zai-direct-
+    no-proxy — moonbridge ходит напрямую). Прямой curl: github timeout, z.ai отвечает. Вердикт gfw.
+    """
+    _mock_domain_probe(monkeypatch, {
+        "github.com": {"reachable": False, "kind": "timeout"},
+        "api.z.ai": {"reachable": True, "kind": "ok"},
+    })
+    r = health._gfw_domain_check()
+    assert r["status"] == "gfw", "github режется + z.ai ок → GFW избирательно режет github"
+    assert "github" in r["detail"].lower(), "detail называет режущийся домен"
+    assert "GFW" in r["detail"] or "режется" in r["detail"].lower(), "detail объясняет: GFW режется"
+
+
+def test_gfw_check_all_ok_is_not_gfw(monkeypatch):
+    """ДЫРА #206: github ok + z.ai ok → не GFW (ничто не режется).
+
+    Нормальная сеть без GFW-блокировки: оба домена отвечают напрямую → ok.
+    """
+    _mock_domain_probe(monkeypatch, {
+        "github.com": {"reachable": True, "kind": "ok"},
+        "api.z.ai": {"reachable": True, "kind": "ok"},
+    })
+    r = health._gfw_domain_check()
+    assert r["status"] != "gfw", "оба домена reachable → НЕ GFW"
+
+
+def test_gfw_check_both_cut_is_not_gfw(monkeypatch):
+    """ДЫРА #206: github timeout + z.ai timeout → НЕ GFW (нет сети / VPS).
+
+    GFW избирателен. Если ОБА домена режутся (включая контрольный z.ai — канонически не GFW-target),
+    это НЕ GFW-блокировка, а более общая причина (нет сети/VPS/нет маршрута), которая уже ловится
+    выше в каскаде (#203 сеть, #196 VPS). GFW-вердикт требует, чтобы контрольный домен был reachable.
+    """
+    _mock_domain_probe(monkeypatch, {
+        "github.com": {"reachable": False, "kind": "timeout"},
+        "api.z.ai": {"reachable": False, "kind": "timeout"},
+    })
+    r = health._gfw_domain_check()
+    assert r["status"] != "gfw", "оба режутся (включая z.ai) → НЕ GFW (нет сети/VPS, не избирательно)"
+
+
+def test_gfw_check_info_only_in_check_all(monkeypatch):
+    """ДЫРА #206 (КАСКАД): GFW-чек в check_all — info-only ВСЕГДА (картина, не driver).
+
+    Даже когда github режется GFW, это не роняет вердикт стека: прокси/VPS могут работать для других
+    доменов. GFW — scoped-диагностика конкретного домена (как endpoint-override/_github_direct_check),
+    подсказка «нужен прокси/VPS для github», не сбой стека. Канон: verify-dont-guess (точная причина
+    в detail), не driver (избегаем шума — github может не быть нужен пользователю прямо сейчас).
+    """
+    _all_up_monkey(monkeypatch, probe_status="ok")
+    monkeypatch.setattr(health, "_tunnel_up", lambda: (True, "HTTP 200", False))
+    _mock_domain_probe(monkeypatch, {
+        "github.com": {"reachable": False, "kind": "timeout"},
+        "api.z.ai": {"reachable": True, "kind": "ok"},
+    })
+    # doctor-only чеки, запускающие реальные subprocess'ы (npm/brew/claude/dscl) — мокаем (предмет
+    # теста — GFW-wiring, не они; как test_check_all_has_privoxy_log_check_info_only).
+    _mock_doctor_only_checks(monkeypatch)
+    # GFW-чек — doctor-only (active_claude): _direct_domain_probe делает прямой curl к github/z.ai
+    # = сетевой overhead/поверхность, не для лёгкого /health/watchdog (как _codex_isolation_check).
+    result = health.check_all(active_claude=True)
+    gfw = next((c for c in result["checks"] if "GFW" in c["name"] or "gfw" in c["name"].lower()), None)
+    assert gfw is not None, "check_all(active_claude=True) содержит GFW per-domain check"
+    assert gfw.get("info") is True, "GFW-чек info-only (не driver — картина для конкретного домена)"
+    drivers = [c for c in result["checks"] if not c.get("info")]
+    assert gfw not in drivers, "info-only GFW исключён из drivers (не роняет вердикт)"
+
+
+def test_gfw_check_absent_in_light_health(monkeypatch):
+    """ДЫРА #206 (регресс-гвард): лёгкий check_all() (без active_claude) НЕ делает GFW-чек.
+
+    /health (dashboard) и watchdog (раз в ~20с) — лёгкие. Прямой curl к github/z.ai = сетевой
+    overhead + DoS-поверхность (как _installed_versions_check/_codex_isolation_check под gate).
+    GFW-пер-домен — ТОЛЬКО doctor-путь (active_claude=True). Канон: gate-is-for-arbitrary-p... /
+    srouter-critical-infra-24-7 (лёгкий healthcheck не тормозит на внешних curl).
+    """
+    _all_up_monkey(monkeypatch, probe_status="ok")
+    _mock_domain_probe(monkeypatch, {
+        "github.com": {"reachable": False, "kind": "timeout"},
+        "api.z.ai": {"reachable": True, "kind": "ok"},
+    })
+    result = health.check_all()  # БЕЗ active_claude — лёгкий путь
+    names = " ".join(c["name"] for c in result["checks"])
+    assert "GFW per-domain" not in names, \
+        f"лёгкий путь НЕ должен нести GFW-чек (overhead/поверхность); checks={names}"
+
+
+def test_print_report_gfw_cut_advises_proxy_for_domain(monkeypatch, capsys):
+    """ДЫРА #206: doctor _print_report при GFW-выборе говорит «нужен прокси/VPS для github».
+
+    Регресс-гвард: ранее github timeout валился в «проверь узел/VPS». При GFW-блокировке узел/VPS
+    НЕ виноваты — github режется избирательно, нужен прокси именно для github. Канон:
+    verify-dont-guess (точная причина), noisy-log-better-than-no-log (подсказка в отчёте).
+    """
+    _all_up_monkey(monkeypatch, probe_status="ok")
+    monkeypatch.setattr(health, "_tunnel_up", lambda: (True, "HTTP 200", False))
+    _mock_domain_probe(monkeypatch, {
+        "github.com": {"reachable": False, "kind": "timeout"},
+        "api.z.ai": {"reachable": True, "kind": "ok"},
+    })
+    _mock_doctor_only_checks(monkeypatch)
+    result = health.check_all(active_claude=True)
+    health._print_report(result)
+    out = capsys.readouterr().out
+    assert "GFW" in out, f"отчёт должен назвать GFW-блокировку, got:\n{out}"
+    assert "github" in out.lower(), f"отчёт должен назвать режущийся домен (github), got:\n{out}"
 
 
 # ============================ _tunnel_up HTTP semantics (issue #82, класс #3) ============================
