@@ -1,0 +1,31 @@
+name: Docker acceptance polygon
+
+# issue #116: приёмочный полигон (issue #112/#114) прогоняется в CI на каждый PR и push в main.
+# GitHub Actions runners тянут Docker Hub напрямую (нет GFW) — BASE_IMAGE=python:3.12-slim через
+# build-arg, не зеркало docker.m.daocloud.io (issue #113, локальный дефолт в acceptance.Dockerfile).
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  acceptance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build acceptance image
+        run: |
+          docker build \
+            --build-arg BASE_IMAGE=python:3.12-slim \
+            -f docker/acceptance.Dockerfile \
+            -t srouter-acceptance \
+            .
+
+      - name: Run acceptance tests
+        run: |
+          docker run --rm \
+            -e SROUTER_ACCEPTANCE=1 \
+            -e PYTHONUNBUFFERED=1 \
+            srouter-acceptance \
+            pytest tests/acceptance/ -v

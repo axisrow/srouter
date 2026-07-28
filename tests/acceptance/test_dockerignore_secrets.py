@@ -11,12 +11,17 @@ XRAY_PRIVATE_KEY/UUID/SHORT_ID, atomic-write temp .tmp, timestamped backup) за
 - C5: glob .env без ** не покрывал server/.env (Docker требует ** для поддиректорий).
 - C6: git check-ignore валидирует .gitignore, НЕ .dockerignore → гард молчал на мутацию .dockerignore.
 
-Два независимых гард'а:
+Три независимых гард'а:
   - .gitignore → git check-ignore (ground truth git-семантики). Host-side (в контейнере .git исключён).
   - .dockerignore → ручной parse + pattern-match (** → .*, * → [^/]*), Docker/semantics. Работает везде
-    (не зависит от .git) — это и есть Docker security gate, которого не хватало (C6).
+    (не зависит от .git).
+  - Docker-native canary (issue #116) → реальный `docker build` с временными секретными файлами в
+    build-context + `docker run test -e` на готовом образе. Ручной parse выше приближает Docker-семантику
+    регулярками, но не гарантирует 100% совпадение с реальным движком (directory-only паттерны, ** в
+    середине пути). Canary — это правда напрямую от Docker, без посредника-парсера.
 """
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -120,11 +125,96 @@ def test_secret_paths_ignored_by_dockerignore():
 
     git check-ignore НЕ валидирует .dockerignore (C6). Этот тест парсит .dockerignore и проверяет
     pattern-match напрямую. Работает и в контейнере (не зависит от .git) — это и есть Docker-gate.
-    C5: server/.env требует ** (Docker glob без ** матчит только корень контекста).
+    C5: server/.env требует ** (Docker glob без ** матчит только корень build-context).
     """
     patterns = _dockerignore_patterns()
     not_covered = [p for p in _SECRET_PATHS if not _dockerignore_matches(p, patterns)]
     assert not_covered == [], (
         f"Секретные пути НЕ покрыты .dockerignore паттернами: {not_covered}. "
         f"C5: для поддиректорий нужен ** (server/.env). C4: inline-комментарий ломает паттерн."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Docker-native build-context canary (issue #116)
+# ---------------------------------------------------------------------------
+
+_CANARY_IMAGE = "srouter-dockerignore-canary"
+_CANARY_DOCKERFILE = _ROOT / "docker" / "canary.Dockerfile"
+
+
+def _docker_available() -> bool:
+    if shutil.which("docker") is None:
+        return False
+    probe = subprocess.run(["docker", "info"], capture_output=True, timeout=10)
+    return probe.returncode == 0
+
+
+@pytest.fixture(scope="module")
+def canary_image():
+    """Собрать реальный Docker-образ из репо С временными секретными файлами в build-context.
+
+    Ни один путь из _SECRET_PATHS не должен существовать ДО теста (иначе рискуем утащить
+    настоящий локальный секрет разработчика в docker build или удалить его в finally) —
+    fail-closed: если хоть один уже существует, skip (не создаём/не удаляем чужие файлы).
+    """
+    if not _docker_available():
+        pytest.skip("Docker недоступен в этом окружении (docker CLI/daemon)")
+
+    preexisting = [p for p in _SECRET_PATHS if (_ROOT / p).exists()]
+    if preexisting:
+        pytest.skip(
+            f"secret-пути уже существуют на диске (реальные локальные файлы?): {preexisting}. "
+            f"Canary не трогает существующие файлы — пропуск, чтобы не рисковать чужими секретами."
+        )
+
+    created = []
+    try:
+        for rel in _SECRET_PATHS:
+            target = _ROOT / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("canary-secret-should-not-be-in-image\n", encoding="utf-8")
+            created.append(target)
+
+        build = subprocess.run(
+            [
+                "docker", "build",
+                "-f", str(_CANARY_DOCKERFILE),
+                "-t", _CANARY_IMAGE,
+                str(_ROOT),
+            ],
+            capture_output=True, text=True, timeout=180,
+        )
+        assert build.returncode == 0, (
+            f"docker build canary упал rc={build.returncode}\n"
+            f"stdout:\n{build.stdout}\nstderr:\n{build.stderr}"
+        )
+        yield _CANARY_IMAGE
+    finally:
+        for target in created:
+            target.unlink(missing_ok=True)
+        # Подчистить опустевшие созданные поддиректории (server/rendered/), не трогая server/.
+        rendered_dir = _ROOT / "server" / "rendered"
+        if rendered_dir.exists() and not any(rendered_dir.iterdir()):
+            rendered_dir.rmdir()
+        subprocess.run(["docker", "rmi", "-f", _CANARY_IMAGE], capture_output=True)
+
+
+def test_secret_paths_absent_from_docker_build_context(canary_image):
+    """Docker-native canary (issue #116, Codex cycle-4 рекомендация): реальный docker build/run,
+    не ручной parse. Секретные файлы физически лежат в build-context на момент `docker build` —
+    если .dockerignore их не отфильтровал, они окажутся в образе, и `test -e` внутри контейнера
+    найдёт их.
+    """
+    leaked = []
+    for rel in _SECRET_PATHS:
+        check = subprocess.run(
+            ["docker", "run", "--rm", canary_image, "test", "-e", f"/ctx/{rel}"],
+            capture_output=True, timeout=30,
+        )
+        if check.returncode == 0:
+            leaked.append(rel)
+    assert leaked == [], (
+        f"Секретные файлы попали в реальный Docker build-context (canary): {leaked}. "
+        f".dockerignore не фильтрует их на практике, несмотря на ручной parse-гвард выше."
     )
