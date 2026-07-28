@@ -202,7 +202,7 @@ def test_check_all_status_ok_when_nothing_installed(monkeypatch, tmp_path):
     """Doctor-путь (active_claude=True), ничего не установлено → status=ok (info-чек не роняет).
     versions-check есть в отчёте как info-only с detail «не установлено»."""
     monkeypatch.setattr(health, "_port_up", lambda port: True)
-    monkeypatch.setattr(health, "_tunnel_up", lambda: (True, "HTTP 200"))
+    monkeypatch.setattr(health, "_tunnel_up", lambda: (True, "HTTP 200", False))
     monkeypatch.setattr(health, "_claude_proxy_probe",
                         lambda: {"status": "unknown", "source": "n/a", "detail": "CC не запущен"})
     monkeypatch.setattr(health, "_claude_transport_probe",
@@ -333,7 +333,7 @@ def _all_up_drivers(monkeypatch):
     """Мок всех driver-чеков в check_all (порты/туннель/probes) — ОСТАВЛЯЕТ _installed_versions_check
     реальным (не мокает), чтобы тест мог зафиксировать, вызывался ли disk inventory."""
     monkeypatch.setattr(health, "_port_up", lambda port: True)
-    monkeypatch.setattr(health, "_tunnel_up", lambda: (True, "HTTP 200"))
+    monkeypatch.setattr(health, "_tunnel_up", lambda: (True, "HTTP 200", False))
     monkeypatch.setattr(health, "_claude_proxy_probe",
                         lambda: {"status": "unknown", "source": "n/a", "detail": "CC не запущен"})
     monkeypatch.setattr(health, "_codex_proxy_probe",
