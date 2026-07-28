@@ -1,3 +1,4 @@
+import os
 import subprocess
 
 import sys_probe
@@ -134,3 +135,70 @@ def test_brew_service_state_matches_dashboard_semantics():
     assert sys_probe.brew_service_state(result, "xray") == "started"
     assert sys_probe.brew_service_state(result, "dnsmasq") == "none"
     assert sys_probe.brew_service_state({"timeout": True, "out": result["out"]}, "xray") == "unknown"
+
+
+# ============================ direct_probe (вынесен из health._direct_domain_probe, #206→#197) ============================
+# Прямой curl к хосту МИНУЯ прокси (env -u) — базовый слой без config, делят health (#206 GFW
+# per-domain) и direct_first (#197 NO_PROXY reachability). Контракт {"reachable": bool, "kind": str}
+# сохранён 1:1 из health._direct_domain_probe (health.py:203-255) — regression-гвард на #206 тестах.
+
+
+def test_direct_probe_http_response_is_reachable(monkeypatch):
+    """HTTP < 500 → reachable, kind=ok (сервер ответил, канал до домена работает)."""
+    monkeypatch.setattr(sys_probe, "run",
+                        lambda cmd, timeout, env=None: {"rc": 0, "out": "404", "err": "", "timeout": False})
+    r = sys_probe.direct_probe("github.com")
+    assert r["reachable"] is True
+    assert r["kind"] == "ok"
+
+
+def test_direct_probe_timeout_is_not_reachable(monkeypatch):
+    monkeypatch.setattr(sys_probe, "run",
+                        lambda cmd, timeout, env=None: {"rc": None, "out": "", "err": "", "timeout": True})
+    r = sys_probe.direct_probe("github.com")
+    assert r["reachable"] is False
+    assert "timeout" in r["kind"]
+
+
+def test_direct_probe_connection_failed_is_not_reachable(monkeypatch):
+    monkeypatch.setattr(sys_probe, "run",
+                        lambda cmd, timeout, env=None: {"rc": 0, "out": "000", "err": "", "timeout": False})
+    r = sys_probe.direct_probe("github.com")
+    assert r["reachable"] is False
+    assert r["kind"] == "connection-failed"
+
+
+def test_direct_probe_5xx_reachable_but_upstream_error(monkeypatch):
+    """5xx = сервер ответил (домен достижим, не режется), но kind=upstream-error (не ok) — #207 паттерн."""
+    monkeypatch.setattr(sys_probe, "run",
+                        lambda cmd, timeout, env=None: {"rc": 0, "out": "503", "err": "", "timeout": False})
+    r = sys_probe.direct_probe("github.com")
+    assert r["reachable"] is True
+    assert r["kind"] == "upstream-error"
+
+
+def test_direct_probe_strips_proxy_env(monkeypatch):
+    """Прямой curl идёт МИНУЯ прокси (env -u) — регресс-гвард канона zai-direct-no-proxy."""
+    captured = {}
+
+    def _fake_run(cmd, timeout, env=None):
+        captured["env"] = env
+        return {"rc": 0, "out": "404", "err": "", "timeout": False}
+
+    monkeypatch.setattr(sys_probe, "run", _fake_run)
+    monkeypatch.setattr(os, "environ", {"HTTPS_PROXY": "http://127.0.0.1:8118",
+                                        "HTTP_PROXY": "http://127.0.0.1:8118",
+                                        "ALL_PROXY": "http://127.0.0.1:8118",
+                                        "NO_PROXY": "localhost"})
+    sys_probe.direct_probe("github.com")
+    env = captured.get("env") or {}
+    for key in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "https_proxy", "http_proxy", "all_proxy"):
+        assert key not in env, f"прямой curl минует прокси: {key} не должен попасть в env"
+
+
+def test_direct_probe_never_raises_on_bad_code(monkeypatch):
+    monkeypatch.setattr(sys_probe, "run",
+                        lambda cmd, timeout, env=None: {"rc": 0, "out": "garbage", "err": "", "timeout": False})
+    r = sys_probe.direct_probe("github.com")
+    assert r["reachable"] is False
+    assert r["kind"] == "connection-failed"

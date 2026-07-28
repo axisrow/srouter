@@ -53,6 +53,7 @@ py-modules = [
     "privoxy_audit",
     "privileged_ops",
     "lock_hierarchy",
+    "direct_first",
 ]
 
 [tool.setuptools.package-data]

@@ -203,56 +203,13 @@ GFW_CONTROL_DOMAIN = "api.z.ai"  # канонически не GFW-target (zai-d
 def _direct_domain_probe(host):
     """Прямой curl к host МИНУЯ прокси (env -u) — достигается ли домен без туннеля?
 
-    #206 per-domain GFW-тест. curl с очищенным proxy-env (как _claude_transport_once clean_keys +
-    GH_DIRECT_HINT #199): домен не идёт через privoxy/xray → VPS, доказывает РЕАЛЬНУЮ достижимость
-    напрямую. GFW режет по TLS-fingerprint → timeout/connection-reset; живой домен отвечает HTTP.
-    Канон zai-direct-no-proxy: probe БЕЗ прокси (иначе github-through-VPS = «VPS мёртв», та же
-    подмена, что git-proxy #199 маскировал «флап gh»).
-
-    Семантика reachable = ЛЮБОЙ HTTP-ответ сервера (включая 5xx): GFW даёт timeout/reset, НЕ
-    HTTP-ответ → сам факт HTTP-кода доказывает достижимость (домен не режется). 404/421/5xx = сервер
-    ответил = канал работает. timeout/000 = режется/нет ответа. kind разделяет «здоров» (HTTP<500, ok)
-    от «ответил, но лежит» (5xx, upstream-error) — та же дискриминация, что _tunnel_target_up #207.
-    Не бросает (probe-канон). Consumer (_gfw_domain_check) смотрит ТОЛЬКО на reachable (для GFW-вердикта
-    важен факт ответа, не здоровье) — но kind точный для observability/detail (noisy-log).
-
-    Возвращает {"reachable": bool, "kind": str}:
-      reachable=True,  kind="ok"                  — сервер ответил HTTP < 500 (домен доступен напрямую);
-      reachable=True,  kind="upstream-error"      — сервер ответил HTTP 5xx (домен достижим, GFW НЕ режет,
-                                                    но сам лежит — vendor down, не «ok»; как #207);
-      reachable=False, kind="timeout"             — curl timeout (GFW режет / нет ответа);
-      reachable=False, kind="connection-failed"   — curl 000/no-response/мусор (reset/не установлено).
+    #206 per-domain GFW-тест. Тонкая обёртка над sys_probe.direct_probe: #197 cycle-review вынес
+    тело в базовый слой sys_probe (как tunnel_code_up) — делят health.py (GFW per-domain) и
+    direct_first.py (NO_PROXY reachability). Канон verify-dont-guess: один probe, не дублировать.
+    Контракт неизменен: {"reachable": bool, "kind": "ok"|"upstream-error"|"timeout"|"connection-failed"}.
+    Не бросает (probe-канон).
     """
-    # env -u всех proxy-vars (оба регистра) — прямой путь минуя privoxy/xray. Список = тот же, что
-    # _claude_transport_once clean_keys + GH_DIRECT_HINT #199 (единый контракт «снять прокси»).
-    env = os.environ.copy()
-    for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
-                "http_proxy", "https_proxy", "all_proxy", "no_proxy"):
-        env.pop(key, None)
-    # https:// + путь '/' — GFW режет на TLS-handshake к корню; -I (HEAD) лёгкий. connect-timeout как
-    # _tunnel_target_up (4с) — probe должен ответить быстрее, чем сдаться; max-time 8с — общий бюджет.
-    r = sys_probe.run([CURL, "-sS", "-o", "/dev/null", "-I",
-                       "--connect-timeout", "4", "--max-time", "8",
-                       "-w", "%{http_code}", f"https://{host}/"],
-                      timeout=10, env=env)
-    if r.get("timeout"):
-        return {"reachable": False, "kind": "timeout"}
-    code = (r.get("out") or "").strip()
-    if not code or code == "000":
-        return {"reachable": False, "kind": "connection-failed"}
-    try:
-        code_int = int(code)
-    except ValueError:
-        # нечисловой код = curl не достучался корректно (мусор) — трактуем как connection-failed.
-        return {"reachable": False, "kind": "connection-failed"}
-    if sys_probe.tunnel_code_up(code_int):
-        return {"reachable": True, "kind": "ok"}  # HTTP < 500 — сервер ответил, канал работает
-    # HTTP 5xx напрямую (без прокси) — сервер ответил, но лежит сам: канал до домена работает, GFW
-    # НЕ режет (GFW даёт timeout/reset, не HTTP-ответ). reachable=True (домен достижим — для GFW-вердикта
-    # важно «ответил вообще», не «здоров»), но kind="upstream-error" (НЕ "ok"): 5xx = vendor down, не
-    # чистый ok. Та же структурная дискриминация, что _tunnel_target_up #207 (kind="upstream-error" для
-    # 5xx), и согласовано с sys_probe.tunnel_code_up (5xx = мёртвый канал). cycle-review #206.
-    return {"reachable": True, "kind": "upstream-error"}
+    return sys_probe.direct_probe(host)
 
 
 def _gfw_domain_check(domains=GFW_PROBE_DOMAINS, control=GFW_CONTROL_DOMAIN):
@@ -294,6 +251,36 @@ def _gfw_domain_check(domains=GFW_PROBE_DOMAINS, control=GFW_CONTROL_DOMAIN):
             "detail": f"домен(ы) {names} режется GFW ({'; '.join(f'{h}: {k}' for h, k in cut)}) — "
                       f"контрольный {control} отвечает напрямую (zai-direct-no-proxy). Нужен "
                       f"прокси/VPS для {names}: github/gh через прокси (env -u снимает scoped git-proxy)"}
+
+
+def _direct_first_check():
+    """#197: какие candidate-домены (z.ai BUILTIN + user direct_domains) идут напрямую (NO_PROXY),
+    какие через прокси. info-only ВСЕГДА (как _gfw_domain_check) — картина для диагностики
+    (какие домены переживут смерть VPS), НЕ driver: доступность прокси-стека не зависит от
+    direct-first детекции. Doctor-only (active_claude gate, как GFW-чек) — direct_first.detect()
+    делает прямой curl per-domain = сетевой overhead, не для лёгкого /health/watchdog.
+
+    Возвращает {status, detail}: status = ok (все candidate reachable) | info (часть/все через
+    прокси, картина) | unknown (direct_first недоступен — import упал). Не бросает.
+    Канон: verify-dont-guess (честный TLS-test, переиспользует sys_probe.direct_probe — не
+    дублирует #206), srouter-critical-infra-24-7 (direct-домены переживают смерть VPS),
+    more-options-better (user direct_domains конфигурируем), zai-direct-no-proxy (z.ai всегда candidate).
+    """
+    try:
+        import direct_first
+        det = direct_first.detect()
+    except Exception:
+        return {"status": "unknown", "detail": "direct-first detect недоступен — check пропущен"}
+    reach = det.get("reachable", [])
+    blocked = det.get("blocked", [])
+    if reach and not blocked:
+        return {"status": "ok", "detail": f"direct-first: {', '.join(reach)} → напрямую (NO_PROXY)"}
+    if reach:
+        return {"status": "info",
+                "detail": f"direct: {', '.join(reach)}; через прокси: {', '.join(blocked)}"}
+    if blocked:
+        return {"status": "info", "detail": f"direct-first: все candidate через прокси ({', '.join(blocked)})"}
+    return {"status": "info", "detail": "direct-first: нет candidate-доменов"}
 
 
 def _tunnel_target_up(url):
@@ -2143,6 +2130,14 @@ def check_all(*, active_claude=False):
         gfw_check = {"name": "GFW per-domain (github vs z.ai прямой curl)",
                      "ok": gfw["status"] != "gfw", "info": True, "detail": gfw["detail"]}
         checks.append(gfw_check)
+        # #197 direct-first: какие candidate-домены (z.ai BUILTIN + user direct_domains) идут
+        # напрямую (NO_PROXY) — переживают смерть VPS. info-only ВСЕГДА (как GFW-чек выше) — картина,
+        # не сбой стека. gate под active_claude (doctor-only): direct_first.detect() делает прямой
+        # curl per-domain = сетевой overhead, не для лёгкого /health/watchdog (тот же паттерн, что GFW).
+        df = _direct_first_check()
+        df_check = {"name": "direct-first (NO_PROXY reachable)",
+                    "ok": df["status"] == "ok", "info": True, "detail": df["detail"]}
+        checks.append(df_check)
     drivers = [c for c in checks if not c.get("info")]
     all_ok = all(c["ok"] for c in drivers)
     any_ok = any(c["ok"] for c in drivers)

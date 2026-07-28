@@ -2073,41 +2073,83 @@ def test_codex_no_proxy_preserves_loopback():
         assert lb in hosts, f"loopback '{lb}' сохранён в CODEX_NO_PROXY: {np}"
 
 
-def test_codenv_env_script_setenv_zai_direct():
-    """srouter-codex-env.sh делает launchctl setenv NO_PROXY с z.ai,.z.ai — regression-гвард.
+def test_codenv_env_script_calls_direct_first():
+    """#197: srouter-codex-env.sh вычисляет NO_PROXY динамически через direct_first.no_proxy_string()
+    (честный TLS-test candidate-доменов), не статичным литералом.
 
-    Скрипт НЕ рендерится через плейсхолдеры (_install_generic_launchagent копирует script_path
-    as-is) → хардкод в файле = то, что реально выполнит LaunchAgent. Если рассинхрон с CODEX_NO_PROXY
-    — launchctl getenv NO_PROXY не получит z.ai (issue #195 корень)."""
+    Скрипт НЕ рендерится через плейсхолдеры при install (запускается in-place из env.root/
+    launchagents/, как health.py у watchdog) — сам резолвит ROOT_DIR, вызывает Python-модуль
+    direct_first. Единый источник правды теперь direct_first.no_proxy_string() (не строковый
+    литерал, дублирующий CODEX_NO_PROXY, issue #195 root — drift между двумя копиями)."""
     script = Path(__file__).resolve().parent.parent / "launchagents" / "srouter-codex-env.sh"
     text = script.read_text(encoding="utf-8")
-    # NO_PROXY присваивается литералом (не из env) и setenv'ится в gui-домен.
     assert "launchctl setenv NO_PROXY" in text, "скрипт выставляет NO_PROXY в gui-домен"
-    # Извлечь присвоенное значение NO_PROXY="..." и проверить z.ai,.z.ai.
+    assert "direct_first" in text, "скрипт вызывает direct_first (не хардкодит NO_PROXY литералом)"
+    assert "no_proxy_string" in text
+
+
+def test_codenv_env_script_sets_proxy_before_blocking_probe():
+    """#197 cycle-review (Codex critical): PROXY-переменные (launchctl setenv HTTP_PROXY ...) ДОЛЖНЫ
+    выставляться ДО блокирующего direct_first.no_proxy_string() probe.
+
+    Boot-race: no_proxy_string() делает serial curl per-domain (до MAX_CANDIDATE_DOMAINS x max_time
+    ≈ сотни секунд worst-case). При RunAtLoad на буте launchctl-env пуст; если PROXY-переменные
+    ставятся ПОСЛЕ probe, GUI-процессы (Codex.app/ChatGPT.app), стартующие в окне probe, унаследуют
+    ОТСУТСТВИЕ SOCKS-прокси → прямой egress под GFW (утечка реального IP + недоступность vendor).
+    launchctl setenv не ретроактивен → уже запущенные процессы не чинятся при последующем setenv.
+
+    Инвариант (канон fail-closed-proxy-down, srouter-critical-infra-24-7): PROXY-переменные попадают
+    в launchctl-env НЕМЕДЛЕННО, окно без них минимально. Единственный сетевой вызов (probe) не должен
+    задерживать установку PROXY — он нужен только для NO_PROXY (логически независим от PROXY-vars)."""
+    script = Path(__file__).resolve().parent.parent / "launchagents" / "srouter-codex-env.sh"
+    # Только строки кода (без комментариев) — иначе якоря цепляются за текст docstring-комментария.
+    code_lines = [ln for ln in script.read_text(encoding="utf-8").splitlines()
+                  if not ln.lstrip().startswith("#")]
+
+    def _first_line(substr):
+        for i, ln in enumerate(code_lines):
+            if substr in ln:
+                return i
+        return -1
+
+    # Установка PROXY-переменных: цикл `for key in HTTP_PROXY ...; do launchctl setenv "$key" ...`.
+    proxy_setenv_line = _first_line('launchctl setenv "$key"')
+    assert proxy_setenv_line != -1, "скрипт должен выставлять PROXY-переменные через launchctl setenv"
+    # Блокирующий probe = присвоение NO_PROXY из вызова no_proxy_string() (serial curl).
+    probe_line = _first_line("no_proxy_string")
+    assert probe_line != -1, "скрипт вызывает direct_first.no_proxy_string() для динамического NO_PROXY"
+    assert proxy_setenv_line < probe_line, (
+        "PROXY-переменные (launchctl setenv HTTP_PROXY) ДОЛЖНЫ выставляться ДО блокирующего "
+        "direct_first.no_proxy_string() probe — иначе GUI-процессы в окне probe при загрузке "
+        "унаследуют отсутствие прокси → прямой egress под GFW (Codex critical #197 cycle-review). "
+        f"proxy_setenv@code-line{proxy_setenv_line} должен быть < probe@code-line{probe_line}"
+    )
+
+
+def test_codenv_env_script_fallback_contains_zai_direct():
+    """srouter-codex-env.sh fallback (Python/detect недоступен) содержит z.ai,.z.ai — regression-гвард
+    #195: даже при сбое Python NO_PROXY не должен потерять z.ai (канон srouter-critical-infra-24-7,
+    zai-direct-no-proxy — z.ai всегда direct, независимо от готовности Python-слоя)."""
+    script = Path(__file__).resolve().parent.parent / "launchagents" / "srouter-codex-env.sh"
+    text = script.read_text(encoding="utf-8")
     import re
-    m = re.search(r'NO_PROXY="([^"]*)"', text)
-    assert m, f"NO_PROXY=\"...\" литерал присутствует в скрипте: {text!r}"
+    # Fallback-присвоение внутри if [ -z "$NO_PROXY" ]; then NO_PROXY="..."; fi
+    m = re.search(r'NO_PROXY="([^"]*z\.ai[^"]*)"', text)
+    assert m, f"fallback NO_PROXY литерал с z.ai не найден в скрипте: {text!r}"
     hosts = {h.strip().lower() for h in m.group(1).split(",") if h.strip()}
     assert "z.ai" in hosts and ".z.ai" in hosts, \
-        f"srouter-codex-env.sh NO_PROXY содержит z.ai,.z.ai (рассинхрон с CODEX_NO_PROXY = баг #195): {m.group(1)}"
+        f"fallback NO_PROXY содержит z.ai,.z.ai (регресс-гвард #195): {m.group(1)}"
+    for lb in ("localhost", "127.0.0.1", "::1"):
+        assert lb in hosts, f"fallback NO_PROXY сохраняет loopback '{lb}': {m.group(1)}"
 
 
-def test_codenv_env_script_synced_with_codex_no_proxy():
-    """srouter-codex-env.sh NO_PROXY-литерал = srouter.CODEX_NO_PROXY (единый источник правды).
-
-    drift-гвард: правим ТОЛЬКО CODEX_NO_PROXY, скрипт обязан ему соответствовать. Два источника
-    правды для одной границы = гарантированная утечка (канон loose-validator-recurring-leak)."""
-    import re
+def test_codenv_env_script_resolves_root_dir_without_placeholders():
+    """Скрипт НЕ содержит нерендеренных плейсхолдеров __SROUTER_*__ — исключает класс багов
+    «placeholder не отрендерен → error 5» (PR #189 регрессия). Сам резолвит ROOT_DIR."""
     script = Path(__file__).resolve().parent.parent / "launchagents" / "srouter-codex-env.sh"
     text = script.read_text(encoding="utf-8")
-    m = re.search(r'NO_PROXY="([^"]*)"', text)
-    assert m, "NO_PROXY=\"...\" литерал в скрипте"
-    script_hosts = {h.strip().lower() for h in m.group(1).split(",") if h.strip()}
-    const_hosts = {h.strip().lower() for h in srouter.CODEX_NO_PROXY.split(",") if h.strip()}
-    assert script_hosts == const_hosts, (
-        f"NO_PROXY drift: скрипт={sorted(script_hosts)} ≠ CODEX_NO_PROXY={sorted(const_hosts)} "
-        f"(править единый источник srouter.CODEX_NO_PROXY)"
-    )
+    assert "__SROUTER_" not in text, "скрипт не должен содержать нерендеренные плейсхолдеры"
+    assert "ROOT_DIR=" in text
 
 
 def test_codenv_plist_comment_mentions_zai():

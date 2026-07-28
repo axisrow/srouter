@@ -612,6 +612,11 @@ _DEFAULT_STATE = {
     # node_selector._auto_route_sync_enabled строго is True). По умолчанию ON — «пофигу VPN»:
     # watchdog (ensure_split_route) держит route через физический шлюз при любом состоянии VPN.
     "auto_route_sync": True,
+    # direct_domains (#197): opt-in user-домены для direct_first.candidate_domains — проверяются
+    # честным прямым TLS-test (мимо прокси), reachable → идут в NO_PROXY (переживают смерть VPS).
+    # BUILTIN z.ai добавляется в direct_first независимо от этого списка (канон zai-direct-no-proxy).
+    # Пустой список по умолчанию — opt-in (реальный IP виден домену, privacy-решение пользователя).
+    "direct_domains": [],
 }
 
 

@@ -50,6 +50,7 @@
     "channels": { "wifi_service": "Wi-Fi", "usb_tether_service": "" }
   },
   "traffic_guard": { "mode": "off", "domains": { "example.com": "allow" } },
+  "direct_domains": ["api.example.com"],
   "detected_environment": {
     "last_checked_at": null,
     "brew": null,
