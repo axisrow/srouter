@@ -537,13 +537,17 @@ def _remove_launchctl_env(runner) -> dict:
     (_launchd_is_loaded), НЕ удаляем plist — иначе StartInterval-агент останется в памяти и будет
     пере-применять мёртвый socks5 env каждые 5 мин (утечка нерабочего прокси в GUI-домен).
 
-    env-cleanup — ВНУТРИ gui-домена явно (issue #94 DEFECT A). `launchctl setenv/unsetenv/getenv`
-    оперируют «caller's context» (man launchctl): setenv делает LaunchAgent-скрипт, запущенный launchd
-    В gui-домене → переменные в gui. uninstall бежит из процесса cmd_uninstall (caller-context может
-    быть user/<uid> из SSH/cron). unsetenv без домена снял бы НЕ в gui → gui-домен остался бы с мёртвым
-    127.0.0.1:10808. Поэтому: `unsetenv gui/<uid> <key>` (доменный таргет принимается launchctl),
-    затем верификация `getenv gui/<uid> <key>` → пустой вывод = подтверждено снято (строгий
-    первоисточник, НЕ rc unsetenv). Любой ключ, оставшийся в gui-домене → ok=False (fail-closed).
+    env-cleanup — ВНУТРИ gui-домена явно (issue #94 DEFECT A, переписано issue #191). `launchctl
+    setenv/unsetenv/getenv` оперируют «caller's context» (man launchctl): setenv делает LaunchAgent-
+    скрипт, запущенный launchd В gui-домене → переменные в gui. uninstall бежит из процесса
+    cmd_uninstall (caller-context может быть user/<uid> из SSH/cron). unsetenv без домена снял бы НЕ
+    в gui → gui-домен остался бы с мёртвым 127.0.0.1:10808. Изначальный фикс #94 предполагал, что
+    домен принимается голым аргументом (`unsetenv gui/<uid> <key>` / `getenv gui/<uid> <key>`) —
+    ОПРОВЕРГНУТО эмпирически (issue #191): эти вызовы молча игнорируют домен-аргумент (Usage:
+    getenv <key> — ровно один позиционный аргумент). Рабочий путь: `launchctl asuser <uid> launchctl
+    unsetenv <key>` (man: исполняет в bootstrap-контексте target-пользователя — реально gui), затем
+    верификация `launchctl print gui/<uid>` блок environment={...} (строгий первоисточник, НЕ getenv).
+    Любой ключ, оставшийся в gui-домене → ok=False (fail-closed).
     """
     try:
         plist_path = Path.home() / "Library" / "LaunchAgents" / f"{CODEX_ENV_LABEL}.plist"
