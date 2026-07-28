@@ -1646,20 +1646,27 @@ _CODENV_LABEL = "com.srouter.codenv"
 _CODENV_MARKER = "srouter-managed-codex-env-v1"
 
 
-def _read_gui_proxy_env():
+def _read_gui_proxy_env(runner=None, *, keys_filter=LAUNCHCTL_PROXY_KEYS):
     """Прокси в launchd GUI-домене (где codenv ставит SOCKS5) — через `launchctl print gui/<uid>`.
 
     launchctl getenv читает ТОЛЬКО caller-context (`Usage: getenv <key>` — НЕ принимает домен), молча
     игнорируя домен-аргумент → из SSH/cron/AO-shell даёт НЕ gui, а из GUI-терминала совпадает случайно.
     codenv-факт = факт о GUI-домене (видит ChatGPT.app launchd-process), не о терминале doctor'а →
     единственный домен-осознанный источник = `launchctl print gui/<uid>` блок `environment = {...}`.
+    Эмпирически подтверждено (issue #191): unsetenv gui/<uid> KEY тоже игнорирует домен — arg1
+    трактуется как имя переменной, arg2 (реальный ключ) молча отбрасывается.
+
+    runner: опциональный (cmd, timeout) -> {rc, out, err, timeout} — для переиспользования вызывающим
+    кодом с собственным инъектируемым runner (srouter._remove_launchctl_env, issue #191). По умолчанию
+    sys_probe.run (as-is для health.py doctor-чеков).
 
     Возвращает {keys: {KEY: value}, verifiable: bool}. timeout → verifiable=False (fail-closed: не
-    различимо «пусто» vs «не смогли спросить», не выдумываем false-down). Парсим только LAUNCHCTL_PROXY_KEYS
-    (HTTPS_PROXY/HTTP_PROXY/ALL_PROXY) — остальные env-ключи не касаются прокси.
+    различимо «пусто» vs «не смогли спросить», не выдумываем false-down). keys_filter ограничивает
+    парсинг нужными env-ключами (по умолчанию LAUNCHCTL_PROXY_KEYS — HTTPS_PROXY/HTTP_PROXY/ALL_PROXY).
     """
+    run = runner if runner is not None else sys_probe.run
     domain = f"gui/{os.getuid()}"
-    lc = sys_probe.run([LAUNCHCTL, "print", domain], timeout=3)
+    lc = run([LAUNCHCTL, "print", domain], 3)
     if lc.get("timeout"):
         return {"keys": {}, "verifiable": False}  # fail-closed
     keys = {}
@@ -1680,7 +1687,7 @@ def _read_gui_proxy_env():
             if " => " in stripped:
                 k, _, v = stripped.partition(" => ")
                 k = k.strip()
-                if k in LAUNCHCTL_PROXY_KEYS and v.strip():
+                if k in keys_filter and v.strip():
                     keys[k] = v.strip()
     if not found_block:
         # out без блока environment (несуществующий домен: launchctl print gui/<bad> отдаёт rc=0 +

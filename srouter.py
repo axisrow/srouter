@@ -501,11 +501,13 @@ def _install_launchctl_env(env, runner) -> str:
     try:
         # Предупредить, если в GUI-домене уже есть ЧУЖОЙ прокси (корпоративный/ручной) — setenv
         # скрипта его перезапишет без восстановления. Не блокируем, но WARN в статусе.
-        # getenv gui/<uid> явно (issue #94 DEFECT A аудит setenv): getenv без домена читает caller-context,
-        # а setenv-скрипт кладёт в gui — из SSH/cron caller-context другой, WARN пропустил бы чужой gui-прокси.
+        # issue #191 (эмпирически подтверждено): `getenv gui/<uid> HTTP_PROXY` МОЛЧА игнорирует домен
+        # (Usage: getenv <key> — ровно один позиционный аргумент, второй отбрасывается) → val ВСЕГДА
+        # пуст, WARN никогда не срабатывал. Единственный домен-осознанный источник — `launchctl print
+        # gui/<uid>` (health._read_gui_proxy_env, тот же паттерн, что doctor-чеки #189).
         warn = ""
-        existing = runner([LAUNCHCTL, "getenv", _launchd_domain(), "HTTP_PROXY"], 5)
-        val = (existing.get("out") or "").strip()
+        gui = health._read_gui_proxy_env(runner, keys_filter=("HTTP_PROXY",))
+        val = gui.get("keys", {}).get("HTTP_PROXY", "")
         if val and "127.0.0.1:10808" not in val:
             warn = f" ВНИМАНИЕ: существующий GUI HTTP_PROXY={val[:40]} будет перезаписан (backup не делается)."
         ok, err = _install_generic_launchagent(
@@ -563,38 +565,41 @@ def _remove_launchctl_env(runner) -> dict:
             # Агент потенциально жив в gui-домене → env активен. ok=False: cmd_uninstall не должен
             # рапортовать полный успех, пока env-прокси не подтверждённо снят (fail-closed).
             return {"ok": False, "note": note}
-        # Снять переменные ИЗ gui-домена явно и верифицировать. setenv делал LaunchAgent-скрипт
-        # (caller-context = gui), uninstall бежит в возможно-другом caller-context → ЯВНЫЙ gui-таргет.
-        domain = _launchd_domain()
-        leftover = []
-        unverifiable = []
-        for key, _ in CODEX_LAUNCHCTL_ENV:
-            runner([LAUNCHCTL, "unsetenv", domain, key], 5)
-            # Строгий первоисточник: getenv gui/<uid> <key>. rc unsetenv игнорируем (loose-валидатор:
-            # «отработал» ≠ «снял»). Пустой вывод getenv = переменной нет в gui-домене = подтверждено.
-            g = runner([LAUNCHCTL, "getenv", domain, key], 5)
-            # fail-closed верификации (канон): сам сбой getenv → переменная НЕверифицируема. Пустой out
-            # при timeout/OSError (rc=None) НЕ считать «снято» — иначе fail-open (переменная могла
-            # остаться, но верификация не смогла спросить). Только достоверный rc=0 + пустой out = снято.
-            if g.get("timeout") or g.get("rc") is None:
-                unverifiable.append(key)
-            elif (g.get("out") or "").strip():
-                leftover.append(key)
+        # Снять переменные ИЗ gui-домена явно и верифицировать.
+        #
+        # issue #191 (эмпирически подтверждено на реальной машине, не гипотеза): `launchctl unsetenv/
+        # getenv gui/<uid> KEY` МОЛЧА не работают — `Usage: launchctl getenv <key>` принимает РОВНО
+        # один позиционный аргумент; вызов с двумя ("gui/<uid>", "KEY") трактует ПЕРВЫЙ как имя
+        # переменной, ВТОРОЙ молча игнорируется (доказано: `setenv gui/501 X` + `getenv gui/501` → X).
+        # То же для unsetenv — реальный ключ в gui-домене не снимается, rc=0 без эффекта.
+        #
+        # Рабочий домен-осознанный путь (эмпирика + man launchctl asuser): `launchctl asuser <uid>
+        # launchctl unsetenv KEY` — asuser выполняет команду "in as similar an execution context as
+        # possible to that of the target user's bootstrap" (man), то есть РЕАЛЬНО внутри gui-домена,
+        # независимо от caller-context процесса cmd_uninstall (SSH/cron/AO-shell). Верификация —
+        # `launchctl print gui/<uid>` блок `environment = {...}` (единственный домен-осознанный
+        # источник чтения, тот же паттерн, что health._read_gui_proxy_env для doctor-чеков #189).
+        uid = os.getuid()
+        all_keys = tuple(key for key, _ in CODEX_LAUNCHCTL_ENV)
+        for key in all_keys:
+            runner([LAUNCHCTL, "asuser", str(uid), LAUNCHCTL, "unsetenv", key], 5)
+        gui = health._read_gui_proxy_env(runner, keys_filter=all_keys)
+        if not gui.get("verifiable"):
+            # print gui/<uid> не смог спросить (timeout / домен недоступен) → состояние НЕверифицируемо.
+            # fail-closed (канон): НЕ рапортуем «снято», ok=False — оператор должен проверить вручную.
+            # Plist оставлен как контроль. Отличие от leftover: переменные МОГУТ быть сняты, но мы не знаем.
+            return {"ok": False,
+                    "note": (f"Codex env: НЕ подтверждено снятие — launchctl print gui/{uid} не ответил "
+                             f"(таймаут/домен недоступен). Проверь: launchctl print gui/{uid}. "
+                             f"Plist оставлен.")}
+        leftover = [k for k in all_keys if k in gui["keys"]]
         if leftover:
             # Переменная осталась ЖИВОЙ в gui-домене → мёртвый 127.0.0.1:10808 утечёт в GUI-приложения.
             # НЕ удаляем plist (контроль), ok=False → cmd_uninstall вернёт ненулевой rc (fail-closed).
             return {"ok": False,
                     "note": (f"Codex env: НЕ снят — переменные остались в gui-домене ({', '.join(leftover)}). "
-                             f"Проверь: launchctl getenv gui/<uid> {leftover[0]} | "
-                             f"launchctl unsetenv gui/<uid> {leftover[0]}. Plist оставлен.")}
-        if unverifiable:
-            # getenv не смог спросить gui-домен (timeout / launchctl-OSError) → состояние НЕверифицируемо.
-            # fail-closed (канон): НЕ рапортуем «снято», ok=False — оператор должен проверить вручную.
-            # Plist оставлен как контроль. Отличие от leftover: переменные МОГУТ быть сняты, но мы не знаем.
-            return {"ok": False,
-                    "note": (f"Codex env: НЕ подтверждено снятие — getenv gui-домена не ответил "
-                             f"({', '.join(unverifiable)}). Проверь: launchctl getenv gui/<uid> {unverifiable[0]}. "
-                             f"Plist оставлен.")}
+                             f"Проверь: launchctl print gui/{uid} | "
+                             f"launchctl asuser {uid} launchctl unsetenv {leftover[0]}. Plist оставлен.")}
         plist_path.unlink()
         return {"ok": True,
                 "note": f"Codex env: снят (LaunchAgent {CODEX_ENV_LABEL} выгружен, env очищен, plist удалён)."}
