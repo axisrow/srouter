@@ -363,10 +363,11 @@ def _dns_up():
 # _tunnel_up сдаться, чтобы различение «VPS мёртв» vs «локальный прокси упал» было осмысленным.
 VPS_TCP_PROBE_TIMEOUT = 3.0
 
-# TEST-NET 203.0.113.0/24 (RFC 5737) — документационные адреса, НЕ маршрутизируются в интернете.
-# Встречаются в srouter_config.example.py / незаменённых шаблонах. Прямой TCP-probe до них ничего
-# не доказывает (пакеты уходят в никуда) — это placeholder, не мёртвый VPS. Детект ДО пробы.
-_TESTNET_203_PREFIX = "203.0.113."
+# TEST-NET 203.0.113.0/24 (RFC 5737) placeholder-детектор = canonical local_state._is_testnet_placeholder
+# (единый источник правды, #200). PR #196 ввёл здесь собственный inline-предикат без octet-валидации
+# → drift с canonical на 203.0.113.300/abc/-1 (post-review #198, cycle-review high-confirmed, канон
+# loose-validator-recurring-leak). Делегируем canonical: doctor и apply/compare судят об endpoint-плейсхолдере
+# одинаково. Прямой TCP-probe до 203.0.113.x ничего не доказывает (пакеты уходят в никуда) — детект ДО пробы.
 
 
 def _vps_endpoint(node):
@@ -416,7 +417,9 @@ def _upstream_vps_reachable(node=None):
         return {"status": "info",
                 "detail": "нет активного узла / endpoint_host (VPS-probe неприменим)"}
     # Placeholder TEST-NET — детект ДО пробы: TCP до 203.0.113.x ничего не доказывает.
-    if host.startswith(_TESTNET_203_PREFIX) and host.count(".") == 3:
+    # #198: делегируем canonical local_state._is_testnet_placeholder (валидация octet 0..255),
+    # не собственный «prefix + count==3» (drift на 203.0.113.300/abc/-1).
+    if local_state._is_testnet_placeholder(host):
         return {"status": "warn",
                 "detail": f"endpoint {host}:{port} — placeholder TEST-NET 203.0.113.x (RFC 5737), "
                           f"не маршрутизируется; замени на реальный VPS-адрес"}

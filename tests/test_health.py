@@ -398,6 +398,37 @@ def test_vps_placeholder_testnet_203_0_113_is_warn(monkeypatch):
     assert vps_check.get("info") is True, "placeholder — info-only (не driver)"
 
 
+def test_vps_placeholder_detector_matches_canonical():
+    """REGRESSION-гвард #198 (post-review #196): health детектит TEST-NET-placeholder ТОЧНО как
+    canonical local_state._is_testnet_placeholder (единый источник правды).
+
+    PR #196 ввёл собственный inline-предикат `host.startswith(_TESTNET_203_PREFIX) and count('.')==3`
+    без octet-валидации → drift с canonical на 203.0.113.300/abc/-1/пустом (cycle-review Codex+я
+    high-confirmed). Канон loose-validator-recurring-leak: граница валидируется строгим первоисточником
+    в одном месте, не «почти-regex» в N. Этот тест падает, пока health не делегирует canonical.
+    """
+    import local_state
+    # Включаем drift-кейсы: prefix+count==3, НО octet невалиден → canonical=False, health-дубликат=True.
+    drift_cases = ["203.0.113.300", "203.0.113.abc", "203.0.113.-1", "203.0.113."]
+    # Согласованные кейсы (оба детектора): валидный placeholder / не-prefix / hostname / None.
+    agree_placeholder = ["203.0.113.0", "203.0.113.10", "203.0.113.255"]
+    agree_not = ["198.51.100.7", "192.0.2.1", "1.2.3.4", "vps.example.com", "203.0.113", "203.0.113.7.5"]
+    # Эмпирически сверяем health-вердикт (status=="warn") с canonical предикатом.
+    for host in drift_cases:
+        health_is_warn = health._upstream_vps_reachable({"endpoint_host": host, "port": 443})["status"] == "warn"
+        canonical = local_state._is_testnet_placeholder(host)
+        assert health_is_warn == canonical, (
+            f"DRIFT host={host!r}: health warn={health_is_warn} vs canonical placeholder={canonical} "
+            f"— health обязан делегировать local_state._is_testnet_placeholder (единый источник)")
+    for host in agree_placeholder:
+        assert health._upstream_vps_reachable({"endpoint_host": host, "port": 443})["status"] == "warn", \
+            f"{host!r} — валидный TEST-NET placeholder, оба детектора warn"
+    for host in agree_not:
+        # Не-placeholder: НЕ должен давать warn (info если невалиден, иначе ok/down через probe).
+        assert health._upstream_vps_reachable({"endpoint_host": host, "port": 443})["status"] != "warn", \
+            f"{host!r} — НЕ TEST-NET placeholder, health не должен звать его warn"
+
+
 def test_vps_unreachable_does_not_mask_down_into_degraded(monkeypatch):
     """REGRESSION-гвард #194: VPS-unreachable при «всё мертво» НЕ превращает down в degraded.
 
