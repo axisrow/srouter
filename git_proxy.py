@@ -205,6 +205,37 @@ def enable():
     return {"ok": True, "proxy": _PROXY}
 
 
+def _is_partial_restore_of(current_values, backup_values):
+    """current_values выглядит как ПРЕРВАННОЕ восстановление backup_values — строгий непустой
+    префикс (порядок совпадает с тем, как _write_values пишет значения последовательно через
+    --add). Round 5 cycle-review issue #222: `_write_values`'s собственный rollback целится в
+    pre-call snapshot KEY, НЕ в backup — если restore ВНУТРИ self-healing (KEY-absent или
+    foreign-matches-backup ветка) сам частично падает посреди цикла --add, KEY застревает на
+    ПОДМНОЖЕСТВЕ backup (напр. backup=[A,B,C], restore падает на B -> KEY=[A]). Такое подмножество
+    статистически неотличимо от случайного стороннего значения по строгому equality-сравнению —
+    но префиксное совпадение с backup практически невозможно для настоящего чужого значения
+    (нужно случайно совпасть С НАЧАЛА списка ровно наших забэкапленных значений). Используется
+    как recovery-эвристика, НЕ заменяет строгий value-match для обычного "чужое значение, не трогаем".
+    """
+    return (
+        0 < len(current_values) < len(backup_values)
+        and current_values == backup_values[:len(current_values)]
+    )
+
+
+def _restore_backup_into_key():
+    """Восстановить backup в KEY и убрать backup-ключ. {ok, err}. Общий шаг всех self-healing веток."""
+    backup = _backup_state()
+    if backup["unknown"]:
+        return {"ok": False, "err": "git config --get-all backup failed"}
+    if not backup["present"]:
+        return {"ok": True}  # backup уже нет — идемпотентно (ничего восстанавливать)
+    w = _write_values(KEY, backup["values"])
+    if not w["ok"]:
+        return {"ok": False, "err": w["err"]}
+    return _unset_all(_BACKUP_KEY)
+
+
 def disable():
     """Снять/восстановить KEY, ТОЛЬКО если текущее значение == наш managed _PROXY. {ok, err}.
 
@@ -230,23 +261,27 @@ def disable():
     KEY absent — идемпотентный no-op ТОЛЬКО если backup ТОЖЕ absent (нормальное «ничего никогда
     не было установлено»); если backup present — восстанавливаем его в KEY, симметрично основной
     restore-ветке ниже.
+
+    Self-healing при ЧАСТИЧНО восстановленном backup (round 5 cycle-review issue #222): restore
+    ВНУТРИ любой из self-healing веток (или основного restore-пути ниже) — ТОЖЕ мутация через
+    `_write_values`, которая сама может частично отказать (см. докстринг `_write_values`). Тогда
+    current застревает на СТРОГОМ ПРЕФИКСЕ backup, а не на полном backup и не на absent — обе
+    предыдущие self-healing-ветки его не распознавали (не равен ни [_PROXY]/absent, ни backup
+    целиком) и классифицировали как "чужое значение, никогда не трогаем", хороня backup и
+    оставшиеся значения безвозвратно. `_is_partial_restore_of` ловит этот случай ДО capitulation
+    в fail-closed ветку и повторяет restore.
     """
     current = _get_all(KEY)
     if current["unknown"]:
         return {"ok": False, "err": "git config --get-all failed (non-absent rc)"}
+
     if not current["present"]:
         backup = _backup_state()
         if backup["unknown"]:
             return {"ok": False, "err": "git config --get-all backup failed"}
         if not backup["present"]:
             return {"ok": True}  # ни ключа, ни backup — идемпотентно, чистое "ничего не было"
-        w = _write_values(KEY, backup["values"])
-        if not w["ok"]:
-            return {"ok": False, "err": w["err"]}
-        c = _unset_all(_BACKUP_KEY)
-        if not c["ok"]:
-            return {"ok": False, "err": c["err"]}
-        return {"ok": True}
+        return _restore_backup_into_key()
 
     if current["values"] != [_PROXY]:
         backup = _backup_state()
@@ -256,19 +291,10 @@ def disable():
             # current уже == restored backup -> предыдущий disable() прервался ПОСЛЕ restore, но
             # ДО cleanup backup-ключа. Значение не трогаем, только доубираем сиротский backup.
             return _unset_all(_BACKUP_KEY)
+        if backup["present"] and _is_partial_restore_of(current["values"], backup["values"]):
+            # current — незавершённый restore backup (строгий префикс), не легитимное чужое
+            # значение — довершаем restore, а не капитулируем в "не трогаем".
+            return _restore_backup_into_key()
         return {"ok": True}  # чужое текущее значение (или multi-value чужое) — не трогаем
 
-    backup = _backup_state()
-    if backup["unknown"]:
-        return {"ok": False, "err": "git config --get-all backup failed"}
-
-    if backup["present"]:
-        w = _write_values(KEY, backup["values"])
-        if not w["ok"]:
-            return {"ok": False, "err": w["err"]}
-        c = _unset_all(_BACKUP_KEY)
-        if not c["ok"]:
-            return {"ok": False, "err": c["err"]}
-        return {"ok": True}
-
-    return _unset_all(KEY)
+    return _restore_backup_into_key() if _backup_state()["present"] else _unset_all(KEY)

@@ -612,3 +612,59 @@ def test_disable_self_heals_when_key_absent_but_backup_matches_history(real_git_
         "-- иначе self-healing недостижима именно в этом (реальном, воспроизведённом) сценарии"
     )
     assert git_proxy._backup_state()["present"] is False, "backup убран после успешного восстановления"
+
+
+# ==== Round 5 (codex-review-222-round5): partial restore внутри self-healing застревает навсегда ====
+
+def test_disable_self_heal_partial_restore_does_not_get_stuck_permanently(monkeypatch, real_git_home):
+    """Regression (round 5, confirmed воспроизведённый баг): self-healing-when-absent ветка вызывает
+    `_write_values(KEY, backup["values"])`. Если ЭТА запись частично падает (multi-value backup
+    [A,B,C], --add B падает после успешного --add A) — `_write_values`'s собственный rollback
+    целится в PRE-CALL snapshot KEY (который был absent), а не в backup — rollback с пустым
+    original_values не убирает уже записанное A. KEY застревает на ["A"] (не absent, не [_PROXY],
+    не полный backup) — ни self-healing-when-absent (KEY уже present), ни self-healing-orphan
+    (backup=[A,B,C] != current=[A], строгое равенство ложно) больше не срабатывают. Следующие
+    disable() навсегда классифицируют ["A"] как "чужое значение, не трогаем" -- backup остаётся
+    orphan-мусором, B и C потеряны безвозвратно.
+
+    Фикс: self-healing распознаёт "current — частично восстановленный backup" (а не просто "backup
+    == current") и ПОВТОРЯЕТ restore вместо капитуляции в "чужое, не трогаем".
+    """
+    _raw_set_add(git_proxy.KEY, "A", real_git_home)
+    _raw_set_add(git_proxy.KEY, "B", real_git_home)
+    _raw_set_add(git_proxy.KEY, "C", real_git_home)
+    assert git_proxy.enable()["ok"] is True  # backup = [A, B, C]
+
+    # Симулируем крэш: KEY снят целиком (как будто процесс убит после _unset_all, до восстановления).
+    assert git_proxy._unset_all(git_proxy.KEY)["ok"] is True
+    assert git_proxy._get_all(git_proxy.KEY)["present"] is False
+    assert git_proxy._backup_state()["values"] == ["A", "B", "C"]
+
+    real_run = sys_probe.run
+
+    def _fail_add_b_once(cmd, **kwargs):
+        if cmd[-2:] == [git_proxy.KEY, "B"]:
+            monkeypatch.setattr(git_proxy.sys_probe, "run", real_run)  # только один раз
+            return {"rc": 1, "out": "", "err": "simulated failure on B", "timeout": False}
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(git_proxy.sys_probe, "run", _fail_add_b_once)
+
+    r1 = git_proxy.disable()  # self-healing-when-absent пытается restore, частично падает на B
+    assert r1["ok"] is False, "частичный restore внутри self-healing -> честный отказ, не ok=True"
+
+    # KEY теперь в частично-восстановленном состоянии (не absent, не полный backup).
+    stuck = git_proxy._get_all(git_proxy.KEY)
+    assert stuck["present"] is True
+    assert stuck["values"] != ["A", "B", "C"], "sanity: реально частичное состояние, не полный backup"
+
+    # Повторный disable() (среда уже "починилась", мок был one-shot) ДОЛЖЕН довести дело до конца,
+    # а не классифицировать частично-восстановленный backup как "чужое значение, никогда не трогаем".
+    r2 = git_proxy.disable()
+    assert r2["ok"] is True, "повторный disable() обязан суметь довершить прерванный restore"
+
+    final = git_proxy.status()
+    assert final["values"] == ["A", "B", "C"], (
+        "backup должен быть полностью восстановлен, ничего не потеряно безвозвратно"
+    )
+    assert git_proxy._backup_state()["present"] is False, "backup убран после успешного восстановления"
