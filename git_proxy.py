@@ -10,17 +10,30 @@ git-серверы (GitLab, корпоративные) идут напряму�
 Состояние = сам ~/.gitconfig (единый источник правды, НЕ дублируется в srouter-state). git config
 правит пользовательский файл от текущего юзера — root НЕ нужен. Функции не бросают (probe-канон).
 
-Provenance (fail-closed value-match, канон vscode_proxy.disable, #112): disable() снимает KEY
-ТОЛЬКО если текущее значение == наш managed _PROXY — ручную смену прокси после install не трогает.
-enable() перезаписывает существующее значение безусловно (install = «одна команда, всё настроено»,
-issue #130). НЕТ backup/restore исходного чужого значения при uninstall — сложная provenance-модель
-(empty-value-aware, multi-value-aware, read-after-write verify) вынесена в issue #222 как отдельная
-задача; здесь только узкий фикс «не стирать чужое ПОСЛЕ install» без полного round-trip восстановления.
+Provenance (issue #222, verify-don't-guess — 3 раунда rc/bool()-эвристик найдены Codex adversarial
+cycle-review PR #221/#130, каждая новая дыра в той же категории):
+
+1. Presence != truthy. `git config --get` при пустом значении даёт rc=0/out="" — валидный override
+   ("ключ есть, но пустой"), НЕ "ключа нет" (rc=1). status() репортит `present` отдельно от `proxy`.
+2. Multi-value-aware. Ключ может иметь НЕСКОЛЬКО значений (`--add` дважды). `--get`/bool() видят
+   только последнее. Мы читаем через `--get-all` (полный список) и явно отслеживаем `multi`.
+3. Read-after-write verify. `git config --unset` на multi-valued key возвращает rc=5 — тот же код,
+   что и «ключа нет» — но НИЧЕГО НЕ УДАЛЯЕТ (мутация отказывает целиком, проверено эмпирически:
+   `--add x1 --add x2 --unset` → rc=5, `--get-all` всё ещё [x1, x2]). Каждая мутация (--unset-all/
+   --add/set) подтверждается контрольным чтением через --get-all, а не доверием к rc.
+4. Backup — ПОЛНЫЙ список чужих значений (не одно), сериализован в _BACKUP_KEY через один --add на
+   значение. Обновляется на КАЖДОЕ новое foreign-состояние между generations (enable() каждый раз
+   сверяет текущий foreign-список с уже забэкапленным и переписывает backup, если они разошлись) —
+   не только "backup отсутствует, бэкапим первый раз" (что теряло промежуточные чужие значения при
+   A→install→manual B→uninstall→install→uninstall).
 """
 import sys_probe
 
 GIT = "/usr/bin/git"
 KEY = "http.https://github.com.proxy"
+# Backup списка исходных чужих значений (created/overwrote-канон install_lib.py, но БЕЗ отдельного
+# state-файла — состояние модуля = сам ~/.gitconfig, backup живёт там же как доп. ключ).
+_BACKUP_KEY = KEY + "-srouter-backup"
 
 # Прокси = SOCKS5 xray (10808). Берём из dashboard_common если доступен; fallback на хардкод,
 # чтобы модуль не падал в среде без srouter_config (git_proxy не должен тянуть конфиг инфраструктуры).
@@ -30,49 +43,164 @@ except Exception:
     _PROXY = "socks5h://127.0.0.1:10808"
 
 
-def status():
-    """{enabled: bool, proxy: str, key, scoped}. НЕ бросает.
+def _get_all(key, timeout=4):
+    """Полный список значений KEY. {present, values, multi, unknown}. Не бросает.
 
-    rc=1 + пустой out — задокументированное «ключа нет» (НЕ ошибка). Любой другой ненулевой rc
-    (permission denied, malformed config, git отсутствует) — реальный сбой чтения, status="unknown".
-    Codex cycle-review PR #221 round 2: раньше любой non-timeout rc маскировался под enabled=False,
-    и disable() врал ok=True без реальной попытки очистки.
+    rc=0 → присутствует (values = все строки, возможно с пустыми). rc=1 → задокументированное
+    «ключа/секции нет» (НЕ ошибка). Любой другой rc (permission denied, malformed config, timeout)
+    — реальный сбой чтения, unknown=True (fail-closed, отличаем от «ключа нет»).
+
+    `-z` (NUL-terminated) — принципиально, НЕ `\\n`-split (Codex cycle-review PR #221 round 3,
+    issue #222): sys_probe.run применяет `.strip()` к сырому выводу (sys_probe.py) ДО парсинга —
+    при `\\n`-разделении это молча съедает пустое значение, если оно СТОИТ ПЕРВЫМ/ПОСЛЕДНИМ в
+    multi-value списке (`'\\nA\\nB\\n'.strip()` → `'A\\nB'` теряет ведущее пустое значение).
+    `-z` не подвержен этому (`.strip()` не трогает NUL-байты) и, дополнительно, корректно отличает
+    ОДНО значение с embedded `\\n` от НЕСКОЛЬКИХ отдельных значений (`\\n`-split спутал бы их).
     """
-    r = sys_probe.run([GIT, "config", "--global", "--get", KEY], timeout=4)
+    r = sys_probe.run([GIT, "config", "--global", "--get-all", "-z", key], timeout=timeout)
     if r.get("timeout"):
-        return {"enabled": False, "proxy": "", "key": KEY, "status": "unknown"}
+        return {"present": False, "values": [], "multi": False, "unknown": True}
     rc = r.get("rc")
-    if rc not in (0, 1):
-        return {"enabled": False, "proxy": "", "key": KEY, "status": "unknown"}
-    out = (r.get("out") or "").strip()
-    return {"enabled": bool(out), "proxy": out, "key": KEY}
+    if rc == 1:
+        return {"present": False, "values": [], "multi": False, "unknown": False}
+    if rc != 0:
+        return {"present": False, "values": [], "multi": False, "unknown": True}
+    out = r.get("out") or ""
+    # NUL-terminated: последний split-элемент после финального разделителя — пустой хвост, отбросить.
+    values = out.split("\x00")[:-1] if out else [""]
+    return {"present": True, "values": values, "multi": len(values) > 1, "unknown": False}
+
+
+def _unset_all(key, timeout=5):
+    """Снять ВСЕ значения KEY (--unset-all, безопасно для multi-value — не частичный отказ).
+
+    Read-after-write verify: rc игнорируется как источник истины (rc=5 двусмысленен — и «ключа
+    нет», и, в принципе, отказ) — реальный результат подтверждается повторным --get-all.
+    """
+    sys_probe.run([GIT, "config", "--global", "--unset-all", key], timeout=timeout)
+    after = _get_all(key, timeout=timeout)
+    if after["unknown"]:
+        return {"ok": False, "err": "git config --get-all verify failed after --unset-all"}
+    if after["present"]:
+        return {"ok": False, "err": "git config --unset-all did not remove key (verified)"}
+    return {"ok": True}
+
+
+def _write_values(key, values, timeout=5):
+    """Записать KEY = список values (может быть один или несколько). Verify после записи.
+
+    Реализация: --unset-all (начисто), затем --add на каждое значение — детерминированно
+    работает и для single-, и для multi-value списков, без спец-случаев.
+    """
+    clr = _unset_all(key, timeout=timeout)
+    if not clr["ok"]:
+        return clr
+    for val in values:
+        r = sys_probe.run([GIT, "config", "--global", "--add", key, val], timeout=timeout)
+        if r.get("timeout") or r.get("rc") != 0:
+            return {"ok": False, "err": (r.get("err") or "git config --add failed")[:200]}
+    after = _get_all(key, timeout=timeout)
+    if after["unknown"] or after["values"] != values:
+        return {"ok": False, "err": "git config write verify mismatch after --add"}
+    return {"ok": True}
+
+
+def status():
+    """{enabled, present, proxy, values, multi, key}. НЕ бросает.
+
+    present — ключ реально существует в gitconfig (независимо от значения — пустая строка тоже
+    present=True). proxy — первое значение (для обратной совместимости с single-value путём и
+    UI). values — полный список (multi-value-aware). enabled — present И единственное значение ==
+    наш managed _PROXY (multi-value или чужое значение → enabled=False, fail-closed).
+    """
+    r = _get_all(KEY)
+    if r["unknown"]:
+        return {"enabled": False, "present": False, "proxy": "", "values": [], "multi": False,
+                "key": KEY, "status": "unknown"}
+    proxy = r["values"][0] if r["values"] else ""
+    enabled = r["present"] and not r["multi"] and proxy == _PROXY
+    return {"enabled": enabled, "present": r["present"], "proxy": proxy, "values": r["values"],
+            "multi": r["multi"], "key": KEY}
+
+
+def _backup_state():
+    """Текущий backup (список чужих значений) в _BACKUP_KEY. {present, values, unknown}."""
+    return _get_all(_BACKUP_KEY)
 
 
 def enable():
-    """Прописать KEY = прокси (scoped github.com). {ok, proxy, err}. Перезаписывает безусловно."""
-    r = sys_probe.run([GIT, "config", "--global", KEY, _PROXY], timeout=5)
-    if r.get("timeout") or r.get("rc") != 0:
-        return {"ok": False, "err": (r.get("err") or "git config failed")[:200]}
+    """Прописать KEY = наш managed _PROXY (scoped github.com). {ok, proxy, err}.
+
+    Если текущее значение(-я) чужие (present и не равны ровно [_PROXY]) — бэкапим ПОЛНЫЙ список
+    ПЕРЕД перезаписью, чтобы disable() мог восстановить исходное состояние целиком (multi-value
+    включительно). Backup обновляется на КАЖДОЕ новое foreign-состояние между generations — если
+    текущий foreign-список отличается от уже сохранённого backup, backup переписывается (иначе
+    A→install→manual B→uninstall→install→uninstall терял бы B, восстанавливая устаревший A).
+    Идемпотентно: если текущее значение уже == наш _PROXY (повторный install), backup не трогаем.
+    """
+    current = _get_all(KEY)
+    if current["unknown"]:
+        return {"ok": False, "err": "git config --get-all failed (non-absent rc)"}
+
+    is_foreign = current["present"] and current["values"] != [_PROXY]
+    if is_foreign:
+        backup = _backup_state()
+        if backup["unknown"]:
+            return {"ok": False, "err": "git config --get-all backup check failed"}
+        if backup["values"] != current["values"]:
+            # Foreign-состояние новое (первый install ИЛИ сменилось между generations) — обновляем.
+            rb = _write_values(_BACKUP_KEY, current["values"])
+            if not rb["ok"]:
+                return {"ok": False, "err": rb["err"]}
+
+    w = _write_values(KEY, [_PROXY])
+    if not w["ok"]:
+        return {"ok": False, "err": w["err"]}
     return {"ok": True, "proxy": _PROXY}
 
 
 def disable():
-    """Снять KEY, ТОЛЬКО если текущее значение == наш managed _PROXY. {ok, err}. Идемпотентно.
+    """Снять/восстановить KEY, ТОЛЬКО если текущее значение == наш managed _PROXY. {ok, err}.
 
-    fail-closed provenance (канон vscode_proxy.disable, #112): value-match по ТЕКУЩЕМУ значению —
-    если пользователь вручную сменил прокси после install, текущее значение чужое, не трогаем.
-    НЕ восстанавливает исходное чужое значение, стоявшее ДО install (backup/restore — issue #222).
+    fail-closed value-match (канон vscode_proxy.disable, #112): если текущее значение(-я) чужие
+    (ручная смена после install, ИЛИ multi-value — не наш single-value путь), НЕ трогаем. Если
+    значение — ровно наше — restore backup (полный список, multi-value включительно), если он
+    есть; иначе (created с нуля) — unset начисто. Read-after-write verify на каждом шаге.
+
+    Self-healing orphan backup (Codex cycle-review PR #221 round 3, issue #222 наблюдение C):
+    если restore значения прошёл в ПРЕДЫДУЩЕМ вызове, но cleanup backup-ключа был прерван (краш
+    между двумя git config-мутациями), current больше НЕ равен [_PROXY] — обычная ветка "чужое
+    значение, не трогаем" вернула бы ok=True, оставляя backup мусором навсегда (единственная
+    ветка, которая его чистит, стала бы недостижима). Поэтому: если текущее чужое значение РОВНО
+    совпадает с существующим backup — restore уже случился раньше, доубираем backup.
     """
-    current = status()
-    if current.get("status") == "unknown":
-        return {"ok": False, "err": "git config --get failed (non-absent rc)"}
-    if not current.get("enabled"):
+    current = _get_all(KEY)
+    if current["unknown"]:
+        return {"ok": False, "err": "git config --get-all failed (non-absent rc)"}
+    if not current["present"]:
         return {"ok": True}  # ключа уже нет — идемпотентно
-    if current.get("proxy") != _PROXY:
-        return {"ok": True}  # чужое ТЕКУЩЕЕ значение — не трогаем (fail-closed provenance)
-    r = sys_probe.run([GIT, "config", "--global", "--unset", KEY], timeout=5)
-    rc = r.get("rc")
-    # rc=0 (снят) или rc=5 (раздел/ключ отсутствует — гонка между status() и unset) — оба успех.
-    if r.get("timeout") or rc not in (0, 5):
-        return {"ok": False, "err": (r.get("err") or "git config --unset failed")[:200]}
-    return {"ok": True}
+
+    if current["values"] != [_PROXY]:
+        backup = _backup_state()
+        if backup["unknown"]:
+            return {"ok": False, "err": "git config --get-all backup failed"}
+        if backup["present"] and backup["values"] == current["values"]:
+            # current уже == restored backup -> предыдущий disable() прервался ПОСЛЕ restore, но
+            # ДО cleanup backup-ключа. Значение не трогаем, только доубираем сиротский backup.
+            return _unset_all(_BACKUP_KEY)
+        return {"ok": True}  # чужое текущее значение (или multi-value чужое) — не трогаем
+
+    backup = _backup_state()
+    if backup["unknown"]:
+        return {"ok": False, "err": "git config --get-all backup failed"}
+
+    if backup["present"]:
+        w = _write_values(KEY, backup["values"])
+        if not w["ok"]:
+            return {"ok": False, "err": w["err"]}
+        c = _unset_all(_BACKUP_KEY)
+        if not c["ok"]:
+            return {"ok": False, "err": c["err"]}
+        return {"ok": True}
+
+    return _unset_all(KEY)
