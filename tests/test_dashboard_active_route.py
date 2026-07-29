@@ -58,6 +58,11 @@ def _fresh_dashboard(monkeypatch, state_path):
 
     monkeypatch.setattr(local_state, "_DEFAULT_PATH", state_path)
     monkeypatch.delitem(sys.modules, "dashboard", raising=False)
+    # issue #227: app/роуты живут в dashboard_app.py/dashboard_routes.py — при свежем
+    # импорте dashboard их тоже надо сбросить, иначе Flask ругнётся на повторную
+    # регистрацию роутов на СТАРОМ app (dashboard_app не пересоздаётся сам по себе).
+    monkeypatch.delitem(sys.modules, "dashboard_app", raising=False)
+    monkeypatch.delitem(sys.modules, "dashboard_routes", raising=False)
     cfg = types.ModuleType("srouter_config")
     cfg.GATEWAY = "192.0.2.1"
     cfg.VPN_SERVER = "198.51.100.20"
@@ -67,6 +72,13 @@ def _fresh_dashboard(monkeypatch, state_path):
     dashboard._cache.update(ts=0.0, data=None, active_route_ip="", active_route_key=None)
     dashboard._nodes_cache.update(ts=0.0, data=None)
     return dashboard
+
+
+def _fresh_dashboard_app(monkeypatch):
+    """dashboard_app СВЕЖЕГО импорта dashboard — там физически живёт gather_status и её
+    зависимости (probe_*, STATUS_CACHE_TTL_SEC, _run_status_probe_set, probe_nodes_snapshot);
+    dashboard.py лишь реэкспортирует их (issue #227). Брать ТОЛЬКО после _fresh_dashboard."""
+    return importlib.import_module("dashboard_app")
 
 
 def test_active_route_ip_reads_changed_active_node_without_restart(monkeypatch, tmp_path):
@@ -85,7 +97,8 @@ def test_gather_status_cache_invalidates_when_active_route_ip_changes(monkeypatc
     state_path = tmp_path / "srouter.local.json"
     _write_state(state_path, _state("sg-1"))
     dashboard = _fresh_dashboard(monkeypatch, state_path)
-    monkeypatch.setattr(dashboard, "STATUS_CACHE_TTL_SEC", 999)
+    dashboard_app = _fresh_dashboard_app(monkeypatch)
+    monkeypatch.setattr(dashboard_app, "STATUS_CACHE_TTL_SEC", 999)
 
     run_count = 0
     lock = threading.Lock()
@@ -101,9 +114,9 @@ def test_gather_status_cache_invalidates_when_active_route_ip_changes(monkeypatc
         return inner
 
     for name in PROBE_NAMES:
-        monkeypatch.setattr(dashboard, name, fake_probe(name))
+        monkeypatch.setattr(dashboard_app, name, fake_probe(name))
     monkeypatch.setattr(
-        dashboard,
+        dashboard_app,
         "probe_nodes_snapshot",
         lambda: [{"status": "unknown"}],
     )
@@ -153,7 +166,8 @@ def test_gather_status_hostname_without_route_ip_does_not_block_on_dns(monkeypat
 
     monkeypatch.setattr(local_state.socket, "gethostbyname", slow_dns)
     dashboard = _fresh_dashboard(monkeypatch, state_path)
-    monkeypatch.setattr(dashboard, "STATUS_CACHE_TTL_SEC", 999)
+    dashboard_app = _fresh_dashboard_app(monkeypatch)
+    monkeypatch.setattr(dashboard_app, "STATUS_CACHE_TTL_SEC", 999)
 
     run_count = 0
     kwargs_seen = []
@@ -168,8 +182,8 @@ def test_gather_status_hostname_without_route_ip_does_not_block_on_dns(monkeypat
         return inner
 
     for name in PROBE_NAMES:
-        monkeypatch.setattr(dashboard, name, fake_probe(name))
-    monkeypatch.setattr(dashboard, "probe_nodes_snapshot", lambda: [])
+        monkeypatch.setattr(dashboard_app, name, fake_probe(name))
+    monkeypatch.setattr(dashboard_app, "probe_nodes_snapshot", lambda: [])
 
     started = time.monotonic()
     first = dashboard.gather_status()

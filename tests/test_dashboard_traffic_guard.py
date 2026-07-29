@@ -6,6 +6,11 @@ import types
 
 def _fresh_dashboard(monkeypatch):
     monkeypatch.delitem(sys.modules, "dashboard", raising=False)
+    # issue #227: app/роуты живут в dashboard_app.py/dashboard_routes.py — при свежем
+    # импорте dashboard их тоже надо сбросить, иначе Flask ругнётся на повторную
+    # регистрацию роутов на СТАРОМ app (dashboard_app не пересоздаётся сам по себе).
+    monkeypatch.delitem(sys.modules, "dashboard_app", raising=False)
+    monkeypatch.delitem(sys.modules, "dashboard_routes", raising=False)
     cfg = types.ModuleType("srouter_config")
     cfg.GATEWAY = "192.0.2.1"
     cfg.VPN_SERVER = "198.51.100.20"
@@ -46,14 +51,17 @@ def test_probe_traffic_guard_reports_counts_and_config_status(monkeypatch, tmp_p
 
 def test_gather_status_registers_traffic_guard_probe(monkeypatch):
     dashboard = _fresh_dashboard(monkeypatch)
+    # issue #227: gather_status/_run_status_probe_set/probe_nodes_snapshot физически
+    # живут в dashboard_app.py — dashboard.py лишь реэкспортирует их.
+    dashboard_app = importlib.import_module("dashboard_app")
     seen = {}
 
     def fake_run_probe_set(probes, budget_sec):
         seen.update(probes)
         return {name: {"status": "ok"} for name in probes}
 
-    monkeypatch.setattr(dashboard, "_run_status_probe_set", fake_run_probe_set)
-    monkeypatch.setattr(dashboard, "probe_nodes_snapshot", lambda: [])
+    monkeypatch.setattr(dashboard_app, "_run_status_probe_set", fake_run_probe_set)
+    monkeypatch.setattr(dashboard_app, "probe_nodes_snapshot", lambda: [])
 
     out = dashboard.gather_status()
 

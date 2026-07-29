@@ -7,6 +7,11 @@ import sys_probe
 
 def _fresh_dashboard_without_legacy_vps(monkeypatch):
     monkeypatch.delitem(sys.modules, "dashboard", raising=False)
+    # issue #227: app/роуты живут в dashboard_app.py/dashboard_routes.py — при свежем
+    # импорте dashboard их тоже надо сбросить, иначе Flask ругнётся на повторную
+    # регистрацию роутов на СТАРОМ app (dashboard_app не пересоздаётся сам по себе).
+    monkeypatch.delitem(sys.modules, "dashboard_app", raising=False)
+    monkeypatch.delitem(sys.modules, "dashboard_routes", raising=False)
     dashboard = importlib.import_module("dashboard")
     # Пустое состояние: нет активного узла -> route_ip == "". Раньше helper подменял
     # sys.modules["srouter_config"], но активный узел всё равно шёл из srouter.local.json

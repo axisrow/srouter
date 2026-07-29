@@ -17,6 +17,11 @@ def _fresh_dashboard(monkeypatch, state_path):
 
     monkeypatch.setattr(local_state, "_DEFAULT_PATH", state_path)
     monkeypatch.delitem(sys.modules, "dashboard", raising=False)
+    # issue #227: app/роуты живут в dashboard_app.py/dashboard_routes.py — при свежем
+    # импорте dashboard их тоже надо сбросить, иначе Flask ругнётся на повторную
+    # регистрацию роутов на СТАРОМ app (dashboard_app не пересоздаётся сам по себе).
+    monkeypatch.delitem(sys.modules, "dashboard_app", raising=False)
+    monkeypatch.delitem(sys.modules, "dashboard_routes", raising=False)
     cfg = types.ModuleType("srouter_config")
     cfg.GATEWAY = "192.0.2.1"
     cfg.VPN_SERVER = "198.51.100.20"
@@ -137,14 +142,17 @@ def test_api_status_contains_hot_routes_section(monkeypatch, tmp_path):
     state_path = tmp_path / "srouter.local.json"
     _write_state(state_path, {"enabled": False})
     dashboard = _fresh_dashboard(monkeypatch, state_path)
+    # issue #227: gather_status/_run_status_probe_set/probe_nodes_snapshot физически
+    # живут в dashboard_app.py — dashboard.py лишь реэкспортирует их.
+    dashboard_app = importlib.import_module("dashboard_app")
     seen = {}
 
     def fake_run_probe_set(probes, budget_sec):
         seen.update(probes)
         return {name: {"status": "ok"} for name in probes}
 
-    monkeypatch.setattr(dashboard, "_run_status_probe_set", fake_run_probe_set)
-    monkeypatch.setattr(dashboard, "probe_nodes_snapshot", lambda: [])
+    monkeypatch.setattr(dashboard_app, "_run_status_probe_set", fake_run_probe_set)
+    monkeypatch.setattr(dashboard_app, "probe_nodes_snapshot", lambda: [])
 
     response = dashboard.app.test_client().get("/api/status")
 
@@ -157,6 +165,7 @@ def test_api_status_hot_routes_public_domains_exclude_timing_metadata(monkeypatc
     state_path = tmp_path / "srouter.local.json"
     _write_state(state_path, {"enabled": True})
     dashboard = _fresh_dashboard(monkeypatch, state_path)
+    dashboard_app = importlib.import_module("dashboard_app")
 
     monkeypatch.setattr(
         dashboard_hotroutes.hot_routes,
@@ -195,8 +204,8 @@ def test_api_status_hot_routes_public_domains_exclude_timing_metadata(monkeypatc
             for name, fn in probes.items()
         }
 
-    monkeypatch.setattr(dashboard, "_run_status_probe_set", fake_run_probe_set)
-    monkeypatch.setattr(dashboard, "probe_nodes_snapshot", lambda: [])
+    monkeypatch.setattr(dashboard_app, "_run_status_probe_set", fake_run_probe_set)
+    monkeypatch.setattr(dashboard_app, "probe_nodes_snapshot", lambda: [])
 
     response = dashboard.app.test_client().get("/api/status")
 

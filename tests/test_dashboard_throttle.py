@@ -15,6 +15,11 @@ import types
 def _fresh_dashboard(monkeypatch):
     """Свежий импорт dashboard с замоканным srouter_config (как в соседних тестах)."""
     monkeypatch.delitem(sys.modules, "dashboard", raising=False)
+    # issue #227: app/роуты живут в dashboard_app.py/dashboard_routes.py — при свежем
+    # импорте dashboard их тоже надо сбросить, иначе Flask ругнётся на повторную
+    # регистрацию роутов на СТАРОМ app (dashboard_app не пересоздаётся сам по себе).
+    monkeypatch.delitem(sys.modules, "dashboard_app", raising=False)
+    monkeypatch.delitem(sys.modules, "dashboard_routes", raising=False)
     cfg = types.ModuleType("srouter_config")
     cfg.GATEWAY = "192.0.2.1"
     cfg.VPN_SERVER = "198.51.100.20"

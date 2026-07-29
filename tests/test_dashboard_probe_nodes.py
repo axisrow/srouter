@@ -9,6 +9,11 @@ import sys_probe
 
 def _fresh_dashboard(monkeypatch):
     monkeypatch.delitem(sys.modules, "dashboard", raising=False)
+    # issue #227: app/роуты живут в dashboard_app.py/dashboard_routes.py — при свежем
+    # импорте dashboard их тоже надо сбросить, иначе Flask ругнётся на повторную
+    # регистрацию роутов на СТАРОМ app (dashboard_app не пересоздаётся сам по себе).
+    monkeypatch.delitem(sys.modules, "dashboard_app", raising=False)
+    monkeypatch.delitem(sys.modules, "dashboard_routes", raising=False)
     cfg = types.ModuleType("srouter_config")
     cfg.GATEWAY = "192.0.2.1"
     cfg.VPN_SERVER = "198.51.100.20"
@@ -174,6 +179,9 @@ def test_probe_nodes_missing_or_invalid_socks_degrades_without_curl(monkeypatch,
 
 def test_gather_status_returns_node_snapshot_without_running_heavy_probe(monkeypatch):
     dashboard = _fresh_dashboard(monkeypatch)
+    # issue #227: gather_status и её probe_*-зависимости физически живут в dashboard_app.py
+    # (dashboard.py — тонкий фасад-реэкспорт) — патчим точку реального вызова.
+    dashboard_app = importlib.import_module("dashboard_app")
     dashboard._cache.update(ts=0.0, data=None)
     called = False
 
@@ -192,7 +200,7 @@ def test_gather_status_returns_node_snapshot_without_running_heavy_probe(monkeyp
         "probe_exit_ips_per_iface",
         "probe_geo_distance",
     ):
-        monkeypatch.setattr(dashboard, name, lambda *args, name=name, **kwargs: {"status": "ok", "probe": name})
+        monkeypatch.setattr(dashboard_app, name, lambda *args, name=name, **kwargs: {"status": "ok", "probe": name})
 
     def slow_probe_nodes():
         nonlocal called
@@ -200,6 +208,10 @@ def test_gather_status_returns_node_snapshot_without_running_heavy_probe(monkeyp
         time.sleep(0.2)
         return [{"name": "sg-1", "status": "ok"}]
 
+    # probe_nodes (ТЯЖЁЛЫЙ probe) патчится здесь лишь чтобы доказать: если бы gather_status
+    # его вызвала — тест бы это заметил через called/elapsed. gather_status использует
+    # ЛЁГКИЙ probe_nodes_snapshot (dashboard_nodes.py), который probe_nodes не зовёт —
+    # поэтому точка патчинга (dashboard vs dashboard_routes) здесь не влияет на результат.
     monkeypatch.setattr(dashboard, "probe_nodes", slow_probe_nodes)
     monkeypatch.setattr(
         dashboard.local_state,
@@ -229,8 +241,10 @@ def test_gather_status_returns_node_snapshot_without_running_heavy_probe(monkeyp
 
 def test_gather_status_timeout_does_not_wait_for_executor_shutdown(monkeypatch):
     dashboard = _fresh_dashboard(monkeypatch)
+    # issue #227: gather_status и её probe_*-зависимости физически живут в dashboard_app.py.
+    dashboard_app = importlib.import_module("dashboard_app")
     dashboard._cache.update(ts=0.0, data=None)
-    monkeypatch.setattr(dashboard, "STATUS_PROBE_BUDGET_SEC", 0.01)
+    monkeypatch.setattr(dashboard_app, "STATUS_PROBE_BUDGET_SEC", 0.01)
 
     def slow_probe():
         time.sleep(0.2)
@@ -252,11 +266,11 @@ def test_gather_status_timeout_does_not_wait_for_executor_shutdown(monkeypatch):
         "probe_geo_distance",
     ):
         monkeypatch.setattr(
-            dashboard,
+            dashboard_app,
             name,
             slow_probe if name == "probe_services" else lambda *args, **kwargs: {"status": "ok"},
         )
-    monkeypatch.setattr(dashboard, "probe_nodes_snapshot", lambda: [])
+    monkeypatch.setattr(dashboard_app, "probe_nodes_snapshot", lambda: [])
 
     started = time.monotonic()
     out = dashboard.gather_status()
@@ -270,7 +284,10 @@ def test_gather_status_timeout_does_not_wait_for_executor_shutdown(monkeypatch):
 
 def test_api_probe_nodes_is_explicit_heavy_probe_endpoint(monkeypatch):
     dashboard = _fresh_dashboard(monkeypatch)
-    monkeypatch.setattr(dashboard, "probe_nodes", lambda: [{"name": "sg-1", "status": "ok"}])
+    # issue #227: api_probe_nodes (роут /api/probe/nodes) резолвит probe_nodes внутри
+    # dashboard_routes.py (dashboard.py — тонкий фасад-реэкспорт).
+    dashboard_routes = importlib.import_module("dashboard_routes")
+    monkeypatch.setattr(dashboard_routes, "probe_nodes", lambda: [{"name": "sg-1", "status": "ok"}])
 
     response = dashboard.app.test_client().get("/api/probe/nodes")
 
