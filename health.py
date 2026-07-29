@@ -1863,9 +1863,10 @@ def _vscode_proxy_check():
 #   1. env: srouter ставит И uppercase (HTTP_PROXY), И lowercase (http_proxy) — Go httpproxy
 #      fallback читает оба регистра. Снимать надо ВСЕ: HTTP_PROXY/http_proxy, HTTPS_PROXY/https_proxy,
 #      ALL_PROXY/all_proxy, NO_PROXY/no_proxy.
-#   2. git-config: `http.https://github.com.proxy` (git_proxy.enable) — env -u его НЕ трогает
-#      (verify: `git config --get-urlmatch` после env -u = 127.0.0.1:8118, прокси активен).
-#      Снимается `git -c http.https://github.com.proxy= <cmd>` (переопределение на лету, пустое).
+#   2. git-config: `http.https://github.com.proxy` (git_proxy.enable, SOCKS5 xray 10808 — #130) —
+#      env -u его НЕ трогает (verify: `git config --get-urlmatch` после env -u всё ещё показывает
+#      прокси активным). Снимается `git -c http.https://github.com.proxy= <cmd>` (переопределение
+#      на лету, пустое).
 # gh repo clone делегирует внутреннему git → scoped git-config применяется к clone (не чистый gh-путь).
 GH_DIRECT_HINT = (
     "gh (Go-стек) и git-over-https — РАЗНЫЕ стеки прокси, разные команды (verify 2026-07-27):\n"
@@ -1918,7 +1919,7 @@ def _github_direct_check():
                 "detail": "git github-proxy выключен — github идёт напрямую (VPS-независимо). "
                           "Если gh/git timeout через прокси: " + GH_DIRECT_HINT}
     return {"status": "warn",
-            "detail": f"git github-proxy ВКЛЮЧЁН ({st.get('proxy') or 'privoxy 8118'}) → "
+            "detail": f"git github-proxy ВКЛЮЧЁН ({st.get('proxy') or 'xray SOCKS5 10808'}) → "
                       f"git pull/push зависит от VPS. " + GH_DIRECT_HINT}
 
 

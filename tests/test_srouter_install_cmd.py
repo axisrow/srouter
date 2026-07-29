@@ -44,6 +44,8 @@ def _stub_cmd_install_internals(monkeypatch, *, apply_ok=True, tty=True):
                         lambda **k: {"ok": apply_ok, "blocked": []})
     # best-effort хелперы после успешного apply (мокаем, чтобы не трогать реальную ФС/сеть).
     monkeypatch.setattr(srouter, "claude_proxy", SimpleNamespace(enable=lambda: {"ok": True}))
+    # issue #130: git → SOCKS5 (xray 10808) через gitconfig, симметрично claude_proxy/vscode_proxy.
+    monkeypatch.setattr(srouter, "git_proxy", SimpleNamespace(enable=lambda: {"ok": True, "proxy": "socks5h://127.0.0.1:10808"}))
     monkeypatch.setattr(srouter, "_install_generic_launchagent", lambda *a, **k: (True, ""))
     monkeypatch.setattr(srouter, "_install_ppp_hook", lambda *a, **k: "")
     monkeypatch.setattr(srouter, "_install_codex_wrappers", lambda env: "")
@@ -170,3 +172,18 @@ def test_cmd_install_activates_codenv_and_vscode_proxy(monkeypatch):
         "install обязан активировать scoped VSCode http.proxy (#185) для codex-расширения "
         "openai.chatgpt — отдельный клиент от ChatGPT.app."
     )
+
+
+# ============================ issue #130: git → SOCKS5 через gitconfig, автоматически в install =====
+def test_cmd_install_enables_git_proxy(monkeypatch):
+    """issue #130: install обязан вызвать git_proxy.enable() — git ходит через SOCKS5 (xray 10808)
+    scoped на github.com, без ручной правки ~/.gitconfig."""
+    _stub_cmd_install_internals(monkeypatch, apply_ok=True, tty=False)
+    calls = {"git_enable": 0}
+    monkeypatch.setattr(srouter, "git_proxy", SimpleNamespace(
+        enable=lambda: (calls.__setitem__("git_enable", 1), {"ok": True, "proxy": "socks5h://127.0.0.1:10808"})[1]))
+
+    rc = srouter.cmd_install(_args(yes=True))
+
+    assert rc == 0
+    assert calls["git_enable"] == 1, "install обязан настроить git-прокси автоматически (#130)"

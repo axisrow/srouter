@@ -58,6 +58,33 @@ def test_enable_rejects_socks_without_mutating_settings(monkeypatch, tmp_path):
     assert claude_proxy.status()["enabled"] is False
 
 
+def test_enable_overwrites_stale_socks5_from_previous_experiments(monkeypatch, tmp_path):
+    """Regression issue #130: settings.json с мусором от экспериментов (SOCKS5 fiasco #127) —
+    HTTPS_PROXY=socks5h://... — enable() ДОЛЖЕН перезаписать на HTTP, не оставлять смесь рядом.
+
+    Сценарий из issue: после экспериментов ~/.claude/settings.json может содержать
+    HTTPS_PROXY=socks5h://127.0.0.1:10808 (SOCKS5, официально не поддерживается Claude Code —
+    UnsupportedProxyProtocol). install должен привести к чистому HTTP-состоянию автоматически.
+    """
+    settings = _setup(monkeypatch, tmp_path)
+    settings.write_text(json.dumps({"env": {
+        "HTTPS_PROXY": "socks5h://127.0.0.1:10808",
+        "HTTP_PROXY": "socks5h://127.0.0.1:10808",
+        "KEEP": "yes",
+    }}))
+
+    r = claude_proxy.enable()
+
+    assert r["ok"] is True
+    data = json.loads(settings.read_text())
+    assert data["env"]["HTTPS_PROXY"] == EXPECTED_CLAUDE_PROXY, "SOCKS5-мусор перезаписан на HTTP"
+    assert data["env"]["HTTP_PROXY"] == EXPECTED_CLAUDE_PROXY, "SOCKS5-мусор перезаписан на HTTP"
+    assert data["env"]["KEEP"] == "yes"
+    s = claude_proxy.status()
+    assert s["enabled"] is True
+    assert s["proxy"] == EXPECTED_CLAUDE_PROXY
+
+
 def test_enable_preserves_existing_env(monkeypatch, tmp_path):
     """enable НЕ должен терять другие env-ключи (TRAVELPAYOUTS_TOKEN, IS_DEMO и т.д.)."""
     settings = _setup(monkeypatch, tmp_path)

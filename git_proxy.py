@@ -1,8 +1,11 @@
 """Вкл/откл git-прокси для github.com в ~/.gitconfig (через `git config --global`).
 
 У пользователя сломан прямой IPv4-путь к github (тормозит/отваливается), а у github нет AAAA
-(только IPv4). Рабочий путь — через privoxy (8118). Эта настройка scoped ТОЛЬКО на github.com:
-другие git-серверы (GitLab, корпоративные) идут напрямую, как раньше.
+(только IPv4). Рабочий путь — через xray. Эта настройка scoped ТОЛЬКО на github.com: другие
+git-серверы (GitLab, корпоративные) идут напрямую, как раньше.
+
+Прокси = SOCKS5 (xray 10808), НЕ HTTP (privoxy 8118) — канон issue #130: git умеет нативный SOCKS5
+(в отличие от Claude Code, см. claude_proxy.py), а privoxy лишний хоп для git-операций.
 
 Состояние = сам ~/.gitconfig (единый источник правды, НЕ дублируется в srouter-state). git config
 правит пользовательский файл от текущего юзера — root НЕ нужен. Функции не бросают (probe-канон).
@@ -12,12 +15,12 @@ import sys_probe
 GIT = "/usr/bin/git"
 KEY = "http.https://github.com.proxy"
 
-# Прокси = privoxy (8118). Берём из dashboard_common если доступен; fallback на хардкод,
+# Прокси = SOCKS5 xray (10808). Берём из dashboard_common если доступен; fallback на хардкод,
 # чтобы модуль не падал в среде без srouter_config (git_proxy не должен тянуть конфиг инфраструктуры).
 try:
-    from dashboard_common import HTTP_PROXY_URL as _PROXY  # http://127.0.0.1:8118
+    from dashboard_common import SOCKS_PROXY_URL as _PROXY  # socks5h://127.0.0.1:10808
 except Exception:
-    _PROXY = "http://127.0.0.1:8118"
+    _PROXY = "socks5h://127.0.0.1:10808"
 
 
 def status():
