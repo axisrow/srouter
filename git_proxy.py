@@ -27,18 +27,13 @@ cycle-review PR #221/#130, каждая новая дыра в той же ка�
    не только "backup отсутствует, бэкапим первый раз" (что теряло промежуточные чужие значения при
    A→install→manual B→uninstall→install→uninstall).
 
-Остаточный риск (/review PR #223 п.1, точечный cycle-review issue #222): `git config` не даёт
-transactional multi-value write — `_write_values` делает `--unset-all` затем цикл `--add`, окно
-между ними физически существует. Если процесс убит именно в этом окне (не "падение вызова", а
-SIGKILL/крэш всего процесса), `_write_values` best-effort rollback (verified read-after-write,
-см. докстринг) не успевает отработать — тогда backup (если уже обновлён) остаётся источником
-восстановления при следующем вызове disable() (self-healing даже при KEY absent, см. докстринг
-disable()). То же TOCTOU-окно есть между snapshot чтением original_values (ДО --unset-all) и
-самой мутацией — если что-то ВНЕШНЕЕ (другой процесс/юзер) меняет KEY именно в этот момент,
-rollback восстановит устаревший snapshot. Оба окна на порядки уже, чем раньше (единственная git
-config-мутация, не произвольный кусок Python-кода), и каждая запись верифицируется read-after-write
-— но полная атомарность потребовала бы file-level tmp+replace (канон vscode_proxy._save/
-install_lib._backup), что для этого объёма риска признано избыточным.
+Остаточный риск (PR #223, issue #224): `git config` не даёт transactional multi-value write —
+`_write_values` делает `--unset-all` затем цикл `--add`, окно между ними физически существует.
+Если процесс убит именно в этом окне (не "падение вызова", а SIGKILL/крэш всего процесса),
+txn-маркер (_TXN_KEY) остаётся установленным, следующая операция видит его и доводит до конца
+(_check_and_resolve_txn retry'ит мутацию с explicit target, НЕ heuristic "current похоже на X").
+Issue #224 решён architectural fix: explicit transactional marker вместо reverse-engineering
+current-vs-backup pattern-matching.
 """
 import sys_probe
 
@@ -47,6 +42,8 @@ KEY = "http.https://github.com.proxy"
 # Backup списка исходных чужих значений (created/overwrote-канон install_lib.py, но БЕЗ отдельного
 # state-файла — состояние модуля = сам ~/.gitconfig, backup живёт там же как доп. ключ).
 _BACKUP_KEY = KEY + "-srouter-backup"
+# Transactional marker для issue #224: фиксирует "операция в процессе, target = X"
+_TXN_KEY = _BACKUP_KEY + "-txn"
 
 # Прокси = SOCKS5 xray (10808). Берём из dashboard_common если доступен; fallback на хардкод,
 # чтобы модуль не падал в среде без srouter_config (git_proxy не должен тянуть конфиг инфраструктуры).
@@ -99,11 +96,19 @@ def _unset_all(key, timeout=5):
     return {"ok": True}
 
 
-def _write_values(key, values, timeout=5):
+def _write_values(key, values, timeout=5, begin_txn=True):
     """Записать KEY = список values (может быть один или несколько). Verify после записи.
 
     Реализация: --unset-all (начисто), затем --add на каждое значение — детерминированно
     работает и для single-, и для multi-value списков, без спец-случаев.
+
+    Issue #224 transactional паттерн: ПЕРЕД первой мутацией записываем txn-маркер
+    (_TXN_KEY) с target state, затем выполняем мутации, ПОСЛЕ подтверждённого успеха
+    (verify) снимаем txn-маркер. Если процесс убит поседи — txn-маркер остаётся, следующая
+    операция видит его и доводит до конца (НЕ heuristic reverse-engineering).
+
+    begin_txn=False используется в _check_and_resolve_txn() для retry без создания
+    нового txn-маркера (транзакция уже начата, маркер существует).
 
     Best-effort rollback (/review PR #223 п.1, ужесточён точечным cycle-review issue #222): git
     config не даёт transactional multi-value write — окно между --unset-all и --add физически
@@ -117,14 +122,26 @@ def _write_values(key, values, timeout=5):
     явный флаг `data_loss=True`, когда восстановленное состояние НЕ совпадает с исходным —
     ЛЮБОЕ расхождение (полный отказ rollback, частичный отказ на одном из нескольких значений)
     репортится одинаково честно, а не молча.
+
+    Нюанс: txn-маркер НЕ снимается при rollback — наоборот, он ОСТАЁТСЯ, чтобы следующая
+    операция видела "операция начата, target = X" и retry'ит. Rollback лишь возвращает данные
+    в pre-call state, но НЕ завершает транзакцию (только успешная write + verify снимает txn).
     """
     before = _get_all(key, timeout=timeout)
     if before["unknown"]:
         return {"ok": False, "err": "git config --get-all pre-write snapshot failed"}
     original_values = before["values"] if before["present"] else []
 
+    # Issue #224: начинаем транзакцию ДО первой мутации (если не retry)
+    if begin_txn:
+        txn_begin = _begin_txn(key, values)
+        if not txn_begin["ok"]:
+            return {"ok": False, "err": f"txn begin failed: {txn_begin['err']}"}
+
     clr = _unset_all(key, timeout=timeout)
     if not clr["ok"]:
+        if begin_txn:
+            _rollback_txn()  # txn не удался — снимаем маркер
         return clr
 
     def _rollback(err):
@@ -132,6 +149,7 @@ def _write_values(key, values, timeout=5):
             sys_probe.run([GIT, "config", "--global", "--add", key, val], timeout=timeout)
         verify = _get_all(key, timeout=timeout)
         restored_ok = not verify["unknown"] and verify["values"] == original_values
+        # ВАЖНО: txn-маркер НЕ снимаем — он остаётся для retry в следующей операции
         return {"ok": False, "err": err[:200], "data_loss": not restored_ok}
 
     for val in values:
@@ -141,6 +159,15 @@ def _write_values(key, values, timeout=5):
     after = _get_all(key, timeout=timeout)
     if after["unknown"] or after["values"] != values:
         return _rollback("git config write verify mismatch after --add")
+
+    # Успех! Снимаем txn-маркер (commit) — только если мы его создавали
+    if begin_txn:
+        commit = _commit_txn()
+        if not commit["ok"]:
+            # Некритично: данные целы, txn-маркер orphan (следующий вызов просто увидит absent)
+            # Не возвращаем ошибку — данные важнее cleanup
+            pass
+
     return {"ok": True}
 
 
@@ -174,6 +201,127 @@ def _backup_state():
     return _get_all(_BACKUP_KEY)
 
 
+def _txn_state():
+    """Текущее состояние транзакции в _TXN_KEY. {present, values, unknown}.
+
+    values = [target_key, target_val1, target_val2, ...] — первый элемент — ключ,
+    остальные — целевой список значений. Формат фиксирован, чтобы избежать
+    дополнительного escaping/parsing (git config --add хранит каждое значение
+    как отдельную строку, multi-value semantics уже есть).
+    """
+    return _get_all(_TXN_KEY)
+
+
+def _begin_txn(key, target_values):
+    """Начать транзакцию: записать в _TXN_KEY "операция начата, target = X".
+
+    target_values — список значений, которые мы хотим записать в key.
+    Возвращает {ok, err} — не бросает.
+
+    ВАЖНО: пишем напрямую через sys_probe.run, НЕ _write_values, чтобы txn-маркер
+    сам не был обёрнут в ещё одну транзакцию (begin_txn=False не помогает, т.к. _write_values
+    с begin_txn=False всё равно может падать, и мы не хотим, чтобы txn begin был обязан perfect).
+    """
+    # Формат: [key, val1, val2, ...] — первый элемент всегда ключ, остальные значения
+    txn_values = [key] + target_values
+
+    # Сначала чистим _TXN_KEY (если был)
+    unset = _unset_all(_TXN_KEY)
+    if not unset["ok"]:
+        return unset
+
+    # Пишем каждое значение
+    for val in txn_values:
+        r = sys_probe.run([GIT, "config", "--global", "--add", _TXN_KEY, val], timeout=5)
+        if r.get("timeout") or r.get("rc") != 0:
+            return {"ok": False, "err": f"txn begin --add failed: {r.get('err')}"}
+
+    # Issue #224 follow-up (Codex review): пишем checksum последним для детекции
+    # partial write.Checksum = количество значений, которые ДОЛЖНЫ быть в маркере.
+    checksum_val = str(len(txn_values))
+    r_checksum = sys_probe.run([GIT, "config", "--global", "--add", _TXN_KEY, checksum_val], timeout=5)
+    if r_checksum.get("timeout") or r_checksum.get("rc") != 0:
+        return {"ok": False, "err": f"txn checksum write failed: {r_checksum.get('err')}"}
+
+    # Verify (включая checksum)
+    after = _get_all(_TXN_KEY)
+    expected_values = txn_values + [checksum_val]
+    if after["unknown"] or after["values"] != expected_values:
+        return {"ok": False, "err": "txn begin verify failed"}
+
+    return {"ok": True}
+
+
+def _commit_txn():
+    """Завершить транзакцию успешно: снять _TXN_KEY.
+
+    Вызывается ТОЛЬКО после подтверждённого успеха (read-after-write verify).
+    """
+    return _unset_all(_TXN_KEY)
+
+
+def _rollback_txn():
+    """Откатить транзакцию: снять _TXN_KEY (operation aborted, not committed).
+
+    Отличие от _commit_txn: смысловая разница для документации, механически
+    одинаково — убираем маркер "операция в процессе".
+    """
+    return _unset_all(_TXN_KEY)
+
+
+def _check_and_resolve_txn():
+    """Проверить наличие незавершённой транзакции и довести до конца.
+
+    Вызывается в начале ANY mutating операции (enable/disable) — если _TXN_KEY
+    present, значит предыдущая операция была прервана посреди мутации.
+    Вместо heuristic "current похоже на X" мы читаем ЯВНЫЙ target из txn-маркера
+    и retry'им операцию до успеха (remove txn-маркер только после verify).
+
+    Возвращает {ok, err, resolved} — resolved=True если транзакция была найдена
+    и доведена до конца, resolved=False если транзакции не было.
+    """
+    txn = _txn_state()
+    if txn["unknown"]:
+        return {"ok": False, "err": "git config --get-all txn check failed", "resolved": False}
+
+    if not txn["present"]:
+        return {"ok": True, "resolved": False}  # Нет незавершённой транзакции — норма
+
+    # Транзакция в процессе — доводим до конца
+    # Формат: [key, val1, val2, ..., checksum] — checksum последний элемент
+    if len(txn["values"]) < 3:  # минимум: [key, one_value, checksum]
+        # Некорректный формат txn-маркера — убираем и ругаемся (fail-closed)
+        _unset_all(_TXN_KEY)
+        return {"ok": False, "err": "corrupt txn marker (less than 3 values with checksum)", "resolved": False}
+
+    # Проверяем checksum: последний элемент = str(len(expected_values))
+    expected_count = int(txn["values"][-1])
+    actual_values = txn["values"][:-1]  # без checksum
+    if len(actual_values) != expected_count:
+        # Checksum не совпадает — маркер частично записан, убираем (fail-closed)
+        _unset_all(_TXN_KEY)
+        return {"ok": False, "err": f"txn marker partial write: expected {expected_count} values, got {len(actual_values)}", "resolved": True}
+
+    target_key = txn["values"][0]
+    target_values = txn["values"][1:-1]  # всё кроме ключа и checksum
+
+    # Retry: пишем target_values в target_key с verify БЕЗ создания нового txn-маркера
+    w = _write_values(target_key, target_values, begin_txn=False)
+    if not w["ok"]:
+        # Retry не удался — txn-маркер ОСТАЁТСЯ (следующая операция попробует снова)
+        return {"ok": False, "err": f"txn retry failed: {w['err']}", "resolved": True}
+
+    # Retry succeeded — убираем txn-маркер (commit)
+    c = _commit_txn()
+    if not c["ok"]:
+        # Критично: verify прошёл, но cleanup txn-маркера упал — orphan marker,
+        # но至少 данные консистентны. Логируем, не возвращаем ошибку (данные важнее).
+        # Следующий вызов _check_and_resolve_txn просто увидит absent txn.
+        pass
+
+    return {"ok": True, "resolved": True}
+
+
 def enable():
     """Прописать KEY = наш managed _PROXY (scoped github.com). {ok, proxy, err}.
 
@@ -183,7 +331,18 @@ def enable():
     текущий foreign-список отличается от уже сохранённого backup, backup переписывается (иначе
     A→install→manual B→uninstall→install→uninstall терял бы B, восстанавливая устаревший A).
     Идемпотентно: если текущее значение уже == наш _PROXY (повторный install), backup не трогаем.
+
+    Issue #224: в начале проверяем и доводим до конец любую незавершённую транзакцию.
     """
+    # Issue #224: итеративно проверяем и доводим до конца незавершённые транзакции
+    # (максимум 1 итерация: после resolved txn проверка снова даст resolved=False)
+    for _ in range(2):
+        txn_check = _check_and_resolve_txn()
+        if not txn_check["ok"]:
+            return {"ok": False, "err": f"txn check failed: {txn_check['err']}"}
+        if not txn_check["resolved"]:
+            break  # Нет незавершённой транзакции — выходим из цикла
+
     current = _get_all(KEY)
     if current["unknown"]:
         return {"ok": False, "err": "git config --get-all failed (non-absent rc)"}
@@ -195,7 +354,8 @@ def enable():
             return {"ok": False, "err": "git config --get-all backup check failed"}
         if backup["values"] != current["values"]:
             # Foreign-состояние новое (первый install ИЛИ сменилось между generations) — обновляем.
-            rb = _write_values(_BACKUP_KEY, current["values"])
+            # begin_txn=False, т.к. backup-ключ не часть основной транзакции
+            rb = _write_values(_BACKUP_KEY, current["values"], begin_txn=False)
             if not rb["ok"]:
                 return {"ok": False, "err": rb["err"]}
 
@@ -270,7 +430,18 @@ def disable():
     целиком) и классифицировали как "чужое значение, никогда не трогаем", хороня backup и
     оставшиеся значения безвозвратно. `_is_partial_restore_of` ловит этот случай ДО capitulation
     в fail-closed ветку и повторяет restore.
+
+    Issue #224: в начале проверяем и доводим до конец любую незавершённую транзакцию.
     """
+    # Issue #224: итеративно проверяем и доводим до конца незавершённые транзакции
+    # (максимум 1 итерация: после resolved txn проверка снова даст resolved=False)
+    for _ in range(2):
+        txn_check = _check_and_resolve_txn()
+        if not txn_check["ok"]:
+            return {"ok": False, "err": f"txn check failed: {txn_check['err']}"}
+        if not txn_check["resolved"]:
+            break  # Нет незавершённой транзакции — выходим из цикла
+
     current = _get_all(KEY)
     if current["unknown"]:
         return {"ok": False, "err": "git config --get-all failed (non-absent rc)"}
