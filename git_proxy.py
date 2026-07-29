@@ -49,7 +49,9 @@ _TXN_KEY = _BACKUP_KEY + "-txn"
 # чтобы модуль не падал в среде без srouter_config (git_proxy не должен тянуть конфиг инфраструктуры).
 try:
     from dashboard_common import SOCKS_PROXY_URL as _PROXY  # socks5h://127.0.0.1:10808
-except Exception:
+except SystemExit:
+    # dashboard_common raises SystemExit (BaseException) when srouter_config.py is missing.
+    # Fallback to canonical value (install-path compatibility — module must not crash).
     _PROXY = "socks5h://127.0.0.1:10808"
 
 

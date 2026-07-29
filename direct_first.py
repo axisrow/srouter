@@ -13,6 +13,8 @@ verify-dont-guess: один probe, не дублируем). Reachable → в NO
 """
 from __future__ import annotations
 
+import subprocess
+
 import local_state
 import sys_probe
 
@@ -45,7 +47,10 @@ def candidate_domains(path=None):
         user_domains = state.get("direct_domains") if isinstance(state, dict) else None
         if not isinstance(user_domains, list):
             user_domains = []
-    except Exception:
+    except (OSError, ValueError, TypeError, KeyError):
+        # State load/parsing failed: local_state.load_state raises OSError on read errors,
+        # ValueError/TypeError on malformed JSON, KeyError on missing dict keys.
+        # Fallback: treat as no user domains (BUILTIN z.ai still included).
         user_domains = []
     seen, out = set(), []
     for host in (*BUILTIN_DIRECT_DOMAINS, *user_domains):
@@ -83,13 +88,18 @@ def detect(*, path=None):
     (candidate_domains/probe) деградирует в «всё через прокси», НЕ роняет вызывающий env-слой."""
     try:
         domains = candidate_domains(path)
-    except Exception:
+    except (OSError, ValueError, TypeError, KeyError, RuntimeError):
+        # candidate_domains raises OSError/ValueError/TypeError on invalid state,
+        # KeyError on missing dict keys, RuntimeError on crashes. Fallback to BUILTIN domains (resilience).
         domains = list(BUILTIN_DIRECT_DOMAINS)
     reachable, blocked, details = [], [], {}
     for host in domains:
         try:
             ok, kind = direct_reachable(host)
-        except Exception:
+        except (OSError, ValueError, TypeError, subprocess.CalledProcessError, subprocess.TimeoutExpired, RuntimeError):
+            # direct_reachable (via sys_probe.direct_probe) raises OSError on network errors,
+            # ValueError/TypeError on invalid response, subprocess errors on probe failures,
+            # RuntimeError on probe crashes. Treat as unreachable (safe fallback: route through proxy).
             ok, kind = False, "probe-error"
         details[host] = kind
         (reachable if ok else blocked).append(host)
@@ -125,7 +135,9 @@ def no_proxy_string(*, path=None):
     try:
         det = detect(path=path)
         return build_no_proxy(det["reachable"])
-    except Exception:
+    except (OSError, ValueError, TypeError, KeyError, RuntimeError):
+        # detect() raises OSError/ValueError/TypeError/KeyError/RuntimeError on state/probe failures.
+        # Fallback: BUILTIN domains always included (resilience — env-layer not left without NO_PROXY).
         return BUILTIN_FALLBACK_NO_PROXY
 
 

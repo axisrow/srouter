@@ -72,7 +72,10 @@ def _load(path):
         if not path.exists():
             return None
         return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
+    except (OSError, json.JSONDecodeError, ValueError, TypeError):
+        # File read errors or JSON parsing failures: OSError on I/O errors,
+        # JSONDecodeError on malformed JSON, ValueError/TypeError on type issues.
+        # Return None (signals "file not present or invalid" to caller).
         return None
 
 
@@ -88,7 +91,9 @@ def _save(path, data):
         tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         tmp.replace(path)
         return {"ok": True}
-    except Exception as exc:
+    except (OSError, TypeError, ValueError) as exc:
+        # File write errors: OSError on I/O failures, TypeError on invalid data types,
+        # ValueError on JSON encoding failures. Return structured error (truncated).
         return {"ok": False, "err": str(exc)[:200]}
 
 

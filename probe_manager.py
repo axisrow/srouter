@@ -66,7 +66,9 @@ class ProbeManager:
             stderr = _text(exc.stderr).strip()
             err = f"{stderr}\ntimeout".strip()
             return {"rc": None, "out": out, "err": err, "timeout": True}
-        except Exception as exc:
+        except (OSError, ValueError, TypeError) as exc:
+            # Process creation failures: OSError (binary not found, permission denied),
+            # ValueError/TypeError on invalid input types. Return structured error.
             return {"rc": None, "out": "", "err": f"{type(exc).__name__}: {exc}", "timeout": False}
 
     def port_open(self, host: str, port: int, timeout: float = 0.5) -> bool:
