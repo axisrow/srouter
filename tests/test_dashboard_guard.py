@@ -10,8 +10,18 @@ import types
 
 
 def _fresh_dashboard(monkeypatch):
-    """Свежий импорт dashboard с замоканным srouter_config (как в соседних тестах)."""
+    """Свежий импорт dashboard с замоканным srouter_config (как в соседних тестах).
+
+    issue #227: probe_traffic_guard, вызываемый роутами /api/guard*, физически живёт в
+    dashboard_routes.py (dashboard.py — тонкий фасад-реэкспорт). monkeypatch должен
+    патчить точку, где имя реально резолвится при вызове — dashboard_routes, не dashboard.
+    """
     monkeypatch.delitem(sys.modules, "dashboard", raising=False)
+    # issue #227: app/роуты живут в dashboard_app.py/dashboard_routes.py — при свежем
+    # импорте dashboard их тоже надо сбросить, иначе Flask ругнётся на повторную
+    # регистрацию роутов на СТАРОМ app (dashboard_app не пересоздаётся сам по себе).
+    monkeypatch.delitem(sys.modules, "dashboard_app", raising=False)
+    monkeypatch.delitem(sys.modules, "dashboard_routes", raising=False)
     cfg = types.ModuleType("srouter_config")
     cfg.GATEWAY = "192.0.2.1"
     cfg.VPN_SERVER = "198.51.100.20"
@@ -20,6 +30,13 @@ def _fresh_dashboard(monkeypatch):
     dashboard = importlib.import_module("dashboard")
     dashboard._cache.update(ts=0.0, data=None)
     return dashboard
+
+
+def _fresh_dashboard_routes(monkeypatch):
+    """dashboard_routes СВЕЖЕГО импорта dashboard (модуль, где реально резолвится
+    probe_traffic_guard внутри /api/guard*-роутов) — брать ТОЛЬКО после _fresh_dashboard,
+    иначе sys.modules ещё укажет на предыдущий (уже сброшенный) объект модуля."""
+    return importlib.import_module("dashboard_routes")
 
 
 def _install_state(monkeypatch, dashboard, state=None, readable=True):
@@ -44,10 +61,11 @@ def _install_state(monkeypatch, dashboard, state=None, readable=True):
 
 def test_api_guard_valid_write_persists_and_returns_probe(monkeypatch):
     dashboard = _fresh_dashboard(monkeypatch)
+    dashboard_routes = _fresh_dashboard_routes(monkeypatch)
     saved = _install_state(monkeypatch, dashboard)
     # probe для рендера count'ов не должен зависеть от реального файла.
     monkeypatch.setattr(
-        dashboard, "probe_traffic_guard", lambda **kw: {"status": "ok", "rule_count": 1, "blocked_domains": 1}
+        dashboard_routes, "probe_traffic_guard", lambda **kw: {"status": "ok", "rule_count": 1, "blocked_domains": 1}
     )
 
     # Два независимых домена: block + allow без parent/child пересечения.
@@ -136,8 +154,9 @@ def test_api_guard_rejects_throttle_mode(monkeypatch):
 def test_api_guard_valid_on_with_block_domain_still_writes(monkeypatch):
     """Легит on+block не должен сломаться scope-проверкой mode."""
     dashboard = _fresh_dashboard(monkeypatch)
+    dashboard_routes = _fresh_dashboard_routes(monkeypatch)
     saved = _install_state(monkeypatch, dashboard)
-    monkeypatch.setattr(dashboard, "probe_traffic_guard", lambda **kw: {"status": "ok", "rule_count": 1})
+    monkeypatch.setattr(dashboard_routes, "probe_traffic_guard", lambda **kw: {"status": "ok", "rule_count": 1})
 
     response = dashboard.app.test_client().post(
         "/api/guard", json={"mode": "on", "domains": {"ads.example.com": "block"}}
@@ -196,8 +215,9 @@ def test_api_guard_non_object_domains_rejected(monkeypatch):
 
 def test_api_guard_off_mode_empty_domains_ok(monkeypatch):
     dashboard = _fresh_dashboard(monkeypatch)
+    dashboard_routes = _fresh_dashboard_routes(monkeypatch)
     saved = _install_state(monkeypatch, dashboard)
-    monkeypatch.setattr(dashboard, "probe_traffic_guard", lambda **kw: {"status": "ok", "rule_count": 0})
+    monkeypatch.setattr(dashboard_routes, "probe_traffic_guard", lambda **kw: {"status": "ok", "rule_count": 0})
 
     response = dashboard.app.test_client().post("/api/guard", json={"mode": "off", "domains": {}})
 
@@ -237,12 +257,13 @@ def test_api_guard_save_failure_reports_error(monkeypatch):
 
 def test_api_guard_get_returns_current_rules_for_editor(monkeypatch):
     dashboard = _fresh_dashboard(monkeypatch)
+    dashboard_routes = _fresh_dashboard_routes(monkeypatch)
     monkeypatch.setattr(
         dashboard.local_state,
         "traffic_guard_config",
         lambda **kw: {"mode": "on", "domains": {"ads.example.com": "block"}, "valid": True, "errors": []},
     )
-    monkeypatch.setattr(dashboard, "probe_traffic_guard", lambda **kw: {"status": "ok", "rule_count": 1})
+    monkeypatch.setattr(dashboard_routes, "probe_traffic_guard", lambda **kw: {"status": "ok", "rule_count": 1})
 
     response = dashboard.app.test_client().get("/api/guard")
 
@@ -262,6 +283,7 @@ def test_api_guard_get_auto_mode_reports_honest_mode_not_editable(monkeypatch):
     отдаёт mode:"auto" + editable:false + domains:{} (плоскую ложь не отдаём).
     """
     dashboard = _fresh_dashboard(monkeypatch)
+    dashboard_routes = _fresh_dashboard_routes(monkeypatch)
     monkeypatch.setattr(
         dashboard.local_state,
         "traffic_guard_config",
@@ -273,7 +295,7 @@ def test_api_guard_get_auto_mode_reports_honest_mode_not_editable(monkeypatch):
             "errors": [],
         },
     )
-    monkeypatch.setattr(dashboard, "probe_traffic_guard", lambda **kw: {"status": "ok", "rule_count": 1})
+    monkeypatch.setattr(dashboard_routes, "probe_traffic_guard", lambda **kw: {"status": "ok", "rule_count": 1})
 
     response = dashboard.app.test_client().get("/api/guard")
 
@@ -316,9 +338,10 @@ def test_api_guard_post_blocked_when_existing_state_is_auto(monkeypatch):
 def test_api_guard_post_allows_write_when_existing_state_is_off(monkeypatch):
     """Штатный round-trip: существующий state on/off → редактор пишет нормально."""
     dashboard = _fresh_dashboard(monkeypatch)
+    dashboard_routes = _fresh_dashboard_routes(monkeypatch)
     off_state = {"schema_version": 1, "traffic_guard": {"mode": "off", "domains": {}}}
     saved = _install_state(monkeypatch, dashboard, state=off_state)
-    monkeypatch.setattr(dashboard, "probe_traffic_guard", lambda **kw: {"status": "ok", "rule_count": 1})
+    monkeypatch.setattr(dashboard_routes, "probe_traffic_guard", lambda **kw: {"status": "ok", "rule_count": 1})
 
     response = dashboard.app.test_client().post(
         "/api/guard", json={"mode": "on", "domains": {"ads.example.com": "block"}}

@@ -15,6 +15,11 @@ ACTIVE_NODE = {
 
 def _fresh_dashboard(monkeypatch):
     monkeypatch.delitem(sys.modules, "dashboard", raising=False)
+    # issue #227: app/роуты живут в dashboard_app.py/dashboard_routes.py — при свежем
+    # импорте dashboard их тоже надо сбросить, иначе Flask ругнётся на повторную
+    # регистрацию роутов на СТАРОМ app (dashboard_app не пересоздаётся сам по себе).
+    monkeypatch.delitem(sys.modules, "dashboard_app", raising=False)
+    monkeypatch.delitem(sys.modules, "dashboard_routes", raising=False)
     cfg = types.ModuleType("srouter_config")
     cfg.GATEWAY = "192.0.2.1"
     cfg.VPN_SERVER = "198.51.100.20"
@@ -239,12 +244,15 @@ def test_api_route_host_reads_action_from_json_form_or_query(monkeypatch, reques
 
 def test_api_route_existing_contract_survives_route_result_refactor(monkeypatch):
     dashboard = _fresh_dashboard(monkeypatch)
+    # issue #227: api_route (роут /api/route/<action>) резолвит sudo_route внутри
+    # dashboard_routes.py (dashboard.py — тонкий фасад-реэкспорт).
+    dashboard_routes = importlib.import_module("dashboard_routes")
 
     def fake_sudo_route(action):
         assert action == "add"
         return {"rc": 1, "out": "stdout", "err": "User canceled. (-128)", "timeout": False}
 
-    monkeypatch.setattr(dashboard, "sudo_route", fake_sudo_route)
+    monkeypatch.setattr(dashboard_routes, "sudo_route", fake_sudo_route)
 
     response = dashboard.app.test_client().post("/api/route/add")
 

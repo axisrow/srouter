@@ -19,6 +19,11 @@ import pytest
 
 def _fresh_dashboard(monkeypatch):
     monkeypatch.delitem(sys.modules, "dashboard", raising=False)
+    # issue #227: app/роуты живут в dashboard_app.py/dashboard_routes.py — при свежем
+    # импорте dashboard их тоже надо сбросить, иначе Flask ругнётся на повторную
+    # регистрацию роутов на СТАРОМ app (dashboard_app не пересоздаётся сам по себе).
+    monkeypatch.delitem(sys.modules, "dashboard_app", raising=False)
+    monkeypatch.delitem(sys.modules, "dashboard_routes", raising=False)
     cfg = types.ModuleType("srouter_config")
     cfg.GATEWAY = "192.0.2.1"
     cfg.VPN_SERVER = "198.51.100.20"
@@ -52,7 +57,10 @@ def test_rebinding_host_on_status_rejected(monkeypatch):
 def test_loopback_host_on_status_passes(monkeypatch, host):
     """Легитимный Host (loopback hostname, с портом и без) проходит к gather_status."""
     dashboard = _fresh_dashboard(monkeypatch)
-    monkeypatch.setattr(dashboard, "gather_status", lambda: {"ok": True})
+    # issue #227: api_status (роут /api/status) резолвит gather_status внутри
+    # dashboard_routes.py (dashboard.py — тонкий фасад-реэкспорт).
+    dashboard_routes = importlib.import_module("dashboard_routes")
+    monkeypatch.setattr(dashboard_routes, "gather_status", lambda: {"ok": True})
 
     response = dashboard.app.test_client().get("/api/status", headers={"Host": host})
 
@@ -149,7 +157,8 @@ def test_default_test_client_host_passes(monkeypatch):
     """Дефолтный Host тестового клиента (localhost) остаётся легитимным —
     существующая тестовая база и легит-браузер по 127.0.0.1/localhost не ломаются."""
     dashboard = _fresh_dashboard(monkeypatch)
-    monkeypatch.setattr(dashboard, "gather_status", lambda: {"ok": True})
+    dashboard_routes = importlib.import_module("dashboard_routes")
+    monkeypatch.setattr(dashboard_routes, "gather_status", lambda: {"ok": True})
 
     response = dashboard.app.test_client().get("/api/status")
 

@@ -27,6 +27,8 @@ srouter = "srouter:main"
 [tool.setuptools]
 py-modules = [
     "dashboard",
+    "dashboard_app",
+    "dashboard_routes",
     "srouter",
     "install_lib",
     "marker_block",

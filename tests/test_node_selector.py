@@ -60,6 +60,11 @@ def _metrics():
 
 def _fresh_dashboard(monkeypatch):
     monkeypatch.delitem(sys.modules, "dashboard", raising=False)
+    # issue #227: app/роуты живут в dashboard_app.py/dashboard_routes.py — при свежем
+    # импорте dashboard их тоже надо сбросить, иначе Flask ругнётся на повторную
+    # регистрацию роутов на СТАРОМ app (dashboard_app не пересоздаётся сам по себе).
+    monkeypatch.delitem(sys.modules, "dashboard_app", raising=False)
+    monkeypatch.delitem(sys.modules, "dashboard_routes", raising=False)
     cfg = types.ModuleType("srouter_config")
     cfg.GATEWAY = "192.0.2.1"
     cfg.VPN_SERVER = "198.51.100.20"
@@ -899,7 +904,10 @@ def test_route_sync_ip_literal_rejects_scoped_and_noncanonical():
 
 def test_api_nodes_ranking_returns_recommendation_from_snapshot(monkeypatch):
     dashboard = _fresh_dashboard(monkeypatch)
-    monkeypatch.setattr(dashboard, "probe_nodes_snapshot", lambda: _metrics())
+    # issue #227: api_nodes_ranking (роут /api/nodes/ranking) резолвит probe_nodes_snapshot
+    # внутри dashboard_routes.py (dashboard.py — тонкий фасад-реэкспорт).
+    dashboard_routes = importlib.import_module("dashboard_routes")
+    monkeypatch.setattr(dashboard_routes, "probe_nodes_snapshot", lambda: _metrics())
     monkeypatch.setattr(dashboard.local_state, "active_node", lambda path=None: {"name": "sg-1"})
 
     response = dashboard.app.test_client().get("/api/nodes/ranking")

@@ -24,6 +24,11 @@ Ethernet Address: aa:bb:cc:dd:ee:ff
 
 def _fresh_dashboard(monkeypatch):
     monkeypatch.delitem(sys.modules, "dashboard", raising=False)
+    # issue #227: app/роуты живут в dashboard_app.py/dashboard_routes.py — при свежем
+    # импорте dashboard их тоже надо сбросить, иначе Flask ругнётся на повторную
+    # регистрацию роутов на СТАРОМ app (dashboard_app не пересоздаётся сам по себе).
+    monkeypatch.delitem(sys.modules, "dashboard_app", raising=False)
+    monkeypatch.delitem(sys.modules, "dashboard_routes", raising=False)
     cfg = types.ModuleType("srouter_config")
     cfg.GATEWAY = "192.0.2.1"
     cfg.VPN_SERVER = "198.51.100.20"
@@ -265,6 +270,9 @@ def test_switch_channel_usb_configured_service_survives_missing_hardware_probe(m
 
 def test_api_channel_wifi_success_and_bad_targets(monkeypatch):
     dashboard = _fresh_dashboard(monkeypatch)
+    # issue #227: api_channel (роут) резолвит switch_channel внутри dashboard_routes.py
+    # (dashboard.py — тонкий фасад-реэкспорт) — патчим точку реального вызова.
+    dashboard_routes = importlib.import_module("dashboard_routes")
     calls = []
 
     def fake_switch(target):
@@ -280,7 +288,7 @@ def test_api_channel_wifi_success_and_bad_targets(monkeypatch):
             "service": "Wi-Fi",
         }
 
-    monkeypatch.setattr(dashboard, "switch_channel", fake_switch)
+    monkeypatch.setattr(dashboard_routes, "switch_channel", fake_switch)
     client = dashboard.app.test_client()
 
     ok = client.post("/api/channel/wifi")

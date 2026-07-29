@@ -20,6 +20,11 @@ BUSY_ERR = {"ok": False, "err": "another mutation is in progress"}
 
 def _fresh_dashboard(monkeypatch):
     monkeypatch.delitem(sys.modules, "dashboard", raising=False)
+    # issue #227: app/роуты живут в dashboard_app.py/dashboard_routes.py — при свежем
+    # импорте dashboard их тоже надо сбросить, иначе Flask ругнётся на повторную
+    # регистрацию роутов на СТАРОМ app (dashboard_app не пересоздаётся сам по себе).
+    monkeypatch.delitem(sys.modules, "dashboard_app", raising=False)
+    monkeypatch.delitem(sys.modules, "dashboard_routes", raising=False)
     cfg = types.ModuleType("srouter_config")
     cfg.GATEWAY = "192.0.2.1"
     cfg.VPN_SERVER = "198.51.100.20"
@@ -33,14 +38,19 @@ def _fresh_dashboard(monkeypatch):
 
 def _trap_mutations(monkeypatch, dashboard):
     """Ловушки на привилегированные пути (канон test_dashboard_csrf_guard): если запрос
-    при занятом локе дошёл до handler — AssertionError (→500), тест не пройдёт молча."""
+    при занятом локе дошёл до handler — AssertionError (→500), тест не пройдёт молча.
+
+    issue #227: switch_channel резолвится роутом api_channel внутри dashboard_routes.py
+    (dashboard.py — тонкий фасад-реэкспорт) — патчим точку реального вызова.
+    """
+    dashboard_routes = importlib.import_module("dashboard_routes")
 
     def boom(*a, **k):
         raise AssertionError("запрос дошёл до привилегированного пути при занятом локе")
 
     monkeypatch.setattr(sys_probe, "run", boom)
     monkeypatch.setattr(dashboard.node_selector, "select_node", boom)
-    monkeypatch.setattr(dashboard, "switch_channel", boom)
+    monkeypatch.setattr(dashboard_routes, "switch_channel", boom)
     monkeypatch.setattr(dashboard.local_state, "save_state", boom)
     monkeypatch.setattr(dashboard.local_state, "enabled_nodes", lambda: [{"name": "sg-1"}])
     monkeypatch.setattr(dashboard.local_state, "active_node", lambda: {"name": "sg-1"})
@@ -65,6 +75,9 @@ def test_concurrent_posts_one_wins_second_409_then_lock_released(monkeypatch):
     """Два одновременных POST: один входит в handler, второй → 409 сразу (без ожидания);
     после завершения первого лок освобождён — третий POST проходит."""
     dashboard = _fresh_dashboard(monkeypatch)
+    # issue #227: service_control резолвится роутом api_service внутри dashboard_routes.py
+    # (dashboard.py — тонкий фасад-реэкспорт) — патчим точку реального вызова.
+    dashboard_routes = importlib.import_module("dashboard_routes")
 
     entered = threading.Event()
     release = threading.Event()
@@ -74,7 +87,7 @@ def test_concurrent_posts_one_wins_second_409_then_lock_released(monkeypatch):
         assert release.wait(timeout=5), "тест не отпустил handler"
         return {"rc": 0, "out": "", "err": "", "timeout": False}
 
-    monkeypatch.setattr(dashboard, "service_control", slow_service_control)
+    monkeypatch.setattr(dashboard_routes, "service_control", slow_service_control)
 
     results = {}
 
@@ -137,17 +150,19 @@ def test_409_rejection_does_not_release_foreign_lock(monkeypatch):
 def test_lock_released_after_handler_exception(monkeypatch):
     """Handler бросил → teardown обязан отпустить лок, следующий POST не получает вечный 409."""
     dashboard = _fresh_dashboard(monkeypatch)
+    # issue #227: service_control резолвится роутом api_service внутри dashboard_routes.py.
+    dashboard_routes = importlib.import_module("dashboard_routes")
 
     def boom(name, action):
         raise RuntimeError("boom")
 
-    monkeypatch.setattr(dashboard, "service_control", boom)
+    monkeypatch.setattr(dashboard_routes, "service_control", boom)
     crashed = dashboard.app.test_client().post("/api/service/xray/restart")
     assert crashed.status_code == 500
     assert not dashboard._MUTATION_LOCK.locked()
 
     monkeypatch.setattr(
-        dashboard, "service_control", lambda n, a: {"rc": 0, "out": "", "err": "", "timeout": False}
+        dashboard_routes, "service_control", lambda n, a: {"rc": 0, "out": "", "err": "", "timeout": False}
     )
     after = dashboard.app.test_client().post("/api/service/xray/restart")
     assert after.status_code == 200
@@ -187,7 +202,9 @@ def test_unroutable_post_gets_honest_404_405_not_409(monkeypatch):
 # --- GET read-only не под локом ---
 def test_get_status_not_blocked_while_mutation_holds_lock(monkeypatch):
     dashboard = _fresh_dashboard(monkeypatch)
-    monkeypatch.setattr(dashboard, "gather_status", lambda: {"ok": True})
+    # issue #227: gather_status резолвится роутом api_status внутри dashboard_routes.py.
+    dashboard_routes = importlib.import_module("dashboard_routes")
+    monkeypatch.setattr(dashboard_routes, "gather_status", lambda: {"ok": True})
 
     assert dashboard._MUTATION_LOCK.acquire(blocking=False)
     try:
@@ -252,7 +269,9 @@ def test_guard_read_modify_write_serialized_toctou(monkeypatch):
         return state
 
     monkeypatch.setattr(dashboard.local_state, "save_state", slow_save)
-    monkeypatch.setattr(dashboard, "probe_traffic_guard", lambda **kw: {"status": "ok"})
+    # issue #227: probe_traffic_guard резолвится роутом api_guard внутри dashboard_routes.py.
+    dashboard_routes = importlib.import_module("dashboard_routes")
+    monkeypatch.setattr(dashboard_routes, "probe_traffic_guard", lambda **kw: {"status": "ok"})
 
     results = {}
 
