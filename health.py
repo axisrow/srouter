@@ -20,9 +20,10 @@ import socket
 import tempfile
 from urllib.parse import urlparse
 
-import sys_probe
-import privoxy_system
 import local_state
+import privoxy_system
+import sys_probe
+from install_lib import _launchd_domain, _launchd_is_loaded
 
 # Абсолютные пути: launchd/GUI PATH их не содержит (канон проекта).
 CURL = "/usr/bin/curl"
@@ -1543,22 +1544,27 @@ def _runtime_model_override_check():
 LAUNCHCTL_PROXY_KEYS = ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY")
 
 def _read_proxy_sources():
-    """Читает Desktop App прокси (launchctl, все ключи) + CLI прокси (settings.json) — #134.
+    """Читает Desktop App прокси (launchctl gui-домен) + CLI прокси (settings.json) — #134.
 
-    Desktop App читает launchctl getenv (gui-домен), в отличие от CLI (settings.json). launchctl
-    держит ТРИ ключа (LAUNCHCTL_PROXY_KEYS); инцидент #127 — SOCKS5 в HTTP_PROXY. Не угадываем
-    приоритет приложения — собираем все найденные «как есть», классификацию делает _desktop_proxy_check.
+    Desktop App видит launchd gui-домен, в отличие от CLI (settings.json). launchctl держит ТРИ
+    ключа (LAUNCHCTL_PROXY_KEYS); инцидент #127 — SOCKS5 в HTTP_PROXY. Не угадываем приоритет
+    приложения — собираем все найденные «как есть», классификацию делает _desktop_proxy_check.
     cli_proxy (settings.json HTTPS_PROXY) нужен для детекта расхождения CLI vs Desktop (issue #134 п.2) —
     один клиент может работать, другой быть сломан, а без сравнения doctor молчит (#127-класс инцидент).
-    Возвращает {desktop_keys: {KEY: value}, cli_proxy: str}. Не бросает (fail-soft: timeout → пустой out,
-    отфильтруется if val; import claude_proxy — local, сохраняет fail-soft границу health).
+
+    cycle-review PR #219 round 2 (Codex, confidence 0.96): голый `launchctl getenv KEY` читает
+    caller-context домен, НЕ gui/<uid> (issue #191 — тот же класс). Из SSH/cron/AO-shell это может
+    быть НЕ gui-домен → _desktop_proxy_check сверял бы SOCKS5-значение с _CODENV_SOCKS_URL по
+    значению из НЕПРАВИЛЬНОГО домена. Делегируем в _read_gui_proxy_env() (`launchctl print gui/<uid>`,
+    тот же domain-aware источник, что уже использует _codenv_managed) — единый домен для всей
+    codenv-trust цепочки. verifiable=False (timeout/unknown domain) → desktop_keys пуст (fail-closed:
+    не выдумываем значения из caller-context, лучше unknown, чем ложный ok/info).
+
+    Возвращает {desktop_keys: {KEY: value}, cli_proxy: str}. Не бросает (fail-soft: import claude_proxy
+    — local, сохраняет fail-soft границу health).
     """
-    desktop_keys = {}
-    for key in LAUNCHCTL_PROXY_KEYS:
-        lc = sys_probe.run(["/bin/launchctl", "getenv", key], timeout=3)
-        val = (lc.get("out") or "").strip()  # timeout → out="" → пропустится if val ниже
-        if val:
-            desktop_keys[key] = val
+    gui = _read_gui_proxy_env(keys_filter=LAUNCHCTL_PROXY_KEYS)
+    desktop_keys = gui.get("keys") or {} if gui.get("verifiable") else {}
     try:
         import claude_proxy
         data = claude_proxy._load()
@@ -1569,23 +1575,38 @@ def _read_proxy_sources():
     return {"desktop_keys": desktop_keys, "cli_proxy": cli_proxy}
 
 
-def _codenv_managed():
-    """codenv LaunchAgent srouter-managed? Читает plist на маркер CODEX_ENV_MARKER (fail-soft).
+def _codenv_managed(runner=None):
+    """codenv LaunchAgent srouter-managed? Маркер в plist (provenance) И реально loaded в launchd.
 
     Архитектурный конфликт #189/#127: codenv ставит SOCKS5 в gui-домен (нужно ChatGPT.app Rust
     app-server), но тот же SOCKS5 ломает Claude Desktop App (#127). _desktop_proxy_check отличает
     «наш codenv» (намеренный tradeoff → info, не driver-шум) от «чужой корпоративный SOCKS5» (→ down).
-    Codenv-managed = plist ~/Library/LaunchAgents/com.srouter.codenv.plist содержит CODEX_ENV_MARKER.
-    Ошибка чтения/отсутствие → False (fail-safe: трактуем как чужой → down, не глушим инцидент #127).
+
+    issue #192: маркер на диске один — НЕДОСТАТОЧЕН. Stale-plist сценарий: codenv когда-то стоял,
+    потом bootout БЕЗ удаления plist (маркер остаётся навсегда), пользователь ставит ЧУЖОЙ SOCKS5
+    вручную — маркер-only читал бы это как managed=True → info, молча маскируя инцидент #127.
+    managed = маркер В plist (provenance) AND job РЕАЛЬНО загружен в launchd (install_lib.
+    _launchd_is_loaded — домен-осознанный `launchctl print`, rc=0 loaded/113 not-found/иначе
+    unknown fail-safe). Только оба условия дают True; unknown (None) НЕ трактуется как loaded —
+    не выдумываем managed без доказательства (та же fail-safe семантика, что и сам _launchd_is_loaded).
+
+    runner: опциональный (cmd, timeout) -> {rc, out, err, timeout} для _launchd_is_loaded — по
+    умолчанию sys_probe.run (as-is для health.py doctor-чеков), инъекция для тестов.
+    Ошибка чтения plist/отсутствие → False (fail-safe: трактуем как чужой → down, не глушим #127).
     """
     try:
         plist = Path.home() / "Library" / "LaunchAgents" / f"{_CODENV_LABEL}.plist"
-        return plist.exists() and _CODENV_MARKER in plist.read_text(encoding="utf-8")
+        has_marker = plist.exists() and _CODENV_MARKER in plist.read_text(encoding="utf-8")
     except (OSError, ValueError):
         # OSError — нет файла/прав; ValueError — UnicodeDecodeError на бинарном/повреждённом plist
         # (codenv plist обычно XML, но может быть binary plutil-convert или битым). НЕ Exception —
         # иначе маскирует баги (канон systemexit-breaks-except-exception-fallback). Fail-safe False.
         return False
+    if not has_marker:
+        return False
+    run = runner if runner is not None else sys_probe.run
+    loaded = _launchd_is_loaded(_CODENV_LABEL, domain=_launchd_domain(), runner=run)
+    return loaded is True
 
 
 def _desktop_proxy_check():
@@ -1619,7 +1640,13 @@ def _desktop_proxy_check():
     if socks_keys:
         bad = ", ".join(f"{k}={v}" for k, v in socks_keys.items())
         # issue #189: srouter-managed codenv SOCKS5 — намеренный (лечит ChatGPT.app). info, не driver-шум.
-        if _codenv_managed():
+        # cycle-review PR #219 (Codex, confidence 0.93): _codenv_managed()=True доказывает только,
+        # что job com.srouter.codenv ЗАГРУЖЕН — НЕ то, что именно он записал ЭТИ SOCKS5-значения.
+        # Кто-то другой может параллельно прописать чужой SOCKS5 в тот же launchctl gui-домен ключ,
+        # пока codenv тоже загружен — тот же класс инцидента #127. Сверяем КАЖДОЕ найденное SOCKS5-
+        # значение с каноническим codenv endpoint (_CODENV_SOCKS_URL) — только полное совпадение
+        # всех ключей даёт info; любое расхождение — down (не глушим потенциально чужой SOCKS5).
+        if _codenv_managed() and all(v == _CODENV_SOCKS_URL for v in socks_keys.values()):
             return {"status": "info",
                     "detail": (f"SOCKS5 в launchctl ({bad}) = srouter codenv (#189 для ChatGPT.app Rust "
                                f"app-server). Claude Desktop App ломается на SOCKS5 (#127), но CC CLI "
@@ -1644,6 +1671,12 @@ def _desktop_proxy_check():
 # смене маркера в srouter.py — обновить тут (как _CODEX_WRAPPER_MARKER health.py:485 ↔ srouter.py).
 _CODENV_LABEL = "com.srouter.codenv"
 _CODENV_MARKER = "srouter-managed-codex-env-v1"
+
+# Канонический codenv SOCKS5-endpoint — тот же литерал, что dashboard_common.SOCKS_PROXY_URL /
+# srouter.py._CODEX_PROXY_URL. cycle-review PR #219 (Codex, confidence 0.93): _codenv_managed()=True
+# доказывает только «job зарегистрирован», НЕ что именно он записал ЭТО SOCKS5-значение — сверка
+# со значением обязательна, иначе чужой SOCKS5 в том же launchctl-ключе маскируется под codenv (#127).
+_CODENV_SOCKS_URL = f"socks5h://127.0.0.1:{XRAY_PORT}"
 
 
 def _read_gui_proxy_env(runner=None, *, keys_filter=LAUNCHCTL_PROXY_KEYS):
