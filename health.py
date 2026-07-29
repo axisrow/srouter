@@ -2059,11 +2059,14 @@ def check_all(*, active_claude=False):
         if active["status"] == "unknown":
             active_check["info"] = True
         checks.append(active_check)
-    # endpoint-override (#129): WARN если ANTHROPIC_BASE_URL не стандартный
+    # endpoint-override (#129): info-only ВСЕГДА (как endpoint-xray-sync/vscode-proxy/gh-direct
+    # ниже) — «стандартный endpoint» это картина, не сигнал живости прокси/сети. #225: eo_check
+    # раньше был driver с ok захардкоженным в True (никогда не False) — единственный вечно-живой
+    # driver держал вердикт на degraded, даже когда все реальные driver-чеки (порты/туннель/прокси)
+    # мертвы. status у _endpoint_override_check() — только ok/info (никогда down/warn), значит он
+    # органически не может сигналить о сбое стека — driver-роль была ошибкой агрегации.
     eo = _endpoint_override_check()
-    eo_check = {"name": "endpoint (ANTHROPIC_BASE_URL)", "ok": True, "detail": eo["detail"]}
-    if eo["status"] == "info":
-        eo_check["info"] = True
+    eo_check = {"name": "endpoint (ANTHROPIC_BASE_URL)", "ok": True, "info": True, "detail": eo["detail"]}
     checks.append(eo_check)
     # endpoint-xray sync (#200): рассинхрон active_node (local.json) ↔ рабочий xray config.
     # info-only ВСЕГДА (как endpoint-override) — картина для диагностики + подсказка `srouter sync`,
