@@ -2015,6 +2015,54 @@ def test_codenv_managed_true_mixed_keys_one_foreign_still_down(monkeypatch, tmp_
         f"один ключ codenv, другой чужой → down (all(), не any()); got {res}")
 
 
+# ============ Codex round 2 (cycle-review PR #219, confidence 0.96): _read_proxy_sources domain ==========
+#
+# _read_proxy_sources() читала Desktop-ключи через голый `launchctl getenv KEY` — caller-context
+# домен, НЕ gui/<uid> (тот же класс бага, что issue #191/_read_gui_proxy_env docstring). Из SSH/cron/
+# AO-shell getenv отвечает НЕ из gui-домена → сравнение SOCKS5-значения с _CODENV_SOCKS_URL (round-2
+# фикс) могло сверяться с НЕ тем значением, что реально видит Desktop App. Фикс: _read_proxy_sources
+# делегирует Desktop-ключи в _read_gui_proxy_env() (`launchctl print gui/<uid>`, тот же домен-осознанный
+# источник, что _codenv_managed уже использует) — единая точка домена для всей проверки codenv-trust.
+
+def test_read_proxy_sources_uses_gui_domain_not_caller_getenv(monkeypatch):
+    """_read_proxy_sources() читает Desktop-ключи через _read_gui_proxy_env (domain-aware), а НЕ
+    через голый `launchctl getenv` (caller-context, может отличаться от gui/<uid> в SSH/cron/AO-shell).
+    """
+    monkeypatch.setattr(health, "_read_gui_proxy_env",
+                        lambda **kw: {"keys": {"HTTPS_PROXY": "http://127.0.0.1:8118"}, "verifiable": True})
+    src = health._read_proxy_sources()
+    assert src["desktop_keys"] == {"HTTPS_PROXY": "http://127.0.0.1:8118"}
+
+
+def test_read_proxy_sources_unverifiable_gui_domain_gives_empty_keys(monkeypatch):
+    """launchctl print gui/<uid> недоступен (timeout/unknown domain) → desktop_keys пуст, НЕ выдумываем
+    значения из caller-context getenv (fail-closed, тот же канон что _read_gui_proxy_env)."""
+    monkeypatch.setattr(health, "_read_gui_proxy_env",
+                        lambda **kw: {"keys": {}, "verifiable": False})
+    src = health._read_proxy_sources()
+    assert src["desktop_keys"] == {}
+
+
+def test_desktop_proxy_domain_mismatch_does_not_certify_foreign_socks_as_codenv(monkeypatch, tmp_path):
+    """Интеграционный регресс-гард на сам Codex round-2 finding: codenv managed=True (gui-домен
+    подтверждён через launchctl print), НО launchctl print gui/<uid> ДЛЯ ПРОКСИ-КЛЮЧЕЙ показывает
+    чужой SOCKS5 (10.0.0.1:1080, не codenv endpoint) — должно быть down, а не info.
+
+    До фикса _read_proxy_sources брала это же значение из caller-context getenv, что в общем случае
+    может НЕ совпадать с тем, что реально в gui-домене — теперь оба чтения (_codenv_managed И
+    desktop-ключи) идут через один и тот же domain-aware `launchctl print gui/<uid>` источник.
+    """
+    _write_codenv_plist(tmp_path, monkeypatch, with_marker=True)
+    monkeypatch.setattr(health.sys_probe, "run",
+                        lambda cmd, timeout=3, **kw: {"rc": 0, "out": "state = running",
+                                                       "err": "", "timeout": False})
+    monkeypatch.setattr(health, "_read_gui_proxy_env",
+                        lambda **kw: {"keys": {"HTTPS_PROXY": "socks5h://10.0.0.1:1080"}, "verifiable": True})
+    res = health._desktop_proxy_check()
+    assert res["status"] == "down", (
+        f"gui-домен показывает чужой SOCKS5 (не codenv) → down, даже если codenv managed=True; got {res}")
+
+
 def test_desktop_proxy_silent_when_settings_matches_launchctl(monkeypatch):
     """settings.json HTTPS_PROXY == launchctl HTTPS_PROXY → ok, без WARN о расхождении."""
     monkeypatch.setattr(health, "_read_proxy_sources",
@@ -2052,30 +2100,22 @@ def test_read_proxy_sources_includes_cli_proxy_from_settings_json(monkeypatch):
         def _load():
             return {"env": {"HTTPS_PROXY": "http://127.0.0.1:8118"}}
     monkeypatch.setitem(__import__("sys").modules, "claude_proxy", FakeClaudeProxy())
-    monkeypatch.setattr(health.sys_probe, "run", _lc_run_per_key({}))
+    monkeypatch.setattr(health, "_read_gui_proxy_env", lambda **kw: {"keys": {}, "verifiable": True})
     src = health._read_proxy_sources()
     assert src["cli_proxy"] == "http://127.0.0.1:8118"
 
 
-# --- _read_proxy_sources: контракт обхода launchctl-ключей (мокаем sys_probe.run) ---
-
-def _lc_run_per_key(vals, timeout_keys=()):
-    """Мок sys_probe.run для launchctl getenv: возвращает out по ключу; timeout_keys → timeout=True."""
-    def fake_run(cmd, timeout):
-        key = cmd[-1]
-        if key in timeout_keys:
-            return {"rc": None, "out": "", "err": "", "timeout": True}
-        return {"rc": 0, "out": vals.get(key, ""), "err": "", "timeout": False}
-    return fake_run
-
+# --- _read_proxy_sources: контракт обхода launchctl-ключей (мокаем _read_gui_proxy_env, domain-aware
+# `launchctl print gui/<uid>` — cycle-review PR #219 round 2, не голый per-key getenv) ---
 
 def test_read_proxy_sources_reads_all_three_launchctl_keys(monkeypatch):
-    """HTTPS_PROXY пуст, HTTP_PROXY=socks5h → desktop_keys содержит SOCKS5 (не теряется).
+    """HTTPS_PROXY пуст (нет ключа), HTTP_PROXY=socks5h → desktop_keys содержит SOCKS5 (не теряется).
 
     ДЫРА на upstream: _read_proxy_sources читал только HTTPS_PROXY → терял SOCKS5 в HTTP_PROXY.
     """
-    monkeypatch.setattr(health.sys_probe, "run",
-                        _lc_run_per_key({"HTTPS_PROXY": "", "HTTP_PROXY": "socks5h://127.0.0.1:10808", "ALL_PROXY": ""}))
+    monkeypatch.setattr(health, "_read_gui_proxy_env",
+                        lambda **kw: {"keys": {"HTTP_PROXY": "socks5h://127.0.0.1:10808"},
+                                      "verifiable": True})
     src = health._read_proxy_sources()
     assert "HTTP_PROXY" in src["desktop_keys"]
     assert "socks" in src["desktop_keys"]["HTTP_PROXY"].lower(), f"SOCKS5 в HTTP_PROXY потерян: {src}"
@@ -2086,18 +2126,18 @@ def test_read_proxy_sources_collects_all_set_keys(monkeypatch):
     vals = {"HTTPS_PROXY": "http://127.0.0.1:8118",
             "HTTP_PROXY": "http://127.0.0.1:8118",
             "ALL_PROXY": "http://127.0.0.1:8118"}
-    monkeypatch.setattr(health.sys_probe, "run", _lc_run_per_key(vals))
+    monkeypatch.setattr(health, "_read_gui_proxy_env",
+                        lambda **kw: {"keys": dict(vals), "verifiable": True})
     src = health._read_proxy_sources()
     assert set(src["desktop_keys"]) == {"HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"}
 
 
 def test_read_proxy_sources_ignores_launchctl_timeout(monkeypatch):
-    """sys_probe.run timeout для всех трёх → desktop_keys пуст (fail-soft).
+    """launchctl print gui/<uid> не верифицируем (timeout/unknown domain) → desktop_keys пуст (fail-closed).
 
     Timeout не должен давать ложный SOCKS5 или падение.
     """
-    monkeypatch.setattr(health.sys_probe, "run",
-                        _lc_run_per_key({}, timeout_keys=("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY")))
+    monkeypatch.setattr(health, "_read_gui_proxy_env", lambda **kw: {"keys": {}, "verifiable": False})
     src = health._read_proxy_sources()
     assert src["desktop_keys"] == {}
 

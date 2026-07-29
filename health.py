@@ -1544,22 +1544,27 @@ def _runtime_model_override_check():
 LAUNCHCTL_PROXY_KEYS = ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY")
 
 def _read_proxy_sources():
-    """Читает Desktop App прокси (launchctl, все ключи) + CLI прокси (settings.json) — #134.
+    """Читает Desktop App прокси (launchctl gui-домен) + CLI прокси (settings.json) — #134.
 
-    Desktop App читает launchctl getenv (gui-домен), в отличие от CLI (settings.json). launchctl
-    держит ТРИ ключа (LAUNCHCTL_PROXY_KEYS); инцидент #127 — SOCKS5 в HTTP_PROXY. Не угадываем
-    приоритет приложения — собираем все найденные «как есть», классификацию делает _desktop_proxy_check.
+    Desktop App видит launchd gui-домен, в отличие от CLI (settings.json). launchctl держит ТРИ
+    ключа (LAUNCHCTL_PROXY_KEYS); инцидент #127 — SOCKS5 в HTTP_PROXY. Не угадываем приоритет
+    приложения — собираем все найденные «как есть», классификацию делает _desktop_proxy_check.
     cli_proxy (settings.json HTTPS_PROXY) нужен для детекта расхождения CLI vs Desktop (issue #134 п.2) —
     один клиент может работать, другой быть сломан, а без сравнения doctor молчит (#127-класс инцидент).
-    Возвращает {desktop_keys: {KEY: value}, cli_proxy: str}. Не бросает (fail-soft: timeout → пустой out,
-    отфильтруется if val; import claude_proxy — local, сохраняет fail-soft границу health).
+
+    cycle-review PR #219 round 2 (Codex, confidence 0.96): голый `launchctl getenv KEY` читает
+    caller-context домен, НЕ gui/<uid> (issue #191 — тот же класс). Из SSH/cron/AO-shell это может
+    быть НЕ gui-домен → _desktop_proxy_check сверял бы SOCKS5-значение с _CODENV_SOCKS_URL по
+    значению из НЕПРАВИЛЬНОГО домена. Делегируем в _read_gui_proxy_env() (`launchctl print gui/<uid>`,
+    тот же domain-aware источник, что уже использует _codenv_managed) — единый домен для всей
+    codenv-trust цепочки. verifiable=False (timeout/unknown domain) → desktop_keys пуст (fail-closed:
+    не выдумываем значения из caller-context, лучше unknown, чем ложный ok/info).
+
+    Возвращает {desktop_keys: {KEY: value}, cli_proxy: str}. Не бросает (fail-soft: import claude_proxy
+    — local, сохраняет fail-soft границу health).
     """
-    desktop_keys = {}
-    for key in LAUNCHCTL_PROXY_KEYS:
-        lc = sys_probe.run(["/bin/launchctl", "getenv", key], timeout=3)
-        val = (lc.get("out") or "").strip()  # timeout → out="" → пропустится if val ниже
-        if val:
-            desktop_keys[key] = val
+    gui = _read_gui_proxy_env(keys_filter=LAUNCHCTL_PROXY_KEYS)
+    desktop_keys = gui.get("keys") or {} if gui.get("verifiable") else {}
     try:
         import claude_proxy
         data = claude_proxy._load()
