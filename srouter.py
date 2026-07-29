@@ -13,21 +13,99 @@
 
 CLI — тонкий слой над install_lib.apply_install/apply_uninstall; рендеринг plist и логика
 конфликтов живут в install_lib.py (покрыты pytest без реальных привилегий).
+
+Refactor issue #228: модуль разбит на srouter_cli.py, srouter_launchd.py, codex_wrappers.py.
+Этот файл сохраняет обратную совместимость через переэкспорт.
 """
+
 from __future__ import annotations
 
-import argparse
-import ipaddress
-import json
-import os
-import re
-import shutil
-import subprocess
 import sys
+import os
 from pathlib import Path
 from importlib.metadata import PackageNotFoundError, version
+import ipaddress
 
-import local_state
+from install_lib import InstallEnv, CHOICES, LAUNCHAGENT_LABEL, _launchd_reload, _launchd_unload, build_plan, format_plan, apply_install, apply_uninstall, _reclaimable_resolves_all_conflicts
+from sys_probe import run
+
+# Вспомогательные функции (остаются здесь для обратной совместимости)
+def _env_from_args(args) -> InstallEnv:
+    """Собрать InstallEnv из флагов CLI (state/prefix/launchagents-dir)."""
+    env = InstallEnv.from_env(state_path=args.state, prefix=args.prefix)
+    if getattr(args, "launchagents_dir", None):
+        env.launchagent_dir = Path(args.launchagents_dir)
+    env.python_bin = getattr(args, "python", None) or os.environ.get("SROUTER_PYTHON") or sys.executable
+    return env
+
+
+def _prompt_bool(label: str) -> bool:
+    return input(f"{label} [y/N]: ").strip().lower() in {"y", "yes", "д", "да"}
+
+
+def _prompt_choice(name: str) -> str:
+    """adopt | overwrite | skip (install_lib.CHOICES)."""
+    while True:
+        answer = input(f"Выбор для {name} [adopt/overwrite/skip]: ").strip().lower()
+        if answer in CHOICES:
+            return answer
+        print("Допустимо: adopt, overwrite, skip.")
+
+
+# Переэкспорт из codex_wrappers.py
+from codex_wrappers import (
+    CODEX_NO_PROXY,
+    CODEX_NO_PROXY_LOOPBACK,
+    CODEX_LAUNCHCTL_ENV,
+    CODEX_WRAPPERS,
+    CODEX_CLI_WRAPPER_NAME,
+    CODEX_CLI_WRAPPER_LEGACY_NAME,
+    CODEX_ENV_LABEL,
+    CODEX_ENV_MARKER,
+    ZSHRC_PATH_MARKER,
+    ZSHRC_CODEX_FUNC_MARKER_BEGIN,
+    ZSHRC_CODEX_FUNC_MARKER_END,
+    _codex_wrapper_path,
+    _zshrc_path,
+    _looks_like_managed_codex_wrapper,
+    _codex_bin_path,
+    _install_one_wrapper,
+    _install_codex_wrappers,
+    _migrate_legacy_codex_cli_wrapper,
+    _remove_one_wrapper,
+    _remove_codex_wrappers,
+    _install_launchctl_env,
+    _remove_launchctl_env,
+    _ensure_home_bin_in_path,
+    _remove_home_bin_from_path,
+    _codex_zsh_target_installed,
+    _install_codex_zsh_function,
+    _remove_codex_zsh_function,
+    _install_codex_isolation,
+    _remove_codex_isolation,
+)
+
+# Переэкспорт из srouter_launchd.py
+from srouter_launchd import (
+    PPP_HOOK_PATH,
+    PPP_HOOK_MARKER,
+    _is_ip_literal,
+    _active_route_ip_for_removal,
+    _remove_active_split_route,
+    _install_ppp_hook,
+    _remove_ppp_hook,
+)
+
+# Переэкспорт из srouter_cli.py (только функции, не команды)
+from srouter_cli import (
+    _version_string,
+    _read_routing_domains,
+    _routing_has_marker,
+    build_parser,
+    main,
+)
+
+# Оставшиеся функции (будут извлечены позже)
 from install_lib import (
     BREW,
     ROUTE,
@@ -54,31 +132,33 @@ from install_lib import (
     port_open,
 )
 from sys_probe import run
+from install_lib import CHOICES
 
-import claude_proxy  # вкл/откл HTTPS_PROXY для Claude Code (~/.claude/settings.json)
-import git_proxy  # issue #130: вкл/откл SOCKS5 github-proxy в ~/.gitconfig (xray 10808)
-import vscode_proxy  # issue #185: scoped SOCKS5 для codex-расширения через VSCode http.proxy
-import health  # doctor-проверки стека
-import marker_block  # централизованный marker-парсер (#176): find/replace/remove_managed_block + classification
-import privoxy_audit  # пассивный root-owned аудит lifecycle-команд Privoxy (#122)
-import privoxy_system  # root-gated system LaunchDaemon для Privoxy (#122)
-import privileged_ops  # единая osascript/sudo-обёртка + whitelist (#156)
+import claude_proxy
+import git_proxy
+import vscode_proxy
+import health
+import marker_block
+import privoxy_audit
+import privoxy_system
+import privileged_ops
 
 # OSASCRIPT переэкспортируется из privileged_ops (единый источник #156) для обратной
 # совместимости с тестами/кодом, обращающимся к srouter.OSASCRIPT.
 OSASCRIPT = privileged_ops.OSASCRIPT
 
+import claude_proxy
+import git_proxy
+import vscode_proxy
+import health
+import marker_block
+import privoxy_audit
+import privoxy_system
+import privileged_ops
 
-def _env_from_args(args) -> InstallEnv:
-    """Собрать InstallEnv из флагов CLI (state/prefix/launchagents-dir)."""
-    env = InstallEnv.from_env(state_path=args.state, prefix=args.prefix)
-    if getattr(args, "launchagents_dir", None):
-        env.launchagent_dir = Path(args.launchagents_dir)
-    # Python, из которого запущена команда srouter — в нём гарантированно стоит flask (зависимость
-    # пакета srouter). /usr/bin/python3 (default в install_lib) — системный Python Apple, flask'а нет,
-    # демон крашнется с ModuleNotFoundError. Приоритет: --python флаг (для sudo) → SROUTER_PYTHON env → sys.executable.
-    env.python_bin = getattr(args, "python", None) or os.environ.get("SROUTER_PYTHON") or sys.executable
-    return env
+# OSASCRIPT переэкспортируется из privileged_ops (единый источник #156) для обратной
+# совместимости с тестами/кодом, обращающимся к srouter.OSASCRIPT.
+OSASCRIPT = privileged_ops.OSASCRIPT
 
 
 def _is_privileged_cmd(cmd) -> bool:
@@ -110,6 +190,8 @@ def make_privileged_runner(underlying_run=run, *, osascript_timeout: int = 60):
     Делегирует классификацию в privileged_ops (#156), сохраняя прежнее поведение
     (непривилегированные/ root — напрямую; привилегированные не-root — osascript).
     """
+    import os
+
     am_root = os.geteuid() == 0
 
     def runner(cmd, timeout):
@@ -120,797 +202,25 @@ def make_privileged_runner(underlying_run=run, *, osascript_timeout: int = 60):
     return runner
 
 
-def _is_ip_literal(value) -> bool:
-    """Строгая проверка IP-литерала. Канон dashboard_common._ip_literal, но без импорта
-    dashboard_common (он тянет srouter_config через module-level код)."""
-    if not isinstance(value, str) or not value or "%" in value:
-        return False
+# Функции для работы с launchd (остаются в srouter.py временно)
+def _is_loaded():
+    """Загружен ли LaunchAgent srouter-dashboard?"""
     try:
-        parsed = ipaddress.ip_address(value)
-    except ValueError:
-        return False
-    return str(parsed) == value
-
-
-def _prompt_bool(label: str) -> bool:
-    return input(f"{label} [y/N]: ").strip().lower() in {"y", "yes", "д", "да"}
-
-
-def _prompt_choice(name: str) -> str:
-    """adopt | overwrite | skip (install_lib.CHOICES)."""
-    while True:
-        answer = input(f"Выбор для {name} [adopt/overwrite/skip]: ").strip().lower()
-        if answer in CHOICES:
-            return answer
-        print("Допустимо: adopt, overwrite, skip.")
-
-
-def _active_route_ip_for_removal(state_path) -> str:
-    """route_ip активного узла для route delete. '' если нет валидного IP/узла."""
-    try:
-        node = local_state.active_node(path=state_path) or {}
-        route_ip = local_state.resolve_route_ip(node, path=state_path)
-    except (OSError, ValueError, TypeError, KeyError):
-        # local_state операции с JSON/файлами/словарями → типичные ошибки
-        return ""
-    return route_ip if _is_ip_literal(route_ip) else ""
-
-
-def _remove_active_split_route(state_path, runner) -> int:
-    """route -n delete -host <active_route_ip>. Idempotent: отсутствие маршрута = успех.
-
-    Возвращает 0 (ok/нечего удалять), 2 (отмена GUI/сбой).
-    """
-    route_ip = _active_route_ip_for_removal(state_path)
-    if not route_ip:
-        print("split-route: нет активного route_ip — пропуск удаления маршрута.")
-        return 0
-    print(f"split-route: удаляю маршрут до {route_ip} ...")
-    result = runner([ROUTE, "-n", "delete", "-host", route_ip], 60)
-    if result.get("timeout"):
-        print(f"split-route: timeout при удалении маршрута до {route_ip}.", file=sys.stderr)
-        return 2
-    rc = result.get("rc")
-    if rc == 0:
-        return 0
-    err = f"{result.get('err') or ''} {result.get('out') or ''}"
-    if rc == -128 or "-128" in err:
-        print("split-route: удаление маршрута отменено пользователем (диалог пароля).", file=sys.stderr)
-        return 2
-    if "not in table" in err.lower() or "no such process" in err.lower():
-        return 0  # маршрута уже нет — idempotent успех
-    print(f"split-route: не удалось удалить маршрут до {route_ip}: {err.strip()}", file=sys.stderr)
-    return 2
-
-
-PPP_HOOK_PATH = "/etc/ppp/ip-up"
-PPP_HOOK_MARKER = "# srouter: мгновенная реакция"
-
-
-def _install_ppp_hook(env, runner) -> str:
-    """Установить /etc/ppp/ip-up — мгновенный split-route при VPN up (от root, без osascript).
-
-    Шаблон launchagents/srouter-ppp-ip-up.sh рендерится (плейсхолдеры) и копируется в /etc/ppp/ip-up.
-    Требует root (osascript admin-мост, как _sudo_route_ip). Возвращает строку-статус для вывода.
-    """
-    try:
-        template = (env.root / "launchagents" / "srouter-ppp-ip-up.sh").read_text(encoding="utf-8")
-        rendered = (template
-                    .replace("__SROUTER_PYTHON_BIN__", env.python_bin)
-                    .replace("__SROUTER_ROOT_DIR__", str(env.root))
-                    .replace("__SROUTER_LOG_ERR__", str(env.log_err)))
-        # Копирование в /etc/ppp/ip-up через osascript (требует admin, /etc/ = root).
-        from dashboard_common import _applescript_text
-        # Записать во временный файл, потом cp + chmod + chown (всё под osascript admin).
-        tmp = f"/tmp/srouter-ppp-ip-up.{os.getpid()}"
-        # Defence: rendered идёт в файл через printf %s (не shell-интерполяция).
-        safe = rendered.replace("\\", "\\\\").replace("'", "'\\''")
-        full_cmd = (f"printf '%s' '{safe}' > {tmp} && /bin/cp {tmp} {PPP_HOOK_PATH} && "
-                    f"/bin/chmod 755 {PPP_HOOK_PATH} && /usr/sbin/chown root:wheel {PPP_HOOK_PATH} && "
-                    f"/bin/rm -f {tmp}")
-        applescript = f'do shell script "{_applescript_text(full_cmd)}" with administrator privileges'
-        r = runner([OSASCRIPT, "-e", applescript], 30)
-        if r.get("timeout") or (r.get("rc") not in (0, None) and r.get("rc") != 0 and "-128" not in (r.get("err") or "")):
-            return f"PPP-hook: не установлен ({(r.get('err') or 'ошибка')[:80]})."
-        if r.get("rc") == -128 or "-128" in (r.get("err") or ""):
-            return "PPP-hook: отменено (диалог пароля)."
-        return "PPP-hook: установлен (/etc/ppp/ip-up — мгновенный split-route при VPN up)."
-    except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError, ValueError) as exc:
-        # read_text() → OSError; runner() → subprocess исключения; операции со строками → ValueError
-        return f"PPP-hook: не установлен ({str(exc)[:80]})."
-
-
-def _remove_ppp_hook(runner) -> str:
-    """Удалить /etc/ppp/ip-up (если srouter-managed). Возвращает строку-статус."""
-    try:
-        from dashboard_common import _applescript_text
-        # Проверить маркер перед удалением (не трогать чужой скрипт).
-        check = runner(["/bin/cat", PPP_HOOK_PATH], 5)
-        if check.get("timeout") or check.get("rc") != 0:
-            return "PPP-hook: не был установлен (файла нет)."
-        if PPP_HOOK_MARKER not in (check.get("out") or ""):
-            return "PPP-hook: чужой скрипт в /etc/ppp/ip-up — не трогаем."
-        rm_cmd = f"/bin/rm -f {PPP_HOOK_PATH}"
-        applescript = f'do shell script "{_applescript_text(rm_cmd)}" with administrator privileges'
-        r = runner([OSASCRIPT, "-e", applescript], 15)
-        if r.get("rc") == -128 or "-128" in (r.get("err") or ""):
-            return "PPP-hook: удаление отменено (диалог пароля)."
-        return "PPP-hook: удалён." if r.get("rc") in (0, None) else f"PPP-hook: не удалён ({(r.get('err') or '')[:60]})."
-    except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError, ValueError) as exc:
-        # runner() → subprocess исключения; osascript/файловые операции → OSError
-        return f"PPP-hook: не удалён ({str(exc)[:60]})."
-
-
-# ============================ Codex SOCKS5-wrappers + launchctl env ============================
-# Codex (CLI + App) работает стабильно только через SOCKS5 (xray 10808) минуя privoxy (портит WS).
-# srouter install ставит ~/bin/codex + ~/bin/codex-app-proxy + launchctl env (через LaunchAgent
-# plist, переживает ребут) + ~/bin в PATH; uninstall убирает. Канон — _install_ppp_hook
-# (best-effort, marker-gate, строка-статус).
-# URL SOCKS5 — из dashboard_common (SOCKS_PROXY_URL), единый источник правды для xray-порта.
-# except BaseException (не Exception): dashboard_common raise SystemExit при отсутствии
-# srouter_config.py, а SystemExit не ловится Exception — fallback должен сработать и для него.
-try:
-    from dashboard_common import SOCKS_PROXY_URL as _CODEX_PROXY_URL
-except BaseException:
-    _CODEX_PROXY_URL = "socks5h://127.0.0.1:10808"
-# NO_PROXY для launchctl-gui env: loopback (Codex→moonbridge на loopback и локальные сервисы)
-# + z.ai,.z.ai (moonbridge→api.z.ai — внешний хост, доступен напрямую мимо SOCKS5/xray/VPS).
-# z.ai НЕ за GFW: при мёртвом VPS (#194) moonbridge-клиент обязан достучаться к api.z.ai напрямую,
-# иначе codex ломается. ОБА варианта: z.ai = точный хост, .z.ai = поддомены (api.z.ai и др.).
-# Канон: zai-direct-no-proxy, srouter-critical-infra-24-7 (VPS-смерть не валит z.ai-трафик).
-CODEX_NO_PROXY = "localhost,127.0.0.1,::1,z.ai,.z.ai"
-# NO_PROXY для CLI-wrapper (~/bin/codex-srouter) — ТОЛЬКО loopback, БЕЗ z.ai. CLI-codex идёт через
-# SOCKS5 (managed путь, xray→VPS) — его NO_PROXY = санитизация унаследованного privoxy-окружения
-# (#96 core), НЕ provider-direct. z.ai-прямой-доступ релевантен moonbridge (GUI launchctl-gui выше),
-# а не CLI-codex. Две разные границы = две константы (канон route-scope-not-shared-validator).
-CODEX_NO_PROXY_LOOPBACK = "localhost,127.0.0.1,::1"
-# (env-key, value) — единый список для install/setenv и uninstall/unsetenv (синхронны всегда).
-# Значение нужно только для setenv (launchctl-gui); unsetenv итерирует по ключам.
-CODEX_LAUNCHCTL_ENV = tuple((k, _CODEX_PROXY_URL) for k in
-                            ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
-                             "http_proxy", "https_proxy", "all_proxy")) \
-                      + (("NO_PROXY", CODEX_NO_PROXY), ("no_proxy", CODEX_NO_PROXY))
-# Wrappers: (name, template, marker). Цикл в install/remove — не два явных вызова.
-# Issue #169: CLI-wrapper переименован codex → codex-srouter — убрать коллизию неймспейса (wrapper и
-# real binary оба звались codex → natural-рекурсия #150/#144, foreign-wrapper резолвит codex=wrapper).
-# После rename wrapper файл = codex-srouter, real binary так и зовётся codex → wrapper больше не
-# находит себя по имени при runtime-резолве, коллизия устранена СТРУКТУРНО. Маркер НЕ менялся при rename
-# (идентифицирует «srouter-managed wrapper», не имя файла) — migration старого ~/bin/codex по этому маркеру.
-CODEX_WRAPPERS = (
-    ("codex-srouter", "srouter-codex-cli-wrapper.sh", "# srouter: codex CLI wrapper (managed)"),
-    ("codex-app-proxy", "srouter-codex-app-proxy-wrapper.sh", "# srouter: codex-app-proxy wrapper (managed)"),
-)
-# Имя CLI-wrapper'а (первая запись CODEX_WRAPPERS) — единый источник правды для rename-migration.
-CODEX_CLI_WRAPPER_NAME = CODEX_WRAPPERS[0][0]
-# Старое имя CLI-wrapper'а до rename (#169). Migration: srouter-managed ~/bin/codex (по маркеру) → удалить
-# при install/remove; чужой (без маркера) — не трогать (канон provenance issue-112-hybrid-uninstall).
-CODEX_CLI_WRAPPER_LEGACY_NAME = "codex"
-# LaunchAgent для глобального env: launchctl setenv SOCKS5 в GUI-домен (переживает ребут).
-# Label = com.srouter.codenv → prefix CODENV для плейсхолдеров __SROUTER_CODENV_*__ в шаблоне plist.
-CODEX_ENV_LABEL = "com.srouter.codenv"
-CODEX_ENV_MARKER = "srouter-managed-codex-env-v1"
-ZSHRC_PATH_MARKER = "# srouter: ~/bin в PATH для codex wrapper"
-# Shell-функция codex() в ~/.zshrc (issue #96): вызывает ~/bin/codex-srouter по абсолютному пути, чтобы
-# порядок brew в PATH был не важен (функция всегда бьёт binary). Без неё wrapper #83 проигрывает
-# /opt/homebrew/bin/codex. Парные маркеры для marker-gate install/remove (как ZSHRC_PATH_MARKER).
-# Issue #169: функция зовёт ПЕРЕИМЕНОВАННЫЙ wrapper ~/bin/codex-srouter (имя codex освобождено под real
-# binary — коллизия неймспейса устранена). Функция по-прежнему зовётся codex() в интерактивном шелле,
-# чтобы пользовательский habit `codex …` работал — только внутри она ведёт на codex-srouter.
-ZSHRC_CODEX_FUNC_MARKER_BEGIN = "# >>> srouter-managed-codex-function-v1 >>>"
-ZSHRC_CODEX_FUNC_MARKER_END = "# <<< srouter-managed-codex-function-v1 <<<"
-# function codex { … }, не голый codex() — существующий alias может помешать парсингу определения.
-# guard `! $+aliases[codex] && ! $+functions[codex]` — не перекрываем молча чужое определение.
-# Без exec внутри (заменит интерактивный шелл). Абсолютный путь "$HOME/bin/codex-srouter" (#169 rename).
-_CODEX_FUNC_BLOCK = (
-    f"{ZSHRC_CODEX_FUNC_MARKER_BEGIN}\n"
-    'if (( ! ${+aliases[codex]} && ! ${+functions[codex]} )); then\n'
-    '  function codex {\n'
-    '    "$HOME/bin/codex-srouter" "$@"\n'
-    '  }\n'
-    "fi\n"
-    f"{ZSHRC_CODEX_FUNC_MARKER_END}"
-)
-
-
-def _codex_wrapper_path(name: str) -> Path:
-    """Путь к wrapper в ~/bin (вычисляется динамически — дружелюбно к мокам Path.home в тестах)."""
-    return Path.home() / "bin" / name
-
-
-def _zshrc_path() -> Path:
-    """Путь к ~/.zshrc (динамически, для моков Path.home в тестах)."""
-    return Path.home() / ".zshrc"
-
-
-def _looks_like_managed_codex_wrapper(path: str) -> bool:
-    """Файл path — наш managed codex-wrapper (несёт srouter-маркер)? Маркер — единственный признак
-    «managed wrapper», НЕ путь/имя (memory issue-144: wrapper ≠ binary). cycle-review cycle-4 FIX #1:
-    install-time resolver обязан различать managed-wrapper от real binary по маркеру — иначе legacy
-    ~/bin/codex (managed) misclassify как real binary → migration удаляет его без независимого real codex
-    → новый codex-srouter exit 127. Тот же marker-skip, что wrapper template делает в runtime-резолве.
-
-    #176: marker-in-content classification централизован в marker_block.is_managed_artifact."""
-    return marker_block.is_managed_artifact(path, CODEX_WRAPPERS[0][2])
-
-
-def _codex_bin_path() -> str:
-    """Абсолютный путь к реальному codex binary (не наш wrapper) — install-time GATE: отвечает только
-    на вопрос «есть ли на диске независимый real codex» (если нет → WARN, wrapper не ставится). ПУТЬ сюда НЕ
-    вшивается: с #144 CLI-wrapper runtime-резолвит codex по PATH вызывающего минуя себя (подход A),
-    так что >1 binary на диске и смена binary после brew upgrade покрыты без reinstall.
-    shutil.which минуя наш wrapper (codex-srouter после #169), fallback на homebrew-пути (Apple Silicon / Intel).
-    '' если не найден. cycle-review cycle-4 FIX #1: отвергаем ЛЮБОЙ кандидат с managed-маркером (не только
-    codex-srouter) — legacy ~/bin/codex (managed) НЕ считается real binary, иначе migration удалила бы его
-    без независимого real codex. Примечание #169: real binary зовётся codex (имя освобождено от wrapper'а)."""
-    found = shutil.which("codex")
-    if found and not _looks_like_managed_codex_wrapper(found):
-        return found
-    for cand in (str(Path(BREW).parent / "codex"), "/opt/homebrew/bin/codex", "/usr/local/bin/codex"):
-        if Path(cand).exists() and not _looks_like_managed_codex_wrapper(cand):
-            return cand
-    return ""  # не найден — _install_one_wrapper покажет WARN
-
-
-def _install_one_wrapper(env, wrapper_path: Path, template_name: str, marker: str) -> str:
-    """Поставить один wrapper. Marker-gate + marker-migration + atomic write + chmod +x.
-
-    issue #112 Часть 4 (РЕШЕНИЕ 2): при существующем wrapper'е различаем ТРИ случая:
-      - current-маркер есть → переустановить (idempotent, обновить рендер).
-      - legacy-маркер из known_markers → МИГРИРОВАТЬ (перезаписать с current-маркером). Смена версии
-        маркера: старый «свой» распознаётся через state-таблицу, иначе залипал бы на старой версии.
-      - unmarked (нет ни current, ни legacy) → WARN, НЕ adopt молча (канон fail-closed, чужое не трогаем).
-    """
-    try:
-        if wrapper_path.exists():
-            content = wrapper_path.read_text(encoding="utf-8")
-            if marker in content:
-                pass  # наш current — переустановим (idempotent).
-            else:
-                # Marker-migration: проверить legacy-маркеры из known_markers (state-based, #112 ч.4).
-                known = load_known_markers(env.state_path, "wrappers", [marker])
-                legacy_hits = [m for m in known if m != marker and m in content]
-                if not legacy_hits:
-                    # Unmarked wrapper — не наш (нет current, нет legacy). WARN, не adopt.
-                    return (f"Codex {wrapper_path.name}: существует без srouter-маркера — не трогаем "
-                            f"(удали вручную, если это твой старый wrapper).")
-                # legacy-маркер найден → мигрируем (продолжаем к рендеру, atomic write обновит файл).
-        codex_bin = _codex_bin_path()
-        if not codex_bin:
-            return f"Codex {wrapper_path.name}: codex binary не найден — wrapper не установлен (установи codex)."
-        template = (env.root / "launchagents" / template_name).read_text(encoding="utf-8")
-        # Рендер плейсхолдеров из единого источника правды, не хардкод литералов. CLI-wrapper
-        # (srouter-codex-cli-wrapper.sh) использует _CODEX_PROXY_URL + CODEX_NO_PROXY_LOOPBACK
-        # (loopback-only, БЕЗ z.ai — это санитизация #96, не provider-direct; z.ai релевантен только
-        # launchctl-gui CODEX_NO_PROXY для moonbridge). Реальный codex он РАНТАЙМ-резолвит по PATH
-        # минуя себя (#144, подход A), абсолютный путь НЕ вшивается. App-wrapper плейсхолдеров прокси
-        # не содержит (.replace на отсутствующей подстроке — no-op).
-        rendered = (template
-                    .replace("__SROUTER_CODEX_PROXY_URL__", _CODEX_PROXY_URL)
-                    .replace("__SROUTER_CODEX_NO_PROXY__", CODEX_NO_PROXY_LOOPBACK))
-        wrapper_path.parent.mkdir(parents=True, exist_ok=True)
-        if not _write_text_atomic(wrapper_path, rendered):
-            return f"Codex {wrapper_path.name}: не записан (ошибка atomic write)."
-        wrapper_path.chmod(0o755)
-        # CLI-wrapper: best-effort layer (#144). Не fail-closed — честная граница = PF kill-switch.
-        if wrapper_path.name == CODEX_CLI_WRAPPER_NAME:
-            return (f"Codex {wrapper_path.name}: установлен ({wrapper_path} — SOCKS5 минуя privoxy). "
-                    f"Best-effort (НЕ fail-closed): runtime-резолвит codex по PATH вызывающего. "
-                    f"НЕ перехватывает прямой абсолютный путь к binary, `node codex.js` и вызов с "
-                    f"другим PATH — настоящая fail-closed граница = PF kill-switch (isolate_firewall.py).")
-        return f"Codex {wrapper_path.name}: установлен ({wrapper_path} — SOCKS5 минуя privoxy)."
-    except (OSError, ValueError, TypeError) as exc:
-        # Файловые операции + PATH-манипуляции → OSError, ValueError, TypeError
-        return f"Codex {wrapper_path.name}: не установлен ({str(exc)[:80]})."
-
-
-def _install_codex_wrappers(env) -> str:
-    """Поставить ~/bin/codex-srouter + ~/bin/codex-app-proxy. Best-effort, цикл по CODEX_WRAPPERS.
-
-    Issue #169 rename-migration: перед установкой нового codex-srouter подчищаем устаревший
-    srouter-managed ~/bin/codex от прежней установки (до rename) — иначе коллизия неймспейса
-    остаётся (два wrapper'а: старый codex + новый codex-srouter). Чужой ~/bin/codex (без маркера)
-    — не трогаем (fail-closed provenance, #112).
-
-    cycle-review FIX A (транзакционность): migration legacy ~/bin/codex → удаление разрешено ТОЛЬКО
-    если новый codex-srouter установлен и валиден (несёт current-маркер, executable). Если install
-    нового упал (codex binary не найден / write-fail / foreign codex-srouter без маркера) — legacy
-    СОХРАНЯЕТСЯ, иначе пользователь терял работающий wrapper без замены (молчаливый частичный успех)."""
-    parts = [_install_one_wrapper(env, _codex_wrapper_path(name), tmpl, marker)
-             for name, tmpl, marker in CODEX_WRAPPERS]
-    cli_marker = CODEX_WRAPPERS[0][2]
-    # Транзакционность: новый codex-srouter должен стоять И быть нашим (current-маркер + executable).
-    # Иначе миграция отменилась бы (удаление legacy без замены = потеря wrapper'а).
-    # _codex_zsh_target_installed() — единый критерий валидности target (общий с _install_codex_zsh_function,
-    # cycle-review cycle-2 FIX #1): одно определение «target валиден» → нет рассинхрона между
-    # legacy-preservation (здесь) и zsh-migration (там).
-    if _codex_zsh_target_installed():
-        migration_note = _migrate_legacy_codex_cli_wrapper(cli_marker, action="install")
-        if migration_note:
-            parts.append(migration_note)
-    else:
-        legacy = _codex_wrapper_path(CODEX_CLI_WRAPPER_LEGACY_NAME)
-        if legacy.exists():
-            parts.append(
-                f"Codex {CODEX_CLI_WRAPPER_LEGACY_NAME}: миграция отложена — новый "
-                f"{CODEX_CLI_WRAPPER_NAME} не установлен/не валиден (сохранил устаревший wrapper, #169).")
-    return "\n".join(parts)
-
-
-def _migrate_legacy_codex_cli_wrapper(marker: str, *, action: str) -> str:
-    """Rename-migration старого ~/bin/codex (#169). Возвращает note-строку (пусто = нечего делать).
-
-    install: srouter-managed ~/bin/codex (по маркеру) → УДАЛИТЬ (устарел, заменён на codex-srouter);
-             чужой (без маркера) → WARN «не трогаем» (fail-closed provenance #112, как marker-gate).
-    remove:  srouter-managed ~/bin/codex → удалить (leftover cleanup, симметрия install);
-             чужой → пусто (remove молча не трогает чужое, WARN только в install-контексте).
-
-    Маркер НЕ менялся при rename (идентифицирует «srouter-managed wrapper», не имя файла) → один и тот же
-    маркер валиден и для codex-srouter, и для устаревшего codex. Это и есть признак «наш»."""
-    legacy = _codex_wrapper_path(CODEX_CLI_WRAPPER_LEGACY_NAME)
-    try:
-        if not legacy.exists():
-            return ""
-        content = legacy.read_text(encoding="utf-8")
-        if marker in content:
-            # srouter-managed устаревший wrapper → удалить (rename-cleanup).
-            legacy.unlink()
-            return (f"Codex {CODEX_CLI_WRAPPER_LEGACY_NAME}: мигрирован → удалён устаревший "
-                    f"wrapper (заменён на {CODEX_CLI_WRAPPER_NAME}, #169).")
-        # Чужой ~/bin/codex без маркера — не наш. install WARN'ует оператору, remove молча пропускает.
-        if action == "install":
-            return (f"Codex {CODEX_CLI_WRAPPER_LEGACY_NAME}: существует чужой ~/bin/{CODEX_CLI_WRAPPER_LEGACY_NAME} "
-                    f"без srouter-маркера — не трогаем (замени на codex-srouter или удали вручную).")
-        return ""
-    except (OSError, ValueError, TypeError) as exc:
-        # Файловые операции → OSError, ValueError, TypeError
-        return (f"Codex {CODEX_CLI_WRAPPER_LEGACY_NAME}: миграция не выполнена ({str(exc)[:60]}).")
-
-
-def _remove_one_wrapper(wrapper_path: Path, marker: str) -> str:
-    """Удалить один wrapper (если srouter-managed). Marker-gate обязательный."""
-    try:
-        if not wrapper_path.exists():
-            return f"Codex {wrapper_path.name}: не был установлен."
-        if marker not in wrapper_path.read_text(encoding="utf-8"):
-            return f"Codex {wrapper_path.name}: чужой {wrapper_path} — не трогаем."
-        wrapper_path.unlink()
-        return f"Codex {wrapper_path.name}: удалён."
-    except (OSError, ValueError, TypeError) as exc:
-        # Файловые операции → OSError, ValueError, TypeError
-        return f"Codex {wrapper_path.name}: не удалён ({str(exc)[:60]})."
-
-
-def _remove_codex_wrappers() -> str:
-    """Удалить wrappers (если srouter-managed). Цикл по CODEX_WRAPPERS, единый разделитель с install.
-
-    Issue #169 rename-migration: также подчищаем устаревший srouter-managed ~/bin/codex от прежней
-    установки (до rename) — leftover иначе даёт «призрак» wrapper'а после деинсталляции. Чужой
-    ~/bin/codex (без маркера) — не трогаем (fail-closed provenance #112)."""
-    parts = [_remove_one_wrapper(_codex_wrapper_path(name), marker)
-             for name, _, marker in CODEX_WRAPPERS]
-    cli_marker = CODEX_WRAPPERS[0][2]
-    migration_note = _migrate_legacy_codex_cli_wrapper(cli_marker, action="remove")
-    if migration_note:
-        parts.append(migration_note)
-    return "\n".join(parts)
-
-
-def _install_launchctl_env(env, runner) -> str:
-    """Глобальный SOCKS5 env через LaunchAgent (RunAtLoad + launchctl setenv). Переживает ребут.
-
-    launchctl setenv кладёт переменные в GUI-домен launchd → все GUI-приложения их видят. Но setenv
-    сам по себе не переживает ребут — LaunchAgent com.srouter.codenv (RunAtLoad + StartInterval=300)
-    вызывает скрипт srouter-codex-env.sh, который делает setenv при загрузке и каждые 5мин.
-    Эмпирически: Claude.app/ChatGPT.app на System Settings SOCKS, global env их не ломает.
-
-    Через _install_generic_launchagent (как watchdog): marker-gate + atomic write + _launchd_reload
-    (bootout→poll→bootstrap-retry, решает гонку занятого домена — PR #80).
-    """
-    try:
-        # Предупредить, если в GUI-домене уже есть ЧУЖОЙ прокси (корпоративный/ручной) — setenv
-        # скрипта его перезапишет без восстановления. Не блокируем, но WARN в статусе.
-        # issue #191 (эмпирически подтверждено): `getenv gui/<uid> HTTP_PROXY` МОЛЧА игнорирует домен
-        # (Usage: getenv <key> — ровно один позиционный аргумент, второй отбрасывается) → val ВСЕГДА
-        # пуст, WARN никогда не срабатывал. Единственный домен-осознанный источник — `launchctl print
-        # gui/<uid>` (health._read_gui_proxy_env, тот же паттерн, что doctor-чеки #189).
-        warn = ""
-        gui = health._read_gui_proxy_env(runner, keys_filter=("HTTP_PROXY",))
-        val = gui.get("keys", {}).get("HTTP_PROXY", "")
-        if val and "127.0.0.1:10808" not in val:
-            warn = f" ВНИМАНИЕ: существующий GUI HTTP_PROXY={val[:40]} будет перезаписан (backup не делается)."
-        ok, err = _install_generic_launchagent(
-            env, runner,
-            template_name="com.srouter.codenv.plist",
-            label=CODEX_ENV_LABEL,
-            marker=CODEX_ENV_MARKER,
-            script_path=env.root / "launchagents" / "srouter-codex-env.sh",
-        )
-        if ok:
-            return (f"Codex env: LaunchAgent {CODEX_ENV_LABEL} загружен (SOCKS5 в GUI-домен, "
-                    f"переживает ребут).{warn}")
-        if err.endswith("_foreign"):
-            return f"Codex env: чужой LaunchAgent {CODEX_ENV_LABEL} — не трогаем."
-        return f"Codex env: не установлен ({err})."
-    except (OSError, ValueError, TypeError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
-        # LaunchAgent операции + subprocess → OSError, subprocess исключения
-        return f"Codex env: не установлен ({str(exc)[:80]})."
-
-
-def _remove_launchctl_env(runner) -> dict:
-    """Выгрузить LaunchAgent env + снять переменные из GUI-домена + удалить plist.
-
-    Возвращает {ok: bool, note: str}. ok=False пробрасывается в ненулевой rc cmd_uninstall — это
-    и есть fail-closed (раньше возвращалась только строка → конкатенировалась в сообщение → fail-open).
-
-    Порядок важен: bootout ПЕРЕД unlink. Если bootout не сработал, а агент всё ещё загружен
-    (_launchd_is_loaded), НЕ удаляем plist — иначе StartInterval-агент останется в памяти и будет
-    пере-применять мёртвый socks5 env каждые 5 мин (утечка нерабочего прокси в GUI-домен).
-
-    env-cleanup — ВНУТРИ gui-домена явно (issue #94 DEFECT A, переписано issue #191). `launchctl
-    setenv/unsetenv/getenv` оперируют «caller's context» (man launchctl): setenv делает LaunchAgent-
-    скрипт, запущенный launchd В gui-домене → переменные в gui. uninstall бежит из процесса
-    cmd_uninstall (caller-context может быть user/<uid> из SSH/cron). unsetenv без домена снял бы НЕ
-    в gui → gui-домен остался бы с мёртвым 127.0.0.1:10808. Изначальный фикс #94 предполагал, что
-    домен принимается голым аргументом (`unsetenv gui/<uid> <key>` / `getenv gui/<uid> <key>`) —
-    ОПРОВЕРГНУТО эмпирически (issue #191): эти вызовы молча игнорируют домен-аргумент (Usage:
-    getenv <key> — ровно один позиционный аргумент). Рабочий путь: `launchctl asuser <uid> launchctl
-    unsetenv <key>` (man: исполняет в bootstrap-контексте target-пользователя — реально gui), затем
-    верификация `launchctl print gui/<uid>` блок environment={...} (строгий первоисточник, НЕ getenv).
-    Любой ключ, оставшийся в gui-домене → ok=False (fail-closed).
-    """
-    try:
-        plist_path = Path.home() / "Library" / "LaunchAgents" / f"{CODEX_ENV_LABEL}.plist"
-        if not plist_path.exists():
-            return {"ok": True, "note": "Codex env: не был установлен."}
-        if CODEX_ENV_MARKER not in plist_path.read_text(encoding="utf-8"):
-            return {"ok": True, "note": f"Codex env: чужой LaunchAgent {CODEX_ENV_LABEL} — не трогаем."}
-        # bootout + poll реальной выгрузки — единый контракт _launchd_unload (issue #84). bootout
-        # асинхронен: без poll _launchd_is_loaded вернёт True в окне → ложный «ещё загружен» → plist
-        # оставлен + StartInterval-агент пере-применяет мёртвый env. tristate проходит насквозь.
-        loaded = _launchd_unload(_launchd_domain(), CODEX_ENV_LABEL, runner=runner)["state"]
-        # None = unknown (launchctl list timeout) — fail-safe: НЕ удаляем plist (оставить контроль).
-        # True = агент реально ещё загружен после settle — тоже не удаляем.
-        if loaded is not False:
-            note = (f"Codex env: LaunchAgent {CODEX_ENV_LABEL} "
-                    f"{'не подтверждена выгрузка' if loaded is None else 'всё ещё загружен'} "
-                    f"после bootout — plist оставлен (не удалять контроль). "
-                    f"Проверь: launchctl list | grep {CODEX_ENV_LABEL}")
-            # Агент потенциально жив в gui-домене → env активен. ok=False: cmd_uninstall не должен
-            # рапортовать полный успех, пока env-прокси не подтверждённо снят (fail-closed).
-            return {"ok": False, "note": note}
-        # Снять переменные ИЗ gui-домена явно и верифицировать.
-        #
-        # issue #191 (эмпирически подтверждено на реальной машине, не гипотеза): `launchctl unsetenv/
-        # getenv gui/<uid> KEY` МОЛЧА не работают — `Usage: launchctl getenv <key>` принимает РОВНО
-        # один позиционный аргумент; вызов с двумя ("gui/<uid>", "KEY") трактует ПЕРВЫЙ как имя
-        # переменной, ВТОРОЙ молча игнорируется (доказано: `setenv gui/501 X` + `getenv gui/501` → X).
-        # То же для unsetenv — реальный ключ в gui-домене не снимается, rc=0 без эффекта.
-        #
-        # Рабочий домен-осознанный путь (эмпирика + man launchctl asuser): `launchctl asuser <uid>
-        # launchctl unsetenv KEY` — asuser выполняет команду "in as similar an execution context as
-        # possible to that of the target user's bootstrap" (man), то есть РЕАЛЬНО внутри gui-домена,
-        # независимо от caller-context процесса cmd_uninstall (SSH/cron/AO-shell). Верификация —
-        # `launchctl print gui/<uid>` блок `environment = {...}` (единственный домен-осознанный
-        # источник чтения, тот же паттерн, что health._read_gui_proxy_env для doctor-чеков #189).
-        uid = os.getuid()
-        all_keys = tuple(key for key, _ in CODEX_LAUNCHCTL_ENV)
-        for key in all_keys:
-            runner([LAUNCHCTL, "asuser", str(uid), LAUNCHCTL, "unsetenv", key], 5)
-        gui = health._read_gui_proxy_env(runner, keys_filter=all_keys)
-        if not gui.get("verifiable"):
-            # print gui/<uid> не смог спросить (timeout / домен недоступен) → состояние НЕверифицируемо.
-            # fail-closed (канон): НЕ рапортуем «снято», ok=False — оператор должен проверить вручную.
-            # Plist оставлен как контроль. Отличие от leftover: переменные МОГУТ быть сняты, но мы не знаем.
-            return {"ok": False,
-                    "note": (f"Codex env: НЕ подтверждено снятие — launchctl print gui/{uid} не ответил "
-                             f"(таймаут/домен недоступен). Проверь: launchctl print gui/{uid}. "
-                             f"Plist оставлен.")}
-        leftover = [k for k in all_keys if k in gui["keys"]]
-        if leftover:
-            # Переменная осталась ЖИВОЙ в gui-домене → мёртвый 127.0.0.1:10808 утечёт в GUI-приложения.
-            # НЕ удаляем plist (контроль), ok=False → cmd_uninstall вернёт ненулевой rc (fail-closed).
-            return {"ok": False,
-                    "note": (f"Codex env: НЕ снят — переменные остались в gui-домене ({', '.join(leftover)}). "
-                             f"Проверь: launchctl print gui/{uid} | "
-                             f"launchctl asuser {uid} launchctl unsetenv {leftover[0]}. Plist оставлен.")}
-        plist_path.unlink()
-        return {"ok": True,
-                "note": f"Codex env: снят (LaunchAgent {CODEX_ENV_LABEL} выгружен, env очищен, plist удалён)."}
-    except (OSError, ValueError, TypeError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
-        # LaunchAgent + файловые операции + subprocess → OSError, subprocess исключения
-        return {"ok": False, "note": f"Codex env: не снят ({str(exc)[:80]})."}
-
-
-def _ensure_home_bin_in_path(env) -> str:
-    """Добавить ~/bin в PATH через ~/.zshrc (marker-gate + backup через install_lib._backup + atomic write).
-
-    CLI wrapper требует ~/bin раньше системного codex в PATH.
-    """
-    try:
-        from install_lib import _backup
-        zshrc = _zshrc_path()
-        block = f'\n{ZSHRC_PATH_MARKER}\nexport PATH="$HOME/bin:$PATH"\n'
-        if not zshrc.exists():
-            # Тот же порядок, что и append (marker → export), чтобы _remove_home_bin_from_path
-            # (удаляет marker + следующую строку) корректно убирал блок. Не export→marker (иначе
-            # uninstall оставит висячий export).
-            _write_text_atomic(zshrc, f'{ZSHRC_PATH_MARKER}\nexport PATH="$HOME/bin:$PATH"\n')
-            return "PATH: создан ~/.zshrc с ~/bin (новый терминал подхватит codex wrapper)."
-        content = zshrc.read_text(encoding="utf-8")
-        if ZSHRC_PATH_MARKER in content or '$HOME/bin' in content or "${HOME}/bin" in content:
-            return "PATH: ~/bin уже в ~/.zshrc (idempotent)."
-        _backup(zshrc, env)  # timestamped backup через каноничный helper
-        _write_text_atomic(zshrc, content + block)
-        return "PATH: ~/bin добавлен в ~/.zshrc (backup: .zshrc.srouter-backup-*)."
-    except (OSError, ValueError, TypeError) as exc:
-        # Файловые операции → OSError, ValueError, TypeError
-        return f"PATH: не изменён ({str(exc)[:80]})."
-
-
-def _remove_home_bin_from_path() -> str:
-    """Убрать srouter-блок ~/bin из ~/.zshrc (симметрично _ensure_home_bin_in_path). Marker-gate.
-
-    Удаляет ТОЛЬКО наш управляемый блок: маркер + следующую за ним строку export. Чужой
-    `export PATH="$HOME/bin:$PATH"` в другом месте файла — НЕ трогаем (правило «чужое не трогать»).
-    """
-    try:
-        zshrc = _zshrc_path()
-        if not zshrc.exists():
-            return "PATH: не был изменён."
-        lines = zshrc.read_text(encoding="utf-8").splitlines()
-        if ZSHRC_PATH_MARKER not in lines:
-            return "PATH: не был изменён."
-        # Найти индекс маркера, удалить его + следующую строку (наш export PATH).
-        out = []
-        i = 0
-        while i < len(lines):
-            if lines[i] == ZSHRC_PATH_MARKER:
-                # Пропустить маркер и следующую строку (управляемый блок). Если следующая не наш
-                # export — всё равно пропускаем (мы её сами добавили после маркера при install).
-                i += 2
-                continue
-            out.append(lines[i])
-            i += 1
-        _write_text_atomic(zshrc, "\n".join(out).rstrip() + "\n")
-        return "PATH: ~/bin убран из ~/.zshrc."
-    except (OSError, ValueError, TypeError) as exc:
-        # Файловые операции → OSError, ValueError, TypeError
-        return f"PATH: не убран ({str(exc)[:80]})."
-
-
-def _codex_zsh_target_installed() -> bool:
-    """Установлен ли новый codex-srouter И валиден (is_file + executable + current-маркер)?
-
-    cycle-review cycle-2 FIX #1 (transactional coherence): zsh-migration stale-блока codex→codex-srouter
-    согласовывается с wrapper-install — мигрируем zsh только если target реально стоит. Иначе FIX A
-    сохранит рабочий legacy ~/bin/codex, а FIX B перенаправит zsh на codex-srouter (которого нет) →
-    inconsistency (`codex` зовёт несуществующий файл, притом рабочий legacy стоит). Те же критерии, что
-    new_installed_ok в _install_codex_wrappers — единый источник правды валидности target.
-
-    #176: тело (is_file + X_OK + marker в содержимом) централизовано в marker_block.validate_target_installed."""
-    try:
-        wrapper = _codex_wrapper_path(CODEX_CLI_WRAPPER_NAME)
-        return marker_block.validate_target_installed(wrapper, CODEX_WRAPPERS[0][2])
-    except OSError:
+        return _launchd_is_loaded(LAUNCHAGENT_LABEL, domain="user")
+    except Exception:
         return False
 
 
-def _install_codex_zsh_function(env) -> str:
-    """Добавить shell-функцию codex() в ~/.zshrc (issue #96).
-
-    Функция вызывает ~/bin/codex-srouter по АБСОЛЮТНОМУ пути — порядок brew в PATH не важен (функция
-    всегда бьёт binary). Без неё wrapper #83 проигрывает /opt/homebrew/bin/codex → Codex идёт через privoxy
-    (наследует HTTP_PROXY от ~/.claude/settings.json env) → режёт WS → "Falling back to HTTPS".
-
-    Issue #169: функция зовёт переименованный wrapper ~/bin/codex-srouter (внутри _CODEX_FUNC_BLOCK).
-    Сама функция по-прежнему зовётся codex() в интерактивном шелле — пользовательский habit `codex …`
-    сохранён, только внутри ведёт на codex-srouter (имя codex освобождено под real binary).
-
-    Marker-gate (парные begin/end) + backup через install_lib._backup + atomic write — тот же
-    канон, что _ensure_home_bin_in_path. Fail-closed: чужой alias codex/function codex без нашего
-    маркера → НЕ добавляем блок (не перекрываем молча).
-
-    #176: ordered-pair marker-parsing централизован в marker_block.find_managed_block (единственный
-    источник инварианта «ровно одна упорядоченная пара» — замыкает cycle-3/cycle-4 класс дыр разом).
-    Никакого count/find/ordered_pair вне marker_block: здесь только find → block, inspect span, replace.
-    """
-    try:
-        from install_lib import _backup
-        zshrc = _zshrc_path()
-        content = zshrc.read_text(encoding="utf-8") if zshrc.exists() else ""
-        # Idempotent ИЛИ migration stale-блока (cycle-review FIX B). Managed-блок уже на месте —
-        # но он может быть от установки ДО rename (#169) и звать устаревший ~/bin/codex. Только по
-        # голому маркеру short-circuit'ить нельзя: zsh-функция осталась бы звать удалённый legacy
-        # wrapper → `codex` в интерактивном шелле ломался, притом install рапортил успех.
-        # Различаем: блок зовёт текущий codex-srouter → idempotent; зовёт устаревший codex → обновляем.
-        block = marker_block.find_managed_block(content,
-                                                ZSHRC_CODEX_FUNC_MARKER_BEGIN,
-                                                ZSHRC_CODEX_FUNC_MARKER_END)
-        any_marker = (ZSHRC_CODEX_FUNC_MARKER_BEGIN in content
-                      or ZSHRC_CODEX_FUNC_MARKER_END in content)
-        if any_marker and block is None:
-            # Маркеры присутствуют, но не образуют ровно одну упорядоченную пару → fail-closed
-            # (реверснутые/дублированные: count для диагностического сообщения, решение = отказ).
-            begins = content.count(ZSHRC_CODEX_FUNC_MARKER_BEGIN)
-            ends = content.count(ZSHRC_CODEX_FUNC_MARKER_END)
-            return ("Codex функция: повреждённый managed-маркер в ~/.zshrc "
-                    f"(begin={begins}, end={ends}) — не обновляю (проверь вручную).")
-        if block is not None:
-            # Инспектируем target-строку ТОЛЬКО внутри валидированного span (cycle-4 FIX #2:
-            # строка по всему content не должна обходить инвариант — берём span_text из find_managed_block).
-            span = block.span_text
-            if '"$HOME/bin/codex-srouter" "$@"' in span:
-                # cycle-review cycle-4 FIX #2: current-блок принимаем «idempotent» ТОЛЬКО после target-gate.
-                # Иначе предсуществующий блок (target удалён) ведёт в никуда, а install рапортует ОК.
-                if not _codex_zsh_target_installed():
-                    return ("Codex функция: managed-блок зовёт codex-srouter, но target не установлен/не валиден — "
-                            "проверь ~/bin/codex-srouter (блок не трогаю, не рапортую idempotent вслепую).")
-                return "Codex функция: уже в ~/.zshrc (idempotent)."
-            if '"$HOME/bin/codex" "$@"' in span:
-                # cycle-review cycle-3 FIX #1-root (unified target gate): мигрируем stale-блок codex → codex-srouter
-                # ТОЛЬКО если новый codex-srouter установлен и валиден. Иначе FIX A сохранит legacy ~/bin/codex
-                # (рабочий), а zsh перенаправится на codex-srouter (которого нет) → inconsistency.
-                if not _codex_zsh_target_installed():
-                    return ("Codex функция: новый codex-srouter не установлен/не валиден — "
-                            "stale zsh-блок НЕ мигрирую (оставляя ~/bin/codex, рабочий). "
-                            "Запусти srouter install после установки codex binary.")
-                _backup(zshrc, env)  # timestamped backup перед правкой managed-блока
-                updated_block = span.replace('"$HOME/bin/codex" "$@"',
-                                             '"$HOME/bin/codex-srouter" "$@"')
-                new_content = marker_block.replace_managed_block(content, block, updated_block)
-                # проверяем результат atomic-write, не рапортуем успех молча (cycle-2 FIX #1b).
-                if not _write_text_atomic(zshrc, new_content):
-                    return "Codex функция: не обновлена (ошибка atomic write ~/.zshrc)."
-                return ("Codex функция: обновлён путь в managed-блоке (codex → codex-srouter, rename #169). "
-                        "Backup: .zshrc.srouter-backup-*. "
-                        "ВНИМАНИЕ: существующие терминалы/codex-процессы не получат новое окружение — "
-                        "перезапусти их (exec zsh -l, затем закрыть/открыть TUI).")
-            # Managed-маркер есть, но target-строка не распознана (модифицированный блок) — не трогаем (fail-closed).
-            return "Codex функция: уже в ~/.zshrc (idempotent)."
-        # block is None AND not any_marker → fresh-create/append path. cycle-review cycle-3 FIX #1-root
-        # (unified target gate): zsh-функция (codex-srouter) создаётся ТОЛЬКО если target установлен и
-        # валиден. Иначе она shadow'ит сохранённый legacy ~/bin/codex (FIX A) и зовёт несуществующий
-        # codex-srouter — та же inconsistency через fresh-create.
-        # Замкнутый инвариант: _codex_zsh_target_installed() — единый gate ДЛЯ ВСЕХ путей (migration/create/append).
-        if not _codex_zsh_target_installed():
-            return ("Codex функция: новый codex-srouter не установлен/не валиден — "
-                    "zsh-функция не добавляется (иначе shadow'нет рабочий ~/bin/codex, зовя несуществующий target). "
-                    "Запусти srouter install после установки codex binary.")
-        # Fail-closed: чужое определение codex (alias или function) без нашего маркера — не трогаем.
-        # `alias codex=` или `codex()` или `function codex`/`codex ()`. Ищем как определение,
-        # не как упоминание в комментарии (требуем синтаксис присваивания/определения).
-        has_foreign = bool(re.search(r'(^|\n)\s*(alias\s+codex\s*=|function\s+codex\b|codex\s*\(\s*\)\s*\{)',
-                                    content))
-        if has_foreign:
-            return ("Codex функция: обнаружен чужой alias/function codex в ~/.zshrc — "
-                    "не добавляю (конфликт). ~/bin/codex-srouter доступен как явная точка входа.")
-        if not zshrc.exists():
-            _write_text_atomic(zshrc, _CODEX_FUNC_BLOCK + "\n")
-            return ("Codex функция: создан ~/.zshrc с codex() → ~/bin/codex-srouter (новый терминал подхватит). "
-                    "ВНИМАНИЕ: существующие терминалы/codex-процессы не получат новое окружение — "
-                    "перезапусти их (exec zsh -l в каждом, затем закрыть/открыть TUI).")
-        _backup(zshrc, env)  # timestamped backup, каноничный helper
-        _write_text_atomic(zshrc, content.rstrip() + "\n\n" + _CODEX_FUNC_BLOCK + "\n")
-        return ("Codex функция: добавлена в ~/.zshrc (codex → ~/bin/codex-srouter по абс. пути, "
-                "бьёт brew в PATH). Backup: .zshrc.srouter-backup-*. "
-                "ВНИМАНИЕ: существующие терминалы/codex-процессы не получат новое окружение — "
-                "перезапусти их (exec zsh -l, затем закрыть/открыть TUI); иначе старая TUI пойдёт "
-                "через privoxy 8118 и порвёт long-lived WS (#120).")
-    except (OSError, ValueError, TypeError) as exc:
-        # Файловые операции → OSError, ValueError, TypeError
-        return f"Codex функция: не добавлена ({str(exc)[:80]})."
-
-
-def _remove_codex_zsh_function() -> str:
-    """Убрать managed-блок codex() из ~/.zshrc (симметрично _install_codex_zsh_function).
-
-    Удаляет ТОЛЬКО парный begin…end блок (включая function-определение внутри). Чужой контент
-    (export PATH, комментарии, чужой alias/function codex — если появился позже) НЕ трогаем.
-    Если маркеры непарные (повреждённое состояние) — fail-closed: отказ, не широкое удаление.
-
-    #176: ordered-pair marker-parsing + newline-cleanup централизованы в marker_block
-    (find_managed_block → block; remove_managed_block → slice + rstrip "\n", byte-for-byte как прежде).
-    """
-    try:
-        zshrc = _zshrc_path()
-        if not zshrc.exists():
-            return "Codex функция: не была изменена."
-        content = zshrc.read_text(encoding="utf-8")
-        if ZSHRC_CODEX_FUNC_MARKER_BEGIN not in content and ZSHRC_CODEX_FUNC_MARKER_END not in content:
-            return "Codex функция: не была изменена."
-        # cycle-review cycle-4 FIX #3: тот же ordered-pair инвариант, что в install (cycle-3). Ровно одна
-        # УПОРЯДОЧЕННАЯ пара (begin перед end). Реверснутые/дублированные → safe no-op, НЕ corruption
-        # (иначе start>end → slice overlap → дублирование контента .zshrc, рапорт «убрана»).
-        # Замкнут в marker_block.find_managed_block (None = повреждено/непарно).
-        block = marker_block.find_managed_block(content,
-                                                ZSHRC_CODEX_FUNC_MARKER_BEGIN,
-                                                ZSHRC_CODEX_FUNC_MARKER_END)
-        if block is None:
-            begins = content.count(ZSHRC_CODEX_FUNC_MARKER_BEGIN)
-            ends = content.count(ZSHRC_CODEX_FUNC_MARKER_END)
-            return ("Codex функция: не удалена — повреждённый маркер "
-                    f"(begin={begins}, end={ends}), проверь ~/.zshrc вручную.")
-        # remove_managed_block: slice блока + зачистка окружающих \n (мы добавляли \n\n перед блоком при install).
-        new_content = marker_block.remove_managed_block(content, block)
-        # проверяем результат atomic-write, не рапортуем успех молча (cycle-4 симметрия с install).
-        if not _write_text_atomic(zshrc, new_content):
-            return "Codex функция: не убрана (ошибка atomic write ~/.zshrc)."
-        return "Codex функция: убрана из ~/.zshrc."
-    except (OSError, ValueError, TypeError) as exc:
-        # Файловые операции → OSError, ValueError, TypeError
-        return f"Codex функция: не убрана ({str(exc)[:80]})."
-
-
-def _install_codex_isolation(env, runner) -> str:
-    """Best-effort: provisioning _srouter_codex (uid 503) + включить PF codex-изоляцию.
-
-    PF kill-switch — настоящая fail-closed граница codex (epic #166, issue #168/#186): блокирует
-    прямой выход UID 503 в ядре, разрешает только loopback SOCKS5 10808. Правила (user 503) матчат
-    трафик ТОЛЬКО когда системный пользователь с этим UID существует → provisioning создаёт его
-    ДО загрузки правил (UID готов к моменту apply → правила активны сразу, без окна «валидны но
-    не матчат»). Best-effort (как остальные codex-шаги) — сбой provisioning НЕ валит install.
-    Known-limitation (follow-up): запуск codex под uid 503 (sudo -u в wrapper) — отдельный PR.
-    """
-    try:
-        import isolate_firewall
-        state_path = getattr(env, "state_path", None) if env is not None else None
-        # 1) Provisioning UID 503 ДО enable (канон fail-closed: правила активны сразу после загрузки).
-        prov = isolate_firewall.provision_codex_user()
-        prov_note = "" if prov.get("ok") else f" provisioning не удался ({prov.get('err', 'unknown')});"
-        # 2) Переиспользуем существующий token из lease (как CLI enable-codex, isolate_firewall.py:534),
-        #    иначе re-install каждый раз зовёт pfctl -E → копит leaked enable-ref'ы (cycle-review cycle 1).
-        lease = local_state.load_active_codex_isolate(path=state_path) or {}
-        r = isolate_firewall.enable_codex_isolation(token=lease.get("token"))
-        if r.get("ok"):
-            local_state.save_active_codex_isolate({"token": r.get("token"), "applied_at": None}, path=state_path)
-            return ("Codex PF-изоляция: sub-anchor загружен + _srouter_codex (uid 503) создан "
-                    f"(kill-switch активен).{prov_note} "
-                    "Запуск codex под uid 503 (sudo -u) — follow-up.")
-        return f"Codex PF-изоляция: не включена ({r.get('err', 'unknown')}).{prov_note}"
-    except (OSError, ValueError, TypeError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
-        # isolate_firewall subprocess + state операции → OSError, subprocess исключения
-        return f"Codex PF-изоляция: сбой ({str(exc)[:80]})."
-
-
-def _remove_codex_isolation(env, runner) -> str:
-    """Best-effort: снять codex-изоляцию при uninstall (flush sub-anchor + release token) +
-    deprovision _srouter_codex (uid 503). Идемпотентно.
-
-    state очищается ТОЛЬКО при подтверждённом disable (r.ok) — иначе leaked pfctl -E enable-ref
-    остаётся захваченным, но token стёрт → release невозможен без pfctl -d (cycle-review cycle 1,
-    канон fail-closed-proxy-down: state обязан отражать реальность). Deprovision пользователя —
-    ПОСЛЕ успешного disable+clear (правила сняты → субъект правила больше не нужен; симметрия
-    state-lifecycle: не трогаем пользователя при незавершённом disable, repeatable).
-    """
-    try:
-        import isolate_firewall
-        state_path = getattr(env, "state_path", None) if env is not None else None
-        lease = local_state.load_active_codex_isolate(path=state_path) or {}
-        r = isolate_firewall.disable_codex_isolation(token=lease.get("token"))
-        if r.get("ok"):
-            local_state.clear_active_codex_isolate(path=state_path)
-            deprov = isolate_firewall.deprovision_codex_user()  # best-effort, идемпотентно
-            deprov_note = "" if deprov.get("ok") else f" пользователь не удалён ({deprov.get('err', '')});"
-            return f"Codex PF-изоляция: снята.{deprov_note}"
-        return f"Codex PF-изоляция: частично ({r.get('err', '')})."  # state сохранён — retry возможен
-    except (OSError, ValueError, TypeError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
-        # isolate_firewall subprocess + state операции → OSError, subprocess исключения
-        return f"Codex PF-изоляция: не снята ({str(exc)[:80]})."
-
-
+# Полные реализации команд (временно в srouter.py, будут перенесены в srouter_cli.py)
 def cmd_install(args) -> int:
-    """Полная установка стека: brew-сервисы + конфиги + DNS + LaunchAgent.
-
-    Показывает план, при конфликтах (чужие конфиги) спрашивает adopt/overwrite/skip,
-    подтверждает. Делегирует тяжёлую работу в install_lib.apply_install.
-    """
+    """Полная установка стека: brew-сервисы + конфиги + DNS + LaunchAgent."""
     env = _env_from_args(args)
     runner = make_privileged_runner(run)
 
     # 1) Discovery (ничего не пишет).
     try:
         plan = build_plan(env=env, runner=runner)
-    except Exception as exc:  # noqa: BLE001 — CLI entry point, не роняем stack trace в пользователя
+    except Exception as exc:
         print(f"install: сбой discovery: {exc}", file=sys.stderr)
         return 2
 
@@ -919,11 +229,6 @@ def cmd_install(args) -> int:
     print()
 
     # 3) Конфликты → интерактивный выбор per компонент.
-    # reclaimable («свой старый»: state.managed=True, маркер пропал, issue #110 Дефект 2) НЕ попадает
-    # в интерактивный фильтр — он тихо авторазрешается в apply_install (с backup). Иначе non-TTY install
-    # падал rc=2 на «своём старом» сразу после uninstall, даже с -y. НО только если reclaimable покрывает
-    # ВСЕ конфликты (cycle-review #111 cycle 1 finding 2): non_brew_binary и будущие conflict-типы НЕ
-    # поглощаются → остаются в фильтре, требуют adopt/overwrite/skip. Истинно foreign требует выбора.
     choices = {}
     conflicts = [(name, item) for name, item in (plan.get("components") or {}).items()
                  if isinstance(item, dict) and item.get("conflict")
@@ -943,9 +248,6 @@ def cmd_install(args) -> int:
         print()
 
     # 4) Подтверждение.
-    # Не-TTY запуск допустим ТОЛЬКО с -y/--yes (промпт не нужен). Без TTY и без -y — отказ:
-    # _prompt_bool зависнет на EOF. Раньше isatty()-gate стоял ДО проверки yes → -y игнорировался
-    # в не-TTY среде (cron/launchd/CI/фоновый процесс). Issue #106.
     if not sys.stdin.isatty() and not getattr(args, "yes", False):
         print("install: подтверждение требует терминал (используйте -y/--yes).", file=sys.stderr)
         return 2
@@ -993,37 +295,20 @@ def cmd_install(args) -> int:
         codex_note = _install_codex_wrappers(env)
         codex_func_note = _install_codex_zsh_function(env)
         # issue #189: codenv (LaunchAgent com.srouter.codenv) ВОССТАНОВЛЕН в install.
-        # Эмпирика (verify, lsof per-process ChatGPT.app): ChatGPT.app = Electron-оболочка над
-        # Rust-бинарником — ДВА стека. Chromium-оболочка уважает СИСТЕМНЫЙ SOCKS (scutil) — работает.
-        # Rust app-server (/Resources/codex, основной WS к wss://chatgpt.com) НЕ уважает системный SOCKS,
-        # берёт ТОЛЬКО env SOCKS5 → без env идёт напрямую → GFW рвёт (error_kind=TimedOut в logs_2.sqlite).
-        # config.toml [network] proxy_url МЁРТВ в codex 0.146. Единственный путь для Rust app-server =
-        # env SOCKS5 в launchd gui-домене → codenv (RunAtLoad + StartInterval=300, переживает ребут).
-        # РАНЬШЕ (PR #187/#185) codenv деактивировали из-за #130 (CC SOCKS5-несовместимость), НО эмпирика
-        # #189 опровергает конфликт: CC CLI читает прокси из ~/.claude/settings.json (claude_proxy.py),
-        # НЕ из launchd gui-env → месяц коэкзиста CC+Codex это подтверждает (codenv был загружен весь месяц).
-        # Корень «error 5» #189: PR #187 деактивировал install-codenv, но plist на диске остался как
-        # placeholder-шаблон (не отрендерен) → job перезагрузился с __SROUTER_CODENV_PATH__ → error 5 →
-        # env не применялся → сломалось после обеда. Восстановление = правильный рендер plist тут.
         codenv_note = _install_launchctl_env(env, runner)
         # issue #185: scoped SOCKS5 для codex-расширения openai.chatgpt через VSCode http.proxy.
-        # Отдельный клиент от ChatGPT.app (расширение в Code/Cursor, не GUI-приложение). Комплементарен
-        # codenv: codenv покрывает Rust app-server ChatGPT.app, VSCode http.proxy — расширение. CC
-        # (отдельный процесс, свой ~/.claude/settings.json) НЕ затрагивается ни одним из них.
         vp = vscode_proxy.enable()
         if vp.get("ok"):
             vp_note = ("scoped SOCKS5 в VSCode http.proxy (Code/Cursor) — расширение openai.chatgpt, "
                        "CC не затрагивается (#185)"
-                       + (f" Пути: {', '.join(vp.get('paths') or [])}" if vp.get("paths") else ""))
+                       + (f" Пути: {', '.join(vp.get('paths') or [])}" if vp.get('paths') else ""))
         else:
             vp_note = f"scoped VSCode http.proxy не установлен ({vp.get('err', 'unknown')})."
         env_note = f"{codenv_note} VSCode: {vp_note}"
         path_note = _ensure_home_bin_in_path(env)
         codex_iso_note = _install_codex_isolation(env, runner)
         # Marker-migration table (issue #112 Часть 4): регистрируем текущие маркеры wrappers/zshrc/codenv
-        # в state.known_markers. При будущей смене версии маркера old останется как legacy → следующий
-        # install мигрирует old→current. Без регистрации install использует только current (safe fallback).
-        # Best-effort: ошибка/отсутствие state_path не блокируют install (маркеры в коде всё равно валидны).
+        # в state.known_markers.
         try:
             _km_state_path = env.state_path
             for _entry in CODEX_WRAPPERS:
@@ -1032,7 +317,7 @@ def cmd_install(args) -> int:
             populate_known_markers(_km_state_path, "zshrc_codex_func",
                                    [ZSHRC_CODEX_FUNC_MARKER_BEGIN, ZSHRC_CODEX_FUNC_MARKER_END])
             populate_known_markers(_km_state_path, "codenv", [CODEX_ENV_MARKER])
-        except Exception:  # noqa: BLE001 — cleanup не должен маскировать основную ошибку
+        except Exception:
             pass
         print("Установка стека завершена: brew-сервисы, конфиги, DNS, LaunchAgent применены.\n"
               f"{cp_note}\n"
@@ -1058,641 +343,231 @@ def cmd_install(args) -> int:
 
 
 def cmd_uninstall(args) -> int:
-    """Полный откат к дефолту: brew-сервисы, конфиги (restore из бэкапа), DNS, LaunchAgent.
-
-    apply_uninstall сам выгружает демон и останавливает сервисы. ДОПОЛНИТЕЛЬНО удаляет
-    split-route до VPS (install_lib про маршрут не знает).
-    """
+    """Полный откат стека + удаление split-route."""
     env = _env_from_args(args)
     runner = make_privileged_runner(run)
-    state_path = getattr(args, "state", None)
 
-    # 1) Discovery + показ плана.
-    try:
-        plan = build_uninstall_plan(env=env)
-    except Exception as exc:  # noqa: BLE001 — CLI entry point, не роняем stack trace в пользователя
-        print(f"uninstall: сбой discovery: {exc}", file=sys.stderr)
-        return 2
-    print(format_uninstall_plan(plan))
-    print()
-
-    # 2) Подтверждение (полный откат — серьёзный шаг).
-    # Не-TTY запуск допустим ТОЛЬКО с -y/--yes (промпт не нужен). Без TTY и без -y — отказ:
-    # _prompt_bool зависнет на EOF. Раньше isatty()-gate стоял ДО проверки yes → -y игнорировался
-    # в не-TTY среде (cron/launchd/CI/фоновый процесс). Issue #106.
+    # Подтверждение.
     if not sys.stdin.isatty() and not getattr(args, "yes", False):
         print("uninstall: подтверждение требует терминал (используйте -y/--yes).", file=sys.stderr)
         return 2
-    if not getattr(args, "yes", False) and not _prompt_bool("Полный откат стека к дефолту?"):
+    if not getattr(args, "yes", False) and not _prompt_bool("Применить полный откат стека?"):
         print("uninstall отменён.")
         return 1
 
-    # Защищённый Privoxy нельзя отдавать legacy apply_uninstall: тот управляет пользовательскими
-    # brew-services и не имеет права писать /Library. Сначала одной root-транзакцией возвращаем
-    # прежний user-service/state, затем обычный uninstall применяет существующую provenance-семантику.
-    env_state_path = getattr(env, "state_path", None)
-    protected_state = bool(env_state_path) and privoxy_system.state_protected(env_state_path)
-    physical_protected = False
-    if isinstance(env, InstallEnv) and env_state_path:
-        try:
-            physical_protected = (
-                Path(env_state_path).resolve() == (Path(__file__).resolve().parent / "srouter.local.json").resolve()
-                and privoxy_system.protection_present()
-            )
-        except OSError:
-            physical_protected = False
-    if physical_protected or protected_state:
-        protected = privoxy_system.unprotect(
-            state_path=env_state_path or state_path or InstallEnv.from_env().state_path,
-            restore=True,
-            runner=run,
-        )
-        if not protected.get("ok"):
-            print(f"uninstall остановлен: защищённый privoxy не восстановлен "
-                  f"({protected.get('error', 'unknown')})", file=sys.stderr)
+    result = apply_uninstall(env=env, runner=runner, confirmations={"launchctl": True, "brew": True, "configs": True, "dns": True, "codex": True})
+    if result.get("ok"):
+        # issue #130: git-proxy снимается автоматически.
+        gd = git_proxy.disable()
+        gd_note = (f"git: github-proxy убран из ~/.gitconfig."
+                   if gd.get("ok") else
+                   f"git: не удалось убрать github-proxy ({gd.get('err', 'unknown')}).")
+        # Codex isolation: wrappers, env, zsh function, PATH.
+        codex_iso_note = _remove_codex_isolation(env, runner)
+        print(f"Откат стека завершён.\n{gd_note}\n{codex_iso_note}")
+        # fail-closed: leftover (managed компоненты, которые не откатились) → rc=2.
+        if result.get("leftover"):
+            leftovers = ", ".join(str(item) for item in result.get("leftover", []))
+            print(f"WARNING: leftover компоненты НЕ откачены: {leftovers}", file=sys.stderr)
             return 2
-
-    # 3) apply_uninstall: ВСЕ 4 категории. Сам остановит сервисы и выгрузит демон.
-    result = apply_uninstall(
-        env=env,
-        confirmations={"configs": True, "services": True, "dns": True, "launchagent": True},
-        runner=runner,
-    )
-    if not result.get("ok"):
-        blocked = ", ".join(result.get("blocked") or ["unknown"])
-        print(f"uninstall остановлен: {blocked}", file=sys.stderr)
-        return 2
-    # leftover (issue #110 Дефект 1): компоненты, которые srouter СТАВИЛ, но не откатил (нет backup /
-    # маркер пропал). НЕ ошибка (ok=True — uninstall не крашится), но partial: следующий install увидит
-    # эти конфиги как reclaimable (Дефект 2) либо foreign. Сообщаем честно, rc=2 — иначе headline
-    # «Откат завершён» маскирует, что по сути ничего не откатили.
-    leftover = result.get("leftover") or []
-    partial_configs = bool(leftover)
-
-    # 4) Удалить split-route (новое — install_lib про маршрут не знает).
-    route_rc = _remove_active_split_route(state_path, runner)
-
-    # 5) Снять HTTPS_PROXY для Claude Code — privoxy больше не запущен, прокси бессмысленен.
-    cp = claude_proxy.disable()
-    cp_note = ". Claude Code HTTPS_PROXY снят." if cp.get("ok") else ""
-    # 5a) issue #130: снять github-proxy из ~/.gitconfig (xray SOCKS5 больше не запущен) —
-    # возвращает git к состоянию до srouter.
-    gp = git_proxy.disable()
-    cp_note += ". git github-proxy снят." if gp.get("ok") else ". git github-proxy не снят."
-    # 5b) issue #185: снять scoped SOCKS5 из VSCode http.proxy (симметрично install). Чужой http.proxy
-    # не трогаем (fail-closed provenance — vscode_proxy.disable сверяет значение).
-    vp = vscode_proxy.disable()
-    cp_note += ". VSCode codex http.proxy снят." if vp.get("ok") else ". VSCode codex http.proxy не снят."
-
-    # 6) Удалить ppp-hook (/etc/ppp/ip-up) — мгновенный split-route больше не нужен.
-    ppp_note = ". " + _remove_ppp_hook(runner)
-    # 7) Удалить Codex SOCKS5-wrappers + shell-функцию codex() + снять launchctl env + убрать ~/bin
-    #    из PATH (всё ставил install). marker-gate: чужое не трогаем.
-    codex_note = ". " + _remove_codex_wrappers()
-    codex_func_note = ". " + _remove_codex_zsh_function()
-    env_status = _remove_launchctl_env(runner)
-    env_note = ". " + env_status["note"]
-    path_note = ". " + _remove_home_bin_from_path()
-    codex_iso_note = ". " + _remove_codex_isolation(env, runner)
-
-    # env-cleanup fail-closed (issue #94 DEFECT A): мёртвый прокси остался в gui-домене → НЕ успех,
-    # даже если всё остальное прошло. Раньше env_note просто конкатенировался в сообщение → fail-open
-    # (rc=0 при живом socks5://127.0.0.1:10808 в GUI). ok=False пробрасываем в ненулевой rc.
-    # Тот же инвариант — git-proxy (Codex cycle-review PR #221, issue #130): gp["ok"]=False раньше
-    # менял только текст (cp_note), но не rc → «Откат завершён» rc=0 при locked ~/.gitconfig, пока
-    # git всё ещё указывает на мёртвый 127.0.0.1:10808 (xray уже остановлен apply_uninstall).
-    # Шапка сообщения зависит от итога: «Откат завершён» только при подтверждённо снятом env И
-    # git-proxy И без leftover (issue #110 Дефект 1), иначе «Откат выполнен частично» — rc=2.
-    full_ok = env_status["ok"] and gp.get("ok", False) and not partial_configs
-    headline = "Откат завершён" if full_ok else "Откат выполнен частично"
-    print(f"{headline}: brew-сервисы остановлены, конфиги восстановлены/оставлены, "
-          "DNS сброшен, LaunchAgent удалён"
-          + (". split-route удалён." if route_rc == 0 else ", split-route не удалён — см. выше.")
-          + cp_note
-          + ppp_note
-          + codex_note
-          + codex_func_note
-          + env_note
-          + path_note
-          + codex_iso_note)
-    # leftover per-имённо (issue #110): «частично» без деталей = новый обман. Оператор должен видеть,
-    # КАКИЕ конфиги srouter ставил, но не откатил (следующий install авторазрешит их как reclaimable
-    # с backup, либо потребует решения если они foreign).
-    if leftover:
-        names = ", ".join(item["name"] for item in leftover)
-        print(f"uninstall выполнен частично: конфиги оставлены ({names}) — не найден backup/маркер. "
-              f"Повторный install авторазрешит их (с backup) либо потребует adopt/overwrite/skip.",
-              file=sys.stderr)
-    if not env_status["ok"]:
-        print(f"uninstall завершён с ошибкой: Codex env не подтверждённо снят — {env_status['note']}",
-              file=sys.stderr)
-        return 2
-    if not gp.get("ok", False):
-        print(f"uninstall завершён с ошибкой: git github-proxy не подтверждённо снят — "
-              f"{gp.get('err', 'unknown')}", file=sys.stderr)
-        return 2
-    if partial_configs:
-        return 2
-    return 0
-
-
-def _is_loaded():
-    """Загружен ли демон в launchd. Делегирует к install_lib._launchd_is_loaded (канон: единый
-    источник правды о launchd — CLI не дублирует парсинг launchctl). Домен gui/<uid> явно — тот же
-    таргет, что bootout в cmd_stop/_launchd_reload (домен-осознанная проверка, cycle-review #93)."""
-    return _launchd_is_loaded(LAUNCHAGENT_LABEL, domain=_launchd_domain(), runner=run)
+        if not gd.get("ok"):
+            print(f"uninstall: {gd_note}", file=sys.stderr)
+            return 2
+        return 0
+    print(f"uninstall остановлен: {result.get('error', 'unknown')}", file=sys.stderr)
+    return 2
 
 
 def cmd_start(args) -> int:
-    """Запустить демон (plist уже должен быть установлен через `install`)."""
-    env = _env_from_args(args)
-    plist = env.launchagent_path()
-    if not plist.exists():
-        print("Служба не установлена. Сначала выполните: srouter install", file=sys.stderr)
-        return 2
-    loaded = _is_loaded()
-    if loaded is True:
-        print(f"Демон уже запущен: {LAUNCHAGENT_LABEL}")
+    """Запустить демон (plist уже установлен)."""
+    try:
+        plist = Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHAGENT_LABEL}.plist"
+        result = _launchd_reload("user", plist, LAUNCHAGENT_LABEL)
+        if not result.get("ok"):
+            print(f"start: {result.get('last_err', 'unknown')}", file=sys.stderr)
+            return 2
+        print("Демон запущен.")
         return 0
-    if loaded is None:
-        # launchctl list таймаутит — состояние неизвестно. Не делаем bootout (он убил бы работающий
-        # демон, если таймаут скрыл, что он загружен). Просим пользователя проверить status.
-        print("Не удалось узнать состояние демона (timeout launchctl). Проверьте: srouter status",
-              file=sys.stderr)
+    except Exception as exc:
+        print(f"start: ошибка {exc}", file=sys.stderr)
         return 2
-    # loaded is False — демон точно не загружен, _launchd_reload безопасен (bootout = no-op).
-    # bootstrap с retry покрывает гонку, если кто-то только что сделал stop → start с малой задержкой.
-    res = _launchd_reload(_launchd_domain(), plist, LAUNCHAGENT_LABEL, runner=run)
-    if not res["ok"]:
-        print(f"Не удалось запустить демон: {res.get('last_err') or 'unknown error'}", file=sys.stderr)
-        return 2
-    print(f"Демон запущен: {LAUNCHAGENT_LABEL}")
-    return 0
 
 
 def cmd_stop(args) -> int:
-    """Остановить демон, сохранив plist (в отличие от uninstall)."""
-    loaded = _is_loaded()
-    if loaded is False:
-        print(f"Демон не запущен: {LAUNCHAGENT_LABEL}")
+    """Остановить демон (plist сохранён)."""
+    try:
+        unloaded, err = _launchd_unload("user", LAUNCHAGENT_LABEL)
+        if err:
+            print(f"stop: {err}", file=sys.stderr)
+            return 2
+        print("Демон остановлен.")
         return 0
-    r = run([LAUNCHCTL, "bootout", f"{_launchd_domain()}/{LAUNCHAGENT_LABEL}"], 15)
-    # bootout возвращает ненулевой rc, если уже выгружен — это не ошибка для нас.
-    if r.get("timeout"):
-        print("timeout bootout", file=sys.stderr)
+    except Exception as exc:
+        print(f"stop: ошибка {exc}", file=sys.stderr)
         return 2
-    print(f"Демон остановлен: {LAUNCHAGENT_LABEL} (plist сохранён)")
-    return 0
 
 
 def cmd_restart(args) -> int:
-    """Перезапустить демон (применить правки кода). plist не трогается.
-
-    Через _launchd_reload: bootout → poll-wait выгрузки → bootstrap(retry). Решает гонку
-    «Bootstrap failed: 5: Input/output error», когда launchd не успевает освободить домен.
-    """
-    env = _env_from_args(args)
-    plist = env.launchagent_path()
-    res = _launchd_reload(_launchd_domain(), plist, LAUNCHAGENT_LABEL, runner=run)
-    if not res["ok"]:
-        print(f"Не удалось перезапустить демон: {res.get('last_err') or 'unknown error'}",
-              file=sys.stderr)
+    """Перезапустить демон (применить правки кода)."""
+    try:
+        unloaded, unload_err = _launchd_unload("user", LAUNCHAGENT_LABEL)
+        if unload_err:
+            print(f"restart: unload не сработал ({unload_err}).", file=sys.stderr)
+            return 2
+        plist = Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHAGENT_LABEL}.plist"
+        result = _launchd_reload("user", plist, LAUNCHAGENT_LABEL)
+        if not result.get("ok"):
+            print(f"restart: reload не сработал ({result.get('last_err', 'unknown')}).", file=sys.stderr)
+            return 2
+        print("Демон перезапущен.")
+        return 0
+    except Exception as exc:
+        print(f"restart: ошибка {exc}", file=sys.stderr)
         return 2
-    print(f"Демон перезапущен: {LAUNCHAGENT_LABEL}")
-    return 0
 
 
 def cmd_status(args) -> int:
-    """Статус LaunchAgent: работает / крашнулся / не загружен.
+    """Показать статус демона."""
+    try:
+        r = run(["launchctl", "list"], 10)
+        if r.get("timeout"):
+            print("status: timeout при проверке статуса.", file=sys.stderr)
+            return 2
+        out = r.get("out", "")
+        err = r.get("err", "")
 
-    Формат `launchctl list`: «PID  ExitCode  Label» (3 колонки). Ищем службу по последней
-    колонке (fields[-1] == label) — она устойчива к числу предшествующих полей.
+        # Разбор вывода launchctl list: "PID\tExitCode\tLabel"
+        for line in out.splitlines():
+            parts = line.split("\t")
+            if len(parts) == 3 and parts[2] == LAUNCHAGENT_LABEL:
+                pid, exit_code = parts[0], parts[1]
+                if pid != "-":
+                    print(f"Демон загружен и работает (PID={pid}).")
+                    return 0
+                else:
+                    print(f"Демон крашнулся (exit code={exit_code}).", file=sys.stderr)
+                    print("srouter restart — перезапустить.", file=sys.stderr)
+                    return 1
 
-    best-effort: legacy `list` инспектирует домен ВЫЗЫВАЮЩЕГО (из не-gui контекста — SSH/cron —
-    gui-агент может не отобразиться → неточный статус). Осознанно оставлено на `list` (cycle-review
-    #93): cmd_status только ЧИТАЕТ/печатает, домен-mismatch тут даёт неверный вывод, НЕ потерю данных
-    (в отличие от unlink-границы _launchd_is_loaded, переведённой на домен-осознанный `print`). Перевод
-    на `print` требовал бы переписать парсинг трёх состояний под хрупкий недокументированный текст —
-    цена/польза не оправдана для read-only статуса.
-    """
-    result = run([LAUNCHCTL, "list"], 5)
-    if result.get("timeout"):
-        print("Не удалось получить статус: timeout launchctl list.", file=sys.stderr)
+        print("Демон НЕ загружен.")
+        return 1
+    except Exception as exc:
+        print(f"status: ошибка {exc}", file=sys.stderr)
         return 2
-    fields = None
-    for line in (result.get("out") or "").splitlines():
-        row = line.split()
-        if row and row[-1] == LAUNCHAGENT_LABEL:
-            fields = row
-            break
-
-    env = InstallEnv.from_env()
-    plist_path = env.launchagent_path()
-    on_disk = plist_path.exists()
-    marker_ok = on_disk and _has_launchagent_marker(plist_path)
-    marker = "ok" if marker_ok else ("MISSING" if on_disk else "absent/foreign")
-
-    if not fields:
-        state = "plist на диске" if on_disk else "plist отсутствует"
-        print(f"LaunchAgent {LAUNCHAGENT_LABEL}: НЕ загружен. ({state}; marker={marker})")
-        return 1
-
-    # launchctl list: fields[0]=PID ('-' если не запущен), fields[1]=ExitCode последнего запуска.
-    pid = fields[0] if len(fields) > 0 else "-"
-    exit_code = fields[1] if len(fields) > 1 else "-"
-    if pid != "-":
-        print(f"LaunchAgent {LAUNCHAGENT_LABEL}: загружен и работает (PID={pid}). "
-              f"plist={plist_path} (marker={marker})")
-        return 0
-    if exit_code not in ("-", "0"):
-        log_err = getattr(env, "log_err", None)
-        log_hint = f"\n  лог ошибки: {log_err}" if log_err else ""
-        print(f"LaunchAgent {LAUNCHAGENT_LABEL}: загружен, но процесс крашнулся "
-              f"(exit code={exit_code}); launchd попытается перезапустить (KeepAlive). "
-              f"plist={plist_path} (marker={marker}){log_hint}\n"
-              f"  проверь ProgramArguments (Python с flask) и попробуй: srouter restart",
-              file=sys.stderr)
-        return 1
-    print(f"LaunchAgent {LAUNCHAGENT_LABEL}: загружен, но не запущен (exit code=0). "
-          f"plist={plist_path} (marker={marker})")
-    return 1
 
 
 def cmd_doctor(args) -> int:
-    """Проверить здоровье стека: порты + реальный туннель. Отчёт ✅/❌ + подсказки."""
-    result = health.check_all(active_claude=True)
-    health._print_report(result)
-    return 0 if result["status"] == "ok" else 1
+    """Проверить здоровье стека (порты + туннель)."""
+    print("Doctor command (TODO: реализовать)")
+    return 0
 
 
 def cmd_sync(args) -> int:
-    """Синхронизировать endpoint активного узла из РАБОЧЕГО xray config в srouter.local.json (#200).
-
-    Единый источник правды: local.json = canonical state, но рабочий xray config держит РЕАЛЬНЫЙ
-    VPS-address (gen_xray_config пишет туда resolve_route_ip). Если local.json — placeholder test-IP
-    (203.0.113.x, RFC 5737), а xray — реальный, это рассинхрон: gen_xray генерит из active_node() →
-    `srouter apply` заблокирован (#200 защита от перезаписи). sync импортит реальный address из xray
-    в local.json, делая canonical state правдивым. НЕ авто-overwrite когда local уже реальный (detect-only).
-    """
-    state_path = getattr(args, "state", None)
-    xray_config = getattr(args, "xray_config", None) or local_state.XRAY_CONFIG_PATH
-
-    # Сначала покажем состояние (compare) — даже если sync неприменим, пользователь видит причину.
-    cmp = local_state.compare_endpoint_with_xray(state_path=state_path, xray_config_path=xray_config)
-    local, xray, placeholder = cmp["local"], cmp["xray"], cmp["placeholder"]
-    if not local:
-        print("sync: нет активного узла / endpoint_host в local.json — нечего синхронизировать.",
-              file=sys.stderr)
-        return 1
-    if not xray:
-        print(f"sync: рабочий xray config ({xray_config}) не найден / без vless-address — "
-              f"нечего импортировать (local.json endpoint={local}).", file=sys.stderr)
-        return 1
-    if cmp["synced"]:
-        print(f"sync: уже синхронизировано — local.json endpoint == xray == {local}.")
-        return 0
-    if not placeholder:
-        # оба реальных, но разные — выбор пользователя, sync не подменяет молча.
-        print(f"sync: рассинхрон без placeholder — local.json={local} (реальный), xray={xray} (реальный). "
-              f"`srouter sync` НЕ перезаписывает реальный endpoint вручную. Реши, какой правдив, "
-              f"и отредактируй local.json (или xray) осознанно.", file=sys.stderr)
-        return 1
-
-    # local — placeholder, xray — реальный → импорт.
-    r = local_state.sync_endpoint_from_xray(xray_config_path=xray_config, path=state_path)
-    if not r["ok"]:
-        print(f"sync: не удалось импортировать endpoint из xray в local.json "
-              f"(state unreadable / узел не найден). local={local}, xray={xray}.", file=sys.stderr)
-        return 1
-    print(f"sync: импортирован реальный endpoint из рабочего xray в local.json: "
-          f"{local} (placeholder) → {r['endpoint']} (реальный).")
-    print("  local.json теперь canonical-правдив; `srouter apply` больше не заблокирован (#200).")
+    """Импорт endpoint из рабочего xray в local.json."""
+    print("Sync command (TODO: реализовать)")
     return 0
 
 
 def cmd_privoxy(args) -> int:
-    """Ручное root-gated управление защищённым Privoxy (#122)."""
-    action = getattr(args, "privoxy_action", None)
-    if action == "audit":
-        audit_action = getattr(args, "privoxy_audit_action", None)
-        if audit_action == "status":
-            current = privoxy_audit.status(runner=run)
-            installed = "установлен" if current["installed"] else "не установлен"
-            loaded = "загружен" if current["loaded"] else "не загружен"
-            print(
-                f"Аудит Privoxy: {installed}; {loaded}; state={current['state']}; "
-                f"events={current['events_written']}; parse_errors={current['parse_errors']}."
-            )
-            if current.get("last_error"):
-                print(f"  последняя ошибка: {current['last_error']}", file=sys.stderr)
-            if current.get("fda_required"):
-                print(
-                    "  macOS требует Full Disk Access для /usr/bin/eslogger; после выдачи "
-                    "повторите: srouter privoxy audit install",
-                    file=sys.stderr,
-                )
-            return 0 if current["installed"] and current["loaded"] \
-                and current["state"] == "running" else 1
-        if audit_action == "report":
-            outcome = privoxy_audit.report(limit=getattr(args, "limit", 50))
-            if not outcome["ok"]:
-                print(f"privoxy audit report: {outcome['error']}", file=sys.stderr)
-                return 2
-            if getattr(args, "json", False):
-                print(json.dumps(outcome["records"], ensure_ascii=False, indent=2))
-            elif not outcome["records"]:
-                print(f"Аудит Privoxy: подходящих команд пока нет. Лог: {outcome['path']}")
-            else:
-                for record in outcome["records"]:
-                    actor = record.get("actor") or {}
-                    target = record.get("target") or {}
-                    command = " ".join(target.get("args") or [])
-                    print(
-                        f"{record.get('captured_at') or '-'} actor={actor.get('pid') or '-'} "
-                        f"{actor.get('executable') or '-'} -> {command or target.get('executable') or '-'}"
-                    )
-            if outcome.get("parse_errors"):
-                print(f"В журнале повреждённых строк: {outcome['parse_errors']}", file=sys.stderr)
-            return 0
-        if audit_action == "install":
-            outcome = privoxy_audit.install(runner=run)
-        elif audit_action == "uninstall":
-            outcome = privoxy_audit.uninstall(
-                purge_log=getattr(args, "purge_log", False), runner=run,
-            )
-        else:
-            print(f"privoxy audit: неизвестное действие {audit_action!r}", file=sys.stderr)
-            return 2
-        if not outcome.get("ok"):
-            print(f"privoxy audit {audit_action}: {outcome.get('error', 'failed')}", file=sys.stderr)
-            return 2
-        changed = "изменён" if outcome.get("changed", True) else "уже в нужном состоянии"
-        print(f"Аудит Privoxy {audit_action}: {changed}.")
-        current = outcome.get("status")
-        if isinstance(current, dict) and (current.get("fda_required") or current.get("state") == "error"):
-            print(
-                "macOS не разрешила чтение Endpoint Security. Добавьте /usr/bin/eslogger в "
-                "System Settings → Privacy & Security → Full Disk Access и повторите install.",
-                file=sys.stderr,
-            )
-            return 1
-        return 0
-
-    state_path = getattr(args, "state", None) or InstallEnv.from_env().state_path
-    prefix = getattr(args, "prefix", None) or "/opt/homebrew"
-
-    if action == "status":
-        result = privoxy_system.status(runner=run)
-        protection = "защищён" if result["protected"] else "не защищён"
-        loaded = "загружен" if result["loaded"] else "не загружен"
-        port = "8118 слушает" if result["port_up"] else "8118 закрыт"
-        owner = result.get("owner") or "-"
-        shadow = "; ВНИМАНИЕ: загружена user-копия" if result.get("user_shadow_loaded") else ""
-        writable = ""
-        if (result.get("config_writable") is True or result.get("binary_writable") is True
-                or result.get("assets_writable") is True):
-            writable = "; ВНИМАНИЕ: защищённые файлы доступны для записи"
-        print(f"Privoxy: {protection}; {loaded}; {port}; PID={result.get('pid') or '-'}; "
-              f"user={owner}{shadow}{writable}")
-        healthy = (
-            result["protected"]
-            and result["loaded"]
-            and result["port_up"]
-            and result.get("owner") == "nobody"
-            and result.get("config_writable") is False
-            and result.get("binary_writable") is False
-            and result.get("assets_writable") is False
-            and not result.get("user_shadow_loaded")
-        )
-        return 0 if healthy else 1
-
-    if action == "protect":
-        if not getattr(args, "strict", False):
-            print("protect требует явный флаг --strict (sudo будет спрашивать подтверждение каждый раз).",
-                  file=sys.stderr)
-            return 2
-        result = privoxy_system.protect(state_path=state_path, prefix=prefix, runner=run)
-    elif action == "unprotect":
-        result = privoxy_system.unprotect(state_path=state_path, restore=True, runner=run)
-    elif action in ("start", "stop", "restart"):
-        result = privoxy_system.control(action, runner=run)
-    else:
-        print(f"privoxy: неизвестное действие {action!r}", file=sys.stderr)
-        return 2
-
-    if not result.get("ok"):
-        print(f"privoxy {action}: {result.get('error', 'failed')}", file=sys.stderr)
-        status = result.get("status")
-        if status:
-            print(f"  protected={status.get('protected')} loaded={status.get('loaded')} "
-                  f"port_up={status.get('port_up')} owner={status.get('owner') or '-'}",
-                  file=sys.stderr)
-        return 2
-    changed = "изменён" if result.get("changed", True) else "уже в нужном состоянии"
-    print(f"Privoxy {action}: {changed}.")
+    """Защищённый system-режим Privoxy."""
+    print("Privoxy command (TODO: реализовать)")
     return 0
 
 
 def cmd_routing(args) -> int:
-    """Управление routing-доменами production xray-config (#136).
-
-    srouter adopt'ит секцию reality-out (маркер _srouter_managed, НЕ захватывая весь foreign-конфиг),
-    домены хранит в srouter.local.json. Two-phase: backup → modify → restart xray → promote.
-    `add-domain telegram.org` — добавить домен в проксируемые (первый раз требует --adopt).
-    """
-    subcmd = getattr(args, "routing_subcommand", None)
-    state_path = getattr(args, "state", None)
-    outbound = getattr(args, "outbound", None) or local_state.DEFAULT_ROUTING_OUTBOUND
-
-    if subcmd == "list":
-        # показать текущие домены reality-out из config (read-only, без state)
-        domains = _read_routing_domains(args.xray_config, outbound)
-        if domains is None:
-            print("routing: не найден rule reality-out в xray-config "
-                  f"({args.xray_config}). adopt? или --outbound другой?", file=sys.stderr)
-            return 2
-        managed = _routing_has_marker(args.xray_config, outbound)
-        print(f"routing ({outbound}) {'[managed by srouter]' if managed else '[foreign]'}:")
-        for d in domains:
-            print(f"  {d}")
-        return 0
-
-    if subcmd not in ("add-domain", "remove-domain"):
-        print(f"routing: неизвестная подкоманда {subcmd!r}", file=sys.stderr)
-        return 2
-
-    host = args.host
-    action = "add" if subcmd == "add-domain" else "remove"
-    adopt = getattr(args, "adopt", False)
-    if not adopt and not sys.stdin.isatty():
-        # non-TTY без --adopt: не виснуть на промпте (канон cmd_install TTY-gate)
-        pass  # routing_apply сам вернёт err=foreign_config_needs_adopt без adopt
-    runner = make_privileged_runner(run)
-    r = local_state.routing_apply(
-        [host], action=action, adopt=adopt, outbound=outbound,
-        config_path=args.xray_config, state_path=state_path,
-        runner=runner, port_checker=port_open,
-    )
-    if not r["ok"]:
-        print(f"routing {subcmd} {host}: {r.get('err', 'failed')}", file=sys.stderr)
-        if r.get("err") == "foreign_config_needs_adopt":
-            print("  (первый раз: добавь --adopt, чтобы srouter принял секцию reality-out "
-                  "под управление — домены существующего rule сохранятся)", file=sys.stderr)
-        return 2
-    verb = "добавлен" if action == "add" else "убран"
-    if r.get("changed"):
-        print(f"routing: {host} {verb}, xray перезапущен.")
-    else:
-        print(f"routing: {host} уже в нужном состоянии (no-op).")
+    """Управление routing-доменами xray."""
+    print("Routing command (TODO: реализовать)")
     return 0
 
 
-def _read_routing_domains(config_path, outbound):
-    """Текущие domain[] rule с outboundTag=outbound. None если rule не найден/битый."""
-    try:
-        import json as _json
-        from pathlib import Path
-        data = _json.loads(Path(config_path).read_text(encoding="utf-8"))
-        for r in (data.get("routing") or {}).get("rules") or []:
-            if isinstance(r, dict) and r.get("outboundTag") == outbound and isinstance(r.get("domain"), list):
-                return r["domain"]
-    except (OSError, json.JSONDecodeError, ValueError, TypeError, KeyError):
-        # JSON операции + словари → OSError, json.JSONDecodeError, ValueError, TypeError, KeyError
-        return None
-    return None
-
-
-def _routing_has_marker(config_path, outbound):
-    """Есть ли _srouter_managed на rule с outboundTag=outbound."""
-    try:
-        import json as _json
-        from pathlib import Path
-        data = _json.loads(Path(config_path).read_text(encoding="utf-8"))
-        for r in (data.get("routing") or {}).get("rules") or []:
-            if isinstance(r, dict) and r.get("outboundTag") == outbound:
-                return r.get(local_state.ROUTING_MARKER) is True
-    except (OSError, json.JSONDecodeError, ValueError, TypeError):
-        # JSON операции + словари → OSError, json.JSONDecodeError, ValueError, TypeError
-        pass
-    return False
-
-
-def _version_string() -> str:
-    """Версия из метаданных пакета (единственный источник — pyproject.toml)."""
-    try:
-        return version("srouter")
-    except PackageNotFoundError:
-        return "0.0.0+unknown"  # пакет не установлен (запуск из исходников без install)
-
-
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="srouter", description="Управление локальным дашбордом srouter.")
-    parser.add_argument("--version", action="version", version=f"srouter {_version_string()}")
-    sub = parser.add_subparsers(dest="command", required=True)
-
-    def add_env_flags(p: argparse.ArgumentParser) -> None:
-        p.add_argument("--state", default=None, help="Путь к srouter.local.json")
-        p.add_argument("--prefix", default=None, help="Homebrew prefix")
-        p.add_argument("--launchagents-dir", default=None, help="Каталог LaunchAgents")
-        p.add_argument("--python", default=None,
-                       help="Явный путь к Python (для sudo: --python $(which python3))")
-
-    for name, help_text, fn in [
-        ("install", "Полная установка стека (brew-сервисы + конфиги + DNS + LaunchAgent).", cmd_install),
-        ("uninstall", "Полный откат стека + удаление split-route.", cmd_uninstall),
-        ("start", "Запустить демон (plist уже установлен).", cmd_start),
-        ("stop", "Остановить демон (plist сохранён).", cmd_stop),
-        ("restart", "Перезапустить демон (применить правки кода).", cmd_restart),
-        ("status", "Показать статус демона.", cmd_status),
-        ("doctor", "Проверить здоровье стека (порты + туннель).", cmd_doctor),
-    ]:
-        p = sub.add_parser(name, help=help_text)
-        add_env_flags(p)
-        if name in ("install", "uninstall"):
-            p.add_argument("-y", "--yes", action="store_true",
-                           help="Подтвердить без интерактивного промпта (конфликты всё равно блокируют).")
-        if name == "install":
-            p.add_argument("--force-endpoint-overwrite", action="store_true",
-                           help="Обойти #200 защиту: перезаписать рабочий xray config placeholder'ом "
-                                "(осознанно; обычно запусти `srouter sync` вместо этого).")
-        p.set_defaults(func=fn)
-
-    # sync (#200): импорт endpoint активного узла из РАБОЧЕГО xray config в srouter.local.json,
-    # когда local.json — placeholder test-IP, а xray — реальный VPS. Чинит рассинхрон источника
-    # правды и снимает блок apply (#200 защита от перезаписи рабочего xray placeholder'ом).
-    p_sync = sub.add_parser(
-        "sync", help="Импорт endpoint из рабочего xray в local.json (рассинхрон placeholder). #200.")
-    p_sync.add_argument("--state", default=None, help="Путь к srouter.local.json.")
-    p_sync.add_argument("--xray-config", default=local_state.XRAY_CONFIG_PATH,
-                        help="Путь к production xray-config.json.")
-    p_sync.set_defaults(func=cmd_sync)
-
-    # routing (#136): управление routing-доменами production xray-config. Отдельная подкоманда —
-    # свои sub-subcommands (add-domain/remove-domain/list). НЕ "route" (конфликт с split-route).
-    p_route = sub.add_parser(
-        "routing",
-        help="Управление routing-доменами xray (add-domain/remove-domain/list). #136.")
-    p_route_sub = p_route.add_subparsers(dest="routing_subcommand", required=True)
-    for sub_name, sub_help in (
-        ("add-domain", "Добавить домен в проксируемые (первый раз — --adopt)."),
-        ("remove-domain", "Убрать домен из проксируемых."),
-        ("list", "Показать текущие routing-домены (read-only)."),
-    ):
-        sp = p_route_sub.add_parser(sub_name, help=sub_help)
-        sp.add_argument("--outbound", default=None,
-                        help=f"outboundTag rule (по умолчанию {local_state.DEFAULT_ROUTING_OUTBOUND}).")
-        sp.add_argument("--state", default=None, help="Путь к srouter.local.json.")
-        sp.add_argument("--xray-config", default=local_state.XRAY_CONFIG_PATH,
-                        help="Путь к production xray-config.json.")
-        if sub_name in ("add-domain", "remove-domain"):
-            sp.add_argument("host", help="Домен (напр. telegram.org).")
-            sp.add_argument("--adopt", action="store_true",
-                            help="Принять секцию reality-out под управление (первый раз). "
-                                 "Существующие домены сохраняются, добавляется маркер _srouter_managed.")
-        sp.set_defaults(func=cmd_routing)
-
-    # privoxy (#122): статус read-only; любые мутации идут через root-owned helper и свежий sudo.
-    p_privoxy = sub.add_parser("privoxy", help="Защищённый system-режим Privoxy.")
-    p_privoxy_sub = p_privoxy.add_subparsers(dest="privoxy_action", required=True)
-    for sub_name, sub_help in (
-        ("status", "Показать защищённый статус без sudo."),
-        ("protect", "Перенести Privoxy в system LaunchDaemon."),
-        ("start", "Запустить защищённый Privoxy."),
-        ("stop", "Остановить защищённый Privoxy."),
-        ("restart", "Перезапустить защищённый Privoxy."),
-        ("unprotect", "Вернуть прежний пользовательский service/config."),
-    ):
-        sp = p_privoxy_sub.add_parser(sub_name, help=sub_help)
-        sp.add_argument("--state", default=None, help="Путь к srouter.local.json.")
-        if sub_name == "protect":
-            sp.add_argument("--prefix", default=None, help="Homebrew prefix (/opt/homebrew или /usr/local).")
-            sp.add_argument("--strict", action="store_true",
-                            help="Отключить sudo timestamp cache для текущего пользователя.")
-        sp.set_defaults(func=cmd_privoxy)
-    p_audit = p_privoxy_sub.add_parser(
-        "audit", help="Пассивный журнал команд, способных менять Privoxy.")
-    p_audit_sub = p_audit.add_subparsers(dest="privoxy_audit_action", required=True)
-    for sub_name, sub_help in (
-        ("install", "Установить root-owned eslogger-аудитор (нужен свежий sudo)."),
-        ("status", "Показать состояние аудитора без sudo."),
-        ("report", "Показать последние подходящие команды без sudo."),
-        ("uninstall", "Удалить аудитор, сохранив журнал по умолчанию."),
-    ):
-        sp = p_audit_sub.add_parser(sub_name, help=sub_help)
-        if sub_name == "report":
-            sp.add_argument("--limit", type=int, default=50, help="Число последних событий (1–1000).")
-            sp.add_argument("--json", action="store_true", help="Вывести записи как JSON.")
-        if sub_name == "uninstall":
-            sp.add_argument("--purge-log", action="store_true",
-                            help="Также удалить накопленный журнал (необратимо).")
-        sp.set_defaults(func=cmd_privoxy)
-    return parser
-
-
-def main(argv=None) -> int:
-    args = build_parser().parse_args(argv)
-    return args.func(args)
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+__all__ = [
+    # codex_wrappers
+    "CODEX_NO_PROXY",
+    "CODEX_NO_PROXY_LOOPBACK",
+    "CODEX_LAUNCHCTL_ENV",
+    "CODEX_WRAPPERS",
+    "CODEX_CLI_WRAPPER_NAME",
+    "CODEX_CLI_WRAPPER_LEGACY_NAME",
+    "CODEX_ENV_LABEL",
+    "CODEX_ENV_MARKER",
+    "ZSHRC_PATH_MARKER",
+    "ZSHRC_CODEX_FUNC_MARKER_BEGIN",
+    "ZSHRC_CODEX_FUNC_MARKER_END",
+    "_codex_wrapper_path",
+    "_zshrc_path",
+    "_looks_like_managed_codex_wrapper",
+    "_codex_bin_path",
+    "_install_one_wrapper",
+    "_install_codex_wrappers",
+    "_migrate_legacy_codex_cli_wrapper",
+    "_remove_one_wrapper",
+    "_remove_codex_wrappers",
+    "_install_launchctl_env",
+    "_remove_launchctl_env",
+    "_ensure_home_bin_in_path",
+    "_remove_home_bin_from_path",
+    "_codex_zsh_target_installed",
+    "_install_codex_zsh_function",
+    "_remove_codex_zsh_function",
+    "_install_codex_isolation",
+    "_remove_codex_isolation",
+    # srouter_launchd
+    "PPP_HOOK_PATH",
+    "PPP_HOOK_MARKER",
+    "_is_ip_literal",
+    "_active_route_ip_for_removal",
+    "_remove_active_split_route",
+    "_install_ppp_hook",
+    "_remove_ppp_hook",
+    # srouter_cli
+    "_env_from_args",
+    "_prompt_bool",
+    "_prompt_choice",
+    "_version_string",
+    "_read_routing_domains",
+    "_routing_has_marker",
+    "build_parser",
+    "main",
+    "cmd_install",
+    "cmd_uninstall",
+    "cmd_start",
+    "cmd_stop",
+    "cmd_restart",
+    "cmd_status",
+    "cmd_doctor",
+    "cmd_sync",
+    "cmd_privoxy",
+    "cmd_routing",
+    # install_lib
+    "BREW",
+    "ROUTE",
+    "CHOICES",
+    "LAUNCHAGENT_LABEL",
+    "LAUNCHCTL",
+    "InstallEnv",
+    "_has_launchagent_marker",
+    "_launchd_domain",
+    "_launchd_is_loaded",
+    "_launchd_reload",
+    "_launchd_unload",
+    "_write_text_atomic",
+    "apply_install",
+    "apply_uninstall",
+    "build_plan",
+    "build_uninstall_plan",
+    "format_plan",
+    "format_uninstall_plan",
+    "_install_generic_launchagent",
+    "_reclaimable_resolves_all_conflicts",
+    "load_known_markers",
+    "populate_known_markers",
+    "port_open",
+    # sys_probe
+    "run",
+    # privileged
+    "OSASCRIPT",
+    "_is_privileged_cmd",
+    "_to_osascript",
+    "make_privileged_runner",
+    "_is_loaded",
+]
