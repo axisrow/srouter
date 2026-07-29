@@ -22,6 +22,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 from importlib.metadata import PackageNotFoundError, version
@@ -149,7 +150,8 @@ def _active_route_ip_for_removal(state_path) -> str:
     try:
         node = local_state.active_node(path=state_path) or {}
         route_ip = local_state.resolve_route_ip(node, path=state_path)
-    except Exception:
+    except (OSError, ValueError, TypeError, KeyError):
+        # local_state операции с JSON/файлами/словарями → типичные ошибки
         return ""
     return route_ip if _is_ip_literal(route_ip) else ""
 
@@ -213,7 +215,8 @@ def _install_ppp_hook(env, runner) -> str:
         if r.get("rc") == -128 or "-128" in (r.get("err") or ""):
             return "PPP-hook: отменено (диалог пароля)."
         return "PPP-hook: установлен (/etc/ppp/ip-up — мгновенный split-route при VPN up)."
-    except Exception as exc:
+    except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError, ValueError) as exc:
+        # read_text() → OSError; runner() → subprocess исключения; операции со строками → ValueError
         return f"PPP-hook: не установлен ({str(exc)[:80]})."
 
 
@@ -233,7 +236,8 @@ def _remove_ppp_hook(runner) -> str:
         if r.get("rc") == -128 or "-128" in (r.get("err") or ""):
             return "PPP-hook: удаление отменено (диалог пароля)."
         return "PPP-hook: удалён." if r.get("rc") in (0, None) else f"PPP-hook: не удалён ({(r.get('err') or '')[:60]})."
-    except Exception as exc:
+    except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError, ValueError) as exc:
+        # runner() → subprocess исключения; osascript/файловые операции → OSError
         return f"PPP-hook: не удалён ({str(exc)[:60]})."
 
 
@@ -394,7 +398,8 @@ def _install_one_wrapper(env, wrapper_path: Path, template_name: str, marker: st
                     f"НЕ перехватывает прямой абсолютный путь к binary, `node codex.js` и вызов с "
                     f"другим PATH — настоящая fail-closed граница = PF kill-switch (isolate_firewall.py).")
         return f"Codex {wrapper_path.name}: установлен ({wrapper_path} — SOCKS5 минуя privoxy)."
-    except Exception as exc:
+    except (OSError, ValueError, TypeError) as exc:
+        # Файловые операции + PATH-манипуляции → OSError, ValueError, TypeError
         return f"Codex {wrapper_path.name}: не установлен ({str(exc)[:80]})."
 
 
@@ -456,7 +461,8 @@ def _migrate_legacy_codex_cli_wrapper(marker: str, *, action: str) -> str:
             return (f"Codex {CODEX_CLI_WRAPPER_LEGACY_NAME}: существует чужой ~/bin/{CODEX_CLI_WRAPPER_LEGACY_NAME} "
                     f"без srouter-маркера — не трогаем (замени на codex-srouter или удали вручную).")
         return ""
-    except Exception as exc:
+    except (OSError, ValueError, TypeError) as exc:
+        # Файловые операции → OSError, ValueError, TypeError
         return (f"Codex {CODEX_CLI_WRAPPER_LEGACY_NAME}: миграция не выполнена ({str(exc)[:60]}).")
 
 
@@ -469,7 +475,8 @@ def _remove_one_wrapper(wrapper_path: Path, marker: str) -> str:
             return f"Codex {wrapper_path.name}: чужой {wrapper_path} — не трогаем."
         wrapper_path.unlink()
         return f"Codex {wrapper_path.name}: удалён."
-    except Exception as exc:
+    except (OSError, ValueError, TypeError) as exc:
+        # Файловые операции → OSError, ValueError, TypeError
         return f"Codex {wrapper_path.name}: не удалён ({str(exc)[:60]})."
 
 
@@ -524,7 +531,8 @@ def _install_launchctl_env(env, runner) -> str:
         if err.endswith("_foreign"):
             return f"Codex env: чужой LaunchAgent {CODEX_ENV_LABEL} — не трогаем."
         return f"Codex env: не установлен ({err})."
-    except Exception as exc:
+    except (OSError, ValueError, TypeError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
+        # LaunchAgent операции + subprocess → OSError, subprocess исключения
         return f"Codex env: не установлен ({str(exc)[:80]})."
 
 
@@ -608,7 +616,8 @@ def _remove_launchctl_env(runner) -> dict:
         plist_path.unlink()
         return {"ok": True,
                 "note": f"Codex env: снят (LaunchAgent {CODEX_ENV_LABEL} выгружен, env очищен, plist удалён)."}
-    except Exception as exc:
+    except (OSError, ValueError, TypeError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
+        # LaunchAgent + файловые операции + subprocess → OSError, subprocess исключения
         return {"ok": False, "note": f"Codex env: не снят ({str(exc)[:80]})."}
 
 
@@ -633,7 +642,8 @@ def _ensure_home_bin_in_path(env) -> str:
         _backup(zshrc, env)  # timestamped backup через каноничный helper
         _write_text_atomic(zshrc, content + block)
         return "PATH: ~/bin добавлен в ~/.zshrc (backup: .zshrc.srouter-backup-*)."
-    except Exception as exc:
+    except (OSError, ValueError, TypeError) as exc:
+        # Файловые операции → OSError, ValueError, TypeError
         return f"PATH: не изменён ({str(exc)[:80]})."
 
 
@@ -663,7 +673,8 @@ def _remove_home_bin_from_path() -> str:
             i += 1
         _write_text_atomic(zshrc, "\n".join(out).rstrip() + "\n")
         return "PATH: ~/bin убран из ~/.zshrc."
-    except Exception as exc:
+    except (OSError, ValueError, TypeError) as exc:
+        # Файловые операции → OSError, ValueError, TypeError
         return f"PATH: не убран ({str(exc)[:80]})."
 
 
@@ -785,7 +796,8 @@ def _install_codex_zsh_function(env) -> str:
                 "ВНИМАНИЕ: существующие терминалы/codex-процессы не получат новое окружение — "
                 "перезапусти их (exec zsh -l, затем закрыть/открыть TUI); иначе старая TUI пойдёт "
                 "через privoxy 8118 и порвёт long-lived WS (#120).")
-    except Exception as exc:
+    except (OSError, ValueError, TypeError) as exc:
+        # Файловые операции → OSError, ValueError, TypeError
         return f"Codex функция: не добавлена ({str(exc)[:80]})."
 
 
@@ -824,7 +836,8 @@ def _remove_codex_zsh_function() -> str:
         if not _write_text_atomic(zshrc, new_content):
             return "Codex функция: не убрана (ошибка atomic write ~/.zshrc)."
         return "Codex функция: убрана из ~/.zshrc."
-    except Exception as exc:
+    except (OSError, ValueError, TypeError) as exc:
+        # Файловые операции → OSError, ValueError, TypeError
         return f"Codex функция: не убрана ({str(exc)[:80]})."
 
 
@@ -854,7 +867,8 @@ def _install_codex_isolation(env, runner) -> str:
                     f"(kill-switch активен).{prov_note} "
                     "Запуск codex под uid 503 (sudo -u) — follow-up.")
         return f"Codex PF-изоляция: не включена ({r.get('err', 'unknown')}).{prov_note}"
-    except Exception as exc:
+    except (OSError, ValueError, TypeError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
+        # isolate_firewall subprocess + state операции → OSError, subprocess исключения
         return f"Codex PF-изоляция: сбой ({str(exc)[:80]})."
 
 
@@ -879,7 +893,8 @@ def _remove_codex_isolation(env, runner) -> str:
             deprov_note = "" if deprov.get("ok") else f" пользователь не удалён ({deprov.get('err', '')});"
             return f"Codex PF-изоляция: снята.{deprov_note}"
         return f"Codex PF-изоляция: частично ({r.get('err', '')})."  # state сохранён — retry возможен
-    except Exception as exc:
+    except (OSError, ValueError, TypeError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
+        # isolate_firewall subprocess + state операции → OSError, subprocess исключения
         return f"Codex PF-изоляция: не снята ({str(exc)[:80]})."
 
 
@@ -895,7 +910,7 @@ def cmd_install(args) -> int:
     # 1) Discovery (ничего не пишет).
     try:
         plan = build_plan(env=env, runner=runner)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — CLI entry point, не роняем stack trace в пользователя
         print(f"install: сбой discovery: {exc}", file=sys.stderr)
         return 2
 
@@ -1017,7 +1032,7 @@ def cmd_install(args) -> int:
             populate_known_markers(_km_state_path, "zshrc_codex_func",
                                    [ZSHRC_CODEX_FUNC_MARKER_BEGIN, ZSHRC_CODEX_FUNC_MARKER_END])
             populate_known_markers(_km_state_path, "codenv", [CODEX_ENV_MARKER])
-        except Exception:
+        except Exception:  # noqa: BLE001 — cleanup не должен маскировать основную ошибку
             pass
         print("Установка стека завершена: brew-сервисы, конфиги, DNS, LaunchAgent применены.\n"
               f"{cp_note}\n"
@@ -1055,7 +1070,7 @@ def cmd_uninstall(args) -> int:
     # 1) Discovery + показ плана.
     try:
         plan = build_uninstall_plan(env=env)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — CLI entry point, не роняем stack trace в пользователя
         print(f"uninstall: сбой discovery: {exc}", file=sys.stderr)
         return 2
     print(format_uninstall_plan(plan))
@@ -1541,7 +1556,8 @@ def _read_routing_domains(config_path, outbound):
         for r in (data.get("routing") or {}).get("rules") or []:
             if isinstance(r, dict) and r.get("outboundTag") == outbound and isinstance(r.get("domain"), list):
                 return r["domain"]
-    except Exception:
+    except (OSError, json.JSONDecodeError, ValueError, TypeError, KeyError):
+        # JSON операции + словари → OSError, json.JSONDecodeError, ValueError, TypeError, KeyError
         return None
     return None
 
@@ -1555,7 +1571,8 @@ def _routing_has_marker(config_path, outbound):
         for r in (data.get("routing") or {}).get("rules") or []:
             if isinstance(r, dict) and r.get("outboundTag") == outbound:
                 return r.get(local_state.ROUTING_MARKER) is True
-    except Exception:
+    except (OSError, json.JSONDecodeError, ValueError, TypeError):
+        # JSON операции + словари → OSError, json.JSONDecodeError, ValueError, TypeError
         pass
     return False
 

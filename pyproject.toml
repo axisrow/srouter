@@ -72,3 +72,18 @@ markers = [
     "acceptance: end-to-end приёмочные тесты реального CLI srouter в Docker-полигоне (skip без SROUTER_ACCEPTANCE=1)",
     "locks: threading/concurrency-тесты иерархии блокировок и watchdog (issue #159)",
 ]
+
+[tool.ruff]
+line-length = 120
+target-version = "py38"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "BLE"]
+ignore = []
+
+# BLE001: не разрешаем bare except и широкие except Exception без явного комментария
+# E722: bare except (без типа исключения)
+# Используй конкретные типы исключений: OSError, ValueError, TypeError, KeyError,
+# subprocess.CalledProcessError, json.JSONDecodeError, requests.RequestException и т.п.
+# Для осознанных широких catch добавь комментарий: # noqa: BLE001 — <причина>
+per-file-ignores = {}
