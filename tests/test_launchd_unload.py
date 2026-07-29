@@ -17,6 +17,7 @@
 runner последовательно по каждому вызову print (эмулирует «ещё выгружается» → «выгрузился»).
 """
 import install_lib
+import install_plist
 
 
 def _print_rc(loaded):
@@ -72,7 +73,7 @@ def _bootouts(calls):
 
 def test_unload_confirmed_after_settle(monkeypatch):
     """Агент «висит» в print (True), затем выгружается (False) → state is False. 1 bootout, ≥2 print."""
-    monkeypatch.setattr(install_lib, "_BOOTOUT_POLL_INTERVAL", 0)
+    monkeypatch.setattr(install_plist, "_BOOTOUT_POLL_INTERVAL", 0)
     calls = []
     runner = _unload_runner(list_states=[True, False], record=calls)
 
@@ -86,8 +87,8 @@ def test_unload_confirmed_after_settle(monkeypatch):
 
 def test_unload_still_loaded_returns_True(monkeypatch):
     """Агент так и не выгружается (print всегда rc=0), settle-потолок ≈0 → state is True (fail-safe)."""
-    monkeypatch.setattr(install_lib, "_BOOTOUT_POLL_INTERVAL", 0)
-    monkeypatch.setattr(install_lib, "_BOOTOUT_SETTLE_MAX_WAIT", 0)
+    monkeypatch.setattr(install_plist, "_BOOTOUT_POLL_INTERVAL", 0)
+    monkeypatch.setattr(install_plist, "_BOOTOUT_SETTLE_MAX_WAIT", 0)
     runner = _unload_runner(list_states=[True] * 5)
 
     res = install_lib._launchd_unload(install_lib._launchd_domain(),
@@ -102,7 +103,7 @@ def test_unload_print_timeout_returns_None(monkeypatch):
     Гард регресса PR #83 на уровне примитива: None (неизвестно) НЕ схлопывается в True/False и НЕ
     крутит полные settle-2с. ≤2 print (первичный + возможный, но None falsy → цикл не входит).
     """
-    monkeypatch.setattr(install_lib, "_BOOTOUT_POLL_INTERVAL", 0)
+    monkeypatch.setattr(install_plist, "_BOOTOUT_POLL_INTERVAL", 0)
     calls = []
     runner = _unload_runner(list_states=[None], record=calls)
 
@@ -115,7 +116,7 @@ def test_unload_print_timeout_returns_None(monkeypatch):
 
 def test_unload_already_unloaded_first_check(monkeypatch):
     """Агент уже выгружен на первой проверке (print rc=113) → state is False, ровно 1 print."""
-    monkeypatch.setattr(install_lib, "_BOOTOUT_POLL_INTERVAL", 0)
+    monkeypatch.setattr(install_plist, "_BOOTOUT_POLL_INTERVAL", 0)
     calls = []
     runner = _unload_runner(list_states=[False], record=calls)
 
@@ -128,7 +129,7 @@ def test_unload_already_unloaded_first_check(monkeypatch):
 
 def test_unload_bootout_rc_ignored(monkeypatch):
     """bootout rc≠0 (напр. «уже выгружен») игнорируется — статус определяет только print."""
-    monkeypatch.setattr(install_lib, "_BOOTOUT_POLL_INTERVAL", 0)
+    monkeypatch.setattr(install_plist, "_BOOTOUT_POLL_INTERVAL", 0)
     runner = _unload_runner(bootout_rc=3, list_states=[False])
 
     res = install_lib._launchd_unload(install_lib._launchd_domain(),

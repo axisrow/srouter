@@ -11,6 +11,7 @@ poll-wait'ом выгрузки после bootout + retry на bootstrap. Ка�
 from types import SimpleNamespace
 
 import install_lib
+import install_plist
 import srouter
 
 
@@ -71,7 +72,7 @@ def _bootstraps(calls):
 
 def test_restart_success_on_first_try(monkeypatch):
     """Happy path: bootout ok, bootstrap rc=0 с первой попытки → rc=0, bootstrap ровно 1 раз."""
-    monkeypatch.setattr(install_lib, "_BOOTSTRAP_RETRY_DELAY", 0)
+    monkeypatch.setattr(install_plist, "_BOOTSTRAP_RETRY_DELAY", 0)
     monkeypatch.setattr(srouter.Path, "exists", lambda self: True)
     calls = []
     monkeypatch.setattr(srouter, "run", _make_runner(bootstrap_sequence=[0], record=calls))
@@ -86,7 +87,7 @@ def test_restart_retries_bootstrap_when_domain_busy(monkeypatch):
 
     На нелеченом коде этот тест ПАДАЕТ: один bootstrap с rc=5, _is_loaded() False → rc=2.
     """
-    monkeypatch.setattr(install_lib, "_BOOTSTRAP_RETRY_DELAY", 0)
+    monkeypatch.setattr(install_plist, "_BOOTSTRAP_RETRY_DELAY", 0)
     monkeypatch.setattr(srouter.Path, "exists", lambda self: True)
     calls = []
     monkeypatch.setattr(srouter, "run", _make_runner(bootstrap_sequence=[5, 0], record=calls))
@@ -98,7 +99,7 @@ def test_restart_retries_bootstrap_when_domain_busy(monkeypatch):
 
 def test_restart_fails_after_max_retries(monkeypatch):
     """Все попытки bootstrap дают rc=5, демон так и не загрузился → rc=2, ошибка в stderr."""
-    monkeypatch.setattr(install_lib, "_BOOTSTRAP_RETRY_DELAY", 0)
+    monkeypatch.setattr(install_plist, "_BOOTSTRAP_RETRY_DELAY", 0)
     monkeypatch.setattr(srouter.Path, "exists", lambda self: True)
     monkeypatch.setattr(srouter, "run", _make_runner(bootstrap_sequence=[5, 5, 5]))
 
@@ -111,8 +112,8 @@ def test_restart_waits_for_unload_after_bootout(monkeypatch):
 
     bootstrap НЕ должен вызываться, пока _is_loaded() ещё True — ждём полной выгрузки.
     """
-    monkeypatch.setattr(install_lib, "_BOOTOUT_POLL_INTERVAL", 0)
-    monkeypatch.setattr(install_lib, "_BOOTSTRAP_RETRY_DELAY", 0)
+    monkeypatch.setattr(install_plist, "_BOOTOUT_POLL_INTERVAL", 0)
+    monkeypatch.setattr(install_plist, "_BOOTSTRAP_RETRY_DELAY", 0)
     monkeypatch.setattr(srouter.Path, "exists", lambda self: True)
     calls = []
     # print: первый poll (после bootout) → True (ещё загружен), затем False (выгрузился). bootstrap → 0.
@@ -138,9 +139,9 @@ def test_reload_bootstraps_when_unload_unconfirmed(monkeypatch):
     state — bootstrap-retry сам покроет занятость домена. Агент так и не выгружается (list=True),
     settle-потолок ≈0 (иначе poll крутил бы полные 2с) → bootstrap всё равно вызван, rc 0.
     """
-    monkeypatch.setattr(install_lib, "_BOOTOUT_POLL_INTERVAL", 0)
-    monkeypatch.setattr(install_lib, "_BOOTOUT_SETTLE_MAX_WAIT", 0)
-    monkeypatch.setattr(install_lib, "_BOOTSTRAP_RETRY_DELAY", 0)
+    monkeypatch.setattr(install_plist, "_BOOTOUT_POLL_INTERVAL", 0)
+    monkeypatch.setattr(install_plist, "_BOOTOUT_SETTLE_MAX_WAIT", 0)
+    monkeypatch.setattr(install_plist, "_BOOTSTRAP_RETRY_DELAY", 0)
     monkeypatch.setattr(srouter.Path, "exists", lambda self: True)
     calls = []
     # list всегда True (агент «не выгружается»); bootstrap → 0. reload должен выстоять regardless.
@@ -191,8 +192,8 @@ def _reload_runner(*, bootstrap_rcs, list_loaded=False):
 
 def test_launchd_reload_retries_bootstrap_when_busy(monkeypatch):
     """_launchd_reload: первый bootstrap rc=5, второй rc=0 → ok, bootstrap ≥2 раз."""
-    monkeypatch.setattr(install_lib, "_BOOTSTRAP_RETRY_DELAY", 0)
-    monkeypatch.setattr(install_lib, "_BOOTOUT_POLL_INTERVAL", 0)
+    monkeypatch.setattr(install_plist, "_BOOTSTRAP_RETRY_DELAY", 0)
+    monkeypatch.setattr(install_plist, "_BOOTOUT_POLL_INTERVAL", 0)
 
     calls = []
     runner = _reload_runner(bootstrap_rcs=[5, 0], list_loaded=False)
@@ -205,8 +206,8 @@ def test_launchd_reload_retries_bootstrap_when_busy(monkeypatch):
 
 def test_launchd_reload_fails_after_max_retries(monkeypatch):
     """Все попытки bootstrap rc=5, агент не загружен → ok=False."""
-    monkeypatch.setattr(install_lib, "_BOOTSTRAP_RETRY_DELAY", 0)
-    monkeypatch.setattr(install_lib, "_BOOTOUT_POLL_INTERVAL", 0)
+    monkeypatch.setattr(install_plist, "_BOOTSTRAP_RETRY_DELAY", 0)
+    monkeypatch.setattr(install_plist, "_BOOTOUT_POLL_INTERVAL", 0)
 
     res = install_lib._launchd_reload("gui/501", "/tmp/x.plist", "com.srouter.dashboard",
                                       runner=_reload_runner(bootstrap_rcs=[5, 5, 5], list_loaded=False))
@@ -215,9 +216,9 @@ def test_launchd_reload_fails_after_max_retries(monkeypatch):
 
 def test_launchd_reload_soft_success_when_loaded_after_busy(monkeypatch):
     """bootstrap вернул rc≠0, но list показывает агент загружен → ok=True (soft-success)."""
-    monkeypatch.setattr(install_lib, "_BOOTSTRAP_RETRY_DELAY", 0)
-    monkeypatch.setattr(install_lib, "_BOOTOUT_POLL_INTERVAL", 0)
-    monkeypatch.setattr(install_lib, "_BOOTOUT_SETTLE_MAX_WAIT", 0)
+    monkeypatch.setattr(install_plist, "_BOOTSTRAP_RETRY_DELAY", 0)
+    monkeypatch.setattr(install_plist, "_BOOTOUT_POLL_INTERVAL", 0)
+    monkeypatch.setattr(install_plist, "_BOOTOUT_SETTLE_MAX_WAIT", 0)
 
     res = install_lib._launchd_reload("gui/501", "/tmp/x.plist", "com.srouter.dashboard",
                                       runner=_reload_runner(bootstrap_rcs=[5], list_loaded=True))

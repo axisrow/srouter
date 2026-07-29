@@ -21,6 +21,7 @@
 """
 from pathlib import Path
 
+import install_config
 import install_lib
 
 
@@ -155,9 +156,9 @@ def test_restart_component_uses_stop_then_start_not_restart(monkeypatch):
     Вместо этого — `brew services stop` → `brew services start`. На нелеченом коде тест падает:
     _restart_component дёргает единственный `restart`, без stop/start.
     """
-    monkeypatch.setattr(install_lib, "_PORT_SETTLE_POLL_INTERVAL", 0)
-    monkeypatch.setattr(install_lib, "_PORT_SETTLE_MAX_WAIT", 0)
-    monkeypatch.setattr(install_lib, "_PORT_UP_MAX_WAIT", 0)
+    monkeypatch.setattr(install_config, "_PORT_SETTLE_POLL_INTERVAL", 0)
+    monkeypatch.setattr(install_config, "_PORT_SETTLE_MAX_WAIT", 0)
+    monkeypatch.setattr(install_config, "_PORT_UP_MAX_WAIT", 0)
     calls = []
     runner = _make_services_runner()
     base = runner
@@ -193,9 +194,9 @@ def test_restart_component_waits_for_port_release_before_start(monkeypatch):
     И False (дождались освобождения). Мутация: если бы код делал один poll и шёл к start без ожидания
     — assert видел бы только [True] без False → падает.
     """
-    monkeypatch.setattr(install_lib, "_PORT_SETTLE_POLL_INTERVAL", 0)
-    monkeypatch.setattr(install_lib, "_PORT_SETTLE_MAX_WAIT", 2.0)
-    monkeypatch.setattr(install_lib, "_PORT_UP_MAX_WAIT", 0)
+    monkeypatch.setattr(install_config, "_PORT_SETTLE_POLL_INTERVAL", 0)
+    monkeypatch.setattr(install_config, "_PORT_SETTLE_MAX_WAIT", 2.0)
+    monkeypatch.setattr(install_config, "_PORT_UP_MAX_WAIT", 0)
     # После stop порт: занят, занят, свободен (старый процесс отпускает с задержкой).
     probe = _PortProbe([True, True, False, True])
     polls_before_start = []
@@ -217,9 +218,9 @@ def test_restart_component_waits_for_port_release_before_start(monkeypatch):
 def test_restart_component_fails_when_port_never_releases(monkeypatch):
     """После stop порт НИКОГДА не освобождается (висячий процесс) → fail, НЕ стартуем новый поверх
     (fail-closed: лучше сломать установку, чем запустить конкурирующий процесс → петля рестартов)."""
-    monkeypatch.setattr(install_lib, "_PORT_SETTLE_POLL_INTERVAL", 0)
-    monkeypatch.setattr(install_lib, "_PORT_SETTLE_MAX_WAIT", 0)
-    monkeypatch.setattr(install_lib, "_PORT_UP_MAX_WAIT", 0)
+    monkeypatch.setattr(install_config, "_PORT_SETTLE_POLL_INTERVAL", 0)
+    monkeypatch.setattr(install_config, "_PORT_SETTLE_MAX_WAIT", 0)
+    monkeypatch.setattr(install_config, "_PORT_UP_MAX_WAIT", 0)
     probe = _PortProbe([True] * 10)  # порт вечно занят
     calls = []
     runner = _make_services_runner()
@@ -238,9 +239,9 @@ def test_restart_component_fails_when_port_never_releases(monkeypatch):
 def test_restart_component_polls_port_up_after_start(monkeypatch):
     """После start порт должен подняться (с задержкой) — poll это доказывает. Если не поднялся за
     потолок → fail (verify-dont-guess: не фиксированный sleep, а подтверждение состояния порта)."""
-    monkeypatch.setattr(install_lib, "_PORT_SETTLE_POLL_INTERVAL", 0)
-    monkeypatch.setattr(install_lib, "_PORT_SETTLE_MAX_WAIT", 0)
-    monkeypatch.setattr(install_lib, "_PORT_UP_MAX_WAIT", 0)
+    monkeypatch.setattr(install_config, "_PORT_SETTLE_POLL_INTERVAL", 0)
+    monkeypatch.setattr(install_config, "_PORT_SETTLE_MAX_WAIT", 0)
+    monkeypatch.setattr(install_config, "_PORT_UP_MAX_WAIT", 0)
     probe = _PortProbe([False, False])  # освобождается сразу, но после start НЕ поднимается
     calls = []
     runner = _make_services_runner()
@@ -255,9 +256,9 @@ def test_restart_component_polls_port_up_after_start(monkeypatch):
 
 def test_restart_component_success_when_stop_release_start_up(monkeypatch):
     """Happy path: stop ok → порт освобождается → start ok → порт поднимается → rc=0."""
-    monkeypatch.setattr(install_lib, "_PORT_SETTLE_POLL_INTERVAL", 0)
-    monkeypatch.setattr(install_lib, "_PORT_SETTLE_MAX_WAIT", 0)
-    monkeypatch.setattr(install_lib, "_PORT_UP_MAX_WAIT", 0)
+    monkeypatch.setattr(install_config, "_PORT_SETTLE_POLL_INTERVAL", 0)
+    monkeypatch.setattr(install_config, "_PORT_SETTLE_MAX_WAIT", 0)
+    monkeypatch.setattr(install_config, "_PORT_UP_MAX_WAIT", 0)
     probe = _PortProbe([False, True])  # освобождается → поднимается
     res = install_lib._restart_component("privoxy", _make_services_runner(), port_checker=probe)
     assert res.get("rc") == 0
@@ -265,9 +266,9 @@ def test_restart_component_success_when_stop_release_start_up(monkeypatch):
 
 def test_restart_component_dnsmasq_uses_sudo_for_stop_and_start(monkeypatch):
     """dnsmasq запускается под sudo (port 53) — stop/start тоже под sudo, polling UDP-порта 53."""
-    monkeypatch.setattr(install_lib, "_PORT_SETTLE_POLL_INTERVAL", 0)
-    monkeypatch.setattr(install_lib, "_PORT_SETTLE_MAX_WAIT", 0)
-    monkeypatch.setattr(install_lib, "_PORT_UP_MAX_WAIT", 0)
+    monkeypatch.setattr(install_config, "_PORT_SETTLE_POLL_INTERVAL", 0)
+    monkeypatch.setattr(install_config, "_PORT_SETTLE_MAX_WAIT", 0)
+    monkeypatch.setattr(install_config, "_PORT_UP_MAX_WAIT", 0)
     calls = []
     runner = _make_services_runner()
 
@@ -293,9 +294,9 @@ def test_apply_install_polls_port_in_managed_privoxy_flow(monkeypatch, tmp_path)
     (расходуя stateless-пробу), а _restart_component для privoxy видит «после stop свободен → после
     start поднят». mark_started переключает порт 8118 в «поднят» ровно в момент brew services start.
     """
-    monkeypatch.setattr(install_lib, "_PORT_SETTLE_POLL_INTERVAL", 0)
-    monkeypatch.setattr(install_lib, "_PORT_SETTLE_MAX_WAIT", 0)
-    monkeypatch.setattr(install_lib, "_PORT_UP_MAX_WAIT", 0)
+    monkeypatch.setattr(install_config, "_PORT_SETTLE_POLL_INTERVAL", 0)
+    monkeypatch.setattr(install_config, "_PORT_SETTLE_MAX_WAIT", 0)
+    monkeypatch.setattr(install_config, "_PORT_UP_MAX_WAIT", 0)
     env = install_lib.InstallEnv(
         root=Path(__file__).resolve().parent.parent,
         prefix=tmp_path / "homebrew",

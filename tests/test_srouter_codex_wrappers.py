@@ -433,12 +433,12 @@ def _print_runner(list_states):
 def test_remove_launchctl_env_keeps_plist_when_still_loaded(monkeypatch, tmp_path):
     """Сайт C fail-safe (PR #83 cycle-3): агент ещё загружен после settle → plist ОСТАВЛЕН, нет unsetenv.
 
-    poll живёт в install_lib → патчим install_lib._BOOTOUT_*. settle≈0 (иначе poll крутил бы 2с),
+    poll живёт в install_plist → патчим install_plist._BOOTOUT_*. settle≈0 (иначе poll крутил бы 2с),
     print всегда rc0 → state=True. Сообщение бит-в-бит: «всё ещё загружен» + «plist оставлен».
     """
-    import install_lib
-    monkeypatch.setattr(install_lib, "_BOOTOUT_POLL_INTERVAL", 0)
-    monkeypatch.setattr(install_lib, "_BOOTOUT_SETTLE_MAX_WAIT", 0)
+    import install_plist
+    monkeypatch.setattr(install_plist, "_BOOTOUT_POLL_INTERVAL", 0)
+    monkeypatch.setattr(install_plist, "_BOOTOUT_SETTLE_MAX_WAIT", 0)
     home = _mock_home(monkeypatch, tmp_path)
     srouter._install_launchctl_env(_env(tmp_path), _fake_runner())
     plist = home / "Library" / "LaunchAgents" / f"{srouter.CODEX_ENV_LABEL}.plist"
@@ -459,8 +459,8 @@ def test_remove_launchctl_env_keeps_plist_when_print_timeout(monkeypatch, tmp_pa
 
     Тест бит-в-бит различия None vs True. None короткозамыкает poll (`while state and …`).
     """
-    import install_lib
-    monkeypatch.setattr(install_lib, "_BOOTOUT_POLL_INTERVAL", 0)
+    import install_plist
+    monkeypatch.setattr(install_plist, "_BOOTOUT_POLL_INTERVAL", 0)
     home = _mock_home(monkeypatch, tmp_path)
     srouter._install_launchctl_env(_env(tmp_path), _fake_runner())
     plist = home / "Library" / "LaunchAgents" / f"{srouter.CODEX_ENV_LABEL}.plist"
@@ -490,9 +490,9 @@ def test_remove_launchctl_env_keeps_plist_on_domain_mismatch(monkeypatch, tmp_pa
     живого. Теперь `print gui/<uid>/CODEX_ENV_LABEL`: rc=0 (жив) → True, rc=112 (домен недоступен) → None;
     оба → loaded is not False → plist оставлен, нет unsetenv.
     """
-    import install_lib
-    monkeypatch.setattr(install_lib, "_BOOTOUT_POLL_INTERVAL", 0)
-    monkeypatch.setattr(install_lib, "_BOOTOUT_SETTLE_MAX_WAIT", 0)
+    import install_plist
+    monkeypatch.setattr(install_plist, "_BOOTOUT_POLL_INTERVAL", 0)
+    monkeypatch.setattr(install_plist, "_BOOTOUT_SETTLE_MAX_WAIT", 0)
     home = _mock_home(monkeypatch, tmp_path)
     srouter._install_launchctl_env(_env(tmp_path), _fake_runner())
     plist = home / "Library" / "LaunchAgents" / f"{srouter.CODEX_ENV_LABEL}.plist"

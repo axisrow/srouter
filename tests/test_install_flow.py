@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 import install_lib
+import install_plist
 import sys_probe
 
 
@@ -519,8 +520,8 @@ def test_install_retries_bootstrap_when_domain_busy(monkeypatch, tmp_path):
     Теперь retry доводит до успеха. Канон always-tdd.
     """
     # Зануляем интервалы — мгновенный тест без реальных слипов.
-    monkeypatch.setattr(install_lib, "_BOOTSTRAP_RETRY_DELAY", 0)
-    monkeypatch.setattr(install_lib, "_BOOTOUT_POLL_INTERVAL", 0)
+    monkeypatch.setattr(install_plist, "_BOOTSTRAP_RETRY_DELAY", 0)
+    monkeypatch.setattr(install_plist, "_BOOTOUT_POLL_INTERVAL", 0)
     env = _env(tmp_path)
 
     calls = []
