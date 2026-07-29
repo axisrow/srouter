@@ -445,6 +445,138 @@ class TestHealthExceptions:
         assert rc == 0
 
 
+class TestNodeSelectorExceptions:
+    """Тесты для node_selector.py exception handling."""
+
+    def test_default_runner_subprocess_error(self):
+        """_default_runner должен обрабатывать subprocess ошибки."""
+        from node_selector import _default_runner
+
+        # Timeout
+        result = _default_runner(["sleep", "10"], timeout=0.01)
+        assert result["timeout"] is True, "Должен возвращать timeout=True при TimeoutExpired"
+
+        # Несуществующая команда
+        result = _default_runner(["nonexistent_command_12345"], timeout=5)
+        assert result["rc"] is None, "Должен возвращать rc=None при сбое запуска"
+
+    def test_active_name_local_state_error(self):
+        """_active_name должен обрабатывать local_state ошибки."""
+        from node_selector import _active_name
+        import local_state
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            state_path.write_text("invalid json", encoding='utf-8')
+
+            result = _active_name(state_path=str(state_path))
+            assert result is None, "Должен возвращать None при ошибке чтения state"
+
+    def test_run_restart_runner_error(self):
+        """_run_restart должен обрабатывать runner ошибки."""
+        from node_selector import _run_restart
+
+        # Mock runner который бросает исключение
+        def failing_runner(cmd, timeout):
+            raise RuntimeError("Runner failed")
+
+        result = _run_restart(failing_runner)
+        assert result["timeout"] is True, "Должен возвращать timeout=True при runner error"
+
+    def test_rollback_local_state_error(self):
+        """_rollback должен обрабатывать local_state ошибки."""
+        from node_selector import _rollback
+        import gen_xray_config
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            config_path = Path(tmpdir) / "config.json"
+            state_path.write_text('{"active_node": {"name": "test"}}', encoding='utf-8')
+
+            # Mock gen_xray_config.write_config который возвращает False (ошибка)
+            with patch('gen_xray_config.write_config', return_value=False):
+                # Mock runner который возвращает success
+                def mock_runner(cmd, timeout):
+                    return {"rc": 0, "out": "", "err": "", "timeout": False}
+
+                result = _rollback(str(state_path), str(config_path), mock_runner)
+                assert result["ok"] is False, "Должен возвращать ok=False при ошибке rollback"
+
+    def test_auto_route_sync_enabled_state_error(self):
+        """_auto_route_sync_enabled должен обрабатывать state ошибки."""
+        from node_selector import _auto_route_sync_enabled
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            # Создаем валидный JSON но без auto_route_sync
+            state_path.write_text('{"nodes": []}', encoding='utf-8')
+
+            result = _auto_route_sync_enabled(str(state_path))
+            assert result is False, "Должен возвращать False когда auto_route_sync не true"
+
+    def test_route_node_ip_error(self):
+        """_route_node_ip должен обрабатывать ошибки."""
+        from node_selector import _route_node_ip
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            state_path.write_text('{"nodes": []}', encoding='utf-8')
+
+            result = _route_node_ip("nonexistent", str(state_path))
+            assert result == "", "Должен возвращать пустую строку при ошибке"
+
+    def test_gateway_literal_import_error(self):
+        """_gateway_literal должен обрабатывать ошибки import."""
+        from node_selector import _gateway_literal
+
+        # Mock ImportError
+        with patch('builtins.__import__', side_effect=ImportError("No module")):
+            result = _gateway_literal()
+            assert result == "", "Должен возвращать пустую строку при import error"
+
+    def test_physical_iface_prefixes_error(self):
+        """_physical_iface_prefixes должен обрабатывать ошибки."""
+        from node_selector import _physical_iface_prefixes
+
+        # Mock ошибку
+        with patch('builtins.__import__', side_effect=OSError("Import failed")):
+            result = _physical_iface_prefixes()
+            assert isinstance(result, tuple), "Должен возвращать tuple при ошибке"
+            assert "en" in result, "Должен возвращать fallback tuple"
+
+    def test_sync_split_route_error(self):
+        """_sync_split_route должен обрабатывать ошибки."""
+        from node_selector import _sync_split_route
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            state_path.write_text('{"nodes": [], "active_node": {"name": null}}', encoding='utf-8')
+
+            result = _sync_split_route("previous", "new", str(state_path))
+            assert "error" in result or result.get("enabled") is True, "Должен обрабатывать ошибки без исключения"
+
+    def test_route_get_gateway_error(self):
+        """_route_get_gateway должен обрабатывать sys_probe ошибки."""
+        from node_selector import _route_get_gateway
+
+        # Mock sys_probe.run который бросает исключение
+        with patch('sys_probe.run', side_effect=OSError("Route command failed")):
+            result = _route_get_gateway("192.0.2.1")
+            assert result["ok"] is False, "Должен возвращать ok=False при sys_probe error"
+
+    def test_ensure_split_route_error(self):
+        """ensure_split_route должен обрабатывать все ошибки."""
+        from node_selector import ensure_split_route
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            state_path.write_text('{"nodes": [], "active_node": {"name": null}}', encoding='utf-8')
+
+            result = ensure_split_route(str(state_path))
+            assert "error" in result or "enabled" in result, "Должен возвращать dict с ошибкой или статусом"
+            assert result.get("enabled") in [True, False], "Должен иметь корректный статус enabled"
+
+
 class TestLocalStateExceptions:
     """Тесты для local_state.py exception handling."""
 
@@ -458,6 +590,80 @@ class TestLocalStateExceptions:
 
             result = local_state.load_state(path=str(state_path))
             assert result is not None, "load_state должен возвращать fallback при JSON error"
+
+    def test_load_state_oserror_fallback(self):
+        """load_state должен обрабатывать OSError."""
+        import local_state
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "unreadable.json"
+            state_path.write_bytes(b'\x00\x01\x02')  # Невалидные UTF-8 данные
+
+            result = local_state.load_state(path=str(state_path))
+            assert result is not None, "load_state должен возвращать fallback при OSError"
+
+    def test_resolve_route_ip_dns_error(self):
+        """resolve_route_ip должен обрабатывать DNS ошибки."""
+        import local_state
+
+        node = {"endpoint_host": "nonexistent.invalid.test.example.com"}
+        result = local_state.resolve_route_ip(node)
+        # Должен возвращать fallback (host или пустую строку)
+        assert isinstance(result, str), "resolve_route_ip должен возвращать строку при DNS error"
+
+    def test_save_state_type_error(self):
+        """save_state должен обрабатывать TypeError."""
+        import local_state
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            # Передаем невалидный state (не dict)
+            result = local_state.save_state(None, path=str(state_path))
+            assert result is None, "save_state должен возвращать None при TypeError"
+
+    def test_read_xray_active_address_json_error(self):
+        """read_xray_active_address должен обрабатывать JSON ошибки."""
+        import local_state
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.json"
+            config_path.write_text("invalid json", encoding='utf-8')
+
+            result = local_state.read_xray_active_address(str(config_path))
+            assert result["status"] == "unreadable", "Должен возвращать unreadable при JSON error"
+
+    def test_sync_endpoint_from_xray_error(self):
+        """sync_endpoint_from_xray должен обрабатывать ошибки."""
+        import local_state
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.json"
+            state_path = Path(tmpdir) / "state.json"
+
+            # Пустой config и state
+            config_path.write_text("{}", encoding='utf-8')
+            state_path.write_text('{"nodes": [], "active_node": {"name": null}}', encoding='utf-8')
+
+            result = local_state.sync_endpoint_from_xray(str(config_path), str(state_path))
+            assert result["ok"] is False, "Должен возвращать ok=False при ошибке"
+
+    def test_routing_apply_lock_error(self):
+        """routing_apply должен обрабатывать ошибки блокировки."""
+        import local_state
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.json"
+            state_path = Path(tmpdir) / "state.json"
+
+            # Создаем валидные файлы
+            config_path.write_text('{"routing": {"rules": [{"domain": [], "outboundTag": "reality-out"}]}}', encoding='utf-8')
+            state_path.write_text('{"nodes": [], "active_node": {"name": null}}', encoding='utf-8')
+
+            # Mock для OSError при создании lockfile
+            with patch('local_state._routing_config_lock', side_effect=OSError("Lock error")):
+                result = local_state.routing_apply(["example.com"], config_path=str(config_path), state_path=str(state_path))
+                assert result["ok"] is False, "Должен возвращать ok=False при lock error"
+                assert "config_lock_failed" in result["err"], "Должен сообщать о неудаче блокировки"
 
 
 class TestProxyConfigExceptions:

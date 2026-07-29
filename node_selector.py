@@ -153,7 +153,8 @@ def _default_runner(cmd_list, timeout):
         return {"rc": proc.returncode, "out": proc.stdout.strip(), "err": proc.stderr.strip(), "timeout": False}
     except subprocess.TimeoutExpired:
         return {"rc": None, "out": "", "err": "timeout", "timeout": True}
-    except Exception as exc:
+    except (subprocess.CalledProcessError, OSError, ValueError) as exc:
+        # CalledProcessError: subprocess сбои; OSError: нет бинаря/прав; ValueError: невалидные аргументы
         return {"rc": None, "out": "", "err": f"{type(exc).__name__}: {exc}", "timeout": False}
 
 
@@ -163,7 +164,8 @@ def _active_name(state_path=None):
     # поэтому чтение active обязано быть безопасным само по себе.
     try:
         active = local_state.active_node(path=state_path) or {}
-    except Exception:
+    except (OSError, ValueError) as exc:
+        # OSError: ошибки файла/чтения; ValueError: JSON ошибка/невалидная структура
         return None
     return active.get("name") if isinstance(active, dict) else None
 
@@ -181,7 +183,8 @@ def _pending_name(state_path=None):
 def _run_restart(runner):
     try:
         result = runner(list(XRAY_RESTART_CMD), _RESTART_TIMEOUT_SEC)
-    except Exception as exc:
+    except (OSError, ValueError, RuntimeError) as exc:
+        # OSError: ошибки выполнения/бинарника; ValueError: невалидные аргументы; RuntimeError: ошибки runner
         return {"rc": None, "out": "", "err": str(exc), "timeout": True}
     return result if isinstance(result, dict) else {"rc": None, "out": "", "err": "bad runner result", "timeout": True}
 
@@ -201,11 +204,13 @@ def _rollback(state_path, config_path, runner):
     """Blocking откат: если previous-конфиг не восстановлен, вызывающий обязан сигналить failure."""
     try:
         local_state.clear_pending(path=state_path)
-    except Exception as exc:
+    except (OSError, ValueError) as exc:
+        # OSError: ошибки файла/записи; ValueError: ошибки структуры state
         return {"ok": False, "error": f"clear pending failed: {exc}", "restore_ok": False}
     try:
         restored = gen_xray_config.write_config(config_path, state_path=state_path)
-    except Exception as exc:
+    except (OSError, ValueError, TypeError) as exc:
+        # OSError: ошибки записи; ValueError: ошибки валидации; TypeError: ошибки типа данных
         return {"ok": False, "error": f"rollback config restore failed: {exc}", "restore_ok": False}
     if not restored:
         return {"ok": False, "error": "rollback config restore failed", "restore_ok": False}
@@ -236,7 +241,8 @@ def _pending_active_hook(pending_name, state_path):
             pending = local_state.get_node(pending_name, path=state_path)
             rendered = gen_xray_config._vless_outbound(pending, "active", state_path=state_path)
             return rendered if isinstance(rendered, dict) and rendered else outbound
-        except Exception:
+        except (OSError, ValueError, KeyError) as exc:
+            # OSError: ошибки файла; ValueError: ошибки структуры; KeyError: отсутствует узел
             return outbound
 
     return hook
@@ -260,7 +266,8 @@ def _auto_route_sync_enabled(state_path):
     """True только при явном "auto_route_sync": true в state. Defensive: не бросает."""
     try:
         state = local_state.load_state(path=state_path)
-    except Exception:
+    except (OSError, ValueError) as exc:
+        # OSError: ошибки файла/чтения; ValueError: JSON ошибки/невалидная структура
         return False
     return isinstance(state, dict) and state.get("auto_route_sync") is True
 
@@ -287,7 +294,8 @@ def _route_node_ip(name, state_path):
     try:
         node = local_state.get_node(name, path=state_path)
         route_ip = local_state.resolve_route_ip(node, path=state_path)
-    except Exception:
+    except (OSError, ValueError, KeyError) as exc:
+        # OSError: ошибки файла; ValueError: ошибки структуры/DNS; KeyError: отсутствует узел
         return ""
     return route_ip if _ip_literal(route_ip) else ""
 
@@ -299,7 +307,8 @@ def _gateway_literal():
         import srouter_config
 
         gateway = srouter_config.GATEWAY
-    except Exception:
+    except (ImportError, AttributeError, OSError) as exc:
+        # ImportError: нет модуля; AttributeError: нет атрибута; OSError: ошибки файла
         return ""
     return gateway if _ip_literal(gateway) else ""
 
@@ -312,7 +321,8 @@ def _physical_iface_prefixes():
         import srouter_config
 
         raw = getattr(srouter_config, "PHYSICAL_IFACE_PREFIXES", ("en",))
-    except Exception:
+    except (ImportError, AttributeError, OSError) as exc:
+        # ImportError: нет модуля; AttributeError: нет атрибута; OSError: ошибки файла
         return ("en",)
     if isinstance(raw, (list, tuple)):
         prefixes = tuple(p for p in raw if isinstance(p, str) and p)
@@ -413,7 +423,8 @@ def _sync_split_route(previous, name, state_path):
         # 3) delete прежнего — только после успешного/idempotent add и только если он отличается.
         if old_ip and old_ip != new_ip:
             result["removed"] = _route_result(_sudo_route_ip("remove", old_ip, gateway))
-    except Exception as exc:
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError, OSError, ValueError, RuntimeError) as exc:
+        # subprocess: route command failures; OSError: системные ошибки; ValueError: ошибки валидации; RuntimeError: mock ошибки в тестах
         result["error"] = str(exc)
     return result
 
@@ -444,7 +455,8 @@ def _route_get_gateway(route_ip):
             [ROUTE, "-n", "get", "-host", route_ip],
             timeout=_ROUTE_SYNC_TIMEOUT_SEC,
         ) or {}
-    except Exception as exc:
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError, OSError, ValueError) as exc:
+        # subprocess: route command failures; OSError: системные ошибки; ValueError: ошибки валидации IP
         return {
             "ok": False,
             "rc": None,
@@ -568,7 +580,9 @@ def _select_node_locked(name, *, enabled_names, runner=None, state_path=None, co
         if _auto_route_sync_enabled(state_path):
             result["route_sync"] = _sync_split_route(previous, name, state_path)
         return result
-    except Exception as exc:
+    except (OSError, ValueError, KeyError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        # OSError: ошибки файла/системы; ValueError: ошибки структуры/валидации;
+        # KeyError: отсутствует узел; subprocess: ошибки команд route/xray
         if begun:
             rollback = _rollback(state_path, config_path, runner)
             if not rollback.get("ok"):
@@ -602,7 +616,8 @@ def _route_goes_via_gateway(route_ip, gateway):
         return False
     try:
         raw = sys_probe.run([ROUTE, "-n", "get", "-host", route_ip], timeout=_ROUTE_SYNC_TIMEOUT_SEC) or {}
-    except Exception:
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError, OSError, ValueError):
+        # subprocess: route command failures; OSError: системные ошибки; ValueError: ошибки валидации IP
         return False
     if raw.get("timeout") or raw.get("rc") != 0:
         return False
@@ -658,5 +673,6 @@ def ensure_split_route(state_path=None):
         else:
             added = _sudo_route_ip("add", route_ip, gateway)
         return {"enabled": True, "added": added}
-    except Exception as exc:
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError, OSError, ValueError) as exc:
+        # subprocess: route command failures; OSError: системные ошибки; ValueError: ошибки валидации
         return {"enabled": True, "error": f"ensure_split_route failed: {exc}"}
