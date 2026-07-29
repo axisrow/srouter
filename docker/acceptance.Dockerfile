@@ -13,9 +13,14 @@
 #
 # Registry: Docker Hub (registry-1.docker.io) недоступен/замедлен за GFW. Тянем через зеркало
 # docker.m.daocloud.io (issue #113). Registry-mirror в daemon.json ломал старт Docker Desktop
-# (health-check зеркал при boot висел) — поэтому зеркало в FROM, а не в daemon-конфиге. У кого Docker Hub
-# доступен напрямую — может заменить на `FROM python:3.12-slim`.
-FROM docker.m.daocloud.io/library/python:3.12-slim
+# (health-check зеркал при boot висел) — поэтому зеркало в FROM, а не в daemon-конфиге.
+#
+# CI (issue #116): GitHub Actions runners тянут Docker Hub напрямую (нет GFW) — параметризовано
+# через build-arg BASE_IMAGE, чтобы не зависеть от зеркала в CI. Дефолт остаётся зеркало для
+# локальной разработки за GFW; кто тянет Docker Hub напрямую — передаёт
+# `--build-arg BASE_IMAGE=python:3.12-slim`.
+ARG BASE_IMAGE=docker.m.daocloud.io/library/python:3.12-slim
+FROM ${BASE_IMAGE}
 
 # lsof — реальный (кросс-платформенный), srouter зовёт /usr/sbin/lsof. Остальные macOS-binary = stub'ы.
 # curl — probe-команды (probe_tunnel/probe_exit_ip). git — для pytest discovery + возможных проверок.
@@ -44,14 +49,15 @@ RUN cp srouter_config.example.py srouter_config.py \
 # macOS-binary stub'ы по тем же абсолютным путям, что в константах srouter
 # (install_lib.py: BREW=/opt/homebrew/bin/brew, LAUNCHCTL=/bin/launchctl, NETWORKSETUP=/usr/sbin/networksetup,
 #  ROUTE=/sbin/route; srouter.py: OSASCRIPT=/usr/bin/osascript). srouter найдёт их без правки кода.
-# Путь 3 (итеративно): сначала тупые stateless stub'ы. Усиливаем до stateful только если cycle-review
-# найдёт, что логика зависит от state между вызовами.
+# Путь 3 (итеративно): тупые stateless stub'ы, кроме brew (issue #116 п.2) — усилен до stateful, т.к.
+# install_lib.py::_restart_component (issue #115) реально poll'ит TCP/UDP порт после `services start`.
 COPY docker/stubs/launchctl.sh     /tmp/stubs/launchctl.sh
 COPY docker/stubs/brew.sh          /tmp/stubs/brew.sh
 COPY docker/stubs/networksetup.sh  /tmp/stubs/networksetup.sh
 COPY docker/stubs/osascript.sh     /tmp/stubs/osascript.sh
 COPY docker/stubs/route.sh         /tmp/stubs/route.sh
 COPY docker/stubs/sudo.sh          /tmp/stubs/sudo.sh
+COPY docker/stubs/port_listener.py /opt/srouter-acceptance/port_listener.py
 
 RUN mkdir -p /opt/homebrew/bin /usr/sbin /sbin /usr/bin /bin \
     && install -m 0755 /tmp/stubs/launchctl.sh    /bin/launchctl \
