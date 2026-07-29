@@ -360,7 +360,7 @@ binary/exec.LookPath), поэтому границей служит именно
 |---|---|
 | **Claude Code** | `HTTPS_PROXY=http://127.0.0.1:8118` в `~/.claude/settings.json` (privoxy HTTP; SOCKS5 CC не умеет) |
 | **Codex CLI/App** | **напрямую SOCKS5 в xray** (`socks5h://127.0.0.1:10808`) тремя живыми путями, минуя privoxy: wrappers (CLI + `--proxy-server` для Chromium-оболочки App), LaunchAgent `com.srouter.codenv` (gui-SOCKS5 env для Rust app-server ChatGPT.app, #189/#190; setenv не ретроактивен — запущенный до install ChatGPT.app перезапустите Cmd+Q), scoped VSCode `http.proxy` (расширение `openai.chatgpt`, #185; только если install обновил существующий settings.json); + **PF kill-switch в ядре** (#168) как будущая fail-closed граница (режет прямой TCP-выход codex на en0–en6/ppp0–ppp1, разрешая loopback SOCKS5 по TCP; пока дормантен — пользователь uid 503 уже создаётся install (#186), активируется после полной активации: запуск codex под uid 503 **независимо от wrapper'а** (не sudo -u в wrapper) + доменная изоляция + TCP на en/ppp, отдельный follow-up). privoxy портит WS-стриминг Codex (`Reconnecting`/`request timed out`); `[network] proxy_url` в `~/.codex/config.toml` мёртв в codex 0.146 (управляет execution-scoped sandbox-прокси для субпроцессов, не клиентом) — поэтому wrappers в `~/bin/codex-srouter` (CLI, имя `codex-srouter` убирает коллизию wrapper↔real-binary #169) + `~/bin/codex-app-proxy` (App Chromium) + `com.srouter.codenv` (Rust app-server) + scoped VSCode `http.proxy` (расширение). Запускать Codex **App** через `~/bin/codex-app-proxy`, а не иконку Dock (Dock не передаёт `--proxy-server`). См. раздел «Изоляция Codex». |
-| **git / gh** | scoped git-прокси `http.https://github.com.proxy → privoxy 8118` (`git_proxy.py`); gh работает **напрямую** через Go-стек (GFW не режет) → для VPS-независимости: `gh` через `env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy` (оба регистра), `git` через `git -c http.https://github.com.proxy=` (env -u НЕ трогает git-config) — см. раздел «gh / git: прямой доступ» |
+| **git / gh** | scoped git-прокси `http.https://github.com.proxy → socks5h://127.0.0.1:10808` (xray, `git_proxy.py`); gh работает **напрямую** через Go-стек (GFW не режет) → для VPS-независимости: `gh` через `env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy` (оба регистра), `git` через `git -c http.https://github.com.proxy=` (env -u НЕ трогает git-config) — см. раздел «gh / git: прямой доступ» |
 | **Браузер** | системный SOCKS5 `127.0.0.1:10808` (вайтлист разруливает сам) |
 
 ## Откат
@@ -415,8 +415,9 @@ git -c http.https://github.com.proxy= clone https://github.com/axisrow/srouter.g
 git clone git@github.com:axisrow/srouter.git   # ssh:22 открыт напрямую (nc github.com 22 = OPEN)
 ```
 
-**Связь с srouter:** `srouter install` ставит scoped git-прокси `http.https://github.com.proxy →
-privoxy 8118` (`git_proxy.py`) — он направляет `git` к github через ускоритель. Это полезно, когда
+**Связь с srouter:** `srouter install` автоматически ставит scoped git-прокси
+`http.https://github.com.proxy → socks5h://127.0.0.1:10808` (xray, `git_proxy.py`, issue #130) —
+он направляет `git` к github через ускоритель. `srouter uninstall` его снимает. Это полезно, когда
 ускоритель жив, но делает `git` **VPS-зависимым**: `env -u` его **не** снимает (это git-config, не
 env), нужен `git -c http.https://github.com.proxy=`. `gh` снимается `env -u` (оба регистра env).
 `srouter doctor` показывает этот чек (`gh/git direct`) с подсказкой обеих команд, когда git-proxy
@@ -821,8 +822,9 @@ git -c http.https://github.com.proxy= clone https://github.com/axisrow/srouter.g
 git clone git@github.com:axisrow/srouter.git   # ssh:22 is open directly (nc github.com 22 = OPEN)
 ```
 
-**Relation to srouter:** `srouter install` sets a scoped git proxy `http.https://github.com.proxy →
-privoxy 8118` (`git_proxy.py`) — it routes `git` to github through the accelerator. That's useful
+**Relation to srouter:** `srouter install` automatically sets a scoped git proxy
+`http.https://github.com.proxy → socks5h://127.0.0.1:10808` (xray, `git_proxy.py`, issue #130) —
+it routes `git` to github through the accelerator. `srouter uninstall` removes it. That's useful
 when the accelerator is alive, but it makes `git` **VPS-dependent**: `env -u` does **not** clear it
 (it's git-config, not env) — use `git -c http.https://github.com.proxy=`. `gh` is cleared with
 `env -u` (both env cases). `srouter doctor` surfaces this check (`gh/git direct`) with both commands
@@ -926,7 +928,7 @@ remove it).
 |---|---|
 | **Claude Code** | `HTTPS_PROXY=http://127.0.0.1:8118` in `~/.claude/settings.json` |
 | **Codex** | **straight to xray** (`socks5h://127.0.0.1:10808`) via three live paths that bypass privoxy: wrappers (CLI + `--proxy-server` for the App Chromium shell), the `com.srouter.codenv` LaunchAgent (gui-SOCKS5 env for ChatGPT.app's Rust app-server, #189/#190; setenv is non-retroactive — restart an already-running ChatGPT.app with Cmd+Q), and scoped VSCode `http.proxy` (the `openai.chatgpt` extension, #185; only if install updated an existing settings.json); + **a PF kill-switch in the kernel** (#168) as the future fail-closed boundary (cuts codex direct TCP egress on en0–en6/ppp0–ppp1, allowing TCP to loopback SOCKS5; dormant today — the uid 503 user is already created by install (#186), and activation requires full activation: launching codex under uid 503 **independently of the wrapper** (not via wrapper sudo -u) + domain isolation + TCP on en/ppp, a separate follow-up). `[network] proxy_url` in `~/.codex/config.toml` is dead in codex 0.146 (it configures the execution-scoped sandbox proxy for spawned `codex` subprocesses, not the client) — hence wrappers + codenv + VSCode http.proxy. See the "Codex isolation" section. |
-| **git / gh** | scoped git proxy `http.https://github.com.proxy → privoxy 8118` (`git_proxy.py`); gh works **direct** via its Go stack (GFW does not cut it) → for VPS-independence: `gh` with `env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy` (both cases), `git` with `git -c http.https://github.com.proxy=` (env -u does NOT touch git-config) — see "gh / git: direct access" |
+| **git / gh** | scoped git proxy `http.https://github.com.proxy → socks5h://127.0.0.1:10808` (xray, `git_proxy.py`); gh works **direct** via its Go stack (GFW does not cut it) → for VPS-independence: `gh` with `env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy` (both cases), `git` with `git -c http.https://github.com.proxy=` (env -u does NOT touch git-config) — see "gh / git: direct access" |
 | **Browser** | system SOCKS5 `127.0.0.1:10808` |
 
 ---

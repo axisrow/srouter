@@ -46,6 +46,9 @@ def _stub_cmd_uninstall_internals(monkeypatch, *, env_ok, leftover=None, tty=Tru
     monkeypatch.setattr(srouter, "_remove_active_split_route", lambda *a, **k: 0)
     monkeypatch.setattr(srouter, "claude_proxy",
                         SimpleNamespace(disable=lambda: {"ok": True}))
+    # issue #130: git → SOCKS5 через gitconfig — disable симметричен enable в install.
+    monkeypatch.setattr(srouter, "git_proxy",
+                        SimpleNamespace(disable=lambda: {"ok": True}))
     # issue #185: scoped SOCKS5 через VSCode http.proxy — disable симметричен enable в install.
     monkeypatch.setattr(srouter, "vscode_proxy",
                         SimpleNamespace(disable=lambda: {"ok": True}))
@@ -146,3 +149,37 @@ def test_cmd_uninstall_zero_rc_when_clean_rollback(monkeypatch):
     rc = srouter.cmd_uninstall(_args(yes=True))
 
     assert rc == 0, "полный откат (leftover=[], env снят) → rc=0"
+
+
+# ============================ issue #130: git → SOCKS5 через gitconfig, снятие в uninstall =====
+def test_cmd_uninstall_disables_git_proxy(monkeypatch):
+    """issue #130: uninstall обязан вызвать git_proxy.disable() — убрать SOCKS5 из ~/.gitconfig,
+    возвращая git к состоянию до srouter."""
+    _stub_cmd_uninstall_internals(monkeypatch, env_ok=True, tty=False)
+    calls = {"git_disable": 0}
+    monkeypatch.setattr(srouter, "git_proxy", SimpleNamespace(
+        disable=lambda: (calls.__setitem__("git_disable", 1), {"ok": True})[1]))
+
+    rc = srouter.cmd_uninstall(_args(yes=True))
+
+    assert rc == 0
+    assert calls["git_disable"] == 1, "uninstall обязан снять git-прокси автоматически (#130)"
+
+
+def test_cmd_uninstall_returns_nonzero_when_git_proxy_not_removed(monkeypatch, capsys):
+    """Regression (Codex cycle-review PR #221): git_proxy.disable() ok=False → rc=2 (fail-closed).
+
+    До фикса gp["ok"] влиял только на текст сообщения (cp_note), не на итоговый rc — locked/
+    read-only ~/.gitconfig или ошибка git config давали «Откат завершён» rc=0, пока git всё ещё
+    указывал на мёртвый 127.0.0.1:10808 (xray уже остановлен apply_uninstall). Тот же класс бага,
+    что issue #94 DEFECT A для env-cleanup — теперь применяем инвариант и к git-proxy.
+    """
+    _stub_cmd_uninstall_internals(monkeypatch, env_ok=True, tty=False)
+    monkeypatch.setattr(srouter, "git_proxy", SimpleNamespace(
+        disable=lambda: {"ok": False, "err": "git config --unset failed"}))
+
+    rc = srouter.cmd_uninstall(_args(yes=True))
+
+    assert rc == 2, f"git-proxy не снят → ненулевой rc (fail-closed), получил {rc}"
+    err = capsys.readouterr().err.lower()
+    assert "git" in err, f"stderr объясняет причину (git-proxy не снят): {err}"

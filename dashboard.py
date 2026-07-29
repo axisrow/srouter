@@ -1029,7 +1029,7 @@ def api_git_proxy_get():
 
 @app.post("/api/git-proxy/enable")
 def api_git_proxy_enable():
-    """Прописать http.https://github.com.proxy = privoxy (scoped github.com)."""
+    """Прописать http.https://github.com.proxy = SOCKS5 xray (scoped github.com)."""
     return jsonify(git_proxy.enable()), 200
 
 

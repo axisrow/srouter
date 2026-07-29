@@ -55,6 +55,7 @@ from install_lib import (
 from sys_probe import run
 
 import claude_proxy  # вкл/откл HTTPS_PROXY для Claude Code (~/.claude/settings.json)
+import git_proxy  # issue #130: вкл/откл SOCKS5 github-proxy в ~/.gitconfig (xray 10808)
 import vscode_proxy  # issue #185: scoped SOCKS5 для codex-расширения через VSCode http.proxy
 import health  # doctor-проверки стека
 import marker_block  # централизованный marker-парсер (#176): find/replace/remove_managed_block + classification
@@ -950,6 +951,13 @@ def cmd_install(args) -> int:
         cp_note = ("Claude Code: HTTPS_PROXY прописан в ~/.claude/settings.json."
                    if cp.get("ok") else
                    f"Claude Code: не удалось прописать HTTPS_PROXY ({cp.get('err', 'unknown')}).")
+        # issue #130: git → SOCKS5 (xray 10808) scoped на github.com, автоматически, без ручных
+        # правок ~/.gitconfig. Best-effort (не критично для install, но часть «одна команда, всё
+        # правильно» — git умеет нативный SOCKS5, в отличие от Claude Code).
+        gp = git_proxy.enable()
+        gp_note = (f"git: github-proxy прописан в ~/.gitconfig ({gp.get('proxy', '')})."
+                   if gp.get("ok") else
+                   f"git: не удалось прописать github-proxy ({gp.get('err', 'unknown')}).")
         # Watchdog-plist: фоновый пинг туннеля раз в 90с + macOS-нотификация при падении.
         # Best-effort (не критично для install), но удобно «из коробки» — защищает от «остался без ИИ».
         wd_ok, wd_err = _install_generic_launchagent(
@@ -1013,6 +1021,7 @@ def cmd_install(args) -> int:
             pass
         print("Установка стека завершена: brew-сервисы, конфиги, DNS, LaunchAgent применены.\n"
               f"{cp_note}\n"
+              f"{gp_note}\n"
               f"{wd_note}\n"
               f"{ppp_note}\n"
               f"{codex_note}\n"
@@ -1111,6 +1120,10 @@ def cmd_uninstall(args) -> int:
     # 5) Снять HTTPS_PROXY для Claude Code — privoxy больше не запущен, прокси бессмысленен.
     cp = claude_proxy.disable()
     cp_note = ". Claude Code HTTPS_PROXY снят." if cp.get("ok") else ""
+    # 5a) issue #130: снять github-proxy из ~/.gitconfig (xray SOCKS5 больше не запущен) —
+    # возвращает git к состоянию до srouter.
+    gp = git_proxy.disable()
+    cp_note += ". git github-proxy снят." if gp.get("ok") else ". git github-proxy не снят."
     # 5b) issue #185: снять scoped SOCKS5 из VSCode http.proxy (симметрично install). Чужой http.proxy
     # не трогаем (fail-closed provenance — vscode_proxy.disable сверяет значение).
     vp = vscode_proxy.disable()
@@ -1130,9 +1143,12 @@ def cmd_uninstall(args) -> int:
     # env-cleanup fail-closed (issue #94 DEFECT A): мёртвый прокси остался в gui-домене → НЕ успех,
     # даже если всё остальное прошло. Раньше env_note просто конкатенировался в сообщение → fail-open
     # (rc=0 при живом socks5://127.0.0.1:10808 в GUI). ok=False пробрасываем в ненулевой rc.
-    # Шапка сообщения зависит от итога: «Откат завершён» только при подтверждённо снятом env И без
-    # leftover (issue #110 Дефект 1), иначе «Откат выполнен частично» — без противоречия rc=2.
-    full_ok = env_status["ok"] and not partial_configs
+    # Тот же инвариант — git-proxy (Codex cycle-review PR #221, issue #130): gp["ok"]=False раньше
+    # менял только текст (cp_note), но не rc → «Откат завершён» rc=0 при locked ~/.gitconfig, пока
+    # git всё ещё указывает на мёртвый 127.0.0.1:10808 (xray уже остановлен apply_uninstall).
+    # Шапка сообщения зависит от итога: «Откат завершён» только при подтверждённо снятом env И
+    # git-proxy И без leftover (issue #110 Дефект 1), иначе «Откат выполнен частично» — rc=2.
+    full_ok = env_status["ok"] and gp.get("ok", False) and not partial_configs
     headline = "Откат завершён" if full_ok else "Откат выполнен частично"
     print(f"{headline}: brew-сервисы остановлены, конфиги восстановлены/оставлены, "
           "DNS сброшен, LaunchAgent удалён"
@@ -1155,6 +1171,10 @@ def cmd_uninstall(args) -> int:
     if not env_status["ok"]:
         print(f"uninstall завершён с ошибкой: Codex env не подтверждённо снят — {env_status['note']}",
               file=sys.stderr)
+        return 2
+    if not gp.get("ok", False):
+        print(f"uninstall завершён с ошибкой: git github-proxy не подтверждённо снят — "
+              f"{gp.get('err', 'unknown')}", file=sys.stderr)
         return 2
     if partial_configs:
         return 2

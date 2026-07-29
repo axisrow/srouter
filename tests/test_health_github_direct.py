@@ -3,9 +3,9 @@
 
 Диагноз #199 (verify, эмпирически 2026-07-27): github TCP напрямую открыт (GFW не режет TCP-слой),
 gh Go-стек обходит GFW TLS-блокировку → `gh api user` через `env -u HTTP_PROXY -u HTTPS_PROXY -u
-ALL_PROXY` работает. Но git-прокси scoped на github.com → privoxy (8118) ВКЛЮЧЁН (git_proxy) →
-git pull/push зависит от VPS (мёртвый VPS = timeout). Подсказка носит образовательный характер:
-для VPS-независимости gh/git запускать с `env -u`.
+ALL_PROXY` работает. Но git-прокси scoped на github.com → xray SOCKS5 10808 ВКЛЮЧЁН (git_proxy,
+канон #130) → git pull/push зависит от VPS (мёртвый VPS = timeout). Подсказка носит образовательный
+характер: для VPS-независимости gh/git запускать с `env -u`.
 
 Чек ВСЕГДА info-only (как endpoint-override): git-proxy-настройка — это scoped-конфиг, не сбой
 стека; ни ok/warn/unknown не роняют агрегированный вердикт. Это картина для диагностики dev-workflow,
@@ -33,13 +33,13 @@ def test_ok_when_gitconfig_github_proxy_disabled(monkeypatch):
 
 
 def test_warn_when_gitconfig_github_proxy_enabled(monkeypatch):
-    """git-config github-proxy ВКЛЮЧЕН (scoped github → privoxy) → warn + подсказка env -u.
+    """git-config github-proxy ВКЛЮЧЕН (scoped github → xray SOCKS5) → warn + подсказка env -u.
 
-    Главный сигнал подсказки: git-операции scoped на privoxy → зависят от VPS. env -u снимает
+    Главный сигнал подсказки: git-операции scoped на xray SOCKS5 → зависят от VPS. env -u снимает
     зависимость (gh Go-стек обходит GFW TLS напрямую).
     """
     monkeypatch.setattr(git_proxy, "status",
-                        lambda: {"enabled": True, "proxy": "http://127.0.0.1:8118",
+                        lambda: {"enabled": True, "proxy": "socks5h://127.0.0.1:10808",
                                  "key": "http.https://github.com.proxy"})
     res = health._github_direct_check()
     assert res["status"] == "warn"
@@ -51,7 +51,7 @@ def test_warn_when_gitconfig_github_proxy_enabled(monkeypatch):
 def test_warn_detail_mentions_gh_go_stack_and_vps_independence(monkeypatch):
     """Подсказка объясняет ПОЧЕМУ env -u работает: gh Go-стек + VPS-независимость (#199 суть)."""
     monkeypatch.setattr(git_proxy, "status",
-                        lambda: {"enabled": True, "proxy": "http://127.0.0.1:8118",
+                        lambda: {"enabled": True, "proxy": "socks5h://127.0.0.1:10808",
                                  "key": "http.https://github.com.proxy"})
     res = health._github_direct_check()
     detail = res["detail"].lower()
@@ -65,7 +65,7 @@ def test_hint_distinguishes_gh_env_vs_git_config_stack(monkeypatch):
 
     gh (Go) читает env-прокси (HTTP_PROXY/http_proxy — оба регистра, Go httpproxy fallback).
     git-over-https читает git-config `http.https://github.com.proxy` — env -u его НЕ трогает
-    (verify: `git config --get-urlmatch` после env -u = 127.0.0.1:8118, прокси активен).
+    (verify: `git config --get-urlmatch` после env -u всё ещё показывает прокси активным).
     Значит подсказка НЕ может обещать одну команду `env -u` для обоих:
       - для gh: env -u должен снимать И uppercase, И lowercase (http_proxy/https_proxy/all_proxy);
       - для git-over-https: нужен `git -c http.https://github.com.proxy=` (переопределение config).
@@ -73,7 +73,7 @@ def test_hint_distinguishes_gh_env_vs_git_config_stack(monkeypatch):
     тот сбой, который PR должен переживать. Тест кодирует РАЗДЕЛЕНИЕ стеков, не одну команду.
     """
     monkeypatch.setattr(git_proxy, "status",
-                        lambda: {"enabled": True, "proxy": "http://127.0.0.1:8118",
+                        lambda: {"enabled": True, "proxy": "socks5h://127.0.0.1:10808",
                                  "key": "http.https://github.com.proxy"})
     res = health._github_direct_check()
     detail = res["detail"].lower()
@@ -91,7 +91,7 @@ def test_hint_does_not_promise_gh_repo_clone_is_proxy_free(monkeypatch):
     VPS-независимый путь только на gh-стеке.
     """
     monkeypatch.setattr(git_proxy, "status",
-                        lambda: {"enabled": True, "proxy": "http://127.0.0.1:8118",
+                        lambda: {"enabled": True, "proxy": "socks5h://127.0.0.1:10808",
                                  "key": "http.https://github.com.proxy"})
     res = health._github_direct_check()
     # Если hint упоминает clone/gh repo clone, он обязан сопровождать git -c (иначе ложь).
@@ -132,7 +132,7 @@ def test_check_all_has_github_direct_check(monkeypatch):
     """check_all содержит gh/git-direct чек (виден в doctor)."""
     _all_up_monkey(monkeypatch)
     monkeypatch.setattr(git_proxy, "status",
-                        lambda: {"enabled": True, "proxy": "http://127.0.0.1:8118",
+                        lambda: {"enabled": True, "proxy": "socks5h://127.0.0.1:10808",
                                  "key": "http.https://github.com.proxy"})
     result = health.check_all()
     names = [c["name"] for c in result["checks"]]
@@ -147,7 +147,7 @@ def test_check_all_github_direct_is_info_only_never_driver(monkeypatch):
     """
     _all_up_monkey(monkeypatch)
     monkeypatch.setattr(git_proxy, "status",
-                        lambda: {"enabled": True, "proxy": "http://127.0.0.1:8118",
+                        lambda: {"enabled": True, "proxy": "socks5h://127.0.0.1:10808",
                                  "key": "http.https://github.com.proxy"})
     result = health.check_all()
     assert result["status"] == "ok", "info-only чек не должен ронять вердикт"
