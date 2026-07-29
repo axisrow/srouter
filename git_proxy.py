@@ -26,6 +26,15 @@ cycle-review PR #221/#130, каждая новая дыра в той же ка�
    сверяет текущий foreign-список с уже забэкапленным и переписывает backup, если они разошлись) —
    не только "backup отсутствует, бэкапим первый раз" (что теряло промежуточные чужие значения при
    A→install→manual B→uninstall→install→uninstall).
+
+Остаточный риск (/review PR #223 п.1): `git config` не даёт transactional multi-value write —
+`_write_values` делает `--unset-all` затем цикл `--add`, окно между ними физически существует.
+Если процесс убит именно в этом окне (не просто "падение вызова", а SIGKILL/крэш всего процесса),
+`_write_values` best-effort rollback (см. докстринг) не успевает отработать — тогда backup (если
+уже обновлён) остаётся источником восстановления при следующем вызове. Окно на порядки уже, чем
+раньше (единственная git config-мутация, не произвольный кусок Python-кода), и every write verified
+read-after-write — но полная атомарность потребовала бы file-level tmp+replace (канон
+vscode_proxy._save/install_lib._backup), что для этого объёма риска признано избыточным.
 """
 import sys_probe
 
@@ -91,17 +100,37 @@ def _write_values(key, values, timeout=5):
 
     Реализация: --unset-all (начисто), затем --add на каждое значение — детерминированно
     работает и для single-, и для multi-value списков, без спец-случаев.
+
+    Best-effort rollback (/review PR #223 п.1): git config не даёт transactional multi-value
+    write — окно между --unset-all и --add физически существует. Если запись НОВЫХ значений
+    падает посреди цикла, key был бы оставлен ПУСТЫМ (не просто "не обновлён", а активно
+    искажён — данные потеряны из ~/.gitconfig ДАЖЕ если backup их где-то хранит). Поэтому при
+    сбое пытаемся восстановить ИСХОДНЫЕ (до этого вызова) значения обратно, прежде чем вернуть
+    ошибку — снижает окно потери данных до единственного узкого best-effort шага вместо
+    "новые значения не записались, старые тоже потеряны".
     """
+    before = _get_all(key, timeout=timeout)
+    if before["unknown"]:
+        return {"ok": False, "err": "git config --get-all pre-write snapshot failed"}
+    original_values = before["values"] if before["present"] else None
+
     clr = _unset_all(key, timeout=timeout)
     if not clr["ok"]:
         return clr
+
+    def _rollback(err):
+        if original_values is not None:
+            for val in original_values:
+                sys_probe.run([GIT, "config", "--global", "--add", key, val], timeout=timeout)
+        return {"ok": False, "err": err[:200]}
+
     for val in values:
         r = sys_probe.run([GIT, "config", "--global", "--add", key, val], timeout=timeout)
         if r.get("timeout") or r.get("rc") != 0:
-            return {"ok": False, "err": (r.get("err") or "git config --add failed")[:200]}
+            return _rollback(r.get("err") or "git config --add failed")
     after = _get_all(key, timeout=timeout)
     if after["unknown"] or after["values"] != values:
-        return {"ok": False, "err": "git config write verify mismatch after --add"}
+        return _rollback("git config write verify mismatch after --add")
     return {"ok": True}
 
 
@@ -109,9 +138,16 @@ def status():
     """{enabled, present, proxy, values, multi, key}. НЕ бросает.
 
     present — ключ реально существует в gitconfig (независимо от значения — пустая строка тоже
-    present=True). proxy — первое значение (для обратной совместимости с single-value путём и
-    UI). values — полный список (multi-value-aware). enabled — present И единственное значение ==
-    наш managed _PROXY (multi-value или чужое значение → enabled=False, fail-closed).
+    present=True). proxy — ПЕРВОЕ значение списка (single-value путь и UI). values — полный список
+    (multi-value-aware). enabled — present И единственное значение == наш managed _PROXY (multi-value
+    или чужое значение → enabled=False, fail-closed).
+
+    Contract change (/review PR #223): раньше (`git config --get` без `--all`) поле `proxy` было
+    ПОСЛЕДНИМ значением multi-valued ключа (git's `--get` semantics). Теперь, после перехода на
+    `--get-all`, это ПЕРВОЕ значение списка. При multi-value `enabled` всегда False, так что для
+    единственного текущего потребителя (`health._github_direct_check()`, читает `proxy` только в
+    info-тексте warn-ветки, недостижимой при multi-value) разницы нет — но контракт поля сменился,
+    учитывай это в новых потребителях `status()["proxy"]`.
     """
     r = _get_all(KEY)
     if r["unknown"]:

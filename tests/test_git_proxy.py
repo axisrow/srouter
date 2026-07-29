@@ -458,3 +458,53 @@ def test_disable_fails_closed_when_status_unknown(monkeypatch):
     r = git_proxy.disable()
 
     assert r["ok"] is False
+
+
+# ==================== enable() partial-failure: backup обновлён, запись KEY падает (/review) ====
+# Codex /review PR #223 п.2: если backup успешно обновлён, но последующий _write_values(KEY, ...)
+# падает — foreign-значение уже забэкаплено (safe: disable() сможет восстановить), но enable()
+# возвращает ok=False. Явный тест на этот путь отказа, не покрытый предыдущими раундами review.
+
+def test_enable_fails_but_backup_already_updated_stays_consistent(monkeypatch, real_git_home):
+    """Regression (/review PR #223): если backup чужого значения успешно обновлён, а запись
+    managed-значения в KEY падает — enable() возвращает ok=False, НЕ теряя backup. Последующий
+    disable() (после починки среды) обязан суметь восстановить чужое значение из backup — состояние
+    не должно "зависнуть" в промежутке между обновлённым backup и незаписанным KEY.
+    """
+    _raw_set(git_proxy.KEY, "https://corp.example:8443", real_git_home)
+    real_run = sys_probe.run
+
+    def _fail_key_write(cmd, **kwargs):
+        # Раним ИМЕННО запись НОВОГО managed-значения (_PROXY) в KEY на этапе --add — имитирует
+        # сбой git config (напр. диск полон, permission race) ПОСЛЕ того, как backup уже успешно
+        # обновлён. Запись старого чужого значения (rollback внутри _write_values, а также любые
+        # операции с _BACKUP_KEY) НЕ трогаем — иначе тест бы проверял не отказ записи, а полную
+        # недоступность git config, что смазало бы конкретно проверяемый сценарий.
+        if cmd[-2:] == [git_proxy.KEY, git_proxy._PROXY]:
+            return {"rc": 1, "out": "", "err": "simulated git config failure", "timeout": False}
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(git_proxy.sys_probe, "run", _fail_key_write)
+
+    r = git_proxy.enable()
+
+    assert r["ok"] is False, "запись KEY провалилась -> enable() честно репортит отказ"
+
+    monkeypatch.setattr(git_proxy.sys_probe, "run", real_run)  # "чиним" среду для проверки состояния
+    backup = git_proxy._backup_state()
+    assert backup["present"] is True, "backup не должен потеряться из-за последующего сбоя записи KEY"
+    assert backup["values"] == ["https://corp.example:8443"], "backup содержит корректное чужое значение"
+
+    # KEY остался в исходном (не-managed) состоянии — запись не прошла, но и не побилась частично.
+    current = git_proxy._get_all(git_proxy.KEY)
+    assert current["values"] == ["https://corp.example:8443"], (
+        "KEY не тронут при отказе записи -- ни managed-значения, ни искажённого состояния"
+    )
+
+    # Повторный enable() (после "починки" среды) должен суметь довести дело до конца.
+    assert git_proxy.enable()["ok"] is True
+    assert git_proxy.status()["proxy"] == EXPECTED_GIT_PROXY
+
+    # И disable() восстанавливает то же самое чужое значение, backup не был испорчен по пути.
+    assert git_proxy.disable()["ok"] is True
+    assert git_proxy.status()["proxy"] == "https://corp.example:8443"
