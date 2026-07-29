@@ -768,3 +768,50 @@ def test_transactional_marker_cleared_only_after_verified_success(monkeypatch, r
     txn_key = git_proxy._BACKUP_KEY + "-txn"
     txn_state = git_proxy._get_all(txn_key)
     assert txn_state["present"] is True, "txn-маркер должен остаться после failed verify"
+
+
+def test_partial_txn_marked_checksum_rejected_as_corrupt(monkeypatch, real_git_home):
+    """Regression (Codex review issue #224): если _begin_txn частично записал txn-маркер
+    (только [KEY, A] из ожидаемых [KEY, A, B, C, checksum]), recovery должен НЕ принимать
+    этот маркер как валидный и не должен replay'ить частичный target.
+
+    Сценарий: enable() с multi-value foreign-состоянием [A,B,C].
+    1. _begin_txn для [A,B,C] падает после записи [KEY, A] (checksum не записан).
+    2. Следующий enable() видит txn-маркер [KEY, A] без checksum.
+    3. Recovery должен ОТКЛОНИТЬ этот маркер как partial/corrupt, а не replay'ить [A]
+       как новый target (что потеряло бы B,C из backup).
+
+    Codex review показал: current implementation accepts any marker with len >= 2 as valid,
+    что приводит к потере данных при partial write.
+    """
+    _raw_set_add(git_proxy.KEY, "A", real_git_home)
+    _raw_set_add(git_proxy.KEY, "B", real_git_home)
+    _raw_set_add(git_proxy.KEY, "C", real_git_home)
+    real_run = sys_probe.run
+
+    call_count = {"begin_add": 0}
+
+    def _fail_begin_checksum_write(cmd, **kwargs):
+        # Роняем запись checksum в _begin_txn (последний --add)
+        if "--add" in cmd and git_proxy._TXN_KEY in cmd:
+            call_count["begin_add"] += 1
+            # Падаем на третьем --add (_TXN_KEY): [KEY, A, B] прошли, checksum упал
+            if call_count["begin_add"] == 3:
+                return {"rc": 1, "out": "", "err": "simulated checksum write failure", "timeout": False}
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(git_proxy.sys_probe, "run", _fail_begin_checksum_write)
+
+    r = git_proxy.enable()
+
+    # Первая попытка упала при записи checksum txn-маркера
+    assert r["ok"] is False, "enable() должен вернуть ошибку при частичном txn begin"
+
+    # Следующий enable() должен ОТКЛОНИТЬ partial txn-маркер как corrupt
+    r2 = git_proxy.enable()
+    assert r2["ok"] is False, "повторный enable() должен отклонить partial txn-маркер"
+
+    # Проверяем, что backup НЕ ПОТЕРЯН — partial recovery не произошло
+    assert git_proxy._backup_state()["values"] == ["A", "B", "C"], (
+        "backup должен остаться нетронутым при отклонении partial txn-маркера"
+    )

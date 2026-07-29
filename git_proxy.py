@@ -236,9 +236,17 @@ def _begin_txn(key, target_values):
         if r.get("timeout") or r.get("rc") != 0:
             return {"ok": False, "err": f"txn begin --add failed: {r.get('err')}"}
 
-    # Verify
+    # Issue #224 follow-up (Codex review): пишем checksum последним для детекции
+    # partial write.Checksum = количество значений, которые ДОЛЖНЫ быть в маркере.
+    checksum_val = str(len(txn_values))
+    r_checksum = sys_probe.run([GIT, "config", "--global", "--add", _TXN_KEY, checksum_val], timeout=5)
+    if r_checksum.get("timeout") or r_checksum.get("rc") != 0:
+        return {"ok": False, "err": f"txn checksum write failed: {r_checksum.get('err')}"}
+
+    # Verify (включая checksum)
     after = _get_all(_TXN_KEY)
-    if after["unknown"] or after["values"] != txn_values:
+    expected_values = txn_values + [checksum_val]
+    if after["unknown"] or after["values"] != expected_values:
         return {"ok": False, "err": "txn begin verify failed"}
 
     return {"ok": True}
@@ -280,14 +288,22 @@ def _check_and_resolve_txn():
         return {"ok": True, "resolved": False}  # Нет незавершённой транзакции — норма
 
     # Транзакция в процессе — доводим до конца
-    # Формат: [key, val1, val2, ...]
-    if len(txn["values"]) < 2:
+    # Формат: [key, val1, val2, ..., checksum] — checksum последний элемент
+    if len(txn["values"]) < 3:  # минимум: [key, one_value, checksum]
         # Некорректный формат txn-маркера — убираем и ругаемся (fail-closed)
         _unset_all(_TXN_KEY)
-        return {"ok": False, "err": "corrupt txn marker (less than 2 values)", "resolved": False}
+        return {"ok": False, "err": "corrupt txn marker (less than 3 values with checksum)", "resolved": False}
+
+    # Проверяем checksum: последний элемент = str(len(expected_values))
+    expected_count = int(txn["values"][-1])
+    actual_values = txn["values"][:-1]  # без checksum
+    if len(actual_values) != expected_count:
+        # Checksum не совпадает — маркер частично записан, убираем (fail-closed)
+        _unset_all(_TXN_KEY)
+        return {"ok": False, "err": f"txn marker partial write: expected {expected_count} values, got {len(actual_values)}", "resolved": True}
 
     target_key = txn["values"][0]
-    target_values = txn["values"][1:]
+    target_values = txn["values"][1:-1]  # всё кроме ключа и checksum
 
     # Retry: пишем target_values в target_key с verify БЕЗ создания нового txn-маркера
     w = _write_values(target_key, target_values, begin_txn=False)
