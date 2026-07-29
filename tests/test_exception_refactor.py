@@ -9,7 +9,6 @@ Regress-гвард тесты для рефакторинга except Exception (
 """
 
 import pytest
-import subprocess
 import tempfile
 from pathlib import Path
 from unittest.mock import Mock, patch
