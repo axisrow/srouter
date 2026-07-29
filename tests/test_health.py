@@ -1971,6 +1971,50 @@ def test_codenv_managed_desktop_proxy_info_when_actually_loaded(monkeypatch, tmp
     assert res["status"] == "info", f"активный codenv (loaded) → info (канон #135); got {res}"
 
 
+def test_codenv_managed_true_does_not_mask_foreign_socks_value(monkeypatch, tmp_path):
+    """Codex (cycle-review PR #219, confidence 0.93): codenv loaded И managed — НЕ означает, что
+    ЛЮБОЕ SOCKS5-значение в launchctl принадлежит codenv. `launchctl print gui/<uid>/com.srouter.codenv`
+    rc=0 доказывает только «job с этим label зарегистрирован», не то, что ИМЕННО он записал
+    конкретное значение, найденное в _read_proxy_sources() непосредственно перед вызовом.
+
+    Сценарий: codenv загружен (managed=True), но КТО-ТО ДРУГОЙ параллельно прописал чужой SOCKS5
+    в тот же launchctl gui-домен ключ (10.0.0.1:1080, не codenv-эндпоинт 127.0.0.1:10808) — тот же
+    класс инцидента #127, который расширяет заявленный fix issue #192. До этого теста
+    _desktop_proxy_check доверял ГОЛОМУ факту codenv-managed без сверки конкретного SOCKS5-значения
+    с известным codenv endpoint (dashboard_common.SOCKS_PROXY_URL) → down.
+    """
+    _write_codenv_plist(tmp_path, monkeypatch, with_marker=True)
+    monkeypatch.setattr(health.sys_probe, "run",
+                        lambda cmd, timeout=3, **kw: {"rc": 0, "out": "state = running",
+                                                       "err": "", "timeout": False})
+    monkeypatch.setattr(health, "_read_proxy_sources",
+                        lambda: {"desktop_keys": {"HTTPS_PROXY": "socks5h://10.0.0.1:1080"}})
+    res = health._desktop_proxy_check()
+    assert res["status"] == "down", (
+        f"codenv managed=True, НО SOCKS5-значение чужое (не codenv endpoint) → down "
+        f"(инцидент #127 не должен маскироваться просто фактом codenv-loaded); got {res}")
+
+
+def test_codenv_managed_true_mixed_keys_one_foreign_still_down(monkeypatch, tmp_path):
+    """Mutation-гард: ОДИН ключ = настоящий codenv endpoint, ДРУГОЙ — чужой SOCKS5 → down.
+
+    Различает `all(...)` (корректно: down, т.к. не ВСЕ ключи codenv) от `any(...)` (баг: любое
+    совпадение хотя бы одного ключа с codenv-endpoint дало бы info, замаскировав чужой ключ рядом).
+    """
+    _write_codenv_plist(tmp_path, monkeypatch, with_marker=True)
+    monkeypatch.setattr(health.sys_probe, "run",
+                        lambda cmd, timeout=3, **kw: {"rc": 0, "out": "state = running",
+                                                       "err": "", "timeout": False})
+    monkeypatch.setattr(health, "_read_proxy_sources",
+                        lambda: {"desktop_keys": {
+                            "HTTPS_PROXY": "socks5h://127.0.0.1:10808",  # настоящий codenv
+                            "ALL_PROXY": "socks5h://10.0.0.1:1080",      # чужой
+                        }})
+    res = health._desktop_proxy_check()
+    assert res["status"] == "down", (
+        f"один ключ codenv, другой чужой → down (all(), не any()); got {res}")
+
+
 def test_desktop_proxy_silent_when_settings_matches_launchctl(monkeypatch):
     """settings.json HTTPS_PROXY == launchctl HTTPS_PROXY → ok, без WARN о расхождении."""
     monkeypatch.setattr(health, "_read_proxy_sources",

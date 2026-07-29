@@ -1635,7 +1635,13 @@ def _desktop_proxy_check():
     if socks_keys:
         bad = ", ".join(f"{k}={v}" for k, v in socks_keys.items())
         # issue #189: srouter-managed codenv SOCKS5 — намеренный (лечит ChatGPT.app). info, не driver-шум.
-        if _codenv_managed():
+        # cycle-review PR #219 (Codex, confidence 0.93): _codenv_managed()=True доказывает только,
+        # что job com.srouter.codenv ЗАГРУЖЕН — НЕ то, что именно он записал ЭТИ SOCKS5-значения.
+        # Кто-то другой может параллельно прописать чужой SOCKS5 в тот же launchctl gui-домен ключ,
+        # пока codenv тоже загружен — тот же класс инцидента #127. Сверяем КАЖДОЕ найденное SOCKS5-
+        # значение с каноническим codenv endpoint (_CODENV_SOCKS_URL) — только полное совпадение
+        # всех ключей даёт info; любое расхождение — down (не глушим потенциально чужой SOCKS5).
+        if _codenv_managed() and all(v == _CODENV_SOCKS_URL for v in socks_keys.values()):
             return {"status": "info",
                     "detail": (f"SOCKS5 в launchctl ({bad}) = srouter codenv (#189 для ChatGPT.app Rust "
                                f"app-server). Claude Desktop App ломается на SOCKS5 (#127), но CC CLI "
@@ -1660,6 +1666,12 @@ def _desktop_proxy_check():
 # смене маркера в srouter.py — обновить тут (как _CODEX_WRAPPER_MARKER health.py:485 ↔ srouter.py).
 _CODENV_LABEL = "com.srouter.codenv"
 _CODENV_MARKER = "srouter-managed-codex-env-v1"
+
+# Канонический codenv SOCKS5-endpoint — тот же литерал, что dashboard_common.SOCKS_PROXY_URL /
+# srouter.py._CODEX_PROXY_URL. cycle-review PR #219 (Codex, confidence 0.93): _codenv_managed()=True
+# доказывает только «job зарегистрирован», НЕ что именно он записал ЭТО SOCKS5-значение — сверка
+# со значением обязательна, иначе чужой SOCKS5 в том же launchctl-ключе маскируется под codenv (#127).
+_CODENV_SOCKS_URL = f"socks5h://127.0.0.1:{XRAY_PORT}"
 
 
 def _read_gui_proxy_env(runner=None, *, keys_filter=LAUNCHCTL_PROXY_KEYS):
