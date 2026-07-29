@@ -27,14 +27,18 @@ cycle-review PR #221/#130, каждая новая дыра в той же ка�
    не только "backup отсутствует, бэкапим первый раз" (что теряло промежуточные чужие значения при
    A→install→manual B→uninstall→install→uninstall).
 
-Остаточный риск (/review PR #223 п.1): `git config` не даёт transactional multi-value write —
-`_write_values` делает `--unset-all` затем цикл `--add`, окно между ними физически существует.
-Если процесс убит именно в этом окне (не просто "падение вызова", а SIGKILL/крэш всего процесса),
-`_write_values` best-effort rollback (см. докстринг) не успевает отработать — тогда backup (если
-уже обновлён) остаётся источником восстановления при следующем вызове. Окно на порядки уже, чем
-раньше (единственная git config-мутация, не произвольный кусок Python-кода), и every write verified
-read-after-write — но полная атомарность потребовала бы file-level tmp+replace (канон
-vscode_proxy._save/install_lib._backup), что для этого объёма риска признано избыточным.
+Остаточный риск (/review PR #223 п.1, точечный cycle-review issue #222): `git config` не даёт
+transactional multi-value write — `_write_values` делает `--unset-all` затем цикл `--add`, окно
+между ними физически существует. Если процесс убит именно в этом окне (не "падение вызова", а
+SIGKILL/крэш всего процесса), `_write_values` best-effort rollback (verified read-after-write,
+см. докстринг) не успевает отработать — тогда backup (если уже обновлён) остаётся источником
+восстановления при следующем вызове disable() (self-healing даже при KEY absent, см. докстринг
+disable()). То же TOCTOU-окно есть между snapshot чтением original_values (ДО --unset-all) и
+самой мутацией — если что-то ВНЕШНЕЕ (другой процесс/юзер) меняет KEY именно в этот момент,
+rollback восстановит устаревший snapshot. Оба окна на порядки уже, чем раньше (единственная git
+config-мутация, не произвольный кусок Python-кода), и каждая запись верифицируется read-after-write
+— но полная атомарность потребовала бы file-level tmp+replace (канон vscode_proxy._save/
+install_lib._backup), что для этого объёма риска признано избыточным.
 """
 import sys_probe
 
@@ -101,28 +105,34 @@ def _write_values(key, values, timeout=5):
     Реализация: --unset-all (начисто), затем --add на каждое значение — детерминированно
     работает и для single-, и для multi-value списков, без спец-случаев.
 
-    Best-effort rollback (/review PR #223 п.1): git config не даёт transactional multi-value
-    write — окно между --unset-all и --add физически существует. Если запись НОВЫХ значений
-    падает посреди цикла, key был бы оставлен ПУСТЫМ (не просто "не обновлён", а активно
-    искажён — данные потеряны из ~/.gitconfig ДАЖЕ если backup их где-то хранит). Поэтому при
-    сбое пытаемся восстановить ИСХОДНЫЕ (до этого вызова) значения обратно, прежде чем вернуть
-    ошибку — снижает окно потери данных до единственного узкого best-effort шага вместо
-    "новые значения не записались, старые тоже потеряны".
+    Best-effort rollback (/review PR #223 п.1, ужесточён точечным cycle-review issue #222): git
+    config не даёт transactional multi-value write — окно между --unset-all и --add физически
+    существует. Если запись НОВЫХ значений падает посреди цикла, key был бы оставлен ПУСТЫМ.
+    При сбое пытаемся восстановить ИСХОДНЫЕ (до этого вызова) значения обратно. Но сам rollback —
+    ТОЖЕ серия git config-мутаций без гарантии успеха: точечный adversarial review нашёл, что
+    rollback раньше не верифицировал свой результат и возвращал тот же generic {"ok": False}
+    независимо от того, откатились данные полностью, частично или вообще не откатились — caller
+    не мог отличить "операция не удалась, но данные целы" от "данные реально потеряны". Теперь
+    после rollback делаем read-after-write verify (`_get_all` == original_values) и добавляем
+    явный флаг `data_loss=True`, когда восстановленное состояние НЕ совпадает с исходным —
+    ЛЮБОЕ расхождение (полный отказ rollback, частичный отказ на одном из нескольких значений)
+    репортится одинаково честно, а не молча.
     """
     before = _get_all(key, timeout=timeout)
     if before["unknown"]:
         return {"ok": False, "err": "git config --get-all pre-write snapshot failed"}
-    original_values = before["values"] if before["present"] else None
+    original_values = before["values"] if before["present"] else []
 
     clr = _unset_all(key, timeout=timeout)
     if not clr["ok"]:
         return clr
 
     def _rollback(err):
-        if original_values is not None:
-            for val in original_values:
-                sys_probe.run([GIT, "config", "--global", "--add", key, val], timeout=timeout)
-        return {"ok": False, "err": err[:200]}
+        for val in original_values:
+            sys_probe.run([GIT, "config", "--global", "--add", key, val], timeout=timeout)
+        verify = _get_all(key, timeout=timeout)
+        restored_ok = not verify["unknown"] and verify["values"] == original_values
+        return {"ok": False, "err": err[:200], "data_loss": not restored_ok}
 
     for val in values:
         r = sys_probe.run([GIT, "config", "--global", "--add", key, val], timeout=timeout)
@@ -209,12 +219,34 @@ def disable():
     значение, не трогаем" вернула бы ok=True, оставляя backup мусором навсегда (единственная
     ветка, которая его чистит, стала бы недостижима). Поэтому: если текущее чужое значение РОВНО
     совпадает с существующим backup — restore уже случился раньше, доубираем backup.
+
+    Self-healing при KEY absent + backup present (точечный cycle-review issue #222, находка 4):
+    если предыдущий enable()/_write_values частично отказал (новая запись упала, rollback ТОЖЕ
+    не сработал — см. `data_loss` в _write_values), KEY может оказаться ПОЛНОСТЬЮ absent, а
+    backup при этом остаться present с исходным чужим значением. Наивная идемпотентная ветка
+    "ключа нет -> ok=True, ничего не делаем" в этом случае оставляла бы backup недостижимым
+    мусором И теряла бы исходное чужое значение НАВСЕГДА — backup существует именно для того,
+    чтобы данные восстановились, а не чтобы висеть нетронутым, когда KEY уже пуст. Поэтому:
+    KEY absent — идемпотентный no-op ТОЛЬКО если backup ТОЖЕ absent (нормальное «ничего никогда
+    не было установлено»); если backup present — восстанавливаем его в KEY, симметрично основной
+    restore-ветке ниже.
     """
     current = _get_all(KEY)
     if current["unknown"]:
         return {"ok": False, "err": "git config --get-all failed (non-absent rc)"}
     if not current["present"]:
-        return {"ok": True}  # ключа уже нет — идемпотентно
+        backup = _backup_state()
+        if backup["unknown"]:
+            return {"ok": False, "err": "git config --get-all backup failed"}
+        if not backup["present"]:
+            return {"ok": True}  # ни ключа, ни backup — идемпотентно, чистое "ничего не было"
+        w = _write_values(KEY, backup["values"])
+        if not w["ok"]:
+            return {"ok": False, "err": w["err"]}
+        c = _unset_all(_BACKUP_KEY)
+        if not c["ok"]:
+            return {"ok": False, "err": c["err"]}
+        return {"ok": True}
 
     if current["values"] != [_PROXY]:
         backup = _backup_state()

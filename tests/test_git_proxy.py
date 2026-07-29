@@ -508,3 +508,107 @@ def test_enable_fails_but_backup_already_updated_stays_consistent(monkeypatch, r
     # И disable() восстанавливает то же самое чужое значение, backup не был испорчен по пути.
     assert git_proxy.disable()["ok"] is True
     assert git_proxy.status()["proxy"] == "https://corp.example:8443"
+
+
+# ==================== Точечный review rollback-логики: 4 находки (codex-review-222-rollback) ====
+# Rollback в _write_values (добавлен для /review п.1) сам оказался подвержен той же категории
+# багов, что и всё остальное в этом файле: "мутация запущена, но не верифицирован реальный
+# результат". Все 4 сценария воспроизведены точечным Codex-ревью через мок sys_probe.run.
+
+def test_rollback_failure_reports_distinct_state_not_generic_ok_false(monkeypatch, real_git_home):
+    """Regression (находка 1): если И запись новых значений, И rollback старых — оба падают,
+    _write_values раньше возвращал тот же generic {"ok": False, "err": ...}, что и "rollback
+    сработал, просто вызывающая операция не удалась" — вызывающий код не мог различить "данные
+    целы (после отката)" от "данные потеряны (rollback тоже не сработал)". KEY при этом реально
+    остаётся ПУСТЫМ (--unset-all уже прошёл, ни новая запись, ни rollback не записались).
+    """
+    _raw_set(git_proxy.KEY, "https://corp.example:8443", real_git_home)
+    real_run = sys_probe.run
+
+    def _fail_all_adds(cmd, **kwargs):
+        # Роняем ЛЮБОЙ --add по KEY (и новую запись, и rollback-восстановление) — полный отказ.
+        if "--add" in cmd and git_proxy.KEY in cmd and git_proxy._BACKUP_KEY not in cmd:
+            return {"rc": 1, "out": "", "err": "simulated total failure", "timeout": False}
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(git_proxy.sys_probe, "run", _fail_all_adds)
+
+    r = git_proxy._write_values(git_proxy.KEY, [git_proxy._PROXY])
+
+    assert r["ok"] is False
+    assert r.get("data_loss") is True, (
+        "rollback тоже не сработал -> caller обязан узнать, что данные РЕАЛЬНО потеряны, "
+        "не просто 'операция не удалась' (иначе неотличимо от случая, когда rollback помог)"
+    )
+
+    monkeypatch.setattr(git_proxy.sys_probe, "run", real_run)
+    current = git_proxy._get_all(git_proxy.KEY)
+    assert current["present"] is False, "sanity: KEY реально пуст в этом сценарии (--unset-all прошёл)"
+
+
+def test_rollback_partial_failure_does_not_silently_lose_one_of_several_values(monkeypatch, real_git_home):
+    """Regression (находка 2): если исходных значений НЕСКОЛЬКО (multi-value), и rollback падает
+    ровно на ОДНОМ из них (не на первом и не на всех) — раньше это проходило молча: цикл `for val
+    in original_values: sys_probe.run(...)` не проверяет успех каждого шага, просто идёт дальше.
+    Итог был: KEY = [A, C] вместо исходных [A, B, C] — B физически потерян БЕЗ какого-либо сигнала
+    об этом (err не упоминает частичность, просто "write verify mismatch").
+    """
+    _raw_set_add(git_proxy.KEY, "A", real_git_home)
+    _raw_set_add(git_proxy.KEY, "B", real_git_home)
+    _raw_set_add(git_proxy.KEY, "C", real_git_home)
+    real_run = sys_probe.run
+
+    def _fail_new_write_and_rollback_of_b(cmd, **kwargs):
+        if cmd[-2:] == [git_proxy.KEY, git_proxy._PROXY]:
+            return {"rc": 1, "out": "", "err": "simulated new-write failure", "timeout": False}
+        if cmd[-2:] == [git_proxy.KEY, "B"]:
+            return {"rc": 1, "out": "", "err": "simulated rollback failure on B", "timeout": False}
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(git_proxy.sys_probe, "run", _fail_new_write_and_rollback_of_b)
+
+    r = git_proxy._write_values(git_proxy.KEY, [git_proxy._PROXY])
+
+    assert r["ok"] is False
+    assert r.get("data_loss") is True, (
+        "rollback восстановил только A и C, B потерян -> это ТОЖЕ data_loss, не 'чистый откат', "
+        "даже если частично KEY похож на исходное состояние"
+    )
+
+    monkeypatch.setattr(git_proxy.sys_probe, "run", real_run)
+    current = git_proxy._get_all(git_proxy.KEY)
+    # Не проверяем ТОЧНОЕ содержимое (могло быть [A, C] или другой частичный набор) — важно, что
+    # data_loss=True корректно сигнализирует о расхождении с original_values для caller'а.
+    assert current["values"] != ["A", "B", "C"], "sanity: реально не полный исходный список"
+
+
+# ==== disable() self-healing недостижима, когда KEY absent (не просто "чужое значение") ====
+
+def test_disable_self_heals_when_key_absent_but_backup_matches_history(real_git_home):
+    """Regression (находка 4, самая серьёзная): если предыдущий enable() обновил backup (на B),
+    но затем запись нового managed-значения в KEY УПАЛА и rollback ТОЖЕ не сработал — KEY становится
+    absent (present=False), а backup остаётся [B]. Старый disable() на строке "if not
+    current['present']: return {'ok': True}" срабатывает РАНЬШЕ self-healing проверки (которая
+    сравнивает backup со значением КОГДА КЛЮЧ ПРИСУТСТВУЕТ) — backup остаётся orphan-мусором
+    НАВСЕГДА, а B потерян безвозвратно (никогда не восстановлен в KEY).
+
+    disable() должен: если KEY absent, но backup present — восстановить backup в KEY (данные не
+    должны "телепортироваться" в никуда только потому что KEY оказался пуст в момент запроса).
+    """
+    _raw_set(git_proxy.KEY, "https://corp-B.example:9443", real_git_home)
+    assert git_proxy.enable()["ok"] is True  # backup = ["https://corp-B.example:9443"]
+
+    # Симулируем "и новая запись, и rollback упали" -> KEY становится пустым, backup остаётся.
+    assert git_proxy._unset_all(git_proxy.KEY)["ok"] is True
+    assert git_proxy._get_all(git_proxy.KEY)["present"] is False
+    assert git_proxy._backup_state()["values"] == ["https://corp-B.example:9443"]
+
+    r = git_proxy.disable()
+
+    assert r["ok"] is True
+    restored = git_proxy.status()
+    assert restored["proxy"] == "https://corp-B.example:9443", (
+        "backup обязан восстановиться в KEY, даже если KEY был ПОЛНОСТЬЮ absent (не просто чужой) "
+        "-- иначе self-healing недостижима именно в этом (реальном, воспроизведённом) сценарии"
+    )
+    assert git_proxy._backup_state()["present"] is False, "backup убран после успешного восстановления"
