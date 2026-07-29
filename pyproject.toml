@@ -46,6 +46,8 @@ py-modules = [
     "hot_routes",
     "node_selector",
     "sys_probe",
+    "probe_manager",
+    "state_manager",
     "traffic_shape",
     "gen_xray_config",
     "isolate_firewall",

@@ -18,6 +18,7 @@ import pytest  # noqa: ICN003 — pytest.fail/raises в тестах ниже (#
 
 import health
 import privoxy_system
+import sys_probe
 
 
 # Watchdog tests must not inspect the real user's launchd domain or write real lifecycle logs.
@@ -983,7 +984,7 @@ def test_direct_domain_probe_http_response_is_reachable(monkeypatch):
 
 def test_direct_domain_probe_timeout_is_cut(monkeypatch):
     """ДЫРА #206: прямой curl timeout → НЕ reachable (режется / нет ответа)."""
-    monkeypatch.setattr(health.sys_probe, "run",
+    monkeypatch.setattr(sys_probe._default_manager, "run",
                         lambda cmd, timeout, env=None: {"rc": None, "out": "", "err": "", "timeout": True})
     r = health._direct_domain_probe("github.com")
     assert r["reachable"] is False, "timeout → домен не отвечает напрямую"
@@ -992,7 +993,7 @@ def test_direct_domain_probe_timeout_is_cut(monkeypatch):
 
 def test_direct_domain_probe_connection_failed_is_cut(monkeypatch):
     """ДЫРА #206: прямой curl 000 (connection-failed/reset) → НЕ reachable (режется)."""
-    monkeypatch.setattr(health.sys_probe, "run",
+    monkeypatch.setattr(sys_probe._default_manager, "run",
                         lambda cmd, timeout, env=None: {"rc": 0, "out": "000", "err": "", "timeout": False})
     r = health._direct_domain_probe("github.com")
     assert r["reachable"] is False, "000 = соединение не установлено → режется/сброшено"
@@ -1009,7 +1010,7 @@ def test_direct_domain_probe_5xx_reachable_but_upstream_error(monkeypatch):
     cycle-review score 85: docstring говорит «reachable = HTTP < 500», но код возвращал kind="ok" для
     5xx — противоречие. reachable=True сохраняется (домен достижим для GFW-вердикта), kind разделяет.
     """
-    monkeypatch.setattr(health.sys_probe, "run",
+    monkeypatch.setattr(sys_probe._default_manager, "run",
                         lambda cmd, timeout, env=None: {"rc": 0, "out": "503", "err": "", "timeout": False})
     r = health._direct_domain_probe("github.com")
     assert r["reachable"] is True, "5xx = сервер ответил → домен достижим (GFW НЕ режет)"

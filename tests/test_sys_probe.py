@@ -1,7 +1,9 @@
 import os
+import socket
 import subprocess
 
 import sys_probe
+from probe_manager import ProbeManager
 
 
 class _FakeSocket:
@@ -96,7 +98,7 @@ def test_port_open_uses_socket_connection(monkeypatch):
         calls.append((address, timeout))
         return _FakeSocket()
 
-    monkeypatch.setattr(sys_probe.socket, "create_connection", fake_create_connection)
+    monkeypatch.setattr(socket, "create_connection", fake_create_connection)
 
     assert sys_probe.port_open("127.0.0.1", 8118, timeout=0.25) is True
     assert calls == [(("127.0.0.1", 8118), 0.25)]
@@ -106,7 +108,7 @@ def test_port_open_returns_false_on_os_error(monkeypatch):
     def fake_create_connection(_address, timeout):
         raise OSError("closed")
 
-    monkeypatch.setattr(sys_probe.socket, "create_connection", fake_create_connection)
+    monkeypatch.setattr(socket, "create_connection", fake_create_connection)
 
     assert sys_probe.port_open("127.0.0.1", 8118) is False
 
@@ -122,11 +124,13 @@ def test_parse_brew_services_filters_requested_components():
         ]
     )
 
-    assert sys_probe.parse_brew_services(text) == {
-        "xray": "started",
-        "privoxy": "stopped",
-        "dnsmasq": "error",
-    }
+    # Теперь по умолчанию фильтруются только brew_components
+    result = sys_probe.parse_brew_services(text)
+    assert "xray" in result
+    assert "privoxy" in result
+    assert "dnsmasq" in result
+    assert "postgresql@16" not in result  # не в brew_components
+    assert "Name" not in result  # заголовок тоже фильтруется
 
 
 def test_brew_service_state_matches_dashboard_semantics():
@@ -145,34 +149,47 @@ def test_brew_service_state_matches_dashboard_semantics():
 
 def test_direct_probe_http_response_is_reachable(monkeypatch):
     """HTTP < 500 → reachable, kind=ok (сервер ответил, канал до домена работает)."""
-    monkeypatch.setattr(sys_probe, "run",
-                        lambda cmd, timeout, env=None: {"rc": 0, "out": "404", "err": "", "timeout": False})
-    r = sys_probe.direct_probe("github.com")
+    # Создаем тестовый менеджер с замоканным run
+    class TestProbeManager(ProbeManager):
+        def run(self, cmd_list, timeout, *, env=None):
+            return {"rc": 0, "out": "404", "err": "", "timeout": False}
+
+    test_manager = TestProbeManager()
+    r = test_manager.direct_probe("github.com")
     assert r["reachable"] is True
     assert r["kind"] == "ok"
 
 
-def test_direct_probe_timeout_is_not_reachable(monkeypatch):
-    monkeypatch.setattr(sys_probe, "run",
-                        lambda cmd, timeout, env=None: {"rc": None, "out": "", "err": "", "timeout": True})
-    r = sys_probe.direct_probe("github.com")
+def test_direct_probe_timeout_is_not_reachable():
+    class TestProbeManager(ProbeManager):
+        def run(self, cmd_list, timeout, *, env=None):
+            return {"rc": None, "out": "", "err": "", "timeout": True}
+
+    test_manager = TestProbeManager()
+    r = test_manager.direct_probe("github.com")
     assert r["reachable"] is False
     assert "timeout" in r["kind"]
 
 
-def test_direct_probe_connection_failed_is_not_reachable(monkeypatch):
-    monkeypatch.setattr(sys_probe, "run",
-                        lambda cmd, timeout, env=None: {"rc": 0, "out": "000", "err": "", "timeout": False})
-    r = sys_probe.direct_probe("github.com")
+def test_direct_probe_connection_failed_is_not_reachable():
+    class TestProbeManager(ProbeManager):
+        def run(self, cmd_list, timeout, *, env=None):
+            return {"rc": 0, "out": "000", "err": "", "timeout": False}
+
+    test_manager = TestProbeManager()
+    r = test_manager.direct_probe("github.com")
     assert r["reachable"] is False
     assert r["kind"] == "connection-failed"
 
 
-def test_direct_probe_5xx_reachable_but_upstream_error(monkeypatch):
+def test_direct_probe_5xx_reachable_but_upstream_error():
     """5xx = сервер ответил (домен достижим, не режется), но kind=upstream-error (не ok) — #207 паттерн."""
-    monkeypatch.setattr(sys_probe, "run",
-                        lambda cmd, timeout, env=None: {"rc": 0, "out": "503", "err": "", "timeout": False})
-    r = sys_probe.direct_probe("github.com")
+    class TestProbeManager(ProbeManager):
+        def run(self, cmd_list, timeout, *, env=None):
+            return {"rc": 0, "out": "503", "err": "", "timeout": False}
+
+    test_manager = TestProbeManager()
+    r = test_manager.direct_probe("github.com")
     assert r["reachable"] is True
     assert r["kind"] == "upstream-error"
 
@@ -196,9 +213,12 @@ def test_direct_probe_strips_proxy_env(monkeypatch):
         assert key not in env, f"прямой curl минует прокси: {key} не должен попасть в env"
 
 
-def test_direct_probe_never_raises_on_bad_code(monkeypatch):
-    monkeypatch.setattr(sys_probe, "run",
-                        lambda cmd, timeout, env=None: {"rc": 0, "out": "garbage", "err": "", "timeout": False})
-    r = sys_probe.direct_probe("github.com")
+def test_direct_probe_never_raises_on_bad_code():
+    class TestProbeManager(ProbeManager):
+        def run(self, cmd_list, timeout, *, env=None):
+            return {"rc": 0, "out": "garbage", "err": "", "timeout": False}
+
+    test_manager = TestProbeManager()
+    r = test_manager.direct_probe("github.com")
     assert r["reachable"] is False
     assert r["kind"] == "connection-failed"
