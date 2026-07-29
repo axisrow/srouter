@@ -1,0 +1,854 @@
+#!/usr/bin/env python3
+"""Config-логика install: InstallEnv, discovery, build_plan/apply_install (issue #229, экстракция
+из install_lib.py).
+
+InstallEnv (env-переменные → runtime paths), маркер-детекция конфигов, discovery компонентов
+(xray/privoxy/dnsmasq), plan/apply install-потока. LaunchAgent-специфика (рендер/загрузка plist) —
+в install_plist.py, uninstall-логика — в install_cleanup.py. Публичные функции возвращают dict/result
+и не бросают наружу (тот же контракт, что был у install_lib.py).
+"""
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+
+import gen_xray_config
+import local_state
+import privoxy_system
+from sys_probe import BREW_COMPONENTS
+from sys_probe import parse_brew_services as _parse_brew_services
+from sys_probe import port_open, run
+
+from install_plist import (
+    LAUNCHAGENT_LABEL,
+    LAUNCHAGENT_FILE,
+    _has_launchagent_marker,
+    _install_launchagent,
+    _launchagent_template_path,
+    _write_text_atomic,
+)
+
+
+MARKER = "srouter-managed"
+TEXT_MARKER = "srouter-managed-config-v1"
+ROOT = Path(__file__).resolve().parent
+
+# Whitelist директив privoxy 4.2.0, гарантированно распознаваемых базовой сборкой. Строгий
+# первоисточник — privoxy 4.2.0 user-manual (https://www.privoxy.org/user-manual/config.html),
+# разделы 7.1-7.6 (Local Set-up / Locations / Debugging / Access Control / Forwarding /
+# Miscellaneous). Намеренно НЕ включаем раздел 7.7 «HTTPS Inspection» (elliptic-curve-keys,
+# ca-directory, ca-cert-file, ca-key-file, ca-password, certificate-directory, cipher-list,
+# trusted-cas-file) — эти директивы валидны ТОЛЬКО при FEATURE_HTTPS_INSPECTION; без неё privoxy
+# 4.2.0 логирует "Ignoring unrecognized directive" и launchd KeepAlive может молотить рестарты
+# на error-выхлопе (issue #115 симптом 1). Инвариант-тест ловит будущий regression: если в
+# templates/privoxy.config попадёт feature-gated директива. Канон: семантика probe — по
+# первоисточнику, не аналогия.
+PRIVOXY_KNOWN_DIRECTIVES = frozenset({
+    # 7.1 Local Set-up Documentation
+    "user-manual", "trust-info-url", "admin-address", "proxy-info-url",
+    # 7.2 Configuration and Log File Locations
+    "confdir", "templdir", "temporary-directory", "logdir", "actionsfile",
+    "filterfile", "logfile", "trustfile",
+    # 7.3 Debugging
+    "debug", "single-threaded", "hostname",
+    # 7.4 Access Control and Security
+    "listen-address", "toggle", "enable-remote-toggle", "enable-remote-http-toggle",
+    "enable-edit-actions", "enforce-blocks", "permit-access", "deny-access",
+    "buffer-limit", "enable-proxy-authentication-forwarding", "trusted-cgi-referer",
+    "cors-allowed-origin",
+    # 7.5 Forwarding
+    "forward", "forward-socks4", "forward-socks4a", "forward-socks5", "forward-socks5t",
+    "forwarded-connect-retries",
+    # 7.6 Miscellaneous
+    "accept-intercepted-requests", "allow-cgi-request-crunching", "split-large-forms",
+    "keep-alive-timeout", "tolerate-pipelining", "default-server-timeout", "connection-sharing",
+    "socket-timeout", "max-client-connections", "listen-backlog", "enable-accept-filter",
+    "handle-as-empty-doc-returns-ok", "enable-compression", "compression-level",
+    "client-header-order", "client-specific-tag", "client-tag-lifetime", "trust-x-forwarded-for",
+    "receive-buffer-size",
+})
+
+BREW = "/opt/homebrew/bin/brew"
+CURL = "/usr/bin/curl"
+ROUTE = "/sbin/route"
+LSOF = "/usr/sbin/lsof"
+NETWORKSETUP = "/usr/sbin/networksetup"
+SUDO = "/usr/bin/sudo"
+
+COMPONENTS = BREW_COMPONENTS
+CHOICES = ("adopt", "overwrite", "skip")
+
+# Прокси-порты (8118/10808) — единый источник dashboard_common (issue #155/#165), НЕ локальные
+# литералы: при смене канонического порта installer должен целить в тот же порт, иначе privoxy/xray
+# стартуют на одном порту, а install-проверки и рестарты смотрят на другой → полный отказ прокси.
+# install_config обязан работать в среде без srouter_config (install-путь): dashboard_common при
+# отсутствии конфига поднимает SystemExit (BaseException, не Exception) — ловим именно SystemExit,
+# чтобы не маскировать РЕАЛЬНЫЕ ошибки источника (SyntaxError/ImportError). Fallback = то же
+# каноническое значение; строки помечены canonical-fallback-port (гвард test_proxy_constants.py
+# разрешает их как осознанный fallback, не свежий дубликат). dnsmasq UDP 53 — НЕ прокси-порт,
+# остаётся локальным литералом (вне scope централизации прокси).
+try:
+    from dashboard_common import PRIVOXY_PORT as _PRIVOXY_PORT  # noqa: F401  (canonical-fallback-port)
+    from dashboard_common import XRAY_SOCKS_PORT as _XRAY_SOCKS_PORT  # noqa: F401  (canonical-fallback-port)
+except SystemExit:  # dashboard_common без srouter_config поднимает SystemExit (install-путь)
+    _PRIVOXY_PORT = 8118  # canonical-fallback-port
+    _XRAY_SOCKS_PORT = 10808  # canonical-fallback-port
+PORTS = {
+    "xray": ("tcp", _XRAY_SOCKS_PORT),
+    "privoxy": ("tcp", _PRIVOXY_PORT),
+    "dnsmasq": ("udp", 53),
+}
+
+# Надёжный рестарт brew-сервиса: `brew services restart` атомарно убивает старый и поднимает новый
+# процесс, но старый может ещё держать порт (TIME_WAIT / медленный shutdown) → новый падает
+# `Fatal: can't bind to 127.0.0.1:8118` → launchd молотит рестарты (issue #115 симптом 2). Лечится
+# разнесением на stop → poll освобождения порта → start → poll поднятия порта. Симметрично канонному
+# эталону _launchd_reload (bootout→poll→bootstrap-retry). Константы уровня модуля → тесты зануляют.
+_PORT_SETTLE_POLL_INTERVAL = 0.5  # шаг poll «порт освободился/поднялся?» (сек)
+_PORT_SETTLE_MAX_WAIT = 3.0       # потолок ожидания освобождения порта после stop (сек)
+_PORT_UP_MAX_WAIT = 5.0           # потолок ожидания поднятия порта после start (сек)
+
+
+def _now():
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+@dataclass
+class InstallEnv:
+    root: Path = ROOT
+    prefix: Path = Path("/opt/homebrew")
+    state_path: Path = ROOT / "srouter.local.json"
+    launchagent_dir: Path = Path.home() / "Library" / "LaunchAgents"
+    python_bin: str = "/usr/bin/python3"
+    log_out: Path = Path.home() / "Library/Logs/srouter-dashboard.out.log"
+    log_err: Path = Path.home() / "Library/Logs/srouter-dashboard.err.log"
+    now: str = ""
+
+    @classmethod
+    def from_env(cls, *, state_path=None, prefix=None):
+        log_dir = Path(os.environ.get("SROUTER_LOG_DIR", Path.home() / "Library/Logs"))
+        return cls(
+            root=ROOT,
+            prefix=Path(prefix or os.environ.get("SROUTER_PREFIX", "/opt/homebrew")),
+            state_path=Path(state_path or os.environ.get("SROUTER_STATE_PATH", ROOT / "srouter.local.json")),
+            launchagent_dir=Path(os.environ.get("SROUTER_LAUNCHAGENTS_DIR", Path.home() / "Library" / "LaunchAgents")),
+            python_bin=os.environ.get("SROUTER_PYTHON", "/usr/bin/python3"),
+            log_out=log_dir / "srouter-dashboard.out.log",
+            log_err=log_dir / "srouter-dashboard.err.log",
+            now=os.environ.get("SROUTER_NOW", "") or _now(),
+        )
+
+    def component_paths(self, name):
+        etc = self.prefix / "etc"
+        paths = {
+            "xray": {
+                "config": etc / "xray" / "config.json",
+                "brew_binary": self.prefix / "bin" / "xray",
+                "non_brew": [Path("/usr/local/bin/xray"), Path("/usr/bin/xray")],
+            },
+            "privoxy": {
+                "config": etc / "privoxy" / "config",
+                "brew_binary": self.prefix / "sbin" / "privoxy",
+                "non_brew": [Path("/usr/local/sbin/privoxy"), Path("/usr/sbin/privoxy")],
+            },
+            "dnsmasq": {
+                "config": etc / "dnsmasq.conf",
+                "brew_binary": self.prefix / "sbin" / "dnsmasq",
+                "non_brew": [Path("/usr/local/sbin/dnsmasq"), Path("/usr/sbin/dnsmasq")],
+            },
+        }
+        return paths[name]
+
+    def launchagent_path(self):
+        return self.launchagent_dir / LAUNCHAGENT_FILE
+
+
+def _read_head(path, limit=4096):
+    try:
+        return Path(path).read_text(encoding="utf-8", errors="ignore")[:limit]
+    except OSError:
+        return ""
+
+
+def _json_has_marker(path):
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return False
+    marker = data.get("srouter", {}).get("marker") if isinstance(data, dict) else None
+    return marker == MARKER
+
+
+def _has_marker(path):
+    head = _read_head(path)
+    if not head:
+        return False
+    if head.lstrip().startswith("{"):
+        return _json_has_marker(path)
+    first_line = head.splitlines()[0].strip() if head.splitlines() else ""
+    if first_line.startswith("#"):
+        first_line = first_line[1:].strip()
+    return first_line == TEXT_MARKER
+
+
+# ============================ known_markers migration table (issue #112 Часть 4) ============================
+# State-based migration: detected_environment.known_markers = {surface: [marker, ...]}.
+# install распознаёт ЛЮБОЙ маркер из таблицы как «свой» → мигрирует old→current. unmarked (нет ни current,
+# ни legacy) → WARN, не adopt (канон fail-closed «никогда молча не adopt»). State может опережать код
+# (новая версия маркера) или отставать — current всегда валиден.
+def load_known_markers(state_path, surface, current_markers):
+    """Union(current_markers, state.known_markers[surface]) без дубликатов.
+
+    srouter.py (wrappers/zshrc/codenv) и configs-side переиспользуют: current из кода (всегда валиден) +
+    legacy из state (migration). Без state/таблицы → только current (безопасный fallback, не угадываем).
+    """
+    state = local_state.load_state(path=state_path)
+    detected = state.get("detected_environment") if isinstance(state.get("detected_environment"), dict) else {}
+    table = detected.get("known_markers") if isinstance(detected.get("known_markers"), dict) else {}
+    known = list(table.get(surface) or [])
+    for m in current_markers:
+        if m not in known:
+            known.append(m)
+    return known
+
+
+def populate_known_markers(state_path, surface, markers):
+    """CLI-слой (srouter.py) регистрирует markers wrappers/zshrc/codenv в state (issue #112 Часть 4).
+
+    lib НЕ знает о wrappers (layers: CLI зависит от lib, не наоборот) — данные передаются сверху.
+    Idempotent: дубликаты не накапливаются. При install с новой версией маркера — old остаётся в таблице
+    как legacy → следующий install мигрирует.
+    """
+    state, readable = local_state.load_state_checked(path=state_path)
+    if not readable:
+        return "state_unreadable"
+    detected = state.get("detected_environment") if isinstance(state.get("detected_environment"), dict) else {}
+    table = detected.get("known_markers") if isinstance(detected.get("known_markers"), dict) else {}
+    existing = list(table.get(surface) or [])
+    for m in markers:
+        if m not in existing:
+            existing.append(m)
+    table[surface] = existing
+    detected["known_markers"] = table
+    state["detected_environment"] = detected
+    if local_state.save_state(state, path=state_path) is None:
+        return "state_write_failed"
+    return ""
+
+
+def _port_owner(name, runner):
+    proto, port = PORTS[name]
+    if proto == "udp":
+        cmd = [LSOF, "-nP", f"-iUDP:{port}"]
+    else:
+        cmd = [LSOF, "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"]
+    result = runner(cmd, 5)
+    out = result.get("out") or ""
+    if result.get("timeout") or not out:
+        return {}
+    for line in out.splitlines():
+        if line.upper().startswith("COMMAND"):
+            continue
+        fields = line.split()
+        if len(fields) >= 2:
+            return {"command": fields[0], "pid": fields[1], "user": fields[2] if len(fields) > 2 else "", "raw": line}
+    return {}
+
+
+# Конфликты, которые reclaimable («свой старый»: state.managed=True, маркер пропал) авто-разрешает.
+# cycle-review #111 cycle 1 finding 2: reclaimable покрывает ТОЛЬКО stale-marker-состояние
+# (foreign_config — конфиг без маркера, foreign_port — порт занят). non_brew_binary — отдельная угроза
+# (чужой бинарник рядом), НЕ должна поглощаться reclaimable → install/restart brew-сервиса при живом
+# чужом бинарнике = конкуренция/падение. downstream-фильтры (apply_install, cmd_install) exempt компонент
+# только если reclaimable И ВСЕ его конфликты ∈ RECLAIMABLE_RESOLVES.
+RECLAIMABLE_RESOLVES = frozenset({"foreign_config", "foreign_port"})
+
+
+def _reclaimable_resolves_all_conflicts(item):
+    """True если reclaimable-компонент можно авторазрешить без явного adopt/overwrite/skip.
+
+    reclaimable должен покрывать КАЖДЫЙ конфликт компонента. non_brew_binary (или будущий conflict-тип)
+    НЕ покрыт → компонент блокируется (требует решения), даже если reclaimable=True.
+    """
+    if not item.get("reclaimable"):
+        return False
+    conflicts = item.get("conflicts") or []
+    return all(c in RECLAIMABLE_RESOLVES for c in conflicts)
+
+
+def _inspect_component(name, env, runner, port_checker, prior_detected=None):
+    """Инспекция одного компонента для build_plan (discovery, ничего не пишет).
+
+    `managed` определяется ДВУМЯ арбитрами (issue #110 Дефект 2):
+      - marker_managed: srouter-маркер в самом конфиге («живой» арбитр, но теряется при смене версии/правке).
+      - state_managed:  detected_environment[name].management из srouter.local.json («память» — install сам
+        пишет её через _write_state_after_apply). До #110 install её игнорировал → «свой старый» конфиг
+        (state.managed=True, маркер пропал) считался foreign → конфликт → non-TTY install падал rc=2 сразу
+        после uninstall. Корень #110: двойное определение managed (uninstall верил state, install — файлу).
+
+    reclaimable = state_managed AND NOT marker_managed AND NOT state_restored — «свой старый»: install
+    ставил, маркер пропал. Авторазрешается с backup (apply_install), НЕ требует adopt/overwrite/skip.
+    state_restored (mode='restored') — легально возвращённый uninstall'ом чужой конфиг → НЕ reclaimable,
+    остаётся foreign_config (install не должен молча перезаписать чужое).
+    """
+    prior_detected = prior_detected or {}
+    paths = env.component_paths(name)
+    config_path = paths["config"]
+    marker_managed = config_path.exists() and _has_marker(config_path)
+    prior = prior_detected.get(name) if isinstance(prior_detected.get(name), dict) else {}
+    state_managed = _is_managed_entry(prior)
+    state_restored = _is_restored_entry(prior)
+    # Привязка ownership к пути (cycle-review #111 cycle 1 finding 1): state.managed авторизует только
+    # конфиг по ТОМУ ЖЕ пути, что записан в state. Смена --prefix (/opt/homebrew → /usr/local) или любое
+    # другое перемещение → state от старого расположения НЕ делает чужой markerless-конфиг по новому пути
+    # reclaimable (иначе install молча перезаписал бы его + рестарт сервиса без adopt/overwrite/skip).
+    prior_path = prior.get("config_path") if isinstance(prior.get("config_path"), str) else ""
+    state_owns_path = bool(prior_path) and str(Path(prior_path)) == str(config_path)
+    managed = marker_managed or (state_managed and state_owns_path)
+    stale_managed = state_managed and state_owns_path and not marker_managed
+    owner = _port_owner(name, runner)
+    _proto, port = PORTS[name]
+    try:
+        listening = bool(port_checker("127.0.0.1", port, timeout=0.5))
+    except Exception:
+        listening = False
+
+    non_brew = [str(p) for p in paths["non_brew"] if p.exists()]
+    config_present = config_path.exists()
+    # reclaimable: «свой старый» (state помнит install по этому пути, маркер пропал), НЕ restored-чужой.
+    # config_present обязан быть True — иначе восстанавливать нечего (install создаст новый конфиг).
+    reclaimable = stale_managed and config_present and not state_restored
+    conflicts = []
+    if config_present and not managed:
+        conflicts.append("foreign_config")
+    # foreign_port: порт занят И слушатель НЕ подтверждён наш. Для marker_managed (маркер на месте) — слушатель
+    # это наш brew-сервис (мы им владеем), конфликта нет. Для stale-managed (state managed, маркер пропал) —
+    # слушатель МОЖЕТ быть чужим (cycle-review #111 cycle 2 finding D): brew restart поверх чужого процесса =
+    # конкуренция/падение. Гасим foreign_port только по marker_managed (живой арбитр), не по state.
+    if owner and not marker_managed:
+        conflicts.append("foreign_port")
+    if non_brew:
+        conflicts.append("non_brew_binary")
+
+    return {
+        "name": name,
+        "port": port,
+        "protocol": PORTS[name][0],
+        "config_path": str(config_path),
+        "config_present": config_present,
+        "config_managed": managed,
+        "reclaimable": reclaimable,
+        "brew_binary_present": paths["brew_binary"].exists(),
+        "non_brew_binaries": non_brew,
+        "service": "unknown",
+        "listening": listening,
+        "port_owner": owner,
+        "conflicts": conflicts,
+        "conflict": bool(conflicts),
+    }
+
+
+def _discover_network(runner):
+    gateway = ""
+    route = runner([ROUTE, "-n", "get", "default"], 3)
+    for line in (route.get("out") or "").splitlines():
+        line = line.strip()
+        if line.startswith("gateway:"):
+            gateway = line.split(":", 1)[1].strip()
+            break
+
+    wifi_service = ""
+    usb_service = ""
+    services = runner([NETWORKSETUP, "-listallnetworkservices"], 4)
+    for raw in (services.get("out") or "").splitlines():
+        name = raw.strip().lstrip("*").strip()
+        low = name.lower()
+        if not wifi_service and ("wi-fi" in low or "wifi" in low):
+            wifi_service = name
+        if not usb_service and ("usb" in low or "iphone" in low or "tether" in low):
+            usb_service = name
+
+    return {"gateway": gateway, "channels": {"wifi_service": wifi_service, "usb_tether_service": usb_service}}
+
+
+def _discover_probe_readiness(state_path, port_checker):
+    readiness = {}
+    for node in local_state.load_nodes(path=state_path):
+        probe = node.get("probe") if isinstance(node.get("probe"), dict) else {}
+        port = probe.get("socks_port")
+        try:
+            port = int(port)
+            ready = bool(port_checker("127.0.0.1", port, timeout=0.25))
+        except Exception:
+            ready = False
+        readiness[node.get("name") or ""] = {"socks_port": port, "ready": ready}
+    return readiness
+
+
+def _homebrew_available(runner):
+    if Path(BREW).exists():
+        return True
+    result = runner([BREW, "--version"], 5)
+    return result.get("rc") == 0
+
+
+def _privoxy_protected_for_env(env):
+    """State — главный контракт; physical fallback только для канонического production state.
+
+    Иначе unit/acceptance с временным --state начали бы зависеть от живого /Library на host после
+    активации защиты (#122) и скрывали бы legacy install-ветки.
+    """
+    if privoxy_system.state_protected(env.state_path):
+        return True
+    try:
+        canonical = (ROOT / "srouter.local.json").resolve()
+        requested = Path(env.state_path).resolve()
+    except OSError:
+        return False
+    return requested == canonical and privoxy_system.protection_present()
+
+
+def build_plan(env=None, runner=run, port_checker=port_open):
+    """Discovery-only: ничего не пишет."""
+    env = env or InstallEnv.from_env()
+    # State грузим ОДИН раз ВВЕРХ (issue #110 Дефект 2): detected_environment нужен в _inspect_component
+    # как второй арбитр managed (stateManaged) — без него «свой старый» конфиг = foreign. Раньше state
+    # грузился после цикла inspect и читал только probes; теперь пробрасываем detected_env в inspect.
+    state = local_state.load_state(path=env.state_path)
+    detected_env = state.get("detected_environment") if isinstance(state.get("detected_environment"), dict) else {}
+    brew_services = runner([BREW, "services", "list"], 8)
+    service_states = _parse_brew_services(brew_services.get("out") or "")
+    components = {}
+    for name in COMPONENTS:
+        item = _inspect_component(name, env, runner, port_checker, prior_detected=detected_env)
+        if name == "privoxy" and _privoxy_protected_for_env(env):
+            # Protected mode — отдельная system-domain ownership boundary. Legacy install обязан
+            # сохранить её и НЕ создавать конкурирующий user LaunchAgent через brew services.
+            item.update({
+                "protected": True,
+                "config_path": str(privoxy_system.DEFAULT_LAYOUT.config_path),
+                "config_present": privoxy_system.DEFAULT_LAYOUT.config_path.exists(),
+                "config_managed": True,
+                "reclaimable": False,
+                "conflicts": [],
+                "conflict": False,
+                "service": "protected-system",
+            })
+        else:
+            item["service"] = service_states.get(name, "none" if brew_services.get("rc") == 0 else "unknown")
+        components[name] = item
+
+    probes = state.get("probes") if isinstance(state.get("probes"), dict) else {}
+    return {
+        "mode": "plan",
+        "state_path": str(env.state_path),
+        "homebrew": {"available": _homebrew_available(runner), "path": BREW},
+        "components": components,
+        "network": _discover_network(runner),
+        "probes": {
+            "reachability_targets": probes.get("reachability_targets", []),
+            "throughput_targets": probes.get("throughput_targets", []),
+            "connect_timeout_sec": probes.get("connect_timeout_sec"),
+            "max_time_sec": probes.get("max_time_sec"),
+            "per_node_socks": _discover_probe_readiness(env.state_path, port_checker),
+        },
+        "launchagent": {
+            "label": LAUNCHAGENT_LABEL,
+            "template_path": str(_launchagent_template_path(env)),
+            "plist_path": str(env.launchagent_path()),
+            "dashboard_path": str(env.root / "dashboard.py"),
+            "python_bin": env.python_bin,
+            "loopback_only": True,
+            "managed": env.launchagent_path().exists() and _has_launchagent_marker(env.launchagent_path()),
+        },
+        "state_sections_to_write": ["detected_environment", "network", "runtime"],
+        "backup_suffix": ".srouter-backup-<timestamp>",
+    }
+
+
+def format_plan(plan):
+    lines = [
+        "srouter install plan",
+        f"- state: {plan.get('state_path')}",
+        f"- Homebrew: {'ok' if plan.get('homebrew', {}).get('available') else 'missing'} ({BREW})",
+        "- apply запишет секции local-state: " + ", ".join(plan.get("state_sections_to_write", [])),
+        "- root/system действия: brew services restart dnsmasq; networksetup DNS для найденного Wi-Fi",
+        "- backup при overwrite: <config>" + plan.get("backup_suffix", ""),
+        "",
+        "Компоненты:",
+    ]
+    for name, item in plan.get("components", {}).items():
+        conflict = "CONFLICT" if item.get("conflict") else "ok"
+        if item.get("protected"):
+            conflict = "PROTECTED"
+        lines.append(
+            f"- {name}: {conflict}; config={item.get('config_path')}; "
+            f"managed={item.get('config_managed')}; service={item.get('service')}; "
+            f"port_owner={item.get('port_owner') or '-'}"
+        )
+        if item.get("conflicts"):
+            lines.append(f"  выбор обязателен: --{name} adopt|overwrite|skip; причины: {', '.join(item['conflicts'])}")
+    lines.append("")
+    launchagent = plan.get("launchagent") or {}
+    lines.append(
+        f"- LaunchAgent: {launchagent.get('label')} -> {launchagent.get('plist_path')} "
+        f"(dashboard loopback-only 127.0.0.1)"
+    )
+    lines.append("")
+    lines.append("plan ничего не пишет. Для применения: ./install.sh apply --yes [--xray ... --privoxy ... --dnsmasq ...]")
+    return "\n".join(lines)
+
+
+def _backup(path, env):
+    if not path.exists():
+        return ""
+    suffix = env.now.replace(":", "").replace("/", "-")
+    backup = path.with_name(path.name + f".srouter-backup-{suffix}")
+    try:
+        shutil.copy2(path, backup)
+        return str(backup)
+    except OSError:
+        return ""
+
+
+def _write_component_config(name, env):
+    path = env.component_paths(name)["config"]
+    if name == "xray":
+        return gen_xray_config.write_config(path, state_path=env.state_path)
+    template = env.root / "templates" / ("privoxy.config" if name == "privoxy" else "dnsmasq.conf")
+    try:
+        text = template.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return _write_text_atomic(path, text)
+
+
+def _traffic_guard_preflight_error(env):
+    errors = gen_xray_config.traffic_guard_validation_errors(state_path=env.state_path)
+    if not errors:
+        return ""
+    return "traffic_guard невалиден: " + "; ".join(errors)
+
+
+def _ensure_package(name, runner):
+    listed = runner([BREW, "list", "--versions", name], 12)
+    if listed.get("rc") == 0 and listed.get("out"):
+        return True
+    installed = runner([BREW, "install", name], 180)
+    return installed.get("rc") == 0
+
+
+def _restart_component(name, runner, *, port_checker=port_open):
+    """Рестарт brew-сервиса без гонки за порт: stop → poll освобождения порта → start → poll поднятия.
+
+    Раньше был слепой `brew services restart` — он атомарно убивает старый и поднимает новый процесс,
+    но старый может ещё держать порт (TIME_WAIT / медленный shutdown) → новый падает `Fatal: can't
+    bind to 127.0.0.1:8118` → launchd KeepAlive молотит рестарты (issue #115 симптом 2). Гонка
+    исключена СТРУКТУРНО: новый процесс стартует ТОЛЬКО после подтверждённого освобождения порта, а
+    успех подтверждается поднятием порта. Симметрично канонному эталону _launchd_reload
+    (bootout→poll выгрузки→bootstrap-retry).
+
+    poll доказывает состояние порта через port_checker (verify-dont-guess: не фиксированный sleep).
+    Константы _PORT_SETTLE_* / _PORT_UP_MAX_WAIT уровня модуля → тесты зануляют для мгновенных прогонов.
+
+    dnsmasq (UDP 53) идёт под sudo, как и прежде. Возвращает dict как runner (rc/out/err/timeout);
+    при провале stop/start/poll — ненулевой rc с причиной в err, не бросает.
+    """
+    _proto, port = PORTS[name]
+    host = "127.0.0.1"
+
+    def _port_busy():
+        return bool(port_checker(host, port, 0.5))
+
+    # 1. stop (игнорируем rc — «уже остановлен» = не ошибка, симметрично bootout в _launchd_unload).
+    if name == "dnsmasq":
+        runner([SUDO, BREW, "services", "stop", "dnsmasq"], 60)
+        start_cmd = [SUDO, BREW, "services", "start", "dnsmasq"]
+    else:
+        runner([BREW, "services", "stop", name], 40)
+        start_cmd = [BREW, "services", "start", name]
+
+    # 2. poll освобождения порта: ждём, пока старый процесс реально отпустит порт. deadline по часам
+    #    (как _launchd_unload), иначе при interval=0 (тесты) цикл был бы бесконечным. Один poll-loop
+    #    проверяет каждое состояние ОДИН раз — повторный вызов port_checker между while и if дал бы
+    #    расхождение с эмулированной последовательностью состояний в тестах.
+    deadline = time.monotonic() + _PORT_SETTLE_MAX_WAIT
+    busy = _port_busy()
+    while busy and time.monotonic() < deadline:
+        time.sleep(_PORT_SETTLE_POLL_INTERVAL)
+        busy = _port_busy()
+    if busy:
+        # fail-closed: порт не освободился → НЕ поднимаем новый поверх (петля рестартов / конкуренция).
+        return {"rc": 1, "out": "", "err": f"{name}_port_still_busy", "timeout": False}
+
+    # 3. start.
+    started = runner(start_cmd, 60 if name == "dnsmasq" else 40)
+    if started.get("timeout") or started.get("rc") != 0:
+        return started
+
+    # 4. poll поднятия порта: brew services start асинхронен, порт поднимается с задержкой.
+    deadline = time.monotonic() + _PORT_UP_MAX_WAIT
+    up = _port_busy()
+    while not up and time.monotonic() < deadline:
+        time.sleep(_PORT_SETTLE_POLL_INTERVAL)
+        up = _port_busy()
+    if not up:
+        return {"rc": 1, "out": "", "err": f"{name}_port_not_up", "timeout": False}
+    return {"rc": 0, "out": "", "err": "", "timeout": False}
+
+
+def _apply_dns(env, plan, runner):
+    service = plan.get("network", {}).get("channels", {}).get("wifi_service") or ""
+    if not service:
+        return {"rc": 0, "out": "", "err": "wifi service not found", "timeout": False}
+    return runner([NETWORKSETUP, "-setdnsservers", service, "127.0.0.1"], 20)
+
+
+def _management_for(mode, item, *, provenance=None):
+    # provenance (issue #112 Часть 1): 'created' | 'overwrote' | None. Только для mode=='managed':
+    # created = config_path НЕ существовал до install (нет backup), overwrote = существовал (есть backup).
+    # Uninstall (Часть 2) различает: created → удалить, overwrote → restore. None — adopted/skipped/restored
+    # (srouter не перезаписывал, semantics не применима). Опускается, если None (обратная совместимость state).
+    management = {"mode": mode, "managed": mode == "managed"}
+    if provenance is not None:
+        management["provenance"] = provenance
+    return {
+        "config_path": item.get("config_path"),
+        "port": item.get("port"),
+        "service": item.get("service"),
+        "port_owner": item.get("port_owner"),
+        "management": management,
+    }
+
+
+def _write_state_after_apply(env, plan, modes, backups, launchagent_action=None):
+    state, readable = local_state.load_state_checked(path=env.state_path)
+    if not readable:
+        return "state_unreadable"
+    detected = state.get("detected_environment") if isinstance(state.get("detected_environment"), dict) else {}
+    for name, item in plan["components"].items():
+        mode = modes.get(name, "skipped")
+        prev = detected.get(name) if isinstance(detected.get(name), dict) else {}
+        if mode == "protected":
+            # Не переписываем protection/previous/backup, которые создала двухфазная root-транзакция.
+            # Reinstall лишь подтверждает, что защищённый компонент намеренно оставлен как есть.
+            detected[name] = dict(prev)
+            detected[name]["service"] = "protected-system"
+            continue
+        # provenance (issue #112 Часть 1): только для managed. backups[name] truthy ⟺ config существовал
+        # до install (apply_install needs_backup требует config_path.exists() → _backup вызван).
+        # created = нет backup (fresh install с нуля), overwrote = есть backup (перезаписан чужой).
+        provenance = None
+        if mode == "managed":
+            provenance = "overwrote" if backups.get(name) else "created"
+        # cycle-review cloud (@bbc356a) P1: idempotent reinstall НЕ должен терять существующий backup/provenance.
+        # Если этот apply не создавал/не перезаписывал файл (backups[name] пуст — target уже marker-managed,
+        # не конфликт) НО prev уже managed с backup — preserve prev.backup/provenance. Иначе _management_for
+        # перезаписывал entry → provenance='created' + backup утерян → следующий uninstall УДАЛЯЛ srouter-config
+        # вместо restore пользовательского оригинала (потеря в цикле install→reinstall→uninstall).
+        # cycle-review cloud round 2 (@307bb34) P1: path-ownership guard. Preserve ТОЛЬКО когда prev.config_path
+        # совпадает с текущим item.config_path. Смена --prefix (A→B): prev под путём A, текущий B → backup A НЕ
+        # переносится на B (иначе uninstall restore'ит A's foreign-конфиг в B, обход path-ownership, cycle-review
+        # #111 finding 1). Привязка ownership к пути — тот же канон, что _inspect_component state_owns_path.
+        prev_same_path = (str(Path(prev.get("config_path") or "")) == str(item.get("config_path"))
+                          if prev.get("config_path") else False)
+        if (mode == "managed" and not backups.get(name) and _is_managed_entry(prev)
+                and prev.get("backup") and prev_same_path):
+            provenance = _provenance_of(prev) or "overwrote"
+        detected[name] = _management_for(mode, item, provenance=provenance)
+        if backups.get(name):
+            detected[name]["backup"] = backups[name]
+        elif mode == "managed" and _is_managed_entry(prev) and prev.get("backup") and prev_same_path:
+            detected[name]["backup"] = prev["backup"]  # preserve backup оригинала (idempotent reinstall, тот же путь)
+    if launchagent_action:
+        launchagent = plan.get("launchagent") or {}
+        detected["launchagent"] = {
+            "label": launchagent.get("label"),
+            "plist_path": launchagent.get("plist_path"),
+            "dashboard_path": launchagent.get("dashboard_path"),
+            "python_bin": launchagent.get("python_bin"),
+            "management": {"mode": "managed", "managed": True},
+            "last_loaded_at": env.now,
+        }
+    detected["brew"] = plan.get("homebrew")
+    detected["last_checked_at"] = env.now
+    state["detected_environment"] = detected
+
+    network = state.get("network") if isinstance(state.get("network"), dict) else {}
+    network.update(plan.get("network") or {})
+    state["network"] = network
+
+    runtime = state.get("runtime") if isinstance(state.get("runtime"), dict) else {}
+    runtime["last_apply"] = env.now
+    runtime["last_error"] = None
+    state["runtime"] = runtime
+    if local_state.save_state(state, path=env.state_path) is None:
+        return "state_write_failed"
+    return ""
+
+
+def apply_install(env=None, *, confirm=False, choices=None, runner=run, port_checker=port_open, install_launchagent=True, force_endpoint_overwrite=False):
+    """Применить план. Без confirm или без выбора по конфликту ничего не пишет."""
+    env = env or InstallEnv.from_env()
+    choices = choices or {}
+    if not confirm:
+        return {"ok": False, "blocked": ["confirmation_required"], "actions": []}
+
+    plan = build_plan(env=env, runner=runner, port_checker=port_checker)
+    unresolved = []
+    for name, item in plan["components"].items():
+        choice = choices.get(name)
+        # reclaimable («свой старый»: state.managed=True, маркер пропал) — НЕ конфликт для пользователя
+        # (issue #110 Дефект 2): авторазрешается в managed-режим с backup. Иначе non-TTY install падал
+        # rc=2 сразу после uninstall. НО только если reclaimable покрывает ВСЕ конфликты (cycle-review
+        # #111 cycle 1 finding 2): non_brew_binary и будущие conflict-типы НЕ поглощаются → блокируют.
+        if item.get("conflict") and not _reclaimable_resolves_all_conflicts(item) and choice not in CHOICES:
+            unresolved.append(name)
+    if unresolved:
+        return {"ok": False, "blocked": unresolved, "actions": [], "plan": plan}
+
+    _state, state_readable = local_state.load_state_checked(path=env.state_path)
+    if not state_readable:
+        return {"ok": False, "blocked": ["state_unreadable"], "actions": [], "plan": plan}
+
+    modes = {}
+    for name, item in plan["components"].items():
+        if item.get("protected"):
+            modes[name] = "protected"
+        elif choices.get(name) == "adopt":
+            modes[name] = "adopted"
+        elif choices.get(name) == "skip":
+            modes[name] = "skipped"
+        else:
+            modes[name] = "managed"
+
+    if modes.get("xray") == "managed":
+        guard_error = _traffic_guard_preflight_error(env)
+        if guard_error:
+            return {"ok": False, "blocked": ["traffic_guard_invalid"], "error": guard_error, "actions": [], "plan": plan}
+
+    needs_brew = any(mode == "managed" for mode in modes.values())
+    if needs_brew and not plan.get("homebrew", {}).get("available"):
+        return {"ok": False, "blocked": ["homebrew_missing"], "actions": [], "plan": plan}
+
+    actions = []
+    backups = {}
+    for name in COMPONENTS:
+        mode = modes.get(name)
+        item = plan["components"][name]
+        if mode in ("adopted", "skipped", "protected"):
+            actions.append({"component": name, "mode": mode, "changed": False})
+            continue
+
+        if not _ensure_package(name, runner):
+            return {"ok": False, "blocked": [f"{name}_install_failed"], "actions": actions, "plan": plan}
+        config_path = Path(item["config_path"])
+        # backup при overwrite ИЛИ reclaimable (issue #110 Дефект 2). reclaimable = «свой старый»
+        # (state.managed=True, маркер пропал) — ВСЕГДА backup перед перезаписью (канон fail-closed):
+        # если state устарел и под «своим старым» оказался чужой конфиг, он сохранится в .srouter-backup-*.
+        # Без этого (раньше backup только при choice=='overwrite') reclaimable перезаписался бы без бэкапа.
+        needs_backup = config_path.exists() and (choices.get(name) == "overwrite" or item.get("reclaimable"))
+        if needs_backup:
+            backup = _backup(config_path, env)
+            if not backup:
+                return {"ok": False, "blocked": [f"{name}_backup_failed"], "actions": actions, "plan": plan}
+            backups[name] = backup
+        # #200: защита от перезаписи рабочего xray config placeholder'ом. gen_xray_config генерит из
+        # local_state.active_node() — если state держит placeholder test-IP 203.0.113.x, а существующий
+        # РАБОЧИЙ xray config — реальный VPS-address (вписан руками / старая генерация), apply перезаписал
+        # бы рабочий config placeholder'ом и сломал прокси (когда VPS оживёт). srouter-critical-infra-24-7:
+        # лучше заблокировать apply, чем затереть рабочий конфиг. force_endpoint_overwrite — осознанный
+        # escape-hatch (как adopt для foreign-config): пользователь подтверждает перезапись.
+        # cycle-review Codex critical 0.94: блокируем и когда СУЩЕСТВУЮЩИЙ xray config unreadable/no_active
+        # (битый JSON / без active) при placeholder local — это НЕ fresh install (config существует),
+        # перезапись + restart превратит recoverable on-disk corruption в outage. xray_status=absent
+        # (= fresh install, файла нет) — единственный случай, где apply свободен.
+        if name == "xray" and mode == "managed" and not force_endpoint_overwrite:
+            cmp = local_state.compare_endpoint_with_xray(
+                state_path=env.state_path, xray_config_path=config_path
+            )
+            if cmp["placeholder"] and not cmp["synced"]:
+                xray_status = cmp.get("xray_status", "absent")
+                if xray_status == "absent":
+                    pass  # fresh install — нечего ломать, apply свободен
+                elif xray_status in ("unreadable", "no_active"):
+                    return {"ok": False, "blocked": ["xray_endpoint_overwrite_blocked"],
+                            "error": (f"active_node endpoint_host={cmp['local']!r} — placeholder, а "
+                                      f"СУЩЕСТВУЮЩИЙ xray config {config_path} — {xray_status} (битый/без "
+                                      f"active). xray ещё может крутить ранее загруженный реальный endpoint; "
+                                      f"apply перезапишет config placeholder'ом + restart → outage. "
+                                      f"Почини xray config или --force-endpoint-overwrite для осознанной "
+                                      f"перезаписи."),
+                            "actions": actions, "plan": plan}
+                else:  # ok + drift: рабочий xray держит реальный address, отличающийся от placeholder local
+                    return {"ok": False, "blocked": ["xray_endpoint_overwrite_blocked"],
+                            "error": (f"active_node endpoint_host={cmp['local']!r} — placeholder, а рабочий "
+                                      f"xray config держит реальный address {cmp['xray']!r}. apply перезапишет "
+                                      f"рабочий xray placeholder'ом и сломает прокси. "
+                                      f"Запусти `srouter sync` (импорт address из xray в local.json) "
+                                      f"или --force-endpoint-overwrite для осознанной перезаписи."),
+                            "actions": actions, "plan": plan}
+        if not _write_component_config(name, env):
+            return {"ok": False, "blocked": [f"{name}_config_write_failed"], "actions": actions, "plan": plan}
+        restart = _restart_component(name, runner, port_checker=port_checker)
+        if restart.get("timeout") or restart.get("rc") != 0:
+            return {"ok": False, "blocked": [f"{name}_restart_failed"], "actions": actions, "plan": plan}
+        if name == "dnsmasq":
+            _apply_dns(env, plan, runner)
+        actions.append({"component": name, "mode": mode, "changed": True})
+
+    launchagent_action = None
+    if install_launchagent:
+        launchagent_ok, launchagent_error = _install_launchagent(env, runner)
+        if not launchagent_ok:
+            return {"ok": False, "blocked": [launchagent_error], "actions": actions, "plan": plan}
+        launchagent_action = {"component": "launchagent", "mode": "managed", "changed": True}
+        actions.append(launchagent_action)
+
+    state_error = _write_state_after_apply(env, plan, modes, backups, launchagent_action=launchagent_action)
+    if state_error:
+        return {"ok": False, "blocked": [state_error], "actions": actions, "plan": plan}
+    return {"ok": True, "blocked": [], "actions": actions, "plan": plan}
+
+
+def _is_managed_entry(entry):
+    if not isinstance(entry, dict):
+        return False
+    management = entry.get("management") if isinstance(entry.get("management"), dict) else {}
+    return management.get("managed") is True or management.get("mode") == "managed"
+
+
+def _is_adopted_entry(entry):
+    if not isinstance(entry, dict):
+        return False
+    management = entry.get("management") if isinstance(entry.get("management"), dict) else {}
+    return management.get("mode") == "adopted"
+
+
+def _is_restored_entry(entry):
+    if not isinstance(entry, dict):
+        return False
+    management = entry.get("management") if isinstance(entry.get("management"), dict) else {}
+    return management.get("mode") == "restored"
+
+
+def _provenance_of(entry):
+    """provenance компонента: 'created' | 'overwrote' | None (issue #112 Часть 2).
+
+    None = legacy state (до #112, нет поля) или non-managed (adopted/skipped/restored — semantics
+    не применима). created = srouter создал конфиг с нуля (нет backup). overwrote = перезаписал чужой.
+    Симметрично по стилю _is_managed_entry/_is_adopted_entry/_is_restored_entry.
+    """
+    if not isinstance(entry, dict):
+        return None
+    management = entry.get("management") if isinstance(entry.get("management"), dict) else {}
+    return management.get("provenance")
+
+
+def _is_created_entry(entry):
+    return _provenance_of(entry) == "created"

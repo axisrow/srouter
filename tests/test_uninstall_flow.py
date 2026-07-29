@@ -4,7 +4,9 @@ from pathlib import Path
 
 import pytest
 
+import install_cleanup
 import install_lib
+import install_plist
 
 
 class FakeRunner:
@@ -331,7 +333,7 @@ def _managed_launchagent_detected():
 
 def test_uninstall_launchagent_unlinks_after_confirmed_unload(tmp_path, monkeypatch):
     """Агент подтверждённо выгрузился (print True→False, т.е. rc0→rc113) → plist удалён, ok+changed."""
-    monkeypatch.setattr(install_lib, "_BOOTOUT_POLL_INTERVAL", 0)
+    monkeypatch.setattr(install_plist, "_BOOTOUT_POLL_INTERVAL", 0)
     env = _env(tmp_path)
     plist_path = _write_removable_launchagent(env)
     _write_state(env, {"launchagent": _managed_launchagent_detected()})
@@ -354,8 +356,8 @@ def test_uninstall_launchagent_keeps_plist_when_still_loaded(tmp_path, monkeypat
     гонку. settle-потолок ≈0 (иначе poll крутил бы 2с), print всегда rc0 → state=True → fail-safe.
     Живой StartInterval-агент иначе пере-применял бы мёртвый конфиг.
     """
-    monkeypatch.setattr(install_lib, "_BOOTOUT_POLL_INTERVAL", 0)
-    monkeypatch.setattr(install_lib, "_BOOTOUT_SETTLE_MAX_WAIT", 0)
+    monkeypatch.setattr(install_plist, "_BOOTOUT_POLL_INTERVAL", 0)
+    monkeypatch.setattr(install_plist, "_BOOTOUT_SETTLE_MAX_WAIT", 0)
     env = _env(tmp_path)
     plist_path = _write_removable_launchagent(env)
     _write_state(env, {"launchagent": _managed_launchagent_detected()})
@@ -371,7 +373,7 @@ def test_uninstall_launchagent_keeps_plist_when_still_loaded(tmp_path, monkeypat
 
 def test_uninstall_launchagent_keeps_plist_when_list_timeout(tmp_path, monkeypatch):
     """list timeout (None = неизвестно) → fail-safe: plist НЕ удалён, blocked. None-ветка для B."""
-    monkeypatch.setattr(install_lib, "_BOOTOUT_POLL_INTERVAL", 0)
+    monkeypatch.setattr(install_plist, "_BOOTOUT_POLL_INTERVAL", 0)
     env = _env(tmp_path)
     plist_path = _write_removable_launchagent(env)
     _write_state(env, {"launchagent": _managed_launchagent_detected()})
@@ -395,8 +397,8 @@ def test_uninstall_launchagent_keeps_plist_when_print_fails(tmp_path, monkeypatc
     Регресс-гард раунда 1 (на print): _launchd_is_loaded возвращает None (не False) на сбойном
     print → state is not False → _unload_launchagent НЕ удаляет plist живого агента.
     """
-    monkeypatch.setattr(install_lib, "_BOOTOUT_POLL_INTERVAL", 0)
-    monkeypatch.setattr(install_lib, "_BOOTOUT_SETTLE_MAX_WAIT", 0)
+    monkeypatch.setattr(install_plist, "_BOOTOUT_POLL_INTERVAL", 0)
+    monkeypatch.setattr(install_plist, "_BOOTOUT_SETTLE_MAX_WAIT", 0)
     env = _env(tmp_path)
     plist_path = _write_removable_launchagent(env)
     _write_state(env, {"launchagent": _managed_launchagent_detected()})
@@ -424,8 +426,8 @@ def test_uninstall_launchagent_keeps_plist_on_domain_mismatch(tmp_path, monkeypa
     ЖИВОГО gui-агента. Теперь домен-осознанный `print gui/<uid>/<label>`: rc=0 (жив) → True, rc=112
     (домен недоступен) → None; оба → state is not False → plist ОСТАВЛЕН. На коде до фикса падал.
     """
-    monkeypatch.setattr(install_lib, "_BOOTOUT_POLL_INTERVAL", 0)
-    monkeypatch.setattr(install_lib, "_BOOTOUT_SETTLE_MAX_WAIT", 0)
+    monkeypatch.setattr(install_plist, "_BOOTOUT_POLL_INTERVAL", 0)
+    monkeypatch.setattr(install_plist, "_BOOTOUT_SETTLE_MAX_WAIT", 0)
     env = _env(tmp_path)
     plist_path = _write_removable_launchagent(env)
     _write_state(env, {"launchagent": _managed_launchagent_detected()})
@@ -497,7 +499,7 @@ def test_unload_launchagent_fails_closed_on_label_plist_mismatch(monkeypatch, tm
     код unlink'ает dashboard.plist — ЖИВОЙ агент. Теперь: plistlib.load требует Label==item_label, на
     mismatch → ok=False, plist оставлен. На коде до фикса тест ПАДАЕТ (plist удаляется).
     """
-    monkeypatch.setattr(install_lib, "_BOOTOUT_POLL_INTERVAL", 0)
+    monkeypatch.setattr(install_plist, "_BOOTOUT_POLL_INTERVAL", 0)
     env = _env(tmp_path)
     item = _mismatch_item(env, plist_label="com.srouter.dashboard",
                           item_label="com.srouter.stale")
@@ -519,7 +521,7 @@ def test_unload_launchagent_unlinks_when_label_matches_plist(monkeypatch, tmp_pa
     Identity связана: единый label на всех уровнях. bootout → state False → plistlib.load подтверждает
     Label==item_label → unlink безопасен. Регресс-гард: валидный путь не сломан identity-проверкой.
     """
-    monkeypatch.setattr(install_lib, "_BOOTOUT_POLL_INTERVAL", 0)
+    monkeypatch.setattr(install_plist, "_BOOTOUT_POLL_INTERVAL", 0)
     env = _env(tmp_path)
     # item.label == plist_label == имя файла → тождество.
     item = _mismatch_item(env, plist_label=install_lib.LAUNCHAGENT_LABEL,
@@ -539,7 +541,7 @@ def test_unload_launchagent_fails_closed_on_path_label_mismatch(monkeypatch, tmp
     Даже если item.label совпадает с одним из них, рассинхрон имя-файла↔Label-внутри = аномалия
     (файл подменён). path-derived label — третий арбитр: все три должны совпасть.
     """
-    monkeypatch.setattr(install_lib, "_BOOTOUT_POLL_INTERVAL", 0)
+    monkeypatch.setattr(install_plist, "_BOOTOUT_POLL_INTERVAL", 0)
     env = _env(tmp_path)
     # Файл называется stale.plist, но внутри Label=dashboard — подмена.
     item = _mismatch_item(env, plist_label="com.srouter.dashboard",
@@ -564,7 +566,7 @@ def test_unload_launchagent_fails_closed_on_missing_label_key(monkeypatch, tmp_p
     Нельзя доверять item.label, если plist не подтверждает identity собственным Label. Нет Label →
     identity не верифицируема → fail-closed (как и любой mismatch).
     """
-    monkeypatch.setattr(install_lib, "_BOOTOUT_POLL_INTERVAL", 0)
+    monkeypatch.setattr(install_plist, "_BOOTOUT_POLL_INTERVAL", 0)
     env = _env(tmp_path)
     plist_path = env.launchagent_dir / f"{install_lib.LAUNCHAGENT_LABEL}.plist"
     plist_path.parent.mkdir(parents=True, exist_ok=True)
@@ -590,7 +592,7 @@ def test_unload_launchagent_fails_closed_on_malformed_xml_plist(monkeypatch, tmp
     вместо контролируемого {ok:False}. Имя файла совпадает с label (нормальный путь), но контент
     невалиден → identity не верифицируема → fail-closed.
     """
-    monkeypatch.setattr(install_lib, "_BOOTOUT_POLL_INTERVAL", 0)
+    monkeypatch.setattr(install_plist, "_BOOTOUT_POLL_INTERVAL", 0)
     env = _env(tmp_path)
     plist_path = env.launchagent_dir / f"{install_lib.LAUNCHAGENT_LABEL}.plist"
     plist_path.parent.mkdir(parents=True, exist_ok=True)
@@ -616,7 +618,7 @@ def test_unload_launchagent_identity_check_before_unlink_live_agent(monkeypatch,
     (живой). Без identity-связки: bootout stale (rc113) → unlink dashboard.plist. Теперь mismatch
     перехватывается ДО unlink → ok=False, apply_uninstall блокируется, plist живого агента цел.
     """
-    monkeypatch.setattr(install_lib, "_BOOTOUT_POLL_INTERVAL", 0)
+    monkeypatch.setattr(install_plist, "_BOOTOUT_POLL_INTERVAL", 0)
     env = _env(tmp_path)
     item = _mismatch_item(env, plist_label="com.srouter.dashboard",
                           item_label="com.srouter.stale")
@@ -626,7 +628,7 @@ def test_unload_launchagent_identity_check_before_unlink_live_agent(monkeypatch,
     # monkeypatch'ив build_uninstall_plan чтобы вернуть наш mismatched item.
     plan = install_lib.build_uninstall_plan(env=env)
     plan["launchagent"] = item
-    monkeypatch.setattr(install_lib, "build_uninstall_plan", lambda **kw: plan)
+    monkeypatch.setattr(install_cleanup, "build_uninstall_plan", lambda **kw: plan)
     runner = ListRunner(list_states=[False])  # bootout stale → rc113 → «выгружен»
 
     result = install_lib.apply_uninstall(env=env, confirmations={"launchagent": True}, runner=runner)
