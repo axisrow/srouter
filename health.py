@@ -13,10 +13,12 @@
 """
 from pathlib import Path
 import json
+import logging
 import os
 import re
 import shutil
 import socket
+import subprocess
 import tempfile
 from urllib.parse import urlparse
 
@@ -24,6 +26,8 @@ import local_state
 import privoxy_system
 import sys_probe
 from install_lib import _launchd_domain, _launchd_is_loaded
+
+_log = logging.getLogger("srouter.health")
 
 # Абсолютные пути: launchd/GUI PATH их не содержит (канон проекта).
 CURL = "/usr/bin/curl"
@@ -40,13 +44,17 @@ try:
     from dashboard_common import HTTP_PROXY_URL as _PROXY  # http://127.0.0.1:8118
     # Порты компонентов стека — единый источник dashboard_common (issue #155).
     from dashboard_common import PRIVOXY_PORT, XRAY_SOCKS_PORT as XRAY_PORT
-except Exception:
+except (ImportError, SystemExit) as exc:  # noqa: BLE001 — намеренно широкий top-level import-guard.
+    # dashboard_common без srouter_config.py бросает SystemExit (не ImportError) — ветка унаследована
+    # от канона (git_proxy/claude_proxy). Оба случая (модуль недоступен / конфиг не создан) равнозначны
+    # для health: используем fallback-константы, не роняем модуль на import time (probe-канон — health
+    # не бросает). Маркер canonical-fallback-port
+    _log.info("dashboard_common недоступен (%s: %s) — health использует fallback-константы порта",
+              type(exc).__name__, exc)
     _PROXY = "http://127.0.0.1:8118"
-    # Fallback на то же каноническое значение. Ветка унаследована от канона (git_proxy/
-    # claude_proxy); сегодня SystemExit от dashboard_common в среде без srouter_config
-    # пробивает except Exception, поэтому health всё равно требует конфиг — но значения
-    # здесь держат единый литерал, а не расходящийся хардкод. Маркер canonical-fallback-port
-    # — tests/test_proxy_constants.py пропускает как осознанный fallback, не свежий дубликат.
+    # Fallback на то же каноническое значение. Значения здесь держат единый литерал, а не
+    # расходящийся хардкод, даже когда srouter_config недоступен — tests/test_proxy_constants.py
+    # пропускает как осознанный fallback, не свежий дубликат.
     PRIVOXY_PORT = 8118  # canonical-fallback-port
     XRAY_PORT = 10808  # canonical-fallback-port
 
@@ -270,7 +278,9 @@ def _direct_first_check():
     try:
         import direct_first
         det = direct_first.detect()
-    except Exception:
+    except (ImportError, RuntimeError, OSError, ValueError) as exc:
+        # ImportError — модуль недоступен; RuntimeError/OSError — сбой detect() (fail-soft).
+        _log.info("direct_first недоступен/сбой: %s — check пропущен", exc)
         return {"status": "unknown", "detail": "direct-first detect недоступен — check пропущен"}
     reach = det.get("reachable", [])
     blocked = det.get("blocked", [])
@@ -367,7 +377,8 @@ def _route_default_interface():
     """
     try:
         raw = sys_probe.run([ROUTE, "-n", "get", "default"], timeout=3) or {}
-    except Exception:
+    except (OSError, subprocess.SubprocessError) as exc:
+        _log.debug("route -n get default: сбой запуска (%s) — default route неприменим", exc)
         return ""
     if raw.get("timeout") or raw.get("rc") != 0:
         return ""
@@ -390,7 +401,8 @@ def _inet_interface():
     """
     try:
         raw = sys_probe.run([IFCONFIG], timeout=3) or {}
-    except Exception:
+    except (OSError, subprocess.SubprocessError) as exc:
+        _log.debug("ifconfig: сбой запуска (%s) — inet-интерфейс неприменим", exc)
         return ""
     if raw.get("timeout"):
         return ""
@@ -453,7 +465,9 @@ def _resolve_host(host):
     try:
         socket.getaddrinfo(host, 443)
         return True
-    except Exception:
+    except OSError as exc:
+        # socket.gaierror (NXDOMAIN/резолвер недоступен) — подкласс OSError (verify).
+        _log.debug("resolve %s: %s — DNS не резолвит", host, exc)
         return False
 
 
@@ -534,7 +548,8 @@ def _upstream_vps_reachable(node=None):
     if node is None:
         try:
             node = local_state.active_node() or {}
-        except Exception:
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            _log.debug("active_node() недоступен (%s) — VPS-probe неприменим", exc)
             node = {}
     host, port = _vps_endpoint(node)
     if host is None:
@@ -549,7 +564,8 @@ def _upstream_vps_reachable(node=None):
                           f"не маршрутизируется; замени на реальный VPS-адрес"}
     try:
         reachable = sys_probe.port_open(host, port, timeout=VPS_TCP_PROBE_TIMEOUT)
-    except Exception:
+    except OSError as exc:
+        _log.debug("TCP-probe %s:%s: %s — считаем VPS недоступным", host, port, exc)
         reachable = False
     if reachable:
         return {"status": "ok",
@@ -775,7 +791,8 @@ def _configured_claude_proxy():
     try:
         import claude_proxy
         return claude_proxy.status().get("proxy", "")
-    except Exception:
+    except ImportError as exc:
+        _log.debug("claude_proxy недоступен: %s — proxy считается не настроенным", exc)
         return ""
 
 
@@ -1222,11 +1239,13 @@ def _installed_versions_check():
     Не бросает (fail-soft: каждый источник изолирован try/except в sys_probe.run)."""
     try:
         codex_bins = _scan_codex_binaries()
-    except Exception:
+    except OSError as exc:
+        _log.debug("_scan_codex_binaries: %s — codex-инвентаризация пропущена", exc)
         codex_bins = []
     try:
         claude_bins = _scan_claude_code_binaries()
-    except Exception:
+    except OSError as exc:
+        _log.debug("_scan_claude_code_binaries: %s — claude-code-инвентаризация пропущена", exc)
         claude_bins = []
     detail = _format_versions_detail(codex_bins, claude_bins)
     if not codex_bins and not claude_bins:
@@ -1274,7 +1293,10 @@ def _codex_isolation_check():
         return {"status": "info",
                 "detail": f"PF codex kill-switch готов, но codex не запущен под uid "
                           f"{isolate_firewall.CODEX_USER} (sudo -u) — продакшн-запуск = follow-up."}
-    except Exception as exc:
+    except (ImportError, AttributeError, KeyError, OSError, subprocess.SubprocessError) as exc:
+        # ImportError — isolate_firewall недоступен; AttributeError/KeyError — probe_* вернул
+        # неожиданную форму (defensive); OSError/SubprocessError — сбой sys_probe.run/ps.
+        _log.info("codex-isolation check: сбой (%s: %s)", type(exc).__name__, exc)
         return {"status": "info", "detail": f"codex-isolation check: сбой ({str(exc)[:80]})."}
 
 
@@ -1570,7 +1592,8 @@ def _read_proxy_sources():
         data = claude_proxy._load()
         env = data.get("env", {}) if isinstance(data, dict) else {}
         cli_proxy = env.get("HTTPS_PROXY", "") or os.environ.get("HTTPS_PROXY", "")
-    except Exception:
+    except ImportError as exc:
+        _log.debug("claude_proxy недоступен: %s — cli_proxy пуст", exc)
         cli_proxy = ""
     return {"desktop_keys": desktop_keys, "cli_proxy": cli_proxy}
 
@@ -1861,7 +1884,8 @@ def _vscode_proxy_check():
     """
     try:
         import vscode_proxy
-    except Exception:
+    except ImportError as exc:
+        _log.debug("vscode_proxy недоступен: %s — check пропущен", exc)
         return {"status": "unknown", "detail": "vscode_proxy недоступен — check пропущен"}
     st = vscode_proxy.status()
     paths = st.get("paths") or {}
@@ -1938,7 +1962,9 @@ def _github_direct_check():
     try:
         import git_proxy
         st = git_proxy.status()
-    except Exception:
+    except (ImportError, RuntimeError, OSError, ValueError) as exc:
+        # ImportError — модуль недоступен; RuntimeError/OSError/ValueError — сбой status() (fail-soft).
+        _log.debug("git_proxy недоступен/сбой: %s — check пропущен", exc)
         return {"status": "unknown", "detail": "git_proxy недоступен — check пропущен"}
     # isinstance ДО .get: git_proxy.status может вернуть None/не-dict (мусор) — .get упал бы
     # (probe-канон: чек не бросает). git_proxy.status при timeout отдаёт {status:"unknown"} — это
@@ -2209,14 +2235,15 @@ def _notify(msg, sound="Glass"):
         WATCHDOG_NOTIFY_LOG.parent.mkdir(parents=True, exist_ok=True)
         with open(WATCHDOG_NOTIFY_LOG, "a", encoding="utf-8") as f:
             f.write(f"{datetime.now().isoformat()} [{sound}] {msg}\n")
-    except Exception:
-        pass  # лог — best-effort
+    except OSError as exc:
+        _log.warning("watchdog notify-log write failed: %s — audit trail неполон", exc)
     try:
         sys_probe.run([OSASCRIPT, "-e",
                        f'display notification "{msg}" with title "srouter" sound name "{sound}"'],
                       timeout=5)
-    except Exception:
-        pass  # нотификация — best-effort, не роняет watchdog
+    except (OSError, subprocess.SubprocessError) as exc:  # noqa: BLE001 — best-effort нотификация,
+        # не роняет watchdog при сбое osascript (top-level defensive fallback #109).
+        _log.debug("osascript notify failed: %s — нотификация пропущена, watchdog продолжает", exc)
 
 
 def _launchd_field(output, key):
@@ -2305,14 +2332,16 @@ def _record_watchdog_lifecycle():
     """
     try:
         current = _collect_launchd_lifecycle()
-    except Exception:
+    except (OSError, subprocess.SubprocessError, AttributeError, KeyError) as exc:
+        _log.debug("_collect_launchd_lifecycle failed: %s — lifecycle-снимок пропущен", exc)
         return
 
     previous = None
     try:
         if WATCHDOG_LIFECYCLE_STATE.exists():
             previous = json.loads(WATCHDOG_LIFECYCLE_STATE.read_text(encoding="utf-8"))
-    except Exception:
+    except (OSError, ValueError) as exc:
+        _log.debug("watchdog lifecycle state read failed: %s — baseline считается пустым", exc)
         previous = None
 
     if previous is not None and previous != current:
@@ -2327,8 +2356,8 @@ def _record_watchdog_lifecycle():
             }
             with open(WATCHDOG_LIFECYCLE_LOG, "a", encoding="utf-8") as log_file:
                 log_file.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
-        except Exception:
-            pass
+        except OSError as exc:
+            _log.warning("watchdog lifecycle-log write failed: %s — событие не записано", exc)
 
     try:
         WATCHDOG_LIFECYCLE_STATE.parent.mkdir(parents=True, exist_ok=True)
@@ -2336,8 +2365,9 @@ def _record_watchdog_lifecycle():
             json.dumps(current, ensure_ascii=False, sort_keys=True),
             encoding="utf-8",
         )
-    except Exception:
-        pass
+    except OSError as exc:
+        _log.warning("watchdog lifecycle-state write failed: %s — следующий прогон может ложно "
+                     "считать это baseline", exc)
 
 
 def _print_report(result):
@@ -2432,7 +2462,8 @@ def cmd_watchdog():
     cur = result["status"]
     try:
         prev = WATCHDOG_STATE.read_text().strip() if WATCHDOG_STATE.exists() else ""
-    except Exception:
+    except OSError as exc:
+        _log.debug("watchdog state read failed: %s — считаем fresh (пустой prev)", exc)
         prev = ""
 
     # Exact-state transitions (#109 + cycle-review #133 C1):
@@ -2451,8 +2482,9 @@ def cmd_watchdog():
 
     try:
         WATCHDOG_STATE.write_text(result["status"])
-    except Exception:
-        pass  # state — best-effort
+    except OSError as exc:
+        _log.warning("watchdog state write failed: %s — следующий прогон может ложно "
+                     "считать переход fresh", exc)
     return 0 if cur == "ok" else 1
 
 
