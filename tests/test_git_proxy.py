@@ -527,7 +527,8 @@ def test_rollback_failure_reports_distinct_state_not_generic_ok_false(monkeypatc
 
     def _fail_all_adds(cmd, **kwargs):
         # Роняем ЛЮБОЙ --add по KEY (и новую запись, и rollback-восстановление) — полный отказ.
-        if "--add" in cmd and git_proxy.KEY in cmd and git_proxy._BACKUP_KEY not in cmd:
+        # ИСКЛЮЧАЯ --add по _TXN_KEY (txn begin должен пройти, тестируем fallback после него)
+        if "--add" in cmd and git_proxy.KEY in cmd and git_proxy._BACKUP_KEY not in cmd and git_proxy._TXN_KEY not in cmd:
             return {"rc": 1, "out": "", "err": "simulated total failure", "timeout": False}
         return real_run(cmd, **kwargs)
 
@@ -668,3 +669,102 @@ def test_disable_self_heal_partial_restore_does_not_get_stuck_permanently(monkey
         "backup должен быть полностью восстановлен, ничего не потеряно безвозвратно"
     )
     assert git_proxy._backup_state()["present"] is False, "backup убран после успешного восстановления"
+
+
+# ==================== Issue #224: transactional-модель ====================
+# Round 5 cycle-review issue #222 показал, что эвристики "current похоже на X" (prefix-match,
+# value-match) не сходятся — нужен explicit transactional marker вместо reverse-engineering.
+
+def test_transactional_marker_survives_partial_failure_mid_write(monkeypatch, real_git_home):
+    """Regression (issue #224): если процесс убит посреди серии git config вызовов (--unset-all
+    затем несколько --add), следующая операция должна видеть ЯВНЫЙ маркер "операция начата,
+    целевой список = X" и доводить её до конца, НЕ угадывая по "current похоже на X".
+
+    Сценарий: enable() с multi-value foreign-состоянием [A,B,C].
+    1. _write_values(_BACKUP_KEY, [A,B,C]) прошёл успешно.
+    2. _write_values(KEY, [_PROXY]): --unset-all прошёл, первый --add[_PROXY] упал.
+    3. Процесс убит (SIGKILL) — rollback НЕ успел отработать.
+
+    После перезапуска disable() должен:
+    - Увидеть txn-маркер "операция в процессе, target = [_PROXY]"
+    - Понять, что это НЕ легитимное чужое значение, а прерванная транзакция
+    - Довести операцию до конца (retry --add[_PROXY])
+    - Снять txn-маркер только после подтверждённого успеха
+    """
+    _raw_set_add(git_proxy.KEY, "A", real_git_home)
+    _raw_set_add(git_proxy.KEY, "B", real_git_home)
+    _raw_set_add(git_proxy.KEY, "C", real_git_home)
+    real_run = sys_probe.run
+
+    call_count = {"add_proxy": 0}
+
+    def _fail_first_add_proxy_then_succeed(cmd, **kwargs):
+        # Роняем ТОЛЬКО первую попытку --add[_PROXY] после --unset-all
+        if cmd[-2:] == [git_proxy.KEY, git_proxy._PROXY]:
+            call_count["add_proxy"] += 1
+            if call_count["add_proxy"] == 1:
+                # Симулируем SIGKILL после первого отказа -- rollback не успевает
+                return {"rc": 1, "out": "", "err": "simulated crash", "timeout": False}
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(git_proxy.sys_probe, "run", _fail_first_add_proxy_then_succeed)
+
+    r = git_proxy.enable()
+
+    # Первая попытка упала — но транзакционный маркер зафиксировал target state
+    assert r["ok"] is False, "первая попытка честно репортит отказ"
+
+    # Проверяем, что txn-маркер установлен (если нет — тест детектит, что фикс не работает)
+    txn_key = git_proxy._BACKUP_KEY + "-txn"
+    txn_state = git_proxy._get_all(txn_key)
+    assert txn_state["present"] is True, "txn-маркер должен быть установлен после частичного отказа"
+
+    # Повторный enable() (после "рестарта процесса") должен довести транзакцию до конца
+    # НЕ угадывая "а вдруг текущее состояние похоже на что-то знакомое"
+    r2 = git_proxy.enable()
+    assert r2["ok"] is True, "повторная попытка должна довести транзакцию до конца"
+
+    # Проверяем, что состояние консистентно
+    assert git_proxy.status()["proxy"] == EXPECTED_GIT_PROXY
+    assert git_proxy._backup_state()["values"] == ["A", "B", "C"]
+
+    # Проверяем, что состояние консистентно
+    assert git_proxy.status()["proxy"] == EXPECTED_GIT_PROXY
+    assert git_proxy._backup_state()["values"] == ["A", "B", "C"]
+
+
+def test_transactional_marker_cleared_only_after_verified_success(monkeypatch, real_git_home):
+    """Regression (issue #224): txn-маркер должен сниматься ТОЛЬКО после подтверждённого
+    успеха (read-after-write verify). Если verify провалился — маркер остаётся, следующая
+    операция retry'ит.
+
+    Сценарий: проверяем напрямую, что _write_values возвращает ошибку при неудаче verify
+    и txn-маркер остаётся (не снимается).
+    """
+    _raw_set(git_proxy.KEY, "https://corp.example:8443", real_git_home)
+    real_run = sys_probe.run
+
+    call_count = {"get_all": 0}
+
+    def _fail_verify_then_succeed(cmd, **kwargs):
+        # Падаем на третьем --get-all для KEY (snapshot → unset-all verify → write verify)
+        if "--get-all" in cmd and cmd[-1] == git_proxy.KEY:
+            call_count["get_all"] += 1
+            # Падаем на третьем --get-all (verify после --add в _write_values)
+            if call_count["get_all"] == 3:
+                # rc=2 чтобы _get_all интерпретировал это как unknown=True
+                return {"rc": 2, "out": "", "err": "simulated verify failure", "timeout": False}
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(git_proxy.sys_probe, "run", _fail_verify_then_succeed)
+
+    # Тестируем напрямую _write_values, обходим enable() (он автоматически разрешает txn)
+    r = git_proxy._write_values(git_proxy.KEY, [git_proxy._PROXY])
+
+    # _write_values должен вернуть ошибку (verify упал)
+    assert r["ok"] is False, "_write_values должен вернуть ошибку при неудаче verify"
+
+    # txn-маркер должен остаться (не был снят, т.к. операция не завершена успешно)
+    txn_key = git_proxy._BACKUP_KEY + "-txn"
+    txn_state = git_proxy._get_all(txn_key)
+    assert txn_state["present"] is True, "txn-маркер должен остаться после failed verify"
