@@ -315,7 +315,7 @@ def _inspect_component(name, env, runner, port_checker, prior_detected=None):
     _proto, port = PORTS[name]
     try:
         listening = bool(port_checker("127.0.0.1", port, timeout=0.5))
-    except Exception:
+    except (OSError, TimeoutError, ValueError, TypeError, OverflowError) as exc:
         listening = False
 
     non_brew = [str(p) for p in paths["non_brew"] if p.exists()]
@@ -384,7 +384,7 @@ def _discover_probe_readiness(state_path, port_checker):
         try:
             port = int(port)
             ready = bool(port_checker("127.0.0.1", port, timeout=0.25))
-        except Exception:
+        except (OSError, TimeoutError, ValueError, TypeError, OverflowError) as exc:
             ready = False
         readiness[node.get("name") or ""] = {"socks_port": port, "ready": ready}
     return readiness
