@@ -35,11 +35,13 @@ def test_enable_writes_socks5_url(monkeypatch):
 
 
 def test_disable_unsets_key(monkeypatch):
-    """disable() снимает git-config ключ (--unset). rc=0 → ok."""
+    """disable() снимает git-config ключ (--unset), когда там наш managed-прокси. rc=0 → ok."""
     calls = []
 
     def _fake_run(cmd, **_kwargs):
         calls.append(cmd)
+        if "--get" in cmd:
+            return {"rc": 0, "out": EXPECTED_GIT_PROXY, "err": ""}
         return {"rc": 0, "out": "", "err": ""}
 
     monkeypatch.setattr(git_proxy.sys_probe, "run", _fake_run)
@@ -57,6 +59,57 @@ def test_disable_idempotent_when_key_absent(monkeypatch):
     r = git_proxy.disable()
 
     assert r["ok"] is True
+
+
+def test_disable_preserves_foreign_value(monkeypatch):
+    """Regression (Codex cycle-review PR #221): disable() НЕ должен трогать чужой/ручной прокси.
+
+    fail-closed provenance (канон vscode_proxy.disable — #112): снимать ключ можно только если
+    текущее значение == наш managed _PROXY. Корпоративный/ручной прокси (например
+    https://corp.example:8443) — НЕ наш, install→uninstall не должен его стирать.
+    """
+    store = {git_proxy.KEY: "https://corp.example:8443"}
+
+    def _fake_run(cmd, **_kwargs):
+        if "--get" in cmd:
+            val = store.get(git_proxy.KEY, "")
+            return {"rc": 0 if val else 1, "out": val, "err": ""}
+        if "--unset" in cmd:
+            had = git_proxy.KEY in store
+            store.pop(git_proxy.KEY, None)
+            return {"rc": 0 if had else 5, "out": "", "err": ""}
+        store[git_proxy.KEY] = cmd[-1]
+        return {"rc": 0, "out": "", "err": ""}
+
+    monkeypatch.setattr(git_proxy.sys_probe, "run", _fake_run)
+
+    r = git_proxy.disable()
+
+    assert r["ok"] is True
+    assert store.get(git_proxy.KEY) == "https://corp.example:8443", "чужое значение не тронуто"
+
+
+def test_disable_removes_own_managed_value(monkeypatch):
+    """disable() снимает ключ, когда значение == наш managed _PROXY (обычный srouter-путь)."""
+    store = {git_proxy.KEY: EXPECTED_GIT_PROXY}
+
+    def _fake_run(cmd, **_kwargs):
+        if "--get" in cmd:
+            val = store.get(git_proxy.KEY, "")
+            return {"rc": 0 if val else 1, "out": val, "err": ""}
+        if "--unset" in cmd:
+            had = git_proxy.KEY in store
+            store.pop(git_proxy.KEY, None)
+            return {"rc": 0 if had else 5, "out": "", "err": ""}
+        store[git_proxy.KEY] = cmd[-1]
+        return {"rc": 0, "out": "", "err": ""}
+
+    monkeypatch.setattr(git_proxy.sys_probe, "run", _fake_run)
+
+    r = git_proxy.disable()
+
+    assert r["ok"] is True
+    assert git_proxy.KEY not in store, "наш managed прокси снят"
 
 
 def test_round_trip_enable_disable_status(monkeypatch):

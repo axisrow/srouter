@@ -1143,9 +1143,12 @@ def cmd_uninstall(args) -> int:
     # env-cleanup fail-closed (issue #94 DEFECT A): мёртвый прокси остался в gui-домене → НЕ успех,
     # даже если всё остальное прошло. Раньше env_note просто конкатенировался в сообщение → fail-open
     # (rc=0 при живом socks5://127.0.0.1:10808 в GUI). ok=False пробрасываем в ненулевой rc.
-    # Шапка сообщения зависит от итога: «Откат завершён» только при подтверждённо снятом env И без
-    # leftover (issue #110 Дефект 1), иначе «Откат выполнен частично» — без противоречия rc=2.
-    full_ok = env_status["ok"] and not partial_configs
+    # Тот же инвариант — git-proxy (Codex cycle-review PR #221, issue #130): gp["ok"]=False раньше
+    # менял только текст (cp_note), но не rc → «Откат завершён» rc=0 при locked ~/.gitconfig, пока
+    # git всё ещё указывает на мёртвый 127.0.0.1:10808 (xray уже остановлен apply_uninstall).
+    # Шапка сообщения зависит от итога: «Откат завершён» только при подтверждённо снятом env И
+    # git-proxy И без leftover (issue #110 Дефект 1), иначе «Откат выполнен частично» — rc=2.
+    full_ok = env_status["ok"] and gp.get("ok", False) and not partial_configs
     headline = "Откат завершён" if full_ok else "Откат выполнен частично"
     print(f"{headline}: brew-сервисы остановлены, конфиги восстановлены/оставлены, "
           "DNS сброшен, LaunchAgent удалён"
@@ -1168,6 +1171,10 @@ def cmd_uninstall(args) -> int:
     if not env_status["ok"]:
         print(f"uninstall завершён с ошибкой: Codex env не подтверждённо снят — {env_status['note']}",
               file=sys.stderr)
+        return 2
+    if not gp.get("ok", False):
+        print(f"uninstall завершён с ошибкой: git github-proxy не подтверждённо снят — "
+              f"{gp.get('err', 'unknown')}", file=sys.stderr)
         return 2
     if partial_configs:
         return 2

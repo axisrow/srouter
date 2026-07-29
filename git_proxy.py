@@ -44,10 +44,22 @@ def enable():
 
 
 def disable():
-    """Снять KEY (--unset). {ok, err}. Идемпотентно: rc=5 (ключа не было) — успех."""
+    """Снять KEY, ТОЛЬКО если текущее значение == наш managed _PROXY. {ok, err}. Идемпотентно.
+
+    fail-closed provenance (канон vscode_proxy.disable, #112): value-match, НЕ безусловный --unset.
+    Codex cycle-review PR #221 — install→uninstall безусловного --unset стирал чужой корпоративный/
+    ручной github-proxy (round trip corp.example:8443 → ключ исчезал). Чужое значение оставляем.
+    """
+    current = status()
+    if current.get("status") == "unknown":
+        return {"ok": False, "err": "git config --get timeout"}
+    if not current.get("enabled"):
+        return {"ok": True}  # ключа уже нет — идемпотентно
+    if current.get("proxy") != _PROXY:
+        return {"ok": True}  # чужое значение — не трогаем (fail-closed provenance)
     r = sys_probe.run([GIT, "config", "--global", "--unset", KEY], timeout=5)
     rc = r.get("rc")
-    # rc=0 (снят) или rc=5 (раздел/ключ отсутствует) — оба успех. timeout/др. rc — ошибка.
+    # rc=0 (снят) или rc=5 (раздел/ключ отсутствует — гонка между status() и unset) — оба успех.
     if r.get("timeout") or rc not in (0, 5):
         return {"ok": False, "err": (r.get("err") or "git config --unset failed")[:200]}
     return {"ok": True}

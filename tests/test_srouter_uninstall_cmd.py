@@ -164,3 +164,22 @@ def test_cmd_uninstall_disables_git_proxy(monkeypatch):
 
     assert rc == 0
     assert calls["git_disable"] == 1, "uninstall обязан снять git-прокси автоматически (#130)"
+
+
+def test_cmd_uninstall_returns_nonzero_when_git_proxy_not_removed(monkeypatch, capsys):
+    """Regression (Codex cycle-review PR #221): git_proxy.disable() ok=False → rc=2 (fail-closed).
+
+    До фикса gp["ok"] влиял только на текст сообщения (cp_note), не на итоговый rc — locked/
+    read-only ~/.gitconfig или ошибка git config давали «Откат завершён» rc=0, пока git всё ещё
+    указывал на мёртвый 127.0.0.1:10808 (xray уже остановлен apply_uninstall). Тот же класс бага,
+    что issue #94 DEFECT A для env-cleanup — теперь применяем инвариант и к git-proxy.
+    """
+    _stub_cmd_uninstall_internals(monkeypatch, env_ok=True, tty=False)
+    monkeypatch.setattr(srouter, "git_proxy", SimpleNamespace(
+        disable=lambda: {"ok": False, "err": "git config --unset failed"}))
+
+    rc = srouter.cmd_uninstall(_args(yes=True))
+
+    assert rc == 2, f"git-proxy не снят → ненулевой rc (fail-closed), получил {rc}"
+    err = capsys.readouterr().err.lower()
+    assert "git" in err, f"stderr объясняет причину (git-proxy не снят): {err}"
