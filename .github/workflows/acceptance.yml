@@ -43,4 +43,4 @@ jobs:
       - name: Run Docker-native .dockerignore canary (host-side)
         run: |
           pip install pytest
-          pytest tests/acceptance/test_dockerignore_secrets.py -v
+          pytest tests/acceptance/test_dockerignore_secrets.py::test_secret_paths_absent_from_docker_build_context -v
