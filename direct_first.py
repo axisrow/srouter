@@ -94,8 +94,7 @@ def detect(*, path=None):
     for host in domains:
         try:
             ok, kind = direct_reachable(host)
-        except Exception:
-            # direct_reachable should never raise — boundary catch-all for safety.
+        except Exception:  # noqa: BLE001 — direct_reachable не должен бросать; boundary catch-all
             # Covers AttributeError (e.g., None.get), RuntimeError, and any other probe failures.
             # Treat as unreachable (safe fallback: route through proxy).
             ok, kind = False, "probe-error"

@@ -544,47 +544,6 @@ class TestTrafficShapeExceptionsBasic:
         assert hasattr(socket, 'gaierror'), "socket.gaierror должен быть доступен"
         assert hasattr(socket, 'timeout'), "socket.timeout должен быть доступен"
 
-# class TestTrafficShapeExceptions:
-#     """Тесты для traffic_shape.py exception handling."""
-#
-#     def test_resolve_domain_ip_dns_failure(self):
-#         """DNS resolution failure в resolve_domain_ip возвращает пустую строку."""
-#         import traffic_shape
-#         import socket
-#
-#         # Mock для DNS failure
-#         with patch('traffic_shape.socket.gethostbyname', side_effect=socket.gaierror("DNS lookup failed")):
-#             result = traffic_shape.resolve_domain_ip("example.com")
-#             assert result == "", "Должен возвращать пустую строку при DNS failure"
-#
-#     def test_apply_throttle_gaierror_fallback(self):
-#         """socket.gaierror в resolve_domain_ip обрабатывается корректно."""
-#         import traffic_shape
-#         import socket
-#
-#         with patch('traffic_shape.socket.gethostbyname', side_effect=socket.gaierror("DNS lookup failed")):
-#             result = traffic_shape.resolve_domain_ip("example.com")
-#             assert result == "", "Должен возвращать пустую строку при gaierror"
-#
-#     def test_deep_exception_defense_in_apply(self):
-#         """Глубокая защита в apply_throttle не бросает исключения."""
-#         import traffic_shape
-#
-#         # Вызов с невалидными параметрами должен возвращать error dict, а не бросать
-#         result = traffic_shape.apply_throttle("", "invalid")
-#         assert isinstance(result, dict), "Должен возвращать dict при любой ошибке"
-#         assert "ok" in result, "Result должен содержать ключ 'ok'"
-#         assert result["ok"] is False, "ok должен быть False при невалидных параметрах"
-#
-#     def test_deep_exception_defense_in_clear(self):
-#         """Глубокая защита в clear_throttle не бросает исключения."""
-#         import traffic_shape
-#
-#         # Вызов с любым токеном (даже None) не должен бросать
-#         result = traffic_shape.clear_throttle(None)
-#         assert isinstance(result, dict), "Должен возвращать dict при любой ошибке"
-#         assert "ok" in result, "Result должен содержать ключ 'ok'"
-
 class TestTrafficShapeExceptions:
     """Тесты для traffic_shape.py exception handling."""
 
@@ -824,7 +783,6 @@ class TestSysProbeExceptions:
     def test_run_timeout_expired_handling(self):
         """ProbeManager.run обрабатывает TimeoutExpired."""
         import probe_manager
-        import subprocess
 
         manager = probe_manager.ProbeManager()
 
