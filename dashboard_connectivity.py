@@ -1,5 +1,6 @@
 """Connectivity/channel helpers dashboard без импорта Flask/dashboard."""
 
+import logging
 import re
 import shlex
 
@@ -18,6 +19,8 @@ from dashboard_common import (
     _http_url,
     _probe_options,
 )
+
+_log = logging.getLogger("srouter.dashboard_connectivity")
 
 
 __all__ = [
@@ -120,7 +123,8 @@ def _parse_ifconfig_ifaces(text, default_iface, hardware_ports):
 def _connectivity_target():
     try:
         targets = _probe_options().get("reachability_targets", [])
-    except Exception:
+    except (AttributeError, TypeError, KeyError) as exc:
+        _log.debug("_connectivity_target: _probe_options недоступен (%s) — дефолтный target", exc)
         targets = []
     for target in targets:
         if _http_url(target):
@@ -203,7 +207,11 @@ def probe_connectivity():
             "metered_reason": reason,
             "status": status,
         }
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 — намеренно широкий top-level guard: probe_connectivity
+        # цепочкой зовёт несколько sys_probe.run + парсинг ifconfig/networksetup вывода
+        # (несколько модулей, несколько форматов текста); один непредвиденный сбой не должен
+        # ронять весь /api/status, поэтому catch-all с честным unknown-статусом и error в ответе.
+        _log.warning("probe_connectivity failed: %s", e)
         return {
             "active_iface": "",
             "default_iface": "",
@@ -302,7 +310,8 @@ def _known_service_name(name, services):
 def _configured_channel_service(target, services):
     try:
         state = local_state.load_state()
-    except Exception:
+    except (AttributeError, TypeError, KeyError) as exc:
+        _log.debug("_configured_channel_service: local_state.load_state недоступен (%s)", exc)
         state = {}
     network = state.get("network") if isinstance(state, dict) else {}
     channels = network.get("channels") if isinstance(network, dict) else {}

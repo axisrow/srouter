@@ -1,5 +1,6 @@
 """Node/DNS probe-хелперы dashboard без импорта Flask/dashboard."""
 
+import logging
 import re
 import threading
 import time
@@ -20,6 +21,8 @@ from dashboard_common import (
 )
 
 import lock_hierarchy
+
+_log = logging.getLogger("srouter.dashboard_nodes")
 
 
 __all__ = [
@@ -191,7 +194,8 @@ def probe_nodes_snapshot(state_path=None):
                 return stale  # лучше stale snapshot, чем жечь throughput из status poll.
     try:
         return [_empty_node_probe(n) for n in local_state.enabled_nodes(path=state_path)]
-    except Exception:
+    except (AttributeError, TypeError, KeyError) as exc:
+        _log.debug("probe_nodes_snapshot: local_state.enabled_nodes недоступен (%s) — пустой snapshot", exc)
         return []
 
 
@@ -225,7 +229,8 @@ def probe_nodes(state_path=None):
     try:
         nodes = local_state.enabled_nodes(path=state_path)
         opts = _probe_options(state_path=state_path)
-    except Exception:
+    except (AttributeError, TypeError, KeyError) as exc:
+        _log.debug("probe_nodes: local state недоступен (%s) — пустой результат", exc)
         return []
     if not nodes:
         return []
@@ -234,7 +239,13 @@ def probe_nodes(state_path=None):
         # Один битый узел не должен ломать весь dashboard: деградируем по ячейке.
         try:
             return _probe_node(node, opts)
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 — намеренно широкий per-node guard:
+            # _probe_node зовёт сеть/subprocess-цепочку (ping, geo, curl через per-node
+            # SOCKS) через несколько модулей; узкий список типов здесь легко разойдётся
+            # с реальным множеством ошибок transitively и один битый узел уронит
+            # весь multi-node probe. Деградация по ячейке важнее точной типизации.
+            _log.warning("probe_nodes: узел %r упал во время probe (%s) — статус unknown",
+                        node.get("name") if isinstance(node, dict) else node, exc)
             item = _empty_node_probe(node)
             item["status"] = "unknown"
             return item

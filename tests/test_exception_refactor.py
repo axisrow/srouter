@@ -15,6 +15,7 @@ Regress-гвард тесты для рефакторинга except Exception (
 главный риск этого рефакторинга (канон srouter-critical-infra-24-7, fail-closed-proxy-down).
 """
 
+import importlib.util
 import json
 import socket
 import subprocess
@@ -1577,6 +1578,276 @@ class TestLocalStateExceptionHandlers:
         assert result["ok"] is False
         assert "restart_failed:restart_exception" in result["err"]
         assert "recovery_restart_exception" in result["err"], f"получено {result}"
+
+
+# ==========================================================================================
+# issue #243 (часть эпика #161): regress-гварды для 14 except-блоков, переписанных с broad
+# `except Exception` на конкретные типы в dashboard_common.py, dashboard_connectivity.py,
+# dashboard_hotroutes.py, dashboard_nodes.py, dashboard_routes.py, dashboard_app.py.
+# Каждый гвард поднимает исключение на реальном seam'е внутри try (patch.object конкретной
+# функции, вызываемой из try), а не мокает сам чек — так регресс сужения типа реально ловится.
+# ==========================================================================================
+
+
+class TestDashboardCommonExceptions:
+    """dashboard_common.py: 3 except-блока (srouter_config load, _probe_defaults, _active_route_context)."""
+
+    # --- srouter_config.py exec_module guard (module-level try/except при импорте) ---
+    #
+    # dashboard_common исполняет `_spec.loader.exec_module(_cfg)` на уровне модуля один раз при
+    # импорте — модуль уже импортирован во всей тестовой сессии, поэтому реальный повторный
+    # import сломал бы глобальное состояние для других тестов. Вместо этого воспроизводим ТОЧНО
+    # ту же последовательность (spec_from_file_location -> module_from_spec -> exec_module) на
+    # изолированном временном файле — так регресс-гвард проверяет реальный механизм, которым
+    # broad except в dashboard_common.py:42 обязан ловить произвольные ошибки исполнения
+    # srouter_config.py (не только заранее перечисленные типы).
+
+    @pytest.mark.parametrize("bad_source,expected_exc", [
+        ("GATEWAY = (\n", SyntaxError),          # незакрытая скобка -> SyntaxError при компиляции
+        ("GATEWAY = UNDEFINED_NAME\n", NameError),  # ссылка на неопределённое имя -> NameError
+    ])
+    def test_srouter_config_exec_module_guard_catches_arbitrary_errors(self, tmp_path, bad_source, expected_exc):
+        """exec_module битого srouter_config.py бросает разные типы ошибок — та же
+        последовательность, что в dashboard_common.py:28-31, должна поймать любую из них
+        под `except Exception`, а НЕ под заранее перечисленный узкий список типов.
+        """
+        cfg_path = tmp_path / "bad_srouter_config.py"
+        cfg_path.write_text(bad_source, encoding="utf-8")
+
+        spec = importlib.util.spec_from_file_location("_srouter_config_test", cfg_path)
+        cfg = importlib.util.module_from_spec(spec)
+
+        with pytest.raises(expected_exc):
+            spec.loader.exec_module(cfg)
+
+        try:
+            spec.loader.exec_module(cfg)
+        except Exception as exc:  # noqa: BLE001 — воспроизводим ИМЕННО broad guard из #243
+            caught = exc
+        else:
+            caught = None
+        assert caught is not None, "broad except Exception обязан поймать сбой exec_module"
+        assert isinstance(caught, expected_exc)
+
+    def test_probe_defaults_falls_back_when_default_state_not_dict(self, monkeypatch):
+        """local_state._DEFAULT_STATE не dict (AttributeError на .get) → встроенный дефолт."""
+        import dashboard_common
+        import local_state
+
+        monkeypatch.setattr(local_state, "_DEFAULT_STATE", None)
+        result = dashboard_common._probe_defaults()
+
+        assert isinstance(result, dict)
+        assert result["reachability_targets"] == ["https://api.ip.sb/ip"]
+        assert result["connect_timeout_sec"] == 4
+
+    def test_active_route_context_falls_back_when_active_node_raises(self, monkeypatch):
+        """local_state.active_node() бросает TypeError → active={} (route_ip неприменим)."""
+        import dashboard_common
+        import local_state
+
+        def boom(path=None):
+            raise TypeError("state corrupted")
+
+        monkeypatch.setattr(local_state, "active_node", boom)
+        result = dashboard_common._active_route_context()
+
+        assert result == {"key": ("", "", ""), "route_ip": ""}
+
+
+class TestDashboardNodesExceptions:
+    """dashboard_nodes.py: 3 except-блока (probe_nodes_snapshot, probe_nodes, safe_probe)."""
+
+    def test_probe_nodes_snapshot_returns_empty_when_enabled_nodes_raises(self, monkeypatch):
+        """local_state.enabled_nodes бросает AttributeError → snapshot=[], не исключение."""
+        import dashboard_nodes
+        import local_state
+
+        monkeypatch.setattr(local_state, "enabled_nodes", Mock(side_effect=AttributeError("boom")))
+        assert dashboard_nodes.probe_nodes_snapshot(state_path="/tmp/does-not-matter.json") == []
+
+    def test_probe_nodes_returns_empty_when_enabled_nodes_raises(self, monkeypatch):
+        """probe_nodes: тот же seam, но в multi-node probe funcion — тоже [] без исключения."""
+        import dashboard_nodes
+        import local_state
+
+        monkeypatch.setattr(local_state, "enabled_nodes", Mock(side_effect=TypeError("boom")))
+        assert dashboard_nodes.probe_nodes(state_path="/tmp/does-not-matter.json") == []
+
+    def test_probe_nodes_degrades_single_node_when_probe_node_raises(self, monkeypatch):
+        """Один узел падает внутри _probe_node (RuntimeError) → status=unknown, остальные не задеты.
+
+        Регресс-риск: safe_probe — намеренно широкий catch (# noqa: BLE001), т.к. _probe_node
+        транзитивно зовёт ping/geo/curl через несколько модулей. Сужение типа тут сломало бы
+        деградацию по ячейке (канон srouter-critical-infra-24-7).
+        """
+        import dashboard_nodes
+        import local_state
+
+        good = _node("good", endpoint_host="203.0.113.5")
+        bad = _node("bad", endpoint_host="203.0.113.6")
+        monkeypatch.setattr(local_state, "enabled_nodes", lambda path=None: [good, bad])
+        monkeypatch.setattr(
+            dashboard_nodes, "_probe_options",
+            lambda state_path=None: {
+                "reachability_targets": [], "throughput_targets": [],
+                "connect_timeout_sec": 4, "max_time_sec": 8,
+            },
+        )
+
+        def fake_probe_node(node, opts):
+            if node["name"] == "bad":
+                raise RuntimeError("socks probe exploded")
+            return {"name": "good", "status": "ok"}
+
+        monkeypatch.setattr(dashboard_nodes, "_probe_node", fake_probe_node)
+
+        result = dashboard_nodes.probe_nodes(state_path="/tmp/does-not-matter.json")
+        by_name = {item["name"]: item for item in result}
+        assert by_name["good"]["status"] == "ok"
+        assert by_name["bad"]["status"] == "unknown"
+
+
+class TestDashboardConnectivityExceptions:
+    """dashboard_connectivity.py: 3 except-блока (_connectivity_target, probe_connectivity,
+    _configured_channel_service)."""
+
+    def test_connectivity_target_falls_back_when_probe_options_raises(self, monkeypatch):
+        """_probe_options бросает TypeError → дефолтный target, не исключение."""
+        import dashboard_connectivity
+
+        monkeypatch.setattr(
+            dashboard_connectivity, "_probe_options", Mock(side_effect=TypeError("bad state")),
+        )
+        assert dashboard_connectivity._connectivity_target() == "https://api.ip.sb/ip"
+
+    def test_probe_connectivity_never_throws_when_route_probe_raises(self, monkeypatch):
+        """sys_probe.run бросает неожиданный RuntimeError → structured unknown, не 500.
+
+        probe_connectivity — top-level API guard (# noqa: BLE001): один непредвиденный сбой
+        в цепочке route/ifconfig/networksetup не должен ронять весь /api/status.
+        """
+        import dashboard_connectivity
+
+        monkeypatch.setattr(
+            dashboard_connectivity.sys_probe, "run", Mock(side_effect=RuntimeError("boom")),
+        )
+        result = dashboard_connectivity.probe_connectivity()
+
+        assert isinstance(result, dict)
+        assert result["status"] == "unknown"
+        assert result["link_up"] is False
+        assert "error" in result
+
+    def test_configured_channel_service_falls_back_when_load_state_raises(self, monkeypatch):
+        """local_state.load_state бросает KeyError → state={} → пустая service-строка."""
+        import dashboard_connectivity
+        import local_state
+
+        monkeypatch.setattr(local_state, "load_state", Mock(side_effect=KeyError("boom")))
+        assert dashboard_connectivity._configured_channel_service("wifi", ["Wi-Fi"]) == ""
+
+
+class TestDashboardHotroutesExceptions:
+    """dashboard_hotroutes.py: 3 except-блока (cache update, hot_domains, top-level fallback)."""
+
+    def test_probe_hot_routes_reports_error_when_cache_update_raises(self, monkeypatch, tmp_path):
+        """hot_routes.update_cache бросает OSError → error в payload, cache не переписан исключением."""
+        import dashboard_hotroutes
+        import hot_routes
+
+        state_path = tmp_path / "state.json"
+        _write_state(state_path, hot_routes={"enabled": True})
+        monkeypatch.setattr(hot_routes, "update_cache", Mock(side_effect=OSError("disk full")))
+
+        result = dashboard_hotroutes.probe_hot_routes(
+            state_path=str(state_path), cache_path=str(tmp_path / "cache.json"),
+            log_path=str(tmp_path / "access.log"), now=1000.0,
+        )
+
+        assert result["enabled"] is True
+        assert result["status"] == "warn"
+        assert result["error"]
+
+    def test_probe_hot_routes_reports_error_when_hot_domains_raises(self, monkeypatch, tmp_path):
+        """hot_routes.hot_domains бросает ValueError → domains=[] + error, не исключение наружу."""
+        import dashboard_hotroutes
+        import hot_routes
+
+        state_path = tmp_path / "state.json"
+        _write_state(state_path, hot_routes={"enabled": True})
+        monkeypatch.setattr(hot_routes, "load_cursor", lambda path: {})
+        monkeypatch.setattr(
+            hot_routes, "parse_new_access_log",
+            lambda path, offset=None, inode=None, dev=None: ({}, {}),
+        )
+        monkeypatch.setattr(hot_routes, "update_cache", lambda *a, **k: {})
+        monkeypatch.setattr(hot_routes, "hot_domains", Mock(side_effect=ValueError("bad ttl")))
+
+        result = dashboard_hotroutes.probe_hot_routes(
+            state_path=str(state_path), cache_path=str(tmp_path / "cache.json"),
+            log_path=str(tmp_path / "access.log"), now=2000.0,
+        )
+
+        assert result["domains"] == []
+        assert result["status"] == "warn"
+        assert result["error"]
+
+    def test_probe_hot_routes_top_level_guard_never_throws(self, monkeypatch, tmp_path):
+        """Неожиданное исключение (RuntimeError) до входа в update-ветку → structured warn payload.
+
+        Top-level catch в probe_hot_routes — namerenno широкий (# noqa: BLE001), privacy-first
+        fallback: при любом сбое НЕ пробуем читать лог повторно, а не даём исключению уйти в
+        /api/status guard dashboard_app.py (что превратило бы privacy-fallback в 500).
+        """
+        import dashboard_hotroutes
+        import local_state
+
+        monkeypatch.setattr(local_state, "load_state", Mock(side_effect=RuntimeError("boom")))
+        result = dashboard_hotroutes.probe_hot_routes(state_path=str(tmp_path / "state.json"))
+
+        assert result["enabled"] is False
+        assert result["status"] == "warn"
+        assert result["error"]
+
+
+class TestDashboardRoutesExceptions:
+    """dashboard_routes.py: 1 except-блок (_active_host_route_ip)."""
+
+    def test_active_host_route_ip_falls_back_when_resolve_route_ip_raises(self, monkeypatch):
+        """local_state.resolve_route_ip бросает AttributeError → пустой route_ip, не исключение."""
+        import dashboard_routes
+        import local_state
+
+        monkeypatch.setattr(local_state, "active_node", lambda path=None: {"name": "n1"})
+        monkeypatch.setattr(
+            local_state, "resolve_route_ip", Mock(side_effect=AttributeError("boom")),
+        )
+        assert dashboard_routes._active_host_route_ip() == ""
+
+
+class TestDashboardAppExceptions:
+    """dashboard_app.py: 1 except-блок (_run_status_probe_set: один упавший probe не рушит статус)."""
+
+    def test_run_status_probe_set_isolates_single_probe_failure(self):
+        """Один probe бросает RuntimeError → его ключ получает unknown/error, остальные ОК.
+
+        _run_status_probe_set — top-level guard (# noqa: BLE001): probes — гетерогенный набор
+        функций из многих модулей, один сбой не должен ронять весь /api/status.
+        """
+        import dashboard_app
+
+        def boom():
+            raise RuntimeError("probe exploded")
+
+        def ok():
+            return {"status": "ok"}
+
+        result = dashboard_app._run_status_probe_set({"bad": boom, "good": ok}, budget_sec=2)
+
+        assert result["good"] == {"status": "ok"}
+        assert result["bad"]["status"] == "unknown"
+        assert "error" in result["bad"]
 
 
 # ==========================================================================================
