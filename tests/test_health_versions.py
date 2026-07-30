@@ -221,6 +221,12 @@ def test_check_all_status_ok_when_nothing_installed(monkeypatch, tmp_path):
     monkeypatch.setattr(health, "_installed_versions_check",
                         lambda: {"status": "unknown", "detail": "не установлено",
                                  "codex": [], "claude_code": []})
+    # #252 perf: GFW/direct-first (active_claude-путь) делают реальный curl без мока — секунды
+    # сетевого I/O на вызов (см. tests/test_health.py::_all_up_monkey для канона).
+    monkeypatch.setattr(health, "_gfw_domain_check",
+                        lambda *a, **kw: {"status": "ok", "detail": "mock: GFW не режет"})
+    monkeypatch.setattr(health, "_direct_first_check",
+                        lambda: {"status": "ok", "detail": "mock: direct-first reachable"})
     result = health.check_all(active_claude=True)
     assert result["status"] == "ok", "info-чек версий НЕ роняет вердикт"
     names = [c["name"] for c in result["checks"]]
@@ -346,6 +352,12 @@ def _all_up_drivers(monkeypatch):
     # реальный ps eww против dev-машины.
     monkeypatch.setattr(health, "_runtime_model_override_check",
                         lambda: {"status": "unknown", "detail": "mock"})
+    # #252 perf: GFW/direct-first (active_claude-путь) делают реальный curl без мока — секунды
+    # сетевого I/O на вызов (см. tests/test_health.py::_all_up_monkey для канона).
+    monkeypatch.setattr(health, "_gfw_domain_check",
+                        lambda *a, **kw: {"status": "ok", "detail": "mock: GFW не режет"})
+    monkeypatch.setattr(health, "_direct_first_check",
+                        lambda: {"status": "ok", "detail": "mock: direct-first reachable"})
 
 
 def test_versions_check_skipped_in_lightweight_health_watchdog_path(monkeypatch):

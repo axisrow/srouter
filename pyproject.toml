@@ -19,7 +19,7 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0"]
+dev = ["pytest>=7.0", "pytest-xdist>=3.8", "pytest-randomly>=4.1"]
 
 [project.scripts]
 srouter = "srouter:main"
@@ -68,6 +68,7 @@ py-modules = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-n auto"
 markers = [
     "acceptance: end-to-end приёмочные тесты реального CLI srouter в Docker-полигоне (skip без SROUTER_ACCEPTANCE=1)",
     "locks: threading/concurrency-тесты иерархии блокировок и watchdog (issue #159)",

@@ -195,14 +195,19 @@ def test_direct_probe_5xx_reachable_but_upstream_error():
 
 
 def test_direct_probe_strips_proxy_env(monkeypatch):
-    """Прямой curl идёт МИНУЯ прокси (env -u) — регресс-гвард канона zai-direct-no-proxy."""
+    """Прямой curl идёт МИНУЯ прокси (env -u) — регресс-гвард канона zai-direct-no-proxy.
+
+    sys_probe.direct_probe() зовёт _default_manager.direct_probe(), который зовёт self.run
+    (bound method на _default_manager) — патч module-level sys_probe.run не перехватывает
+    (issue #252 блокер: тест держался на реальной сети вместо мока).
+    """
     captured = {}
 
     def _fake_run(cmd, timeout, env=None):
         captured["env"] = env
         return {"rc": 0, "out": "404", "err": "", "timeout": False}
 
-    monkeypatch.setattr(sys_probe, "run", _fake_run)
+    monkeypatch.setattr(sys_probe._default_manager, "run", _fake_run)
     monkeypatch.setattr(os, "environ", {"HTTPS_PROXY": "http://127.0.0.1:8118",
                                         "HTTP_PROXY": "http://127.0.0.1:8118",
                                         "ALL_PROXY": "http://127.0.0.1:8118",

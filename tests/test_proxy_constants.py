@@ -308,7 +308,7 @@ def test_privoxy_system_helper_runs_isolated_without_dashboard_common(tmp_path):
         capture_output=True,
         text=True,
         env={"PATH": "/usr/bin:/bin", "HOME": "/var/root"},
-        timeout=15,
+        timeout=30,  # было 15: под -n auto CPU-contention python3-спавна иногда не укладывался (#252)
     )
     # Helper намеренно выходит ненулевым при не-root (root_required) — это его контракт, не падение.
     # Regression-критерий: импорт верхнего уровня НЕ должен падать на ModuleNotFoundError/dashboard_common.

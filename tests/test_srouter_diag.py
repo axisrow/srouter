@@ -64,7 +64,7 @@ def test_srouter_diag_reads_enabled_nodes_without_real_network(tmp_path):
         capture_output=True,
         env=env,
         text=True,
-        timeout=10,
+        timeout=25,  # было 10: под -n auto CPU-contention реального shell+python спавна (#252)
     )
 
     assert "sg-1" in result.stdout
@@ -96,7 +96,7 @@ def test_srouter_diag_missing_local_state_reports_friendly_error(tmp_path):
         capture_output=True,
         env=env,
         text=True,
-        timeout=10,
+        timeout=25,  # было 10: под -n auto CPU-contention реального shell+python спавна (#252)
     )
 
     assert result.returncode != 0
