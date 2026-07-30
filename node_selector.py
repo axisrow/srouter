@@ -153,8 +153,12 @@ def _default_runner(cmd_list, timeout):
         return {"rc": proc.returncode, "out": proc.stdout.strip(), "err": proc.stderr.strip(), "timeout": False}
     except subprocess.TimeoutExpired:
         return {"rc": None, "out": "", "err": "timeout", "timeout": True}
-    except (subprocess.CalledProcessError, OSError, ValueError) as exc:
-        # CalledProcessError: subprocess сбои; OSError: нет бинаря/прав; ValueError: невалидные аргументы
+    except Exception as exc:  # noqa: BLE001 — участник контракта «never throws», осознанно широкий (#238 шаг 3)
+        # subprocess.run вызывается БЕЗ check=True ⇒ CalledProcessError не бросается вовсе, зато
+        # бросаются IndexError (пустой argv), TypeError (не-str аргумент), ValueError (NUL в строке),
+        # OSError (нет бинаря/прав). _default_runner — дефолтный runner select_node, который обязан
+        # «никогда не бросать наружу» (#159) и зовётся из unguarded Flask-роута, поэтому перечислять
+        # типы здесь опасно: тип уже попадает в err через type(exc).__name__, контекст не теряется.
         return {"rc": None, "out": "", "err": f"{type(exc).__name__}: {exc}", "timeout": False}
 
 
@@ -184,8 +188,10 @@ def _pending_name(state_path=None):
 def _run_restart(runner):
     try:
         result = runner(list(XRAY_RESTART_CMD), _RESTART_TIMEOUT_SEC)
-    except (OSError, ValueError, RuntimeError) as exc:
-        # OSError: ошибки выполнения/бинарника; ValueError: невалидные аргументы; RuntimeError: ошибки runner
+    except Exception as exc:  # noqa: BLE001 — часть контракта «never throws» (#238 шаг 3)
+        # runner — инжектируемый (тесты, ppp-hook, select_node) и вызывается здесь БЕЗ обёртки
+        # в вызывающих (_rollback:222 зовёт напрямую, без try) — поэтому тип сбоя не под нашим
+        # контролем, а утечка отсюда пробивает и основной путь, и rollback внутри _select_node_locked.
         return {"rc": None, "out": "", "err": str(exc), "timeout": True}
     return result if isinstance(result, dict) else {"rc": None, "out": "", "err": "bad runner result", "timeout": True}
 
@@ -582,9 +588,12 @@ def _select_node_locked(name, *, enabled_names, runner=None, state_path=None, co
         if _auto_route_sync_enabled(state_path):
             result["route_sync"] = _sync_split_route(previous, name, state_path)
         return result
-    except (OSError, ValueError, KeyError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-        # OSError: ошибки файла/системы; ValueError: ошибки структуры/валидации;
-        # KeyError: отсутствует узел; subprocess: ошибки команд route/xray
+    except Exception as exc:  # noqa: BLE001 — top-level never-throws guard (#159), осознанно широкий (#238 шаг 3)
+        # select_node зовётся из unguarded Flask-роута (dashboard_routes.py) — утечка отсюда
+        # превращается в 500 вместо структурированного {"ok": false, ...}. Внутренние границы
+        # (_pending_active_hook, write_config, _rollback) заявляют свои типы, но эта — последняя
+        # линия обороны, и в проде уже случалось (commit 47acc47 восстановил RuntimeError в
+        # _active_name именно из-за сужения этого контракта).
         if begun:
             rollback = _rollback(state_path, config_path, runner)
             if not rollback.get("ok"):
@@ -675,6 +684,7 @@ def ensure_split_route(state_path=None):
         else:
             added = _sudo_route_ip("add", route_ip, gateway)
         return {"enabled": True, "added": added}
-    except (subprocess.TimeoutExpired, subprocess.CalledProcessError, OSError, ValueError) as exc:
-        # subprocess: route command failures; OSError: системные ошибки; ValueError: ошибки валидации
+    except Exception as exc:  # noqa: BLE001 — «не бросает» контракт, осознанно широкий (#238 шаг 3)
+        # Зовётся из ppp-hook (health.py:2506, от root) без своего try — r.get() сразу после
+        # вызова, поэтому утечка типа, не входящего в перечисленный список, крашит hook.
         return {"enabled": True, "error": f"ensure_split_route failed: {exc}"}

@@ -8,7 +8,6 @@ import json
 import os
 import re
 import socket
-import subprocess
 from pathlib import Path
 
 # Путь к локальному state по умолчанию — рядом с этим модулем, не cwd.
@@ -1359,9 +1358,12 @@ def _routing_apply_locked(config_path, state_path, outbound, hosts, action, adop
     if runner is not None and install_lib is not None:
         try:
             res = install_lib._restart_component("xray", runner, port_checker=port_checker)
-        except (OSError, ValueError, TypeError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
-            # OSError: системные ошибки; ValueError: ошибки валидации; TypeError: ошибки типа;
-            # subprocess: ошибки процесса xray
+        except Exception:  # noqa: BLE001 — транзакционная граница, осознанно широкий (issue #238 шаг 3)
+            # _restart_component делает stop ДО start и дёргает ИНЖЕКТИРУЕМЫЙ runner напрямую, поэтому
+            # тип исключения здесь не под нашим контролем (RuntimeError из runner'а — реальный кейс).
+            # Любая утечка отсюда фатальна: config+state уже записаны, xray уже остановлен → прокси
+            # лежит без откатов и без recovery-рестарта (каноны fail-closed-proxy-down,
+            # srouter-critical-infra-24-7). Ловим всё и уходим в штатный rollback ниже.
             res = {"rc": 1, "err": "restart_exception"}
         if res.get("rc") != 0 or res.get("timeout"):
             # atomic rollback к backup (tmp+fsync+replace); провал записи не оставляет config
@@ -1397,9 +1399,10 @@ def _routing_apply_locked(config_path, state_path, outbound, hosts, action, adop
                 recovery = install_lib._restart_component("xray", runner, port_checker=port_checker)
                 if recovery.get("rc") != 0 or recovery.get("timeout"):
                     recovery_err = f"; recovery_restart_failed:{recovery.get('err', 'unknown')}"
-            except (OSError, ValueError, TypeError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
-                # OSError: системные ошибки; ValueError: ошибки валидации; TypeError: ошибки типа;
-                # subprocess: ошибки процесса xray
+            except Exception:  # noqa: BLE001 — last-resort recovery, осознанно широкий (issue #238 шаг 3)
+                # Симметрично основному restart-catch: утечка отсюда оставила бы xray down с уже
+                # откаченным config'ом и без диагностики в err. Recovery — последний шанс поднять
+                # прокси, он обязан пережить любой тип сбоя runner'а.
                 recovery_err = "; recovery_restart_exception"
             # changed=True если что-то осталось изменённым (не полный rollback); False при полном откате
             changed = not (config_rollback_ok and state_rollback_ok)

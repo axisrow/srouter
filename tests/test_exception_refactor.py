@@ -1270,5 +1270,190 @@ class TestLocalStateExceptionHandlers:
         assert "recovery_restart_exception" in result["err"], f"получено {result}"
 
 
+# ==========================================================================================
+# cycle-review round 1: осознанные broad-catch границы (issue #238 шаг 3)
+#
+# Эти границы — НЕ обычные handler'ы, а документированные контракты «не бросает наружу»:
+#   - routing_apply       — «Не бросает (fail-soft)», транзакция config+state вокруг restart xray;
+#   - select_node          — «Функция никогда не бросает наружу» (#159), зовётся из unguarded
+#                            Flask-роута dashboard_routes.py:184;
+#   - ensure_split_route   — «Не бросает», зовётся из ppp-hook health.py:2506 (от root).
+# Сужение таких границ до конкретных типов ломает контракт: исключение уходит наружу, а в случае
+# routing_apply — ПОСЛЕ dispatched stop xray, оставляя прокси лежать с незакоммиченным rollback
+# (каноны fail-closed-proxy-down, srouter-critical-infra-24-7). Поэтому здесь broad catch осознан
+# и помечен noqa-директивой BLE001, как и предписывает issue #238 шаг 3.
+# ==========================================================================================
+
+
+class TestNeverThrowsBoundaries:
+    """Границы «не бросает наружу» обязаны держать ЛЮБОЙ Exception, не только перечисленные типы."""
+
+    # --- routing_apply: транзакционная граница вокруг restart xray ---
+
+    def test_routing_apply_runner_runtime_error_rolls_back_and_recovers(self, monkeypatch):
+        """runner бросает RuntimeError на start (stop уже прошёл) → НЕ бросает наружу,
+        config+state откачены byte-exact, recovery-рестарт предпринят.
+
+        Регресс round-1 (Codex critical): _restart_component дёргает runner напрямую и делает
+        stop ДО start. Сужение catch до (OSError, ValueError, TypeError, subprocess.*) пропускало
+        RuntimeError мимо обеих restart-границ, а внешний catch routing_apply ловит только OSError →
+        исключение уходило наружу с xray в stopped и БЕЗ откатов.
+        """
+        import local_state
+
+        calls = []
+
+        def runner(cmd, timeout):
+            calls.append(list(cmd))
+            if "start" in cmd:
+                raise RuntimeError("runner exploded during start")
+            return {"rc": 0, "out": "", "err": "", "timeout": False}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.json"
+            state_path = Path(tmpdir) / "state.json"
+            _write_xray_config(config_path)
+            _write_state(state_path, nodes=[_node("n1")], active_name="n1")
+            before_config = config_path.read_text(encoding="utf-8")
+            before_state = state_path.read_text(encoding="utf-8")
+
+            # port_checker=False → порт свободен, _restart_component доходит до start
+            result = local_state.routing_apply(
+                ["telegram.org"], config_path=str(config_path), state_path=str(state_path),
+                runner=runner, port_checker=lambda *a, **k: False,
+            )
+
+            after_config = config_path.read_text(encoding="utf-8")
+            after_state = state_path.read_text(encoding="utf-8")
+
+        assert any("stop" in c for c in calls), "stop обязан быть dispatched (иначе сценарий не тот)"
+        assert isinstance(result, dict), "routing_apply обязан вернуть dict, а не бросить"
+        assert result["ok"] is False
+        assert "restart_failed" in result["err"], f"получено {result}"
+        assert after_config == before_config, "config обязан быть откачен byte-exact"
+        assert after_state == before_state, "state обязан быть откачен byte-exact"
+        assert result["changed"] is False, "полный откат → changed=False"
+
+    def test_routing_apply_recovery_runtime_error_still_returns_dict(self, monkeypatch):
+        """И основной, и recovery restart бросают RuntimeError → dict с recovery_restart_exception."""
+        import sys
+        import local_state
+
+        calls = {"n": 0}
+
+        def always_boom(component, runner, port_checker=None):
+            calls["n"] += 1
+            raise RuntimeError("brew wedged")
+
+        fake = types.ModuleType("install_lib")
+        fake._restart_component = always_boom
+        monkeypatch.setitem(sys.modules, "install_lib", fake)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.json"
+            state_path = Path(tmpdir) / "state.json"
+            _write_xray_config(config_path)
+            _write_state(state_path, nodes=[_node("n1")], active_name="n1")
+            result = local_state.routing_apply(
+                ["telegram.org"], config_path=str(config_path), state_path=str(state_path),
+                runner=lambda *a, **k: {"rc": 0}, port_checker=lambda *a, **k: True,
+            )
+
+        assert calls["n"] >= 2, "и основной, и recovery рестарт обязаны быть вызваны"
+        assert isinstance(result, dict), "не бросает наружу даже когда recovery тоже упал"
+        assert "restart_failed:restart_exception" in result["err"]
+        assert "recovery_restart_exception" in result["err"], f"получено {result}"
+
+    # --- select_node: контракт «никогда не бросает наружу» (#159) ---
+
+    @pytest.mark.parametrize("exc", [TypeError("unexpected type"),
+                                     AttributeError("no attribute"),
+                                     RuntimeError("boom"),
+                                     KeyError("missing")])
+    def test_select_node_never_throws_for_any_exception(self, exc):
+        """Любое исключение внутри → структурированный dict, НЕ исключение наружу.
+
+        dashboard_routes.py:184 зовёт select_node без своего try/except и отдаёт результат в
+        jsonify → утечка исключения превращается в Flask 500 вместо {"ok": false, ...}.
+        """
+        import node_selector
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            _write_state(state_path, nodes=[_node("n1")], active_name="n1")
+
+            def boom(cmd, timeout):
+                raise exc
+
+            result = node_selector.select_node(
+                "n1", enabled_names={"n1"}, runner=boom,
+                state_path=str(state_path), config_path=str(Path(tmpdir) / "config.json"),
+            )
+
+        assert isinstance(result, dict), f"select_node бросил {type(exc).__name__} наружу"
+        assert result["ok"] is False
+        assert result.get("step"), "результат обязан нести step для диагностики"
+
+    def test_select_node_locked_catches_unlisted_exception(self):
+        """_select_node_locked (внутренняя граница) тоже держит незаявленный тип → step=internal."""
+        import node_selector
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            _write_state(state_path, nodes=[_node("n1")], active_name="n1")
+
+            def boom(cmd, timeout):
+                raise TypeError("unexpected type from runner")
+
+            result = node_selector._select_node_locked(
+                "n1", enabled_names={"n1"}, runner=boom,
+                state_path=str(state_path), config_path=str(Path(tmpdir) / "config.json"),
+            )
+
+        assert isinstance(result, dict)
+        assert result["ok"] is False
+
+    # --- _default_runner: реальные сбои subprocess.run, не только заявленные типы ---
+
+    @pytest.mark.parametrize("cmd_list,expected", [
+        ([], "IndexError"),                  # subprocess.run([]) → IndexError
+        (["/bin/echo", 5], "TypeError"),     # не-str аргумент → TypeError
+    ])
+    def test_default_runner_survives_degenerate_argv(self, cmd_list, expected):
+        """Вырожденный argv → typed err в dict, НЕ исключение наружу.
+
+        _default_runner — дефолтный runner select_node ⇒ участник контракта «никогда не бросает».
+        subprocess.run без check=True не бросает CalledProcessError вовсе, зато бросает
+        IndexError/TypeError, которых в суженном кортеже не было.
+        """
+        from node_selector import _default_runner
+
+        result = _default_runner(cmd_list, timeout=5)
+        assert isinstance(result, dict), f"{expected} ушёл наружу вместо dict"
+        assert result["rc"] is None
+        assert result["timeout"] is False, "сбой запуска — НЕ timeout (семантика issue #82)"
+        assert expected in result["err"], f"ожидался {expected} в err, получено {result['err']!r}"
+
+    # --- ensure_split_route: контракт «не бросает» (ppp-hook от root) ---
+
+    @pytest.mark.parametrize("exc", [TypeError("bad type"),
+                                     KeyError("missing"),
+                                     RuntimeError("boom")])
+    def test_ensure_split_route_never_throws_for_any_exception(self, monkeypatch, exc):
+        """Любое исключение → dict с enabled/error; health.py:2506 (ppp-hook) сразу делает r.get()."""
+        import node_selector
+
+        monkeypatch.setattr(node_selector, "_auto_route_sync_enabled", lambda p: True)
+
+        def boom(path=None):
+            raise exc
+
+        monkeypatch.setattr(node_selector.local_state, "active_node", boom)
+        result = node_selector.ensure_split_route("/tmp/state.json")
+        assert isinstance(result, dict), f"ensure_split_route бросил {type(exc).__name__} наружу"
+        assert result["enabled"] is True
+        assert "ensure_split_route failed" in result["error"]
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
