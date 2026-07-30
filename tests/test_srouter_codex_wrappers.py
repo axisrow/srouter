@@ -4,8 +4,15 @@ Codex (CLI + App) работает стабильно только через SO
 srouter install ставит ~/bin/codex-srouter + ~/bin/codex-app-proxy + LaunchAgent env-plist + ~/bin в PATH;
 uninstall убирает. Канон — _install_ppp_hook/_remove_ppp_hook (best-effort, marker-gate «чужое не
 трогать», строка-статус).
+
+Issue #251: subprocess.run(...) на реальный wrapper-скрипт использует timeout=30/45 (не 10/15) — под
+pytest-xdist -n 8 несколько десятков таких вызовов исполняются одновременно (каждый сам по себе
+спавнит readlink/stat/grep/env), и CPU-contention на 10-ядерной машине не укладывается в 10-15с
+(эмпирически подтверждено: TimeoutExpired ровно на границе timeout, воспроизводится с чистым PATH без
+реального ~/bin — т.е. дело не в гонке за общий каталог, а в тесном таймауте под параллельной нагрузкой).
 """
 import os
+import signal
 import subprocess
 from pathlib import Path
 
@@ -182,7 +189,7 @@ def test_cli_launcher_clears_inherited_privoxy_env(monkeypatch, tmp_path):
         "OUT": str(out_file),
     }
     subprocess.run([str(wrapper), "arg1"], env={**os.environ, **inherited},
-                   check=True, timeout=10)
+                   check=True, timeout=30)
     child = json.loads(out_file.read_text(encoding="utf-8"))
     for k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
               "http_proxy", "https_proxy", "all_proxy"):
@@ -202,7 +209,7 @@ def test_cli_launcher_forwards_argv_verbatim(monkeypatch, tmp_path):
     wrapper = _install_with_fake_codex(monkeypatch, tmp_path, fake_bin)
     args = ["--flag", "with space", "with'quote", "*.glob", "--", "-leading-dash"]
     subprocess.run([str(wrapper), *args], env={**os.environ, "OUT": "x"},
-                   check=True, timeout=10)
+                   check=True, timeout=30)
     forwarded = argv_file.read_text(encoding="utf-8").splitlines()
     assert forwarded == args, f"argv проброшен verbatim: {forwarded}"
 
@@ -977,7 +984,7 @@ def test_codex_function_beats_brew_in_path(monkeypatch, tmp_path):
         env={**os.environ,
              "PATH": f"{brew_dir}:{home}/bin:/usr/bin:/bin",
              "HOME": str(home)},
-        capture_output=True, text=True, timeout=15)
+        capture_output=True, text=True, timeout=45)
     whence = rc.stdout.splitlines()[0] if rc.stdout.strip() else ""
     assert "function" in whence, f"codex должен быть функцией (не brew-binary): {whence!r}"
     assert result_file.exists(), f"вызов дошёл до codex (через функцию): stderr={rc.stderr!r}"
@@ -1658,7 +1665,7 @@ def test_foreign_wrapper_recursion_cycle_breaks_not_timeout(monkeypatch, tmp_pat
         proc = subprocess.run(
             [str(wrapper), "x"],
             env={**os.environ, "PATH": f"{Path.home() / 'bin'}:{foreignbin}:{tmp_path / 'realdir'}:/usr/bin:/bin"},
-            capture_output=True, text=True, timeout=10)
+            capture_output=True, text=True, timeout=30)
     except subprocess.TimeoutExpired:
         pytest.fail("foreign-wrapper (зовущий managed codex-srouter) вызвал бесконечную рекурсию "
                     "managed→foreign→managed (rc=124 timeout) — cycle-guard не замыкается (#150/#153)")
@@ -1679,7 +1686,6 @@ def test_cycle_guard_pid_scoped_not_blocking_descendant(monkeypatch, tmp_path):
     обрыв), fork даёт новый PID (descendant → no match → легитимный вход, переписывает сентинель своим
     PID). Этот тест моделирует descendant через fork (background subshell `(...)&` = новый процесс).
     """
-    import subprocess
     import time
     home = _mock_home(monkeypatch, tmp_path)
     env = _env(tmp_path)
@@ -1699,13 +1705,41 @@ def test_cycle_guard_pid_scoped_not_blocking_descendant(monkeypatch, tmp_path):
         f'exit 0\n', encoding="utf-8")
     (real_codex_dir / "codex").chmod(0o755)
     caller_path = f"{home / 'bin'}:{real_codex_dir}:/usr/bin:/bin"
-    proc = subprocess.run([str(wrapper)],
-                          env={**os.environ, "PATH": caller_path},
-                          capture_output=True, text=True, timeout=15)
+    # Codex-review PR #253: этот процесс форкает descendant — на timeout нужно убить ВСЮ группу процессов
+    # (start_new_session=True + killpg), иначе descendant переживает kill прямого child (orphan-риск,
+    # см. process-group containment в fork_foreign_bounded ниже).
+    proc = _run_wrapper_containerized([str(wrapper)], env={**os.environ, "PATH": caller_path}, timeout=45)
     time.sleep(0.3)  # descendant background может дописывать маркер
     assert child_marker.exists() and child_marker.read_text(encoding="utf-8") == "ok", \
         (f"descendant codex (fork, новый PID) заблокирован ложным sentinel — regression nested-agent: "
          f"parent rc={proc.returncode}, stderr={proc.stderr!r}")
+
+
+def _run_wrapper_containerized(cmd, *, env, timeout):
+    """subprocess.run с process-group containment (Codex-review PR #253 critical finding).
+
+    Тесты в этом блоке намеренно моделируют fork-рекурсивные/fork-порождающие сценарии wrapper'а.
+    Голый subprocess.run(timeout=...) на TimeoutExpired убивает ТОЛЬКО прямого child — форкнутые
+    descendants (уже запущенные до истечения timeout) переживают kill и продолжают исполняться как
+    orphans (задокументированный инцидент здесь же: 1134+ orphan-процессов от идентичного паттерна,
+    см. test_cycle_guard_foreign_self_cycle_documented_limitation). Увеличение timeout (issue #251,
+    таймаут-раса под xdist) БЕЗ containment расширяло бы окно, в котором сломанный hop-ceiling мог бы
+    наплодить orphans, прежде чем тест вообще завершится. start_new_session=True сажает процесс в
+    свою process group (setsid); при TimeoutExpired killpg(pgid, SIGKILL) гарантированно убивает всё
+    дерево (родителя и уже запущенных потомков), а не только прямого child.
+    """
+    proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True, start_new_session=True)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        out, err = proc.communicate()
+        raise subprocess.TimeoutExpired(cmd, timeout, output=out, stderr=err)
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
 
 
 def test_cycle_guard_fork_foreign_bounded_not_process_bomb(monkeypatch, tmp_path):
@@ -1721,8 +1755,12 @@ def test_cycle_guard_fork_foreign_bounded_not_process_bomb(monkeypatch, tmp_path
     Hop-счётчик в sentinel (<pid>:<hop>): каждый fork-re-entry инкрементирует унаследованный hop; при
     hop > CEILING → обрыв rc=126. Отличает бесконтрольную fork-рекурсию (foreign) от bounded-вложенности
     легитимного descendant (которая «выдыхается» сама — процессы завершаются).
+
+    Codex-review PR #253 (critical, confidence 0.99): если hop-ceiling когда-нибудь регрессирует (ровно
+    баг, который этот тест обязан ловить), голый subprocess.run(timeout=...) на TimeoutExpired убивает
+    только прямого child — уже наплодившиеся descendants переживают и продолжают форкать (см. containment
+    в _run_wrapper_containerized выше). Используем её вместо голого subprocess.run.
     """
-    import subprocess
     home = _mock_home(monkeypatch, tmp_path)
     env = _env(tmp_path)
     monkeypatch.setattr(srouter, "_codex_bin_path", lambda: str(tmp_path / "any-codex"))
@@ -1740,9 +1778,8 @@ def test_cycle_guard_fork_foreign_bounded_not_process_bomb(monkeypatch, tmp_path
     (foreignbin / "codex").write_text(f'#!/bin/sh\n{managed_name} "$@"; exit $?\n', encoding="utf-8")
     (foreignbin / "codex").chmod(0o755)
     caller_path = f"{home / 'bin'}:{foreignbin}:{tmp_path / 'realdir'}:/usr/bin:/bin"
-    proc = subprocess.run([str(wrapper), "x"],
-                          env={**os.environ, "PATH": caller_path},
-                          capture_output=True, text=True, timeout=15)
+    proc = _run_wrapper_containerized([str(wrapper), "x"],
+                                       env={**os.environ, "PATH": caller_path}, timeout=45)
     assert proc.returncode == 126, \
         (f"fork-foreign должен bounded-обрываться rc=126 (hop-ceiling), не fork-bomb: "
          f"получено rc={proc.returncode}, stderr={proc.stderr[:200]!r}")
@@ -1805,7 +1842,7 @@ def test_cycle_guard_non_numeric_hop_resets_not_crash(monkeypatch, tmp_path):
     proc = subprocess.run([str(wrapper), "x"],
                           env={**os.environ, "PATH": caller_path,
                                "SROUTER_CODEX_WRAPPER_V1": "99999:not-a-number"},
-                          capture_output=True, text=True, timeout=10)
+                          capture_output=True, text=True, timeout=30)
     assert proc.returncode == 0, \
         f"non-numeric hop должен reset'нуться → штатный запуск (не arith-краш): rc={proc.returncode}, stderr={proc.stderr!r}"
 
@@ -1828,7 +1865,7 @@ def test_cycle_guard_runs_real_codex_on_single_pass(monkeypatch, tmp_path):
     proc = subprocess.run(
         [str(wrapper), "hello-arg"],
         env={**os.environ, "PATH": f"{Path.home() / 'bin'}:{tmp_path / 'realdir'}:/usr/bin:/bin"},
-        capture_output=True, text=True, timeout=10)
+        capture_output=True, text=True, timeout=30)
 
     assert proc.returncode == 0, f"однократный запуск — успех: {proc.stderr!r}"
     assert called.exists() and called.read_text(encoding="utf-8") == "hello-arg", \
@@ -1855,7 +1892,7 @@ def test_cycle_guard_preserves_caller_path(monkeypatch, tmp_path):
 
     subprocess.run([str(wrapper), "x"],
                    env={**os.environ, "PATH": caller_path},
-                   check=True, timeout=10)
+                   check=True, timeout=30)
     child_path = json.loads(out_file.read_text(encoding="utf-8"))
     assert child_path == caller_path, \
         f"PATH дочернего codex сохранён целиком (сентинель не PATH-санitизация): {child_path!r} != {caller_path!r}"
@@ -1932,7 +1969,7 @@ def test_wrapper_runtime_resolves_codex_from_caller_path(monkeypatch, tmp_path):
 
     subprocess.run([str(wrapper), "x"],
                     env={**os.environ, "PATH": f"{Path.home() / 'bin'}:{codex_dir}:/usr/bin:/bin"},
-                    check=True, timeout=10)
+                    check=True, timeout=30)
     assert called.exists(), "wrapper runtime-резолвнул и exec'нул codex из PATH"
     assert called.read_text(encoding="utf-8") == "real-codex", "exec'нут именно codex из PATH caller'а"
 
@@ -1950,7 +1987,7 @@ def test_wrapper_skips_itself_no_recursion(monkeypatch, tmp_path):
     # ~/bin ПЕРВЫМ в PATH (там wrapper), затем каталог с реальным codex. Без skip-self — рекурсия/timeout.
     subprocess.run([str(wrapper), "x"],
                     env={**os.environ, "PATH": f"{Path.home() / 'bin'}:{tmp_path / 'other'}:/usr/bin:/bin"},
-                    check=True, timeout=10)
+                    check=True, timeout=30)
     assert called.exists() and called.read_text(encoding="utf-8") == "real", \
         "wrapper пропустил себя (антирекурсия) и взял следующий codex из PATH"
 
@@ -1980,7 +2017,7 @@ def test_wrapper_skips_itself_hardlink_no_recursion(monkeypatch, tmp_path):
     try:
         subprocess.run([str(wrapper), "x"],
                         env={**os.environ, "PATH": f"{Path.home() / 'bin'}:{hardbin}:{tmp_path / 'realdir'}:/usr/bin:/bin"},
-                        check=True, timeout=10)
+                        check=True, timeout=30)
     except subprocess.TimeoutExpired:
         pytest.fail("hardlink-копия wrapper'а в PATH вызвала рекурсию (антирекурсия не ловит hardlink)")
     assert called.exists() and called.read_text(encoding="utf-8") == "real", \
@@ -2013,7 +2050,7 @@ def test_wrapper_skips_other_managed_copy_no_recursion(monkeypatch, tmp_path):
     try:
         subprocess.run([str(wrapper), "x"],
                         env={**os.environ, "PATH": f"{Path.home() / 'bin'}:{stalebin}:{tmp_path / 'realdir'}:/usr/bin:/bin"},
-                        check=True, timeout=10)
+                        check=True, timeout=30)
     except subprocess.TimeoutExpired:
         pytest.fail("две управляемые копии wrapper'а в PATH вызвали ping-pong рекурсию "
                     "(антирекурсия не распознаёт srouter-маркер у другой копии)")
@@ -2047,7 +2084,7 @@ def test_wrapper_picks_second_codex_when_two_binaries(monkeypatch, tmp_path):
     # Caller с PATH, где d2 ПЕРВЫМ (минуя wrapper в ~/bin): wrapper должен взять d2/codex.
     subprocess.run([str(wrapper), "x"],
                     env={**os.environ, "PATH": f"{Path.home() / 'bin'}:{d2}:{d1}:/usr/bin:/bin"},
-                    check=True, timeout=10)
+                    check=True, timeout=30)
     assert second_called.exists() and second_called.read_text(encoding="utf-8") == "second", \
         "caller с PATH→d2 дошёл до d2/codex через runtime-резолв (не до вшитого d1)"
     assert not first_called.exists(), "вшитый install-time codex НЕ выиграл у PATH caller'а"
@@ -2066,7 +2103,7 @@ def test_wrapper_runtime_resolves_after_binary_change(monkeypatch, tmp_path):
     (bin_slot / "codex").chmod(0o755)
     subprocess.run([str(wrapper), "x"],
                     env={**os.environ, "PATH": f"{Path.home() / 'bin'}:{bin_slot}:/usr/bin:/bin"},
-                    check=True, timeout=10)
+                    check=True, timeout=30)
     assert marker.read_text(encoding="utf-8") == "v1"
 
     # brew upgrade: тот же путь, другой binary. БЕЗ reinstall wrapper'а.
@@ -2074,7 +2111,7 @@ def test_wrapper_runtime_resolves_after_binary_change(monkeypatch, tmp_path):
     (bin_slot / "codex").chmod(0o755)
     subprocess.run([str(wrapper), "x"],
                     env={**os.environ, "PATH": f"{Path.home() / 'bin'}:{bin_slot}:/usr/bin:/bin"},
-                    check=True, timeout=10)
+                    check=True, timeout=30)
     assert marker.read_text(encoding="utf-8") == "v2", "runtime-резолв подхватил обновлённый binary"
 
 
