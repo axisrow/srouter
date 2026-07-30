@@ -12,6 +12,7 @@ pytest-xdist -n 8 несколько десятков таких вызовов 
 реального ~/bin — т.е. дело не в гонке за общий каталог, а в тесном таймауте под параллельной нагрузкой).
 """
 import os
+import signal
 import subprocess
 from pathlib import Path
 
@@ -1685,7 +1686,6 @@ def test_cycle_guard_pid_scoped_not_blocking_descendant(monkeypatch, tmp_path):
     обрыв), fork даёт новый PID (descendant → no match → легитимный вход, переписывает сентинель своим
     PID). Этот тест моделирует descendant через fork (background subshell `(...)&` = новый процесс).
     """
-    import subprocess
     import time
     home = _mock_home(monkeypatch, tmp_path)
     env = _env(tmp_path)
@@ -1705,13 +1705,41 @@ def test_cycle_guard_pid_scoped_not_blocking_descendant(monkeypatch, tmp_path):
         f'exit 0\n', encoding="utf-8")
     (real_codex_dir / "codex").chmod(0o755)
     caller_path = f"{home / 'bin'}:{real_codex_dir}:/usr/bin:/bin"
-    proc = subprocess.run([str(wrapper)],
-                          env={**os.environ, "PATH": caller_path},
-                          capture_output=True, text=True, timeout=45)
+    # Codex-review PR #253: этот процесс форкает descendant — на timeout нужно убить ВСЮ группу процессов
+    # (start_new_session=True + killpg), иначе descendant переживает kill прямого child (orphan-риск,
+    # см. process-group containment в fork_foreign_bounded ниже).
+    proc = _run_wrapper_containerized([str(wrapper)], env={**os.environ, "PATH": caller_path}, timeout=45)
     time.sleep(0.3)  # descendant background может дописывать маркер
     assert child_marker.exists() and child_marker.read_text(encoding="utf-8") == "ok", \
         (f"descendant codex (fork, новый PID) заблокирован ложным sentinel — regression nested-agent: "
          f"parent rc={proc.returncode}, stderr={proc.stderr!r}")
+
+
+def _run_wrapper_containerized(cmd, *, env, timeout):
+    """subprocess.run с process-group containment (Codex-review PR #253 critical finding).
+
+    Тесты в этом блоке намеренно моделируют fork-рекурсивные/fork-порождающие сценарии wrapper'а.
+    Голый subprocess.run(timeout=...) на TimeoutExpired убивает ТОЛЬКО прямого child — форкнутые
+    descendants (уже запущенные до истечения timeout) переживают kill и продолжают исполняться как
+    orphans (задокументированный инцидент здесь же: 1134+ orphan-процессов от идентичного паттерна,
+    см. test_cycle_guard_foreign_self_cycle_documented_limitation). Увеличение timeout (issue #251,
+    таймаут-раса под xdist) БЕЗ containment расширяло бы окно, в котором сломанный hop-ceiling мог бы
+    наплодить orphans, прежде чем тест вообще завершится. start_new_session=True сажает процесс в
+    свою process group (setsid); при TimeoutExpired killpg(pgid, SIGKILL) гарантированно убивает всё
+    дерево (родителя и уже запущенных потомков), а не только прямого child.
+    """
+    proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True, start_new_session=True)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        out, err = proc.communicate()
+        raise subprocess.TimeoutExpired(cmd, timeout, output=out, stderr=err)
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
 
 
 def test_cycle_guard_fork_foreign_bounded_not_process_bomb(monkeypatch, tmp_path):
@@ -1727,8 +1755,12 @@ def test_cycle_guard_fork_foreign_bounded_not_process_bomb(monkeypatch, tmp_path
     Hop-счётчик в sentinel (<pid>:<hop>): каждый fork-re-entry инкрементирует унаследованный hop; при
     hop > CEILING → обрыв rc=126. Отличает бесконтрольную fork-рекурсию (foreign) от bounded-вложенности
     легитимного descendant (которая «выдыхается» сама — процессы завершаются).
+
+    Codex-review PR #253 (critical, confidence 0.99): если hop-ceiling когда-нибудь регрессирует (ровно
+    баг, который этот тест обязан ловить), голый subprocess.run(timeout=...) на TimeoutExpired убивает
+    только прямого child — уже наплодившиеся descendants переживают и продолжают форкать (см. containment
+    в _run_wrapper_containerized выше). Используем её вместо голого subprocess.run.
     """
-    import subprocess
     home = _mock_home(monkeypatch, tmp_path)
     env = _env(tmp_path)
     monkeypatch.setattr(srouter, "_codex_bin_path", lambda: str(tmp_path / "any-codex"))
@@ -1746,9 +1778,8 @@ def test_cycle_guard_fork_foreign_bounded_not_process_bomb(monkeypatch, tmp_path
     (foreignbin / "codex").write_text(f'#!/bin/sh\n{managed_name} "$@"; exit $?\n', encoding="utf-8")
     (foreignbin / "codex").chmod(0o755)
     caller_path = f"{home / 'bin'}:{foreignbin}:{tmp_path / 'realdir'}:/usr/bin:/bin"
-    proc = subprocess.run([str(wrapper), "x"],
-                          env={**os.environ, "PATH": caller_path},
-                          capture_output=True, text=True, timeout=45)
+    proc = _run_wrapper_containerized([str(wrapper), "x"],
+                                       env={**os.environ, "PATH": caller_path}, timeout=45)
     assert proc.returncode == 126, \
         (f"fork-foreign должен bounded-обрываться rc=126 (hop-ceiling), не fork-bomb: "
          f"получено rc={proc.returncode}, stderr={proc.stderr[:200]!r}")
