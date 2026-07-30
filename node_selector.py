@@ -164,7 +164,7 @@ def _active_name(state_path=None):
     # поэтому чтение active обязано быть безопасным само по себе.
     try:
         active = local_state.active_node(path=state_path) or {}
-    except (OSError, ValueError, RuntimeError) as exc:
+    except (OSError, ValueError, RuntimeError):
         # OSError: ошибки файла/чтения; ValueError: JSON ошибка/невалидная структура;
         # RuntimeError: ошибки runtime/тестовые ошибки (never-throws contract)
         return None
@@ -242,7 +242,7 @@ def _pending_active_hook(pending_name, state_path):
             pending = local_state.get_node(pending_name, path=state_path)
             rendered = gen_xray_config._vless_outbound(pending, "active", state_path=state_path)
             return rendered if isinstance(rendered, dict) and rendered else outbound
-        except (OSError, ValueError, KeyError) as exc:
+        except (OSError, ValueError, KeyError):
             # OSError: ошибки файла; ValueError: ошибки структуры; KeyError: отсутствует узел
             return outbound
 
@@ -267,7 +267,7 @@ def _auto_route_sync_enabled(state_path):
     """True только при явном "auto_route_sync": true в state. Defensive: не бросает."""
     try:
         state = local_state.load_state(path=state_path)
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError):
         # OSError: ошибки файла/чтения; ValueError: JSON ошибки/невалидная структура
         return False
     return isinstance(state, dict) and state.get("auto_route_sync") is True
@@ -295,7 +295,7 @@ def _route_node_ip(name, state_path):
     try:
         node = local_state.get_node(name, path=state_path)
         route_ip = local_state.resolve_route_ip(node, path=state_path)
-    except (OSError, ValueError, KeyError) as exc:
+    except (OSError, ValueError, KeyError):
         # OSError: ошибки файла; ValueError: ошибки структуры/DNS; KeyError: отсутствует узел
         return ""
     return route_ip if _ip_literal(route_ip) else ""
@@ -308,7 +308,7 @@ def _gateway_literal():
         import srouter_config
 
         gateway = srouter_config.GATEWAY
-    except (ImportError, AttributeError, OSError) as exc:
+    except (ImportError, AttributeError, OSError):
         # ImportError: нет модуля; AttributeError: нет атрибута; OSError: ошибки файла
         return ""
     return gateway if _ip_literal(gateway) else ""
@@ -322,7 +322,7 @@ def _physical_iface_prefixes():
         import srouter_config
 
         raw = getattr(srouter_config, "PHYSICAL_IFACE_PREFIXES", ("en",))
-    except (ImportError, AttributeError, OSError) as exc:
+    except (ImportError, AttributeError, OSError):
         # ImportError: нет модуля; AttributeError: нет атрибута; OSError: ошибки файла
         return ("en",)
     if isinstance(raw, (list, tuple)):
@@ -425,7 +425,8 @@ def _sync_split_route(previous, name, state_path):
         if old_ip and old_ip != new_ip:
             result["removed"] = _route_result(_sudo_route_ip("remove", old_ip, gateway))
     except (subprocess.TimeoutExpired, subprocess.CalledProcessError, OSError, ValueError, RuntimeError) as exc:
-        # subprocess: route command failures; OSError: системные ошибки; ValueError: ошибки валидации; RuntimeError: mock ошибки в тестах
+        # subprocess: route command failures; OSError: системные ошибки;
+        # ValueError: ошибки валидации; RuntimeError: ошибки runner (в т.ч. mock в тестах)
         result["error"] = str(exc)
     return result
 
