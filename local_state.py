@@ -912,8 +912,8 @@ def resolve_route_ip(node, path=None):
         resolved = socket.gethostbyname(host)
         if resolved and _is_valid_host(resolved):
             return resolved
-    except (OSError, socket.gaierror, socket.herror, ValueError):
-        # OSError: сетевые ошибки; gaierror/herror: DNS ошибки; ValueError: невалидный host
+    except (OSError, ValueError):
+        # OSError: сетевые/DNS ошибки (gaierror/herror — подклассы OSError); ValueError: невалидный host
         pass
     return host  # fallback на endpoint_host
 
@@ -939,8 +939,8 @@ def read_xray_active_address(config_path=XRAY_CONFIG_PATH):
         return {"status": "absent", "address": ""}
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, ValueError):
-        # OSError: ошибки файла/чтения; JSONDecodeError: JSON ошибки; ValueError: невалидные данные
+    except (OSError, ValueError):
+        # OSError: ошибки файла/чтения; ValueError: невалидные данные (JSONDecodeError — подкласс ValueError)
         return {"status": "unreadable", "address": ""}
     if not isinstance(data, dict):
         return {"status": "unreadable", "address": ""}
@@ -1254,9 +1254,9 @@ def _routing_apply_locked(config_path, state_path, outbound, hosts, action, adop
     # 1. читать config (fail-soft)
     try:
         data = json.loads(Path(config_path).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, ValueError, TypeError):
-        # OSError: ошибки файла/чтения; JSONDecodeError: JSON ошибки;
-        # ValueError: невалидные данные; TypeError: ошибки типа данных
+    except (OSError, ValueError, TypeError):
+        # OSError: ошибки файла/чтения; ValueError: невалидные данные (JSONDecodeError — подкласс ValueError);
+        # TypeError: ошибки типа данных
         return {"ok": False, "changed": False, "err": "config_unreadable"}
     if not isinstance(data, dict):
         return {"ok": False, "changed": False, "err": "config_not_dict"}
