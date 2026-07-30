@@ -1225,7 +1225,7 @@ def state_protected(state_path):
     try:
         import local_state
         state = local_state.load_state(path=state_path)
-    except Exception:
+    except (OSError, ValueError, TypeError, ImportError) as exc:
         return False
     detected = state.get("detected_environment") if isinstance(state.get("detected_environment"), dict) else {}
     entry = detected.get("privoxy") if isinstance(detected.get("privoxy"), dict) else {}

@@ -431,7 +431,7 @@ def install_as_root(*, username, uid, gid, layout=DEFAULT_LAYOUT, runner=_run,
     raw = audit_launchdaemon_bytes(layout)
     try:
         plistlib.loads(raw)
-    except Exception as exc:
+    except (OSError, ValueError, TypeError, plistlib.InvalidFileException) as exc:
         return _result(False, error=f"audit_plist_invalid:{exc}")
     if not _atomic_write(layout.launchdaemon_path, raw, mode=0o644, uid=0, gid=0, chown=chown):
         return _result(False, error="audit_plist_write_failed")
