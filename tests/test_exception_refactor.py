@@ -116,6 +116,16 @@ class TestIsolateFirewallExceptions:
             result = isolate_firewall.enable_isolation(["api.anthropic.com"])
             assert result["ok"] is False, "ValueError должен возвращать ok=False"
 
+    def test_enable_isolation_type_error_on_malformed_domains(self):
+        """TypeError при malformed domains (целое число вместо списка) возвращает error (Codex P2)."""
+        import isolate_firewall
+
+        # Мокаем resolve_domain_ips чтобы выбросить TypeError при получении integer вместо списка
+        with patch('isolate_firewall.resolve_domain_ips', side_effect=TypeError("expected iterable, got int")):
+            result = isolate_firewall.enable_isolation(42)  # malformed: integer instead of list
+            assert result["ok"] is False, "TypeError на malformed domains должен возвращать ok=False"
+            assert "failed" in result["err"] or "type" in str(result["err"]).lower()
+
     def test_probe_isolation_type_error_returns_unknown_status(self):
         """TypeError в probe_isolation возвращает status=unknown (FAIL-CLOSED)."""
         import isolate_firewall
