@@ -164,8 +164,9 @@ def _active_name(state_path=None):
     # поэтому чтение active обязано быть безопасным само по себе.
     try:
         active = local_state.active_node(path=state_path) or {}
-    except (OSError, ValueError) as exc:
-        # OSError: ошибки файла/чтения; ValueError: JSON ошибка/невалидная структура
+    except (OSError, ValueError, RuntimeError) as exc:
+        # OSError: ошибки файла/чтения; ValueError: JSON ошибка/невалидная структура;
+        # RuntimeError: ошибки runtime/тестовые ошибки (never-throws contract)
         return None
     return active.get("name") if isinstance(active, dict) else None
 
