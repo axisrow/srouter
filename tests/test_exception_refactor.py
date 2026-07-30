@@ -726,10 +726,12 @@ class TestTrafficShapeExceptions:
         """Глубокая защита в clear_throttle не бросает исключения."""
         import traffic_shape
 
-        # Вызов с любым токеном (даже None) не должен бросать
-        result = traffic_shape.clear_throttle(None)
-        assert isinstance(result, dict), "Должен возвращать dict при любой ошибке"
-        assert "ok" in result, "Result должен содержать ключ 'ok'"
+        # clear_throttle всегда зовёт privileged _admin_run (osascript+pfctl/dnctl) — мокаем,
+        # тест не должен трогать реальный PF/dummynet на машине разработчика.
+        with patch('traffic_shape._admin_run', return_value={"ok": True, "rc": 0}):
+            result = traffic_shape.clear_throttle(None)
+            assert isinstance(result, dict), "Должен возвращать dict при любой ошибке"
+            assert "ok" in result, "Result должен содержать ключ 'ok'"
 
 
 class TestVSCodeProxyExceptions:
@@ -805,13 +807,16 @@ class TestClaudeProxyExceptions:
                     result = claude_proxy._load()
                     assert result == {}, "Должен возвращать пустой dict при JSON decode error"
 
-    def test_save_os_error_handling(self):
+    def test_save_os_error_handling(self, tmp_path):
         """_save обрабатывает OS ошибки и возвращает structured error."""
         import claude_proxy
 
-        result = claude_proxy._save({"test": "data"})
-        assert isinstance(result, dict), "Должен возвращать dict"
-        assert "ok" in result, "Result должен содержать ключ 'ok'"
+        # SETTINGS обязан быть замокан на tmp_path — _save атомарно пишет в реальный
+        # ~/.claude/settings.json, иначе тест затирает живой конфиг разработчика.
+        with patch('claude_proxy.SETTINGS', tmp_path / "settings.json"):
+            result = claude_proxy._save({"test": "data"})
+            assert isinstance(result, dict), "Должен возвращать dict"
+            assert "ok" in result, "Result должен содержать ключ 'ok'"
 
     def test_status_with_invalid_data(self):
         """status обрабатывает невалидные данные в settings.json."""
