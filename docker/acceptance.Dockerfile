@@ -78,4 +78,8 @@ USER root
 RUN touch /srouter-acceptance-sentinel
 
 # Дефолтный cmd — прогон acceptance-тестов с SROUTER_ACCEPTANCE=1 (включает skip'нутые вне полигона).
-CMD ["pytest", "tests/acceptance/", "-v"]
+# -n 0 (issue #252): addopts="-n auto" в pyproject.toml запускал acceptance-тесты параллельно —
+# несколько xdist-воркеров в ОДНОМ контейнере одновременно дерутся за общий brew-stub
+# (docker/stubs/brew.sh) singleton listener/pid-файл на udp/53 (dnsmasq) → dnsmasq_restart_failed.
+# Acceptance-тесты мутируют общесистемное состояние контейнера — не безопасны для параллелизма.
+CMD ["pytest", "tests/acceptance/", "-v", "-n", "0"]

@@ -28,7 +28,7 @@ jobs:
             -e SROUTER_ACCEPTANCE=1 \
             -e PYTHONUNBUFFERED=1 \
             srouter-acceptance \
-            pytest tests/acceptance/ -v
+            pytest tests/acceptance/ -v -n 0
 
       # Docker-native .dockerignore canary (issue #116) — host-side тест: собирает
       # docker/canary.Dockerfile ПРЯМО НА РАННЕРЕ (не внутри acceptance-контейнера, где нет docker
@@ -42,5 +42,5 @@ jobs:
 
       - name: Run Docker-native .dockerignore canary (host-side)
         run: |
-          pip install pytest
-          pytest tests/acceptance/test_dockerignore_secrets.py::test_secret_paths_absent_from_docker_build_context -v
+          pip install pytest pytest-xdist
+          pytest tests/acceptance/test_dockerignore_secrets.py::test_secret_paths_absent_from_docker_build_context -v -n 0

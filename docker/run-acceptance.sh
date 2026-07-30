@@ -17,11 +17,13 @@ docker build -f "$DOCKERFILE" -t "$IMAGE" .
 
 echo ""
 echo "==> Прогон acceptance-тестов (SROUTER_ACCEPTANCE=1)..."
+# -n 0 (issue #252): acceptance-тесты мутируют общесистемное состояние контейнера (brew-stub
+# singleton listener/pid-файл) — не безопасны для параллельного xdist-запуска.
 docker run --rm \
     -e SROUTER_ACCEPTANCE=1 \
     -e PYTHONUNBUFFERED=1 \
     "$IMAGE" \
-    pytest tests/acceptance/ -v "$@"
+    pytest tests/acceptance/ -v -n 0 "$@"
 
 echo ""
 echo "==> Готово. Контейнер удалён (--rm). Живой стек не затронут."
