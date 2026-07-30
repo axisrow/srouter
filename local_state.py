@@ -912,7 +912,8 @@ def resolve_route_ip(node, path=None):
         resolved = socket.gethostbyname(host)
         if resolved and _is_valid_host(resolved):
             return resolved
-    except Exception:
+    except (OSError, ValueError):
+        # OSError: сетевые/DNS ошибки (gaierror/herror — подклассы OSError); ValueError: невалидный host
         pass
     return host  # fallback на endpoint_host
 
@@ -938,7 +939,8 @@ def read_xray_active_address(config_path=XRAY_CONFIG_PATH):
         return {"status": "absent", "address": ""}
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
+    except (OSError, ValueError):
+        # OSError: ошибки файла/чтения; ValueError: невалидные данные (JSONDecodeError — подкласс ValueError)
         return {"status": "unreadable", "address": ""}
     if not isinstance(data, dict):
         return {"status": "unreadable", "address": ""}
@@ -984,7 +986,8 @@ def sync_route_ip_from_xray(name, xray_config_path=XRAY_CONFIG_PATH, path=None):
         state, readable = _load_state_checked(path)
         if not readable:
             return {"ok": False, "route_ip": ""}
-    except Exception:
+    except (OSError, ValueError, TypeError):
+        # OSError: ошибки файла; ValueError: ошибки структуры; TypeError: ошибки типа данных
         return {"ok": False, "route_ip": ""}
     nodes = _nodes_from_state(state)
     updated = False
@@ -999,7 +1002,8 @@ def sync_route_ip_from_xray(name, xray_config_path=XRAY_CONFIG_PATH, path=None):
     if updated:
         try:
             save_state(state, path)
-        except Exception:
+        except (OSError, ValueError, TypeError):
+            # OSError: ошибки записи; ValueError: ошибки структуры; TypeError: ошибки типа данных
             return {"ok": False, "route_ip": ""}
     return {"ok": True, "route_ip": address}
 
@@ -1107,7 +1111,8 @@ def sync_endpoint_from_xray(xray_config_path=XRAY_CONFIG_PATH, path=None):
         state, readable = _load_state_checked(path)
         if not readable:
             return {"ok": False, "endpoint": "", "changed": False}
-    except Exception:
+    except (OSError, ValueError, TypeError):
+        # OSError: ошибки файла; ValueError: ошибки структуры; TypeError: ошибки типа данных
         return {"ok": False, "endpoint": "", "changed": False}
 
     # Резолв target через active_node() — единственный источник правды «какой узел активен».
@@ -1140,7 +1145,8 @@ def sync_endpoint_from_xray(xray_config_path=XRAY_CONFIG_PATH, path=None):
     try:
         if save_state(state, path) is None:
             return {"ok": False, "endpoint": "", "changed": False}
-    except Exception:
+    except (OSError, ValueError, TypeError):
+        # OSError: ошибки записи; ValueError: ошибки структуры; TypeError: ошибки типа данных
         return {"ok": False, "endpoint": "", "changed": False}
     return {"ok": True, "endpoint": address, "changed": True}
 
@@ -1218,7 +1224,7 @@ def routing_apply(hosts, *, action="add", adopt=False, outbound=DEFAULT_ROUTING_
     # lazy import чтобы не тащить зависимость модуля при простом чтении state
     try:
         import install_lib
-    except Exception:
+    except ImportError:
         install_lib = None
 
     # ВСЯ транзакция (read config → read state → backup → modify → restart) под process-safe
@@ -1248,7 +1254,9 @@ def _routing_apply_locked(config_path, state_path, outbound, hosts, action, adop
     # 1. читать config (fail-soft)
     try:
         data = json.loads(Path(config_path).read_text(encoding="utf-8"))
-    except Exception:
+    except (OSError, ValueError, TypeError):
+        # OSError: ошибки файла/чтения; ValueError: невалидные данные (JSONDecodeError — подкласс ValueError);
+        # TypeError: ошибки типа данных
         return {"ok": False, "changed": False, "err": "config_unreadable"}
     if not isinstance(data, dict):
         return {"ok": False, "changed": False, "err": "config_not_dict"}
@@ -1284,7 +1292,8 @@ def _routing_apply_locked(config_path, state_path, outbound, hosts, action, adop
     #    (data-loss — теряет nodes/active_node/traffic_guard/isolate пользователя).
     try:
         state, state_readable = _load_state_checked(state_path)
-    except Exception:
+    except (OSError, ValueError, TypeError):
+        # OSError: ошибки файла; ValueError: ошибки структуры; TypeError: ошибки типа данных
         state, state_readable = None, False
     if not state_readable or not isinstance(state, dict):
         return {"ok": False, "changed": False, "err": "state_unreadable"}
@@ -1330,7 +1339,8 @@ def _routing_apply_locked(config_path, state_path, outbound, hosts, action, adop
         state["routing"]["outbound"] = outbound
         state["routing"]["last_applied_hash"] = _routing_domains_hash(new_domains)
         state_write_ok = save_state(state, state_path) is not None
-    except Exception:
+    except (OSError, ValueError, TypeError):
+        # OSError: ошибки записи; ValueError: ошибки структуры; TypeError: ошибки типа данных
         state_write_ok = False
     if not state_write_ok:
         # atomic rollback: tmp+fsync+replace, не truncate+write (ENOSPC не повредит production).
@@ -1348,7 +1358,12 @@ def _routing_apply_locked(config_path, state_path, outbound, hosts, action, adop
     if runner is not None and install_lib is not None:
         try:
             res = install_lib._restart_component("xray", runner, port_checker=port_checker)
-        except Exception:
+        except Exception:  # noqa: BLE001 — транзакционная граница, осознанно широкий (issue #238 шаг 3)
+            # _restart_component делает stop ДО start и дёргает ИНЖЕКТИРУЕМЫЙ runner напрямую, поэтому
+            # тип исключения здесь не под нашим контролем (RuntimeError из runner'а — реальный кейс).
+            # Любая утечка отсюда фатальна: config+state уже записаны, xray уже остановлен → прокси
+            # лежит без откатов и без recovery-рестарта (каноны fail-closed-proxy-down,
+            # srouter-critical-infra-24-7). Ловим всё и уходим в штатный rollback ниже.
             res = {"rc": 1, "err": "restart_exception"}
         if res.get("rc") != 0 or res.get("timeout"):
             # atomic rollback к backup (tmp+fsync+replace); провал записи не оставляет config
@@ -1384,7 +1399,10 @@ def _routing_apply_locked(config_path, state_path, outbound, hosts, action, adop
                 recovery = install_lib._restart_component("xray", runner, port_checker=port_checker)
                 if recovery.get("rc") != 0 or recovery.get("timeout"):
                     recovery_err = f"; recovery_restart_failed:{recovery.get('err', 'unknown')}"
-            except Exception:
+            except Exception:  # noqa: BLE001 — last-resort recovery, осознанно широкий (issue #238 шаг 3)
+                # Симметрично основному restart-catch: утечка отсюда оставила бы xray down с уже
+                # откаченным config'ом и без диагностики в err. Recovery — последний шанс поднять
+                # прокси, он обязан пережить любой тип сбоя runner'а.
                 recovery_err = "; recovery_restart_exception"
             # changed=True если что-то осталось изменённым (не полный rollback); False при полном откате
             changed = not (config_rollback_ok and state_rollback_ok)

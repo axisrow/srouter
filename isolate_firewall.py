@@ -38,13 +38,17 @@ ipaddress round-trip). Домены в shell НЕ попадают — dig вы�
 Функции не бросают: при сбое возвращают структированный dict.
 """
 import ipaddress
+import logging
 import re
+import subprocess
 
 import local_state
 import sys_probe
 import traffic_shape  # переиспользуем osascript-мост, валидаторы, парсер токена
 from dashboard_common import XRAY_SOCKS_PORT  # единый источник порта SOCKS5 (issue #155)
 from dashboard_common import _applescript_text  # единый канон экранирования (issue #154)
+
+logger = logging.getLogger("isolate_firewall")
 
 # ============================ константы (shell-safe) ============================
 PFCTL = "/sbin/pfctl"
@@ -321,7 +325,8 @@ def enable_strict():
             res["err"] = ("pf включён, но release-token не получен — enable-ref может течь; "
                           + (res["err"] or "")).rstrip("; ")
         return res
-    except Exception as exc:
+    except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
+        logger.error("enable_strict failed: %s", exc)
         return {**_reject(f"enable_strict failed: {exc}"), "token": None}
 
 
@@ -338,7 +343,8 @@ def disable_strict(token=None):
             steps.append(f"{PFCTL} -X {tok}")
         body = "; ".join(f"{step} || rc=1" for step in steps)
         return _admin_run(f"rc=0; {body}; exit $rc")
-    except Exception as exc:
+    except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
+        logger.error("disable_strict failed: %s", exc)
         return _reject(f"disable_strict failed: {exc}")
 
 
@@ -401,7 +407,8 @@ def enable_isolation(domains, ports=DEFAULT_PORTS, token=None):
             res["err"] = ("pf включён, но release-token не получен — enable-ref может течь; "
                           + (res["err"] or "")).rstrip("; ")
         return res
-    except Exception as exc:
+    except (OSError, ValueError, TypeError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
+        logger.error("enable_isolation failed: %s", exc)
         return {**_reject(f"enable_isolation failed: {exc}"), "token": None,
                 "domains": {}, "unresolved": [], "ports": list(ports or DEFAULT_PORTS)}
 
@@ -431,7 +438,8 @@ def refresh_isolation_ips(domains, ports=DEFAULT_PORTS, token=None):
         res["unresolved"] = unresolved
         res["ports"] = list(ports or DEFAULT_PORTS)
         return res
-    except Exception as exc:
+    except (OSError, ValueError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
+        logger.error("refresh_isolation_ips failed: %s", exc)
         return {**_reject(f"refresh failed: {exc}"),
                 "domains": {}, "unresolved": [], "ports": list(ports or DEFAULT_PORTS)}
 
@@ -448,7 +456,8 @@ def disable_isolation(token=None):
             steps.append(f"{PFCTL} -X {tok}")
         body = "; ".join(f"{step} || rc=1" for step in steps)
         return _admin_run(f"rc=0; {body}; exit $rc")
-    except Exception as exc:
+    except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
+        logger.error("disable_isolation failed: %s", exc)
         return _reject(f"disable_isolation failed: {exc}")
 
 
@@ -481,7 +490,8 @@ def enable_codex_isolation(token=None):
             res["err"] = ("pf включён, но release-token не получен — enable-ref может течь; "
                           + (res["err"] or "")).rstrip("; ")
         return res
-    except Exception as exc:
+    except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
+        logger.error("enable_codex_isolation failed: %s", exc)
         return {**_reject(f"enable_codex_isolation failed: {exc}"), "token": None}
 
 
@@ -498,7 +508,8 @@ def disable_codex_isolation(token=None):
             steps.append(f"{PFCTL} -X {tok}")
         body = "; ".join(f"{step} || rc=1" for step in steps)
         return _admin_run(f"rc=0; {body}; exit $rc")
-    except Exception as exc:
+    except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
+        logger.error("disable_codex_isolation failed: %s", exc)
         return _reject(f"disable_codex_isolation failed: {exc}")
 
 
@@ -530,7 +541,9 @@ def probe_isolation(state_path=None):
             status = "warn"   # working, но IP пустые (все домены unresolved)
         return {"status": status, "phase": phase, "domains": domains, "ips": ips,
                 "unresolved": unresolved, "ports": ports, "applied_at": applied_at}
-    except Exception as exc:
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        # fail-closed: любая ошибка чтения state = status unknown (не предполагаем успех)
+        logger.warning("probe_isolation failed to read state: %s", exc)
         return {"status": "unknown", "phase": "none", "error": str(exc),
                 "domains": [], "ips": {}, "unresolved": [], "ports": list(DEFAULT_PORTS)}
 
@@ -550,7 +563,9 @@ def probe_codex_isolation(state_path=None):
             return {"status": "down", "token": None, "applied_at": None}
         return {"status": "ok", "token": str(lease.get("token")),
                 "applied_at": lease.get("applied_at")}
-    except Exception as exc:
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        # fail-closed: любая ошибка чтения state = status unknown (не предполагаем успех)
+        logger.warning("probe_codex_isolation failed to read state: %s", exc)
         return {"status": "unknown", "token": None, "applied_at": None, "error": str(exc)}
 
 
@@ -591,7 +606,9 @@ def probe_codex_user():
                 "uid": found_uid if provisioned else None,
                 "name": name if provisioned else None,
                 "gid": found_gid if provisioned else None}
-    except Exception as exc:
+    except (OSError, ValueError, KeyError, AttributeError) as exc:
+        # fail-closed: любая ошибка чтения dscl = not provisioned (не предполагаем успех)
+        logger.warning("probe_codex_user failed to read user: %s", exc)
         return {"provisioned": False, "uid": None, "name": None, "gid": None, "error": str(exc)}
 
 
@@ -616,8 +633,9 @@ def _uid_in_use(uid):
                     continue  # наше имя — легитимно (уже provisioned)
                 return True
         return False
-    except Exception:
-        return True  # fail-closed
+    except Exception:  # noqa: BLE001
+        # fail-closed: при любой ошибке считаем uid заняты (не создаём поверх неизвестного)
+        return True
 
 
 def provision_codex_user():
@@ -658,7 +676,8 @@ def provision_codex_user():
         ]
         shell_cmd = " && ".join(steps)
         return _admin_run(shell_cmd)
-    except Exception as exc:
+    except (OSError, ValueError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
+        logger.error("provision_codex_user failed: %s", exc)
         return _reject(f"provision_codex_user failed: {exc}")
 
 
@@ -679,7 +698,8 @@ def deprovision_codex_user():
             return _reject("константа codex-user name невалидна")
         shell_cmd = f"{DSCL} . -delete /Users/{name}"
         return _admin_run(shell_cmd)
-    except Exception as exc:
+    except (OSError, ValueError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
+        logger.error("deprovision_codex_user failed: %s", exc)
         return _reject(f"deprovision_codex_user failed: {exc}")
 
 
