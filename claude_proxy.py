@@ -18,7 +18,9 @@ from urllib.parse import urlparse
 # black-box proof — реальный Claude Code должен получить ожидаемый API 401 (#127).
 try:
     from dashboard_common import HTTP_PROXY_URL as _PROXY  # http://127.0.0.1:8118
-except Exception:
+except SystemExit:
+    # dashboard_common raises SystemExit (BaseException) when srouter_config.py is missing.
+    # Fallback to canonical value (install-path compatibility — module must not crash).
     _PROXY = "http://127.0.0.1:8118"
 
 SETTINGS = Path.home() / ".claude" / "settings.json"
@@ -70,7 +72,10 @@ def _load():
     """Прочитать settings.json. Missing/non-JSON → {}. Не бросает."""
     try:
         return json.loads(SETTINGS.read_text(encoding="utf-8")) if SETTINGS.exists() else {}
-    except Exception:
+    except (OSError, json.JSONDecodeError, ValueError, TypeError):
+        # File read errors or JSON parsing failures: OSError on I/O errors,
+        # JSONDecodeError on malformed JSON, ValueError/TypeError on type issues.
+        # Fallback: empty dict (no proxy configured).
         return {}
 
 
@@ -82,7 +87,9 @@ def _save(data):
         tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         tmp.replace(SETTINGS)
         return {"ok": True}
-    except Exception as exc:
+    except (OSError, TypeError, ValueError) as exc:
+        # File write errors: OSError on I/O failures, TypeError on invalid data types,
+        # ValueError on JSON encoding failures. Return structured error (truncated).
         return {"ok": False, "err": str(exc)[:200]}
 
 

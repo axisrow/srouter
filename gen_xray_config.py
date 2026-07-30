@@ -89,7 +89,10 @@ def _safe_tag(value, fallback="node"):
 def _valid_host(value):
     try:
         return local_state._is_valid_host(value)
-    except Exception:
+    except (ValueError, TypeError, OSError, KeyError):
+        # local_state._is_valid_host raises ValueError/TypeError on invalid input,
+        # OSError on file read errors, KeyError on missing dict keys.
+        # Treat invalid host as False (fail-closed).
         return False
 
 
@@ -200,7 +203,10 @@ def _apply_outbound_hook(outbound, outbound_hook, *, node, role):
     try:
         patched = outbound_hook(copy.deepcopy(outbound), node=node, role=role)
         return patched if isinstance(patched, dict) else outbound
-    except Exception:
+    except Exception:  # noqa: BLE001 — extension boundary: any hook exception → fail-safe
+        # outbound_hook is arbitrary user code — catch everything to avoid aborting config generation.
+        # Covers RuntimeError, AttributeError, and any other user exceptions.
+        # Fallback: return original outbound (fail-safe).
         return outbound
 
 
@@ -390,7 +396,7 @@ def main(argv=None):
         else:
             print(text, end="")
         return 0
-    except Exception as exc:  # CLI-граница: не роняем stack trace в пользователя.
+    except Exception as exc:  # noqa: BLE001 — CLI-граница: не роняем stack trace в пользователя
         print(f"Ошибка генерации xray config: {exc}", file=sys.stderr)
         return 1
 

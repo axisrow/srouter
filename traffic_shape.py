@@ -179,7 +179,10 @@ def resolve_domain_ip(domain):
         return ""
     try:
         ip = socket.gethostbyname(domain)
-    except Exception:
+    except (OSError, socket.gaierror, socket.timeout):
+        # DNS resolution failures: socket.gethostbyname raises gaierror on DNS lookup failures,
+        # timeout on network timeouts, OSError on other network errors. Return empty string
+        # (caller treats as invalid/unreachable domain).
         return ""
     return ip if _ip_literal(ip) else ""
 
@@ -341,7 +344,7 @@ def apply_throttle(domain, rate):
             # best-effort rollback (второй промпт только здесь), ошибку не теряем.
             res["rollback"] = clear_throttle(token)
         return res
-    except Exception as exc:  # глубокая защита: функция не бросает, токен не теряем
+    except Exception as exc:  # noqa: BLE001 — глубокая защита: функция не бросает, токен не теряем
         return {**_reject(f"throttle failed: {exc}"), "token": token}
 
 
@@ -376,5 +379,5 @@ def clear_throttle(token=None):
         body = "; ".join(f"{step} || rc=1" for step in steps)
         shell_cmd = f"rc=0; {body}; exit $rc"
         return _admin_run(shell_cmd)
-    except Exception as exc:  # глубокая защита: функция не бросает
+    except Exception as exc:  # noqa: BLE001 — глубокая защита: функция не бросает
         return _reject(f"clear failed: {exc}")
