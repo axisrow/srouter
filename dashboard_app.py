@@ -5,6 +5,7 @@
 перенос кода, без редизайна. Роуты — в dashboard_routes.py (импортирует `app` отсюда).
 dashboard.py остаётся тонким фасадом и точкой входа (python3 dashboard.py).
 """
+import logging
 import threading
 import time
 from pathlib import Path
@@ -29,6 +30,8 @@ from dashboard_network import (
 from dashboard_nodes import probe_dns, probe_nodes_snapshot
 from dashboard_traffic import probe_traffic_guard
 import lock_hierarchy
+
+_log = logging.getLogger("srouter.dashboard_app")
 
 PORT = 8787
 STATUS_CACHE_TTL_SEC = 1.5
@@ -57,7 +60,11 @@ def _run_status_probe_set(probes, budget_sec):
                 continue
             try:
                 out[k] = f.result()
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 — намеренно широкий guard: probes — гетероген-
+                # ный набор функций из множества модулей (network/geo/hot_routes/isolate/...),
+                # каждая со своим набором возможных ошибок; один упавший probe не должен ронять
+                # весь /api/status, поэтому catch-all с честным unknown-статусом per-key.
+                _log.warning("status-probe %r failed: %s", k, e)
                 out[k] = {"status": "unknown", "error": str(e) or e.__class__.__name__}
     finally:
         ex.shutdown(wait=False, cancel_futures=True)

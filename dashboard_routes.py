@@ -5,6 +5,7 @@
 перенос кода, без редизайна. Flask app/gather_status/guard'ы — в dashboard_app.py, общие
 статус-хелперы — в dashboard_common.py. dashboard.py остаётся тонким фасадом.
 """
+import logging
 import re
 import time
 from flask import jsonify, request
@@ -23,6 +24,8 @@ import git_proxy  # вкл/откл git-прокси для github (через g
 import claude_proxy  # вкл/откл HTTPS_PROXY для Claude Code (~/.claude/settings.json)
 import health  # check_all для /health эндпоинта
 import privoxy_system  # protected system-service gate (#122)
+
+_log = logging.getLogger("srouter.dashboard_routes")
 
 
 # ============================ privileged: osascript-мост ============================
@@ -66,7 +69,8 @@ def _active_host_route_ip():
     try:
         active = local_state.active_node() or {}
         route_ip = local_state.resolve_route_ip(active)
-    except Exception:
+    except (AttributeError, TypeError, KeyError) as exc:
+        _log.debug("_active_host_route_ip: local_state недоступен (%s) — route_ip неприменим", exc)
         route_ip = ""
     return route_ip if _ip_literal(route_ip) else ""
 

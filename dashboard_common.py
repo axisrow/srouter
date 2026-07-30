@@ -1,9 +1,12 @@
 import importlib.util
 import ipaddress
+import logging
 import re
 from pathlib import Path
 
 import local_state
+
+_log = logging.getLogger("srouter.dashboard_common")
 
 # --- захардкоженные факты окружения (проверены) ---
 BREW = "/opt/homebrew/bin/brew"          # абсолютный путь: launchd/GUI PATH его не содержит
@@ -36,7 +39,10 @@ try:
     _raw_prefixes = getattr(_cfg, "PHYSICAL_IFACE_PREFIXES", ("en",))
 except FileNotFoundError:
     raise SystemExit("Нет srouter_config.py — скопируй: cp srouter_config.example.py srouter_config.py")
-except Exception as _exc:
+except Exception as _exc:  # noqa: BLE001 — намеренно широкий guard: exec_module выполняет
+    # произвольный код srouter_config.py, ошибка там может быть любого типа (SyntaxError,
+    # AttributeError, ValueError...). Любая из них должна остановить старт с понятным
+    # сообщением, а не тихо провалиться в трудноотлаживаемый AttributeError ниже по коду.
     raise SystemExit(f"srouter_config.py повреждён или неполон: {_exc}")
 
 # Нормализуем: только непустые строки-префиксы; битое значение → безопасный дефолт.
@@ -162,7 +168,8 @@ def _safe_port(value):
 def _probe_defaults():
     try:
         return local_state._DEFAULT_STATE.get("probes", {})
-    except Exception:
+    except AttributeError as exc:
+        _log.debug("local_state._DEFAULT_STATE недоступен (%s) — используется встроенный дефолт", exc)
         return {
             "reachability_targets": ["https://api.ip.sb/ip"],
             "throughput_targets": [{"url": "https://speed.cloudflare.com/__down?bytes=1048576", "bytes": 1048576}],
@@ -241,7 +248,8 @@ def _active_route_context():
     """Свежий route target без DNS. Hostname без route_ip не блокирует status path."""
     try:
         active = local_state.active_node() or {}
-    except Exception:
+    except (AttributeError, TypeError, KeyError) as exc:
+        _log.debug("local_state.active_node() недоступен (%s) — route_ip неприменим", exc)
         active = {}
     if not isinstance(active, dict):
         active = {}

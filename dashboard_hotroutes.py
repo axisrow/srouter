@@ -4,6 +4,7 @@
 ignored cache hot_routes только при enabled=true и отдаём top-N в /api/status.
 Роутинг и генератор xray здесь не трогаются.
 """
+import logging
 import threading
 import time
 
@@ -11,6 +12,8 @@ import hot_routes
 import local_state
 
 import lock_hierarchy
+
+_log = logging.getLogger("srouter.dashboard_hotroutes")
 
 
 HOT_ROUTES_UPDATE_THROTTLE_SEC = 60.0
@@ -244,7 +247,8 @@ def probe_hot_routes(state_path=None, cache_path=None, log_path=None, now=None):
                         bucket_size=opts["bucket_size"],
                         cursor=cursor,
                     )
-                except Exception as e:
+                except (OSError, ValueError, TypeError, KeyError) as e:
+                    _log.warning("probe_hot_routes: обновление кэша упало (%s) — используем прежний кэш", e)
                     cache = None
                     error = str(e) or e.__class__.__name__
                 if isinstance(cache, dict):
@@ -264,15 +268,18 @@ def probe_hot_routes(state_path=None, cache_path=None, log_path=None, now=None):
 
         try:
             names = hot_routes.hot_domains(path=cache_path, top_n=top_n, ttl=ttl, now=now_ts)
-        except Exception as e:
+        except (OSError, ValueError, TypeError, KeyError) as e:
+            _log.warning("probe_hot_routes: hot_domains упал (%s) — пустой top-N", e)
             names = []
             error = error or str(e) or e.__class__.__name__
         domains = _ranked_entries(names, _last_entries(key))
         status = "warn" if error else "ok"
         return _payload(True, status, domains, top_n, ttl, updated=updated, error=error)
-    except Exception as e:
-        # Privacy-first fallback: при любой неожиданной ошибке не пробуем читать
-        # лог повторно.
+    except Exception as e:  # noqa: BLE001 — намеренно широкий top-level guard: privacy-first
+        # fallback. probe_hot_routes читает privoxy access log (внешний файл, формат не под
+        # нашим контролем) и не должен ронять /api/status ни при каком сбое; любая неожиданная
+        # ошибка -> честный "warn" без повторного чтения лога, а не 500.
+        _log.warning("probe_hot_routes failed: %s", e)
         return _payload(
             False,
             "warn",
