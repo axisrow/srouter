@@ -648,15 +648,18 @@ class TestVSCodeProxyExceptions:
             result = vscode_proxy._load(invalid_path)
             assert result is None, "Должен возвращать None при JSON decode error"
 
-    def test_save_os_error_handling(self):
+    def test_save_os_error_handling(self, tmp_path):
         """_save обрабатывает OS ошибки и возвращает structured error."""
         import vscode_proxy
 
-        # Попытка записи в readonly путь
-        result = vscode_proxy._save(Path("/root/settings.json"), {"test": "data"})
-        assert isinstance(result, dict), "Должен возвращать dict"
-        assert result.get("ok") is False, "ok должен быть False при OS error"
-        assert "err" in result, "Result должен содержать ключ 'err'"
+        # Используем tmp_path и мокаем write_text для OS error
+        test_file = tmp_path / "settings.json"
+
+        with patch.object(Path, 'write_text', side_effect=OSError("Permission denied")):
+            result = vscode_proxy._save(test_file, {"test": "data"})
+            assert isinstance(result, dict), "Должен возвращать dict"
+            assert result.get("ok") is False, "ok должен быть False при OS error"
+            assert "err" in result, "Result должен содержать ключ 'err'"
 
     def test_enable_does_not_create_nonexistent_file(self):
         """enable не создаёт файл, если его не было."""
@@ -750,12 +753,16 @@ class TestGenXrayConfigExceptions:
         assert "inbounds" in result, "Result должен содержать 'inbounds'"
         assert "outbounds" in result, "Result должен содержать 'outbounds'"
 
-    def test_write_config_os_error_returns_false(self):
+    def test_write_config_os_error_returns_false(self, tmp_path):
         """write_config возвращает False при OS error."""
         import gen_xray_config
 
-        result = gen_xray_config.write_config("/root/readonly/config.json")
-        assert result is False, "Должен возвращать False при OS error"
+        # Используем tmp_path и мокаем файловые операции для OS error
+        test_file = tmp_path / "config.json"
+
+        with patch('gen_xray_config.generate_config', side_effect=OSError("Permission denied")):
+            result = gen_xray_config.write_config(str(test_file))
+            assert result is False, "Должен возвращать False при OS error"
 
 
 class TestGitProxyExceptions:

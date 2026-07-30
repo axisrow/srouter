@@ -13,8 +13,6 @@ verify-dont-guess: один probe, не дублируем). Reachable → в NO
 """
 from __future__ import annotations
 
-import subprocess
-
 import local_state
 import sys_probe
 
@@ -96,10 +94,10 @@ def detect(*, path=None):
     for host in domains:
         try:
             ok, kind = direct_reachable(host)
-        except (OSError, ValueError, TypeError, subprocess.CalledProcessError, subprocess.TimeoutExpired, RuntimeError):
-            # direct_reachable (via sys_probe.direct_probe) raises OSError on network errors,
-            # ValueError/TypeError on invalid response, subprocess errors on probe failures,
-            # RuntimeError on probe crashes. Treat as unreachable (safe fallback: route through proxy).
+        except Exception:
+            # direct_reachable should never raise — boundary catch-all for safety.
+            # Covers AttributeError (e.g., None.get), RuntimeError, and any other probe failures.
+            # Treat as unreachable (safe fallback: route through proxy).
             ok, kind = False, "probe-error"
         details[host] = kind
         (reachable if ok else blocked).append(host)

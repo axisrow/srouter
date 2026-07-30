@@ -203,9 +203,9 @@ def _apply_outbound_hook(outbound, outbound_hook, *, node, role):
     try:
         patched = outbound_hook(copy.deepcopy(outbound), node=node, role=role)
         return patched if isinstance(patched, dict) else outbound
-    except (ValueError, TypeError, OSError, KeyError):
-        # outbound_hook failures: ValueError/TypeError on invalid hook output,
-        # OSError on I/O errors, KeyError on missing dict keys.
+    except Exception:  # noqa: BLE001 — extension boundary: any hook exception → fail-safe
+        # outbound_hook is arbitrary user code — catch everything to avoid aborting config generation.
+        # Covers RuntimeError, AttributeError, and any other user exceptions.
         # Fallback: return original outbound (fail-safe).
         return outbound
 
