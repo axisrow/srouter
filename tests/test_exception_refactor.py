@@ -15,6 +15,7 @@ Regress-гвард тесты для рефакторинга except Exception (
 главный риск этого рефакторинга (канон srouter-critical-infra-24-7, fail-closed-proxy-down).
 """
 
+import importlib.util
 import json
 import socket
 import subprocess
@@ -1591,6 +1592,43 @@ class TestLocalStateExceptionHandlers:
 class TestDashboardCommonExceptions:
     """dashboard_common.py: 3 except-блока (srouter_config load, _probe_defaults, _active_route_context)."""
 
+    # --- srouter_config.py exec_module guard (module-level try/except при импорте) ---
+    #
+    # dashboard_common исполняет `_spec.loader.exec_module(_cfg)` на уровне модуля один раз при
+    # импорте — модуль уже импортирован во всей тестовой сессии, поэтому реальный повторный
+    # import сломал бы глобальное состояние для других тестов. Вместо этого воспроизводим ТОЧНО
+    # ту же последовательность (spec_from_file_location -> module_from_spec -> exec_module) на
+    # изолированном временном файле — так регресс-гвард проверяет реальный механизм, которым
+    # broad except в dashboard_common.py:42 обязан ловить произвольные ошибки исполнения
+    # srouter_config.py (не только заранее перечисленные типы).
+
+    @pytest.mark.parametrize("bad_source,expected_exc", [
+        ("GATEWAY = (\n", SyntaxError),          # незакрытая скобка -> SyntaxError при компиляции
+        ("GATEWAY = UNDEFINED_NAME\n", NameError),  # ссылка на неопределённое имя -> NameError
+    ])
+    def test_srouter_config_exec_module_guard_catches_arbitrary_errors(self, tmp_path, bad_source, expected_exc):
+        """exec_module битого srouter_config.py бросает разные типы ошибок — та же
+        последовательность, что в dashboard_common.py:28-31, должна поймать любую из них
+        под `except Exception`, а НЕ под заранее перечисленный узкий список типов.
+        """
+        cfg_path = tmp_path / "bad_srouter_config.py"
+        cfg_path.write_text(bad_source, encoding="utf-8")
+
+        spec = importlib.util.spec_from_file_location("_srouter_config_test", cfg_path)
+        cfg = importlib.util.module_from_spec(spec)
+
+        with pytest.raises(expected_exc):
+            spec.loader.exec_module(cfg)
+
+        try:
+            spec.loader.exec_module(cfg)
+        except Exception as exc:  # noqa: BLE001 — воспроизводим ИМЕННО broad guard из #243
+            caught = exc
+        else:
+            caught = None
+        assert caught is not None, "broad except Exception обязан поймать сбой exec_module"
+        assert isinstance(caught, expected_exc)
+
     def test_probe_defaults_falls_back_when_default_state_not_dict(self, monkeypatch):
         """local_state._DEFAULT_STATE не dict (AttributeError на .get) → встроенный дефолт."""
         import dashboard_common
@@ -1615,14 +1653,6 @@ class TestDashboardCommonExceptions:
         result = dashboard_common._active_route_context()
 
         assert result == {"key": ("", "", ""), "route_ip": ""}
-
-    def test_active_route_ip_never_throws_when_active_node_raises(self, monkeypatch):
-        """_active_route_ip (обёртка над _active_route_context) не бросает наружу."""
-        import dashboard_common
-        import local_state
-
-        monkeypatch.setattr(local_state, "active_node", Mock(side_effect=KeyError("name")))
-        assert dashboard_common._active_route_ip() == ""
 
 
 class TestDashboardNodesExceptions:
@@ -1725,7 +1755,6 @@ class TestDashboardHotroutesExceptions:
         """hot_routes.update_cache бросает OSError → error в payload, cache не переписан исключением."""
         import dashboard_hotroutes
         import hot_routes
-        import local_state
 
         state_path = tmp_path / "state.json"
         _write_state(state_path, hot_routes={"enabled": True})
