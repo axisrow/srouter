@@ -407,7 +407,7 @@ def enable_isolation(domains, ports=DEFAULT_PORTS, token=None):
             res["err"] = ("pf включён, но release-token не получен — enable-ref может течь; "
                           + (res["err"] or "")).rstrip("; ")
         return res
-    except (OSError, ValueError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
+    except (OSError, ValueError, TypeError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
         logger.error("enable_isolation failed: %s", exc)
         return {**_reject(f"enable_isolation failed: {exc}"), "token": None,
                 "domains": {}, "unresolved": [], "ports": list(ports or DEFAULT_PORTS)}
