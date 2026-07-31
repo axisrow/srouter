@@ -1213,8 +1213,22 @@ def test_routing_apply_serializes_concurrent_apply_no_lost_update(tmp_path, monk
     a_write_entered = threading.Event()
     a_release = threading.Event()
     a_done = threading.Event()
+    b_lock_attempted = threading.Event()
     real_atomic_write = local_state._atomic_write_text
+    real_lock = local_state._routing_config_lock
     write_seen = {"n": 0}
+
+    def observed_lock(path):
+        import contextlib
+
+        @contextlib.contextmanager
+        def wrapped():
+            if threading.current_thread().name == "apply-B":
+                b_lock_attempted.set()
+            with real_lock(path):
+                yield
+
+        return wrapped()
 
     def barrier_atomic_write(path, text):
         write_seen["n"] += 1
@@ -1224,6 +1238,7 @@ def test_routing_apply_serializes_concurrent_apply_no_lost_update(tmp_path, monk
         return real_atomic_write(path, text)
 
     monkeypatch.setattr(local_state, "_atomic_write_text", barrier_atomic_write)
+    monkeypatch.setattr(local_state, "_routing_config_lock", observed_lock)
 
     results = {}
     errors = {}
@@ -1249,7 +1264,8 @@ def test_routing_apply_serializes_concurrent_apply_no_lost_update(tmp_path, monk
     # A заходит, берёт flock, доходит до step-4 modify (a_write_entered). Теперь стартуем B.
     assert a_write_entered.wait(timeout=5.0), "A не дошёл до step-4 modify за отведённое время"
     th_b.start()
-    th_b.join(timeout=3.0)
+    assert b_lock_attempted.wait(timeout=1.0), "B не дошёл до попытки взять routing lock"
+    th_b.join(timeout=0.01)
     # B должен БЛОКИРОВАТЬСЯ на flock (A держит lock в step-4) — не завершился и не упал.
     assert not errors, f"apply упал исключением вместо ожидания lock: {errors}"
     assert th_b.is_alive(), (

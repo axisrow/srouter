@@ -612,11 +612,16 @@ def test_malformed_body_is_400_not_500(monkeypatch):
 # ============================ GET /api/guard: throttle-проекция без токена ============================
 def test_get_guard_exposes_active_throttle_without_token(monkeypatch):
     dashboard = _fresh_dashboard(monkeypatch)
+
+    def fake_guard(**kw):
+        return {"status": "ok", "rule_count": 0}
+
     monkeypatch.setattr(
         dashboard.local_state, "traffic_guard_config",
         lambda **kw: {"mode": "off", "domains": {}, "valid": True, "errors": []},
     )
-    monkeypatch.setattr(dashboard, "probe_traffic_guard", lambda **kw: {"status": "ok", "rule_count": 0})
+    monkeypatch.setattr(sys.modules["dashboard_routes"], "probe_traffic_guard", fake_guard)
+    assert sys.modules["dashboard_routes"].probe_traffic_guard is fake_guard
     monkeypatch.setattr(
         dashboard.local_state, "load_active_throttle",
         lambda path=None: {"domain": "x.example.com", "rate": 512, "token": "9", "applied_at": 1000},
@@ -637,11 +642,16 @@ def test_get_guard_exposes_active_throttle_without_token(monkeypatch):
 
 def test_get_guard_exposes_cleanup_lease_as_cleanup_required(monkeypatch):
     dashboard = _fresh_dashboard(monkeypatch)
+
+    def fake_guard(**kw):
+        return {"status": "ok", "rule_count": 0}
+
     monkeypatch.setattr(
         dashboard.local_state, "traffic_guard_config",
         lambda **kw: {"mode": "off", "domains": {}, "valid": True, "errors": []},
     )
-    monkeypatch.setattr(dashboard, "probe_traffic_guard", lambda **kw: {"status": "ok", "rule_count": 0})
+    monkeypatch.setattr(sys.modules["dashboard_routes"], "probe_traffic_guard", fake_guard)
+    assert sys.modules["dashboard_routes"].probe_traffic_guard is fake_guard
     monkeypatch.setattr(
         dashboard.local_state, "load_active_throttle",
         lambda path=None: {
@@ -667,11 +677,16 @@ def test_get_guard_exposes_cleanup_lease_as_cleanup_required(monkeypatch):
 
 def test_get_guard_throttle_none_when_inactive(monkeypatch):
     dashboard = _fresh_dashboard(monkeypatch)
+
+    def fake_guard(**kw):
+        return {"status": "ok", "rule_count": 0}
+
     monkeypatch.setattr(
         dashboard.local_state, "traffic_guard_config",
         lambda **kw: {"mode": "off", "domains": {}, "valid": True, "errors": []},
     )
-    monkeypatch.setattr(dashboard, "probe_traffic_guard", lambda **kw: {"status": "ok", "rule_count": 0})
+    monkeypatch.setattr(sys.modules["dashboard_routes"], "probe_traffic_guard", fake_guard)
+    assert sys.modules["dashboard_routes"].probe_traffic_guard is fake_guard
     monkeypatch.setattr(dashboard.local_state, "load_active_throttle", lambda path=None: None)
 
     assert dashboard.app.test_client().get("/api/guard").get_json()["throttle"] is None

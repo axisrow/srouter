@@ -208,15 +208,21 @@ def test_gather_status_returns_node_snapshot_without_running_heavy_probe(monkeyp
         time.sleep(0.2)
         return [{"name": "sg-1", "status": "ok"}]
 
-    # probe_nodes (ТЯЖЁЛЫЙ probe) патчится здесь лишь чтобы доказать: если бы gather_status
-    # его вызвала — тест бы это заметил через called/elapsed. gather_status использует
-    # ЛЁГКИЙ probe_nodes_snapshot (dashboard_nodes.py), который probe_nodes не зовёт —
-    # поэтому точка патчинга (dashboard vs dashboard_routes) здесь не влияет на результат.
-    monkeypatch.setattr(dashboard, "probe_nodes", slow_probe_nodes)
+    # Ставим ловушку в globals реальной gather_status. Сейчас она использует только
+    # лёгкий probe_nodes_snapshot; если вернётся тяжёлый probe_nodes, тест это заметит.
+    monkeypatch.setattr(dashboard_app, "probe_nodes", slow_probe_nodes, raising=False)
+    assert dashboard_app.probe_nodes is slow_probe_nodes
     monkeypatch.setattr(
         dashboard.local_state,
         "enabled_nodes",
-        lambda path=None: [{"name": "sg-1", "endpoint_host": "203.0.113.10", "route_ip": "203.0.113.10", "enabled": True}],
+        lambda path=None: [
+            {
+                "name": "sg-1",
+                "endpoint_host": "203.0.113.10",
+                "route_ip": "203.0.113.10",
+                "enabled": True,
+            }
+        ],
     )
 
     started = time.monotonic()

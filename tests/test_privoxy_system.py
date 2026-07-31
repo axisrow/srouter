@@ -492,6 +492,19 @@ def test_root_transaction_rolls_back_before_touching_user_job_on_bad_config_test
     staged.chmod(0o600)
     monkeypatch.setattr(privoxy_system, "_allowed_prefix", lambda value: str(value))
 
+    class FakeClock:
+        now = 0.0
+
+        def __call__(self):
+            return self.now
+
+        def sleep(self, seconds):
+            self.now += seconds
+
+    clock = FakeClock()
+    monkeypatch.setattr(privoxy_system.time, "monotonic", clock)
+    monkeypatch.setattr(privoxy_system.time, "sleep", clock.sleep)
+
     def runner(cmd, timeout):
         if cmd[:2] == [privoxy_system.LAUNCHCTL, "print"]:
             return {"rc": 0, "out": "loaded", "err": "", "timeout": False}
@@ -519,6 +532,7 @@ def test_root_transaction_rolls_back_before_touching_user_job_on_bad_config_test
     assert result["error"].startswith("config_test_failed")
     assert user_plist.exists()
     assert not layout.launchdaemon_path.exists()
+    assert clock.now >= 5.0
 
 
 def test_protect_as_root_runs_config_test_as_nobody_not_root(tmp_path, monkeypatch):
@@ -1490,4 +1504,3 @@ def test_install_helper_fail_closed_when_staged_substituted_after_mkstemp(tmp_pa
     assert result["error"] == "helper_digest_mismatch"
     # helper_path удалён (fail-closed cleanup) — attacker-bytes не остаются как helper.
     assert not layout.helper_path.exists()
-

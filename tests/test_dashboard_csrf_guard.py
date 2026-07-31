@@ -48,7 +48,8 @@ def _guard_all_mutations(monkeypatch, dashboard):
     def boom_switch(*a, **k):
         raise AssertionError("cross-origin запрос дошёл до switch_channel")
 
-    monkeypatch.setattr(dashboard, "switch_channel", boom_switch)
+    monkeypatch.setattr(sys.modules["dashboard_routes"], "switch_channel", boom_switch)
+    assert sys.modules["dashboard_routes"].switch_channel is boom_switch
 
     def enabled_nodes():
         return [{"name": "sg-1"}]
@@ -248,13 +249,15 @@ def test_missing_origin_and_fetch_metadata_passes_guard(monkeypatch):
 def test_get_routes_not_guarded(monkeypatch):
     """GET read-only роуты не трогаем даже с cross-origin Origin."""
     dashboard = _fresh_dashboard(monkeypatch)
-    monkeypatch.setattr(dashboard, "gather_status", lambda: {"ok": True})
+    dashboard_routes = sys.modules["dashboard_routes"]
+    monkeypatch.setattr(dashboard_routes, "gather_status", lambda: {"ok": True})
 
     response = dashboard.app.test_client().get(
         "/api/status", headers={"Origin": "http://evil.com"}
     )
 
     assert response.status_code == 200
+    assert response.get_json() == {"ok": True}
 
 
 def test_index_get_not_guarded(monkeypatch):
