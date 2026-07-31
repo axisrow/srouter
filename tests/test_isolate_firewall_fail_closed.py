@@ -265,7 +265,71 @@ def test_provision_codex_user_noop_when_already_provisioned(monkeypatch):
     assert result["ok"] is True, f"ожидали no-op success: {result}"
 
 
-# ============================ 4. граница роута: 500 структурированный, не пробитый стек ============================
+# ============================ 4. CLI-граница: launchd получает exit-code, не стек ============================
+# main() — вторая привилегированная граница наряду с Flask-роутом: её вызывает launchd
+# (com.srouter.isolate.plist → enable-strict, com.srouter.isolate-refresh.plist → refresh,
+# com.srouter.isolate-escape.plist → disable-strict). Движок теперь fail-closed, но main()
+# читает local_state ДО вызова движка — и этот участок обязан держать тот же контракт,
+# иначе повреждённый lease валит job стеком вместо честного exit-кода.
+# Мутирующие команды: сбой обязан дать ненулевой код (launchd-jobs enable-strict/refresh/
+# disable-strict живут здесь — им нужен честный fail, а не тихий успех).
+CLI_MUTATING_COMMANDS = ["enable", "disable", "refresh", "enable-codex", "disable-codex",
+                         "enable-strict", "disable-strict"]
+
+# Диагностические read-only команды: контракт probe-слоя — ВСЕГДА напечатать статус,
+# включая "unknown" при нечитаемом state. Ненулевой код здесь был бы неверен: отсутствие
+# ответа и ответ «не знаю» — разные вещи, и launchd их не запускает (см. plists).
+CLI_STATUS_COMMANDS = ["status", "status-codex", "status-codex-user"]
+
+
+@pytest.mark.parametrize("exc", UNEXPECTED_EXCEPTIONS, ids=_ids(UNEXPECTED_EXCEPTIONS))
+@pytest.mark.parametrize("cmd", CLI_MUTATING_COMMANDS)
+def test_cli_returns_exit_code_on_state_failure(cmd, exc, monkeypatch, boom):
+    """Сбой чтения state → ненулевой exit-code, не проброс исключения в launchd.
+
+    launchd не различает «упало со стеком» и «вернуло 2» иначе как по коду возврата;
+    непойманное исключение = job помечен crashed, а причина видна только в логе.
+    Контракт CLI: всегда int, как у любой main()-обёртки.
+    """
+    def _raise(*args, **kwargs):
+        raise exc
+    for fn in ("load_active_isolate", "load_active_codex_isolate", "load_state"):
+        monkeypatch.setattr(isolate_firewall.local_state, fn, _raise)
+    boom(exc)
+
+    rc = isolate_firewall.main([cmd])
+
+    assert isinstance(rc, int), f"{cmd}: main() обязана вернуть int, вернула {type(rc).__name__}"
+    assert rc != 0, f"{cmd}: сбой обязан дать ненулевой exit-code, получили {rc}"
+
+
+@pytest.mark.parametrize("exc", UNEXPECTED_EXCEPTIONS, ids=_ids(UNEXPECTED_EXCEPTIONS))
+@pytest.mark.parametrize("cmd", CLI_STATUS_COMMANDS)
+def test_cli_status_never_raises_on_state_failure(cmd, exc, monkeypatch, boom):
+    """status-команды при нечитаемом state печатают статус и возвращают int, не бросают.
+
+    Контракт probe-слоя (unknown вместо ok/down) уже держит движок; здесь фиксируется,
+    что CLI-обёртка его не ломает и что диагностика остаётся доступной именно тогда,
+    когда что-то сломано — иначе оператор теряет инструмент в самый нужный момент.
+    """
+    def _raise(*args, **kwargs):
+        raise exc
+    for fn in ("load_active_isolate", "load_active_codex_isolate", "load_state"):
+        monkeypatch.setattr(isolate_firewall.local_state, fn, _raise)
+    boom(exc)
+
+    rc = isolate_firewall.main([cmd])
+
+    assert isinstance(rc, int), f"{cmd}: main() обязана вернуть int, вернула {type(rc).__name__}"
+
+
+def test_cli_returns_zero_on_success(monkeypatch):
+    """Позитивный путь CLI: успешный enable-strict → exit 0 (фикс не ломает happy-path)."""
+    monkeypatch.setattr(isolate_firewall.sys_probe, "run", _ok_run("3"))
+    assert isolate_firewall.main(["enable-strict"]) == 0
+
+
+# ============================ 5. граница роута: 500 структурированный, не пробитый стек ============================
 def test_isolate_enable_route_reports_structured_error(monkeypatch):
     """Сбой движка на границе Flask → JSON-ответ 500, а не необработанное исключение.
 

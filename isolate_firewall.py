@@ -717,7 +717,25 @@ def deprovision_codex_user():
 
 # ============================ CLI (для launchd jobs) ============================
 def main(argv=None):
-    """CLI для launchd: enable/disable/refresh/enable-strict/disable-strict/status + codex."""
+    """CLI для launchd: enable/disable/refresh/enable-strict/disable-strict/status + codex.
+
+    Fail-closed обёртка (issue #260): launchd не различает «упало со стеком» и «вернуло 2»
+    иначе как по коду возврата, поэтому CLI обязан держать тот же контракт, что и движок —
+    всегда int, никогда исключение. Гейт один, в корне: ветки ниже читают local_state ДО
+    вызова движка, и оборачивать каждую по отдельности значило бы плодить дублирующий слой.
+
+    SystemExit пробрасывается намеренно: argparse завершает так штатный `--help`/ошибку
+    разбора аргументов, и подменять её кодом 2 значило бы ломать контракт argparse.
+    """
+    try:
+        return _main_impl(argv)
+    except Exception as exc:  # noqa: BLE001 — fail-closed контракт, см. модульный docstring
+        logger.error("isolate_firewall CLI failed: %s", exc)
+        return 2
+
+
+def _main_impl(argv=None):
+    """Тело CLI. Бросать МОЖЕТ — исключения ловит fail-closed обёртка main()."""
     import argparse
     p = argparse.ArgumentParser(prog="isolate_firewall", description="PF-изоляция Proxy-доменов.")
     sub = p.add_subparsers(dest="cmd", required=True)
