@@ -64,6 +64,17 @@ def _all_up_monkey(monkeypatch, *, probe_status="ok", probe_detail="runtime: к�
     # иначе реальный launchd на dev-машине (protected/brew-mode, живой/мёртвый privoxy/xray)
     # драйвит вердикт недетерминированно. _port_up уже мокаем True выше → ok по контракту.
     monkeypatch.setattr(health, "_service_running", lambda label, domain=None: "running")
+    # #252 perf: _gfw_domain_check/_direct_first_check (active_claude-путь) делают РЕАЛЬНЫЙ прямой
+    # curl (env -u) к github.com/z.ai через sys_probe.direct_probe — без мока каждый
+    # check_all(active_claude=True) в сьюте платит секунды сетевого I/O (cProfile: ~4.4s + ~1.6s
+    # на вызов, топ-1 виновник времени сьюта в #251). Тесты, которым нужен реальный wiring этих
+    # чеков (test_gfw_domain_check_*/test_direct_first_check_*), переопределяют мок ПОСЛЕ этого
+    # вызова через _mock_domain_probe/_mock_direct_first — late-binding monkeypatch.setattr
+    # гарантирует, что их мок побеждает (эта функция вызывается первой везде).
+    monkeypatch.setattr(health, "_gfw_domain_check",
+                        lambda *a, **kw: {"status": "ok", "detail": "mock: GFW не режет"})
+    monkeypatch.setattr(health, "_direct_first_check",
+                        lambda: {"status": "ok", "detail": "mock: direct-first reachable"})
 
 
 # ============================ _claude_proxy_probe (детект lsof) ============================
@@ -955,6 +966,12 @@ def _mock_doctor_only_checks(monkeypatch):
     Предмет check_all-тестов GFW — wiring (чек присутствует/info-only), не эти тяжёлые пробы.
     Без моков active_claude-путь тормозит на реальных binary-сканированиях/transport-probe (как
     test_check_all_has_privoxy_log_check_info_only мокает их же). Канон: детерминизм тестов.
+
+    GFW/direct-first (_gfw_domain_check/_direct_first_check) НЕ мокаются здесь — дефолтный мок
+    для них живёт в _all_up_monkey (вызывается ПЕРЕД специфичными _mock_domain_probe/
+    _mock_direct_first во всех тестах, а эта функция — ПОСЛЕ них; безусловный мок здесь затирал
+    бы специфичный мок из-за late-binding monkeypatch.setattr, см. #252 регресс
+    test_direct_first_check_info_when_some_blocked).
     """
     monkeypatch.setattr(health, "_installed_versions_check",
                         lambda: {"status": "ok", "detail": "mock", "codex": [], "claude_code": []})
@@ -975,7 +992,10 @@ def test_direct_domain_probe_http_response_is_reachable(monkeypatch):
     для туннеля — 4xx это ЖИВОЙ канал). GFW даёт timeout/reset/connection-failed, НЕ HTTP-ответ.
     """
     # curl отдал HTTP 404 → сервер ответил → reachable
-    monkeypatch.setattr(health.sys_probe, "run",
+    # _direct_domain_probe делегирует sys_probe.direct_probe(), который зовёт self.run на
+    # _default_manager (bound method), а не module-level sys_probe.run — патч атрибута модуля
+    # здесь не перехватывает вызов (issue #252 блокер: без мока тест держался на реальной сети).
+    monkeypatch.setattr(sys_probe._default_manager, "run",
                         lambda cmd, timeout, env=None: {"rc": 0, "out": "404", "err": "", "timeout": False})
     r = health._direct_domain_probe("github.com")
     assert r["reachable"] is True, "HTTP 404 = сервер ответил → канал работает (не режется)"
@@ -1023,13 +1043,17 @@ def test_direct_domain_probe_strips_proxy_env(monkeypatch):
     Регресс-гвард: probe БЕЗ прокси доказывает реальную достижимость домена. Если прокси-env
     останется, github пойдёт через privoxy/xray → VPS, и «режется GFW» станет «VPS мёртв» (та же
     подмена, что #199 git-proxy маскировал). Мок ловит env-аргумент sys_probe.run.
+
+    _direct_domain_probe делегирует sys_probe.direct_probe(), который зовёт self.run на
+    _default_manager (bound method) — патч module-level sys_probe.run не перехватывает (issue #252
+    блокер: тест держался на реальной сети вместо мока).
     """
     captured = {}
 
     def _fake_run(cmd, timeout, env=None):
         captured["env"] = env
         return {"rc": 0, "out": "404", "err": "", "timeout": False}
-    monkeypatch.setattr(health.sys_probe, "run", _fake_run)
+    monkeypatch.setattr(sys_probe._default_manager, "run", _fake_run)
     monkeypatch.setattr(os, "environ", {"HTTPS_PROXY": "http://127.0.0.1:8118",
                                         "HTTP_PROXY": "http://127.0.0.1:8118",
                                         "ALL_PROXY": "http://127.0.0.1:8118",

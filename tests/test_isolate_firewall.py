@@ -208,8 +208,9 @@ def test_codex_ruleset_parses_via_pfctl_vn():
     пользователя. Ruleset активируется автоматически после provisioning (follow-up).
     """
     ruleset = isolate_firewall._codex_ruleset()
+    # timeout=25 (было 10): под -n auto CPU-contention реального pfctl-вызова иногда не укладывался в 10с (#252).
     proc = subprocess.run(["pfctl", "-vn", "-f", "-"], input=ruleset,
-                          capture_output=True, text=True, timeout=10)
+                          capture_output=True, text=True, timeout=25)
     # pfctl может писать warning про main ruleset на stderr — это не ошибка парсинга.
     combined = proc.stdout + proc.stderr
     assert "unknown user" not in combined, f"pfctl не распознал user: {combined}"

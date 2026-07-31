@@ -133,6 +133,29 @@ def _passive_health(monkeypatch):
         health, "_codex_proxy_probe",
         lambda: {"status": "unknown", "source": "runtime", "detail": "idle"},
     )
+    # #252 perf: check_all(active_claude=True) без этих моков бьёт по реальному ps/launchctl/curl
+    # (GFW/direct-first делают настоящий curl к github.com/z.ai — секунды сетевого I/O на вызов).
+    # См. tests/test_health.py::_all_up_monkey для канона этих же моков.
+    monkeypatch.setattr(health, "_codex_app_proxy_check",
+                        lambda: {"status": "unknown", "source": "n/a", "detail": "App не запущен (mock)"})
+    monkeypatch.setattr(health, "_desktop_proxy_check",
+                        lambda: {"status": "unknown", "detail": "launchctl (mock)"})
+    monkeypatch.setattr(health, "_resolve_host", lambda host: True)
+    monkeypatch.setattr(health, "_service_running", lambda label, domain=None: "running")
+    monkeypatch.setattr(health, "_installed_versions_check",
+                        lambda: {"status": "ok", "detail": "mock", "codex": [], "claude_code": []})
+    monkeypatch.setattr(health, "_runtime_model_override_check",
+                        lambda: {"status": "ok", "detail": "mock"})
+    monkeypatch.setattr(health, "_privoxy_log_observability_check",
+                        lambda **kw: {"status": "ok", "detail": "mock"})
+    monkeypatch.setattr(health, "_codex_isolation_check",
+                        lambda: {"status": "info", "detail": "mock"})
+    monkeypatch.setattr(health, "_gfw_domain_check",
+                        lambda *a, **kw: {"status": "ok", "detail": "mock: GFW не режет"})
+    monkeypatch.setattr(health, "_direct_first_check",
+                        lambda: {"status": "ok", "detail": "mock: direct-first reachable"})
+    import local_state
+    monkeypatch.setattr(local_state, "active_node", lambda path=None: {})
 
 
 def test_check_all_runs_real_cli_only_when_explicit(monkeypatch):

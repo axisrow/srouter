@@ -166,17 +166,15 @@ def test_cli_launcher_clears_inherited_privoxy_env(monkeypatch, tmp_path):
 
     Fake-codex дампит своё окружение в JSON — проверяем значения 8 переменных.
     """
-    import json
     import subprocess
-    out_file = tmp_path / "child-env.json"
+    out_file = tmp_path / "child-env.txt"
     fake_bin = tmp_path / "fake-codex"
-    fake_bin.write_text(
-        "#!/bin/sh\n"
-        f"python3 -c \"import json,os; "
-        f"json.dump(dict((k,os.environ.get(k,'')) for k in "
-        f"['HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','http_proxy','https_proxy','all_proxy',"
-        f"'NO_PROXY','no_proxy']), open('$OUT','w'))\"\n",
-        encoding="utf-8")
+    # #252 perf: python3-спавн (42.5мс) заменён на чистый /bin/sh (4.8мс) — предмет теста ENV-var
+    # проброс до дочернего процесса, не поведение Python. Простой KEY=value построчный дамп.
+    keys = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy",
+            "NO_PROXY", "no_proxy")
+    dump_lines = "\n".join(f'printf \'{k}=%s\\n\' "${k}"' for k in keys)
+    fake_bin.write_text(f"#!/bin/sh\n{{ {dump_lines}; }} > \"$OUT\"\n", encoding="utf-8")
     fake_bin.chmod(0o755)
     wrapper = _install_with_fake_codex(monkeypatch, tmp_path, fake_bin)
     # Наследуем privoxy-окружение (как от ~/.claude/settings.json env).
@@ -190,7 +188,9 @@ def test_cli_launcher_clears_inherited_privoxy_env(monkeypatch, tmp_path):
     }
     subprocess.run([str(wrapper), "arg1"], env={**os.environ, **inherited},
                    check=True, timeout=30)
-    child = json.loads(out_file.read_text(encoding="utf-8"))
+    child = dict(
+        line.split("=", 1) for line in out_file.read_text(encoding="utf-8").splitlines() if "=" in line
+    )
     for k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
               "http_proxy", "https_proxy", "all_proxy"):
         assert child[k] == "socks5h://127.0.0.1:10808", \
@@ -1879,12 +1879,12 @@ def test_cycle_guard_preserves_caller_path(monkeypatch, tmp_path):
     PATH-санitизации из issue #150 здесь отсутствует).
     """
     import subprocess
-    import json
-    out_file = tmp_path / "child-path.json"
+    out_file = tmp_path / "child-path.txt"
     real_codex = tmp_path / "realdir" / "codex"
     real_codex.parent.mkdir(parents=True)
+    # #252 perf: python3-спавн заменён на /bin/sh — предмет теста PATH-строка, не Python-поведение.
     real_codex.write_text(
-        f"#!/bin/sh\npython3 -c \"import json,os; json.dump(os.environ.get('PATH',''), open('{out_file}','w'))\"\n",
+        f"#!/bin/sh\nprintf '%s' \"$PATH\" > {out_file}\n",
         encoding="utf-8")
     real_codex.chmod(0o755)
     wrapper = _install_cycle_guard_wrapper(monkeypatch, tmp_path)
@@ -1893,7 +1893,7 @@ def test_cycle_guard_preserves_caller_path(monkeypatch, tmp_path):
     subprocess.run([str(wrapper), "x"],
                    env={**os.environ, "PATH": caller_path},
                    check=True, timeout=30)
-    child_path = json.loads(out_file.read_text(encoding="utf-8"))
+    child_path = out_file.read_text(encoding="utf-8")
     assert child_path == caller_path, \
         f"PATH дочернего codex сохранён целиком (сентинель не PATH-санitизация): {child_path!r} != {caller_path!r}"
 

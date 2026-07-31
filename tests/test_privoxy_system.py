@@ -112,7 +112,7 @@ def test_installed_privoxy_accepts_protected_config(tmp_path):
         [str(binary), "--config-test", str(layout.config_path)],
         capture_output=True,
         text=True,
-        timeout=10,
+        timeout=25,  # было 10: под -n auto CPU-contention реального privoxy-спавна (#252)
     )
 
     assert result.returncode == 0, result.stderr or result.stdout
@@ -160,7 +160,7 @@ def test_protected_runtime_is_independent_from_user_owned_homebrew_files(tmp_pat
         [str(layout.binary_path), "--config-test", str(layout.config_path)],
         capture_output=True,
         text=True,
-        timeout=10,
+        timeout=25,  # было 10: под -n auto CPU-contention реального privoxy-спавна (#252)
     )
     assert checked.returncode == 0, checked.stderr or checked.stdout
 
@@ -180,7 +180,7 @@ def test_macos_visudo_accepts_strict_no_cache_rule(tmp_path):
         [str(visudo), "-cf", str(candidate)],
         capture_output=True,
         text=True,
-        timeout=10,
+        timeout=25,  # было 10: под -n auto CPU-contention реального visudo-спавна (#252)
     )
 
     assert result.returncode == 0, result.stderr or result.stdout
