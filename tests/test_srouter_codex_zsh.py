@@ -18,6 +18,7 @@ from pathlib import Path
 
 import pytest
 
+import codex_wrappers
 import srouter
 
 
@@ -329,7 +330,7 @@ def test_codex_function_beats_brew_in_path(monkeypatch, tmp_path):
         f'printf managed > {result_file}; else printf direct > {result_file}; fi\n',
         encoding="utf-8")
     (brew_dir / "codex").chmod(0o755)
-    monkeypatch.setattr(srouter, "_codex_bin_path", lambda: str(brew_dir / "codex"))
+    monkeypatch.setattr(codex_wrappers, "_codex_bin_path", lambda: str(brew_dir / "codex"))
     srouter._install_codex_wrappers(env)
     srouter._install_codex_zsh_function(env)
     zsh = shutil.which("zsh")
@@ -541,7 +542,7 @@ def test_install_keeps_legacy_when_new_wrapper_not_installed(monkeypatch, tmp_pa
     legacy_content = f"{legacy}\n#!/bin/sh\nexec codex\n"
     (bin_dir / "codex").write_text(legacy_content, encoding="utf-8")
     # codex binary НЕ найден → install нового codex-srouter WARN'ется и не ставится.
-    monkeypatch.setattr(srouter, "_codex_bin_path", lambda: "")
+    monkeypatch.setattr(codex_wrappers, "_codex_bin_path", lambda: "")
 
     note = srouter._install_codex_wrappers(env)
 
@@ -590,7 +591,7 @@ def test_install_no_delete_legacy_when_only_managed_codex_in_path(monkeypatch, t
     (bin_dir / "codex").write_text(legacy_content, encoding="utf-8")
     (bin_dir / "codex").chmod(0o755)
     monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin:/bin")  # legacy единственный codex в PATH
-    monkeypatch.setattr(srouter, "_codex_bin_path", lambda: "")  # НЕТ независимого real codex
+    monkeypatch.setattr(codex_wrappers, "_codex_bin_path", lambda: "")  # НЕТ независимого real codex
 
     note = srouter._install_codex_wrappers(env)
 
@@ -815,9 +816,11 @@ def test_install_zsh_function_migration_reports_write_failure(monkeypatch, tmp_p
     )
     zshrc.write_text(stale_block, encoding="utf-8")
     # _write_text_atomic падает (имитация отказа записи).
-    monkeypatch.setattr(srouter, "_write_text_atomic", lambda path, text: False)
+    # Патчим модуль-владелец codex_wrappers (#228): именно оттуда _install_codex_zsh_function
+    # резолвит эти имена. Через srouter (re-export) патч бы не подействовал.
+    monkeypatch.setattr(codex_wrappers, "_write_text_atomic", lambda path, text: False)
     # Нужен валидный новый codex-srouter, чтобы миграция вообще пыталась выполниться.
-    monkeypatch.setattr(srouter, "_codex_zsh_target_installed", lambda: True)
+    monkeypatch.setattr(codex_wrappers, "_codex_zsh_target_installed", lambda: True)
 
     note = srouter._install_codex_zsh_function(env)
 

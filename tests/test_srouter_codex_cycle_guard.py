@@ -18,6 +18,7 @@ from pathlib import Path
 
 import pytest
 
+import codex_wrappers
 import srouter
 
 
@@ -95,7 +96,7 @@ def _install_cycle_guard_wrapper(monkeypatch, tmp_path):
     _codex_bin_path → found (install-gate проходит), путь не вшивается (#144). Возвращает путь к wrapper."""
     _mock_home(monkeypatch, tmp_path)
     env = _env(tmp_path)
-    monkeypatch.setattr(srouter, "_codex_bin_path", lambda: str(tmp_path / "any-codex"))
+    monkeypatch.setattr(codex_wrappers, "_codex_bin_path", lambda: str(tmp_path / "any-codex"))
     srouter._install_codex_wrappers(env)
     return Path.home() / "bin" / _cli_wrapper_name()
 
@@ -158,7 +159,7 @@ def test_cycle_guard_pid_scoped_not_blocking_descendant(monkeypatch, tmp_path):
     import time
     home = _mock_home(monkeypatch, tmp_path)
     env = _env(tmp_path)
-    monkeypatch.setattr(srouter, "_codex_bin_path", lambda: str(tmp_path / "any-codex"))
+    monkeypatch.setattr(codex_wrappers, "_codex_bin_path", lambda: str(tmp_path / "any-codex"))
     srouter._install_codex_wrappers(env)
     wrapper = home / "bin" / _cli_wrapper_name()
     child_marker = tmp_path / "child_ran.txt"
@@ -232,7 +233,7 @@ def test_cycle_guard_fork_foreign_bounded_not_process_bomb(monkeypatch, tmp_path
     """
     home = _mock_home(monkeypatch, tmp_path)
     env = _env(tmp_path)
-    monkeypatch.setattr(srouter, "_codex_bin_path", lambda: str(tmp_path / "any-codex"))
+    monkeypatch.setattr(codex_wrappers, "_codex_bin_path", lambda: str(tmp_path / "any-codex"))
     srouter._install_codex_wrappers(env)
     wrapper = home / "bin" / _cli_wrapper_name()
     real_codex = tmp_path / "realdir" / "codex"
@@ -300,7 +301,7 @@ def test_cycle_guard_non_numeric_hop_resets_not_crash(monkeypatch, tmp_path):
     import subprocess
     home = _mock_home(monkeypatch, tmp_path)
     env = _env(tmp_path)
-    monkeypatch.setattr(srouter, "_codex_bin_path", lambda: str(tmp_path / "any-codex"))
+    monkeypatch.setattr(codex_wrappers, "_codex_bin_path", lambda: str(tmp_path / "any-codex"))
     srouter._install_codex_wrappers(env)
     wrapper = home / "bin" / _cli_wrapper_name()
     real_codex = tmp_path / "realdir" / "codex"; real_codex.parent.mkdir(parents=True)
@@ -375,7 +376,7 @@ def test_cycle_guard_uses_versioned_sentinel_env(monkeypatch, tmp_path):
     """
     home = _mock_home(monkeypatch, tmp_path)
     env = _env(tmp_path)
-    monkeypatch.setattr(srouter, "_codex_bin_path", lambda: str(tmp_path / "any-codex"))
+    monkeypatch.setattr(codex_wrappers, "_codex_bin_path", lambda: str(tmp_path / "any-codex"))
     srouter._install_codex_wrappers(env)
     cli_text = (home / "bin" / _cli_wrapper_name()).read_text(encoding="utf-8")
 
