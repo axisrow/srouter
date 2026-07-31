@@ -729,8 +729,11 @@ def main(argv=None):
     """
     try:
         return _main_impl(argv)
-    except Exception as exc:  # noqa: BLE001 — fail-closed контракт, см. модульный docstring
-        logger.error("isolate_firewall CLI failed: %s", exc)
+    except Exception:  # noqa: BLE001 — fail-closed контракт, см. модульный docstring
+        # logger.exception (не .error): обёртка ловит ВСЁ тело CLI, поэтому без трейсбека
+        # непредвиденный сбой не локализуется до ветки. launchd пишет stderr в plist-лог —
+        # стек там единственный способ узнать, где именно упало (канон noisy-log).
+        logger.exception("isolate_firewall CLI failed")
         return 2
 
 
