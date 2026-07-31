@@ -182,6 +182,7 @@ def test_gather_status_returns_node_snapshot_without_running_heavy_probe(monkeyp
     # issue #227: gather_status и её probe_*-зависимости физически живут в dashboard_app.py
     # (dashboard.py — тонкий фасад-реэкспорт) — патчим точку реального вызова.
     dashboard_app = importlib.import_module("dashboard_app")
+    dashboard_nodes = importlib.import_module("dashboard_nodes")
     dashboard._cache.update(ts=0.0, data=None)
     called = False
 
@@ -208,11 +209,14 @@ def test_gather_status_returns_node_snapshot_without_running_heavy_probe(monkeyp
         time.sleep(0.2)
         return [{"name": "sg-1", "status": "ok"}]
 
+    # Ловушка ставится в dashboard_nodes — модуль-первоисточник, откуда тяжёлый probe_nodes
+    # резолвился бы при регрессии (в globals самой gather_status его нет, см. assert ниже,
+    # поэтому патчить dashboard_app бессмысленно: setattr(..., raising=False) создал бы
+    # атрибут, который никто не читает, и guard молча не сработал бы).
+    monkeypatch.setattr(dashboard_nodes, "probe_nodes", slow_probe_nodes)
+
     # gather_status резолвит имена из globals своего модуля (dashboard_app). Тяжёлого
-    # probe_nodes там быть не должно вовсе — модуль импортирует только лёгкий
-    # probe_nodes_snapshot. Проверяем именно ОТСУТСТВИЕ имени: ловушку сюда ставить
-    # бессмысленно (setattr(..., raising=False) создал бы атрибут, который никто не читает,
-    # и guard молча не сработал бы). Регрессию ловят assert'ы elapsed/called/nodes ниже.
+    # probe_nodes там быть не должно вовсе — импортируется только лёгкий probe_nodes_snapshot.
     assert not hasattr(dashboard_app, "probe_nodes"), (
         "gather_status'у стал доступен тяжёлый probe_nodes — снимок узлов обязан "
         "строиться лёгким probe_nodes_snapshot")
