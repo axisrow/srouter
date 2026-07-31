@@ -272,7 +272,24 @@ def test_install_fails_when_readiness_poll_times_out_via_real_poller(tmp_path, m
     runner, _ = _install_runner_factory({"value": False})
     monkeypatch.setattr(privoxy_audit, "_read_status_file", lambda layout_: {"state": "starting"})
 
-    # Без readiness_poll — используется реальный _wait_daemon_readiness с застрявшим starting.
+    class FakeClock:
+        now = 0.0
+
+        def __call__(self):
+            return self.now
+
+        def sleep(self, seconds):
+            self.now += seconds
+
+    clock = FakeClock()
+    real_poller = privoxy_audit._wait_daemon_readiness
+    monkeypatch.setattr(
+        privoxy_audit,
+        "_wait_daemon_readiness",
+        lambda layout_: real_poller(layout_, clock=clock, sleep=clock.sleep),
+    )
+
+    # Без readiness_poll — install вызывает настоящий polling loop, но его время детерминированно.
     result = privoxy_audit.install_as_root(
         username=identity.pw_name, uid=identity.pw_uid, gid=identity.pw_gid,
         layout=layout, runner=runner, chown=lambda path, uid, gid: None, enforce_root=False,
@@ -280,6 +297,7 @@ def test_install_fails_when_readiness_poll_times_out_via_real_poller(tmp_path, m
 
     assert result["ok"] is False
     assert "fda" in result["error"]
+    assert clock.now >= 5.0
 
 
 def test_install_refuses_foreign_launchdaemon_before_lifecycle_change(tmp_path):

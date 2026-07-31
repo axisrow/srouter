@@ -182,6 +182,7 @@ def test_gather_status_returns_node_snapshot_without_running_heavy_probe(monkeyp
     # issue #227: gather_status и её probe_*-зависимости физически живут в dashboard_app.py
     # (dashboard.py — тонкий фасад-реэкспорт) — патчим точку реального вызова.
     dashboard_app = importlib.import_module("dashboard_app")
+    dashboard_nodes = importlib.import_module("dashboard_nodes")
     dashboard._cache.update(ts=0.0, data=None)
     called = False
 
@@ -208,15 +209,28 @@ def test_gather_status_returns_node_snapshot_without_running_heavy_probe(monkeyp
         time.sleep(0.2)
         return [{"name": "sg-1", "status": "ok"}]
 
-    # probe_nodes (ТЯЖЁЛЫЙ probe) патчится здесь лишь чтобы доказать: если бы gather_status
-    # его вызвала — тест бы это заметил через called/elapsed. gather_status использует
-    # ЛЁГКИЙ probe_nodes_snapshot (dashboard_nodes.py), который probe_nodes не зовёт —
-    # поэтому точка патчинга (dashboard vs dashboard_routes) здесь не влияет на результат.
-    monkeypatch.setattr(dashboard, "probe_nodes", slow_probe_nodes)
+    # Ловушка ставится в dashboard_nodes — модуль-первоисточник, откуда тяжёлый probe_nodes
+    # резолвился бы при регрессии (в globals самой gather_status его нет, см. assert ниже,
+    # поэтому патчить dashboard_app бессмысленно: setattr(..., raising=False) создал бы
+    # атрибут, который никто не читает, и guard молча не сработал бы).
+    monkeypatch.setattr(dashboard_nodes, "probe_nodes", slow_probe_nodes)
+
+    # gather_status резолвит имена из globals своего модуля (dashboard_app). Тяжёлого
+    # probe_nodes там быть не должно вовсе — импортируется только лёгкий probe_nodes_snapshot.
+    assert not hasattr(dashboard_app, "probe_nodes"), (
+        "gather_status'у стал доступен тяжёлый probe_nodes — снимок узлов обязан "
+        "строиться лёгким probe_nodes_snapshot")
     monkeypatch.setattr(
         dashboard.local_state,
         "enabled_nodes",
-        lambda path=None: [{"name": "sg-1", "endpoint_host": "203.0.113.10", "route_ip": "203.0.113.10", "enabled": True}],
+        lambda path=None: [
+            {
+                "name": "sg-1",
+                "endpoint_host": "203.0.113.10",
+                "route_ip": "203.0.113.10",
+                "enabled": True,
+            }
+        ],
     )
 
     started = time.monotonic()

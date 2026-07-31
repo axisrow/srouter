@@ -43,7 +43,8 @@ def test_rebinding_host_on_status_rejected(monkeypatch):
     def boom():
         raise AssertionError("rebinding-запрос дошёл до gather_status")
 
-    monkeypatch.setattr(dashboard, "gather_status", boom)
+    monkeypatch.setattr(sys.modules["dashboard_routes"], "gather_status", boom)
+    assert sys.modules["dashboard_routes"].gather_status is boom
 
     response = dashboard.app.test_client().get(
         "/api/status", headers={"Host": "evil.com:8787"}
@@ -95,7 +96,8 @@ def test_hostile_host_rejected(monkeypatch, host):
     def boom():
         raise AssertionError(f"hostile Host {host!r} дошёл до gather_status")
 
-    monkeypatch.setattr(dashboard, "gather_status", boom)
+    monkeypatch.setattr(sys.modules["dashboard_routes"], "gather_status", boom)
+    assert sys.modules["dashboard_routes"].gather_status is boom
 
     response = dashboard.app.test_client().get("/api/status", headers={"Host": host})
 
@@ -110,7 +112,8 @@ def test_missing_host_rejected(monkeypatch):
     def boom():
         raise AssertionError("запрос без Host дошёл до gather_status")
 
-    monkeypatch.setattr(dashboard, "gather_status", boom)
+    monkeypatch.setattr(sys.modules["dashboard_routes"], "gather_status", boom)
+    assert sys.modules["dashboard_routes"].gather_status is boom
 
     # HTTP/1.0-style: снимаем Host целиком.
     response = dashboard.app.test_client().get(
