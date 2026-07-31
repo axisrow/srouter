@@ -89,47 +89,45 @@ def _routing_has_marker(config_path, outbound):
         return False
 
 
-# Команды реализованы в srouter.py (будут перенесены сюда позже)
-# Для обратной совместимости оставляем заглушки
+def _delegate_command(name: str, args) -> int:
+    """Временно вызвать реализацию команды из legacy-модуля.
+
+    Реализации остаются в srouter.py до завершения экстракции; импорт внутри функции
+    сохраняет возможность импортировать этот CLI-модуль без циклического импорта.
+    """
+    from srouter import __dict__ as legacy
+    return legacy[name](args)
+
+
 def cmd_install(args) -> int:
-    """Команда install - реализация в srouter.py."""
-    raise NotImplementedError("Используйте srouter.cmd_install")
+    return _delegate_command("cmd_install", args)
 
 def cmd_uninstall(args) -> int:
-    """Команда uninstall - реализация в srouter.py."""
-    raise NotImplementedError("Используйте srouter.cmd_uninstall")
+    return _delegate_command("cmd_uninstall", args)
 
 def cmd_start(args) -> int:
-    """Команда start - реализация в srouter.py."""
-    raise NotImplementedError("Используйте srouter.cmd_start")
+    return _delegate_command("cmd_start", args)
 
 def cmd_stop(args) -> int:
-    """Команда stop - реализация в srouter.py."""
-    raise NotImplementedError("Используйте srouter.cmd_stop")
+    return _delegate_command("cmd_stop", args)
 
 def cmd_restart(args) -> int:
-    """Команда restart - реализация в srouter.py."""
-    raise NotImplementedError("Используйте srouter.cmd_restart")
+    return _delegate_command("cmd_restart", args)
 
 def cmd_status(args) -> int:
-    """Команда status - реализация в srouter.py."""
-    raise NotImplementedError("Используйте srouter.cmd_status")
+    return _delegate_command("cmd_status", args)
 
 def cmd_doctor(args) -> int:
-    """Команда doctor - реализация в srouter.py."""
-    raise NotImplementedError("Используйте srouter.cmd_doctor")
+    return _delegate_command("cmd_doctor", args)
 
 def cmd_sync(args) -> int:
-    """Команда sync - реализация в srouter.py."""
-    raise NotImplementedError("Используйте srouter.cmd_sync")
+    return _delegate_command("cmd_sync", args)
 
 def cmd_routing(args) -> int:
-    """Команда routing - реализация в srouter.py."""
-    raise NotImplementedError("Используйте srouter.cmd_routing")
+    return _delegate_command("cmd_routing", args)
 
 def cmd_privoxy(args) -> int:
-    """Команда privoxy - реализация в srouter.py."""
-    raise NotImplementedError("Используйте srouter.cmd_privoxy")
+    return _delegate_command("cmd_privoxy", args)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -142,12 +140,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="store_true", help="показать версию и выйти")
 
     subparsers = parser.add_subparsers(dest="command", help="Доступные команды")
+    parser.set_defaults(
+        state=None, prefix=None, launchagents_dir=None, python=None,
+        yes=False, force_endpoint_overwrite=False,
+    )
 
     # install
     install_parser = subparsers.add_parser("install", help="Полная установка стека (brew-сервисы + конфиги + DNS + LaunchAgent).")
+    install_parser.add_argument("-y", "--yes", action="store_true", help="подтвердить без промпта")
 
     # uninstall
     uninstall_parser = subparsers.add_parser("uninstall", help="Полный откат стека + удаление split-route.")
+    uninstall_parser.add_argument("-y", "--yes", action="store_true", help="подтвердить без промпта")
 
     # start
     start_parser = subparsers.add_parser("start", help="Запустить демон (plist уже установлен).")
