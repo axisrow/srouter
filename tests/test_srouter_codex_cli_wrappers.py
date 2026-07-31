@@ -18,6 +18,7 @@ from pathlib import Path
 
 import pytest
 
+import codex_wrappers
 import srouter
 
 
@@ -129,8 +130,10 @@ def test_cli_launcher_renders_configured_proxy(monkeypatch, tmp_path):
     НЕ CODEX_NO_PROXY (z.ai релевантен только launchctl-gui moonbridge)."""
     _mock_home(monkeypatch, tmp_path)
     env = _env(tmp_path)
-    monkeypatch.setattr(srouter, "_CODEX_PROXY_URL", "socks5h://127.0.0.1:99999")
-    monkeypatch.setattr(srouter, "CODEX_NO_PROXY_LOOPBACK", "localhost,internal")
+    # Константы живут в codex_wrappers (#228) — патчим модуль-владелец, т.к. именно оттуда
+    # _install_codex_wrappers их читает. Через srouter (re-export) патч бы не подействовал.
+    monkeypatch.setattr(codex_wrappers, "_CODEX_PROXY_URL", "socks5h://127.0.0.1:99999")
+    monkeypatch.setattr(codex_wrappers, "CODEX_NO_PROXY_LOOPBACK", "localhost,internal")
 
     srouter._install_codex_wrappers(env)
     cli_text = (Path.home() / "bin" / _cli_wrapper_name()).read_text(encoding="utf-8")
@@ -148,7 +151,7 @@ def _install_with_fake_codex(monkeypatch, tmp_path, fake_bin):
     (наследуется env={**os.environ, ...}). Возвращает путь к wrapper."""
     _mock_home(monkeypatch, tmp_path)
     env = _env(tmp_path)
-    monkeypatch.setattr(srouter, "_codex_bin_path", lambda: str(fake_bin))
+    monkeypatch.setattr(codex_wrappers, "_codex_bin_path", lambda: str(fake_bin))
     fakebin = tmp_path / "fakebin"
     fakebin.mkdir()
     # Копия под именем codex — wrapper ищет именно `codex` в PATH.
@@ -279,7 +282,7 @@ def test_wrapper_does_not_hardcode_bin_placeholder(monkeypatch, tmp_path):
     fake_bin = tmp_path / "realcodex"
     fake_bin.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     fake_bin.chmod(0o755)
-    monkeypatch.setattr(srouter, "_codex_bin_path", lambda: str(fake_bin))
+    monkeypatch.setattr(codex_wrappers, "_codex_bin_path", lambda: str(fake_bin))
 
     srouter._install_codex_wrappers(env)
     cli_text = (home / "bin" / _cli_wrapper_name()).read_text(encoding="utf-8")
@@ -295,7 +298,7 @@ def _install_with_path_resolving_wrapper(monkeypatch, tmp_path):
     _mock_home(monkeypatch, tmp_path)
     env = _env(tmp_path)
     # Наличие codex нужно install'у как gate (WARN если совсем нет), но путь не вшивается.
-    monkeypatch.setattr(srouter, "_codex_bin_path", lambda: str(tmp_path / "any-codex"))
+    monkeypatch.setattr(codex_wrappers, "_codex_bin_path", lambda: str(tmp_path / "any-codex"))
     srouter._install_codex_wrappers(env)
     return Path.home() / "bin" / _cli_wrapper_name()
 
@@ -422,7 +425,7 @@ def test_wrapper_picks_second_codex_when_two_binaries(monkeypatch, tmp_path):
     (d2 / "codex").write_text(f"#!/bin/sh\nprintf 'second' > {second_called}\n", encoding="utf-8")
     (d2 / "codex").chmod(0o755)
     # install-time нашёл d1/codex (раньше вшло бы в __SROUTER_CODEX_BIN__ и d2 был бы проигнорирован).
-    monkeypatch.setattr(srouter, "_codex_bin_path", lambda: str(d1 / "codex"))
+    monkeypatch.setattr(codex_wrappers, "_codex_bin_path", lambda: str(d1 / "codex"))
     _mock_home(monkeypatch, tmp_path)
     env = _env(tmp_path)
     srouter._install_codex_wrappers(env)
@@ -471,7 +474,7 @@ def test_install_warns_about_uncovered_entry_points(monkeypatch, tmp_path):
     fake_bin = tmp_path / "codex"
     fake_bin.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     fake_bin.chmod(0o755)
-    monkeypatch.setattr(srouter, "_codex_bin_path", lambda: str(fake_bin))
+    monkeypatch.setattr(codex_wrappers, "_codex_bin_path", lambda: str(fake_bin))
 
     note = srouter._install_codex_wrappers(env)
 

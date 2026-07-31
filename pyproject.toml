@@ -30,6 +30,8 @@ py-modules = [
     "dashboard_app",
     "dashboard_routes",
     "srouter",
+    "codex_wrappers",
+    "srouter_launchd",
     "install_lib",
     "install_plist",
     "install_config",
