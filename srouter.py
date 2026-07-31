@@ -449,7 +449,7 @@ def cmd_status(args) -> int:
                     print("srouter restart — перезапустить.", file=sys.stderr)
                     return 1
 
-        print("Демон НЕ загружен.")
+        print(f"Демон {LAUNCHAGENT_LABEL} НЕ загружен.")
         return 1
     except Exception as exc:
         print(f"status: ошибка {exc}", file=sys.stderr)
