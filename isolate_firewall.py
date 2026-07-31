@@ -35,12 +35,20 @@ PF-инфраструктура: anchor com.apple/srouter_isolate (под-anchor
 имена таблиц/anchor, подсети) и ВАЛИДИРОВАННЫХ значений (canonical IP через
 ipaddress round-trip). Домены в shell НЕ попадают — dig вызывается через sys_probe.run
 как список аргументов (не shell), его вывод валидируется _ip_literal перед -T replace.
-Функции не бросают: при сбое возвращают структированный dict.
+Контракт публичных функций (fail-closed, issue #260): НЕ бросают — при любом сбое
+возвращают структурированный dict (`ok: False` / `status: "unknown"` / `provisioned: False`).
+Поэтому обработчики здесь ловят `except Exception` намеренно, а не перечислением типов:
+эти функции — привилегированная граница, вызываемая launchd при буте (RunAtLoad),
+Flask-роутами дашборда и codex-wrapper'ом. Ни один из вызывающих не оборачивает вызов
+в try/except: непойманное исключение = PF-изоляция не поднялась / 500 вместо
+структурированной ошибки / повисший pf enable-ref (token захвачен, lease не записан).
+Сужение до конкретных типов (issue #240) выпустило наружу непредвиденный RuntimeError
+из sys_probe.run и было откачено на этих границах — гвард: tests/test_isolate_firewall_fail_closed.py.
+Внутренние хелперы (_valid_*, _*_ruleset) исключения НЕ подавляют.
 """
 import ipaddress
 import logging
 import re
-import subprocess
 
 import local_state
 import sys_probe
@@ -307,7 +315,8 @@ def enable_strict():
 
     Используется launchd при буте (RunAtLoad). pfctl -E + загрузка anchor. Без
     переключения в working — это делает enable_isolation, когда таблица IP готова.
-    Возвращает dict (ok/cancelled/rc/token/out/err/timeout).
+    Возвращает dict (ok/cancelled/rc/token/out/err/timeout). Не бросает: при сбое
+    ok=False + token=None (launchd не должен падать — иначе изоляция не поднимется).
     """
     try:
         ruleset = _strict_ruleset()
@@ -325,7 +334,7 @@ def enable_strict():
             res["err"] = ("pf включён, но release-token не получен — enable-ref может течь; "
                           + (res["err"] or "")).rstrip("; ")
         return res
-    except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
+    except Exception as exc:  # noqa: BLE001 — fail-closed контракт, см. модульный docstring
         logger.error("enable_strict failed: %s", exc)
         return {**_reject(f"enable_strict failed: {exc}"), "token": None}
 
@@ -343,7 +352,7 @@ def disable_strict(token=None):
             steps.append(f"{PFCTL} -X {tok}")
         body = "; ".join(f"{step} || rc=1" for step in steps)
         return _admin_run(f"rc=0; {body}; exit $rc")
-    except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
+    except Exception as exc:  # noqa: BLE001 — fail-closed контракт, см. модульный docstring
         logger.error("disable_strict failed: %s", exc)
         return _reject(f"disable_strict failed: {exc}")
 
@@ -407,7 +416,7 @@ def enable_isolation(domains, ports=DEFAULT_PORTS, token=None):
             res["err"] = ("pf включён, но release-token не получен — enable-ref может течь; "
                           + (res["err"] or "")).rstrip("; ")
         return res
-    except (OSError, ValueError, TypeError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
+    except Exception as exc:  # noqa: BLE001 — fail-closed контракт, см. модульный docstring
         logger.error("enable_isolation failed: %s", exc)
         return {**_reject(f"enable_isolation failed: {exc}"), "token": None,
                 "domains": {}, "unresolved": [], "ports": list(ports or DEFAULT_PORTS)}
@@ -438,7 +447,7 @@ def refresh_isolation_ips(domains, ports=DEFAULT_PORTS, token=None):
         res["unresolved"] = unresolved
         res["ports"] = list(ports or DEFAULT_PORTS)
         return res
-    except (OSError, ValueError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
+    except Exception as exc:  # noqa: BLE001 — fail-closed контракт, см. модульный docstring
         logger.error("refresh_isolation_ips failed: %s", exc)
         return {**_reject(f"refresh failed: {exc}"),
                 "domains": {}, "unresolved": [], "ports": list(ports or DEFAULT_PORTS)}
@@ -447,7 +456,8 @@ def refresh_isolation_ips(domains, ports=DEFAULT_PORTS, token=None):
 def disable_isolation(token=None):
     """Снять изоляцию полностью: flush anchor + освободить enable-ref.
 
-    attempt-all, идемпотентно. token из enable_isolation/enable_strict.
+    attempt-all, идемпотентно. token из enable_isolation/enable_strict. Не бросает:
+    при сбое возвращает ok=False.
     """
     try:
         steps = [f'{PFCTL} -a "{ANCHOR}" -F all']
@@ -456,7 +466,7 @@ def disable_isolation(token=None):
             steps.append(f"{PFCTL} -X {tok}")
         body = "; ".join(f"{step} || rc=1" for step in steps)
         return _admin_run(f"rc=0; {body}; exit $rc")
-    except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
+    except Exception as exc:  # noqa: BLE001 — fail-closed контракт, см. модульный docstring
         logger.error("disable_isolation failed: %s", exc)
         return _reject(f"disable_isolation failed: {exc}")
 
@@ -490,7 +500,7 @@ def enable_codex_isolation(token=None):
             res["err"] = ("pf включён, но release-token не получен — enable-ref может течь; "
                           + (res["err"] or "")).rstrip("; ")
         return res
-    except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
+    except Exception as exc:  # noqa: BLE001 — fail-closed контракт, см. модульный docstring
         logger.error("enable_codex_isolation failed: %s", exc)
         return {**_reject(f"enable_codex_isolation failed: {exc}"), "token": None}
 
@@ -508,7 +518,7 @@ def disable_codex_isolation(token=None):
             steps.append(f"{PFCTL} -X {tok}")
         body = "; ".join(f"{step} || rc=1" for step in steps)
         return _admin_run(f"rc=0; {body}; exit $rc")
-    except (OSError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
+    except Exception as exc:  # noqa: BLE001 — fail-closed контракт, см. модульный docstring
         logger.error("disable_codex_isolation failed: %s", exc)
         return _reject(f"disable_codex_isolation failed: {exc}")
 
@@ -541,7 +551,7 @@ def probe_isolation(state_path=None):
             status = "warn"   # working, но IP пустые (все домены unresolved)
         return {"status": status, "phase": phase, "domains": domains, "ips": ips,
                 "unresolved": unresolved, "ports": ports, "applied_at": applied_at}
-    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+    except Exception as exc:  # noqa: BLE001 — fail-closed контракт, см. модульный docstring
         # fail-closed: любая ошибка чтения state = status unknown (не предполагаем успех)
         logger.warning("probe_isolation failed to read state: %s", exc)
         return {"status": "unknown", "phase": "none", "error": str(exc),
@@ -563,7 +573,7 @@ def probe_codex_isolation(state_path=None):
             return {"status": "down", "token": None, "applied_at": None}
         return {"status": "ok", "token": str(lease.get("token")),
                 "applied_at": lease.get("applied_at")}
-    except (OSError, ValueError, KeyError, TypeError) as exc:
+    except Exception as exc:  # noqa: BLE001 — fail-closed контракт, см. модульный docstring
         # fail-closed: любая ошибка чтения state = status unknown (не предполагаем успех)
         logger.warning("probe_codex_isolation failed to read state: %s", exc)
         return {"status": "unknown", "token": None, "applied_at": None, "error": str(exc)}
@@ -606,7 +616,7 @@ def probe_codex_user():
                 "uid": found_uid if provisioned else None,
                 "name": name if provisioned else None,
                 "gid": found_gid if provisioned else None}
-    except (OSError, ValueError, KeyError, AttributeError) as exc:
+    except Exception as exc:  # noqa: BLE001 — fail-closed контракт, см. модульный docstring
         # fail-closed: любая ошибка чтения dscl = not provisioned (не предполагаем успех)
         logger.warning("probe_codex_user failed to read user: %s", exc)
         return {"provisioned": False, "uid": None, "name": None, "gid": None, "error": str(exc)}
@@ -633,7 +643,7 @@ def _uid_in_use(uid):
                     continue  # наше имя — легитимно (уже provisioned)
                 return True
         return False
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001 — fail-closed контракт, см. модульный docstring
         # fail-closed: при любой ошибке считаем uid заняты (не создаём поверх неизвестного)
         return True
 
@@ -648,6 +658,7 @@ def provision_codex_user():
     Канон _admin_run: shell_cmd собран ТОЛЬКО из констант (DSCL, CODEX_USER_*) и validated
     значений (record из _valid_user_name → только [_A-Za-z0-9/]). Пользовательских строк в shell
     нет (нет вектора атаки). Возвращает dict формы _isolate_result (ok/cancelled/rc/out/err/timeout).
+    Не бросает: при сбое ok=False.
     Порядок UniqueID первым семантически яснее (объявляет идентификатор); dscl create свойств
     идемпотентен → при partial-fail re-install добивает (сходится).
     """
@@ -676,7 +687,7 @@ def provision_codex_user():
         ]
         shell_cmd = " && ".join(steps)
         return _admin_run(shell_cmd)
-    except (OSError, ValueError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
+    except Exception as exc:  # noqa: BLE001 — fail-closed контракт, см. модульный docstring
         logger.error("provision_codex_user failed: %s", exc)
         return _reject(f"provision_codex_user failed: {exc}")
 
@@ -687,6 +698,7 @@ def deprovision_codex_user():
     probe_codex_user() → если не provisioned → no-op ok. Иначе одна osascript-инвокация:
     dscl . -delete /Users/_srouter_codex (record delete — вся запись). Идемпотентно:
     на гонку (delete кем-то между probe и delete) — repeatable. Возвращает dict _isolate_result.
+    Не бросает: при сбое ok=False.
     """
     try:
         existing = probe_codex_user()
@@ -698,7 +710,7 @@ def deprovision_codex_user():
             return _reject("константа codex-user name невалидна")
         shell_cmd = f"{DSCL} . -delete /Users/{name}"
         return _admin_run(shell_cmd)
-    except (OSError, ValueError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
+    except Exception as exc:  # noqa: BLE001 — fail-closed контракт, см. модульный docstring
         logger.error("deprovision_codex_user failed: %s", exc)
         return _reject(f"deprovision_codex_user failed: {exc}")
 
