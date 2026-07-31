@@ -153,27 +153,38 @@ def test_dashboard_connectivity_uses_canonical():
 
 
 def test_srouter_uses_canonical():
-    """srouter.py больше не импортирует копию из traffic_shape — использует канон.
+    """PPP-hook'и импортируют _applescript_text из dashboard_common, не копию из traffic_shape.
 
-    Читаем исходник напрямую (без import srouter): srouter.py тянет health.py и
-    другие тяжёлые модули верхнего уровня, что сделало бы тест хрупким к
-    окружению. Контракт #154 — статический: оба PPP-hook'а должны импортировать
-    _applescript_text из dashboard_common, а не из traffic_shape (копия).
+    Читаем исходники напрямую (без import): srouter.py тянет health.py и другие тяжёлые
+    модули верхнего уровня, что сделало бы тест хрупким к окружению. Контракт #154 —
+    статический: оба PPP-hook'а должны импортировать канон, а не копию.
+
+    #228: PPP-hook'и переехали srouter.py → srouter_launchd.py. Гвард смотрит на оба модуля
+    и суммирует — так он переживает дальнейшие переносы, но по-прежнему требует ровно 2
+    канонических импорта (по одному на _install_ppp_hook/_remove_ppp_hook) и запрещает
+    копию из traffic_shape в любом из них.
     """
     from pathlib import Path
 
-    srouter_src = (Path(__file__).resolve().parent.parent / "srouter.py").read_text(encoding="utf-8")
+    root = Path(__file__).resolve().parent.parent
+    sources = {
+        name: (root / name).read_text(encoding="utf-8")
+        for name in ("srouter.py", "srouter_launchd.py")
+        if (root / name).exists()
+    }
 
-    # Старого (копийного) импорта из traffic_shape остаться не должно.
-    assert "from traffic_shape import _applescript_text" not in srouter_src, (
-        "srouter.py не должен импортировать _applescript_text из traffic_shape (это копия), "
-        "только из dashboard_common"
-    )
-    # Канонический импорт присутствует ровно в двух местах (оба PPP-hook'а).
+    # Старого (копийного) импорта из traffic_shape остаться не должно НИ В ОДНОМ модуле.
+    for name, src in sources.items():
+        assert "from traffic_shape import _applescript_text" not in src, (
+            f"{name} не должен импортировать _applescript_text из traffic_shape (это копия), "
+            "только из dashboard_common"
+        )
+    # Канонический импорт присутствует ровно в двух местах (оба PPP-hook'а), суммарно по модулям.
     canonical = "from dashboard_common import _applescript_text"
-    assert srouter_src.count(canonical) == 2, (
-        f"ожидали 2 канонических импорта (оба PPP-hook'а), нашли "
-        f"{srouter_src.count(canonical)}"
+    total = sum(src.count(canonical) for src in sources.values())
+    assert total == 2, (
+        f"ожидали 2 канонических импорта (оба PPP-hook'а) суммарно по "
+        f"{sorted(sources)}, нашли {total}"
     )
 
 
