@@ -208,10 +208,14 @@ def test_gather_status_returns_node_snapshot_without_running_heavy_probe(monkeyp
         time.sleep(0.2)
         return [{"name": "sg-1", "status": "ok"}]
 
-    # Ставим ловушку в globals реальной gather_status. Сейчас она использует только
-    # лёгкий probe_nodes_snapshot; если вернётся тяжёлый probe_nodes, тест это заметит.
-    monkeypatch.setattr(dashboard_app, "probe_nodes", slow_probe_nodes, raising=False)
-    assert dashboard_app.probe_nodes is slow_probe_nodes
+    # gather_status резолвит имена из globals своего модуля (dashboard_app). Тяжёлого
+    # probe_nodes там быть не должно вовсе — модуль импортирует только лёгкий
+    # probe_nodes_snapshot. Проверяем именно ОТСУТСТВИЕ имени: ловушку сюда ставить
+    # бессмысленно (setattr(..., raising=False) создал бы атрибут, который никто не читает,
+    # и guard молча не сработал бы). Регрессию ловят assert'ы elapsed/called/nodes ниже.
+    assert not hasattr(dashboard_app, "probe_nodes"), (
+        "gather_status'у стал доступен тяжёлый probe_nodes — снимок узлов обязан "
+        "строиться лёгким probe_nodes_snapshot")
     monkeypatch.setattr(
         dashboard.local_state,
         "enabled_nodes",
