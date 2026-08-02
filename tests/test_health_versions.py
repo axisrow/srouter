@@ -213,7 +213,10 @@ def _machine_state_monkey(monkeypatch):
     она доказывает, что вердикт держится на versions-check, а не подпирается чужим ok.
     Параметризация (probe_status/codex_status канона) здесь не нужна — ни один тест файла
     не варьирует эти статусы; добавим, когда появится первый такой тест.
-    """
+
+    Новый machine-state probe добавляй в ОБА списка (сюда и в канон) — гвард
+    test_machine_state_mock_guard.py падает, если канонический набор перестанет быть
+    подмножеством этого (issue #267)."""
     monkeypatch.setattr(health, "_port_up", lambda port: True)
     monkeypatch.setattr(health, "_tunnel_up", lambda: (True, "HTTP 200", False))
     monkeypatch.setattr(health, "_claude_proxy_probe",
