@@ -547,3 +547,21 @@ def test_codenv_stderr_tail_default_matches_template(monkeypatch, tmp_path):
     monkeypatch.setattr(health.Path, "home", lambda: tmp_path)
     assert health._codenv_default_stderr_path() == expected, \
         "дефолт stderr совпадает с log_err генератора"
+
+
+def test_in_ao_worktree_never_raises_on_non_path_input():
+    """_in_ao_worktree не бросает ни на каком входе — докстринг обещает «не бросает».
+
+    Cycle-review round 2 (/review): except охватывал resolve(), но `Path(path)` бросает TypeError
+    РАНЬШЕ — на None/int/bytes. Оба текущих вызова защищены (`if script:` в детекторе, `env.root/...`
+    в guard'е), так что сейчас недостижимо. Но это ОБЩИЙ предикат двух подсистем: следующий вызывающий
+    справедливо поверит докстрингу, а исключение отсюда уходит в check_all (fail-open по всему стеку,
+    ровно то, что чинил дефект #5 раунда 1). Контракт должен быть правдой, а не почти-правдой.
+    """
+    from pathlib import Path as _P
+
+    for bad in (None, 1234, b"/tmp/x", object()):
+        assert health._in_ao_worktree(bad) is False, f"нераспознанный вход → False, не бросок: {bad!r}"
+    # Валидные входы по-прежнему решаются по существу, а не глушатся except'ом.
+    assert health._in_ao_worktree("/Users/u/.AO/data/worktrees/s1/x.sh") is True
+    assert health._in_ao_worktree(_P("/Users/u/Projects/srouter/x.sh")) is False

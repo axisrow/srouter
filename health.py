@@ -1780,12 +1780,22 @@ def _in_ao_worktree(path):
 
     resolve(strict=False) нормализует '..' и делает путь абсолютным ДАЖЕ для несуществующего файла,
     поэтому вердикт не зависит ни от факта существования, ни от регистра, ни от '..'-сегментов.
-    Не бросает: на ошибке ОС падаем обратно на сырую строку (fail-soft, но всё ещё casefold).
+
+    НЕ бросает ни на каком входе — контракт, а не почти-контракт (cycle-review round 2, /review):
+    `Path(path)` кидает TypeError на None/int/bytes РАНЬШЕ, чем отработает except вокруг resolve().
+    Оба текущих вызывающих защищены, но это ОБЩИЙ предикат двух подсистем, и исключение отсюда
+    ушло бы в check_all — fail-open по всему стеку. Нераспознанный вход → False: «не доказано, что
+    worktree». Для guard'а это fail-open-сторона, поэтому оба вызывающих обязаны давать реальный
+    путь (Path/str), а не полагаться на этот fallback.
     """
     try:
         resolved = str(Path(path).resolve(strict=False))
     except (OSError, ValueError, RuntimeError):
+        # Путь есть, но ОС/парсер его не осилили — решаем по сырой строке (всё ещё casefold).
         resolved = str(path)
+    except TypeError:
+        _log.debug("_in_ao_worktree: не путь (%s) — не worktree", type(path).__name__)
+        return False
     return _AO_WORKTREE_MARK in resolved.casefold()
 
 
