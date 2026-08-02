@@ -775,12 +775,17 @@ def test_apply_uninstall_no_leftover_for_fresh_install_without_backup(tmp_path):
     assert config.exists(), "legacy state без provenance → конфиг НЕ удалён (требуется fresh install)"
 
 
-def test_main_uninstall_apply_nonzero_when_leftover(tmp_path, monkeypatch):
+def test_main_uninstall_apply_nonzero_when_leftover(tmp_path):
     """cycle-review #111 cycle 2 finding A: install_lib.main (uninstall.sh apply entrypoint) учитывает leftover.
 
     main() для mode=uninstall-apply проверял ТОЛЬКО result["ok"] → exit 0 при partial. Codex: supported
     uninstall.sh apply path инвокает install_lib.main → partial rollback молча успешен вне srouter uninstall.
     Фикс: main учитывает leftover (как cmd_uninstall) → rc≠0 + список leftover в stderr.
+
+    runner=FakeRunner() (issue #269): main без явной инъекции падает на дефолт runner=run — реальный
+    subprocess. С --stop-services это бьёт в настоящий `brew services stop privoxy` (таймаут 40с) на
+    машине разработчика/CI. Как и все 22 соседних вызова apply_uninstall в этом файле — DI, не реальный
+    процесс.
     """
     env = _env(tmp_path)
     config_path = env.component_paths("privoxy")["config"]
@@ -799,9 +804,44 @@ def test_main_uninstall_apply_nonzero_when_leftover(tmp_path, monkeypatch):
         "--prefix", str(env.prefix),
         "--launchagents-dir", str(env.launchagent_dir),
         "--restore-configs", "--stop-services", "--restore-dns", "--unload-launchagent",
-    ])
+    ], runner=FakeRunner())
 
     assert rc != 0, "stale-managed leftover через main(uninstall-apply) → rc≠0 (не маскировать exit 0)"
+
+
+def test_main_uninstall_apply_routes_stop_services_through_injected_runner(tmp_path):
+    """issue #269: main(uninstall-apply --stop-services) обязан направлять команды в переданный runner,
+    а не в реальный subprocess (дефолт install_cleanup.run). До фикса main не принимал runner вовсе
+    (TypeError) — вся DI-цепочка (build_plan/build_uninstall_plan/apply_uninstall/apply_install)
+    обрывалась именно на main, единственном месте, отставшем от паттерна runner=run, принятого во
+    всём остальном install_config.py/install_cleanup.py (см. srouter_cli.cmd_uninstall — эталон,
+    явно строящий runner и прокидывающий его дальше).
+
+    Managed+restorable privoxy (не stale) → apply_uninstall дойдёт до _stop_service и реально вызовет
+    [BREW, "services", "stop", "privoxy"] — но через FakeRunner, не через настоящий brew.
+    """
+    env = _env(tmp_path)
+    backup = tmp_path / "privoxy.backup"
+    backup.write_text("# srouter-managed-config-v1\nlisten-address 127.0.0.1:8118\n", encoding="utf-8")
+    config = env.component_paths("privoxy")["config"]
+    config.parent.mkdir(parents=True)
+    config.write_text("# srouter-managed-config-v1\nlisten-address 127.0.0.1:8118\n", encoding="utf-8")
+    _write_state(env, {"privoxy": _managed_component(env, "privoxy", backup)})
+
+    runner = FakeRunner()
+    rc = install_lib.main([
+        "uninstall-apply",
+        "--state", str(env.state_path),
+        "--prefix", str(env.prefix),
+        "--launchagents-dir", str(env.launchagent_dir),
+        "--stop-services",
+    ], runner=runner)
+
+    assert rc == 0
+    assert [install_lib.BREW, "services", "stop", "privoxy"] in runner.calls, (
+        "main(--stop-services) должен маршрутизировать brew-вызов через инъецированный runner, "
+        "не создавать собственный процесс мимо DI-контракта"
+    )
 
 
 # ============================ issue #112 Часть 2: uninstall hybrid remove/restore по provenance ============================

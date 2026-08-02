@@ -378,7 +378,10 @@ def _collect_uninstall_confirmations(args, plan):
     }
 
 
-def main(argv=None):
+def main(argv=None, *, runner=run):
+    """CLI entrypoint (install.sh/uninstall.sh apply). runner=run по умолчанию (issue #269): та же
+    DI-точка, что у build_plan/build_uninstall_plan/apply_uninstall/apply_install — main прокидывает
+    её дальше вместо того, чтобы обрывать цепочку (как уже делает srouter_cli.cmd_uninstall)."""
     parser = argparse.ArgumentParser(description="Локальный установщик srouter")
     parser.add_argument("mode", nargs="?", choices=("plan", "apply", "init", "uninstall-plan", "uninstall-apply"), default="plan")
     parser.add_argument("-y", "--yes", action="store_true", help="Явное подтверждение apply/init")
@@ -397,19 +400,19 @@ def main(argv=None):
     if args.launchagents_dir:
         env.launchagent_dir = Path(args.launchagents_dir)
     if args.mode == "plan":
-        print(format_plan(build_plan(env=env)))
+        print(format_plan(build_plan(env=env, runner=runner)))
         return 0
     if args.mode == "uninstall-plan":
-        print(format_uninstall_plan(build_uninstall_plan(env=env)))
+        print(format_uninstall_plan(build_uninstall_plan(env=env, runner=runner)))
         return 0
     if args.mode == "uninstall-apply":
-        plan = build_uninstall_plan(env=env)
+        plan = build_uninstall_plan(env=env, runner=runner)
         confirmations = _collect_uninstall_confirmations(args, plan)
         if confirmations is None:
             print(format_uninstall_plan(plan), file=sys.stderr)
             print("uninstall apply остановлен: нужно подтвердить категории restore/stop/unload", file=sys.stderr)
             return 2
-        result = apply_uninstall(env=env, confirmations=confirmations)
+        result = apply_uninstall(env=env, confirmations=confirmations, runner=runner)
         if result["ok"]:
             leftover = result.get("leftover") or []
             if leftover:
@@ -430,7 +433,8 @@ def main(argv=None):
     if args.mode == "init":
         choices = {name: "skip" for name in COMPONENTS} | choices
         install_launchagent = False
-    result = apply_install(env=env, confirm=args.yes, choices=choices, install_launchagent=install_launchagent)
+    result = apply_install(env=env, confirm=args.yes, choices=choices,
+                            install_launchagent=install_launchagent, runner=runner)
     if result["ok"]:
         print("apply завершён успешно: изменения сохранены (подтверждено через --yes).")
         return 0
