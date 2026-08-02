@@ -243,6 +243,29 @@ def _machine_state_monkey(monkeypatch):
                         lambda *a, **kw: {"status": "ok", "detail": "mock: GFW не режет"})
     monkeypatch.setattr(health, "_direct_first_check",
                         lambda: {"status": "ok", "detail": "mock: direct-first reachable"})
+    # #271: канон (tests/test_health.py::_all_up_monkey) расширен полным покрытием real probes
+    # check_all() — дублируем сюда (гвард test_machine_state_mock_guard.py требует canon ⊆ versions).
+    # Тесты этого файла, которым нужен конкретный статус этих чеков, переопределяют мок ПОСЛЕ
+    # вызова этой функции (late-binding monkeypatch.setattr побеждает — см. паттерн GFW/direct-first).
+    monkeypatch.setattr(health, "_network_interface_up",
+                        lambda: {"up": True, "detail": "mock: сеть активна"})
+    monkeypatch.setattr(health, "_endpoint_xray_sync_check",
+                        lambda *a, **kw: {"status": "ok", "detail": "mock: endpoint синхронизирован"})
+    # _codenv_job_check НЕ мокаем безусловно — см. канон в test_health.py::_all_up_monkey (issue #271).
+    monkeypatch.setattr(health, "_vscode_proxy_check",
+                        lambda: {"status": "unknown", "detail": "mock: VSCode не установлен"})
+    monkeypatch.setattr(health, "_github_direct_check",
+                        lambda: {"status": "ok", "detail": "mock: github direct"})
+    monkeypatch.setattr(health, "_runtime_model_override_check",
+                        lambda: {"status": "ok", "detail": "mock: без override"})
+    monkeypatch.setattr(health, "_installed_versions_check",
+                        lambda: {"status": "unknown", "detail": "mock: не установлено", "codex": [], "claude_code": []})
+    monkeypatch.setattr(health, "_privoxy_log_observability_check",
+                        lambda *a, **kw: {"status": "ok", "detail": "mock: privoxy-log ок"})
+    monkeypatch.setattr(health, "_codex_isolation_check",
+                        lambda: {"status": "info", "detail": "mock: PF kill-switch не установлен"})
+    monkeypatch.setattr(health, "_claude_transport_probe",
+                        lambda *a, **kw: {"status": "unknown", "detail": "mock: CC не запущен (real CLI)"})
 
 
 def test_check_all_status_ok_when_nothing_installed(monkeypatch, tmp_path):
