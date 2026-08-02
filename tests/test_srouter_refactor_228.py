@@ -15,19 +15,33 @@
 3. Команды — не заглушки (нет TODO, тело не вырождено).
 4. Идентичность объектов при re-export (ловит двустороннюю делегацию srouter ↔ srouter_cli).
 
-Полный `pytest tests/` (1560 passed на 894eb40) — внешний гвард поверх этого.
+Достроено в #259 (когда srouter_cli наконец появился и пункт 4 ожил):
+5. Отсутствие цикла по AST: ни один модуль ниже по цепочке не импортирует srouter.
+6. Владелец привилегированного слоя — srouter_privileged (вариант 1 issue #259), а не
+   srouter/srouter_cli: от него зависят ОБЕ стороны, поэтому цикла не возникает.
+7. Контракт моков: патч модуля-ВЛАДЕЛЬЦА действует, патч re-export'а — нет. Это самый
+   опасный класс регрессии экстракции, потому что он ТИХИЙ (AttributeError не будет,
+   а реальная реализация выполнится против машины разработчика).
+
+Полный `pytest tests/` (1817 passed на f7469b4) — внешний гвард поверх этого.
 """
 
 from __future__ import annotations
 
 import argparse
 import ast
+import importlib
 import inspect
 import textwrap
 
 import pytest
 
+# Жёсткий импорт, НЕ importorskip: с #259 эти модули — обязательные зависимости
+# самого srouter. importorskip превратил бы весь гвард в тихий skip ровно в том
+# случае, ради которого он написан (модуль сломан/не импортируется).
 import srouter
+import srouter_cli
+import srouter_privileged
 
 
 COMMAND_FUNCS = [
@@ -249,16 +263,139 @@ class TestReexportIdentity:
 
     @pytest.mark.parametrize("name", COMMAND_FUNCS + ["build_parser", "main"])
     def test_no_shadowing(self, name):
-        srouter_cli = pytest.importorskip("srouter_cli")
-        if not hasattr(srouter_cli, name):
-            pytest.skip(f"{name} не в srouter_cli")
+        assert hasattr(srouter_cli, name), (
+            f"{name} отсутствует в srouter_cli — команда не перенесена"
+        )
         assert getattr(srouter, name) is getattr(srouter_cli, name), (
             f"srouter.{name} и srouter_cli.{name} — разные объекты (затенение/делегация)"
         )
 
     def test_no_delegation_back_into_srouter(self):
-        srouter_cli = pytest.importorskip("srouter_cli")
         src = inspect.getsource(srouter_cli)
         assert "from srouter import __dict__" not in src, (
             "srouter_cli делегирует обратно в srouter — циклическая зависимость"
+        )
+
+
+class TestReexportSurfaceIsComplete:
+    """Ни одно имя, доступное как srouter.X до экстракции, не пропало (#259).
+
+    Канон star-import-reexport-contract: контракт — это ВСЯ поверхность модуля, включая
+    имена, которые кажутся «случайными» (argparse/os/version/PackageNotFoundError попали
+    в поверхность как побочный эффект import'ов). Судить «этим никто не пользуется» —
+    домысел; гвард сравнивает с реальным до-экстракционным срезом из git.
+    """
+
+    # Срез публичной поверхности srouter.py на f7469b4 (коммит перед экстракцией #259),
+    # снятый по AST: def/class + module-level присваивания + все импортированные имена.
+    # Список зафиксирован намеренно: читать git из теста — хрупко (пустой clone, shallow).
+    # Включая `annotations`: `from __future__ import annotations` связывает настоящий объект
+    # _Feature, то есть это такой же атрибут модуля, как остальные (проверено, не домысел).
+    BASELINE = {
+        "CHOICES",
+        "annotations", "CODEX_CLI_WRAPPER_LEGACY_NAME", "CODEX_CLI_WRAPPER_NAME", "CODEX_ENV_LABEL",
+        "CODEX_ENV_MARKER", "CODEX_LAUNCHCTL_ENV", "CODEX_NO_PROXY", "CODEX_NO_PROXY_LOOPBACK",
+        "CODEX_WRAPPERS", "InstallEnv", "LAUNCHAGENT_LABEL", "LAUNCHCTL", "OSASCRIPT",
+        "PPP_HOOK_MARKER", "PPP_HOOK_PATH", "PackageNotFoundError", "Path",
+        "ZSHRC_CODEX_FUNC_MARKER_BEGIN", "ZSHRC_CODEX_FUNC_MARKER_END", "ZSHRC_PATH_MARKER",
+        "_CODEX_FUNC_BLOCK", "_active_route_ip_for_removal", "_codex_bin_path",
+        "_codex_wrapper_path", "_codex_zsh_target_installed", "_ensure_home_bin_in_path",
+        "_env_from_args", "_has_launchagent_marker", "_install_codex_isolation",
+        "_install_codex_wrappers", "_install_codex_zsh_function", "_install_generic_launchagent",
+        "_install_launchctl_env", "_install_one_wrapper", "_install_ppp_hook", "_is_ip_literal",
+        "_is_loaded", "_is_privileged_cmd", "_launchd_domain", "_launchd_is_loaded",
+        "_launchd_reload", "_looks_like_managed_codex_wrapper", "_migrate_legacy_codex_cli_wrapper",
+        "_prompt_bool", "_prompt_choice", "_read_routing_domains",
+        "_reclaimable_resolves_all_conflicts", "_remove_active_split_route",
+        "_remove_codex_isolation", "_remove_codex_wrappers", "_remove_codex_zsh_function",
+        "_remove_home_bin_from_path", "_remove_launchctl_env", "_remove_one_wrapper",
+        "_remove_ppp_hook", "_routing_has_marker", "_to_osascript", "_version_string",
+        "_write_text_atomic", "_zshrc_path", "apply_install", "apply_uninstall", "argparse",
+        "build_parser", "build_plan", "build_uninstall_plan", "claude_proxy", "cmd_doctor",
+        "cmd_install", "cmd_privoxy", "cmd_restart", "cmd_routing", "cmd_start", "cmd_status",
+        "cmd_stop", "cmd_sync", "cmd_uninstall", "format_plan", "format_uninstall_plan",
+        "git_proxy", "health", "json", "local_state", "main", "make_privileged_runner", "os",
+        "populate_known_markers", "port_open", "privileged_ops", "privoxy_audit",
+        "privoxy_system", "run", "sys", "version", "vscode_proxy",
+    }
+
+    @pytest.mark.parametrize("name", sorted(BASELINE))
+    def test_name_still_reachable_on_srouter(self, name):
+        assert hasattr(srouter, name), (
+            f"srouter.{name} пропал при экстракции — регресс star-import-reexport-contract"
+        )
+
+
+class TestNoImportCycle:
+    """Зависимости однонаправленны: srouter → srouter_cli → srouter_privileged (#259).
+
+    Обратный импорт (`import srouter` где-либо ниже по цепочке) — тот самый цикл, ради
+    обхода которого в #232 появилась двусторонняя делегация. Проверяем по AST: строковый
+    grep не отличит `import srouter_cli` от `import srouter`.
+    """
+
+    @pytest.mark.parametrize("module_name", ["srouter_cli", "srouter_privileged",
+                                             "srouter_launchd", "codex_wrappers"])
+    def test_downstream_module_never_imports_srouter(self, module_name):
+        module = importlib.import_module(module_name)
+        tree = ast.parse(inspect.getsource(module))
+        imported = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported.add(node.module)
+        assert "srouter" not in imported, (
+            f"{module_name} импортирует srouter — цикл srouter → {module_name} → srouter"
+        )
+
+
+class TestPrivilegedLayerOwnership:
+    """Привилегированный слой живёт в srouter_privileged (#259, вариант 1).
+
+    Он нужен ОБЕИМ сторонам (srouter_cli зовёт, srouter переэкспортирует). Оставь его
+    в srouter.py — получишь цикл; оставь в srouter_cli — владельцем CLI-модуля станут
+    обёртки над privileged_ops, которым там не место.
+    """
+
+    @pytest.mark.parametrize("name", ["_env_from_args", "make_privileged_runner",
+                                      "_is_privileged_cmd", "_to_osascript", "OSASCRIPT"])
+    def test_owned_by_privileged_module(self, name):
+        owner_obj = getattr(srouter_privileged, name)
+        assert getattr(srouter, name) is owner_obj, f"srouter.{name} — не объект владельца"
+        assert getattr(srouter_cli, name) is owner_obj, f"srouter_cli.{name} — не объект владельца"
+
+    @pytest.mark.parametrize("name", ["_env_from_args", "make_privileged_runner",
+                                      "_is_privileged_cmd", "_to_osascript"])
+    def test_defined_in_privileged_module(self, name):
+        assert getattr(srouter_privileged, name).__module__ == "srouter_privileged", (
+            f"{name} лишь переэкспортирован из srouter_privileged, а определён в другом модуле"
+        )
+
+
+class TestMockOwnershipContract:
+    """Патч ставится на модуль-ВЛАДЕЛЕЦ команды, а не на re-export (#259).
+
+    Самый опасный класс регрессии этой экстракции — ТИХИЙ: `monkeypatch.setattr(srouter,
+    "apply_install", ...)` не бросит AttributeError (имя на srouter есть — re-export), но
+    cmd_install резолвит его в globals srouter_cli → выполнится РЕАЛЬНЫЙ apply_install
+    против машины разработчика. Тест фиксирует обе половины инварианта: патч владельца
+    действует, патч re-export'а — нет. Вторая половина и есть причина, по которой 44 мока
+    в 5 файлах были перенацелены на srouter_cli.
+    """
+
+    def test_patch_on_owner_module_takes_effect(self, monkeypatch):
+        """Смотрим в __globals__ функции — именно оттуда cmd_install берёт имя в рантайме."""
+        sentinel = object()
+        monkeypatch.setattr(srouter_cli, "build_plan", sentinel)
+        assert srouter_cli.cmd_install.__globals__["build_plan"] is sentinel, (
+            "патч srouter_cli.build_plan не виден cmd_install — сломана связка владельца"
+        )
+
+    def test_patch_on_reexport_is_a_noop_for_commands(self, monkeypatch):
+        sentinel = object()
+        monkeypatch.setattr(srouter, "build_plan", sentinel)
+        assert srouter_cli.cmd_install.__globals__["build_plan"] is not sentinel, (
+            "патч srouter.build_plan повлиял на cmd_install — значит владелец имени снова "
+            "srouter, и экстракция не состоялась (либо появилась двусторонняя делегация)"
         )

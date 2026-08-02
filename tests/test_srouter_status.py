@@ -5,6 +5,12 @@
 не загружен (метки нет в выводе).
 """
 import srouter
+# Моки ставим на srouter_cli — модуль-ВЛАДЕЛЕЦ команд (#259). cmd_* резолвят свои
+# глобалы в srouter_cli.__dict__, поэтому setattr(srouter, ...) был бы тихим no-op:
+# имя на srouter есть (re-export), AttributeError не будет, а реальная реализация
+# всё равно выполнится и полезет в ФС/сеть. Вызовы намеренно оставлены через srouter —
+# они проверяют, что публичный контракт srouter.cmd_* по-прежнему ведёт в реализацию.
+import srouter_cli
 
 LAUNCHCTL_LIST_RUNNING = "12345\t0\tcom.srouter.dashboard\n"
 LAUNCHCTL_LIST_CRASHED = "-\t1\tcom.srouter.dashboard\n"
@@ -17,7 +23,7 @@ def _run_returning(out: str):
 
 
 def test_status_running(monkeypatch, capsys):
-    monkeypatch.setattr(srouter, "run", _run_returning(LAUNCHCTL_LIST_RUNNING))
+    monkeypatch.setattr(srouter_cli, "run", _run_returning(LAUNCHCTL_LIST_RUNNING))
     rc = srouter.cmd_status(argparse_ns())
     out = capsys.readouterr().out
     assert rc == 0
@@ -26,7 +32,7 @@ def test_status_running(monkeypatch, capsys):
 
 
 def test_status_crashed(monkeypatch, capsys):
-    monkeypatch.setattr(srouter, "run", _run_returning(LAUNCHCTL_LIST_CRASHED))
+    monkeypatch.setattr(srouter_cli, "run", _run_returning(LAUNCHCTL_LIST_CRASHED))
     rc = srouter.cmd_status(argparse_ns())
     err = capsys.readouterr().err
     assert rc == 1
@@ -37,7 +43,7 @@ def test_status_crashed(monkeypatch, capsys):
 
 def test_status_not_loaded(monkeypatch, capsys):
     # launchctl list не содержит нашу метку вообще.
-    monkeypatch.setattr(srouter, "run", _run_returning(LAUNCHCTL_LIST_OTHER))
+    monkeypatch.setattr(srouter_cli, "run", _run_returning(LAUNCHCTL_LIST_OTHER))
     rc = srouter.cmd_status(argparse_ns())
     out = capsys.readouterr().out
     assert rc == 1

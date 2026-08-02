@@ -638,8 +638,9 @@ class TestCriticalPathBehavior:
             yes=True
         )
 
-        # Mock для ошибки в build_plan
-        with patch('srouter.build_plan', side_effect=OSError("Test error")):
+        # Mock для ошибки в build_plan. Патчим srouter_cli — модуль-владелец cmd_install (#259):
+        # cmd_install резолвит build_plan в своих глобалах, патч через re-export srouter был бы no-op.
+        with patch('srouter_cli.build_plan', side_effect=OSError("Test error")):
             result = cmd_install(args)
             assert result == 2, "install должен возвращать rc=2 при discovery error"
 
