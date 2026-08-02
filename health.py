@@ -20,6 +20,7 @@ import shutil
 import socket
 import subprocess
 import tempfile
+import time
 from urllib.parse import urlparse
 
 import local_state
@@ -1789,14 +1790,37 @@ def _in_ao_worktree(path):
     путь (Path/str), а не полагаться на этот fallback.
     """
     try:
-        resolved = str(Path(path).resolve(strict=False))
+        resolved = Path(path).resolve(strict=False)
     except (OSError, ValueError, RuntimeError):
-        # Путь есть, но ОС/парсер его не осилили — решаем по сырой строке (всё ещё casefold).
-        resolved = str(path)
+        # Путь есть, но ОС/парсер его не осилили — решаем по сырой строке (ниже, регистронезависимо).
+        return _AO_WORKTREE_MARK in str(path).casefold()
     except TypeError:
         _log.debug("_in_ao_worktree: не путь (%s) — не worktree", type(path).__name__)
         return False
-    return _AO_WORKTREE_MARK in resolved.casefold()
+    # Точное совпадение написания — worktree без вопросов (быстрый путь, большинство случаев).
+    if _AO_WORKTREE_MARK in str(resolved):
+        return True
+    # Иначе написание отличается регистром. Регистр решает НЕ строка, а сама ФС (cycle-review
+    # round 3, Codex): macOS поддерживает case-sensitive APFS, где '.AO' и '.ao' — РАЗНЫЕ каталоги,
+    # и безусловный casefold объявил бы канонический '/.AO/...'-чекаут эфемерным worktree →
+    # guard отказал бы в установке, doctor нарисовал бы ложный down на здоровой машине (канон #135).
+    # Спрашиваем первоисточник: тот же ли это физически каталог, что канонический AO-worktrees-корень.
+    if _AO_WORKTREE_MARK not in str(resolved).casefold():
+        return False
+    # Ищем предка, чьё написание заканчивается worktrees-маркером, и спрашиваем ФС: он ли это.
+    canonical = Path.home() / ".ao" / "data" / "worktrees"
+    for ancestor in resolved.parents:
+        if not f"{ancestor}/".casefold().endswith(_AO_WORKTREE_MARK):
+            continue
+        try:
+            # Оба существуют и это ОДИН каталог → просто иначе записан (case-insensitive том).
+            return ancestor.samefile(canonical)
+        except OSError:
+            # Одного из каталогов нет / нет прав → ФС не опровергла совпадение. Fail-closed:
+            # для guard'а «не доказано, что другой» безопаснее трактовать как worktree — цена
+            # ошибки здесь отказ в установке, а не молча зашитая мина (issue #250).
+            return True
+    return False
 
 
 # Хвост stderr codenv-скрипта: там причина падения прописана буквально ('No such file or directory'
@@ -1815,8 +1839,12 @@ def _codenv_default_stderr_path():
     """
     try:
         import install_config
-        return str(install_config.InstallEnv().log_err)
-    except (ImportError, OSError, ValueError, TypeError) as exc:
+        # from_env(), НЕ InstallEnv(): реальный CLI строит env именно так, и именно его log_err
+        # рендерится в plist. InstallEnv() дал бы дефолты класса, игнорируя SROUTER_LOG_DIR —
+        # при кастомном log-dir doctor читал бы ЧУЖОЙ лог и молча терял причину падения
+        # (cycle-review round 3, Codex; каноны more-options-better + config-contract-is-the-generator).
+        return str(install_config.InstallEnv.from_env().log_err)
+    except (ImportError, OSError, ValueError, TypeError, AttributeError) as exc:
         _log.debug("install_config недоступен (%s) — дефолт stderr codenv неизвестен", exc)
         return ""
 
@@ -1973,6 +2001,29 @@ def _codenv_job_state(runner=None):
     return st
 
 
+# Пауза перед перепроверкой «job выгружен». Окно reload в install_plist — до ~3.5с
+# (_BOOTOUT_SETTLE_MAX_WAIT 2.0 + 3 x _BOOTSTRAP_RETRY_DELAY 0.5). Ждём с запасом, но не настолько,
+# чтобы затормозить doctor: перепроверка происходит ТОЛЬКО в редкой ветке «managed plist + rc=113».
+_CODENV_RELOAD_SETTLE_WAIT = 4.0
+
+
+def _codenv_unloaded_is_persistent(runner=None, *, wait=_CODENV_RELOAD_SETTLE_WAIT):
+    """«Выгружен» — устойчивое состояние, а не окно reload? Перепроверка после паузы.
+
+    cycle-review round 3 (Codex): единичный снимок rc=113 не отличает мёртвый codenv от штатной
+    переустановки — install_plist._launchd_reload делает bootout → poll → bootstrap, и в этом окне
+    plist уже на диске, а job'а ещё нет. Ложный down там шумел бы на ЗДОРОВОЙ машине (канон #135)
+    и мог бы дёрнуть watchdog ложным recovery.
+
+    True только если job ПОВТОРНО не найден (rc=113) после паузы, перекрывающей окно reload.
+    Любой другой исход (job появился / launchctl недоступен / таймаут) → False: не эскалируем
+    в down без подтверждения (fail-safe, та же семантика, что и у остального детектора).
+    """
+    time.sleep(wait)
+    st = _codenv_job_state(runner=runner)
+    return st["loaded"] is False
+
+
 def _codenv_job_check(runner=None):
     """codenv LaunchAgent реально ЖИВ? По состоянию job'а, не по наличию plist-файла (issue #250).
 
@@ -2001,7 +2052,13 @@ def _codenv_job_check(runner=None):
             # (там job без plist, тут plist без job'а) — и ровно тот класс, что ловит issue #250:
             # codenv сконфигурирован, но мёртв → после ребута Codex молча без SOCKS5.
             # Provenance-граница (#112): ЧУЖОЙ plist без маркера — не наша установка, молчим.
-            if _codenv_plist_is_managed():
+            # Окно reload — НЕ авария (cycle-review round 3, Codex): install пишет plist, затем
+            # bootout → poll → bootstrap (install_plist._launchd_reload), и МЕЖДУ ними состояние
+            # ровно «managed plist есть, rc=113». Окно до ~3.5с, а watchdog бежит раз в ~20с и
+            # /health дёргается в любой момент → штатная переустановка давала бы degraded/503 и
+            # ложное recovery-уведомление. Uninstall имеет такое же окно (bootout→unlink).
+            # Down — только для УСТОЙЧИВОГО состояния: перепроверяем после короткой паузы.
+            if _codenv_plist_is_managed() and _codenv_unloaded_is_persistent(runner=runner):
                 return {"status": "down",
                         "detail": (f"codenv установлен, но НЕ загружен: srouter-managed plist на диске "
                                    f"({Path.home() / 'Library' / 'LaunchAgents' / f'{_CODENV_LABEL}.plist'}), "

@@ -543,10 +543,12 @@ def test_codenv_stderr_tail_default_matches_template(monkeypatch, tmp_path):
     (канон config-contract-is-the-generator).
     """
     import install_config
-    expected = str(install_config.InstallEnv().log_err)
-    monkeypatch.setattr(health.Path, "home", lambda: tmp_path)
+    # from_env() — ровно то, чем строит env реальный CLI (и чей log_err уходит в plist).
+    # cycle-review round 3: сверка с InstallEnv() была бы сверкой с дефолтами класса, т.е. с
+    # тем самым багом, который чинили — тест обязан отражать генератор, а не старое поведение.
+    expected = str(install_config.InstallEnv.from_env().log_err)
     assert health._codenv_default_stderr_path() == expected, \
-        "дефолт stderr совпадает с log_err генератора"
+        "дефолт stderr совпадает с log_err генератора (from_env, со всеми его опциями)"
 
 
 def test_in_ao_worktree_never_raises_on_non_path_input():
@@ -565,3 +567,95 @@ def test_in_ao_worktree_never_raises_on_non_path_input():
     # Валидные входы по-прежнему решаются по существу, а не глушатся except'ом.
     assert health._in_ao_worktree("/Users/u/.AO/data/worktrees/s1/x.sh") is True
     assert health._in_ao_worktree(_P("/Users/u/Projects/srouter/x.sh")) is False
+
+
+# ============ cycle-review round 3 (Codex sol): три medium в фиксах раунда 2 ====================
+
+def test_codenv_worktree_detect_respects_case_sensitive_volume(monkeypatch, tmp_path):
+    """На case-sensitive томе '.AO' — ОТДЕЛЬНЫЙ каталог, не worktree (ложный down/отказ install).
+
+    Cycle-review round 3 (Codex, medium): безусловный casefold — зеркальный дефект к тому, что
+    чинил раунд 2. macOS поддерживает case-sensitive APFS (`diskutil listFilesystems`); там
+    /Users/u/.AO/projects/srouter — легитимный канонический чекаут. Безусловный casefold объявлял
+    бы его эфемерным worktree → guard отказывает в установке, doctor рисует ложный down на здоровой
+    машине (канон #135: шум на здоровой установке запрещён).
+
+    Правильный арбитр — сама ФС: если каталог существует, спрашиваем samefile у канонического
+    AO-корня, а не сравниваем написание (канон loose-validator: строгий первоисточник).
+    """
+    # Сценарий Codex ДОСЛОВНО: на case-sensitive томе существует каталог, чьё написание совпадает
+    # с worktree-маркером ПО РЕГИСТРУ, но это ДРУГОЙ физический каталог — реальный AO-worktree
+    # ('.ao/data/worktrees') рядом существует отдельно. Написание совпадает — сущность разная.
+    real_ao = tmp_path / ".ao" / "data" / "worktrees"
+    real_ao.mkdir(parents=True)
+    upper = tmp_path / ".AO" / "data" / "worktrees" / "srouter" / "s1" / "launchagents"
+    upper.mkdir(parents=True)
+    script = upper / "srouter-codex-env.sh"
+    script.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setattr(health.Path, "home", lambda: tmp_path)
+
+    case_sensitive = not (tmp_path / ".AO").samefile(tmp_path / ".ao") \
+        if (tmp_path / ".ao").exists() and (tmp_path / ".AO").exists() else False
+    if not case_sensitive:
+        import pytest
+        pytest.skip("том case-insensitive: '.AO' и '.ao' — один каталог, сценарий неприменим")
+
+    # На case-sensitive томе '.AO/data/worktrees' — НЕ тот каталог, что AO-корень '.ao/data/worktrees'.
+    assert health._in_ao_worktree(script) is False, \
+        "case-sensitive том: '.AO' — отдельный каталог, не эфемерный AO-worktree"
+
+    # Регресс-гард раунда 2: НАСТОЯЩИЙ worktree (под реальным '.ao') по-прежнему ловится.
+    true_wt = real_ao / "srouter" / "s2" / "launchagents"
+    true_wt.mkdir(parents=True)
+    true_script = true_wt / "srouter-codex-env.sh"
+    true_script.write_text("#!/bin/sh\n", encoding="utf-8")
+    assert health._in_ao_worktree(true_script) is True, "реальный AO-worktree — down"
+
+
+def test_codenv_stderr_default_honours_log_dir_override(monkeypatch, tmp_path):
+    """Дефолт stderr уважает SROUTER_LOG_DIR — как и install, который рендерит его в plist.
+
+    Cycle-review round 3 (Codex, medium): я звал InstallEnv() (дефолты класса), а реальный CLI —
+    InstallEnv.from_env(), который читает SROUTER_LOG_DIR и ИМЕННО его путь зашивает в plist.
+    При кастомном log-dir doctor в fallback-ветке читал бы чужой (дефолтный) лог и молча терял
+    причину падения codenv. Канон more-options-better (эталон InstallEnv.from_env) —
+    и config-contract-is-the-generator: путь берём у генератора со ВСЕМИ его опциями.
+    """
+    monkeypatch.setenv("SROUTER_LOG_DIR", str(tmp_path / "custom-logs"))
+    got = health._codenv_default_stderr_path()
+    assert str(tmp_path / "custom-logs") in got, f"дефолт уважает SROUTER_LOG_DIR; got {got}"
+
+
+def test_codenv_unknown_during_install_reload_window(monkeypatch, tmp_path):
+    """Окно reload (bootout→bootstrap) НЕ даёт ложный down: rc=113 должен ПОДТВЕРДИТЬСЯ повтором.
+
+    Cycle-review round 3 (Codex, medium): install пишет plist, затем bootout → poll → bootstrap
+    (install_plist._launchd_reload). Между bootout и bootstrap состояние ровно «managed plist есть,
+    rc=113» — то есть мой новый down. Окно до ~3.5с (2.0 settle + 3x0.5 retry), а watchdog бежит
+    раз в ~20с и /health дёргается в любой момент → штатная переустановка могла бы дать degraded/503
+    и ложное recovery-уведомление watchdog'а. Uninstall имеет такое же окно (bootout→unlink).
+
+    Лечение: down только для УСТОЙЧИВОГО состояния — перепроверяем rc=113 после короткой паузы.
+    Транзиентное окно (второй запрос показал job живым) → unknown, без шума.
+    """
+    _codenv_env(monkeypatch, tmp_path, plist_exists=True)
+    calls = {"n": 0}
+
+    def flapping_runner(cmd, tmo=5, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {"rc": 113, "out": "", "err": "Could not find service", "timeout": False}
+        # Повтор: bootstrap успел пройти — job снова на месте.
+        return {"rc": 0, "out": _print_out(state="running", runs=1, last_exit_code=0),
+                "err": "", "timeout": False}
+
+    res = health._codenv_job_check(runner=flapping_runner)
+    assert res["status"] != "down", f"транзиентное окно reload → НЕ down; got {res}"
+    assert calls["n"] >= 2, "rc=113 при managed-plist обязан перепроверяться (не разовый снимок)"
+
+
+def test_codenv_down_when_unloaded_state_is_persistent(monkeypatch, tmp_path):
+    """Регресс-гард: УСТОЙЧИВЫЙ rc=113 при managed plist по-прежнему down (находка раунда 2 жива)."""
+    _codenv_env(monkeypatch, tmp_path, plist_exists=True)
+    res = health._codenv_job_check(runner=_runner("Could not find service", rc=113))
+    assert res["status"] == "down", f"устойчиво выгруженный managed codenv → down; got {res}"
