@@ -20,12 +20,13 @@ import shutil
 import socket
 import subprocess
 import tempfile
+import time
 from urllib.parse import urlparse
 
 import local_state
 import privoxy_system
 import sys_probe
-from install_lib import _launchd_domain, _launchd_is_loaded
+from install_lib import _LAUNCHCTL_SERVICE_NOT_FOUND, _launchd_domain, _launchd_is_loaded
 
 _log = logging.getLogger("srouter.health")
 
@@ -1689,9 +1690,11 @@ def _desktop_proxy_check():
 
 # ============================ #189: ChatGPT.app Rust app-server proxy (launchctl gui-env) =========
 
-# codenv LaunchAgent label/marker — ДУБЛИРОВАНЫ из srouter.py (CODEX_ENV_LABEL/MARKER :273-274).
-# health.py НЕ импортирует srouter.py (CLI-слой, тащит argparse/apply_install). Парity-гвард: при
-# смене маркера в srouter.py — обновить тут (как _CODEX_WRAPPER_MARKER health.py:485 ↔ srouter.py).
+# codenv LaunchAgent label/marker — ДУБЛИРОВАНЫ из codex_wrappers.py (CODEX_ENV_LABEL/MARKER :74-75).
+# health.py НЕ импортирует codex_wrappers (тот сам импортирует health — вышел бы цикл; плюс CLI-слой
+# тащит argparse/apply_install). Парity-гвард: при смене маркера в codex_wrappers.py — обновить тут.
+# Указатель на srouter.py устарел: PR #258 (a177c6f) перенёс определения в codex_wrappers.py,
+# srouter.py их только реэкспортирует (cycle-review PR #262).
 _CODENV_LABEL = "com.srouter.codenv"
 _CODENV_MARKER = "srouter-managed-codex-env-v1"
 
@@ -1751,6 +1754,369 @@ def _read_gui_proxy_env(runner=None, *, keys_filter=LAUNCHCTL_PROXY_KEYS):
         # → unknown (fail-closed), НЕ false-down.
         return {"keys": {}, "verifiable": False}
     return {"keys": keys, "verifiable": True}
+
+
+# ============================ #250: состояние codenv launchd-job (первоисточник) =================
+#
+# Инцидент 2026-07-30: job загружен, plist с диска удалён, ProgramArguments указывает в стёртый
+# AO-worktree → exit 127 при КАЖДОМ из 1419 запусков (RunAtLoad + StartInterval=300), Codex молча
+# без SOCKS5. doctor молчал: _codenv_managed читал АРТЕФАКТ (plist-файл + маркер), а не СОСТОЯНИЕ
+# job'а. Первоисточник — `launchctl print gui/<uid>/<label>`: path / state / runs / last exit code /
+# arguments. Канон verify-dont-guess (probe-semantics-from-primary-source).
+
+# Эфемерный каталог AO-worktree. Постоянный LaunchAgent, указывающий туда, — всегда мина: worktree
+# удаляется, job остаётся и падает. Тот же литерал — в guard установки (codex_wrappers).
+_AO_WORKTREE_MARK = "/.ao/data/worktrees/"
+
+
+def _in_ao_worktree(path):
+    """Путь ведёт внутрь эфемерного AO-worktree? Единая точка для guard установки и детектора.
+
+    cycle-review round 2 (Codex, critical): сравнение было регистрозависимым. Эмпирически на APFS
+    по умолчанию `.AO/data/worktrees` и `.ao/data/worktrees` — ОДИН каталог (`Path.samefile` →
+    True), но `resolve()` сохраняет исходное написание, поэтому подстрочная сверка промахивалась:
+    install через альтернативное написание молча зашивал эфемерный путь в постоянный LaunchAgent
+    (та самая мина issue #250), а детектор его не подсвечивал. Сверяем casefold'ом — решение по
+    свойствам ФС, а не по написанию строки (канон loose-validator-recurring-leak).
+
+    resolve(strict=False) нормализует '..' и делает путь абсолютным ДАЖЕ для несуществующего файла,
+    поэтому вердикт не зависит ни от факта существования, ни от регистра, ни от '..'-сегментов.
+
+    НЕ бросает ни на каком входе — контракт, а не почти-контракт (cycle-review round 2, /review):
+    `Path(path)` кидает TypeError на None/int/bytes РАНЬШЕ, чем отработает except вокруг resolve().
+    Оба текущих вызывающих защищены, но это ОБЩИЙ предикат двух подсистем, и исключение отсюда
+    ушло бы в check_all — fail-open по всему стеку. Нераспознанный вход → False: «не доказано, что
+    worktree». Для guard'а это fail-open-сторона, поэтому оба вызывающих обязаны давать реальный
+    путь (Path/str), а не полагаться на этот fallback.
+    """
+    try:
+        resolved = Path(path).resolve(strict=False)
+    except (OSError, ValueError, RuntimeError):
+        # Путь есть, но ОС/парсер его не осилили — решаем по сырой строке (ниже, регистронезависимо).
+        return _AO_WORKTREE_MARK in str(path).casefold()
+    except TypeError:
+        _log.debug("_in_ao_worktree: не путь (%s) — не worktree", type(path).__name__)
+        return False
+    # Точное совпадение написания — worktree без вопросов (быстрый путь, большинство случаев).
+    if _AO_WORKTREE_MARK in str(resolved):
+        return True
+    # Иначе написание отличается регистром. Регистр решает НЕ строка, а сама ФС (cycle-review
+    # round 3, Codex): macOS поддерживает case-sensitive APFS, где '.AO' и '.ao' — РАЗНЫЕ каталоги,
+    # и безусловный casefold объявил бы канонический '/.AO/...'-чекаут эфемерным worktree →
+    # guard отказал бы в установке, doctor нарисовал бы ложный down на здоровой машине (канон #135).
+    # Спрашиваем первоисточник: тот же ли это физически каталог, что канонический AO-worktrees-корень.
+    if _AO_WORKTREE_MARK not in str(resolved).casefold():
+        return False
+    # Ищем предка, чьё написание заканчивается worktrees-маркером, и спрашиваем ФС: он ли это.
+    canonical = Path.home() / ".ao" / "data" / "worktrees"
+    for ancestor in resolved.parents:
+        if not f"{ancestor}/".casefold().endswith(_AO_WORKTREE_MARK):
+            continue
+        try:
+            # Оба существуют и это ОДИН каталог → просто иначе записан (case-insensitive том).
+            return ancestor.samefile(canonical)
+        except OSError:
+            # Одного из каталогов нет / нет прав → ФС не опровергла совпадение. Fail-closed:
+            # для guard'а «не доказано, что другой» безопаснее трактовать как worktree — цена
+            # ошибки здесь отказ в установке, а не молча зашитая мина (issue #250).
+            return True
+    return False
+
+
+# Хвост stderr codenv-скрипта: там причина падения прописана буквально ('No such file or directory'
+# с полным путём). Канон noisy-log-better-than-no-log — detail без причины бесполезен оператору.
+_CODENV_STDERR_TAIL_BYTES = 2048
+
+
+def _codenv_default_stderr_path():
+    """Дефолтный StandardErrorPath codenv — из того же генератора, что рендерит шаблон.
+
+    cycle-review round 2 (/review): дефолт был захардкожен как '/tmp/codenv.err' (взят из текста
+    инцидента), тогда как шаблон подставляет `__SROUTER_LOG_ERR__` → InstallEnv.log_err
+    (~/Library/Logs/...). Мёртвый дефолт: когда `launchctl print` не отдал 'stderr path', читался
+    несуществующий файл и причина падения молча терялась из detail — канон
+    config-contract-is-the-generator (путь берём у генератора, не переписываем его руками).
+    """
+    try:
+        import install_config
+        # from_env(), НЕ InstallEnv(): реальный CLI строит env именно так, и именно его log_err
+        # рендерится в plist. InstallEnv() дал бы дефолты класса, игнорируя SROUTER_LOG_DIR —
+        # при кастомном log-dir doctor читал бы ЧУЖОЙ лог и молча терял причину падения
+        # (cycle-review round 3, Codex; каноны more-options-better + config-contract-is-the-generator).
+        return str(install_config.InstallEnv.from_env().log_err)
+    except (ImportError, OSError, ValueError, TypeError, AttributeError) as exc:
+        _log.debug("install_config недоступен (%s) — дефолт stderr codenv неизвестен", exc)
+        return ""
+
+
+def _codenv_stderr_tail(path=None, *, limit=_CODENV_STDERR_TAIL_BYTES):
+    """Хвост stderr-лога codenv (по умолчанию StandardErrorPath из шаблона). Не бросает → ''."""
+    try:
+        target = path or _codenv_default_stderr_path()
+        if not target:
+            return ""
+        data = Path(target).read_bytes()[-limit:]
+        return data.decode("utf-8", errors="replace").strip()
+    except (OSError, ValueError):
+        # Нет файла / нет прав / битый путь — отсутствие лога не должно ронять чек (fail-soft).
+        return ""
+
+
+def _codenv_plist_is_managed():
+    """srouter-managed codenv plist лежит на диске? (только provenance, БЕЗ launchd-состояния.)
+
+    Доказательство «установка была»: маркер в plist. Отличает «codenv не ставили» (опционален —
+    молчим) от «ставили, а job мёртв» (авария #250). Провенанс-часть _codenv_managed, вынесенная
+    отдельно: тому нужны И маркер, И loaded — здесь как раз случай «маркер есть, loaded нет».
+    Ошибка чтения/битый plist → False (fail-safe: не выдумываем установку без доказательства).
+    """
+    try:
+        plist = Path.home() / "Library" / "LaunchAgents" / f"{_CODENV_LABEL}.plist"
+        return plist.exists() and _CODENV_MARKER in plist.read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        # OSError — нет файла/прав; ValueError — UnicodeDecodeError на бинарном/битом plist
+        # (та же граница, что в _codenv_managed: один файл не должен ронять doctor).
+        return False
+
+
+def _codenv_job_state(runner=None):
+    """Состояние launchd-job com.srouter.codenv по `launchctl print gui/<uid>/<label>`.
+
+    Первоисточник, не артефакт: plist-файл на диске может быть удалён, пока job живёт в памяти
+    launchd (осиротевший job) — и наоборот. Разбираем реальный формат launchctl print (проверен на
+    живой машине, `com.srouter.dashboard`): табулированные `key = value` + блок `arguments = { ... }`
+    со строками-аргументами по одной на строку.
+
+    Возвращает dict, НЕ бросает:
+      loaded: True (rc=0, вывод распознан) / False (rc=113 service-not-found) / None (unknown)
+      path: str — plist-путь, как его помнит launchd ('' если поля нет)
+      state: str — 'running' / 'not running' / 'spawn scheduled' / ''
+      runs: int|None, last_exit_code: int|None — None = поля НЕТ (нет данных), НЕ 0
+      arguments: list[str] — ProgramArguments как их видит launchd
+      stderr_path: str — StandardErrorPath (для хвоста причины)
+
+    last_exit_code=None НАМЕРЕННО не подменяется нулём: 0 = «доказанно завершился успешно»,
+    None = «нет данных». Подмена вернула бы fail-open (молчание при неизвестном состоянии).
+    """
+    empty = {"loaded": None, "path": "", "state": "", "runs": None, "last_exit_code": None,
+             "arguments": [], "stderr_path": ""}
+    run = runner if runner is not None else sys_probe.run
+    try:
+        r = run([LAUNCHCTL, "print", f"{_launchd_domain()}/{_CODENV_LABEL}"], 5)
+    except (OSError, ValueError, TypeError) as exc:
+        # runner — инъекция; сбой запуска launchctl не должен ронять doctor (fail-soft граница).
+        _log.debug("launchctl print codenv не выполнен: %s", exc)
+        return empty
+    # cycle-review PR #262 (Codex): try охватывал только ВЫЗОВ, а разбор результата был снаружи —
+    # runner, вернувший не-словарь (None/строка), ронял `.get` → AttributeError сквозь весь
+    # check_all (общий doctor/watchdog путь → fail-open по всему стеку). Валидируем форму ответа.
+    if not isinstance(r, dict):
+        _log.debug("launchctl print codenv: runner вернул %s, не словарь", type(r).__name__)
+        return empty
+    # rc-семантика ОБЯЗАНА совпадать с install_plist._launchd_is_loaded (rc=0 загружен / rc=113
+    # not-found — единственный достоверный False / иначе unknown fail-safe). Мы не вызываем его
+    # напрямую: он отдаёт голый tristate, а нам нужен САМ вывод того же `launchctl print` для
+    # разбора state/runs/last exit code/arguments — вызов _launchd_is_loaded означал бы ВТОРОЙ
+    # идентичный subprocess за прогон doctor'а. Парity-гвард (как _CODENV_LABEL ниже): при смене
+    # tristate-контракта в install_plist — обновить здесь; тест-гвард на совпадение семантики —
+    # tests/test_health_codenv_job.py::test_codenv_job_state_rc_semantics_match_launchd_is_loaded.
+    if r.get("timeout"):
+        return empty  # unknown, НЕ false-down (probe-канон)
+    rc = r.get("rc")
+    if rc == _LAUNCHCTL_SERVICE_NOT_FOUND:
+        return {**empty, "loaded": False}  # 113 — единственный достоверный «не загружен»
+    if rc != 0:
+        return empty
+    out = r.get("out") or ""
+    st = {**empty, "loaded": None}
+    in_args = False
+    args = []
+    # Глубина вложенности. cycle-review PR #262: парсер строил `key = value` ПЛОСКО, срезая отступы,
+    # а реальный `launchctl print` содержит вложенные блоки (`resource coalition = {`,
+    # `jetsam coalition = {`, `event triggers = {`) со СВОИМИ `state`/`runs`/`last exit code`. Они
+    # идут ПОСЛЕ top-level полей и затирали их: на живом `com.srouter.dashboard` истинное
+    # `state = spawn scheduled` читалось как `active` (state коалиции, к job'у отношения не имеет).
+    # Критично вдвойне — `state` служит гейтом loaded=True: обрывок, заканчивающийся внутри
+    # coalition-блока, выдал бы себя за полноценно загруженный job (fail-open).
+    # Берём ТОЛЬКО поля первого уровня (depth == 1: внутри `gui/<uid>/<label> = {`).
+    depth = 0
+    for line in out.splitlines():
+        stripped = line.strip()
+        if in_args:
+            if stripped == "}":
+                in_args = False
+                depth -= 1
+                continue
+            if stripped:
+                args.append(stripped)
+            continue
+        if stripped == "}":
+            depth -= 1
+            # cycle-review round 2 (/review): на закрывающей скобке top-level блока depth падал в 0,
+            # и СЛЕДУЮЩИЙ блок-сосед снова входил на depth==1 → его `state`/`last exit code`
+            # читались как поля нашего job'а (утечка 99 вместо 0). Живой `launchctl print` отдаёт
+            # один top-level блок, так что случай недостижим из настоящего вывода — но парсер
+            # первоисточника обязан быть строг: после закрытия своего блока читать больше нечего.
+            if depth <= 0:
+                break
+            continue
+        if stripped.endswith("= {"):
+            depth += 1
+            # `arguments = {` парсим как список строк-аргументов; прочие блоки просто пропускаем.
+            if stripped == "arguments = {" and depth == 2:
+                in_args = True
+            continue
+        if depth != 1:
+            continue  # вложенный блок (coalition/triggers) — его поля НЕ про наш job
+        key, sep, value = stripped.partition(" = ")
+        if not sep:
+            continue
+        key, value = key.strip(), value.strip()
+        if key == "path":
+            st["path"] = value
+        elif key == "state":
+            st["state"] = value
+        elif key == "stderr path":
+            st["stderr_path"] = value
+        elif key in ("runs", "last exit code"):
+            field = "runs" if key == "runs" else "last_exit_code"
+            try:
+                st[field] = int(value)
+            except ValueError:
+                # launchctl печатает 'last exit code = (never exited)' и подобное — не число,
+                # значит данных нет. None, не выдуманный 0 (fail-closed).
+                st[field] = None
+    st["arguments"] = args
+    # rc=0 сам по себе НЕ доказывает загруженный job: `launchctl print gui/<bad>/<label>` отдаёт
+    # rc=0 + 'Bad request.' Требуем узнаваемый вывод — иначе unknown (не выдумываем ни down, ни ok
+    # из мусора; тот же fail-closed, что found_block в _read_gui_proxy_env).
+    #
+    # cycle-review PR #262 (Codex): прежнее условие принимало ЛЮБОЕ одно поле, включая одинокий
+    # `path`. Усечённый вывод (только path) давал loaded=True → все проверки падений пропускались
+    # → «здоров». Неполный первоисточник — это «не смогли спросить», а не «спросили, всё хорошо».
+    # `state` обязателен: это поле launchd печатает для КАЖДОГО реально загруженного job'а, и
+    # именно оно отличает живую запись от обрывка вывода.
+    if st["state"]:
+        st["loaded"] = True
+    return st
+
+
+# Пауза перед перепроверкой «job выгружен». Окно reload в install_plist — до ~3.5с
+# (_BOOTOUT_SETTLE_MAX_WAIT 2.0 + 3 x _BOOTSTRAP_RETRY_DELAY 0.5). Ждём с запасом, но не настолько,
+# чтобы затормозить doctor: перепроверка происходит ТОЛЬКО в редкой ветке «managed plist + rc=113».
+_CODENV_RELOAD_SETTLE_WAIT = 4.0
+
+
+def _codenv_unloaded_is_persistent(runner=None, *, wait=_CODENV_RELOAD_SETTLE_WAIT):
+    """«Выгружен» — устойчивое состояние, а не окно reload? Перепроверка после паузы.
+
+    cycle-review round 3 (Codex): единичный снимок rc=113 не отличает мёртвый codenv от штатной
+    переустановки — install_plist._launchd_reload делает bootout → poll → bootstrap, и в этом окне
+    plist уже на диске, а job'а ещё нет. Ложный down там шумел бы на ЗДОРОВОЙ машине (канон #135)
+    и мог бы дёрнуть watchdog ложным recovery.
+
+    True только если job ПОВТОРНО не найден (rc=113) после паузы, перекрывающей окно reload.
+    Любой другой исход (job появился / launchctl недоступен / таймаут) → False: не эскалируем
+    в down без подтверждения (fail-safe, та же семантика, что и у остального детектора).
+    """
+    time.sleep(wait)
+    st = _codenv_job_state(runner=runner)
+    return st["loaded"] is False
+
+
+def _codenv_job_check(runner=None):
+    """codenv LaunchAgent реально ЖИВ? По состоянию job'а, не по наличию plist-файла (issue #250).
+
+    Исходы (ТДД issue #250):
+      down    — job загружен, но: last exit code != 0 (падает; runs подсвечивает флап) ИЛИ plist
+                на диске отсутствует (осиротевший job переживает удаление своего plist) ИЛИ
+                ProgramArguments указывает на несуществующий файл ИЛИ путь внутри AO-worktree
+                (эфемерный каталог как цель постоянного LaunchAgent — всегда мина установки).
+      ok      — job загружен, exit ДОКАЗАННО 0, скрипт на месте: канон #135 — здоровый codenv
+                НЕ шумит. Именно ok, а не info: _print_report рендерит КАЖДЫЙ info-чек жёлтым ⚠️
+                (`mark = "⚠️" if c.get("info")`), т.е. info для здорового вернуло бы ровно тот шум,
+                который #135 запрещает — просто в другом цвете (cycle-review PR #262, Codex).
+      unknown — job не загружен (codenv опционален — не авария), launchctl недоступен/таймаут,
+                вывод не распознан ИЛИ exit-код неизвестен. Никогда не бросает (probe-канон).
+
+    down обязан быть DRIVER: 1419 падений в тишине — ровно то, что этот чек закрывает
+    (noisy-log-better-than-no-log). Без codenv Codex после ребута идёт напрямую за GFW —
+    утечка реального IP (fail-closed-proxy-down).
+    """
+    st = _codenv_job_state(runner=runner)
+    if st["loaded"] is not True:
+        if st["loaded"] is False:
+            # cycle-review round 2 (Codex, critical): rc=113 БЕЗУСЛОВНО давал «опционален» → info.
+            # Но srouter-managed plist на диске ДОКАЗЫВАЕТ, что установка была: значит это не «не
+            # ставили», а «поставили, и job выгружен/не забутстрапился». Зеркало осиротевшего job'а
+            # (там job без plist, тут plist без job'а) — и ровно тот класс, что ловит issue #250:
+            # codenv сконфигурирован, но мёртв → после ребута Codex молча без SOCKS5.
+            # Provenance-граница (#112): ЧУЖОЙ plist без маркера — не наша установка, молчим.
+            # Окно reload — НЕ авария (cycle-review round 3, Codex): install пишет plist, затем
+            # bootout → poll → bootstrap (install_plist._launchd_reload), и МЕЖДУ ними состояние
+            # ровно «managed plist есть, rc=113». Окно до ~3.5с, а watchdog бежит раз в ~20с и
+            # /health дёргается в любой момент → штатная переустановка давала бы degraded/503 и
+            # ложное recovery-уведомление. Uninstall имеет такое же окно (bootout→unlink).
+            # Down — только для УСТОЙЧИВОГО состояния: перепроверяем после короткой паузы.
+            if _codenv_plist_is_managed() and _codenv_unloaded_is_persistent(runner=runner):
+                return {"status": "down",
+                        "detail": (f"codenv установлен, но НЕ загружен: srouter-managed plist на диске "
+                                   f"({Path.home() / 'Library' / 'LaunchAgents' / f'{_CODENV_LABEL}.plist'}), "
+                                   f"а job в launchd отсутствует — bootstrap не прошёл или job выгружен. "
+                                   f"Codex останется без SOCKS5 после ребута → прямой трафик за GFW. "
+                                   f"Лечение: srouter install (codenv) — перезагрузит LaunchAgent")}
+            return {"status": "unknown",
+                    "detail": f"codenv LaunchAgent {_CODENV_LABEL} не загружен в launchd "
+                              f"(опционален — нужен только для ChatGPT.app Rust app-server, #189)"}
+        return {"status": "unknown",
+                "detail": f"состояние {_CODENV_LABEL} не определено (launchctl print недоступен/таймаут)"}
+    facts = f"state={st['state'] or '?'}, runs={st['runs'] if st['runs'] is not None else '?'}"
+    # 1. Падает. Хвост stderr — причина буквально ('No such file or directory' + полный путь).
+    exit_code = st["last_exit_code"]
+    if exit_code is not None and exit_code != 0:
+        tail = _codenv_stderr_tail(st["stderr_path"] or None)
+        cause = f" Причина (stderr): {tail[-300:]}" if tail else ""
+        flap = " ФЛАП (падает при каждом запуске)" if (st["runs"] or 0) > 5 else ""
+        return {"status": "down",
+                "detail": (f"codenv падает: last exit code = {exit_code} ({facts}).{flap} "
+                           f"Codex останется без SOCKS5 после ребута → прямой трафик за GFW."
+                           f"{cause} Лечение: srouter install (codenv)")}
+    # 2. Осиротевший job: живёт в launchd, plist с диска удалён (bootout его не снял).
+    plist = Path.home() / "Library" / "LaunchAgents" / f"{_CODENV_LABEL}.plist"
+    if not plist.exists():
+        return {"status": "down",
+                "detail": (f"осиротевший codenv job: загружен в launchd ({facts}), но plist на диске "
+                           f"отсутствует ({plist}) — переустановка его не заменит. "
+                           f"Лечение: launchctl bootout {_launchd_domain()}/{_CODENV_LABEL}, "
+                           f"затем srouter install")}
+    # 3. ProgramArguments → эфемерный worktree / несуществующий файл (корень exit 127).
+    script = st["arguments"][-1] if st["arguments"] else ""
+    if script:
+        # _in_ao_worktree — та же единая точка, что и в guard установки (codex_wrappers):
+        # resolve('..'/относительных) + casefold. Guard и детектор ОБЯЗАНЫ видеть worktree
+        # одинаково, иначе одна сторона молчит там, где другая бьёт тревогу.
+        if _in_ao_worktree(script):
+            return {"status": "down",
+                    "detail": (f"codenv указывает в эфемерный AO-worktree: {script} ({facts}). "
+                               f"Worktree удаляется — job останется и начнёт падать с exit 127 "
+                               f"(мина установки, issue #250). Лечение: srouter install из "
+                               f"канонического репозитория")}
+        if not Path(script).exists():
+            return {"status": "down",
+                    "detail": (f"codenv ProgramArguments указывает на несуществующий файл: {script} "
+                               f"({facts}) — следующий запуск даст exit 127, Codex без SOCKS5. "
+                               f"Лечение: srouter install (codenv)")}
+    # 4. Здоров — но только если exit-код ДОКАЗАННО 0. cycle-review PR #262 (Codex): `None` («нет
+    # данных»: launchctl не напечатал поле или напечатал '(never exited)') раньше проваливался сюда,
+    # и detail ЛГАЛ «last exit code = 0» — «не смогли проверить» выдавалось за «проверили, здоров».
+    # Ровно тот fail-open, который докстринг _codenv_job_state обещал исключить.
+    if exit_code is None:
+        return {"status": "unknown",
+                "detail": (f"codenv загружен ({facts}), но launchctl не сообщил last exit code — "
+                           f"здоровье не подтверждено (job мог ни разу не завершиться). "
+                           f"Проверить вручную: launchctl print {_launchd_domain()}/{_CODENV_LABEL}")}
+    return {"status": "ok",
+            "detail": f"codenv LaunchAgent загружен и здоров ({facts}, last exit code = 0): {script or plist}"}
 
 
 def _codex_app_proxy_check():
@@ -2135,6 +2501,20 @@ def check_all(*, active_claude=False):
     elif ap["status"] == "warn":
         ap_check["ok"] = False  # App на privoxy — degraded (WS порвётся #120)
     checks.append(ap_check)
+    # codenv launchd-job (#250): job загружен, но падает (exit != 0) / осиротел (plist удалён) /
+    # указывает на несуществующий путь → down DRIVER. Реальный инцидент: 1419 падений подряд в
+    # тишине — doctor читал plist-артефакт, а не состояние job'а. Без codenv Codex после ребута
+    # идёт напрямую за GFW (fail-closed-proxy-down) → это настоящий сбой стека, не info-шёпот.
+    # ok (здоровый job) — обычный ✅ БЕЗ info-флага: _print_report рендерит любой info-чек жёлтым
+    # ⚠️, что для здоровой установки и есть запрещённый каноном #135 шум (cycle-review PR #262).
+    # unknown (job не загружен — codenv опционален / launchctl недоступен / exit-код неизвестен) —
+    # info-only: не роняет вердикт, но и не притворяется подтверждённо здоровым.
+    cj = _codenv_job_check()
+    cj_check = {"name": "codenv LaunchAgent (job launchd)",
+                "ok": cj["status"] != "down", "detail": cj["detail"]}
+    if cj["status"] == "unknown":
+        cj_check["info"] = True
+    checks.append(cj_check)
     # VSCode scoped SOCKS5 (#185): codex-расширение openai.chatgpt через http.proxy. info-only ВСЕГДА
     # (как endpoint-override) — VSCode может быть не установлен, srouter-stack от этого не падает.
     # down (http.proxy=privoxy/чужой — рвёт WS) показываем в detail, но НЕ driver: это scoped-диагностика

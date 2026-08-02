@@ -289,7 +289,22 @@ def _install_launchctl_env(env, runner) -> str:
 
     Через _install_generic_launchagent (как watchdog): marker-gate + atomic write + _launchd_reload
     (bootout→poll→bootstrap-retry, решает гонку занятого домена — PR #80).
+
+    issue #250 guard: plist рендерится из env.root. install, запущенный ИЗ эфемерного AO-worktree,
+    зашивает в ПОСТОЯННЫЙ LaunchAgent путь, который скоро исчезнет — мина замедленного действия
+    (реальный инцидент: worktree srouter-117 стёрт → /bin/sh не находит скрипт → exit 127 при каждом
+    из 1419 запусков, Codex молча без SOCKS5). Отказываемся ставить вовсе (fail-closed: явный отказ
+    при install лучше 1419 падений в тишине). Канон ao-worktree-vs-main-worktree-confusion.
     """
+    script_path = env.root / "launchagents" / "srouter-codex-env.sh"
+    # health._in_ao_worktree — ЕДИНАЯ точка решения (тот же предикат, что детектит doctor):
+    # guard установки и детектор обязаны видеть worktree одинаково, иначе одна сторона молчит.
+    # Внутри: resolve(strict=False) (нормализует '..' и относительные пути даже для
+    # несуществующего файла) + casefold (на APFS '.AO' и '.ao' — один каталог, cycle-review round 2).
+    if health._in_ao_worktree(script_path):
+        return (f"Codex env: НЕ установлен — путь ведёт в эфемерный AO-worktree ({script_path}). "
+                f"LaunchAgent постоянен, worktree — нет: после его удаления job упадёт с exit 127 "
+                f"(issue #250). Запусти srouter install из канонического репозитория.")
     try:
         # Предупредить, если в GUI-домене уже есть ЧУЖОЙ прокси (корпоративный/ручной) — setenv
         # скрипта его перезапишет без восстановления. Не блокируем, но WARN в статусе.
