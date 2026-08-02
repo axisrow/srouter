@@ -26,6 +26,7 @@ if str(_ROOT) not in sys.path:
 # антирекурсионных тестов (os.link + assert st_ino), подмена превратила бы их в no-op. Здесь речь о
 # fake-codex — обычной заглушке, чей inode не проверяется нигде. Гвард против тихой регрессии (заглушка
 # перестала переиспользовать inode → оптимизация стала no-op) — tests/test_fake_codex_fixture.py.
+
 # 8 прокси-переменных, которые wrapper обязан санировать через `env -u` (#96): верхний/нижний регистр
 # + ALL_PROXY + NO_PROXY. Единый источник для дампа заглушкой и для ассертов в тестах.
 PROXY_ENV_KEYS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
@@ -60,6 +61,16 @@ FAKE_CODEX_ENV_KEYS = ("SROUTER_FAKE_OUT", "SROUTER_FAKE_TAG", "SROUTER_FAKE_ARG
                        "SROUTER_FAKE_ENV", "SROUTER_FAKE_RC")
 
 
+def scrub_fake_codex_keys(environ):
+    """Изъять FAKE_CODEX_ENV_KEYS из mapping'а `environ` in-place; вернуть изъятое (для restore).
+
+    Отдельная функция, а не тело фикстуры, СПЕЦИАЛЬНО: гвард должен проверять саму логику чистки
+    на подготовленном словаре. Проверка «ключей нет в живом os.environ» зелёная и при сломанном
+    scrubber'е — в чистом CI переменных и так нет, поэтому мутант выживает (проверено мутационно).
+    Тестируемая функция ловит регрессию независимо от того, что экспортировано в окружении."""
+    return {k: environ.pop(k) for k in FAKE_CODEX_ENV_KEYS if k in environ}
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _scrub_ambient_fake_codex_env():
     """Вычистить ambient SROUTER_FAKE_* из os.environ на время сессии (#257, cycle-review).
@@ -71,10 +82,12 @@ def _scrub_ambient_fake_codex_env():
     9 красных тестов без единого намёка на причину, при зелёном CI («works on my machine» наоборот).
 
     Чистим ОДИН раз на границе сессии, а не оборачиваем каждый env-словарь: барьер структурный, его
-    нельзя забыть применить в новом тесте. Гвард — test_ambient_srouter_fake_env_is_scrubbed."""
+    нельзя забыть применить в новом тесте. Гварды — test_scrub_fake_codex_keys_removes_all_keys
+    (логика чистки, ловит мутанта в любом окружении) + test_ambient_srouter_fake_env_is_scrubbed
+    (фикстура реально применена к os.environ)."""
     import os
 
-    saved = {k: os.environ.pop(k) for k in FAKE_CODEX_ENV_KEYS if k in os.environ}
+    saved = scrub_fake_codex_keys(os.environ)
     try:
         yield
     finally:

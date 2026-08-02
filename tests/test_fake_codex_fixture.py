@@ -10,6 +10,8 @@
 import os
 import subprocess
 
+import conftest
+
 
 def test_fake_codex_reuses_master_inode(fake_codex, fake_codex_master, tmp_path):
     """Корневой инвариант #257: заглушка — hardlink на прогретый мастер, НЕ копия.
@@ -83,33 +85,60 @@ def test_fake_codex_propagates_rc(fake_codex, tmp_path):
 
 
 def test_fake_codex_is_noop_without_env(fake_codex, tmp_path):
-    """Без SROUTER_FAKE_* заглушка ничего не пишет и выходит 0 — безопасный дефолт для прогрева."""
-    p = fake_codex(tmp_path / "bin" / "codex")
-    clean = {k: v for k, v in os.environ.items() if not k.startswith("SROUTER_FAKE_")}
+    """Без SROUTER_FAKE_* заглушка ничего не пишет и выходит 0 — безопасный дефолт для прогрева.
 
-    proc = subprocess.run([str(p)], env=clean, capture_output=True, timeout=30)
+    Окружение берётся как есть (без ручной фильтрации): чистоту гарантирует autouse-фикстура
+    _scrub_ambient_fake_codex_env. Фильтр здесь маскировал бы эту зависимость — тест оставался бы
+    зелёным при сломанном scrubber'е, ровно та дыра, которую чинит парный гвард на логику чистки."""
+    p = fake_codex(tmp_path / "bin" / "codex")
+
+    proc = subprocess.run([str(p)], env={**os.environ}, capture_output=True, timeout=30)
 
     assert proc.returncode == 0
     assert list(tmp_path.glob("*.txt")) == [], "без env-параметров заглушка не создаёт файлов"
 
 
+def test_scrub_fake_codex_keys_removes_all_keys():
+    """Корневой гвард scrubber'а: проверяем ЛОГИКУ чистки на подготовленном словаре, не на os.environ.
+
+    Проверка «ключей нет в живом os.environ» зелёная и при сломанном scrubber'е — в чистом CI этих
+    переменных и так нет, мутант выживает (проверено мутационно: `saved = {}` вместо pop → тест всё
+    равно проходил). Поэтому инвариант проверяется на входном mapping'е, где ключи заведомо есть:
+    регрессия ловится независимо от того, что экспортировано в окружении запуска."""
+    env = {"PATH": "/usr/bin", "SROUTER_FAKE_RC": "99", "SROUTER_FAKE_OUT": "/tmp/x",
+           "SROUTER_FAKE_TAG": "t", "SROUTER_FAKE_ARGV": "/tmp/a", "SROUTER_FAKE_ENV": "/tmp/e"}
+
+    saved = conftest.scrub_fake_codex_keys(env)
+
+    assert env == {"PATH": "/usr/bin"}, f"все SROUTER_FAKE_* изъяты, чужое не тронуто: {env}"
+    for key in conftest.FAKE_CODEX_ENV_KEYS:
+        assert key in saved, f"{key} возвращён для restore (иначе finally не восстановит окружение)"
+    assert saved["SROUTER_FAKE_RC"] == "99", "значения сохранены точно, а не затёрты"
+
+
+def test_scrub_fake_codex_keys_is_noop_when_absent():
+    """Чистка на окружении без SROUTER_FAKE_* — no-op: ничего не изъято, ничего не сломано."""
+    env = {"PATH": "/usr/bin", "HOME": "/home/u"}
+
+    saved = conftest.scrub_fake_codex_keys(env)
+
+    assert saved == {}, "нечего сохранять"
+    assert env == {"PATH": "/usr/bin", "HOME": "/home/u"}, "чужие ключи не тронуты"
+
+
 def test_ambient_srouter_fake_env_is_scrubbed(fake_codex, tmp_path):
-    """Ambient SROUTER_FAKE_* из окружения разработчика НЕ должна долетать до заглушки.
+    """Фикстура _scrub_ambient_fake_codex_env РЕАЛЬНО применена к живому os.environ.
 
-    Тесты передают env={**os.environ, ...} — любая не-переопределённая SROUTER_FAKE_* пролезла бы
-    в дочерний процесс. Самая опасная — SROUTER_FAKE_RC: её не переопределяет никто, кроме
-    test_cli_launcher_propagates_exit_status, поэтому заглушка выходила бы с чужим кодом и валила
-    все check=True вызовы. Симптом при этом немой: 9 красных тестов без намёка на причину в shell'е,
-    CI зелёный («works on my machine» наоборот).
+    Дополняет test_scrub_fake_codex_keys_removes_all_keys (та проверяет логику чистки): здесь
+    проверяется, что autouse-фикстура эту логику к процессу применила. В чистом CI ассерт ниже
+    тривиально истинен — регрессию ловит парный тест логики, этот же ловит случай «фикстуру
+    отцепили от сессии», когда переменные в окружении есть.
 
-    Гвард на autouse-фикстуру _scrub_ambient_fake_codex_env: она вычищает эти ключи из os.environ
-    на время сессии, поэтому env={**os.environ, ...} безопасен СТРУКТУРНО, а не по дисциплине."""
-    # Симулируем «разработчик экспортировал SROUTER_FAKE_RC=99 и забыл» ПОСЛЕ старта сессии:
-    # monkeypatch кладёт ключ обратно в os.environ уже после работы autouse-scrubber'а.
-    # Скраббер обязан быть не разовой чисткой, а барьером на границе запуска — поэтому тест
-    # проверяет именно то, что тесты СТРОЯТ env без ambient-ключей.
-    for key in ("SROUTER_FAKE_RC", "SROUTER_FAKE_OUT", "SROUTER_FAKE_TAG",
-                "SROUTER_FAKE_ARGV", "SROUTER_FAKE_ENV"):
+    Зачем вообще: тесты передают env={**os.environ, ...}, поэтому любая не-переопределённая
+    SROUTER_FAKE_* пролезла бы в заглушку. Опаснее всех SROUTER_FAKE_RC — её не переопределяет
+    никто, кроме test_cli_launcher_propagates_exit_status: экспортированная снаружи RC=99 роняла
+    9 тестов под check=True, без намёка на причину и при зелёном CI."""
+    for key in conftest.FAKE_CODEX_ENV_KEYS:
         assert key not in os.environ, \
             f"{key} обязан быть вычищен из os.environ на время сессии (ambient env ломает тесты)"
 
