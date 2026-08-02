@@ -119,7 +119,10 @@ EXPECTED_SIGNATURES = {
     "build_uninstall_plan": "(env=None, runner=<function run at ",
     "format_plan": "(plan)",
     "format_uninstall_plan": "(plan)",
-    "main": "(argv=None)",
+    # issue #269: main получил runner=run — та же DI-точка, что у build_plan/apply_install/
+    # apply_uninstall/build_uninstall_plan (см. их записи выше), main её теперь прокидывает,
+    # а не обрывает цепочку на реальный subprocess.
+    "main": "(argv=None, *, runner=<function run at ",
 }
 
 
