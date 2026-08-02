@@ -203,10 +203,15 @@ def test_gather_status_returns_node_snapshot_without_running_heavy_probe(monkeyp
     ):
         monkeypatch.setattr(dashboard_app, name, lambda *args, name=name, **kwargs: {"status": "ok", "probe": name})
 
+    # Как в test_gather_status_timeout_does_not_wait_for_executor_shutdown: длительность пробы
+    # заметно больше порога assert'а ниже, чтобы «позвали тяжёлый probe» и «не позвали»
+    # различались с запасом под CPU-contention параллельного прогона.
+    slow_probe_sec = 1.0
+
     def slow_probe_nodes():
         nonlocal called
         called = True
-        time.sleep(0.2)
+        time.sleep(slow_probe_sec)
         return [{"name": "sg-1", "status": "ok"}]
 
     # Ловушка ставится в dashboard_nodes — модуль-первоисточник, откуда тяжёлый probe_nodes
@@ -237,7 +242,12 @@ def test_gather_status_returns_node_snapshot_without_running_heavy_probe(monkeyp
     out = dashboard.gather_status()
     elapsed = time.monotonic() - started
 
-    assert elapsed < 0.1
+    # Основной guard инварианта — `called is False` ниже (он timing-независим). Порог по времени
+    # вторичен и выражен долей от slow_probe_sec, а не абсолютными 0.1s: вызов тяжёлого
+    # probe_nodes дал бы >= slow_probe_sec, а contention съедает 100мс и на здоровом пути.
+    assert elapsed < slow_probe_sec / 2, (
+        f"gather_status выполнила тяжёлый probe_nodes ({elapsed:.3f}s) — "
+        "снимок узлов обязан строиться лёгким probe_nodes_snapshot")
     assert called is False
     assert out["nodes"] == [
         {
@@ -260,8 +270,13 @@ def test_gather_status_timeout_does_not_wait_for_executor_shutdown(monkeypatch):
     dashboard._cache.update(ts=0.0, data=None)
     monkeypatch.setattr(dashboard_app, "STATUS_PROBE_BUDGET_SEC", 0.01)
 
+    # Предмет теста — что gather_status НЕ дожидается executor.shutdown() медленной пробы,
+    # а не абсолютная латентность. Проба заметно длиннее порога assert'а ниже, чтобы «дождались»
+    # и «не дождались» различались с запасом даже под CPU-contention параллельного прогона.
+    slow_probe_sec = 1.0
+
     def slow_probe():
-        time.sleep(0.2)
+        time.sleep(slow_probe_sec)
         return {"status": "ok"}
 
     for name in (
@@ -290,7 +305,13 @@ def test_gather_status_timeout_does_not_wait_for_executor_shutdown(monkeypatch):
     out = dashboard.gather_status()
     elapsed = time.monotonic() - started
 
-    assert elapsed < 0.1
+    # Порог — доля от slow_probe_sec, а не абсолютные 0.1s: под xdist-contention планировщик
+    # легко съедает 100мс на ровном месте (тест флапал на main), но «дождались shutdown» дало бы
+    # >= slow_probe_sec. Половина отделяет одно от другого с большим запасом.
+    assert elapsed < slow_probe_sec / 2, (
+        f"gather_status дождалась медленной пробы ({elapsed:.3f}s при бюджете 0.01s) — "
+        "executor.shutdown(wait=False) не работает"
+    )
     assert out["services"]["status"] == "unknown"
     assert out["tunnel"]["status"] == "ok"
     assert out["nodes"] == []
