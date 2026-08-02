@@ -25,7 +25,7 @@ from urllib.parse import urlparse
 import local_state
 import privoxy_system
 import sys_probe
-from install_lib import _launchd_domain, _launchd_is_loaded
+from install_lib import _LAUNCHCTL_SERVICE_NOT_FOUND, _launchd_domain, _launchd_is_loaded
 
 _log = logging.getLogger("srouter.health")
 
@@ -1753,6 +1753,173 @@ def _read_gui_proxy_env(runner=None, *, keys_filter=LAUNCHCTL_PROXY_KEYS):
     return {"keys": keys, "verifiable": True}
 
 
+# ============================ #250: состояние codenv launchd-job (первоисточник) =================
+#
+# Инцидент 2026-07-30: job загружен, plist с диска удалён, ProgramArguments указывает в стёртый
+# AO-worktree → exit 127 при КАЖДОМ из 1419 запусков (RunAtLoad + StartInterval=300), Codex молча
+# без SOCKS5. doctor молчал: _codenv_managed читал АРТЕФАКТ (plist-файл + маркер), а не СОСТОЯНИЕ
+# job'а. Первоисточник — `launchctl print gui/<uid>/<label>`: path / state / runs / last exit code /
+# arguments. Канон verify-dont-guess (probe-semantics-from-primary-source).
+
+# Эфемерный каталог AO-worktree. Постоянный LaunchAgent, указывающий туда, — всегда мина: worktree
+# удаляется, job остаётся и падает. Тот же литерал — в guard установки (codex_wrappers).
+_AO_WORKTREE_MARK = "/.ao/data/worktrees/"
+
+# Хвост stderr codenv-скрипта: там причина падения прописана буквально ('No such file or directory'
+# с полным путём). Канон noisy-log-better-than-no-log — detail без причины бесполезен оператору.
+_CODENV_STDERR_TAIL_BYTES = 2048
+
+
+def _codenv_stderr_tail(path=None, *, limit=_CODENV_STDERR_TAIL_BYTES):
+    """Хвост stderr-лога codenv (по умолчанию StandardErrorPath из шаблона). Не бросает → ''."""
+    try:
+        p = Path(path) if path else Path("/tmp/codenv.err")
+        data = p.read_bytes()[-limit:]
+        return data.decode("utf-8", errors="replace").strip()
+    except (OSError, ValueError):
+        # Нет файла / нет прав / битый путь — отсутствие лога не должно ронять чек (fail-soft).
+        return ""
+
+
+def _codenv_job_state(runner=None):
+    """Состояние launchd-job com.srouter.codenv по `launchctl print gui/<uid>/<label>`.
+
+    Первоисточник, не артефакт: plist-файл на диске может быть удалён, пока job живёт в памяти
+    launchd (осиротевший job) — и наоборот. Разбираем реальный формат launchctl print (проверен на
+    живой машине, `com.srouter.dashboard`): табулированные `key = value` + блок `arguments = { ... }`
+    со строками-аргументами по одной на строку.
+
+    Возвращает dict, НЕ бросает:
+      loaded: True (rc=0, вывод распознан) / False (rc=113 service-not-found) / None (unknown)
+      path: str — plist-путь, как его помнит launchd ('' если поля нет)
+      state: str — 'running' / 'not running' / 'spawn scheduled' / ''
+      runs: int|None, last_exit_code: int|None — None = поля НЕТ (нет данных), НЕ 0
+      arguments: list[str] — ProgramArguments как их видит launchd
+      stderr_path: str — StandardErrorPath (для хвоста причины)
+
+    last_exit_code=None НАМЕРЕННО не подменяется нулём: 0 = «доказанно завершился успешно»,
+    None = «нет данных». Подмена вернула бы fail-open (молчание при неизвестном состоянии).
+    """
+    empty = {"loaded": None, "path": "", "state": "", "runs": None, "last_exit_code": None,
+             "arguments": [], "stderr_path": ""}
+    run = runner if runner is not None else sys_probe.run
+    try:
+        r = run([LAUNCHCTL, "print", f"{_launchd_domain()}/{_CODENV_LABEL}"], 5)
+    except (OSError, ValueError, TypeError) as exc:
+        # runner — инъекция; сбой запуска launchctl не должен ронять doctor (fail-soft граница).
+        _log.debug("launchctl print codenv не выполнен: %s", exc)
+        return empty
+    if r.get("timeout"):
+        return empty  # unknown, НЕ false-down (probe-канон)
+    rc = r.get("rc")
+    if rc == _LAUNCHCTL_SERVICE_NOT_FOUND:
+        return {**empty, "loaded": False}  # 113 — единственный достоверный «не загружен»
+    if rc != 0:
+        return empty
+    out = r.get("out") or ""
+    st = {**empty, "loaded": None}
+    in_args = False
+    args = []
+    for line in out.splitlines():
+        stripped = line.strip()
+        if in_args:
+            if stripped == "}":
+                in_args = False
+                continue
+            if stripped:
+                args.append(stripped)
+            continue
+        if stripped == "arguments = {":
+            in_args = True
+            continue
+        key, sep, value = stripped.partition(" = ")
+        if not sep:
+            continue
+        key, value = key.strip(), value.strip()
+        if key == "path":
+            st["path"] = value
+        elif key == "state":
+            st["state"] = value
+        elif key == "stderr path":
+            st["stderr_path"] = value
+        elif key in ("runs", "last exit code"):
+            field = "runs" if key == "runs" else "last_exit_code"
+            try:
+                st[field] = int(value)
+            except ValueError:
+                # launchctl печатает 'last exit code = (never exited)' и подобное — не число,
+                # значит данных нет. None, не выдуманный 0 (fail-closed).
+                st[field] = None
+    st["arguments"] = args
+    # rc=0 сам по себе НЕ доказывает загруженный job: `launchctl print gui/<bad>/<label>` отдаёт
+    # rc=0 + 'Bad request.' Требуем хотя бы одно узнаваемое поле — иначе unknown (не выдумываем
+    # down из мусора, тот же fail-closed, что found_block в _read_gui_proxy_env).
+    if st["state"] or st["path"] or args or st["runs"] is not None:
+        st["loaded"] = True
+    return st
+
+
+def _codenv_job_check(runner=None):
+    """codenv LaunchAgent реально ЖИВ? По состоянию job'а, не по наличию plist-файла (issue #250).
+
+    Пять исходов (ТДД issue #250):
+      down    — job загружен, но: last exit code != 0 (падает; runs подсвечивает флап) ИЛИ plist
+                на диске отсутствует (осиротевший job переживает удаление своего plist) ИЛИ
+                ProgramArguments указывает на несуществующий файл ИЛИ путь внутри AO-worktree
+                (эфемерный каталог как цель постоянного LaunchAgent — всегда мина установки).
+      info    — job загружен, exit 0, скрипт на месте: канон #135 — здоровый codenv НЕ шумит.
+      unknown — job не загружен (codenv опционален — не авария), launchctl недоступен/таймаут,
+                вывод не распознан. Никогда не бросает (probe-канон, check_all fail-soft).
+
+    down обязан быть DRIVER: 1419 падений в тишине — ровно то, что этот чек закрывает
+    (noisy-log-better-than-no-log). Без codenv Codex после ребута идёт напрямую за GFW —
+    утечка реального IP (fail-closed-proxy-down).
+    """
+    st = _codenv_job_state(runner=runner)
+    if st["loaded"] is not True:
+        if st["loaded"] is False:
+            return {"status": "unknown",
+                    "detail": f"codenv LaunchAgent {_CODENV_LABEL} не загружен в launchd "
+                              f"(опционален — нужен только для ChatGPT.app Rust app-server, #189)"}
+        return {"status": "unknown",
+                "detail": f"состояние {_CODENV_LABEL} не определено (launchctl print недоступен/таймаут)"}
+    facts = f"state={st['state'] or '?'}, runs={st['runs'] if st['runs'] is not None else '?'}"
+    # 1. Падает. Хвост stderr — причина буквально ('No such file or directory' + полный путь).
+    exit_code = st["last_exit_code"]
+    if exit_code:  # не None и не 0
+        tail = _codenv_stderr_tail(st["stderr_path"] or None)
+        cause = f" Причина (stderr): {tail[-300:]}" if tail else ""
+        flap = " ФЛАП (падает при каждом запуске)" if (st["runs"] or 0) > 5 else ""
+        return {"status": "down",
+                "detail": (f"codenv падает: last exit code = {exit_code} ({facts}).{flap} "
+                           f"Codex останется без SOCKS5 после ребута → прямой трафик за GFW."
+                           f"{cause} Лечение: srouter install (codenv)")}
+    # 2. Осиротевший job: живёт в launchd, plist с диска удалён (bootout его не снял).
+    plist = Path.home() / "Library" / "LaunchAgents" / f"{_CODENV_LABEL}.plist"
+    if not plist.exists():
+        return {"status": "down",
+                "detail": (f"осиротевший codenv job: загружен в launchd ({facts}), но plist на диске "
+                           f"отсутствует ({plist}) — переустановка его не заменит. "
+                           f"Лечение: launchctl bootout {_launchd_domain()}/{_CODENV_LABEL}, "
+                           f"затем srouter install")}
+    # 3. ProgramArguments → эфемерный worktree / несуществующий файл (корень exit 127).
+    script = st["arguments"][-1] if st["arguments"] else ""
+    if script:
+        if _AO_WORKTREE_MARK in script:
+            return {"status": "down",
+                    "detail": (f"codenv указывает в эфемерный AO-worktree: {script} ({facts}). "
+                               f"Worktree удаляется — job останется и начнёт падать с exit 127 "
+                               f"(мина установки, issue #250). Лечение: srouter install из "
+                               f"канонического репозитория")}
+        if not Path(script).exists():
+            return {"status": "down",
+                    "detail": (f"codenv ProgramArguments указывает на несуществующий файл: {script} "
+                               f"({facts}) — следующий запуск даст exit 127, Codex без SOCKS5. "
+                               f"Лечение: srouter install (codenv)")}
+    return {"status": "info",
+            "detail": f"codenv LaunchAgent загружен и здоров ({facts}, last exit code = 0): {script or plist}"}
+
+
 def _codex_app_proxy_check():
     """ChatGPT.app Rust app-server без прокси (codenv снят/битый) → down DRIVER (issue #189).
 
@@ -2135,6 +2302,18 @@ def check_all(*, active_claude=False):
     elif ap["status"] == "warn":
         ap_check["ok"] = False  # App на privoxy — degraded (WS порвётся #120)
     checks.append(ap_check)
+    # codenv launchd-job (#250): job загружен, но падает (exit != 0) / осиротел (plist удалён) /
+    # указывает на несуществующий путь → down DRIVER. Реальный инцидент: 1419 падений подряд в
+    # тишине — doctor читал plist-артефакт, а не состояние job'а. Без codenv Codex после ребута
+    # идёт напрямую за GFW (fail-closed-proxy-down) → это настоящий сбой стека, не info-шёпот.
+    # unknown (job не загружен — codenv опционален / launchctl недоступен) и info (здоровый job,
+    # канон #135) — info-only, не роняют вердикт.
+    cj = _codenv_job_check()
+    cj_check = {"name": "codenv LaunchAgent (job launchd)",
+                "ok": cj["status"] != "down", "detail": cj["detail"]}
+    if cj["status"] in ("unknown", "info"):
+        cj_check["info"] = True
+    checks.append(cj_check)
     # VSCode scoped SOCKS5 (#185): codex-расширение openai.chatgpt через http.proxy. info-only ВСЕГДА
     # (как endpoint-override) — VSCode может быть не установлен, srouter-stack от этого не падает.
     # down (http.proxy=privoxy/чужой — рвёт WS) показываем в detail, но НЕ driver: это scoped-диагностика

@@ -32,13 +32,25 @@ def _mock_home(monkeypatch, tmp_path):
 
 
 def _env(tmp_path):
-    """Минимальный InstallEnv: root=реальный репо (шаблоны launchagents/ оттуда).
+    """Минимальный InstallEnv: root = tmp-копия репо (реальные шаблоны launchagents/ копируются).
     launchagent_dir = home/Library/LaunchAgents (как прод) — _install_launchctl_env пишет туда,
-    _remove_launchctl_env ищет там же; путь должен совпадать."""
+    _remove_launchctl_env ищет там же; путь должен совпадать.
+
+    Issue #250: root НЕ указывает на сам чекаут репозитория — сам чекаут может лежать внутри
+    AO-worktree (`.ao/data/worktrees/...`), а guard `_install_launchctl_env` такой путь отвергает.
+    Тесты «нормальной установки» должны моделировать КАНОНИЧЕСКИЙ root (как прод ~/Projects/srouter),
+    а не зависеть от того, где физически лежит чекаут прогона. Worktree-путь проверяется отдельно
+    (_worktree_env ниже) — намеренно, а не случайно."""
+    import shutil
     home = Path.home()  # monkeypatched _mock_home
     import install_lib
+    root = tmp_path / "srouter-root"
+    root.mkdir(exist_ok=True)
+    repo_agents = Path(__file__).resolve().parent.parent / "launchagents"
+    if not (root / "launchagents").exists():
+        shutil.copytree(repo_agents, root / "launchagents")
     return install_lib.InstallEnv(
-        root=Path(__file__).resolve().parent.parent,
+        root=root,
         prefix=tmp_path / "homebrew",
         state_path=tmp_path / "srouter.local.json",
         launchagent_dir=home / "Library" / "LaunchAgents",
@@ -621,3 +633,61 @@ def test_codenv_plist_comment_mentions_zai():
     plist = Path(__file__).resolve().parent.parent / "launchagents" / "com.srouter.codenv.plist"
     text = plist.read_text(encoding="utf-8")
     assert "z.ai" in text, f"plist комментарий описывает z.ai в NO_PROXY: {plist.name}"
+
+
+# ============ issue #250: guard — LaunchAgent НЕ ставится с путём в эфемерный AO-worktree =========
+#
+# Инцидент 2026-07-30: `com.srouter.codenv` указывал на
+# `~/.ao/data/worktrees/srouter/srouter-117/launchagents/srouter-codex-env.sh`. Worktree стёрт →
+# /bin/sh не находит скрипт → exit 127 при каждом из 1419 запусков, Codex молча без SOCKS5.
+# Корень: `_install_launchctl_env` рендерит plist из `env.root`; install, запущенный ИЗ AO-worktree,
+# сажает мину замедленного действия — эфемерный каталог как цель ПОСТОЯННОГО LaunchAgent.
+# Канон ao-worktree-vs-main-worktree-confusion.
+
+def _worktree_env(tmp_path, home):
+    """InstallEnv с root ВНУТРИ .ao/data/worktrees/ — реальные шаблоны копируются туда."""
+    import shutil
+    import install_lib
+    root = home / ".ao" / "data" / "worktrees" / "srouter" / "srouter-117"
+    root.mkdir(parents=True)
+    repo = Path(__file__).resolve().parent.parent
+    shutil.copytree(repo / "launchagents", root / "launchagents")
+    return install_lib.InstallEnv(
+        root=root,
+        prefix=tmp_path / "homebrew",
+        state_path=tmp_path / "srouter.local.json",
+        launchagent_dir=home / "Library" / "LaunchAgents",
+        python_bin="/usr/bin/python3",
+        now="2026-07-04T00-00-00Z",
+    )
+
+
+def test_install_launchctl_env_refuses_ao_worktree_root(monkeypatch, tmp_path):
+    """install из AO-worktree → LaunchAgent НЕ ставится (fail-closed), plist не создан.
+
+    Мина: worktree эфемерен, LaunchAgent постоянен. Молчаливая установка = отложенный exit 127
+    (issue #250). Лучше явный отказ при install, чем 1419 падений в тишине после удаления worktree.
+    """
+    home = _mock_home(monkeypatch, tmp_path)
+    env = _worktree_env(tmp_path, home)
+    runner = _fake_runner()
+
+    note = srouter._install_launchctl_env(env, runner)
+
+    plist = home / "Library" / "LaunchAgents" / f"{srouter.CODEX_ENV_LABEL}.plist"
+    assert not plist.exists(), f"plist с worktree-путём НЕ должен создаваться; note={note}"
+    assert "worktree" in note.lower(), f"note объясняет причину отказа; got {note}"
+    assert not any(len(c) > 1 and c[1] == "bootstrap" for c in runner.calls), \
+        "bootstrap не вызывается — job не загружаем вовсе"
+
+
+def test_install_launchctl_env_allows_canonical_root(monkeypatch, tmp_path):
+    """Регресс-гард: канонический root (не worktree) по-прежнему ставится — guard не ломает норму."""
+    home = _mock_home(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    runner = _fake_runner()
+
+    note = srouter._install_launchctl_env(env, runner)
+
+    assert "загружен" in note, f"канонический root ставится как раньше: {note}"
+    assert (home / "Library" / "LaunchAgents" / f"{srouter.CODEX_ENV_LABEL}.plist").exists()
