@@ -260,8 +260,13 @@ def test_gather_status_timeout_does_not_wait_for_executor_shutdown(monkeypatch):
     dashboard._cache.update(ts=0.0, data=None)
     monkeypatch.setattr(dashboard_app, "STATUS_PROBE_BUDGET_SEC", 0.01)
 
+    # Предмет теста — что gather_status НЕ дожидается executor.shutdown() медленной пробы,
+    # а не абсолютная латентность. Проба заметно длиннее порога assert'а ниже, чтобы «дождались»
+    # и «не дождались» различались с запасом даже под CPU-contention параллельного прогона.
+    slow_probe_sec = 1.0
+
     def slow_probe():
-        time.sleep(0.2)
+        time.sleep(slow_probe_sec)
         return {"status": "ok"}
 
     for name in (
@@ -290,7 +295,13 @@ def test_gather_status_timeout_does_not_wait_for_executor_shutdown(monkeypatch):
     out = dashboard.gather_status()
     elapsed = time.monotonic() - started
 
-    assert elapsed < 0.1
+    # Порог — доля от slow_probe_sec, а не абсолютные 0.1s: под xdist-contention планировщик
+    # легко съедает 100мс на ровном месте (тест флапал на main), но «дождались shutdown» дало бы
+    # >= slow_probe_sec. Половина отделяет одно от другого с большим запасом.
+    assert elapsed < slow_probe_sec / 2, (
+        f"gather_status дождалась медленной пробы ({elapsed:.3f}s при бюджете 0.01s) — "
+        "executor.shutdown(wait=False) не работает"
+    )
     assert out["services"]["status"] == "unknown"
     assert out["tunnel"]["status"] == "ok"
     assert out["nodes"] == []
