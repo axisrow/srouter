@@ -462,7 +462,7 @@ def test_codenv_down_when_managed_plist_on_disk_but_job_unloaded(monkeypatch, tm
     """
     plist = _codenv_env(monkeypatch, tmp_path, plist_exists=True)
     assert health._CODENV_MARKER in plist.read_text(encoding="utf-8")
-    res = health._codenv_job_check(runner=_runner("Could not find service", rc=113))
+    res = health._codenv_job_check(runner=_runner("Could not find service", rc=113), wait=0)
     assert res["status"] == "down", f"managed plist + выгруженный job → down; got {res}"
     assert "bootstrap" in res["detail"] or "install" in res["detail"], \
         f"detail даёт путь лечения; got {res}"
@@ -649,7 +649,7 @@ def test_codenv_unknown_during_install_reload_window(monkeypatch, tmp_path):
         return {"rc": 0, "out": _print_out(state="running", runs=1, last_exit_code=0),
                 "err": "", "timeout": False}
 
-    res = health._codenv_job_check(runner=flapping_runner)
+    res = health._codenv_job_check(runner=flapping_runner, wait=0)
     assert res["status"] != "down", f"транзиентное окно reload → НЕ down; got {res}"
     assert calls["n"] >= 2, "rc=113 при managed-plist обязан перепроверяться (не разовый снимок)"
 
@@ -657,5 +657,19 @@ def test_codenv_unknown_during_install_reload_window(monkeypatch, tmp_path):
 def test_codenv_down_when_unloaded_state_is_persistent(monkeypatch, tmp_path):
     """Регресс-гард: УСТОЙЧИВЫЙ rc=113 при managed plist по-прежнему down (находка раунда 2 жива)."""
     _codenv_env(monkeypatch, tmp_path, plist_exists=True)
-    res = health._codenv_job_check(runner=_runner("Could not find service", rc=113))
+    res = health._codenv_job_check(runner=_runner("Could not find service", rc=113), wait=0)
     assert res["status"] == "down", f"устойчиво выгруженный managed codenv → down; got {res}"
+
+
+def test_codenv_job_check_forwards_wait_to_settle_pause(monkeypatch, tmp_path):
+    """`wait` из `_codenv_job_check` реально долетает до `time.sleep` в reload-settle паузе.
+
+    Регресс-гард: DI-контракт (`wait=`) должен пробрасываться до `_codenv_unloaded_is_persistent`,
+    а не быть декоративным параметром — иначе тесты с `wait=0` молча продолжали бы спать боевые
+    `_CODENV_RELOAD_SETTLE_WAIT` секунды (та же ловушка, что чинил #269 для `runner=`).
+    """
+    _codenv_env(monkeypatch, tmp_path, plist_exists=True)
+    seen = {}
+    monkeypatch.setattr(health.time, "sleep", lambda s: seen.setdefault("wait", s))
+    health._codenv_job_check(runner=_runner("Could not find service", rc=113), wait=0.25)
+    assert seen.get("wait") == 0.25, f"wait= обязан долетать до time.sleep; got {seen}"

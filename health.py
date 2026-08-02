@@ -2024,7 +2024,7 @@ def _codenv_unloaded_is_persistent(runner=None, *, wait=_CODENV_RELOAD_SETTLE_WA
     return st["loaded"] is False
 
 
-def _codenv_job_check(runner=None):
+def _codenv_job_check(runner=None, *, wait=_CODENV_RELOAD_SETTLE_WAIT):
     """codenv LaunchAgent реально ЖИВ? По состоянию job'а, не по наличию plist-файла (issue #250).
 
     Исходы (ТДД issue #250):
@@ -2058,7 +2058,7 @@ def _codenv_job_check(runner=None):
             # /health дёргается в любой момент → штатная переустановка давала бы degraded/503 и
             # ложное recovery-уведомление. Uninstall имеет такое же окно (bootout→unlink).
             # Down — только для УСТОЙЧИВОГО состояния: перепроверяем после короткой паузы.
-            if _codenv_plist_is_managed() and _codenv_unloaded_is_persistent(runner=runner):
+            if _codenv_plist_is_managed() and _codenv_unloaded_is_persistent(runner=runner, wait=wait):
                 return {"status": "down",
                         "detail": (f"codenv установлен, но НЕ загружен: srouter-managed plist на диске "
                                    f"({Path.home() / 'Library' / 'LaunchAgents' / f'{_CODENV_LABEL}.plist'}), "
