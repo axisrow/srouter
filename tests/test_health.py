@@ -35,7 +35,11 @@ def _all_up_monkey(monkeypatch, *, probe_status="ok", probe_detail="runtime: к�
 
     Заглушка «туннель здоров» = (True, HTTP 200): недвусмысленно живой канал. Прежнее
     (True, HTTP 404) полагалось на «любой не-000 = жив» — после фикса #82 семантика строгая
-    (5xx=down, 2xx/3xx/4xx=up), 404 остаётся up, но 200 читается однозначнее как здоровый."""
+    (5xx=down, 2xx/3xx/4xx=up), 404 остаётся up, но 200 читается однозначнее как здоровый.
+
+    Канон: параллельная копия — tests/test_health_versions.py::_machine_state_monkey. Новый
+    machine-state probe добавляй в ОБА списка — гвард test_machine_state_mock_guard.py падает,
+    если этот (канонический) набор перестанет быть подмножеством versions-набора (issue #267)."""
     monkeypatch.setattr(health, "_port_up", lambda port: True)
     monkeypatch.setattr(health, "_tunnel_up", lambda: (True, "HTTP 200", False))
     monkeypatch.setattr(health, "_claude_proxy_probe",
