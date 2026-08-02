@@ -137,13 +137,14 @@ def test_codenv_down_highlights_ao_worktree_path(monkeypatch, tmp_path):
     assert "worktree" in res["detail"].lower(), f"detail называет worktree; got {res}"
 
 
-# ============================ 4. здоровый job → info (канон #135, шум НЕ возвращается) ==========
+# ============================ 4. здоровый job → ok (канон #135, шум НЕ возвращается) ============
 
-def test_codenv_info_when_healthy_job_and_socks5(monkeypatch, tmp_path):
-    """job загружен + exit 0 + существующий скрипт → info (канон #135 — шум НЕ возвращается).
+def test_codenv_ok_when_healthy_job_and_socks5(monkeypatch, tmp_path):
+    """job загружен + exit 0 + существующий скрипт → ok (канон #135 — шум НЕ возвращается).
 
     Нормальная установка с codenv не должна вечно светиться degraded (тот же компромисс, что PR #135
-    для PF и #189 для SOCKS5 в launchctl).
+    для PF и #189 для SOCKS5 в launchctl). Именно "ok", а не "info": cycle-review PR #262 показал,
+    что _print_report красит КАЖДЫЙ info-чек жёлтым ⚠️ — «info для здорового» и есть тот шум.
     """
     script = tmp_path / "Projects" / "srouter" / "launchagents" / "srouter-codex-env.sh"
     script.parent.mkdir(parents=True)
@@ -151,20 +152,21 @@ def test_codenv_info_when_healthy_job_and_socks5(monkeypatch, tmp_path):
     _codenv_env(monkeypatch, tmp_path)
     runner = _runner(_print_out(state="running", runs=42, last_exit_code=0, script=str(script)))
     res = health._codenv_job_check(runner=runner)
-    assert res["status"] == "info", f"здоровый codenv → info (канон #135); got {res}"
+    assert res["status"] == "ok", f"здоровый codenv → ok (канон #135); got {res}"
 
 
 def test_codenv_check_all_healthy_job_not_driver(monkeypatch, tmp_path):
-    """Интеграция: здоровый codenv-job НЕ роняет вердикт check_all (info-only, канон #135)."""
+    """Интеграция: здоровый codenv-job НЕ роняет вердикт check_all и НЕ добавляет ⚠️-шум."""
     script = tmp_path / "Projects" / "srouter" / "launchagents" / "srouter-codex-env.sh"
     script.parent.mkdir(parents=True)
     script.write_text("#!/bin/sh\n", encoding="utf-8")
     _codenv_env(monkeypatch, tmp_path)
     monkeypatch.setattr(health, "_codenv_job_check",
-                        lambda **kw: {"status": "info", "detail": "codenv job здоров"})
+                        lambda **kw: {"status": "ok", "detail": "codenv job здоров"})
     checks = _codenv_checks(monkeypatch)
     row = _find_check(checks, "codenv")
-    assert row.get("info") is True, f"здоровый codenv — info-only, не driver; got {row}"
+    assert row["ok"] is True and not row.get("info"), \
+        f"здоровый codenv — ✅ без info-флага (канон #135); got {row}"
 
 
 def test_codenv_check_all_dead_job_is_driver(monkeypatch, tmp_path):
@@ -273,3 +275,175 @@ def test_codenv_job_state_last_exit_code_absent_is_none(monkeypatch, tmp_path):
     """
     st = health._codenv_job_state(runner=_runner(_print_out(last_exit_code=None)))
     assert st["last_exit_code"] is None
+
+
+# ============ cycle-review PR #262 (Codex): fail-open дыры классификации ==========================
+#
+# Пять дефектов, найденных адверсариальным ревью. Общий класс: парсер отдавал корректные данные,
+# но КЛАССИФИКАТОР трактовал «нет данных» как «доказанно здоров» — ровно тот fail-open, который
+# докстринг обещал не допускать (канон verify-dont-guess: отсутствие доказательства ≠ доказательство).
+
+def test_codenv_unknown_when_exit_code_absent_not_healthy(monkeypatch, tmp_path):
+    """`last exit code` ОТСУТСТВУЕТ (job ни разу не завершался) → unknown, НЕ info.
+
+    Cycle-review дефект #2 (Codex): парсер честно клал None, но классификатор проверял `if exit_code`
+    — None проваливался в здоровую ветку, а detail ЛГАЛ «last exit code = 0». «Нет данных» выдавалось
+    за «доказанно завершился успешно» — fail-open, который докстринг явно обещал исключить.
+    """
+    script = tmp_path / "s.sh"
+    script.write_text("#!/bin/sh\n", encoding="utf-8")
+    _codenv_env(monkeypatch, tmp_path)
+    runner = _runner(_print_out(state="running", runs=3, last_exit_code=None, script=str(script)))
+    res = health._codenv_job_check(runner=runner)
+    assert res["status"] == "unknown", f"нет данных об exit code → unknown, не info; got {res}"
+    assert "= 0" not in res["detail"], f"detail НЕ должен утверждать exit code = 0; got {res}"
+
+
+def test_codenv_unknown_when_exit_code_non_numeric(monkeypatch, tmp_path):
+    """`last exit code = (never exited)` — launchctl печатает и такое → unknown, не выдуманный 0."""
+    script = tmp_path / "s.sh"
+    script.write_text("#!/bin/sh\n", encoding="utf-8")
+    _codenv_env(monkeypatch, tmp_path)
+    out = _print_out(state="running", runs=1, last_exit_code=0,
+                     script=str(script)).replace("last exit code = 0", "last exit code = (never exited)")
+    res = health._codenv_job_check(runner=_runner(out))
+    assert res["status"] == "unknown", f"нечисловой exit code → unknown; got {res}"
+
+
+def test_codenv_unknown_when_output_partial(monkeypatch, tmp_path):
+    """rc=0, но вывод УСЕЧЁН (только `path`, без state/runs/exit/arguments) → unknown, НЕ info.
+
+    Cycle-review дефект #1 (Codex): loaded=True выставлялся по ЛЮБОМУ узнанному полю, включая
+    одинокий `path`. Дальше все проверки падений пропускались → info «здоров». Неполный
+    первоисточник — это «не смогли спросить», а не «спросили и всё хорошо» (fail-closed).
+    """
+    _codenv_env(monkeypatch, tmp_path)
+    res = health._codenv_job_check(runner=_runner(
+        f"gui/501/{health._CODENV_LABEL} = {{\n\tpath = /tmp/p.plist\n}}\n"))
+    assert res["status"] == "unknown", f"усечённый вывод → unknown, не info; got {res}"
+
+
+def test_codenv_job_state_never_raises_on_malformed_runner_result(monkeypatch, tmp_path):
+    """runner вернул не-словарь (None) → unknown, НЕ AttributeError.
+
+    Cycle-review дефект #5 (Codex): try охватывал только ВЫЗОВ runner'а, а разбор результата был
+    снаружи → `None.get` ронял весь check_all. check_all — общий doctor/watchdog путь; одно
+    исключение здесь = fail-open по всему стеку (srouter-critical-infra-24-7).
+    """
+    _codenv_env(monkeypatch, tmp_path)
+    assert health._codenv_job_state(runner=lambda *a, **k: None)["loaded"] is None
+    assert health._codenv_job_check(runner=lambda *a, **k: None)["status"] == "unknown"
+    assert health._codenv_job_check(runner=lambda *a, **k: "не словарь")["status"] == "unknown"
+
+
+def test_codenv_healthy_job_is_ok_not_warning_noise(monkeypatch, tmp_path):
+    """Здоровый codenv → check_all даёт ✅ (ok, НЕ info) — канон #135 буквально.
+
+    Cycle-review дефект #3 (Codex): _print_report рендерит КАЖДЫЙ info-чек жёлтым ⚠️
+    (health.py `mark = "⚠️" if c.get("info")`). То есть «info для здорового» возвращало ровно тот
+    шум, который #135 запрещает — просто в другом цвете. Здоровый job обязан быть ✅ и не-driver'ом
+    по определению (ok=True), а info оставлен для «не смогли проверить»/«намеренный tradeoff».
+    """
+    script = tmp_path / "Projects" / "srouter" / "launchagents" / "srouter-codex-env.sh"
+    script.parent.mkdir(parents=True)
+    script.write_text("#!/bin/sh\n", encoding="utf-8")
+    _codenv_env(monkeypatch, tmp_path)
+    runner = _runner(_print_out(state="running", runs=42, last_exit_code=0, script=str(script)))
+    assert health._codenv_job_check(runner=runner)["status"] == "ok"
+
+    monkeypatch.setattr(health, "_codenv_job_check",
+                        lambda **kw: {"status": "ok", "detail": "codenv job здоров"})
+    row = _find_check(_codenv_checks(monkeypatch), "codenv")
+    assert row["ok"] is True and not row.get("info"), \
+        f"здоровый codenv = ✅, НЕ ⚠️ (канон #135 — никакого шума); got {row}"
+
+
+def test_codenv_job_state_ignores_nested_block_fields(monkeypatch, tmp_path):
+    """Вложенные блоки (`jetsam coalition = { state = active }`) НЕ перетирают top-level поля.
+
+    Cycle-review PR #262: парсер строил `key = value` на ПЛОСКОМ уровне, срезая отступы. Реальный
+    `launchctl print` содержит вложенные блоки (`resource coalition`, `jetsam coalition`), внутри
+    которых свои `state = active` — и они шли ПОСЛЕ настоящего top-level `state`, затирая его.
+    Воспроизведено на живом выводе `launchctl print gui/501/com.srouter.dashboard`: истинное
+    `state = spawn scheduled` читалось как `active` (state коалиции, к job'у отношения не имеет).
+
+    Критично вдвойне: `state` — это ГЕЙТ loaded=True. Обрывок вывода, заканчивающийся внутри
+    coalition-блока, иначе выдал бы себя за полноценно загруженный job (fail-open).
+    """
+    out = (
+        "gui/501/com.srouter.codenv = {\n"
+        "\tpath = /Users/u/Library/LaunchAgents/com.srouter.codenv.plist\n"
+        "\tstate = spawn scheduled\n"
+        "\targuments = {\n"
+        "\t\t/bin/sh\n"
+        "\t\t/Users/u/Projects/srouter/launchagents/srouter-codex-env.sh\n"
+        "\t}\n"
+        "\truns = 357\n"
+        "\tlast exit code = 1\n"
+        "\tresource coalition = {\n"
+        "\t\tID = 913\n"
+        "\t\tstate = active\n"
+        "\t\truns = 999\n"
+        "\t}\n"
+        "\tjetsam coalition = {\n"
+        "\t\tstate = active\n"
+        "\t\tlast exit code = 0\n"
+        "\t}\n"
+        "}\n"
+    )
+    st = health._codenv_job_state(runner=_runner(out))
+    assert st["state"] == "spawn scheduled", f"top-level state не перетёрт коалицией; got {st}"
+    assert st["runs"] == 357, f"runs из top-level, не из coalition; got {st}"
+    assert st["last_exit_code"] == 1, f"exit code из top-level, не из coalition; got {st}"
+
+
+def test_codenv_job_state_unknown_when_only_nested_block_seen(monkeypatch, tmp_path):
+    """Обрывок вывода, где `state` встречается ТОЛЬКО внутри вложенного блока → loaded не True.
+
+    state — гейт loaded. Значение из coalition-блока не доказывает, что job загружен (fail-closed)."""
+    out = ("gui/501/com.srouter.codenv = {\n"
+           "\tjetsam coalition = {\n"
+           "\t\tstate = active\n"
+           "\t}\n"
+           "}\n")
+    assert health._codenv_job_state(runner=_runner(out))["loaded"] is not True
+
+
+def test_codenv_job_state_rc_semantics_match_launchd_is_loaded():
+    """Парити-гвард: rc-семантика _codenv_job_state == install_plist._launchd_is_loaded.
+
+    Cycle-review PR #262: _codenv_job_state ПОВТОРЯЕТ tristate-контракт `launchctl print`
+    (rc=0 загружен / rc=113 not-found / иначе unknown) вместо вызова _launchd_is_loaded. Вызвать
+    его напрямую нельзя — он отдаёт голый tristate, а нам нужен САМ вывод для разбора state/runs/
+    exit code, и второй вызов означал бы ВТОРОЙ идентичный subprocess за прогон doctor'а.
+    Дублирование осознанное, поэтому его удерживает гвард: обе стороны обязаны отвечать одинаково
+    на один и тот же rc, иначе детекторы разъедутся молча (канон post-review-catches-detector-
+    duplication + parity-гвард _CODENV_LABEL).
+    """
+    from install_lib import _launchd_is_loaded
+
+    for rc, timeout, expected in [(0, False, True), (113, False, False), (112, False, None),
+                                  (None, True, None), (1, False, None)]:
+        def runner(cmd, tmo=5, _rc=rc, _to=timeout, **kw):
+            # rc=0 требует узнаваемого вывода — иначе _codenv_job_state честно скажет unknown.
+            out = _print_out() if _rc == 0 else ""
+            return {"rc": _rc, "out": out, "err": "", "timeout": _to}
+
+        assert _launchd_is_loaded(health._CODENV_LABEL, runner=runner) is expected, \
+            f"эталон _launchd_is_loaded для rc={rc}"
+        assert health._codenv_job_state(runner=runner)["loaded"] is expected, \
+            f"_codenv_job_state разошёлся с эталоном на rc={rc}"
+
+
+def test_codenv_label_marker_parity_with_codex_wrappers():
+    """Парити-гвард литералов: health._CODENV_* == codex_wrappers.CODEX_ENV_*.
+
+    health.py дублирует label/marker намеренно (импорт codex_wrappers дал бы цикл — тот сам
+    импортирует health). Комментарий-гвард в health.py указывал на srouter.py :273-274, но PR #258
+    перенёс определения в codex_wrappers.py — указатель протух, а расхождение значений так и
+    осталось бы незамеченным до прода. Проверяем машиной, а не комментарием.
+    """
+    import codex_wrappers
+
+    assert health._CODENV_LABEL == codex_wrappers.CODEX_ENV_LABEL
+    assert health._CODENV_MARKER == codex_wrappers.CODEX_ENV_MARKER

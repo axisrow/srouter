@@ -691,3 +691,64 @@ def test_install_launchctl_env_allows_canonical_root(monkeypatch, tmp_path):
 
     assert "загружен" in note, f"канонический root ставится как раньше: {note}"
     assert (home / "Library" / "LaunchAgents" / f"{srouter.CODEX_ENV_LABEL}.plist").exists()
+
+
+def test_install_launchctl_env_guard_resolves_relative_worktree_path(monkeypatch, tmp_path):
+    """Относительный root внутри worktree тоже отвергается (guard резолвит, не сверяет строку).
+
+    Cycle-review PR #262 (Codex): guard звал resolve() ТОЛЬКО для существующего файла, иначе сверял
+    сырую строку. Относительный путь '.ao/data/worktrees/...' не содержит ведущего '/' → маркер
+    '/.ao/data/worktrees/' не совпадал → мина проходила молча. False negative на ровном месте.
+    """
+    import shutil
+    import install_lib
+    home = _mock_home(monkeypatch, tmp_path)
+    abs_root = home / ".ao" / "data" / "worktrees" / "srouter" / "srouter-117"
+    abs_root.mkdir(parents=True)
+    shutil.copytree(Path(__file__).resolve().parent.parent / "launchagents", abs_root / "launchagents")
+    monkeypatch.chdir(home)
+    env = install_lib.InstallEnv(
+        root=Path(os.path.relpath(abs_root, home)),  # ОТНОСИТЕЛЬНЫЙ путь — без ведущего '/'
+        prefix=tmp_path / "homebrew",
+        state_path=tmp_path / "srouter.local.json",
+        launchagent_dir=home / "Library" / "LaunchAgents",
+        python_bin="/usr/bin/python3",
+        now="2026-07-04T00-00-00Z",
+    )
+
+    note = srouter._install_launchctl_env(env, _fake_runner())
+
+    assert "worktree" in note.lower(), f"относительный worktree-путь тоже мина; got {note}"
+    assert not (home / "Library" / "LaunchAgents" / f"{srouter.CODEX_ENV_LABEL}.plist").exists()
+
+
+def test_install_launchctl_env_guard_no_false_positive_on_dotdot_escape(monkeypatch, tmp_path):
+    """Путь, ТЕКСТОВО содержащий маркер, но резолвящийся ЗА worktree → установка разрешена.
+
+    Cycle-review PR #262 (Codex): '<...>/.ao/data/worktrees/../canonical' содержит маркер как
+    подстроку, хотя '..' выводит реальный путь наружу. Подстрочная сверка давала ложный отказ —
+    канон loose-validator (сверяем резолвнутый путь, не написание строки)."""
+    import shutil
+    import install_lib
+    home = _mock_home(monkeypatch, tmp_path)
+    canonical = home / ".ao" / "data" / "canonical-srouter"
+    canonical.mkdir(parents=True)
+    shutil.copytree(Path(__file__).resolve().parent.parent / "launchagents", canonical / "launchagents")
+    # Написание содержит '/.ao/data/worktrees/', но '..' резолвится в canonical-srouter.
+    tricky = home / ".ao" / "data" / "worktrees" / ".." / "canonical-srouter"
+    env = install_lib.InstallEnv(
+        root=tricky,
+        prefix=tmp_path / "homebrew",
+        state_path=tmp_path / "srouter.local.json",
+        launchagent_dir=home / "Library" / "LaunchAgents",
+        python_bin="/usr/bin/python3",
+        now="2026-07-04T00-00-00Z",
+    )
+
+    note = srouter._install_launchctl_env(env, _fake_runner())
+
+    # Проверяем ИМЕННО guard по его собственной формулировке отказа: он не должен сработать на
+    # пути, резолвящемся за пределы worktree. Сверять по подстроке "worktree" во ВСЁМ note нельзя —
+    # сам путь её содержит и попадает в текст любой другой ошибки (то же ловушка loose-validator,
+    # от которой guard и лечили: решение по резолвнутому пути, а не по написанию строки).
+    assert "эфемерный AO-worktree" not in note, f"guard НЕ должен отвергать путь вне worktree; got {note}"
