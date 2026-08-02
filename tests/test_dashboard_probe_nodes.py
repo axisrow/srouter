@@ -203,10 +203,15 @@ def test_gather_status_returns_node_snapshot_without_running_heavy_probe(monkeyp
     ):
         monkeypatch.setattr(dashboard_app, name, lambda *args, name=name, **kwargs: {"status": "ok", "probe": name})
 
+    # Как в test_gather_status_timeout_does_not_wait_for_executor_shutdown: длительность пробы
+    # заметно больше порога assert'а ниже, чтобы «позвали тяжёлый probe» и «не позвали»
+    # различались с запасом под CPU-contention параллельного прогона.
+    slow_probe_sec = 1.0
+
     def slow_probe_nodes():
         nonlocal called
         called = True
-        time.sleep(0.2)
+        time.sleep(slow_probe_sec)
         return [{"name": "sg-1", "status": "ok"}]
 
     # Ловушка ставится в dashboard_nodes — модуль-первоисточник, откуда тяжёлый probe_nodes
@@ -237,7 +242,12 @@ def test_gather_status_returns_node_snapshot_without_running_heavy_probe(monkeyp
     out = dashboard.gather_status()
     elapsed = time.monotonic() - started
 
-    assert elapsed < 0.1
+    # Основной guard инварианта — `called is False` ниже (он timing-независим). Порог по времени
+    # вторичен и выражен долей от slow_probe_sec, а не абсолютными 0.1s: вызов тяжёлого
+    # probe_nodes дал бы >= slow_probe_sec, а contention съедает 100мс и на здоровом пути.
+    assert elapsed < slow_probe_sec / 2, (
+        f"gather_status выполнила тяжёлый probe_nodes ({elapsed:.3f}s) — "
+        "снимок узлов обязан строиться лёгким probe_nodes_snapshot")
     assert called is False
     assert out["nodes"] == [
         {

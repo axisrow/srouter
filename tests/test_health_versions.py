@@ -207,6 +207,12 @@ def _machine_state_monkey(monkeypatch):
     например, немоканный _codex_app_proxy_check находит реальный ChatGPT.app без gui-env прокси
     и роняет status в degraded (не info-only) — тест «версии не роняют вердикт» падает по причине,
     к версиям отношения не имеющей.
+
+    Отличие от канона осознанное: claude/codex-proxy отдают unknown ("не запущен"), а не ok.
+    Предмет тестов этого файла — versions-check как info-only чек, и unknown-заглушка строже:
+    она доказывает, что вердикт держится на versions-check, а не подпирается чужим ok.
+    Параметризация (probe_status/codex_status канона) здесь не нужна — ни один тест файла
+    не варьирует эти статусы; добавим, когда появится первый такой тест.
     """
     monkeypatch.setattr(health, "_port_up", lambda port: True)
     monkeypatch.setattr(health, "_tunnel_up", lambda: (True, "HTTP 200", False))
@@ -228,6 +234,12 @@ def _machine_state_monkey(monkeypatch):
     monkeypatch.setattr(health, "_service_running", lambda label, domain=None: "running")
     # #194: _upstream_vps_reachable читает реальный srouter.local.json + бьёт по VPS.
     monkeypatch.setattr(local_state, "active_node", lambda path=None: {})
+    # #252 perf: GFW/direct-first (active_claude-путь) делают РЕАЛЬНЫЙ прямой curl к
+    # github.com/z.ai — секунды сетевого I/O на каждый check_all(active_claude=True).
+    monkeypatch.setattr(health, "_gfw_domain_check",
+                        lambda *a, **kw: {"status": "ok", "detail": "mock: GFW не режет"})
+    monkeypatch.setattr(health, "_direct_first_check",
+                        lambda: {"status": "ok", "detail": "mock: direct-first reachable"})
 
 
 def test_check_all_status_ok_when_nothing_installed(monkeypatch, tmp_path):
@@ -244,12 +256,6 @@ def test_check_all_status_ok_when_nothing_installed(monkeypatch, tmp_path):
     monkeypatch.setattr(health, "_installed_versions_check",
                         lambda: {"status": "unknown", "detail": "не установлено",
                                  "codex": [], "claude_code": []})
-    # #252 perf: GFW/direct-first (active_claude-путь) делают реальный curl без мока — секунды
-    # сетевого I/O на вызов (см. tests/test_health.py::_all_up_monkey для канона).
-    monkeypatch.setattr(health, "_gfw_domain_check",
-                        lambda *a, **kw: {"status": "ok", "detail": "mock: GFW не режет"})
-    monkeypatch.setattr(health, "_direct_first_check",
-                        lambda: {"status": "ok", "detail": "mock: direct-first reachable"})
     result = health.check_all(active_claude=True)
     assert result["status"] == "ok", "info-чек версий НЕ роняет вердикт"
     names = [c["name"] for c in result["checks"]]
@@ -366,12 +372,6 @@ def _all_up_drivers(monkeypatch):
     # реальный ps eww против dev-машины.
     monkeypatch.setattr(health, "_runtime_model_override_check",
                         lambda: {"status": "unknown", "detail": "mock"})
-    # #252 perf: GFW/direct-first (active_claude-путь) делают реальный curl без мока — секунды
-    # сетевого I/O на вызов (см. tests/test_health.py::_all_up_monkey для канона).
-    monkeypatch.setattr(health, "_gfw_domain_check",
-                        lambda *a, **kw: {"status": "ok", "detail": "mock: GFW не режет"})
-    monkeypatch.setattr(health, "_direct_first_check",
-                        lambda: {"status": "ok", "detail": "mock: direct-first reachable"})
 
 
 def test_versions_check_skipped_in_lightweight_health_watchdog_path(monkeypatch):
