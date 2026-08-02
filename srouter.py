@@ -47,6 +47,7 @@ from srouter_privileged import (  # noqa: F401 — намеренный re-expor
     _is_privileged_cmd,
     _to_osascript,
     make_privileged_runner,
+    os,
 )
 from srouter_launchd import (  # noqa: F401 — намеренный re-export публичного контракта
     PPP_HOOK_MARKER,
@@ -91,6 +92,8 @@ from codex_wrappers import (  # noqa: F401 — намеренный re-export п
 )
 from srouter_cli import (  # noqa: F401 — намеренный re-export публичного контракта
     CHOICES,
+    PackageNotFoundError,
+    argparse,
     LAUNCHAGENT_LABEL,
     LAUNCHCTL,
     InstallEnv,
@@ -138,6 +141,7 @@ from srouter_cli import (  # noqa: F401 — намеренный re-export пу�
     privoxy_system,
     run,
     sys,
+    version,
     vscode_proxy,
 )
 
