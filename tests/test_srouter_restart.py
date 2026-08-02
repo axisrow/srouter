@@ -13,6 +13,12 @@ from types import SimpleNamespace
 import install_lib
 import install_plist
 import srouter
+# Моки ставим на srouter_cli — модуль-ВЛАДЕЛЕЦ команд (#259). cmd_* резолвят свои
+# глобалы в srouter_cli.__dict__, поэтому setattr(srouter, ...) был бы тихим no-op:
+# имя на srouter есть (re-export), AttributeError не будет, а реальная реализация
+# всё равно выполнится и полезет в ФС/сеть. Вызовы намеренно оставлены через srouter —
+# они проверяют, что публичный контракт srouter.cmd_* по-прежнему ведёт в реализацию.
+import srouter_cli
 
 
 def _make_runner(*, bootout_rc=0, bootstrap_sequence=None, list_states=None, record=None):
@@ -75,7 +81,7 @@ def test_restart_success_on_first_try(monkeypatch):
     monkeypatch.setattr(install_plist, "_BOOTSTRAP_RETRY_DELAY", 0)
     monkeypatch.setattr(srouter.Path, "exists", lambda self: True)
     calls = []
-    monkeypatch.setattr(srouter, "run", _make_runner(bootstrap_sequence=[0], record=calls))
+    monkeypatch.setattr(srouter_cli, "run", _make_runner(bootstrap_sequence=[0], record=calls))
 
     rc = srouter.cmd_restart(_args())
     assert rc == 0
@@ -90,7 +96,7 @@ def test_restart_retries_bootstrap_when_domain_busy(monkeypatch):
     monkeypatch.setattr(install_plist, "_BOOTSTRAP_RETRY_DELAY", 0)
     monkeypatch.setattr(srouter.Path, "exists", lambda self: True)
     calls = []
-    monkeypatch.setattr(srouter, "run", _make_runner(bootstrap_sequence=[5, 0], record=calls))
+    monkeypatch.setattr(srouter_cli, "run", _make_runner(bootstrap_sequence=[5, 0], record=calls))
 
     rc = srouter.cmd_restart(_args())
     assert rc == 0, "retry должен привести к успеху, а не к rc=2"
@@ -101,7 +107,7 @@ def test_restart_fails_after_max_retries(monkeypatch):
     """Все попытки bootstrap дают rc=5, демон так и не загрузился → rc=2, ошибка в stderr."""
     monkeypatch.setattr(install_plist, "_BOOTSTRAP_RETRY_DELAY", 0)
     monkeypatch.setattr(srouter.Path, "exists", lambda self: True)
-    monkeypatch.setattr(srouter, "run", _make_runner(bootstrap_sequence=[5, 5, 5]))
+    monkeypatch.setattr(srouter_cli, "run", _make_runner(bootstrap_sequence=[5, 5, 5]))
 
     rc = srouter.cmd_restart(_args())
     assert rc == 2
@@ -117,7 +123,7 @@ def test_restart_waits_for_unload_after_bootout(monkeypatch):
     monkeypatch.setattr(srouter.Path, "exists", lambda self: True)
     calls = []
     # print: первый poll (после bootout) → True (ещё загружен), затем False (выгрузился). bootstrap → 0.
-    monkeypatch.setattr(srouter, "run",
+    monkeypatch.setattr(srouter_cli, "run",
                         _make_runner(bootstrap_sequence=[0], list_states=[True, False], record=calls))
 
     rc = srouter.cmd_restart(_args())
@@ -145,7 +151,7 @@ def test_reload_bootstraps_when_unload_unconfirmed(monkeypatch):
     monkeypatch.setattr(srouter.Path, "exists", lambda self: True)
     calls = []
     # list всегда True (агент «не выгружается»); bootstrap → 0. reload должен выстоять regardless.
-    monkeypatch.setattr(srouter, "run",
+    monkeypatch.setattr(srouter_cli, "run",
                         _make_runner(bootstrap_sequence=[0], list_states=[True] * 8, record=calls))
 
     rc = srouter.cmd_restart(_args())
@@ -156,7 +162,7 @@ def test_reload_bootstraps_when_unload_unconfirmed(monkeypatch):
 def test_start_idempotent_when_already_loaded(monkeypatch):
     """cmd_start: демон уже загружен → bootstrap не вызывается вообще (текущее поведение сохранить)."""
     calls = []
-    monkeypatch.setattr(srouter, "run", _make_runner(list_states=[True], record=calls))
+    monkeypatch.setattr(srouter_cli, "run", _make_runner(list_states=[True], record=calls))
     monkeypatch.setattr(srouter.Path, "exists", lambda self: True)
 
     rc = srouter.cmd_start(_args())

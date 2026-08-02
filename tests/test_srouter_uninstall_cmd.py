@@ -11,6 +11,12 @@ uninstall обязан вернуть ненулевой rc — НЕ рапор�
 from types import SimpleNamespace
 
 import srouter
+# Моки ставим на srouter_cli — модуль-ВЛАДЕЛЕЦ команд (#259). cmd_* резолвят свои
+# глобалы в srouter_cli.__dict__, поэтому setattr(srouter, ...) был бы тихим no-op:
+# имя на srouter есть (re-export), AttributeError не будет, а реальная реализация
+# всё равно выполнится и полезет в ФС/сеть. Вызовы намеренно оставлены через srouter —
+# они проверяют, что публичный контракт srouter.cmd_* по-прежнему ведёт в реализацию.
+import srouter_cli
 
 
 def _args(**over):
@@ -36,30 +42,30 @@ def _stub_cmd_uninstall_internals(monkeypatch, *, env_ok, leftover=None, tty=Tru
     (маркер в ~/.zshrc есть) тест молча переписывает shell-конфиг. Cycle-review #108 cycle 2
     (Codex critical) — зафиксировано spy.
     """
-    monkeypatch.setattr(srouter, "_env_from_args", lambda args: SimpleNamespace())
-    monkeypatch.setattr(srouter, "make_privileged_runner", lambda *a, **k: (lambda cmd, t: {"rc": 0}))
-    monkeypatch.setattr(srouter, "build_uninstall_plan", lambda **k: {"state_readable": True})
-    monkeypatch.setattr(srouter, "format_uninstall_plan", lambda p: "")
+    monkeypatch.setattr(srouter_cli, "_env_from_args", lambda args: SimpleNamespace())
+    monkeypatch.setattr(srouter_cli, "make_privileged_runner", lambda *a, **k: (lambda cmd, t: {"rc": 0}))
+    monkeypatch.setattr(srouter_cli, "build_uninstall_plan", lambda **k: {"state_readable": True})
+    monkeypatch.setattr(srouter_cli, "format_uninstall_plan", lambda p: "")
     monkeypatch.setattr(srouter.sys, "stdin", SimpleNamespace(isatty=lambda: tty))
-    monkeypatch.setattr(srouter, "apply_uninstall",
+    monkeypatch.setattr(srouter_cli, "apply_uninstall",
                         lambda **k: {"ok": True, "blocked": [], "leftover": leftover or []})
-    monkeypatch.setattr(srouter, "_remove_active_split_route", lambda *a, **k: 0)
-    monkeypatch.setattr(srouter, "claude_proxy",
+    monkeypatch.setattr(srouter_cli, "_remove_active_split_route", lambda *a, **k: 0)
+    monkeypatch.setattr(srouter_cli, "claude_proxy",
                         SimpleNamespace(disable=lambda: {"ok": True}))
     # issue #130: git → SOCKS5 через gitconfig — disable симметричен enable в install.
-    monkeypatch.setattr(srouter, "git_proxy",
+    monkeypatch.setattr(srouter_cli, "git_proxy",
                         SimpleNamespace(disable=lambda: {"ok": True}))
     # issue #185: scoped SOCKS5 через VSCode http.proxy — disable симметричен enable в install.
-    monkeypatch.setattr(srouter, "vscode_proxy",
+    monkeypatch.setattr(srouter_cli, "vscode_proxy",
                         SimpleNamespace(disable=lambda: {"ok": True}))
-    monkeypatch.setattr(srouter, "_remove_ppp_hook", lambda *a, **k: "")
-    monkeypatch.setattr(srouter, "_remove_codex_wrappers", lambda: "")
-    if hasattr(srouter, "_remove_codex_zsh_function"):
+    monkeypatch.setattr(srouter_cli, "_remove_ppp_hook", lambda *a, **k: "")
+    monkeypatch.setattr(srouter_cli, "_remove_codex_wrappers", lambda: "")
+    if hasattr(srouter_cli, "_remove_codex_zsh_function"):
         # issue #97: лезет в реальный ~/.zshrc (_zshrc_path = Path.home()/.zshrc, не замокан).
-        monkeypatch.setattr(srouter, "_remove_codex_zsh_function", lambda: "")
-    monkeypatch.setattr(srouter, "_remove_home_bin_from_path", lambda: "")
+        monkeypatch.setattr(srouter_cli, "_remove_codex_zsh_function", lambda: "")
+    monkeypatch.setattr(srouter_cli, "_remove_home_bin_from_path", lambda: "")
     # ЕДИНСТВЕННЫЙ варьируемый параметр: статус env-cleanup.
-    monkeypatch.setattr(srouter, "_remove_launchctl_env",
+    monkeypatch.setattr(srouter_cli, "_remove_launchctl_env",
                         lambda runner: {"ok": env_ok, "note": "Codex env: mock."})
 
 
@@ -157,7 +163,7 @@ def test_cmd_uninstall_disables_git_proxy(monkeypatch):
     возвращая git к состоянию до srouter."""
     _stub_cmd_uninstall_internals(monkeypatch, env_ok=True, tty=False)
     calls = {"git_disable": 0}
-    monkeypatch.setattr(srouter, "git_proxy", SimpleNamespace(
+    monkeypatch.setattr(srouter_cli, "git_proxy", SimpleNamespace(
         disable=lambda: (calls.__setitem__("git_disable", 1), {"ok": True})[1]))
 
     rc = srouter.cmd_uninstall(_args(yes=True))
@@ -175,7 +181,7 @@ def test_cmd_uninstall_returns_nonzero_when_git_proxy_not_removed(monkeypatch, c
     что issue #94 DEFECT A для env-cleanup — теперь применяем инвариант и к git-proxy.
     """
     _stub_cmd_uninstall_internals(monkeypatch, env_ok=True, tty=False)
-    monkeypatch.setattr(srouter, "git_proxy", SimpleNamespace(
+    monkeypatch.setattr(srouter_cli, "git_proxy", SimpleNamespace(
         disable=lambda: {"ok": False, "err": "git config --unset failed"}))
 
     rc = srouter.cmd_uninstall(_args(yes=True))

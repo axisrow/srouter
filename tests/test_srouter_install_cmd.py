@@ -11,6 +11,12 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import srouter
+# Моки ставим на srouter_cli — модуль-ВЛАДЕЛЕЦ команд (#259). cmd_* резолвят свои
+# глобалы в srouter_cli.__dict__, поэтому setattr(srouter, ...) был бы тихим no-op:
+# имя на srouter есть (re-export), AttributeError не будет, а реальная реализация
+# всё равно выполнится и полезет в ФС/сеть. Вызовы намеренно оставлены через srouter —
+# они проверяют, что публичный контракт srouter.cmd_* по-прежнему ведёт в реализацию.
+import srouter_cli
 
 
 def _args(**over):
@@ -34,36 +40,36 @@ def _stub_cmd_install_internals(monkeypatch, *, apply_ok=True, tty=True):
     `_install_codex_zsh_function` обязательно: без мока она падает в try/except на env.now mock'а,
     и тест проходит СЛУЧАЙНО (маскируя вызов) — хрупкость, ломающаяся при любом изменении stub'а.
     """
-    monkeypatch.setattr(srouter, "_env_from_args", lambda args: SimpleNamespace(root=Path(".")))
-    monkeypatch.setattr(srouter, "make_privileged_runner", lambda *a, **k: (lambda cmd, t: {"rc": 0}))
+    monkeypatch.setattr(srouter_cli, "_env_from_args", lambda args: SimpleNamespace(root=Path(".")))
+    monkeypatch.setattr(srouter_cli, "make_privileged_runner", lambda *a, **k: (lambda cmd, t: {"rc": 0}))
     # plan без конфликтов → блок :527 (conflicts) пустой → доходим до gate :544.
-    monkeypatch.setattr(srouter, "build_plan", lambda **k: {"components": {}})
-    monkeypatch.setattr(srouter, "format_plan", lambda p: "")
+    monkeypatch.setattr(srouter_cli, "build_plan", lambda **k: {"components": {}})
+    monkeypatch.setattr(srouter_cli, "format_plan", lambda p: "")
     monkeypatch.setattr(srouter.sys, "stdin", SimpleNamespace(isatty=lambda: tty))
-    monkeypatch.setattr(srouter, "apply_install",
+    monkeypatch.setattr(srouter_cli, "apply_install",
                         lambda **k: {"ok": apply_ok, "blocked": []})
     # best-effort хелперы после успешного apply (мокаем, чтобы не трогать реальную ФС/сеть).
-    monkeypatch.setattr(srouter, "claude_proxy", SimpleNamespace(enable=lambda: {"ok": True}))
+    monkeypatch.setattr(srouter_cli, "claude_proxy", SimpleNamespace(enable=lambda: {"ok": True}))
     # issue #130: git → SOCKS5 (xray 10808) через gitconfig, симметрично claude_proxy/vscode_proxy.
-    monkeypatch.setattr(srouter, "git_proxy", SimpleNamespace(enable=lambda: {"ok": True, "proxy": "socks5h://127.0.0.1:10808"}))
-    monkeypatch.setattr(srouter, "_install_generic_launchagent", lambda *a, **k: (True, ""))
-    monkeypatch.setattr(srouter, "_install_ppp_hook", lambda *a, **k: "")
-    monkeypatch.setattr(srouter, "_install_codex_wrappers", lambda env: "")
-    if hasattr(srouter, "_install_codex_zsh_function"):
+    monkeypatch.setattr(srouter_cli, "git_proxy", SimpleNamespace(enable=lambda: {"ok": True, "proxy": "socks5h://127.0.0.1:10808"}))
+    monkeypatch.setattr(srouter_cli, "_install_generic_launchagent", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(srouter_cli, "_install_ppp_hook", lambda *a, **k: "")
+    monkeypatch.setattr(srouter_cli, "_install_codex_wrappers", lambda env: "")
+    if hasattr(srouter_cli, "_install_codex_zsh_function"):
         # issue #97: лезет в реальный ~/.zshrc (_zshrc_path = Path.home()/.zshrc, не замокан).
-        monkeypatch.setattr(srouter, "_install_codex_zsh_function", lambda env: "")
-    monkeypatch.setattr(srouter, "_install_launchctl_env", lambda env, runner: "")
-    monkeypatch.setattr(srouter, "_ensure_home_bin_in_path", lambda env: "")
+        monkeypatch.setattr(srouter_cli, "_install_codex_zsh_function", lambda env: "")
+    monkeypatch.setattr(srouter_cli, "_install_launchctl_env", lambda env, runner: "")
+    monkeypatch.setattr(srouter_cli, "_ensure_home_bin_in_path", lambda env: "")
     # issue #185: scoped SOCKS5 через VSCode http.proxy (вместо gui-SOCKS5, который ломал CC #130).
-    monkeypatch.setattr(srouter, "vscode_proxy",
+    monkeypatch.setattr(srouter_cli, "vscode_proxy",
                         SimpleNamespace(enable=lambda: {"ok": True, "paths": []}))
     # issue #168: PF codex-изоляция (sub-anchor). Лезет в реальный pfctl/osascript — мокаем.
-    if hasattr(srouter, "_install_codex_isolation"):
-        monkeypatch.setattr(srouter, "_install_codex_isolation", lambda env, runner: "")
+    if hasattr(srouter_cli, "_install_codex_isolation"):
+        monkeypatch.setattr(srouter_cli, "_install_codex_isolation", lambda env, runner: "")
     # issue #112 Часть 4: cmd_install регистрирует known_markers в state после установки wrappers/zshrc.
     # Мокаем (как все best-effort хелперы) — иначе лезет в реальный state_path и local_state.save_state.
-    if hasattr(srouter, "populate_known_markers"):
-        monkeypatch.setattr(srouter, "populate_known_markers", lambda *a, **k: "")
+    if hasattr(srouter_cli, "populate_known_markers"):
+        monkeypatch.setattr(srouter_cli, "populate_known_markers", lambda *a, **k: "")
 
 
 def test_cmd_install_yes_works_without_tty(monkeypatch):
@@ -105,7 +111,7 @@ def test_cmd_install_idempotent_after_partial_uninstall(monkeypatch):
     """
     _stub_cmd_install_internals(monkeypatch, apply_ok=True, tty=False)
     # Переопределяем build_plan: компонент с conflict=True И reclaimable=True (stale-managed).
-    monkeypatch.setattr(srouter, "build_plan", lambda **k: {
+    monkeypatch.setattr(srouter_cli, "build_plan", lambda **k: {
         "components": {
             "privoxy": {"name": "privoxy", "conflict": True, "reclaimable": True,
                         "conflicts": ["foreign_config"], "config_path": "/tmp/x", "port_owner": None},
@@ -125,7 +131,7 @@ def test_cmd_install_foreign_conflict_still_blocks_non_tty(monkeypatch, capsys):
     конфликтом, требующим явного adopt/overwrite/skip. non-TTY без выбора → rc=2 (как до фикса).
     """
     _stub_cmd_install_internals(monkeypatch, apply_ok=True, tty=False)
-    monkeypatch.setattr(srouter, "build_plan", lambda **k: {
+    monkeypatch.setattr(srouter_cli, "build_plan", lambda **k: {
         "components": {
             "privoxy": {"name": "privoxy", "conflict": True, "reclaimable": False,
                         "conflicts": ["foreign_config"], "config_path": "/tmp/x", "port_owner": None},
@@ -156,9 +162,9 @@ def test_cmd_install_activates_codenv_and_vscode_proxy(monkeypatch):
     (scoped для расширения) — ОБА вызваны. Они покрывают разных клиентов, не конфликтуют."""
     _stub_cmd_install_internals(monkeypatch, apply_ok=True, tty=False)
     calls = {"vscode_enable": 0, "launchctl_env": 0}
-    monkeypatch.setattr(srouter, "vscode_proxy",
+    monkeypatch.setattr(srouter_cli, "vscode_proxy",
                         SimpleNamespace(enable=lambda: (calls.__setitem__("vscode_enable", 1), {"ok": True})[1]))
-    monkeypatch.setattr(srouter, "_install_launchctl_env",
+    monkeypatch.setattr(srouter_cli, "_install_launchctl_env",
                         lambda env, runner: (calls.__setitem__("launchctl_env", 1), "")[1])
 
     rc = srouter.cmd_install(_args(yes=True))
@@ -180,7 +186,7 @@ def test_cmd_install_enables_git_proxy(monkeypatch):
     scoped на github.com, без ручной правки ~/.gitconfig."""
     _stub_cmd_install_internals(monkeypatch, apply_ok=True, tty=False)
     calls = {"git_enable": 0}
-    monkeypatch.setattr(srouter, "git_proxy", SimpleNamespace(
+    monkeypatch.setattr(srouter_cli, "git_proxy", SimpleNamespace(
         enable=lambda: (calls.__setitem__("git_enable", 1), {"ok": True, "proxy": "socks5h://127.0.0.1:10808"})[1]))
 
     rc = srouter.cmd_install(_args(yes=True))
