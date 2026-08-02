@@ -12,7 +12,6 @@ pytest-xdist -n 8 несколько десятков таких вызовов 
 реального ~/bin — т.е. дело не в гонке за общий каталог, а в тесном таймауте под параллельной нагрузкой).
 """
 import os
-import signal
 import subprocess
 from pathlib import Path
 
@@ -143,43 +142,34 @@ def test_cli_launcher_renders_configured_proxy(monkeypatch, tmp_path):
     assert "10808" not in cli_text, "launcher НЕ хардкодит 10808 литералом"
 
 
-def _install_with_fake_codex(monkeypatch, tmp_path, fake_bin):
-    """Общий хелпер интеграционных тестов launcher'а. monkeypatch _codex_bin_path → fake_bin как
-    install-time GATE (есть ли codex вообще), и делает fake_bin достижимым как `codex` в PATH
+def _install_with_fake_codex(monkeypatch, tmp_path, fake_codex):
+    """Общий хелпер интеграционных тестов launcher'а. monkeypatch _codex_bin_path → заглушка как
+    install-time GATE (есть ли codex вообще), и делает её достижимой как `codex` в PATH
     вызывающего — wrapper с #144 runtime-резолвит binary по PATH минуя себя, путь НЕ вшивается.
-    Копия fake_bin → tmp_path/fakebin/codex, fakebin добавлен в PATH через monkeypatch.setenv
-    (наследуется env={**os.environ, ...}). Возвращает путь к wrapper."""
+    Заглушка кладётся в tmp_path/fakebin/codex, fakebin добавлен в PATH через monkeypatch.setenv
+    (наследуется env={**os.environ, ...}). Возвращает путь к wrapper.
+
+    #257: заглушка — hardlink на прогретую session-мастер-копию (фикстура fake_codex), поведение
+    задаётся env SROUTER_FAKE_* при запуске. Новый inode стоил бы ~0.4s syspolicyd-штрафа."""
     _mock_home(monkeypatch, tmp_path)
     env = _env(tmp_path)
-    monkeypatch.setattr(codex_wrappers, "_codex_bin_path", lambda: str(fake_bin))
     fakebin = tmp_path / "fakebin"
-    fakebin.mkdir()
-    # Копия под именем codex — wrapper ищет именно `codex` в PATH.
-    (fakebin / "codex").write_text(fake_bin.read_text(encoding="utf-8"), encoding="utf-8")
-    (fakebin / "codex").chmod(0o755)
+    stub = fake_codex(fakebin / "codex")
+    monkeypatch.setattr(codex_wrappers, "_codex_bin_path", lambda: str(stub))
     # ~/bin ПЕРЕД fakebin: проверяем, что wrapper пропускает себя и берёт fakebin/codex (антирекурсия).
     monkeypatch.setenv("PATH", f"{Path.home() / 'bin'}:{fakebin}:/usr/bin:/bin")
     srouter._install_codex_wrappers(env)
     return Path.home() / "bin" / _cli_wrapper_name()
 
 
-def test_cli_launcher_clears_inherited_privoxy_env(monkeypatch, tmp_path):
+def test_cli_launcher_clears_inherited_privoxy_env(monkeypatch, tmp_path, fake_codex):
     """Интеграционный (#96 core): запуск ~/bin/codex-srouter с унаследованным privoxy-окружением →
     дочерний codex видит SOCKS5, privoxy (8118) отсутствует. Доказывает env -u работает.
 
-    Fake-codex дампит своё окружение в JSON — проверяем значения 8 переменных.
+    Fake-codex дампит своё окружение построчно KEY=value — проверяем значения 8 переменных.
     """
-    import subprocess
     out_file = tmp_path / "child-env.txt"
-    fake_bin = tmp_path / "fake-codex"
-    # #252 perf: python3-спавн (42.5мс) заменён на чистый /bin/sh (4.8мс) — предмет теста ENV-var
-    # проброс до дочернего процесса, не поведение Python. Простой KEY=value построчный дамп.
-    keys = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy",
-            "NO_PROXY", "no_proxy")
-    dump_lines = "\n".join(f'printf \'{k}=%s\\n\' "${k}"' for k in keys)
-    fake_bin.write_text(f"#!/bin/sh\n{{ {dump_lines}; }} > \"$OUT\"\n", encoding="utf-8")
-    fake_bin.chmod(0o755)
-    wrapper = _install_with_fake_codex(monkeypatch, tmp_path, fake_bin)
+    wrapper = _install_with_fake_codex(monkeypatch, tmp_path, fake_codex)
     # Наследуем privoxy-окружение (как от ~/.claude/settings.json env).
     inherited = {
         "HTTP_PROXY": "http://127.0.0.1:8118", "HTTPS_PROXY": "http://127.0.0.1:8118",
@@ -187,7 +177,7 @@ def test_cli_launcher_clears_inherited_privoxy_env(monkeypatch, tmp_path):
         "http_proxy": "http://127.0.0.1:8118", "https_proxy": "http://127.0.0.1:8118",
         "all_proxy": "http://127.0.0.1:8118",
         "NO_PROXY": "localhost,127.0.0.1,::1,z.ai", "no_proxy": "localhost,127.0.0.1,::1,z.ai",
-        "OUT": str(out_file),
+        "SROUTER_FAKE_ENV": str(out_file),
     }
     subprocess.run([str(wrapper), "arg1"], env={**os.environ, **inherited},
                    check=True, timeout=30)
@@ -202,29 +192,26 @@ def test_cli_launcher_clears_inherited_privoxy_env(monkeypatch, tmp_path):
     assert "z.ai" not in child["NO_PROXY"], "NO_PROXY очищен от чужих z.ai-исключений"
 
 
-def test_cli_launcher_forwards_argv_verbatim(monkeypatch, tmp_path):
+def test_cli_launcher_forwards_argv_verbatim(monkeypatch, tmp_path, fake_codex):
     """argv доходит до codex-бинаря как есть: пробелы, кавычки, glob-символы, ведущие дефисы."""
-    import subprocess
     argv_file = tmp_path / "argv.txt"
-    fake_bin = tmp_path / "fake-codex"
-    fake_bin.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$@\" > {argv_file}\n", encoding="utf-8")
-    fake_bin.chmod(0o755)
-    wrapper = _install_with_fake_codex(monkeypatch, tmp_path, fake_bin)
+    wrapper = _install_with_fake_codex(monkeypatch, tmp_path, fake_codex)
     args = ["--flag", "with space", "with'quote", "*.glob", "--", "-leading-dash"]
-    subprocess.run([str(wrapper), *args], env={**os.environ, "OUT": "x"},
+    subprocess.run([str(wrapper), *args],
+                   env={**os.environ, "SROUTER_FAKE_ARGV": str(argv_file)},
                    check=True, timeout=30)
     forwarded = argv_file.read_text(encoding="utf-8").splitlines()
     assert forwarded == args, f"argv проброшен verbatim: {forwarded}"
 
 
-def test_cli_launcher_propagates_exit_status(monkeypatch, tmp_path):
-    """exec пробрасывает exit-код реального codex (например 23) — без потерь."""
-    import subprocess
-    fake_bin = tmp_path / "fake-codex"
-    fake_bin.write_text("#!/bin/sh\nexit 23\n", encoding="utf-8")
-    fake_bin.chmod(0o755)
-    wrapper = _install_with_fake_codex(monkeypatch, tmp_path, fake_bin)
-    rc = subprocess.run([str(wrapper)], env={**os.environ, "OUT": "x"}).returncode
+def test_cli_launcher_propagates_exit_status(monkeypatch, tmp_path, fake_codex):
+    """exec пробрасывает exit-код реального codex (например 23) — без потерь.
+
+    #257: timeout обязателен — без него зависший wrapper держал бы прогон бесконечно (единственный
+    subprocess.run без timeout в файле)."""
+    wrapper = _install_with_fake_codex(monkeypatch, tmp_path, fake_codex)
+    rc = subprocess.run([str(wrapper)], env={**os.environ, "SROUTER_FAKE_RC": "23"},
+                        timeout=30).returncode
     assert rc == 23, f"launcher возвращает реальный exit-код: {rc}"
 
 
@@ -303,7 +290,7 @@ def _install_with_path_resolving_wrapper(monkeypatch, tmp_path):
     return Path.home() / "bin" / _cli_wrapper_name()
 
 
-def test_wrapper_runtime_resolves_codex_from_caller_path(monkeypatch, tmp_path):
+def test_wrapper_runtime_resolves_codex_from_caller_path(monkeypatch, tmp_path, fake_codex):
     """#144(A) core: wrapper в runtime находит codex из PATH ВЫЗЫВАЮЩЕЙ оболочки (минуя себя) и exec'ает
     именно его. Смена binary в PATH НЕ требует reinstall wrapper'а — runtime всегда берёт текущий.
 
@@ -311,38 +298,34 @@ def test_wrapper_runtime_resolves_codex_from_caller_path(monkeypatch, tmp_path):
     """
     called = tmp_path / "called-codex.txt"
     codex_dir = tmp_path / "codexbin"
-    codex_dir.mkdir()
-    real_codex = codex_dir / "codex"
-    real_codex.write_text(f"#!/bin/sh\nprintf '%s' 'real-codex' > {called}\n", encoding="utf-8")
-    real_codex.chmod(0o755)
+    fake_codex(codex_dir / "codex")
     wrapper = _install_with_path_resolving_wrapper(monkeypatch, tmp_path)
 
     subprocess.run([str(wrapper), "x"],
-                    env={**os.environ, "PATH": f"{Path.home() / 'bin'}:{codex_dir}:/usr/bin:/bin"},
+                    env={**os.environ, "PATH": f"{Path.home() / 'bin'}:{codex_dir}:/usr/bin:/bin",
+                         "SROUTER_FAKE_OUT": str(called), "SROUTER_FAKE_TAG": "real-codex"},
                     check=True, timeout=30)
     assert called.exists(), "wrapper runtime-резолвнул и exec'нул codex из PATH"
     assert called.read_text(encoding="utf-8") == "real-codex", "exec'нут именно codex из PATH caller'а"
 
 
-def test_wrapper_skips_itself_no_recursion(monkeypatch, tmp_path):
+def test_wrapper_skips_itself_no_recursion(monkeypatch, tmp_path, fake_codex):
     """#144(A) антирекурсия: wrapper НЕ находит сам себя как реальный binary. ~/bin/codex = wrapper,
     он первый в PATH → wrapper обязан его ПРОПУСТИТЬ и взять следующий codex, иначе бесконечный цикл."""
     called = tmp_path / "called.txt"
-    real_codex = tmp_path / "other" / "codex"
-    real_codex.parent.mkdir(parents=True)
-    real_codex.write_text(f"#!/bin/sh\nprintf 'real' > {called}\n", encoding="utf-8")
-    real_codex.chmod(0o755)
+    fake_codex(tmp_path / "other" / "codex")
     wrapper = _install_with_path_resolving_wrapper(monkeypatch, tmp_path)
 
     # ~/bin ПЕРВЫМ в PATH (там wrapper), затем каталог с реальным codex. Без skip-self — рекурсия/timeout.
     subprocess.run([str(wrapper), "x"],
-                    env={**os.environ, "PATH": f"{Path.home() / 'bin'}:{tmp_path / 'other'}:/usr/bin:/bin"},
+                    env={**os.environ, "PATH": f"{Path.home() / 'bin'}:{tmp_path / 'other'}:/usr/bin:/bin",
+                         "SROUTER_FAKE_OUT": str(called), "SROUTER_FAKE_TAG": "real"},
                     check=True, timeout=30)
     assert called.exists() and called.read_text(encoding="utf-8") == "real", \
         "wrapper пропустил себя (антирекурсия) и взял следующий codex из PATH"
 
 
-def test_wrapper_skips_itself_hardlink_no_recursion(monkeypatch, tmp_path):
+def test_wrapper_skips_itself_hardlink_no_recursion(monkeypatch, tmp_path, fake_codex):
     """#144(A) антирекурсия — hardlink-случай (корневой инвариант «wrapper не exec'нет сам себя»).
 
     Hardlink-копия wrapper'а в другой PATH-директории: тот же inode, но ДРУГОЙ realpath.
@@ -351,14 +334,12 @@ def test_wrapper_skips_itself_hardlink_no_recursion(monkeypatch, tmp_path):
 
     Без фикса: wrapper берёт hardlink как «реальный codex» → exec'ает копию себя → снова → timeout.
     """
-    import subprocess
     called = tmp_path / "called.txt"
-    real_codex = tmp_path / "realdir" / "codex"
-    real_codex.parent.mkdir(parents=True)
-    real_codex.write_text(f"#!/bin/sh\nprintf 'real' > {called}\n", encoding="utf-8")
-    real_codex.chmod(0o755)
+    fake_codex(tmp_path / "realdir" / "codex")
     wrapper = _install_with_path_resolving_wrapper(monkeypatch, tmp_path)
     # hardbin/codex — HARDLINK на wrapper (тот же inode, другой путь). os.link создаёт hardlink.
+    # ВАЖНО (#257): здесь hardlink делается на WRAPPER, а не на fake-codex — это предмет теста,
+    # его подменять прогретой заглушкой нельзя (превратило бы антирекурсию в no-op).
     hardbin = tmp_path / "hardbin"
     hardbin.mkdir()
     os.link(str(wrapper), str(hardbin / "codex"))
@@ -366,7 +347,9 @@ def test_wrapper_skips_itself_hardlink_no_recursion(monkeypatch, tmp_path):
     # hardbin ПЕРВЫМ (минуя wrapper в ~/bin), затем realdir. Без hardlink-aware skip → рекурсия/timeout.
     try:
         subprocess.run([str(wrapper), "x"],
-                        env={**os.environ, "PATH": f"{Path.home() / 'bin'}:{hardbin}:{tmp_path / 'realdir'}:/usr/bin:/bin"},
+                        env={**os.environ,
+                             "PATH": f"{Path.home() / 'bin'}:{hardbin}:{tmp_path / 'realdir'}:/usr/bin:/bin",
+                             "SROUTER_FAKE_OUT": str(called), "SROUTER_FAKE_TAG": "real"},
                         check=True, timeout=30)
     except subprocess.TimeoutExpired:
         pytest.fail("hardlink-копия wrapper'а в PATH вызвала рекурсию (антирекурсия не ловит hardlink)")
@@ -374,7 +357,7 @@ def test_wrapper_skips_itself_hardlink_no_recursion(monkeypatch, tmp_path):
         "wrapper пропустил hardlink-копию себя (inode-aware антирекурсия) и взял реальный codex"
 
 
-def test_wrapper_skips_other_managed_copy_no_recursion(monkeypatch, tmp_path):
+def test_wrapper_skips_other_managed_copy_no_recursion(monkeypatch, tmp_path, fake_codex):
     """#144(A) антирекурсия — корневой инвариант: wrapper НЕ exec'нит ДРУГУЮ управляемую srouter-копию.
 
     Две НЕЗАВИСИМЫЕ копии managed wrapper'а в PATH (разные inode, разные realpath — например текущая
@@ -383,14 +366,12 @@ def test_wrapper_skips_other_managed_copy_no_recursion(monkeypatch, tmp_path):
     → зависание. Управляемый wrapper отличим от реального codex ТОЛЬКО по srouter-маркеру в содержимом,
     не по пути/inode. Антирекурсия обязана skip'ать любого кандидата, несущего srouter-маркер wrapper'а.
     """
-    import subprocess
     called = tmp_path / "called.txt"
-    real_codex = tmp_path / "realdir" / "codex"
-    real_codex.parent.mkdir(parents=True)
-    real_codex.write_text(f"#!/bin/sh\nprintf 'real' > {called}\n", encoding="utf-8")
-    real_codex.chmod(0o755)
+    fake_codex(tmp_path / "realdir" / "codex")
     wrapper = _install_with_path_resolving_wrapper(monkeypatch, tmp_path)
     # stalebin/codex — ВТОРАЯ независимая копия managed wrapper'а (другой путь, другой inode).
+    # ВАЖНО (#257): копия делается с WRAPPER'а (write_text = намеренно новый inode) — это предмет
+    # теста, прогретой заглушкой не подменяется. Штраф syspolicyd тут оплачивается осознанно.
     stalebin = tmp_path / "stalebin"
     stalebin.mkdir()
     (stalebin / "codex").write_text(wrapper.read_text(encoding="utf-8"), encoding="utf-8")
@@ -399,7 +380,9 @@ def test_wrapper_skips_other_managed_copy_no_recursion(monkeypatch, tmp_path):
     # ~/bin (копия A) → stalebin (копия B) → realdir. Без marker-aware skip → A↔B рекурсия/timeout.
     try:
         subprocess.run([str(wrapper), "x"],
-                        env={**os.environ, "PATH": f"{Path.home() / 'bin'}:{stalebin}:{tmp_path / 'realdir'}:/usr/bin:/bin"},
+                        env={**os.environ,
+                             "PATH": f"{Path.home() / 'bin'}:{stalebin}:{tmp_path / 'realdir'}:/usr/bin:/bin",
+                             "SROUTER_FAKE_OUT": str(called), "SROUTER_FAKE_TAG": "real"},
                         check=True, timeout=30)
     except subprocess.TimeoutExpired:
         pytest.fail("две управляемые копии wrapper'а в PATH вызвали ping-pong рекурсию "
