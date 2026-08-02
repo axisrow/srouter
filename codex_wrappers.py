@@ -297,16 +297,11 @@ def _install_launchctl_env(env, runner) -> str:
     при install лучше 1419 падений в тишине). Канон ao-worktree-vs-main-worktree-confusion.
     """
     script_path = env.root / "launchagents" / "srouter-codex-env.sh"
-    # Литерал маркера — единый источник health._AO_WORKTREE_MARK (тот же, что детектит doctor):
+    # health._in_ao_worktree — ЕДИНАЯ точка решения (тот же предикат, что детектит doctor):
     # guard установки и детектор обязаны видеть worktree одинаково, иначе одна сторона молчит.
-    #
-    # cycle-review PR #262 (Codex): resolve() ТОЛЬКО для существующего файла давал два бага сразу.
-    # False negative: относительный root ('.ao/data/worktrees/...') не содержит ведущего '/' →
-    # маркер не совпадал → мина проходила. False positive: '/tmp/.ao/data/worktrees/../canonical'
-    # текстово содержит маркер, хотя resolve() выводит путь ЗА пределы worktree → ложный отказ.
-    # resolve(strict=False) нормализует '..' и делает путь абсолютным ДАЖЕ для несуществующего
-    # файла — решение зависит от реального пути, а не от факта существования и написания строки.
-    if health._AO_WORKTREE_MARK in str(script_path.resolve(strict=False)):
+    # Внутри: resolve(strict=False) (нормализует '..' и относительные пути даже для
+    # несуществующего файла) + casefold (на APFS '.AO' и '.ao' — один каталог, cycle-review round 2).
+    if health._in_ao_worktree(script_path):
         return (f"Codex env: НЕ установлен — путь ведёт в эфемерный AO-worktree ({script_path}). "
                 f"LaunchAgent постоянен, worktree — нет: после его удаления job упадёт с exit 127 "
                 f"(issue #250). Запусти srouter install из канонического репозитория.")

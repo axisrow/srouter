@@ -447,3 +447,103 @@ def test_codenv_label_marker_parity_with_codex_wrappers():
 
     assert health._CODENV_LABEL == codex_wrappers.CODEX_ENV_LABEL
     assert health._CODENV_MARKER == codex_wrappers.CODEX_ENV_MARKER
+
+
+# ============ cycle-review round 2 (Codex sol/xhigh + /review): остаточные fail-open ============
+
+def test_codenv_down_when_managed_plist_on_disk_but_job_unloaded(monkeypatch, tmp_path):
+    """srouter-managed plist НА ДИСКЕ + job выгружен (rc=113) → down, НЕ «опционален».
+
+    Cycle-review round 2 (Codex, critical): rc=113 безусловно давал «codenv опционален» → info-only.
+    Но маркерный plist на диске ДОКАЗЫВАЕТ, что установка была: значит это не «не ставили», а
+    «поставили и job сдох/не забутстрапился». Зеркало осиротевшего job'а (тот случай — job без
+    plist, этот — plist без job'а), и ровно тот класс, что issue #250 просил ловить: codenv
+    сконфигурирован, но мёртв → после ребута Codex молча без SOCKS5 (fail-closed-proxy-down).
+    """
+    plist = _codenv_env(monkeypatch, tmp_path, plist_exists=True)
+    assert health._CODENV_MARKER in plist.read_text(encoding="utf-8")
+    res = health._codenv_job_check(runner=_runner("Could not find service", rc=113))
+    assert res["status"] == "down", f"managed plist + выгруженный job → down; got {res}"
+    assert "bootstrap" in res["detail"] or "install" in res["detail"], \
+        f"detail даёт путь лечения; got {res}"
+
+
+def test_codenv_unknown_when_no_plist_and_job_unloaded(monkeypatch, tmp_path):
+    """Регресс-гард: НЕТ plist + job не загружен → unknown (codenv правда не ставили).
+
+    Граница предыдущего теста: down только когда есть доказательство установки. Иначе doctor
+    вечно красный на машинах без codenv — тот самый шум, который канон #135 запрещает.
+    """
+    _codenv_env(monkeypatch, tmp_path, plist_exists=False)
+    res = health._codenv_job_check(runner=_runner("Could not find service", rc=113))
+    assert res["status"] == "unknown", f"нет установки → unknown (опционален); got {res}"
+
+
+def test_codenv_unknown_when_foreign_plist_and_job_unloaded(monkeypatch, tmp_path):
+    """ЧУЖОЙ plist (без нашего маркера) + job выгружен → unknown, не down.
+
+    Provenance-граница (канон fail-closed provenance #112): чужой com.srouter.codenv.plist — не
+    наша установка, мы про неё ничего не утверждаем и не зовём чинить чужое.
+    """
+    plist = tmp_path / "Library" / "LaunchAgents" / f"{health._CODENV_LABEL}.plist"
+    plist.parent.mkdir(parents=True, exist_ok=True)
+    plist.write_text("<plist>чужой, без маркера</plist>", encoding="utf-8")
+    monkeypatch.setattr(health.Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(health, "_codenv_stderr_tail", lambda path=None, **kw: "")
+    res = health._codenv_job_check(runner=_runner("Could not find service", rc=113))
+    assert res["status"] == "unknown", f"чужой plist → не наша забота, unknown; got {res}"
+
+
+def test_codenv_worktree_mark_is_case_insensitive(monkeypatch, tmp_path):
+    """`.AO/data/worktrees/` (иной регистр) детектится как worktree — macOS APFS case-insensitive.
+
+    Cycle-review round 2 (Codex, critical): проверка вхождения была регистрозависимой. Эмпирически
+    на этом APFS `.AO` и `.ao` — ОДИН каталог (`samefile=True`), но `resolve()` сохраняет исходное
+    написание → подстрока промахивалась, и мина проходила мимо guard'а и мимо детектора.
+    Канон loose-validator: сверяем по свойствам ФС, а не по написанию строки.
+    """
+    _codenv_env(monkeypatch, tmp_path)
+    wt = tmp_path / ".AO" / "data" / "worktrees" / "srouter" / "s1" / "launchagents"
+    wt.mkdir(parents=True)
+    script = wt / "srouter-codex-env.sh"
+    script.write_text("#!/bin/sh\n", encoding="utf-8")
+    runner = _runner(_print_out(state="running", runs=1, last_exit_code=0, script=str(script)))
+    res = health._codenv_job_check(runner=runner)
+    assert res["status"] == "down", f"'.AO' — тот же каталог, что '.ao' → down; got {res}"
+    assert "worktree" in res["detail"].lower(), f"detail называет worktree; got {res}"
+
+
+def test_codenv_job_state_no_leak_after_top_level_block_closes(monkeypatch, tmp_path):
+    """Поля соседнего блока ПОСЛЕ закрытия top-level не читаются как поля job'а.
+
+    Cycle-review round 2 (/review): depth возвращался к 0 на закрывающей скобке, и следующий
+    блок-сосед снова входил на depth==1 → его `state`/`last exit code` читались как свои. Тот же
+    класс утечки, что чинила depth-трекинг, просто смещённый за первую `}`. На живом выводе
+    недостижимо (там один top-level блок), но парсер обязан быть строгим к своему первоисточнику.
+    """
+    out = ("gui/501/com.srouter.codenv = {\n"
+           "\tstate = running\n"
+           "\tlast exit code = 0\n"
+           "}\n"
+           "resource coalition = {\n"
+           "\tstate = active\n"
+           "\tlast exit code = 99\n"
+           "}\n")
+    st = health._codenv_job_state(runner=_runner(out))
+    assert st["state"] == "running", f"state не из соседнего блока; got {st}"
+    assert st["last_exit_code"] == 0, f"exit code не из соседнего блока (99 = утечка); got {st}"
+
+
+def test_codenv_stderr_tail_default_matches_template(monkeypatch, tmp_path):
+    """Дефолтный путь stderr-лога согласован с тем, что подставляет генератор шаблона.
+
+    Cycle-review round 2 (/review): fallback был захардкожен в `/tmp/codenv.err`, а шаблон
+    рендерит `__SROUTER_LOG_ERR__` → `~/Library/Logs/...`. Мёртвый дефолт: когда `launchctl print`
+    не отдал `stderr path`, читался несуществующий файл и причина падения молча терялась
+    (канон config-contract-is-the-generator).
+    """
+    import install_config
+    expected = str(install_config.InstallEnv().log_err)
+    monkeypatch.setattr(health.Path, "home", lambda: tmp_path)
+    assert health._codenv_default_stderr_path() == expected, \
+        "дефолт stderr совпадает с log_err генератора"
