@@ -148,90 +148,111 @@ def test_concurrent_enable_and_disable_do_not_lose_backup_deterministic(monkeypa
     (через monkeypatch на sys_probe.run) -- под реальным локом это создавало дедлок.
 
     PR #281 round 1 (start-only barrier перед `_mutation_lock()`) НЕ поймал Codex adversarial
-    finding (confidence 0.99, эмпирически подтверждено негативным контролем -- see
-    test_negative_control_noop_mutation_lock_loses_backup ниже): barrier синхронизировал только МОМЕНТ
-    ВЫЗОВА `_mutation_lock()`, а не реальное удержание критической секции. С `_mutation_lock`,
-    заменённым на no-op (никогда не сериализующий), тест ВСЁ РАВНО проходил 20/20 -- потому что
-    git's СОБСТВЕННЫЙ файловый lock на `.gitconfig` (`could not lock config file ...: File exists`)
-    заставлял ОДИН из потоков упасть в `_begin_txn` с fail-closed ошибкой, а другой -- завершиться
-    последовательно. Тест валидировал побочный git-native lock, а не наш `_mutation_lock`.
+    finding (confidence 0.99, эмпирически подтверждено -- см. test_negative_control_*_loses_backup
+    ниже): barrier синхронизировал только МОМЕНТ ВЫЗОВА `_mutation_lock()`, а не реальное удержание
+    критической секции. Тест ВСЁ РАВНО проходил -- git's СОБСТВЕННЫЙ файловый lock на `.gitconfig`
+    маскировал отсутствие сериализации через наш `_mutation_lock`.
 
-    Fix (round 2): holder/waiter внутри САМОЙ критической секции. `_enable_locked`/`_disable_locked`
-    -- внутренние функции, вызываемые ТОЛЬКО под `_mutation_lock()` (см. enable()/disable() выше) --
-    monkeypatch'аются так, что holder (первый вошедший под лок) сигналит `holder_entered` и ждёт
-    `waiter_confirmed`, ДАВАЯ waiter'у шанс убедиться, что он НЕ может продвинуться, пока holder не
-    выйдет. Это доказывает, что _mutation_lock реально сериализует -- если бы лок был no-op, waiter
-    вошёл бы в свою locked-функцию одновременно с holder, а не заблокировался бы снаружи.
+    Round 2 (holder/waiter вокруг `_enable_locked`/`_disable_locked`) ТОЖЕ не поймал регресс (Codex
+    xhigh, confidence 0.99, эмпирически 1680/2000 false-green): main thread сигналил
+    `waiter_confirmed_blocked` сразу после НАБЛЮДЕНИЯ `len(order)==1`, но это НЕ доказывает, что
+    waiter физически заблокирован НА ВХОДЕ -- при no-op локе holder мог полностью завершиться (и
+    выйти из critical section) ДО того, как waiter вообще успел стартовать, и main thread видел
+    order=[holder], не замечая отсутствия реальной конкуренции.
+
+    Round 3 (waiter сигналит СЕБЯ перед вызовом _mutation_lock, holder ждёт и проверяет флаг) ТОЖЕ
+    был сломан (эмпирически поймано при первом же прогоне с реальным локом, до пуша): "designated
+    holder"/"waiter" назначались по порядку ВЫЗОВА обёртки `_synced_mutation_lock`, а НЕ по порядку
+    реального ЗАХВАТА flock -- между этими двумя моментами оба потока независимо конкурируют за
+    `os.open()`+`fcntl.flock()`, и "designated waiter" мог реально ПОЛУЧИТЬ flock раньше
+    "designated holder" (кто первым дошёл до строки кода -- не то же самое, что кто первым выиграл
+    гонку за настоящий лок). Это ложно триггерило assert даже с исправным production-локом.
+
+    Fix (round 4): holder/waiter НЕ назначаются заранее -- они определяются ПОСЛЕ фактического
+    входа в `with real_mutation_lock()` (т.е. по факту РЕАЛЬНОГО обладания flock, единственному
+    источнику истины). Первый поток, вошедший в реальную критическую секцию, становится holder.
+    Отдельный Event НА КАЖДЫЙ поток (`attempting[name]`) сигналит "я собираюсь вызвать
+    real_mutation_lock()" -- holder проверяет ЧУЖОЙ (не свой) attempting-Event, чтобы не словить
+    собственный сигнал как ложное подтверждение (round 3 багом было именно это: holder ждал Event,
+    который сам же установил перед своим входом).
     """
     _seed_foreign_proxy_with_backup(real_git_home)
 
-    real_enable_locked = git_proxy._enable_locked
-    real_disable_locked = git_proxy._disable_locked
-
-    holder_entered = threading.Event()
-    waiter_confirmed_blocked = threading.Event()
-    order = []
-    order_lock = threading.Lock()
-
-    def _mark_and_call(name, real_fn):
-        with order_lock:
-            is_holder = not order
-            order.append(name)
-        if is_holder:
-            holder_entered.set()
-            # Дать waiter'у время попытаться войти -- если лок реально сериализует, waiter
-            # физически не может дойти до своей _locked-функции здесь (она вызывается ТОЛЬКО
-            # под _mutation_lock, который holder сейчас держит).
-            waiter_confirmed_blocked.wait(timeout=2)
-        return real_fn()
-
-    def _traced_enable_locked():
-        return _mark_and_call("enable", real_enable_locked)
-
-    def _traced_disable_locked():
-        return _mark_and_call("disable", real_disable_locked)
-
-    monkeypatch.setattr(git_proxy, "_enable_locked", _traced_enable_locked)
-    monkeypatch.setattr(git_proxy, "_disable_locked", _traced_disable_locked)
-
-    both_started = threading.Barrier(2, timeout=5)
     real_mutation_lock = git_proxy._mutation_lock
 
+    holder_active = threading.Event()
+    holder_assigned = threading.Event()
+    attempting = {"enable-thread": threading.Event(), "disable-thread": threading.Event()}
+    entered = {"enable-thread": threading.Event(), "disable-thread": threading.Event()}
+    call_count = {"n": 0}
+    call_count_lock = threading.Lock()
+    both_started = threading.Barrier(2, timeout=5)
+
+    @contextlib.contextmanager
     def _synced_mutation_lock():
+        name = threading.current_thread().name
+        other = "disable-thread" if name == "enable-thread" else "enable-thread"
         both_started.wait()
-        return real_mutation_lock()
+        with call_count_lock:
+            call_count["n"] += 1
+        # Сигналим "я собираюсь попытаться войти в real_mutation_lock()" ДО фактического
+        # вызова -- единственный достоверный момент, когда мы точно ЕЩЁ не владеем flock.
+        attempting[name].set()
+        with real_mutation_lock() as lock_acquired:
+            entered[name].set()
+            # Мы РЕАЛЬНО вошли -- значит либо мы первые (становимся holder), либо
+            # заблокировались на flock до тех пор, пока предыдущий holder не вышел
+            # (holder_assigned уже True -- мы второй, вход был последовательным).
+            became_holder = not holder_assigned.is_set()
+            if became_holder:
+                holder_assigned.set()
+                holder_active.set()
+                # Ждём, что ДРУГОЙ поток дозвонится до ПОПЫТКИ входа (attempting[other]).
+                # Он физически не может пройти дальше этой точки в реальный flock, пока
+                # мы (holder) не выйдем из `with` -- проверяем это явно.
+                attempting[other].wait(timeout=3)
+                assert not entered[other].is_set(), (
+                    "второй поток вошёл в критическую секцию, ПОКА holder ещё держит flock -- "
+                    "_mutation_lock НЕ сериализует (регресс issue #234 finding 2 не пойман)"
+                )
+            yield lock_acquired
 
     monkeypatch.setattr(git_proxy, "_mutation_lock", _synced_mutation_lock)
 
     results = {}
+    thread_errors = {}
 
+    # КРИТИЧНО: AssertionError, выброшенный ВНУТРИ дочернего потока, НЕ проваливает pytest
+    # по умолчанию -- pytest лишь эмитит PytestUnhandledThreadExceptionWarning (проверено
+    # эмпирически: без -W error тест показывал "1 passed, 1 warning" даже когда assert внутри
+    # _synced_mutation_lock реально падал). Ловим исключение явно и ре-рейзим в main thread
+    # после join -- иначе регресс тихо проходит CI без -W error в конфиге проекта.
     def _run_enable():
-        results["enable"] = git_proxy.enable()
+        try:
+            results["enable"] = git_proxy.enable()
+        except BaseException as exc:  # noqa: BLE001 -- re-raised verbatim in main thread below
+            thread_errors["enable"] = exc
 
     def _run_disable():
-        results["disable"] = git_proxy.disable()
+        try:
+            results["disable"] = git_proxy.disable()
+        except BaseException as exc:  # noqa: BLE001 -- re-raised verbatim in main thread below
+            thread_errors["disable"] = exc
 
     t_enable = threading.Thread(target=_run_enable, name="enable-thread")
     t_disable = threading.Thread(target=_run_disable, name="disable-thread")
     t_enable.start()
     t_disable.start()
 
-    # Holder вошёл в locked-секцию -- waiter ЕЩЁ НЕ должен быть внутри своей _locked-функции
-    # (иначе оба вошли одновременно -- лок не сериализует, регресс issue #234 не пойман).
-    assert holder_entered.wait(timeout=10), "ни один поток не вошёл в критическую секцию"
-    with order_lock:
-        assert len(order) == 1, (
-            f"ОБА потока вошли в critical section одновременно ({order}) -- "
-            f"_mutation_lock НЕ сериализует (регресс issue #234 finding 2 не пойман)"
-        )
-    waiter_confirmed_blocked.set()
+    assert holder_active.wait(timeout=10), "ни один поток не вошёл в критическую секцию"
 
     t_enable.join(timeout=15)
     t_disable.join(timeout=15)
 
-    assert order == ["enable", "disable"] or order == ["disable", "enable"], (
-        f"holder/waiter должны были войти строго последовательно, получили: {order}"
-    )
+    if thread_errors:
+        raise next(iter(thread_errors.values()))
+
+    assert call_count["n"] == 2, f"оба потока обязаны были вызвать _mutation_lock ровно один раз: {call_count['n']}"
 
     final_key = git_proxy._get_all(git_proxy.KEY)
     final_backup = git_proxy._backup_state()
@@ -293,6 +314,81 @@ def test_negative_control_noop_mutation_lock_loses_backup(monkeypatch, real_git_
         f"ожидался конфликт (git-уровневый lock ИЛИ txn-verify) между несериализованными "
         f"enable/disable (иначе негативный контроль не воспроизводит гонку из issue #234): "
         f"results={results}"
+    )
+
+
+def test_harness_itself_rejects_noop_mutation_lock(monkeypatch, real_git_home):
+    """Мета-негативный-контроль (round 4, Codex confidence 0.99 x3 -- rounds 1-3 всех false-green):
+    доказывает, что САМА holder/waiter-обвязка из test_concurrent_enable_and_disable_do_not_lose_backup_deterministic
+    детектирует no-op `_mutation_lock` как регресс (`AssertionError`, явно ре-рейзнутый из
+    дочернего потока в main thread -- pytest НЕ проваливает тест на необработанном исключении в
+    треде без `-W error` в конфиге, что и было корнем false-green в rounds 1-3: assert внутри
+    потока падал, но тест показывал "1 passed, 1 warning").
+
+    Верифицировано вручную (30/30 прогонов до коммита): с этой же harness-логикой, применённой к
+    no-op `_mutation_lock`, тест 30/30 раз ловит `AssertionError` "второй поток вошёл в
+    критическую секцию, ПОКА holder ещё держит flock" -- т.е. harness способен различить
+    реальную сериализацию от её отсутствия, а не просто "иногда проходит по случайности
+    scheduling"."""
+    _seed_foreign_proxy_with_backup(real_git_home)
+
+    @contextlib.contextmanager
+    def _noop_lock():
+        yield True
+
+    holder_active = threading.Event()
+    holder_assigned = threading.Event()
+    attempting = {"enable-thread": threading.Event(), "disable-thread": threading.Event()}
+    entered = {"enable-thread": threading.Event(), "disable-thread": threading.Event()}
+    both_started = threading.Barrier(2, timeout=5)
+
+    @contextlib.contextmanager
+    def _synced_noop_lock():
+        name = threading.current_thread().name
+        other = "disable-thread" if name == "enable-thread" else "enable-thread"
+        both_started.wait()
+        attempting[name].set()
+        with _noop_lock() as lock_acquired:
+            entered[name].set()
+            became_holder = not holder_assigned.is_set()
+            if became_holder:
+                holder_assigned.set()
+                holder_active.set()
+                attempting[other].wait(timeout=3)
+                assert not entered[other].is_set(), (
+                    "второй поток вошёл в критическую секцию, ПОКА holder ещё держит flock -- "
+                    "_mutation_lock НЕ сериализует"
+                )
+            yield lock_acquired
+
+    monkeypatch.setattr(git_proxy, "_mutation_lock", _synced_noop_lock)
+
+    results = {}
+    thread_errors = {}
+
+    def _run_enable():
+        try:
+            results["enable"] = git_proxy.enable()
+        except BaseException as exc:  # noqa: BLE001 -- re-raised verbatim in main thread below
+            thread_errors["enable"] = exc
+
+    def _run_disable():
+        try:
+            results["disable"] = git_proxy.disable()
+        except BaseException as exc:  # noqa: BLE001 -- re-raised verbatim in main thread below
+            thread_errors["disable"] = exc
+
+    t_enable = threading.Thread(target=_run_enable, name="enable-thread")
+    t_disable = threading.Thread(target=_run_disable, name="disable-thread")
+    t_enable.start()
+    t_disable.start()
+    t_enable.join(timeout=15)
+    t_disable.join(timeout=15)
+
+    assert thread_errors, (
+        "harness ОБЯЗАН обнаружить no-op _mutation_lock как регресс (AssertionError в одном из "
+        "потоков) -- если исключений нет, harness сам сломан и НЕ способен ловить регресс "
+        "issue #234 finding 2 (см. rounds 1-3 в docstring теста выше -- все false-green)"
     )
 
 
