@@ -100,6 +100,15 @@ def _mutation_lock():
     lockfile рядом с управляемым ресурсом, flock блокирующий — вторая операция ждёт, не читает
     stale snapshot). Lockfile — НЕ ~/.gitconfig (нельзя flock файл, который сам rewrite'ится через
     `git config`, apply мог бы держать fd на пере-созданном inode) — отдельный sentinel-файл рядом.
+
+    Yield'ит bool `lock_acquired`. Codex cycle-review PR #275 follow-up: недоступность самого
+    lock-примитива (os.open/flock упали — напр. permission, missing HOME, сетевой HOME с
+    ENOTSUP/EIO) означает, что конкурентный доступ к ~/.gitconfig на этой ФС В ПРИНЦИПЕ не
+    сериализуем через flock — тихая деградация "без лока" здесь молча возвращала finding 2
+    (concurrent enable/disable теряет backup безвозвратно), т.к. caller не знал, что мутирует
+    без защиты. Вызывающий код (enable()/disable()) обязан проверить `lock_acquired` и вернуть
+    fail-closed {"ok": False, ...} вместо мутации без сериализации — явный отказ лучше тихой
+    потери данных (канон fail-closed-proxy-down).
     """
     lock_p = Path.home() / ".gitconfig.srouter-proxy.lock"
 
@@ -109,22 +118,21 @@ def _mutation_lock():
             lock_p.parent.mkdir(parents=True, exist_ok=True)
             fd = os.open(lock_p, os.O_CREAT | os.O_RDWR, 0o600)
         except OSError:
-            # Не можем создать lock-файл (permission/missing HOME) — деградируем без lock,
-            # не блокируем управление прокси целиком из-за недоступности lock-примитива.
-            yield
+            # Не можем создать/открыть lock-файл (permission/missing HOME) — caller обязан
+            # отказать fail-closed, а не мутировать без сериализации.
+            yield False
             return
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)  # блокирует до отпускания другим процессом/потоком
         except OSError:
             # Файловая система открыла fd, но не поддерживает flock (напр. сетевой HOME на
-            # macOS -> ENOTSUP/EIO). Та же деградация, что при недоступном lock-файле: не
-            # блокируем enable()/disable() исключением (issue #234 cycle-review follow-up) —
-            # без advisory-lock (best-effort сериализация), а не HTTP 500 из dashboard.
+            # macOS -> ENOTSUP/EIO) — та же fail-closed деградация, что при недоступном
+            # lock-файле: без реальной сериализации caller не должен мутировать состояние.
             os.close(fd)
-            yield
+            yield False
             return
         try:
-            yield
+            yield True
         finally:
             try:
                 fcntl.flock(fd, fcntl.LOCK_UN)
@@ -432,9 +440,13 @@ def enable():
 
     Issue #234 finding 2: вся транзакция (txn-check + current-read + backup-decision + write)
     выполняется под cross-process exclusive lock (_mutation_lock) — конкурентный disable() не
-    может interleave'иться между read и write этой функции.
+    может interleave'иться между read и write этой функции. Если лок физически недоступен
+    (flock unsupported/permission) — fail-closed, НЕ мутируем без сериализации (Codex
+    cycle-review PR #275 follow-up).
     """
-    with _mutation_lock():
+    with _mutation_lock() as lock_acquired:
+        if not lock_acquired:
+            return {"ok": False, "err": "cross-process lock unavailable — refusing unsynchronized mutation"}
         return _enable_locked()
 
 
@@ -541,8 +553,12 @@ def disable():
 
     Issue #234 finding 2: вся транзакция выполняется под cross-process exclusive lock
     (_mutation_lock) — конкурентный enable() не может interleave'иться между read и write.
+    Если лок физически недоступен (flock unsupported/permission) — fail-closed, НЕ мутируем
+    без сериализации (Codex cycle-review PR #275 follow-up).
     """
-    with _mutation_lock():
+    with _mutation_lock() as lock_acquired:
+        if not lock_acquired:
+            return {"ok": False, "err": "cross-process lock unavailable — refusing unsynchronized mutation"}
         return _disable_locked()
 
 

@@ -199,14 +199,27 @@ def test_concurrent_enable_and_disable_do_not_lose_backup_deterministic(monkeypa
 
 
 # ==================== Post-review follow-up: flock acquisition errors ====================
-# Codex cycle-review PR #275 (issue #234 follow-up), P2: _mutation_lock открывал lock-файл
-# успешно (os.open), но fcntl.flock(fd, LOCK_EX) мог бросить OSError отдельно (напр. сетевой
-# HOME на macOS -> ENOTSUP/EIO) -- это НЕ было поймано, enable()/disable() убегали с исключением
-# вместо документированного result-словаря, dashboard-запрос падал в HTTP 500.
+# Codex cycle-review PR #275 (issue #234 follow-up), round 1:
+# P2 (round 0, уже исправлен ниже фиксом round 1): _mutation_lock открывал lock-файл успешно
+# (os.open), но fcntl.flock(fd, LOCK_EX) мог бросить OSError отдельно (напр. сетевой HOME на
+# macOS -> ENOTSUP/EIO) -- это НЕ было поймано, enable()/disable() убегали с исключением вместо
+# документированного result-словаря, dashboard-запрос падал в HTTP 500.
+#
+# CRITICAL (round 1, Codex xhigh, confidence 0.99): фикс P2 сам по себе тихо снял ВСЮ защиту
+# finding 2 (cross-process lock) -- если flock физически недоступен (тот же ENOTSUP/EIO), код
+# просто продолжал мутацию БЕЗ сериализации ("best-effort"), молча воссоздавая race из finding 2:
+# конкурентные enable()/disable() снова могли терять backup безвозвратно, просто оба вызова
+# больше не падали исключением. Codex эмпирически воспроизвёл: KEY=[P], backup=absent, оба
+# результата ok=True -- те же A,B потеряны навсегда, что и до fix issue #234.
+#
+# Fix: _mutation_lock() теперь yield'ит bool lock_acquired; enable()/disable() ОБЯЗАНЫ
+# проверить его и вернуть fail-closed {"ok": False, ...} вместо мутации без реальной
+# сериализации -- явный отказ вместо тихой потери данных (канон fail-closed-proxy-down).
 
-def test_flock_acquisition_error_degrades_instead_of_raising(monkeypatch, real_git_home):
+def test_flock_acquisition_error_fails_closed_instead_of_mutating_unsynchronized(monkeypatch, real_git_home):
     """fcntl.flock бросает OSError на LOCK_EX (fd открылся, но ФС не поддерживает advisory-lock).
-    enable() должен деградировать без lock (best-effort), а не пробрасывать исключение наружу."""
+    enable() ОБЯЗАН вернуть {"ok": False, ...} (fail-closed) -- НЕ мутировать состояние без
+    реальной cross-process сериализации, и уж точно не бросить исключение наружу."""
     import fcntl
 
     real_flock = fcntl.flock
@@ -221,7 +234,74 @@ def test_flock_acquisition_error_degrades_instead_of_raising(monkeypatch, real_g
     result = git_proxy.enable()
 
     assert isinstance(result, dict), "enable() обязан вернуть result-словарь, не бросить исключение"
-    assert result["ok"] is True, f"enable() должен успешно завершиться без lock: {result}"
+    assert result["ok"] is False, f"enable() без реального лока обязан отказать fail-closed: {result}"
 
     current = git_proxy._get_all(git_proxy.KEY)
-    assert current["values"] == [EXPECTED_GIT_PROXY]
+    assert not current["present"], "KEY не должен быть мутирован при недоступном lock-примитиве"
+
+
+def test_concurrent_enable_disable_with_forced_lock_failure_fail_closed_not_racy(monkeypatch, real_git_home):
+    """CRITICAL regression (Codex cycle-review PR #275, round 1, confidence 0.99): если
+    fcntl.flock физически недоступен (ENOTSUP/EIO) В ОБОИХ конкурентных вызовах, старый код
+    тихо деградировал в "без лока" и терял backup [A,B] безвозвратно (тот же race, что
+    finding 2 issue #234, просто без исключения). С fail-closed фиксом: КАЖДЫЙ вызов, который
+    не смог получить реальный лок, обязан отказать {"ok": False} и НЕ трогать состояние --
+    поэтому гонка невозможна в принципе (нет мутации без лока, значит нет racy-мутации)."""
+    import fcntl
+
+    real_flock = fcntl.flock
+
+    # Baseline setup (proxy=P enabled, backup=[A,B]) -- ДО установки forced-failure мока,
+    # реальный flock работает нормально для этой части.
+    assert git_proxy.enable()["ok"] is True
+    _raw_set_add(git_proxy._BACKUP_KEY, "A", real_git_home)
+    subprocess.run(
+        ["git", "config", "--global", "--add", git_proxy._BACKUP_KEY, "B"],
+        env=dict(os.environ, HOME=str(real_git_home)), capture_output=True, text=True, check=True,
+    )
+    assert git_proxy._backup_state()["values"] == ["A", "B"]
+
+    # Теперь принудительно ломаем flock -- ОБА конкурентных enable()/disable() пытаются
+    # мутировать под forced flock-failure.
+    def _flock_always_raises(fd, operation):
+        if operation == fcntl.LOCK_EX:
+            raise OSError("simulated ENOTSUP: flock not supported on this filesystem")
+        return real_flock(fd, operation)
+
+    monkeypatch.setattr(git_proxy.fcntl, "flock", _flock_always_raises)
+
+    results = {}
+
+    def _run_enable():
+        results["enable"] = git_proxy.enable()
+
+    def _run_disable():
+        results["disable"] = git_proxy.disable()
+
+    t_enable = threading.Thread(target=_run_enable, name="enable-thread")
+    t_disable = threading.Thread(target=_run_disable, name="disable-thread")
+    t_enable.start()
+    t_disable.start()
+    t_enable.join(timeout=15)
+    t_disable.join(timeout=15)
+
+    final_key = git_proxy._get_all(git_proxy.KEY)
+    final_backup = git_proxy._backup_state()
+
+    # С fail-closed фиксом: ЛЮБОЙ вызов без реального лока обязан отказать, не мутируя.
+    # Значит backup НЕ МОЖЕТ быть потерян -- он либо остаётся нетронутым (оба вызова
+    # отказали), либо один из них успешно завершился (что невозможно при forced-failure
+    # ВСЕГДА raise, но проверяем инвариант данных, а не то, что оба обязательно ok=False).
+    backup_alive = final_backup["present"] and final_backup["values"] == ["A", "B"]
+    restored_into_key = final_key["present"] and final_key["values"] == ["A", "B"]
+    proxy_enabled_with_backup_intact = (
+        final_key["present"] and final_key["values"] == [EXPECTED_GIT_PROXY] and backup_alive
+    )
+
+    assert backup_alive or restored_into_key or proxy_enabled_with_backup_intact, (
+        f"[A,B] потерян безвозвратно из-за racy-мутации под forced lock-failure (fail-closed "
+        f"фикс должен был предотвратить ЛЮБУЮ мутацию без реального лока): "
+        f"KEY={final_key}, BACKUP={final_backup}, results={results}"
+    )
+    assert results["enable"]["ok"] is False, f"enable() без лока обязан fail-closed: {results['enable']}"
+    assert results["disable"]["ok"] is False, f"disable() без лока обязан fail-closed: {results['disable']}"
