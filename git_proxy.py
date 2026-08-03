@@ -437,13 +437,23 @@ def _check_and_resolve_txn():
     # полного _TXN_KEY списка. Partial write (crash между записью target-values и sentinel)
     # оставляет _TXN_SENTINEL_KEY absent или mismatched — fail-closed отклоняем.
     sentinel_state = _get_all(_TXN_SENTINEL_KEY)
+
+    # Issue #234 round 3 (Codex xhigh, confidence 0.99, эмпирически подтверждено): transient
+    # read failure (timeout/permission-race — unknown=True) на _TXN_SENTINEL_KEY НЕ ЗНАЧИТ
+    # "sentinel отсутствует/не совпадает" (permanent corruption) — это ДРУГОЙ случай, тот же,
+    # что уже корректно обрабатывается для txn["unknown"] выше: вернуть ошибку БЕЗ мутации,
+    # чтобы следующий вызов мог повторить чтение на рабочем соединении. Смешение этих двух
+    # случаев (было: unknown ИЛИ absent ИЛИ mismatch → один и тот же _unset_all) превращало
+    # единичный transient сбой в permanent data loss — валидный in-flight маркер удалялся
+    # НАВСЕГДА, следующий enable()/disable() видел current как "новое foreign состояние" и
+    # перезаписывал backup, теряя всё, что было после уже частично восстановленного префикса.
+    if sentinel_state["unknown"]:
+        return {"ok": False, "err": "git config --get-all txn sentinel check failed", "resolved": False}
+
     expected_sentinel = _txn_sentinel(txn["values"])
-    if (
-        sentinel_state["unknown"]
-        or not sentinel_state["present"]
-        or sentinel_state["values"] != [expected_sentinel]
-    ):
-        # Sentinel отсутствует/не совпадает — маркер частично записан, убираем (fail-closed)
+    if not sentinel_state["present"] or sentinel_state["values"] != [expected_sentinel]:
+        # Sentinel ДЕЙСТВИТЕЛЬНО отсутствует/не совпадает (не transient read failure) — маркер
+        # частично записан, убираем (fail-closed).
         _unset_all(_TXN_KEY)
         _unset_all(_TXN_SENTINEL_KEY)
         return {"ok": False, "err": "txn marker partial write: sentinel mismatch or missing", "resolved": True}

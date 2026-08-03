@@ -345,3 +345,61 @@ def test_target_value_matching_its_own_sentinel_not_accepted_as_complete(real_gi
 
     current = git_proxy._get_all(git_proxy.KEY)
     assert current["values"] == ["A", x], "KEY не должен быть искажён отклонённым partial-маркером"
+
+
+# ==================== Round 3: transient sentinel-read failure destroys valid marker ====================
+# Codex cycle-review PR #275 round 3 (xhigh, confidence 0.99), эмпирически подтверждено triage:
+# _check_and_resolve_txn смешивал "не удалось прочитать _TXN_SENTINEL_KEY" (unknown=True,
+# transient -- git timeout/permission-race) с "прочитали, но sentinel отсутствует/не совпадает"
+# (permanent corruption) в ОДНОЙ ветке -- оба случая удаляли ОБА маркера. Единичный transient
+# сбой чтения уничтожал ВАЛИДНЫЙ, готовый-к-retry in-flight маркер: следующий enable()/disable()
+# видел current (ещё НЕ тронутый, т.к. retry так и не выполнился) как "новое foreign состояние"
+# и мог перезаписать backup, теряя всё, что было после уже частично восстановленного префикса.
+
+def test_transient_sentinel_read_failure_does_not_destroy_valid_marker(monkeypatch, real_git_home):
+    """CRITICAL regression (Codex cycle-review PR #275, round 3, confidence 0.99): валидный
+    complete txn-маркер (target=[_PROXY], корректный sentinel в _TXN_SENTINEL_KEY) существует.
+    Одно чтение _TXN_SENTINEL_KEY транзиентно падает (timeout, НЕ "ключа нет"). Recovery
+    ОБЯЗАН вернуть ошибку БЕЗ мутации (resolved=False, оба маркера НЕТРОНУТЫ) -- не удалять
+    валидный маркер, который мог бы быть успешно доведён до конца следующим вызовом."""
+    _raw_set_add(git_proxy.KEY, "A", real_git_home)
+    _raw_set_add(git_proxy.KEY, "B", real_git_home)
+    _raw_set_add(git_proxy.KEY, "C", real_git_home)
+
+    begin = git_proxy._begin_txn(git_proxy.KEY, [EXPECTED_GIT_PROXY])
+    assert begin["ok"] is True, "sanity: валидный complete txn-маркер должен быть записан успешно"
+
+    real_run = git_proxy.sys_probe.run
+
+    def _sentinel_read_times_out_once(cmd, **kwargs):
+        if cmd[-3:-1] == ["--get-all", "-z"] and cmd[-1] == git_proxy._TXN_SENTINEL_KEY:
+            return {"rc": None, "out": "", "err": "simulated timeout", "timeout": True}
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(git_proxy.sys_probe, "run", _sentinel_read_times_out_once)
+
+    resolved = git_proxy._check_and_resolve_txn()
+
+    assert resolved["ok"] is False, "transient read failure должен вернуть ошибку"
+    assert resolved["resolved"] is False, (
+        "transient read failure -- НЕ 'маркер разрешён' (resolved=True удалил бы валидный "
+        "маркер навсегда); должно быть resolved=False, как и для txn['unknown'] выше"
+    )
+
+    monkeypatch.setattr(git_proxy.sys_probe, "run", real_run)
+
+    txn_after = git_proxy._get_all(git_proxy._TXN_KEY)
+    sentinel_after = git_proxy._get_all(git_proxy._TXN_SENTINEL_KEY)
+    assert txn_after["present"] is True, "валидный _TXN_KEY НЕ должен быть удалён из-за transient сбоя"
+    assert sentinel_after["present"] is True, "валидный _TXN_SENTINEL_KEY НЕ должен быть удалён из-за transient сбоя"
+
+    # KEY нетронут -- retry так и не выполнился (transient failure произошёл ДО retry).
+    current = git_proxy._get_all(git_proxy.KEY)
+    assert current["values"] == ["A", "B", "C"], "KEY не должен быть мутирован при transient read failure"
+
+    # Следующий вызов (на рабочем соединении) должен успешно довести маркер до конца.
+    resolved2 = git_proxy._check_and_resolve_txn()
+    assert resolved2["ok"] is True
+    assert resolved2["resolved"] is True
+    current2 = git_proxy._get_all(git_proxy.KEY)
+    assert current2["values"] == [EXPECTED_GIT_PROXY], "маркер должен корректно replay'иться на следующей попытке"
