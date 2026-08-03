@@ -25,6 +25,18 @@ import sys_probe
 # Dedicated lifecycle tests below call the saved implementation explicitly with isolated paths.
 _REAL_RECORD_WATCHDOG_LIFECYCLE = getattr(health, "_record_watchdog_lifecycle", None)
 
+# #271: _all_up_monkey мокает _network_interface_up целиком (real route/ifconfig иначе гуляет по
+# dev-машине). Тесты #203-каскада (test_network_down_*/test_network_up_proceeds_*/
+# test_network_check_is_info_only_when_up, test_dns_*_masks/proceeds/info_only) намеренно проверяют
+# РЕАЛЬНУЮ _network_interface_up через мок sys_probe.run (route/ifconfig) — им нужен настоящий
+# helper, не заглушка. Восстанавливают его этой ссылкой ПОСЛЕ _all_up_monkey (late-binding).
+_REAL_NETWORK_INTERFACE_UP = health._network_interface_up
+
+# #271: аналогично — _codex_isolation_check тесты (test_check_all_codex_isolation_*) мокают
+# isolate_firewall.probe_codex_isolation/probe_codex_user + ps через _codex_iso_probes ДО вызова
+# _all_up_monkey; им нужна РЕАЛЬНАЯ _codex_isolation_check, не глобальная заглушка.
+_REAL_CODEX_ISOLATION_CHECK = health._codex_isolation_check
+
 
 def _all_up_monkey(monkeypatch, *, probe_status="ok", probe_detail="runtime: коннект",
                    codex_status="ok", codex_detail="runtime: codex через SOCKS5"):
@@ -79,6 +91,36 @@ def _all_up_monkey(monkeypatch, *, probe_status="ok", probe_detail="runtime: к�
                         lambda *a, **kw: {"status": "ok", "detail": "mock: GFW не режет"})
     monkeypatch.setattr(health, "_direct_first_check",
                         lambda: {"status": "ok", "detail": "mock: direct-first reachable"})
+    # #271: остальные проб check_all(), которые дёргают реальные системные API (route/ifconfig,
+    # launchctl print, dscl+ps, git config, файлы settings/xray/лог) без промежуточного слоя,
+    # уже замоканного выше — Codex adversarial review на PR #268 показал, что гвард
+    # test_machine_state_mock_guard.py проверял только «canon ⊆ versions», а не «canon покрывает
+    # ВСЕ real probes check_all». Мокаем чек целиком (как _claude_proxy_probe/_codex_proxy_probe
+    # выше) — иначе dev-машина (её route table, launchd jobs, dscl-пользователи, git-config,
+    # диск с binary) недетерминированно драйвит detail/status этих info-only чеков.
+    monkeypatch.setattr(health, "_network_interface_up",
+                        lambda: {"up": True, "detail": "mock: сеть активна"})
+    monkeypatch.setattr(health, "_endpoint_xray_sync_check",
+                        lambda *a, **kw: {"status": "ok", "detail": "mock: endpoint синхронизирован"})
+    # _codenv_job_check НЕ мокаем здесь безусловно (issue #271, allowlist test_machine_state_mock_guard.py):
+    # test_health_codenv_job.py::_codenv_checks вызывает _all_up_monkey ПОСЛЕ того, как тест уже
+    # замокал health._codenv_job_check своим сценарием (ok/down/unknown) — безусловный мок здесь
+    # перезаписал бы его позже по времени и молча подменил бы сценарий. Тесты этого файла, которые
+    # НЕ мокают _codenv_job_check сами, получают реальный launchctl print (см. allowlist).
+    monkeypatch.setattr(health, "_vscode_proxy_check",
+                        lambda: {"status": "unknown", "detail": "mock: VSCode не установлен"})
+    monkeypatch.setattr(health, "_github_direct_check",
+                        lambda: {"status": "ok", "detail": "mock: github direct"})
+    monkeypatch.setattr(health, "_runtime_model_override_check",
+                        lambda: {"status": "ok", "detail": "mock: без override"})
+    monkeypatch.setattr(health, "_installed_versions_check",
+                        lambda: {"status": "unknown", "detail": "mock: не установлено", "codex": [], "claude_code": []})
+    monkeypatch.setattr(health, "_privoxy_log_observability_check",
+                        lambda *a, **kw: {"status": "ok", "detail": "mock: privoxy-log ок"})
+    monkeypatch.setattr(health, "_codex_isolation_check",
+                        lambda: {"status": "info", "detail": "mock: PF kill-switch не установлен"})
+    monkeypatch.setattr(health, "_claude_transport_probe",
+                        lambda *a, **kw: {"status": "unknown", "detail": "mock: CC не запущен (real CLI)"})
 
 
 # ============================ _claude_proxy_probe (детект lsof) ============================
@@ -586,6 +628,7 @@ def test_network_down_takes_precedence_over_vps_dead_in_check_all(monkeypatch):
     «подключи интернет», VPS-чек подавляется (info-only, не «VPS мёртв» поверх «нет сети»).
     """
     _all_up_monkey(monkeypatch)  # порты живы; claude/codex/app/desktop — info/ok
+    monkeypatch.setattr(health, "_network_interface_up", _REAL_NETWORK_INTERFACE_UP)  # #271: real fn
     monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed", False))
     # route + ifconfig: нет сети
     monkeypatch.setattr(health.sys_probe, "run", lambda cmd, timeout:
@@ -613,6 +656,7 @@ def test_network_up_proceeds_to_vps_probe_in_check_all(monkeypatch):
     реальную VPS-смерть. VPS-unreachable при живой сети → по-прежнему driver DOWN (#196).
     """
     _all_up_monkey(monkeypatch)
+    monkeypatch.setattr(health, "_network_interface_up", _REAL_NETWORK_INTERFACE_UP)  # #271: real fn
     monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed", False))
     monkeypatch.setattr(health.sys_probe, "run", lambda cmd, timeout:
                         {"rc": 0, "out": _ROUTE_DEFAULT_UP, "err": "", "timeout": False}
@@ -635,6 +679,7 @@ def test_network_check_is_info_only_when_up(monkeypatch):
     в агрегации drivers (как endpoint-override/versions). Driver net-чек становится ТОЛЬКО при up=False.
     """
     _all_up_monkey(monkeypatch, probe_status="ok")
+    monkeypatch.setattr(health, "_network_interface_up", _REAL_NETWORK_INTERFACE_UP)  # #271: real fn
     monkeypatch.setattr(health, "_tunnel_up", lambda: (True, "HTTP 200", False))
     monkeypatch.setattr(health.sys_probe, "run", lambda cmd, timeout:
                         {"rc": 0, "out": _ROUTE_DEFAULT_UP, "err": "", "timeout": False}
@@ -839,6 +884,7 @@ def test_dns_fail_masks_vps_dead_in_check_all(monkeypatch):
     когда резолв не работает). Канон: verify-dont-guess (gaierror ≠ VPS-смерть).
     """
     _all_up_monkey(monkeypatch)  # порты живы; claude/codex/app/desktop — info/ok
+    monkeypatch.setattr(health, "_network_interface_up", _REAL_NETWORK_INTERFACE_UP)  # #271: real fn
     monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed", False))
     # сеть есть (route default → en0) — мок sys_probe.run, как #203-каскадные тесты.
     monkeypatch.setattr(health.sys_probe, "run", lambda cmd, timeout:
@@ -869,6 +915,7 @@ def test_network_down_suppresses_dns_check_in_check_all(monkeypatch):
     VPS-чек), «нет сети» остаётся единственным driver. Канон: verify-dont-guess (первичная причина).
     """
     _all_up_monkey(monkeypatch)  # порты живы; _resolve_host замокан True, но ниже переопределим
+    monkeypatch.setattr(health, "_network_interface_up", _REAL_NETWORK_INTERFACE_UP)  # #271: real fn
     monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed", False))
     # НЕТ сети: route rc!=0 + ifconfig только loopback (как test_network_down_* из #203)
     monkeypatch.setattr(health.sys_probe, "run", lambda cmd, timeout:
@@ -895,6 +942,7 @@ def test_dns_ok_proceeds_to_vps_probe_in_check_all(monkeypatch):
     VPS-смерть. VPS-unreachable при живой сети + работающем DNS → по-прежнему driver DOWN (#196).
     """
     _all_up_monkey(monkeypatch)
+    monkeypatch.setattr(health, "_network_interface_up", _REAL_NETWORK_INTERFACE_UP)  # #271: real fn
     monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed", False))
     monkeypatch.setattr(health.sys_probe, "run", lambda cmd, timeout:
                         {"rc": 0, "out": _ROUTE_DEFAULT_UP, "err": "", "timeout": False}
@@ -918,6 +966,7 @@ def test_dns_check_is_info_only_when_up(monkeypatch):
     при up=False.
     """
     _all_up_monkey(monkeypatch, probe_status="ok")
+    monkeypatch.setattr(health, "_network_interface_up", _REAL_NETWORK_INTERFACE_UP)  # #271: real fn
     monkeypatch.setattr(health, "_tunnel_up", lambda: (True, "HTTP 200", False))
     monkeypatch.setattr(health.sys_probe, "run", lambda cmd, timeout:
                         {"rc": 0, "out": _ROUTE_DEFAULT_UP, "err": "", "timeout": False}
@@ -2828,6 +2877,7 @@ def test_check_all_codex_isolation_gated_under_active_claude(monkeypatch):
     на вердикт (избегаем шума как PR #135)."""
     _codex_iso_probes(monkeypatch, lease_status="down", provisioned=False)
     _all_up_monkey(monkeypatch, probe_status="ok", codex_status="ok")
+    monkeypatch.setattr(health, "_codex_isolation_check", _REAL_CODEX_ISOLATION_CHECK)  # #271: real fn
 
     # active_claude=False (лёгкий /health/watchdog) — чека codex-isolation НЕТ.
     result = health.check_all(active_claude=False)
@@ -2848,6 +2898,7 @@ def test_check_all_codex_isolation_ok_is_driver(monkeypatch):
     _codex_iso_probes(monkeypatch, lease_status="ok", provisioned=True,
                       ps_out=" 1234 codex\n", ps_rc=0)
     _all_up_monkey(monkeypatch, probe_status="ok", codex_status="ok")
+    monkeypatch.setattr(health, "_codex_isolation_check", _REAL_CODEX_ISOLATION_CHECK)  # #271: real fn
     result = health.check_all(active_claude=True)
     ci = next(c for c in result["checks"] if "codex-isolation" in c["name"])
     assert ci["ok"] is True, "real fail-closed активна → ok"
