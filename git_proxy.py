@@ -66,6 +66,15 @@ KEY = "http.https://github.com.proxy"
 _BACKUP_KEY = KEY + "-srouter-backup"
 # Transactional marker для issue #224: фиксирует "операция в процессе, target = X"
 _TXN_KEY = _BACKUP_KEY + "-txn"
+# Issue #234 round 2 (Codex cycle-review PR #275, confidence 0.99, эмпирически подтверждено):
+# sentinel ДОЛЖЕН жить в ОТДЕЛЬНОМ ключе от target-values. Пока sentinel был последним
+# элементом ТОГО ЖЕ списка _TXN_KEY, любое target-значение X, случайно/специально равное
+# sentinel(values_before_X), делало partial-маркер [key,...,X] неотличимым от complete
+# (X сам "притворялся" сентинелом своего же префикса) — крэш ровно после записи такого X
+# терял всё после X навсегда. Физическое разделение ключей устраняет класс проблемы: target-
+# values в _TXN_KEY НИКОГДА не могут быть спутаны с sentinel в _TXN_SENTINEL_KEY, т.к. это
+# разные git-config записи, а не позиции в одном списке.
+_TXN_SENTINEL_KEY = _TXN_KEY + "-sentinel"
 
 # Issue #234 (Codex cycle-review PR #233, finding 1): checksum-sentinel ДОЛЖЕН быть
 # self-identifying — decimal count (`str(len(values))`) неотличим от легитимного numeric
@@ -79,10 +88,21 @@ _TXN_SENTINEL_PREFIX = "srouter-git-proxy-txn-checksum:"
 def _txn_sentinel(txn_values):
     """Self-identifying sentinel для txn-маркера: префикс + sha256(canonical join).
 
-    txn_values — [key, val1, val2, ...] (БЕЗ sentinel). Digest покрывает КАЖДОЕ значение
-    (не только count) — коллизия требовала бы найти другой список значений с тем же digest,
+    txn_values — [key, val1, val2, ...] (полный target-список _TXN_KEY). Digest покрывает
+    КАЖДОЕ значение — коллизия требовала бы найти другой список значений с тем же digest,
     криптографически неосуществимо. NUL-separated join исключает ambiguity типа
     ["A", "B"] vs ["AB"] (те же байты, разный split).
+
+    Codex cycle-review PR #275 round 2 (confidence 0.99, эмпирически подтверждено): пока
+    sentinel был ПОСЛЕДНИМ ЭЛЕМЕНТОМ ТОГО ЖЕ _TXN_KEY списка, что и target-values, любое
+    target-значение X, случайно/специально равное sentinel(values_before_X), делало
+    partial-маркер [key,...,X] structurally неотличимым от complete (X сам "притворялся"
+    сентинелом своего префикса) — не требует SHA-256 коллизии, просто X == digest своего же
+    предшествующего списка. Кодирование count в саму sentinel-строку НЕ закрывает дыру (count
+    для complete-маркера с X как sentinel совпадает с count для partial-маркера без X — тот
+    же список меньшей длины даёт тот же count). Реальный fix — физическое разделение ключей
+    (_TXN_SENTINEL_KEY, отдельно от _TXN_KEY): sentinel больше не элемент target-списка,
+    поэтому НИКАКОЕ target-значение не может быть спутано с ним.
     """
     canonical = "\x00".join(txn_values).encode("utf-8")
     digest = hashlib.sha256(canonical).hexdigest()
@@ -321,54 +341,68 @@ def _begin_txn(key, target_values):
     ВАЖНО: пишем напрямую через sys_probe.run, НЕ _write_values, чтобы txn-маркер
     сам не был обёрнут в ещё одну транзакцию (begin_txn=False не помогает, т.к. _write_values
     с begin_txn=False всё равно может падать, и мы не хотим, чтобы txn begin был обязан perfect).
+
+    Issue #234 round 2: sentinel пишется в ОТДЕЛЬНЫЙ ключ (_TXN_SENTINEL_KEY), не как
+    последний элемент _TXN_KEY — target-values физически не могут быть спутаны с sentinel.
     """
-    # Формат: [key, val1, val2, ...] — первый элемент всегда ключ, остальные значения
+    # Формат _TXN_KEY: [key, val1, val2, ...] — первый элемент всегда ключ, остальные значения
     txn_values = [key] + target_values
 
-    # Сначала чистим _TXN_KEY (если был)
+    # Сначала чистим оба ключа (если были)
     unset = _unset_all(_TXN_KEY)
     if not unset["ok"]:
         return unset
+    unset_sentinel = _unset_all(_TXN_SENTINEL_KEY)
+    if not unset_sentinel["ok"]:
+        return unset_sentinel
 
-    # Пишем каждое значение
+    # Пишем каждое target-значение в _TXN_KEY
     for val in txn_values:
         r = sys_probe.run([GIT, "config", "--global", "--add", _TXN_KEY, val], timeout=5)
         if r.get("timeout") or r.get("rc") != 0:
             return {"ok": False, "err": f"txn begin --add failed: {r.get('err')}"}
 
-    # Issue #224 follow-up (Codex review), fixed issue #234 (checksum sentinel collision):
-    # пишем self-identifying sentinel последним для детекции partial write. Sentinel — НЕ
-    # decimal count (который неотличим от легитимного numeric target-значения), а digest
-    # префиксированный строкой, которая не может встретиться как реальное git-config значение.
+    # Issue #224 follow-up (Codex review), fixed issue #234 (checksum sentinel collision,
+    # rounds 1+2): sentinel пишется ПОСЛЕДНИМ шагом, в ОТДЕЛЬНЫЙ ключ — детектирует partial
+    # write (_TXN_KEY present, _TXN_SENTINEL_KEY absent = crash до этого шага), и НИКАКОЕ
+    # target-значение в _TXN_KEY не может быть спутано с sentinel (разные git-config записи).
     sentinel_val = _txn_sentinel(txn_values)
-    r_checksum = sys_probe.run([GIT, "config", "--global", "--add", _TXN_KEY, sentinel_val], timeout=5)
-    if r_checksum.get("timeout") or r_checksum.get("rc") != 0:
-        return {"ok": False, "err": f"txn checksum write failed: {r_checksum.get('err')}"}
+    r_sentinel = sys_probe.run([GIT, "config", "--global", "--add", _TXN_SENTINEL_KEY, sentinel_val], timeout=5)
+    if r_sentinel.get("timeout") or r_sentinel.get("rc") != 0:
+        return {"ok": False, "err": f"txn sentinel write failed: {r_sentinel.get('err')}"}
 
-    # Verify (включая sentinel)
+    # Verify обоих ключей
     after = _get_all(_TXN_KEY)
-    expected_values = txn_values + [sentinel_val]
-    if after["unknown"] or after["values"] != expected_values:
+    if after["unknown"] or after["values"] != txn_values:
         return {"ok": False, "err": "txn begin verify failed"}
+    after_sentinel = _get_all(_TXN_SENTINEL_KEY)
+    if after_sentinel["unknown"] or after_sentinel["values"] != [sentinel_val]:
+        return {"ok": False, "err": "txn sentinel verify failed"}
 
     return {"ok": True}
 
 
 def _commit_txn():
-    """Завершить транзакцию успешно: снять _TXN_KEY.
+    """Завершить транзакцию успешно: снять _TXN_KEY и _TXN_SENTINEL_KEY.
 
     Вызывается ТОЛЬКО после подтверждённого успеха (read-after-write verify).
     """
-    return _unset_all(_TXN_KEY)
+    unset = _unset_all(_TXN_KEY)
+    if not unset["ok"]:
+        return unset
+    return _unset_all(_TXN_SENTINEL_KEY)
 
 
 def _rollback_txn():
-    """Откатить транзакцию: снять _TXN_KEY (operation aborted, not committed).
+    """Откатить транзакцию: снять _TXN_KEY и _TXN_SENTINEL_KEY (operation aborted, not committed).
 
     Отличие от _commit_txn: смысловая разница для документации, механически
     одинаково — убираем маркер "операция в процессе".
     """
-    return _unset_all(_TXN_KEY)
+    unset = _unset_all(_TXN_KEY)
+    if not unset["ok"]:
+        return unset
+    return _unset_all(_TXN_SENTINEL_KEY)
 
 
 def _check_and_resolve_txn():
@@ -390,24 +424,32 @@ def _check_and_resolve_txn():
         return {"ok": True, "resolved": False}  # Нет незавершённой транзакции — норма
 
     # Транзакция в процессе — доводим до конца
-    # Формат: [key, val1, val2, ..., sentinel] — sentinel последний элемент
-    if len(txn["values"]) < 3:  # минимум: [key, one_value, sentinel]
+    # Формат _TXN_KEY: [key, val1, val2, ...] (БЕЗ sentinel — issue #234 round 2: sentinel
+    # живёт в ОТДЕЛЬНОМ _TXN_SENTINEL_KEY, поэтому НИКАКОЕ target-значение здесь не может
+    # быть спутано с sentinel).
+    if len(txn["values"]) < 2:  # минимум: [key, one_value]
         # Некорректный формат txn-маркера — убираем и ругаемся (fail-closed)
         _unset_all(_TXN_KEY)
-        return {"ok": False, "err": "corrupt txn marker (less than 3 values with sentinel)", "resolved": False}
+        _unset_all(_TXN_SENTINEL_KEY)
+        return {"ok": False, "err": "corrupt txn marker (less than 2 values in _TXN_KEY)", "resolved": False}
 
-    # Issue #234: self-identifying sentinel вместо decimal count — не может случайно совпасть
-    # с легитимным numeric target-значением. Пересчитываем ожидаемый sentinel из actual_values
-    # (без последнего элемента) и сравниваем строго, byte-for-byte, с тем, что реально на диске.
-    last = txn["values"][-1]
-    actual_values = txn["values"][:-1]  # без sentinel
-    if not last.startswith(_TXN_SENTINEL_PREFIX) or last != _txn_sentinel(actual_values):
+    # Issue #234 round 2: sentinel читается из ОТДЕЛЬНОГО ключа и сравнивается с digest
+    # полного _TXN_KEY списка. Partial write (crash между записью target-values и sentinel)
+    # оставляет _TXN_SENTINEL_KEY absent или mismatched — fail-closed отклоняем.
+    sentinel_state = _get_all(_TXN_SENTINEL_KEY)
+    expected_sentinel = _txn_sentinel(txn["values"])
+    if (
+        sentinel_state["unknown"]
+        or not sentinel_state["present"]
+        or sentinel_state["values"] != [expected_sentinel]
+    ):
         # Sentinel отсутствует/не совпадает — маркер частично записан, убираем (fail-closed)
         _unset_all(_TXN_KEY)
+        _unset_all(_TXN_SENTINEL_KEY)
         return {"ok": False, "err": "txn marker partial write: sentinel mismatch or missing", "resolved": True}
 
     target_key = txn["values"][0]
-    target_values = txn["values"][1:-1]  # всё кроме ключа и sentinel
+    target_values = txn["values"][1:]  # всё кроме ключа (sentinel — в отдельном ключе)
 
     # Retry: пишем target_values в target_key с verify БЕЗ создания нового txn-маркера
     w = _write_values(target_key, target_values, begin_txn=False)

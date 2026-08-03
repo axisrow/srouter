@@ -305,3 +305,43 @@ def test_concurrent_enable_disable_with_forced_lock_failure_fail_closed_not_racy
     )
     assert results["enable"]["ok"] is False, f"enable() без лока обязан fail-closed: {results['enable']}"
     assert results["disable"]["ok"] is False, f"disable() без лока обязан fail-closed: {results['disable']}"
+
+
+# ==================== Round 2: target value can impersonate the sentinel ====================
+# Codex cycle-review PR #275 round 2 (xhigh, confidence 0.99), эмпирически подтверждено triage:
+# sentinel, зависящий ТОЛЬКО от digest(values_before_last), structurally неотличим от target
+# X == _txn_sentinel(values_before_X). Не требует SHA-256 коллизии -- X просто должен буквально
+# совпасть со своим собственным digest-хвостом. Crash ПОСЛЕ записи X (но до записи РЕАЛЬНОГО
+# финального sentinel) оставляет [KEY, ..., X], который старая схема (digest без count)
+# принимала как complete, теряя всё после X навсегда. Fix: sentinel теперь кодирует count И
+# digest вместе -- X, совпавший ТОЛЬКО с digest(values_before_X), больше не проходит, т.к.
+# ожидаемый count для настоящего sentinel = len(txn_values), а не len(values_before_X).
+
+def test_target_value_matching_its_own_sentinel_not_accepted_as_complete(real_git_home):
+    """CRITICAL regression (Codex cycle-review PR #275, round 2, confidence 0.99): target-список
+    [KEY, "A", X], где X == _txn_sentinel([KEY, "A"]) (т.е. последнее target-значение случайно
+    равно sentinel предыдущих значений). Crash ПОСЛЕ записи X, ДО записи реального финального
+    sentinel (sentinel([KEY,"A",X])) оставляет на диске ровно [KEY, "A", X] -- то же самое, что
+    оставил бы настоящий complete-маркер для target=["A"] с sentinel=X. Recovery ОБЯЗАН отклонить
+    это как corrupt (count не совпадёт), а не тихо принять и потерять X навсегда."""
+    x = git_proxy._txn_sentinel([git_proxy.KEY, "A"])
+
+    _raw_set_add(git_proxy._TXN_KEY, git_proxy.KEY, real_git_home)
+    _raw_set_add(git_proxy._TXN_KEY, "A", real_git_home)
+    _raw_set_add(git_proxy._TXN_KEY, x, real_git_home)
+
+    _raw_set_add(git_proxy.KEY, "A", real_git_home)
+    _raw_set_add(git_proxy.KEY, x, real_git_home)
+
+    txn = git_proxy._get_all(git_proxy._TXN_KEY)
+    assert txn["values"] == [git_proxy.KEY, "A", x], "sanity: сырой partial-маркер, где X подделывает sentinel"
+
+    resolved = git_proxy._check_and_resolve_txn()
+
+    assert resolved["ok"] is False, (
+        f"partial-маркер [KEY,'A',X], где X=_txn_sentinel([KEY,'A']), ОБЯЗАН быть отклонён как "
+        f"corrupt -- НЕ реплеиться как complete target=['A'] (что потеряло бы X={x!r} навсегда)"
+    )
+
+    current = git_proxy._get_all(git_proxy.KEY)
+    assert current["values"] == ["A", x], "KEY не должен быть искажён отклонённым partial-маркером"
