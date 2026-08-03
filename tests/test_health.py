@@ -457,7 +457,7 @@ def test_vps_placeholder_testnet_203_0_113_is_warn(monkeypatch):
     assert vps_check.get("info") is True, "placeholder — info-only (не driver)"
 
 
-def test_vps_placeholder_detector_matches_canonical():
+def test_vps_placeholder_detector_matches_canonical(monkeypatch):
     """REGRESSION-гвард #198 (post-review #196): health детектит TEST-NET-placeholder ТОЧНО как
     canonical local_state._is_testnet_placeholder (единый источник правды).
 
@@ -465,8 +465,13 @@ def test_vps_placeholder_detector_matches_canonical():
     без octet-валидации → drift с canonical на 203.0.113.300/abc/-1/пустом (cycle-review Codex+я
     high-confirmed). Канон loose-validator-recurring-leak: граница валидируется строгим первоисточником
     в одном месте, не «почти-regex» в N. Этот тест падает, пока health не делегирует canonical.
+
+    #278: тест проверяет только placeholder-детектор (строковую логику), не реальную сетевую
+    доступность non-placeholder хостов — мокаем sys_probe.port_open, иначе agree_not-хосты
+    (198.51.100.7/192.0.2.1/1.2.3.4/203.0.113) уходят в реальный TCP-таймаут 3s × 4 = 12s.
     """
     import local_state
+    _mock_vps_tcp(monkeypatch, reachable=False)
     # Включаем drift-кейсы: prefix+count==3, НО octet невалиден → canonical=False, health-дубликат=True.
     drift_cases = ["203.0.113.300", "203.0.113.abc", "203.0.113.-1", "203.0.113."]
     # Согласованные кейсы (оба детектора): валидный placeholder / не-prefix / hostname / None.
