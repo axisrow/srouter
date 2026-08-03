@@ -34,7 +34,29 @@ txn-маркер (_TXN_KEY) остаётся установленным, сле�
 (_check_and_resolve_txn retry'ит мутацию с explicit target, НЕ heuristic "current похоже на X").
 Issue #224 решён architectural fix: explicit transactional marker вместо reverse-engineering
 current-vs-backup pattern-matching.
+
+Issue #234 (Codex cycle-review PR #233, 3 раунда → architectural signal, канон
+best-effort-layer-cycle-review-never-converges): 2 CRITICAL находки, отличные по категории от
+core transactional-логики (threading/serialization и cross-process coordination, не edge cases
+базового transactional паттерна).
+
+1. Checksum sentinel collision: старый checksum = `str(len(txn_values))` — decimal-строка
+   неотличима от легитимного numeric target-значения (target=["A","2"], partial-маркер
+   [KEY,"A","2"] мог быть ошибочно принят за complete). Fix: self-identifying sentinel —
+   `_TXN_SENTINEL_PREFIX + sha256(canonical join)` (_txn_sentinel()) — криптографически не может
+   совпасть ни с одним легитимным git-config значением.
+2. Concurrent enable/disable race: txn-check, current-state read, backup decision и write не были
+   сериализованы между процессами (CLI + dashboard threaded server могли interleave'иться и терять
+   backup безвозвратно). Fix: cross-process advisory lock (`_mutation_lock()`, flock LOCK_EX,
+   эталон local_state._routing_config_lock issue #139) оборачивает ВСЮ enable()/disable()
+   транзакцию — вторая операция блокируется до полного завершения первой, не читает stale snapshot.
 """
+import contextlib
+import fcntl
+import hashlib
+import os
+from pathlib import Path
+
 import sys_probe
 
 GIT = "/usr/bin/git"
@@ -44,6 +66,102 @@ KEY = "http.https://github.com.proxy"
 _BACKUP_KEY = KEY + "-srouter-backup"
 # Transactional marker для issue #224: фиксирует "операция в процессе, target = X"
 _TXN_KEY = _BACKUP_KEY + "-txn"
+# Issue #234 round 2 (Codex cycle-review PR #275, confidence 0.99, эмпирически подтверждено):
+# sentinel ДОЛЖЕН жить в ОТДЕЛЬНОМ ключе от target-values. Пока sentinel был последним
+# элементом ТОГО ЖЕ списка _TXN_KEY, любое target-значение X, случайно/специально равное
+# sentinel(values_before_X), делало partial-маркер [key,...,X] неотличимым от complete
+# (X сам "притворялся" сентинелом своего же префикса) — крэш ровно после записи такого X
+# терял всё после X навсегда. Физическое разделение ключей устраняет класс проблемы: target-
+# values в _TXN_KEY НИКОГДА не могут быть спутаны с sentinel в _TXN_SENTINEL_KEY, т.к. это
+# разные git-config записи, а не позиции в одном списке.
+_TXN_SENTINEL_KEY = _TXN_KEY + "-sentinel"
+
+# Issue #234 (Codex cycle-review PR #233, finding 1): checksum-sentinel ДОЛЖЕН быть
+# self-identifying — decimal count (`str(len(values))`) неотличим от легитимного numeric
+# target-значения (target=["A","2"], партийный маркер [KEY,"A","2"] интерпретировался как
+# complete с checksum="2"==len([KEY,"A"]) по случайному совпадению строк, теряя "2" навсегда).
+# Префикс НЕ может встретиться как реальное git-config значение, записанное нами или
+# пользователем — ни одно легитимное proxy-URL/target-значение не начинается с этой строки.
+_TXN_SENTINEL_PREFIX = "srouter-git-proxy-txn-checksum:"
+
+
+def _txn_sentinel(txn_values):
+    """Self-identifying sentinel для txn-маркера: префикс + sha256(canonical join).
+
+    txn_values — [key, val1, val2, ...] (полный target-список _TXN_KEY). Digest покрывает
+    КАЖДОЕ значение — коллизия требовала бы найти другой список значений с тем же digest,
+    криптографически неосуществимо. NUL-separated join исключает ambiguity типа
+    ["A", "B"] vs ["AB"] (те же байты, разный split).
+
+    Codex cycle-review PR #275 round 2 (confidence 0.99, эмпирически подтверждено): пока
+    sentinel был ПОСЛЕДНИМ ЭЛЕМЕНТОМ ТОГО ЖЕ _TXN_KEY списка, что и target-values, любое
+    target-значение X, случайно/специально равное sentinel(values_before_X), делало
+    partial-маркер [key,...,X] structurally неотличимым от complete (X сам "притворялся"
+    сентинелом своего префикса) — не требует SHA-256 коллизии, просто X == digest своего же
+    предшествующего списка. Кодирование count в саму sentinel-строку НЕ закрывает дыру (count
+    для complete-маркера с X как sentinel совпадает с count для partial-маркера без X — тот
+    же список меньшей длины даёт тот же count). Реальный fix — физическое разделение ключей
+    (_TXN_SENTINEL_KEY, отдельно от _TXN_KEY): sentinel больше не элемент target-списка,
+    поэтому НИКАКОЕ target-значение не может быть спутано с ним.
+    """
+    canonical = "\x00".join(txn_values).encode("utf-8")
+    digest = hashlib.sha256(canonical).hexdigest()
+    return _TXN_SENTINEL_PREFIX + digest
+
+
+def _mutation_lock():
+    """Context-manager cross-process exclusive lock (flock LOCK_EX) вокруг ВСЕЙ enable()/disable()
+    транзакции — issue #234 finding 2 (Codex cycle 2): txn-check, current-state read, backup
+    decision и write НЕ были сериализованы между процессами (CLI + dashboard threaded server).
+    Конкурентные enable/disable могли interleave'иться так, что backup терялся безвозвратно (одна
+    сторона читает stale current ДО того, как другая завершит restore+cleanup backup).
+
+    Эталон — local_state._routing_config_lock (issue #139 finding 2): тот же примитив (adaptive
+    lockfile рядом с управляемым ресурсом, flock блокирующий — вторая операция ждёт, не читает
+    stale snapshot). Lockfile — НЕ ~/.gitconfig (нельзя flock файл, который сам rewrite'ится через
+    `git config`, apply мог бы держать fd на пере-созданном inode) — отдельный sentinel-файл рядом.
+
+    Yield'ит bool `lock_acquired`. Codex cycle-review PR #275 follow-up: недоступность самого
+    lock-примитива (os.open/flock упали — напр. permission, missing HOME, сетевой HOME с
+    ENOTSUP/EIO) означает, что конкурентный доступ к ~/.gitconfig на этой ФС В ПРИНЦИПЕ не
+    сериализуем через flock — тихая деградация "без лока" здесь молча возвращала finding 2
+    (concurrent enable/disable теряет backup безвозвратно), т.к. caller не знал, что мутирует
+    без защиты. Вызывающий код (enable()/disable()) обязан проверить `lock_acquired` и вернуть
+    fail-closed {"ok": False, ...} вместо мутации без сериализации — явный отказ лучше тихой
+    потери данных (канон fail-closed-proxy-down).
+    """
+    lock_p = Path.home() / ".gitconfig.srouter-proxy.lock"
+
+    @contextlib.contextmanager
+    def _cm():
+        try:
+            lock_p.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(lock_p, os.O_CREAT | os.O_RDWR, 0o600)
+        except OSError:
+            # Не можем создать/открыть lock-файл (permission/missing HOME) — caller обязан
+            # отказать fail-closed, а не мутировать без сериализации.
+            yield False
+            return
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)  # блокирует до отпускания другим процессом/потоком
+        except OSError:
+            # Файловая система открыла fd, но не поддерживает flock (напр. сетевой HOME на
+            # macOS -> ENOTSUP/EIO) — та же fail-closed деградация, что при недоступном
+            # lock-файле: без реальной сериализации caller не должен мутировать состояние.
+            os.close(fd)
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(fd)
+
+    return _cm()
+
 
 # Прокси = SOCKS5 xray (10808). Берём из dashboard_common если доступен; fallback на хардкод,
 # чтобы модуль не падал в среде без srouter_config (git_proxy не должен тянуть конфиг инфраструктуры).
@@ -223,52 +341,68 @@ def _begin_txn(key, target_values):
     ВАЖНО: пишем напрямую через sys_probe.run, НЕ _write_values, чтобы txn-маркер
     сам не был обёрнут в ещё одну транзакцию (begin_txn=False не помогает, т.к. _write_values
     с begin_txn=False всё равно может падать, и мы не хотим, чтобы txn begin был обязан perfect).
+
+    Issue #234 round 2: sentinel пишется в ОТДЕЛЬНЫЙ ключ (_TXN_SENTINEL_KEY), не как
+    последний элемент _TXN_KEY — target-values физически не могут быть спутаны с sentinel.
     """
-    # Формат: [key, val1, val2, ...] — первый элемент всегда ключ, остальные значения
+    # Формат _TXN_KEY: [key, val1, val2, ...] — первый элемент всегда ключ, остальные значения
     txn_values = [key] + target_values
 
-    # Сначала чистим _TXN_KEY (если был)
+    # Сначала чистим оба ключа (если были)
     unset = _unset_all(_TXN_KEY)
     if not unset["ok"]:
         return unset
+    unset_sentinel = _unset_all(_TXN_SENTINEL_KEY)
+    if not unset_sentinel["ok"]:
+        return unset_sentinel
 
-    # Пишем каждое значение
+    # Пишем каждое target-значение в _TXN_KEY
     for val in txn_values:
         r = sys_probe.run([GIT, "config", "--global", "--add", _TXN_KEY, val], timeout=5)
         if r.get("timeout") or r.get("rc") != 0:
             return {"ok": False, "err": f"txn begin --add failed: {r.get('err')}"}
 
-    # Issue #224 follow-up (Codex review): пишем checksum последним для детекции
-    # partial write.Checksum = количество значений, которые ДОЛЖНЫ быть в маркере.
-    checksum_val = str(len(txn_values))
-    r_checksum = sys_probe.run([GIT, "config", "--global", "--add", _TXN_KEY, checksum_val], timeout=5)
-    if r_checksum.get("timeout") or r_checksum.get("rc") != 0:
-        return {"ok": False, "err": f"txn checksum write failed: {r_checksum.get('err')}"}
+    # Issue #224 follow-up (Codex review), fixed issue #234 (checksum sentinel collision,
+    # rounds 1+2): sentinel пишется ПОСЛЕДНИМ шагом, в ОТДЕЛЬНЫЙ ключ — детектирует partial
+    # write (_TXN_KEY present, _TXN_SENTINEL_KEY absent = crash до этого шага), и НИКАКОЕ
+    # target-значение в _TXN_KEY не может быть спутано с sentinel (разные git-config записи).
+    sentinel_val = _txn_sentinel(txn_values)
+    r_sentinel = sys_probe.run([GIT, "config", "--global", "--add", _TXN_SENTINEL_KEY, sentinel_val], timeout=5)
+    if r_sentinel.get("timeout") or r_sentinel.get("rc") != 0:
+        return {"ok": False, "err": f"txn sentinel write failed: {r_sentinel.get('err')}"}
 
-    # Verify (включая checksum)
+    # Verify обоих ключей
     after = _get_all(_TXN_KEY)
-    expected_values = txn_values + [checksum_val]
-    if after["unknown"] or after["values"] != expected_values:
+    if after["unknown"] or after["values"] != txn_values:
         return {"ok": False, "err": "txn begin verify failed"}
+    after_sentinel = _get_all(_TXN_SENTINEL_KEY)
+    if after_sentinel["unknown"] or after_sentinel["values"] != [sentinel_val]:
+        return {"ok": False, "err": "txn sentinel verify failed"}
 
     return {"ok": True}
 
 
 def _commit_txn():
-    """Завершить транзакцию успешно: снять _TXN_KEY.
+    """Завершить транзакцию успешно: снять _TXN_KEY и _TXN_SENTINEL_KEY.
 
     Вызывается ТОЛЬКО после подтверждённого успеха (read-after-write verify).
     """
-    return _unset_all(_TXN_KEY)
+    unset = _unset_all(_TXN_KEY)
+    if not unset["ok"]:
+        return unset
+    return _unset_all(_TXN_SENTINEL_KEY)
 
 
 def _rollback_txn():
-    """Откатить транзакцию: снять _TXN_KEY (operation aborted, not committed).
+    """Откатить транзакцию: снять _TXN_KEY и _TXN_SENTINEL_KEY (operation aborted, not committed).
 
     Отличие от _commit_txn: смысловая разница для документации, механически
     одинаково — убираем маркер "операция в процессе".
     """
-    return _unset_all(_TXN_KEY)
+    unset = _unset_all(_TXN_KEY)
+    if not unset["ok"]:
+        return unset
+    return _unset_all(_TXN_SENTINEL_KEY)
 
 
 def _check_and_resolve_txn():
@@ -290,22 +424,42 @@ def _check_and_resolve_txn():
         return {"ok": True, "resolved": False}  # Нет незавершённой транзакции — норма
 
     # Транзакция в процессе — доводим до конца
-    # Формат: [key, val1, val2, ..., checksum] — checksum последний элемент
-    if len(txn["values"]) < 3:  # минимум: [key, one_value, checksum]
+    # Формат _TXN_KEY: [key, val1, val2, ...] (БЕЗ sentinel — issue #234 round 2: sentinel
+    # живёт в ОТДЕЛЬНОМ _TXN_SENTINEL_KEY, поэтому НИКАКОЕ target-значение здесь не может
+    # быть спутано с sentinel).
+    if len(txn["values"]) < 2:  # минимум: [key, one_value]
         # Некорректный формат txn-маркера — убираем и ругаемся (fail-closed)
         _unset_all(_TXN_KEY)
-        return {"ok": False, "err": "corrupt txn marker (less than 3 values with checksum)", "resolved": False}
+        _unset_all(_TXN_SENTINEL_KEY)
+        return {"ok": False, "err": "corrupt txn marker (less than 2 values in _TXN_KEY)", "resolved": False}
 
-    # Проверяем checksum: последний элемент = str(len(expected_values))
-    expected_count = int(txn["values"][-1])
-    actual_values = txn["values"][:-1]  # без checksum
-    if len(actual_values) != expected_count:
-        # Checksum не совпадает — маркер частично записан, убираем (fail-closed)
+    # Issue #234 round 2: sentinel читается из ОТДЕЛЬНОГО ключа и сравнивается с digest
+    # полного _TXN_KEY списка. Partial write (crash между записью target-values и sentinel)
+    # оставляет _TXN_SENTINEL_KEY absent или mismatched — fail-closed отклоняем.
+    sentinel_state = _get_all(_TXN_SENTINEL_KEY)
+
+    # Issue #234 round 3 (Codex xhigh, confidence 0.99, эмпирически подтверждено): transient
+    # read failure (timeout/permission-race — unknown=True) на _TXN_SENTINEL_KEY НЕ ЗНАЧИТ
+    # "sentinel отсутствует/не совпадает" (permanent corruption) — это ДРУГОЙ случай, тот же,
+    # что уже корректно обрабатывается для txn["unknown"] выше: вернуть ошибку БЕЗ мутации,
+    # чтобы следующий вызов мог повторить чтение на рабочем соединении. Смешение этих двух
+    # случаев (было: unknown ИЛИ absent ИЛИ mismatch → один и тот же _unset_all) превращало
+    # единичный transient сбой в permanent data loss — валидный in-flight маркер удалялся
+    # НАВСЕГДА, следующий enable()/disable() видел current как "новое foreign состояние" и
+    # перезаписывал backup, теряя всё, что было после уже частично восстановленного префикса.
+    if sentinel_state["unknown"]:
+        return {"ok": False, "err": "git config --get-all txn sentinel check failed", "resolved": False}
+
+    expected_sentinel = _txn_sentinel(txn["values"])
+    if not sentinel_state["present"] or sentinel_state["values"] != [expected_sentinel]:
+        # Sentinel ДЕЙСТВИТЕЛЬНО отсутствует/не совпадает (не transient read failure) — маркер
+        # частично записан, убираем (fail-closed).
         _unset_all(_TXN_KEY)
-        return {"ok": False, "err": f"txn marker partial write: expected {expected_count} values, got {len(actual_values)}", "resolved": True}
+        _unset_all(_TXN_SENTINEL_KEY)
+        return {"ok": False, "err": "txn marker partial write: sentinel mismatch or missing", "resolved": True}
 
     target_key = txn["values"][0]
-    target_values = txn["values"][1:-1]  # всё кроме ключа и checksum
+    target_values = txn["values"][1:]  # всё кроме ключа (sentinel — в отдельном ключе)
 
     # Retry: пишем target_values в target_key с verify БЕЗ создания нового txn-маркера
     w = _write_values(target_key, target_values, begin_txn=False)
@@ -335,7 +489,21 @@ def enable():
     Идемпотентно: если текущее значение уже == наш _PROXY (повторный install), backup не трогаем.
 
     Issue #224: в начале проверяем и доводим до конец любую незавершённую транзакцию.
+
+    Issue #234 finding 2: вся транзакция (txn-check + current-read + backup-decision + write)
+    выполняется под cross-process exclusive lock (_mutation_lock) — конкурентный disable() не
+    может interleave'иться между read и write этой функции. Если лок физически недоступен
+    (flock unsupported/permission) — fail-closed, НЕ мутируем без сериализации (Codex
+    cycle-review PR #275 follow-up).
     """
+    with _mutation_lock() as lock_acquired:
+        if not lock_acquired:
+            return {"ok": False, "err": "cross-process lock unavailable — refusing unsynchronized mutation"}
+        return _enable_locked()
+
+
+def _enable_locked():
+    """Тело enable() — вызывается ТОЛЬКО под _mutation_lock() (issue #234 finding 2)."""
     # Issue #224: итеративно проверяем и доводим до конца незавершённые транзакции
     # (максимум 1 итерация: после resolved txn проверка снова даст resolved=False)
     for _ in range(2):
@@ -434,7 +602,20 @@ def disable():
     в fail-closed ветку и повторяет restore.
 
     Issue #224: в начале проверяем и доводим до конец любую незавершённую транзакцию.
+
+    Issue #234 finding 2: вся транзакция выполняется под cross-process exclusive lock
+    (_mutation_lock) — конкурентный enable() не может interleave'иться между read и write.
+    Если лок физически недоступен (flock unsupported/permission) — fail-closed, НЕ мутируем
+    без сериализации (Codex cycle-review PR #275 follow-up).
     """
+    with _mutation_lock() as lock_acquired:
+        if not lock_acquired:
+            return {"ok": False, "err": "cross-process lock unavailable — refusing unsynchronized mutation"}
+        return _disable_locked()
+
+
+def _disable_locked():
+    """Тело disable() — вызывается ТОЛЬКО под _mutation_lock() (issue #234 finding 2)."""
     # Issue #224: итеративно проверяем и доводим до конца незавершённые транзакции
     # (максимум 1 итерация: после resolved txn проверка снова даст resolved=False)
     for _ in range(2):

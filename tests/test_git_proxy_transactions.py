@@ -282,35 +282,33 @@ def test_transactional_marker_cleared_only_after_verified_success(monkeypatch, r
 
 def test_partial_txn_marked_checksum_rejected_as_corrupt(monkeypatch, real_git_home):
     """Regression (Codex review issue #224): если _begin_txn частично записал txn-маркер
-    (только [KEY, A] из ожидаемых [KEY, A, B, C, checksum]), recovery должен НЕ принимать
-    этот маркер как валидный и не должен replay'ить частичный target.
+    (target-values в _TXN_KEY, но sentinel в _TXN_SENTINEL_KEY не записан), recovery должен
+    НЕ принимать этот маркер как валидный и не должен replay'ить частичный target.
 
-    Сценарий: enable() с multi-value foreign-состоянием [A,B,C].
-    1. _begin_txn для [A,B,C] падает после записи [KEY, A] (checksum не записан).
-    2. Следующий enable() видит txn-маркер [KEY, A] без checksum.
-    3. Recovery должен ОТКЛОНИТЬ этот маркер как partial/corrupt, а не replay'ить [A]
-       как новый target (что потеряло бы B,C из backup).
+    Сценарий: enable() с multi-value foreign-состоянием [A,B,C] (target для _begin_txn — сам
+    managed [_PROXY], backup хранит [A,B,C] отдельно).
+    1. _begin_txn для [_PROXY] падает при записи sentinel в _TXN_SENTINEL_KEY (target-values в
+       _TXN_KEY уже записаны).
+    2. Следующий enable() видит _TXN_KEY present, но _TXN_SENTINEL_KEY absent.
+    3. Recovery должен ОТКЛОНИТЬ этот маркер как partial/corrupt (issue #234 round 2:
+       sentinel в отдельном ключе — его отсутствие однозначно значит partial write, никакого
+       target-значения, которое могло бы "притвориться" sentinel, здесь физически нет).
 
-    Codex review показал: current implementation accepts any marker with len >= 2 as valid,
-    что приводит к потере данных при partial write.
+    Codex review (issue #224) показал: старая реализация принимала любой маркер с len >= 2
+    как валидный, что приводило к потере данных при partial write.
     """
     _raw_set_add(git_proxy.KEY, "A", real_git_home)
     _raw_set_add(git_proxy.KEY, "B", real_git_home)
     _raw_set_add(git_proxy.KEY, "C", real_git_home)
     real_run = sys_probe.run
 
-    call_count = {"begin_add": 0}
-
-    def _fail_begin_checksum_write(cmd, **kwargs):
-        # Роняем запись checksum в _begin_txn (последний --add)
-        if "--add" in cmd and git_proxy._TXN_KEY in cmd:
-            call_count["begin_add"] += 1
-            # Падаем на третьем --add (_TXN_KEY): [KEY, A, B] прошли, checksum упал
-            if call_count["begin_add"] == 3:
-                return {"rc": 1, "out": "", "err": "simulated checksum write failure", "timeout": False}
+    def _fail_sentinel_write(cmd, **kwargs):
+        # Роняем запись sentinel в _begin_txn (issue #234 round 2: отдельный _TXN_SENTINEL_KEY)
+        if "--add" in cmd and git_proxy._TXN_SENTINEL_KEY in cmd:
+            return {"rc": 1, "out": "", "err": "simulated sentinel write failure", "timeout": False}
         return real_run(cmd, **kwargs)
 
-    monkeypatch.setattr(git_proxy.sys_probe, "run", _fail_begin_checksum_write)
+    monkeypatch.setattr(git_proxy.sys_probe, "run", _fail_sentinel_write)
 
     r = git_proxy.enable()
 
