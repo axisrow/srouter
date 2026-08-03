@@ -196,3 +196,32 @@ def test_concurrent_enable_and_disable_do_not_lose_backup_deterministic(monkeypa
         f"[A,B] потерян безвозвратно из-за неcериализованной гонки: "
         f"KEY={final_key}, BACKUP={final_backup}, results={results}"
     )
+
+
+# ==================== Post-review follow-up: flock acquisition errors ====================
+# Codex cycle-review PR #275 (issue #234 follow-up), P2: _mutation_lock открывал lock-файл
+# успешно (os.open), но fcntl.flock(fd, LOCK_EX) мог бросить OSError отдельно (напр. сетевой
+# HOME на macOS -> ENOTSUP/EIO) -- это НЕ было поймано, enable()/disable() убегали с исключением
+# вместо документированного result-словаря, dashboard-запрос падал в HTTP 500.
+
+def test_flock_acquisition_error_degrades_instead_of_raising(monkeypatch, real_git_home):
+    """fcntl.flock бросает OSError на LOCK_EX (fd открылся, но ФС не поддерживает advisory-lock).
+    enable() должен деградировать без lock (best-effort), а не пробрасывать исключение наружу."""
+    import fcntl
+
+    real_flock = fcntl.flock
+
+    def _flock_raises(fd, operation):
+        if operation == fcntl.LOCK_EX:
+            raise OSError("simulated ENOTSUP: flock not supported on this filesystem")
+        return real_flock(fd, operation)
+
+    monkeypatch.setattr(git_proxy.fcntl, "flock", _flock_raises)
+
+    result = git_proxy.enable()
+
+    assert isinstance(result, dict), "enable() обязан вернуть result-словарь, не бросить исключение"
+    assert result["ok"] is True, f"enable() должен успешно завершиться без lock: {result}"
+
+    current = git_proxy._get_all(git_proxy.KEY)
+    assert current["values"] == [EXPECTED_GIT_PROXY]

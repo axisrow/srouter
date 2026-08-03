@@ -51,8 +51,11 @@ core transactional-логики (threading/serialization и cross-process coordi
    эталон local_state._routing_config_lock issue #139) оборачивает ВСЮ enable()/disable()
    транзакцию — вторая операция блокируется до полного завершения первой, не читает stale snapshot.
 """
+import contextlib
+import fcntl
 import hashlib
 import os
+from pathlib import Path
 
 import sys_probe
 
@@ -98,10 +101,6 @@ def _mutation_lock():
     stale snapshot). Lockfile — НЕ ~/.gitconfig (нельзя flock файл, который сам rewrite'ится через
     `git config`, apply мог бы держать fd на пере-созданном inode) — отдельный sentinel-файл рядом.
     """
-    import contextlib
-    import fcntl
-    from pathlib import Path
-
     lock_p = Path.home() / ".gitconfig.srouter-proxy.lock"
 
     @contextlib.contextmanager
@@ -116,6 +115,15 @@ def _mutation_lock():
             return
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)  # блокирует до отпускания другим процессом/потоком
+        except OSError:
+            # Файловая система открыла fd, но не поддерживает flock (напр. сетевой HOME на
+            # macOS -> ENOTSUP/EIO). Та же деградация, что при недоступном lock-файле: не
+            # блокируем enable()/disable() исключением (issue #234 cycle-review follow-up) —
+            # без advisory-lock (best-effort сериализация), а не HTTP 500 из dashboard.
+            os.close(fd)
+            yield
+            return
+        try:
             yield
         finally:
             try:
