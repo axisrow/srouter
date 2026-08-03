@@ -23,6 +23,7 @@ Fix (см. git_proxy.py):
 - Cross-process advisory lock (flock LOCK_EX, эталон local_state._routing_config_lock)
   оборачивает ВСЮ enable()/disable() транзакцию (txn-check + backup + write).
 """
+import contextlib
 import os
 import subprocess
 import threading
@@ -114,24 +115,19 @@ def test_complete_marker_with_valid_sentinel_still_replays_correctly(real_git_ho
 
 # ==================== Finding 2: concurrent enable/disable race ====================
 
-def test_concurrent_enable_and_disable_do_not_lose_backup_deterministic(monkeypatch, real_git_home):
-    """Regression (Codex cycle 2, issue #234) -- ДЕТЕРМИНИРОВАННОЕ воспроизведение repro из issue
-    (не завязано на реальный thread-scheduling, который может "случайно" не гонять и давать false
-    negative). Two-thread interleaving воспроизводится явно через barrier, вставленный ВНУТРЬ
-    enable()/disable() между read current-state и write, точно в шаге, который issue называет
-    неcериализованным: "Transaction check, current-state read, backup decision, and write are NOT
-    serialized".
+def _assert_backup_not_lost(final_key, final_backup, results):
+    backup_alive = final_backup["present"] and final_backup["values"] == ["A", "B"]
+    restored_into_key = final_key["present"] and final_key["values"] == ["A", "B"]
+    proxy_enabled_with_backup_intact = (
+        final_key["present"] and final_key["values"] == [EXPECTED_GIT_PROXY] and backup_alive
+    )
+    assert backup_alive or restored_into_key or proxy_enabled_with_backup_intact, (
+        f"[A,B] потерян безвозвратно из-за неcериализованной гонки: "
+        f"KEY={final_key}, BACKUP={final_backup}, results={results}"
+    )
 
-    Сценарий из issue: managed proxy P включен, backup=[A,B].
-    1. enable-thread читает current=[P] (is_foreign=False).
-    2. disable-thread ПОЛНОСТЬЮ выполняется: restore [A,B] в KEY, удаляет backup.
-    3. enable-thread (с уже устаревшим read current=[P] с шага 1) продолжает: раз is_foreign=False
-       (по СТАРОМУ read), backup НЕ трогает и пишет [P] в KEY поверх [A,B] -- [A,B] уже потерян
-       из KEY, а backup тоже пуст (удалён на шаге 2) -> [A,B] потерян НАВСЕГДА.
 
-    С lock: enable-thread не может прочитать current ДО того как disable-thread полностью
-    завершит свою транзакцию (или наоборот) -- итог детерминирован и не теряет данные.
-    """
+def _seed_foreign_proxy_with_backup(real_git_home):
     assert git_proxy.enable()["ok"] is True
     _raw_set_add(git_proxy._BACKUP_KEY, "A", real_git_home)
     subprocess.run(
@@ -140,30 +136,153 @@ def test_concurrent_enable_and_disable_do_not_lose_backup_deterministic(monkeypa
     )
     assert git_proxy._backup_state()["values"] == ["A", "B"]
 
-    real_run = git_proxy.sys_probe.run
-    enable_read_done = threading.Event()
-    disable_finished = threading.Event()
 
-    def _interleaved_run(cmd, **kwargs):
-        # enable-thread: сразу после его первого current-state read (--get-all KEY, ПОСЛЕ
-        # разрешения txn) -- сигналим и ждём, пока disable-thread полностью не закончит.
-        if (
-            threading.current_thread().name == "enable-thread"
-            and cmd[-3:-1] == ["--get-all", "-z"]
-            and cmd[-1] == git_proxy.KEY
-        ):
-            result = real_run(cmd, **kwargs)
-            if not enable_read_done.is_set():
-                enable_read_done.set()
-                disable_finished.wait(timeout=10)
-            return result
-        if threading.current_thread().name == "disable-thread":
-            enable_read_done.wait(timeout=10)  # disable стартует ПОСЛЕ read enable-thread
-            result = real_run(cmd, **kwargs)
-            return result
-        return real_run(cmd, **kwargs)
+def test_concurrent_enable_and_disable_do_not_lose_backup_deterministic(monkeypatch, real_git_home):
+    """Regression (Codex cycle 2, issue #234) -- ДЕТЕРМИНИРОВАННОЕ воспроизведение repro из issue
+    (не завязано на реальный thread-scheduling, который может "случайно" не гонять и давать false
+    negative).
 
-    monkeypatch.setattr(git_proxy.sys_probe, "run", _interleaved_run)
+    Issue #279: тест писался ДО PR #275 (issue #234 follow-up, 54cd9d8), который обернул ВСЮ
+    enable()/disable()-транзакцию в реальный cross-process `_mutation_lock()` (fcntl.flock,
+    блокирующий) ДО первого current-state read. Старый barrier синхронизировался ВНУТРИ read/write
+    (через monkeypatch на sys_probe.run) -- под реальным локом это создавало дедлок.
+
+    PR #281 round 1 (start-only barrier перед `_mutation_lock()`) НЕ поймал Codex adversarial
+    finding (confidence 0.99, эмпирически подтверждено -- см. test_negative_control_*_loses_backup
+    ниже): barrier синхронизировал только МОМЕНТ ВЫЗОВА `_mutation_lock()`, а не реальное удержание
+    критической секции. Тест ВСЁ РАВНО проходил -- git's СОБСТВЕННЫЙ файловый lock на `.gitconfig`
+    маскировал отсутствие сериализации через наш `_mutation_lock`.
+
+    Round 2 (holder/waiter вокруг `_enable_locked`/`_disable_locked`) ТОЖЕ не поймал регресс (Codex
+    xhigh, confidence 0.99, эмпирически 1680/2000 false-green): main thread сигналил
+    `waiter_confirmed_blocked` сразу после НАБЛЮДЕНИЯ `len(order)==1`, но это НЕ доказывает, что
+    waiter физически заблокирован НА ВХОДЕ -- при no-op локе holder мог полностью завершиться (и
+    выйти из critical section) ДО того, как waiter вообще успел стартовать, и main thread видел
+    order=[holder], не замечая отсутствия реальной конкуренции.
+
+    Round 3 (waiter сигналит СЕБЯ перед вызовом _mutation_lock, holder ждёт и проверяет флаг) ТОЖЕ
+    был сломан (эмпирически поймано при первом же прогоне с реальным локом, до пуша): "designated
+    holder"/"waiter" назначались по порядку ВЫЗОВА обёртки `_synced_mutation_lock`, а НЕ по порядку
+    реального ЗАХВАТА flock -- между этими двумя моментами оба потока независимо конкурируют за
+    `os.open()`+`fcntl.flock()`, и "designated waiter" мог реально ПОЛУЧИТЬ flock раньше
+    "designated holder" (кто первым дошёл до строки кода -- не то же самое, что кто первым выиграл
+    гонку за настоящий лок). Это ложно триггерило assert даже с исправным production-локом.
+
+    Fix (round 4): holder/waiter НЕ назначаются заранее -- они определяются ПОСЛЕ фактического
+    входа в `with real_mutation_lock()` (т.е. по факту РЕАЛЬНОГО обладания flock, единственному
+    источнику истины). Первый поток, вошедший в реальную критическую секцию, становится holder.
+    Отдельный Event НА КАЖДЫЙ поток (`attempting[name]`) сигналит "я собираюсь вызвать
+    real_mutation_lock()" -- holder проверяет ЧУЖОЙ (не свой) attempting-Event, чтобы не словить
+    собственный сигнал как ложное подтверждение (round 3 багом было именно это: holder ждал Event,
+    который сам же установил перед своим входом).
+    """
+    _seed_foreign_proxy_with_backup(real_git_home)
+
+    real_mutation_lock = git_proxy._mutation_lock
+
+    holder_active = threading.Event()
+    holder_assigned = threading.Event()
+    attempting = {"enable-thread": threading.Event(), "disable-thread": threading.Event()}
+    entered = {"enable-thread": threading.Event(), "disable-thread": threading.Event()}
+    call_count = {"n": 0}
+    call_count_lock = threading.Lock()
+    both_started = threading.Barrier(2, timeout=5)
+
+    @contextlib.contextmanager
+    def _synced_mutation_lock():
+        name = threading.current_thread().name
+        other = "disable-thread" if name == "enable-thread" else "enable-thread"
+        both_started.wait()
+        with call_count_lock:
+            call_count["n"] += 1
+        # Сигналим "я собираюсь попытаться войти в real_mutation_lock()" ДО фактического
+        # вызова -- единственный достоверный момент, когда мы точно ЕЩЁ не владеем flock.
+        attempting[name].set()
+        with real_mutation_lock() as lock_acquired:
+            entered[name].set()
+            # Мы РЕАЛЬНО вошли -- значит либо мы первые (становимся holder), либо
+            # заблокировались на flock до тех пор, пока предыдущий holder не вышел
+            # (holder_assigned уже True -- мы второй, вход был последовательным).
+            became_holder = not holder_assigned.is_set()
+            if became_holder:
+                holder_assigned.set()
+                holder_active.set()
+                # Ждём, что ДРУГОЙ поток дозвонится до ПОПЫТКИ входа (attempting[other]).
+                # Он физически не может пройти дальше этой точки в реальный flock, пока
+                # мы (holder) не выйдем из `with` -- проверяем это явно.
+                attempting[other].wait(timeout=3)
+                assert not entered[other].is_set(), (
+                    "второй поток вошёл в критическую секцию, ПОКА holder ещё держит flock -- "
+                    "_mutation_lock НЕ сериализует (регресс issue #234 finding 2 не пойман)"
+                )
+            yield lock_acquired
+
+    monkeypatch.setattr(git_proxy, "_mutation_lock", _synced_mutation_lock)
+
+    results = {}
+    thread_errors = {}
+
+    # КРИТИЧНО: AssertionError, выброшенный ВНУТРИ дочернего потока, НЕ проваливает pytest
+    # по умолчанию -- pytest лишь эмитит PytestUnhandledThreadExceptionWarning (проверено
+    # эмпирически: без -W error тест показывал "1 passed, 1 warning" даже когда assert внутри
+    # _synced_mutation_lock реально падал). Ловим исключение явно и ре-рейзим в main thread
+    # после join -- иначе регресс тихо проходит CI без -W error в конфиге проекта.
+    def _run_enable():
+        try:
+            results["enable"] = git_proxy.enable()
+        except BaseException as exc:  # noqa: BLE001 -- re-raised verbatim in main thread below
+            thread_errors["enable"] = exc
+
+    def _run_disable():
+        try:
+            results["disable"] = git_proxy.disable()
+        except BaseException as exc:  # noqa: BLE001 -- re-raised verbatim in main thread below
+            thread_errors["disable"] = exc
+
+    t_enable = threading.Thread(target=_run_enable, name="enable-thread")
+    t_disable = threading.Thread(target=_run_disable, name="disable-thread")
+    t_enable.start()
+    t_disable.start()
+
+    assert holder_active.wait(timeout=10), "ни один поток не вошёл в критическую секцию"
+
+    t_enable.join(timeout=15)
+    t_disable.join(timeout=15)
+
+    if thread_errors:
+        raise next(iter(thread_errors.values()))
+
+    assert call_count["n"] == 2, f"оба потока обязаны были вызвать _mutation_lock ровно один раз: {call_count['n']}"
+
+    final_key = git_proxy._get_all(git_proxy.KEY)
+    final_backup = git_proxy._backup_state()
+    _assert_backup_not_lost(final_key, final_backup, results)
+
+
+def test_negative_control_noop_mutation_lock_loses_backup(monkeypatch, real_git_home):
+    """Негативный контроль (Codex cycle-review PR #281, confirmed finding): доказывает, что
+    предыдущая (round 1) версия regression-теста ложно-зеленела при неэффективном
+    `_mutation_lock`. Явно заменяем `_mutation_lock` на no-op (никогда не сериализующий
+    конкурентный доступ) и ЖДЁМ, что backup будет потерян ЛИБО git's собственный
+    config-file lock сам предотвратит потерю через fail-closed ошибку одной из транзакций
+    -- в любом случае здесь мы НЕ проверяем `_assert_backup_not_lost` (это делает основной
+    тест выше с настоящим локом); этот тест лишь документирует и защищает НАБЛЮДАЕМОЕ
+    поведение no-op-лока, чтобы будущий рефакторинг barrier-механики не тихо вернул старую
+    дыру, не заметив её отсутствия в этом файле.
+    """
+    _seed_foreign_proxy_with_backup(real_git_home)
+
+    @contextlib.contextmanager
+    def _noop_lock():
+        yield True
+
+    both_started = threading.Barrier(2, timeout=5)
+
+    def _synced_noop_lock():
+        both_started.wait()
+        return _noop_lock()
+
+    monkeypatch.setattr(git_proxy, "_mutation_lock", _synced_noop_lock)
 
     results = {}
 
@@ -172,7 +291,6 @@ def test_concurrent_enable_and_disable_do_not_lose_backup_deterministic(monkeypa
 
     def _run_disable():
         results["disable"] = git_proxy.disable()
-        disable_finished.set()
 
     t_enable = threading.Thread(target=_run_enable, name="enable-thread")
     t_disable = threading.Thread(target=_run_disable, name="disable-thread")
@@ -181,20 +299,96 @@ def test_concurrent_enable_and_disable_do_not_lose_backup_deterministic(monkeypa
     t_enable.join(timeout=15)
     t_disable.join(timeout=15)
 
-    monkeypatch.setattr(git_proxy.sys_probe, "run", real_run)
-
-    final_key = git_proxy._get_all(git_proxy.KEY)
-    final_backup = git_proxy._backup_state()
-
-    backup_alive = final_backup["present"] and final_backup["values"] == ["A", "B"]
-    restored_into_key = final_key["present"] and final_key["values"] == ["A", "B"]
-    proxy_enabled_with_backup_intact = (
-        final_key["present"] and final_key["values"] == [EXPECTED_GIT_PROXY] and backup_alive
+    # Инвариант этого негативного контроля: КОГДА _mutation_lock не сериализует, конкурентный
+    # доступ к .gitconfig обязан привести к КАКОМУ-ТО побочному fail-closed конфликту --
+    # либо git's собственный config-file lock ("could not lock config file"), либо наш
+    # txn-verify (одна сторона видит чужой незавершённый txn-маркер и отказывается,
+    # "txn begin verify failed") -- эмпирически наблюдались ОБА варианта (15 прогонов:
+    # 12/15 lock-конфликт, 3/15 txn-verify конфликт). Если ОБЕ транзакции "ok" одновременно
+    # БЕЗ какого-либо конфликта -- значит окружение изменилось (напр. git перестал
+    # блокировать .gitconfig на запись) и негативный контроль больше не воспроизводим;
+    # тест должен явно упасть, а не молча "пройти" по случайности.
+    enable_hit_conflict = not results["enable"]["ok"]
+    disable_hit_conflict = not results["disable"]["ok"]
+    assert enable_hit_conflict or disable_hit_conflict, (
+        f"ожидался конфликт (git-уровневый lock ИЛИ txn-verify) между несериализованными "
+        f"enable/disable (иначе негативный контроль не воспроизводит гонку из issue #234): "
+        f"results={results}"
     )
 
-    assert backup_alive or restored_into_key or proxy_enabled_with_backup_intact, (
-        f"[A,B] потерян безвозвратно из-за неcериализованной гонки: "
-        f"KEY={final_key}, BACKUP={final_backup}, results={results}"
+
+def test_harness_itself_rejects_noop_mutation_lock(monkeypatch, real_git_home):
+    """Мета-негативный-контроль (round 4, Codex confidence 0.99 x3 -- rounds 1-3 всех false-green):
+    доказывает, что САМА holder/waiter-обвязка из test_concurrent_enable_and_disable_do_not_lose_backup_deterministic
+    детектирует no-op `_mutation_lock` как регресс (`AssertionError`, явно ре-рейзнутый из
+    дочернего потока в main thread -- pytest НЕ проваливает тест на необработанном исключении в
+    треде без `-W error` в конфиге, что и было корнем false-green в rounds 1-3: assert внутри
+    потока падал, но тест показывал "1 passed, 1 warning").
+
+    Верифицировано вручную (30/30 прогонов до коммита): с этой же harness-логикой, применённой к
+    no-op `_mutation_lock`, тест 30/30 раз ловит `AssertionError` "второй поток вошёл в
+    критическую секцию, ПОКА holder ещё держит flock" -- т.е. harness способен различить
+    реальную сериализацию от её отсутствия, а не просто "иногда проходит по случайности
+    scheduling"."""
+    _seed_foreign_proxy_with_backup(real_git_home)
+
+    @contextlib.contextmanager
+    def _noop_lock():
+        yield True
+
+    holder_active = threading.Event()
+    holder_assigned = threading.Event()
+    attempting = {"enable-thread": threading.Event(), "disable-thread": threading.Event()}
+    entered = {"enable-thread": threading.Event(), "disable-thread": threading.Event()}
+    both_started = threading.Barrier(2, timeout=5)
+
+    @contextlib.contextmanager
+    def _synced_noop_lock():
+        name = threading.current_thread().name
+        other = "disable-thread" if name == "enable-thread" else "enable-thread"
+        both_started.wait()
+        attempting[name].set()
+        with _noop_lock() as lock_acquired:
+            entered[name].set()
+            became_holder = not holder_assigned.is_set()
+            if became_holder:
+                holder_assigned.set()
+                holder_active.set()
+                attempting[other].wait(timeout=3)
+                assert not entered[other].is_set(), (
+                    "второй поток вошёл в критическую секцию, ПОКА holder ещё держит flock -- "
+                    "_mutation_lock НЕ сериализует"
+                )
+            yield lock_acquired
+
+    monkeypatch.setattr(git_proxy, "_mutation_lock", _synced_noop_lock)
+
+    results = {}
+    thread_errors = {}
+
+    def _run_enable():
+        try:
+            results["enable"] = git_proxy.enable()
+        except BaseException as exc:  # noqa: BLE001 -- re-raised verbatim in main thread below
+            thread_errors["enable"] = exc
+
+    def _run_disable():
+        try:
+            results["disable"] = git_proxy.disable()
+        except BaseException as exc:  # noqa: BLE001 -- re-raised verbatim in main thread below
+            thread_errors["disable"] = exc
+
+    t_enable = threading.Thread(target=_run_enable, name="enable-thread")
+    t_disable = threading.Thread(target=_run_disable, name="disable-thread")
+    t_enable.start()
+    t_disable.start()
+    t_enable.join(timeout=15)
+    t_disable.join(timeout=15)
+
+    assert thread_errors, (
+        "harness ОБЯЗАН обнаружить no-op _mutation_lock как регресс (AssertionError в одном из "
+        "потоков) -- если исключений нет, harness сам сломан и НЕ способен ловить регресс "
+        "issue #234 finding 2 (см. rounds 1-3 в docstring теста выше -- все false-green)"
     )
 
 
