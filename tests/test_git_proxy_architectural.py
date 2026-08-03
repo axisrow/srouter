@@ -117,20 +117,26 @@ def test_complete_marker_with_valid_sentinel_still_replays_correctly(real_git_ho
 def test_concurrent_enable_and_disable_do_not_lose_backup_deterministic(monkeypatch, real_git_home):
     """Regression (Codex cycle 2, issue #234) -- ДЕТЕРМИНИРОВАННОЕ воспроизведение repro из issue
     (не завязано на реальный thread-scheduling, который может "случайно" не гонять и давать false
-    negative). Two-thread interleaving воспроизводится явно через barrier, вставленный ВНУТРЬ
-    enable()/disable() между read current-state и write, точно в шаге, который issue называет
-    неcериализованным: "Transaction check, current-state read, backup decision, and write are NOT
-    serialized".
+    negative).
 
-    Сценарий из issue: managed proxy P включен, backup=[A,B].
-    1. enable-thread читает current=[P] (is_foreign=False).
-    2. disable-thread ПОЛНОСТЬЮ выполняется: restore [A,B] в KEY, удаляет backup.
-    3. enable-thread (с уже устаревшим read current=[P] с шага 1) продолжает: раз is_foreign=False
-       (по СТАРОМУ read), backup НЕ трогает и пишет [P] в KEY поверх [A,B] -- [A,B] уже потерян
-       из KEY, а backup тоже пуст (удалён на шаге 2) -> [A,B] потерян НАВСЕГДА.
+    Issue #279: тест писался ДО PR #275 (issue #234 follow-up, 54cd9d8), который обернул ВСЮ
+    enable()/disable()-транзакцию в реальный cross-process `_mutation_lock()` (fcntl.flock,
+    блокирующий) ДО первого current-state read. Старый barrier синхронизировался ВНУТРИ read/write
+    (через monkeypatch на sys_probe.run) -- под реальным локом это создавало дедлок: enable-thread
+    держит flock и ждёт `disable_finished`, а disable-thread физически не может дойти до своего
+    первого sys_probe.run()-вызова (и просигналить `disable_finished`), пока не получит тот же
+    flock, который занят enable-thread. Разрешалось только по wait(timeout=10) -- 10.5s balласт
+    на каждый прогон.
 
-    С lock: enable-thread не может прочитать current ДО того как disable-thread полностью
-    завершит свою транзакцию (или наоборот) -- итог детерминирован и не теряет данные.
+    Fix: barrier синхронизирует СТАРТ обоих потоков ПЕРЕД входом в _mutation_lock() (гарантирует,
+    что оба потока реально конкурируют за лок, а не гоняются по чистой случайности планировщика),
+    а не interleaving ВНУТРИ locked-тела. Реальный flock после этого сериализует транзакции сам --
+    именно это и есть проверяемый инвариант (issue #234 finding 2), никакого искусственного
+    ожидания под локом не требуется.
+
+    Сценарий: managed proxy P включен, backup=[A,B]. Оба потока стартуют одновременно и конкурируют
+    за _mutation_lock; какой бы порядок flock ни выбрал, каждая транзакция видит консистентный
+    read/write без interleaving -- backup не теряется НИ В ОДНОМ порядке выполнения.
     """
     assert git_proxy.enable()["ok"] is True
     _raw_set_add(git_proxy._BACKUP_KEY, "A", real_git_home)
@@ -140,30 +146,17 @@ def test_concurrent_enable_and_disable_do_not_lose_backup_deterministic(monkeypa
     )
     assert git_proxy._backup_state()["values"] == ["A", "B"]
 
-    real_run = git_proxy.sys_probe.run
-    enable_read_done = threading.Event()
-    disable_finished = threading.Event()
+    real_mutation_lock = git_proxy._mutation_lock
+    both_started = threading.Barrier(2, timeout=5)
 
-    def _interleaved_run(cmd, **kwargs):
-        # enable-thread: сразу после его первого current-state read (--get-all KEY, ПОСЛЕ
-        # разрешения txn) -- сигналим и ждём, пока disable-thread полностью не закончит.
-        if (
-            threading.current_thread().name == "enable-thread"
-            and cmd[-3:-1] == ["--get-all", "-z"]
-            and cmd[-1] == git_proxy.KEY
-        ):
-            result = real_run(cmd, **kwargs)
-            if not enable_read_done.is_set():
-                enable_read_done.set()
-                disable_finished.wait(timeout=10)
-            return result
-        if threading.current_thread().name == "disable-thread":
-            enable_read_done.wait(timeout=10)  # disable стартует ПОСЛЕ read enable-thread
-            result = real_run(cmd, **kwargs)
-            return result
-        return real_run(cmd, **kwargs)
+    def _synced_mutation_lock():
+        # Гарантируем, что оба потока реально стартуют одновременно и конкурируют за flock --
+        # без этого один поток мог бы полностью завершиться до старта второго (false negative
+        # на быстрой машине), не воспроизводя ситуацию из issue #234 вовсе.
+        both_started.wait()
+        return real_mutation_lock()
 
-    monkeypatch.setattr(git_proxy.sys_probe, "run", _interleaved_run)
+    monkeypatch.setattr(git_proxy, "_mutation_lock", _synced_mutation_lock)
 
     results = {}
 
@@ -172,7 +165,6 @@ def test_concurrent_enable_and_disable_do_not_lose_backup_deterministic(monkeypa
 
     def _run_disable():
         results["disable"] = git_proxy.disable()
-        disable_finished.set()
 
     t_enable = threading.Thread(target=_run_enable, name="enable-thread")
     t_disable = threading.Thread(target=_run_disable, name="disable-thread")
@@ -181,7 +173,7 @@ def test_concurrent_enable_and_disable_do_not_lose_backup_deterministic(monkeypa
     t_enable.join(timeout=15)
     t_disable.join(timeout=15)
 
-    monkeypatch.setattr(git_proxy.sys_probe, "run", real_run)
+    monkeypatch.setattr(git_proxy, "_mutation_lock", real_mutation_lock)
 
     final_key = git_proxy._get_all(git_proxy.KEY)
     final_backup = git_proxy._backup_state()
