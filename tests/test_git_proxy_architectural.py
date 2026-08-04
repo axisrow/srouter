@@ -26,7 +26,10 @@ Fix (см. git_proxy.py):
 import contextlib
 import os
 import subprocess
+import sys
 import threading
+import time
+from pathlib import Path
 
 import pytest
 
@@ -597,3 +600,166 @@ def test_transient_sentinel_read_failure_does_not_destroy_valid_marker(monkeypat
     assert resolved2["resolved"] is True
     current2 = git_proxy._get_all(git_proxy.KEY)
     assert current2["values"] == [EXPECTED_GIT_PROXY], "маркер должен корректно replay'иться на следующей попытке"
+
+
+# ==================== issue #282: НАСТОЯЩИЙ cross-process harness ====================
+# Round 3 (эта issue): thread-based harness (threading.Thread в одном интерпретаторе) доказывает
+# только in-process взаимоисключение. Сломанный _mutation_lock, использующий process-local
+# threading.Lock/mutex вместо реального fcntl.flock, прошёл бы такой тест -- но НЕ защитил бы
+# реальный сценарий issue #234 (CLI-процесс vs dashboard-поток, РАЗНЫЕ процессы).
+#
+# Два настоящих дочерних процесса (subprocess.Popen, общий временный HOME) через standalone
+# helper tests/git_proxy_lock_harness.py:
+#   - holder сигналит `holder_entered` ТОЛЬКО ПОСЛЕ входа в защищённое тело (после реального flock)
+#     и держит лок, пока его не освободят явно маркером `release`;
+#   - waiter обязан доказуемо НЕ суметь войти в критическую секцию, пока holder держит лок
+#     (иначе `waiter_entered_too_early` -- lock process-local/сломан).
+# Проверяются exit-коды обоих процессов (включая propagated exceptions, превращаемые helper'ом
+# в rc!=0).
+
+_LOCK_HARNESS = Path(__file__).with_name("git_proxy_lock_harness.py")
+
+
+def _wait_for_file(path: Path, timeout: float, poll: float = 0.05) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            return True
+        time.sleep(poll)
+    return False
+
+
+def _run_lock_harness(tmp_path, broken_lock: bool):
+    """Запускает holder+waiter+probe через дочерние процессы, делит один временный HOME.
+
+    Возвращает: holder_rc, waiter_rc, entered_too_early (bool), waiter_entered_after_release (bool),
+    probe_locked_rc (int — 0 если flock удержан cross-process пока holder внутри), probe_free_rc
+    (int — 0 если flock освободился после выхода holder'а).
+
+    Детерминированный handshake (cycle-review #283, Codex round 2): НИКАКИХ тайминговых окон.
+    Cross-process характер _mutation_lock доказывается ПРЯМЫМ probe'ом канонического lockfile:
+    пока holder внутри (после holder_entered, до release) отдельный процесс пытается LOCK_EX|LOCK_NB
+    и ОБЯЗАН получить EWOULDBLOCK — авторитетный ответ ОС о том, что flock удержан другим процессом.
+    Это замена wall-clock-absence-проверки (3-секундного отсутствия entered_too_early), которая
+    могла false-green на сломанном локе, задерживающем yield дольше окна (канон
+    wall-clock-assert-is-not-the-invariant).
+    """
+    home = tmp_path / "home"
+    home.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ, HOME=str(home))
+    if broken_lock:
+        env["SR_BROKEN_LOCK"] = "1"
+
+    holder = waiter = probe_locked = probe_free = None
+    try:
+        holder = subprocess.Popen(
+            [sys.executable, str(_LOCK_HARNESS), "holder", str(tmp_path)], env=env
+        )
+        assert _wait_for_file(tmp_path / "holder_entered", timeout=20), (
+            "holder обязан войти в критическую секцию (после реального flock)"
+        )
+
+        # Детерминированный cross-process proof: пока holder внутри _mutation_lock, flock на
+        # каноническом lockfile обязан быть удержан (LOCK_EX|LOCK_NB -> EWOULDBLOCK) из другого
+        # процесса. Завершаем probe ДО release, чтобы holder гарантированно ещё держал лок.
+        probe_locked = subprocess.Popen(
+            [sys.executable, str(_LOCK_HARNESS), "probe", str(tmp_path), "locked"], env=env
+        )
+        probe_locked_rc = probe_locked.wait(timeout=20)
+
+        waiter = subprocess.Popen(
+            [sys.executable, str(_LOCK_HARNESS), "waiter", str(tmp_path)], env=env
+        )
+        assert _wait_for_file(tmp_path / "waiter_attempting", timeout=20), (
+            "waiter обязан дойти до порога блокирующего входа"
+        )
+
+        (tmp_path / "release").write_text("1")  # явное освобождение holder'а
+
+        holder_rc = holder.wait(timeout=20)
+        waiter_rc = waiter.wait(timeout=20)
+
+        # Детерминированный proof освобождения: после выхода holder'а probe обязан приобрести лок.
+        probe_free = subprocess.Popen(
+            [sys.executable, str(_LOCK_HARNESS), "probe", str(tmp_path), "free"], env=env
+        )
+        probe_free_rc = probe_free.wait(timeout=20)
+    except Exception:
+        # Не оставляем дочерние процессы висеть (cycle-review major #2): освобождаем holder,
+        # завершаем и ждём все, чтобы никакой процесс не держал flock/не утёк.
+        try:
+            (tmp_path / "release").write_text("1")
+        except OSError:
+            pass
+        for p in (holder, waiter, probe_locked, probe_free):
+            if p is not None and p.poll() is None:
+                p.terminate()
+        for p in (holder, waiter, probe_locked, probe_free):
+            if p is not None:
+                try:
+                    p.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+        raise
+
+    waiter_after = (tmp_path / "waiter.result").read_text() if (tmp_path / "waiter.result").exists() else ""
+    return {
+        "holder_rc": holder_rc,
+        "waiter_rc": waiter_rc,
+        "entered_too_early": (tmp_path / "waiter_entered_too_early").exists(),
+        "waiter_entered_after_release": waiter_after == "ok",
+        "probe_locked_rc": probe_locked_rc,
+        "probe_free_rc": probe_free_rc,
+    }
+
+
+def test_mutation_lock_is_true_cross_process_exclusion(tmp_path):
+    """Позитивный контроль: настоящий _mutation_lock (fcntl.flock) сериализует МЕЖДУ процессами.
+
+    holder (отдельный процесс) входит в критическую секцию и держит лок; ДЕТЕРМИНИРОВАННЫЙ probe
+    (другой процесс, LOCK_EX|LOCK_NB на каноническом lockfile) обязан получить EWOULDBLOCK — flock
+    удержан cross-process. После явного освобождения probe обязан приобрести лок, а waiter —
+    сериализованно войти. Это доказывает cross-process природу лока, которую in-process harness
+    (issue #282 round 3 gap) не мог различить: process-local threading.Lock прошёл бы thread-based тест.
+    """
+    outcomes = _run_lock_harness(tmp_path, broken_lock=False)
+
+    assert outcomes["probe_locked_rc"] == 0, (
+        f"flock обязан быть удержан cross-process (EWOULDBLOCK) пока holder внутри: {outcomes}"
+    )
+    assert outcomes["holder_rc"] == 0, f"holder обязан завершиться успешно: {outcomes}"
+    assert outcomes["waiter_rc"] == 0, f"waiter обязан дождаться входа ПОСЛЕ release: {outcomes}"
+    assert outcomes["entered_too_early"] is False, (
+        f"waiter вошёл в критическую секцию ПОКА holder держит лок -- значит лок НЕ "
+        f"cross-process (сломан): {outcomes}"
+    )
+    assert outcomes["waiter_entered_after_release"] is True, (
+        f"waiter обязан успешно войти после явного освобождения holder'а: {outcomes}"
+    )
+    assert outcomes["probe_free_rc"] == 0, (
+        f"flock обязан освободиться после выхода holder'а (probe приобретает): {outcomes}"
+    )
+
+
+def test_harness_rejects_process_local_lock(tmp_path):
+    """Негативный контроль (чувствительность harness): process-local threading.Lock НЕ
+    сериализует между процессами (у каждого процесса свой объект) -- такой «сломанный»
+    _mutation_lock обязан быть пойман harness'ом как детерминированный probe (LOCK_EX|LOCK_NB на
+    каноническом lockfile НЕ даст EWOULDBLOCK, т.к. process-local лок не держит файловый flock).
+    Без этого теста harness был бы false-green: он бы «проходил» и с настоящим flock, и с
+    process-local локом, ничего не доказывая (regression-гвард против тихого обесценивания проверки).
+    """
+    outcomes = _run_lock_harness(tmp_path, broken_lock=True)
+
+    assert outcomes["probe_locked_rc"] != 0, (
+        f"probe ОБЯЗАН поймать, что process-local лок НЕ удерживает файловый flock "
+        f"(LOCK_NB обязан приобрести, rc!=0): {outcomes}"
+    )
+    assert outcomes["entered_too_early"] is True, (
+        f"harness ОБЯЗАН детектировать process-local лок (waiter вошёл ДО release): {outcomes}"
+    )
+    assert outcomes["waiter_rc"] == 2, f"waiter под сломанным локом обязан rc=2 (entered-before-release): {outcomes}"
+    assert outcomes["holder_rc"] == 0, f"holder (после явного release) обязан выйти успешно: {outcomes}"
+    assert outcomes["waiter_entered_after_release"] is False, (
+        f"waiter под сломанным локом НЕ должен войти «после release» — он вошёл раньше: {outcomes}"
+    )
