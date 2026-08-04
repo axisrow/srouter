@@ -323,3 +323,48 @@ def test_partial_txn_marked_checksum_rejected_as_corrupt(monkeypatch, real_git_h
     assert git_proxy._backup_state()["values"] == ["A", "B", "C"], (
         "backup должен остаться нетронутым при отклонении partial txn-маркера"
     )
+
+
+# ==================== Issue #277: unknown/absent conflation audit ====================
+# Аудит каждого _get_all call site на инвариант: отличать unknown=True (transient — retry-safe,
+# НЕ мутировать, НЕ коммитить fail-closed reset) от present=False (ключ реально отсутствует —
+# норма) и present=True с неожиданным значением. Находка: финальная ветка _disable_locked
+# (current == [_PROXY]) читала backup через `_backup_state()["present"]` — при unknown=True
+# _get_all кодирует это как present=False, и код конфаундил "транзиентный сбой чтения backup"
+# с "backup отсутствует", уходя в _unset_all(KEY) — снимая наш managed-прокси БЕЗ восстановления
+# backup вместо fail-closed (тот же класс, что round 3 чинил для sentinel-чтения в
+# _check_and_resolve_txn).
+
+def test_disable_restore_backup_unknown_read_fails_closed_not_unset(monkeypatch, real_git_home):
+    """Regression (issue #277): когда current == наш [_PROXY] и чтение backup даёт unknown=True
+    (transient timeout/permission-race на _BACKUP_KEY), disable() обязан НЕ мутировать: вернуть
+    ok=False без снятия KEY. Старая ветка `_backup_state()["present"]` (unknown → present=False)
+    уходила в _unset_all(KEY), снимая managed-прокси и молча отбрасывая решение о restore backup.
+    """
+    # Состояние: установлен наш managed-прокси + присутствует backup чужого значения
+    _raw_set(git_proxy.KEY, "https://corp.example:8443", real_git_home)
+    assert git_proxy.enable()["ok"] is True
+    assert git_proxy.status()["proxy"] == EXPECTED_GIT_PROXY
+    assert git_proxy._backup_state()["present"] is True, "sanity: backup создан enable()"
+
+    real_run = sys_probe.run
+
+    def _fail_backup_read(cmd, **kwargs):
+        # Роняем ТОЛЬКО чтение _BACKUP_KEY (unknown=True) — остальное реальный git.
+        if "--get-all" in cmd and cmd[-1] == git_proxy._BACKUP_KEY:
+            return {"rc": 2, "out": "", "err": "simulated backup read failure", "timeout": False}
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(git_proxy.sys_probe, "run", _fail_backup_read)
+
+    r = git_proxy.disable()
+
+    # Fail-closed: не мутируем при транзиентном сбое чтения backup
+    assert r["ok"] is False, "disable() обязан fail-closed при unknown-чтении backup (не unset KEY)"
+    assert "backup" in r["err"].lower(), "ошибка должна указывать на сбой чтения backup"
+
+    monkeypatch.setattr(git_proxy.sys_probe, "run", real_run)
+    # KEY НЕ снят: managed-прокси остался, решение о restore не отброшено
+    assert git_proxy._get_all(git_proxy.KEY)["values"] == [EXPECTED_GIT_PROXY], (
+        "KEY не должен быть снят при unknown-чтении backup — это не 'backup отсутствует'"
+    )

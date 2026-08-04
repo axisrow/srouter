@@ -651,4 +651,17 @@ def _disable_locked():
             return _restore_backup_into_key()
         return {"ok": True}  # чужое текущее значение (или multi-value чужое) — не трогаем
 
-    return _restore_backup_into_key() if _backup_state()["present"] else _unset_all(KEY)
+    # Issue #277 (unknown/absent conflation audit): финальная ветка (current == [_PROXY])
+    # раньше читала backup через `_backup_state()["present"]` — при unknown=True (transient
+    # timeout/permission-race) _get_all кодирует это как present=False, и код конфаундил
+    # "транзиентный сбой чтения backup" с "backup отсутствует", уходя в _unset_all(KEY) —
+    # снимая наш managed-прокси БЕЗ восстановления backup вместо fail-closed (тот же класс,
+    # что round 3 чинил для sentinel-чтения в _check_and_resolve_txn). Теперь unknown читается
+    # явно и возвращает ошибку БЕЗ мутации; отсутствие backup — легитимный путь "мы ставили
+    # сами, просто снимаем".
+    backup = _backup_state()
+    if backup["unknown"]:
+        return {"ok": False, "err": "git config --get-all backup failed"}
+    if backup["present"]:
+        return _restore_backup_into_key()
+    return _unset_all(KEY)
