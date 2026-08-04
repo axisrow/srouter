@@ -27,6 +27,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -424,10 +425,16 @@ def test_transient_sentinel_read_failure_does_not_destroy_valid_marker(monkeypat
 
 _LOCK_HARNESS = Path(__file__).with_name("git_proxy_lock_harness.py")
 
+# Окно подтверждения блокировки waiter'а (cycle-review #283, Codex major). `waiter_attempting`
+# пишется ДО входа в lock context manager, поэтому его наличие само по себе НЕ доказывает, что
+# waiter достиг блокирующего flock — вытесненный между маркером и входом waiter с process-local/no-op
+# локом вошёл бы уже ПОСЛЕ появления `release` и записал `ok` (false-green). Это окно даёт waiter'у
+# время дойти до flock; инвариант читается из `entered_too_early`, а не из самого окна (канон
+# wall-clock-assert-is-not-the-invariant).
+_CONFIRM_WINDOW = 3.0
+
 
 def _wait_for_file(path: Path, timeout: float, poll: float = 0.05) -> bool:
-    import time
-
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if path.exists():
@@ -442,17 +449,18 @@ def _run_lock_harness(tmp_path, broken_lock: bool):
     Возвращает: holder_rc, waiter_rc, entered_too_early (bool — waiter вошёл ДО release,
     т.е. лок НЕ cross-process), waiter_entered_after_release (bool).
 
-    Детерминированный handshake (cycle-review PR #283, major): НИКАКИХ жёстких тайминговых
-    окон-«критериев корректности». Ветвление по `broken_lock` решает, когда писать `release`:
-      - broken_lock=True (негативный контроль): release НЕ пишем, пока не докажем, что сломанный
-        (process-local) лок даёт `entered_too_early`. Он захватывается мгновенно (release ещё
-        отсутствует) → маркер появляется надёжно, независимо от скорости spawn/CI — ждём щедрым
-        таймаутом, а не фиксированным окном.
-      - broken_lock=False (позитивный контроль): настоящий flock блокирует waiter ДО release,
-        поэтому `entered_too_early` физически не может появиться — пишем release сразу после
-        `waiter_attempting`, без всякого окна (waiter уже на блокирующем входе).
-    Истина про `entered_too_early` читается из файла ПОСЛЕ завершения обоих процессов, а не из
-    прежнего pre-release polling-окна.
+    Детерминированный handshake (cycle-review PR #283, Codex major): ЕДИНЫЙ протокол для обоих
+    контролей. `waiter_attempting` пишется ДО входа в lock context manager (harness:100), поэтому
+    его наличие не доказывает, что waiter достиг блокирующего flock — вытесненный после маркера
+    waiter с process-local/no-op локом вошёл бы уже ПОСЛЕ `release` и записал `ok` (false-green).
+    Поэтому после `waiter_attempting` ждём bounded-окно появления `entered_too_early` и проверяем
+    его ПРЯМО ЗДЕСЬ, единообразно:
+      - broken_lock=True  : process-local лок входит мгновенно → `entered_too_early` появляется в окне.
+      - broken_lock=False : настоящий flock блокирует waiter → `entered_too_early` НЕ появляется
+                            (отсутствие в течение окна = waiter ДОКАЗАННО заблокирован, а не просто
+                            ещё не стартовал). Только после этого пишем `release`.
+    Окно — синхронизационный запас на вытеснение, НЕ критерий корректности: инвариант
+    (отсутствие/наличие `entered_too_early`) читается из маркеров.
     """
     home = tmp_path / "home"
     home.mkdir(parents=True, exist_ok=True)
@@ -476,10 +484,23 @@ def _run_lock_harness(tmp_path, broken_lock: bool):
             "waiter обязан дойти до порога блокирующего входа"
         )
 
+        # Единый handshake (cycle-review #283, Codex major): ждём bounded-окно появления
+        # `entered_too_early` и проверяем его единообразно для обоих контролей. Это закрывает
+        # false-green, где waiter, вытесненный между `waiter_attempting` и входом, входил бы после
+        # немедленно записанного `release` и ложно проходил как «сериализованный».
+        entered_too_early = _wait_for_file(
+            tmp_path / "waiter_entered_too_early", timeout=_CONFIRM_WINDOW
+        )
         if broken_lock:
-            # Сломанный лок обязан дать entered_too_early ДО release; ждём щедрым таймаутом
-            # (release ещё не написан), а не узким тайминговым окном (cycle-review major #1).
-            _wait_for_file(tmp_path / "waiter_entered_too_early", timeout=20)
+            assert entered_too_early, (
+                "broken_lock: waiter обязан войти ДО release (entered_too_early) -- иначе harness "
+                "не поймал бы сломанный лок"
+            )
+        else:
+            assert not entered_too_early, (
+                "real lock: waiter ВОШЁЛ, пока holder держит flock -- значит лок НЕ cross-process "
+                "(сломан)"
+            )
 
         (tmp_path / "release").write_text("1")  # явное освобождение holder'а
 
