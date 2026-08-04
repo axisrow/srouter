@@ -441,6 +441,18 @@ def _run_lock_harness(tmp_path, broken_lock: bool):
 
     Возвращает: holder_rc, waiter_rc, entered_too_early (bool — waiter вошёл ДО release,
     т.е. лок НЕ cross-process), waiter_entered_after_release (bool).
+
+    Детерминированный handshake (cycle-review PR #283, major): НИКАКИХ жёстких тайминговых
+    окон-«критериев корректности». Ветвление по `broken_lock` решает, когда писать `release`:
+      - broken_lock=True (негативный контроль): release НЕ пишем, пока не докажем, что сломанный
+        (process-local) лок даёт `entered_too_early`. Он захватывается мгновенно (release ещё
+        отсутствует) → маркер появляется надёжно, независимо от скорости spawn/CI — ждём щедрым
+        таймаутом, а не фиксированным окном.
+      - broken_lock=False (позитивный контроль): настоящий flock блокирует waiter ДО release,
+        поэтому `entered_too_early` физически не может появиться — пишем release сразу после
+        `waiter_attempting`, без всякого окна (waiter уже на блокирующем входе).
+    Истина про `entered_too_early` читается из файла ПОСЛЕ завершения обоих процессов, а не из
+    прежнего pre-release polling-окна.
     """
     home = tmp_path / "home"
     home.mkdir(parents=True, exist_ok=True)
@@ -448,34 +460,54 @@ def _run_lock_harness(tmp_path, broken_lock: bool):
     if broken_lock:
         env["SR_BROKEN_LOCK"] = "1"
 
-    holder = subprocess.Popen(
-        [sys.executable, str(_LOCK_HARNESS), "holder", str(tmp_path)], env=env
-    )
-    assert _wait_for_file(tmp_path / "holder_entered", timeout=20), (
-        "holder обязан войти в критическую секцию (после реального flock)"
-    )
+    holder = waiter = None
+    try:
+        holder = subprocess.Popen(
+            [sys.executable, str(_LOCK_HARNESS), "holder", str(tmp_path)], env=env
+        )
+        assert _wait_for_file(tmp_path / "holder_entered", timeout=20), (
+            "holder обязан войти в критическую секцию (после реального flock)"
+        )
 
-    waiter = subprocess.Popen(
-        [sys.executable, str(_LOCK_HARNESS), "waiter", str(tmp_path)], env=env
-    )
-    assert _wait_for_file(tmp_path / "waiter_attempting", timeout=20), (
-        "waiter обязан дойти до порога блокирующего входа"
-    )
+        waiter = subprocess.Popen(
+            [sys.executable, str(_LOCK_HARNESS), "waiter", str(tmp_path)], env=env
+        )
+        assert _wait_for_file(tmp_path / "waiter_attempting", timeout=20), (
+            "waiter обязан дойти до порога блокирующего входа"
+        )
 
-    # Короткий буфер: если waiter вошёл ДО release (lock не сериализует между процессами) —
-    # маркер появится здесь. При настоящем flock waiter заблокирован и НЕ входит.
-    entered_too_early = _wait_for_file(tmp_path / "waiter_entered_too_early", timeout=0.5, poll=0.02)
+        if broken_lock:
+            # Сломанный лок обязан дать entered_too_early ДО release; ждём щедрым таймаутом
+            # (release ещё не написан), а не узким тайминговым окном (cycle-review major #1).
+            _wait_for_file(tmp_path / "waiter_entered_too_early", timeout=20)
 
-    (tmp_path / "release").write_text("1")  # явное освобождение holder'а
+        (tmp_path / "release").write_text("1")  # явное освобождение holder'а
 
-    holder_rc = holder.wait(timeout=20)
-    waiter_rc = waiter.wait(timeout=20)
+        holder_rc = holder.wait(timeout=20)
+        waiter_rc = waiter.wait(timeout=20)
+    except Exception:
+        # Не оставляем дочерние процессы висеть (cycle-review major #2): освобождаем holder,
+        # завершаем и ждём оба, чтобы никакой процесс не держал flock/не утёк.
+        try:
+            (tmp_path / "release").write_text("1")
+        except OSError:
+            pass
+        for p in (holder, waiter):
+            if p is not None and p.poll() is None:
+                p.terminate()
+        for p in (holder, waiter):
+            if p is not None:
+                try:
+                    p.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+        raise
 
     waiter_after = (tmp_path / "waiter.result").read_text() if (tmp_path / "waiter.result").exists() else ""
     return {
         "holder_rc": holder_rc,
         "waiter_rc": waiter_rc,
-        "entered_too_early": entered_too_early,
+        "entered_too_early": (tmp_path / "waiter_entered_too_early").exists(),
         "waiter_entered_after_release": waiter_after == "ok",
     }
 
@@ -514,3 +546,7 @@ def test_harness_rejects_process_local_lock(tmp_path):
         f"harness ОБЯЗАН детектировать process-local лок (waiter вошёл ДО release): {outcomes}"
     )
     assert outcomes["waiter_rc"] == 2, f"waiter под сломанным локом обязан rc=2 (entered-before-release): {outcomes}"
+    assert outcomes["holder_rc"] == 0, f"holder (после явного release) обязан выйти успешно: {outcomes}"
+    assert outcomes["waiter_entered_after_release"] is False, (
+        f"waiter под сломанным локом НЕ должен войти «после release» — он вошёл раньше: {outcomes}"
+    )

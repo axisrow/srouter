@@ -40,8 +40,8 @@ def _write(path: Path, text: str) -> None:
 
 
 def _wait_for(path: Path, timeout: float, poll: float = 0.05) -> bool:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
         if path.exists():
             return True
         time.sleep(poll)
@@ -70,18 +70,22 @@ def _make_lock():
 
 
 def _holder(workdir: Path) -> int:
-    lock_factory = _make_lock()
-    with lock_factory() as acquired:
-        if not acquired:
-            _write(workdir / "holder.result", "no-lock")
-            return 3
-        # Вход в защищённое тело ПОСЛЕ реального flock — сигналим только теперь.
-        _write(workdir / "holder_entered", "1")
-        if not _wait_for(workdir / "release", timeout=30):
-            _write(workdir / "holder.result", "timeout-waiting-release")
-            return 4
-        _write(workdir / "holder.result", "ok")
-    return 0
+    try:
+        lock_factory = _make_lock()
+        with lock_factory() as acquired:
+            if not acquired:
+                _write(workdir / "holder.result", "no-lock")
+                return 3
+            # Вход в защищённое тело ПОСЛЕ реального flock — сигналим только теперь.
+            _write(workdir / "holder_entered", "1")
+            if not _wait_for(workdir / "release", timeout=30):
+                _write(workdir / "holder.result", "timeout-waiting-release")
+                return 4
+            _write(workdir / "holder.result", "ok")
+        return 0
+    except BaseException as exc:  # noqa: BLE001 — симметрично _waiter: propagated exception = rc!=0
+        _write(workdir / "holder.result", f"exception:{type(exc).__name__}:{exc}")
+        return 5
 
 
 def _waiter(workdir: Path) -> int:
