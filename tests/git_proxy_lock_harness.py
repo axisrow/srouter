@@ -15,6 +15,10 @@
            значит лок НЕ cross-process (сломан): сигналит `waiter_entered_too_early` и
            завершается rc=2. Если дождался входа ПОСЛЕ `release` — нормальный сериализованный
            вход: сигналит rc=0.
+  probe   — детерминированный LOCK_EX|LOCK_NB-пробер канонического lockfile (argv[3]='locked'|'free'):
+            'locked' обязан получить EWOULDBLOCK (flock удержан holder'ом), 'free' — приобрести.
+            rc=0 при совпадении ожидания, ненулевой иначе. Это авторитетный ответ ОС, замена
+            wall-clock-absence-проверки (cycle-review #283, Codex round 2).
 
 Маркеры — файлы в workdir (argv[2]). Env-флаг SR_BROKEN_LOCK=1 подменяет _mutation_lock
 на process-local threading.Lock — негативный контроль: harness ОБЯЗАН детектировать такой
@@ -25,6 +29,8 @@ Propagated exceptions: любой BaseException из _mutation_lock/критич
 отказ, а не как молчаливое прохождение.
 """
 import contextlib
+import errno
+import fcntl
 import os
 import sys
 import threading
@@ -111,6 +117,51 @@ def _waiter(workdir: Path) -> int:
         return 5
 
 
+def _probe(workdir: Path, expect: str) -> int:
+    """Детерминированный cross-process probe (cycle-review #283, Codex round 2).
+
+    Открывает канонический lockfile `_mutation_lock` (git_proxy._MUTATION_LOCKFILE — единый
+    источник правды, не дублируем имя) и пытается LOCK_EX|LOCK_NB:
+      - expect='locked' (holder внутри _mutation_lock): обязан получить EWOULDBLOCK — flock удержан
+        другим процессом. rc=0 при EWOULDBLOCK, rc=3 если лок НЕ удержан (сломан/process-local).
+      - expect='free' (holder вышел): обязан приобрести лок. rc=0 при приобретении, rc=2 если занят.
+
+    Это авторитетный ответ ОС без тайминговых окон — замена wall-clock-absence-проверки, которая
+    могла false-green на сломанном локе, задерживающем yield дольше окна (канон
+    wall-clock-assert-is-not-the-invariant).
+    """
+    import git_proxy
+
+    lock_p = Path.home() / git_proxy._MUTATION_LOCKFILE
+    try:
+        fd = os.open(lock_p, os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError as exc:
+        _write(workdir / "probe.result", f"open-failed:{exc}")
+        return 6
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno == errno.EWOULDBLOCK:
+                # flock удержан другим процессом.
+                if expect == "locked":
+                    _write(workdir / "probe.result", "blocked-as-expected")
+                    return 0
+                _write(workdir / "probe.result", "blocked-unexpectedly")
+                return 2
+            _write(workdir / "probe.result", f"flock-error:{exc.errno}")
+            return 7
+        else:
+            # flock приобретён (никто не держит).
+            if expect == "free":
+                _write(workdir / "probe.result", "acquired-as-expected")
+                return 0
+            _write(workdir / "probe.result", "acquired-unexpectedly")
+            return 3
+    finally:
+        os.close(fd)
+
+
 def main() -> None:
     role = sys.argv[1]
     workdir = Path(sys.argv[2])
@@ -118,6 +169,8 @@ def main() -> None:
         sys.exit(_holder(workdir))
     elif role == "waiter":
         sys.exit(_waiter(workdir))
+    elif role == "probe":
+        sys.exit(_probe(workdir, sys.argv[3]))
     sys.exit(10)
 
 

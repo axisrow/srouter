@@ -84,6 +84,13 @@ _TXN_SENTINEL_KEY = _TXN_KEY + "-sentinel"
 # пользователем — ни одно легитимное proxy-URL/target-значение не начинается с этой строки.
 _TXN_SENTINEL_PREFIX = "srouter-git-proxy-txn-checksum:"
 
+# Lockfile-имя cross-process _mutation_lock (issue #234 finding 2): отдельный sentinel-файл рядом
+# с ~/.gitconfig (нельзя flock сам ~/.gitconfig, который rewrite'ится через `git config` — apply мог
+# бы держать fd на пере-созданном inode). Единый источник правды: двухпроцессный тест-пробер
+# (tests/git_proxy_lock_harness.py, issue #282) обязан проверять ТОТ ЖЕ путь, чтобы не дублировать
+# захардкоженное имя и не дрейфовать от production-лока (канон single-source-of-truth).
+_MUTATION_LOCKFILE = ".gitconfig.srouter-proxy.lock"
+
 
 def _txn_sentinel(txn_values):
     """Self-identifying sentinel для txn-маркера: префикс + sha256(canonical join).
@@ -130,7 +137,7 @@ def _mutation_lock():
     fail-closed {"ok": False, ...} вместо мутации без сериализации — явный отказ лучше тихой
     потери данных (канон fail-closed-proxy-down).
     """
-    lock_p = Path.home() / ".gitconfig.srouter-proxy.lock"
+    lock_p = Path.home() / _MUTATION_LOCKFILE
 
     @contextlib.contextmanager
     def _cm():
