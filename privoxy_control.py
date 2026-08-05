@@ -1,16 +1,20 @@
-"""User-side оркестрация защищённого Privoxy (issue #158, декомпозиция privoxy_system.py).
+"""User-side оркестрация защищённого Privoxy (issue #158, декомпозиция privoxy_system.py;
+issue #287 — tree-copy redesign install-механизма).
 
 Выполняется в ОСНОВНОМ процессе srouter (CLI/dashboard) — НЕ копируется в
-/Library/PrivilegedHelperTools и не исполняется через sudo. В отличие от helper-payload
-(privoxy_system.py: protect_as_root/unprotect_as_root/control_as_root/helper_main и все
-транзитивные примитивы), этот модуль читает/пишет local_state и вызывает root-helper через
-`sudo <helper_path> ...` как subprocess — не импортом.
+/Library/PrivilegedHelperTools и не исполняется через sudo. В отличие от helper-дерева
+(privoxy_system.py + privoxy_helper_fs.py/privoxy_helper_launchd.py/privoxy_helper_config.py:
+protect_as_root/unprotect_as_root/control_as_root/helper_main и все транзитивные примитивы),
+этот модуль читает/пишет local_state и вызывает root-helper через `sudo <helper_path> ...`
+как subprocess — не импортом.
 
-Архитектурный инвариант (каноны root-helper-stdlib-only, helper-stdlib-only-no-dashboard-common):
-privoxy_system.py копируется РОВНО ОДНИМ файлом (_read_helper_bytes_pinned читает __file__ целиком,
-digest-pinning на этих байтах) — весь код, достижимый из helper_main→*_as_root, ФИЗИЧЕСКИ обязан
-оставаться там, иначе ModuleNotFoundError под sudo (helper исполняется изолированно, только
-stdlib). Этот модуль, наоборот, безопасно импортирует local_state — он не копируется никуда.
+Архитектурный инвариант (каноны root-helper-stdlib-only, helper-stdlib-only-no-dashboard-common,
+обновлены #287): helper-дерево (entrypoint privoxy_system.py + HELPER_TREE_MODULES) копируется
+_install_helper'ом НИЖЕ ЦЕЛИКОМ, каждый файл — с собственным digest-pinning
+(_read_helper_tree_pinned/_stage_helper_tree/_digest_fd_nofollow в privoxy_system.py) —
+ФИЗИЧЕСКИ обязано оставаться в дереве, иначе ModuleNotFoundError под sudo (helper исполняется
+изолированно, только stdlib в каждом файле дерева). Этот модуль, наоборот, безопасно
+импортирует local_state — он не копируется никуда.
 
 Facade-lookup (канон moving-caller-inverts-mock-ownership, тот же паттерн что
 local_state_traffic_guard.py и др.): все функции здесь резолвят и helper-side примитивы
@@ -32,6 +36,7 @@ import tempfile
 from pathlib import Path
 
 import privoxy_system
+
 
 def status(*, runner=None, layout=None):
     """Read-only статус доступен без sudo."""
@@ -65,6 +70,7 @@ def status(*, runner=None, layout=None):
         layout.binary_path,
         layout.launchdaemon_path,
         layout.helper_path,
+        layout.helper_modules_dir,  # #287: writable modules-директория = code-execution vector
         layout.sudoers_path,
     )
     return {
@@ -215,75 +221,137 @@ def _sudo_reset(runner):
 
 
 def _install_helper(runner, layout=None):
-    """Установка root-owned helper через fd-pinning + post-install digest (TOCTOU-свободно, #148 variant 3).
+    """Установка root-owned helper-ДЕРЕВА через fd-pinning + per-file post-install digest
+    (issue #287, tree-copy redesign — заменяет прежний однофайловый install #148 variant 3).
 
-    Прежний код проверял marker на __file__ и затем звал `sudo install __file__ dst` —
-    /usr/bin/install ПОВТОРНО открывал тот же pathname под sudo. Атакующий атомарно
-    заменял файл во время password-prompt: Python шёл по безопасному control flow, а
-    install клал attacker-bytes как root-owned helper 0755, который protect сразу
-    запускал через sudo → произвольное root-выполнение.
+    Прежний код (single-file) проверял marker на __file__ и звал `sudo install __file__ dst` —
+    /usr/bin/install ПОВТОРНО открывал тот же pathname под sudo (TOCTOU: атакующий подменял
+    файл во время password-prompt). Фикс #148: honest-read через O_NOFOLLOW → staged temp →
+    `sudo install staged dst` (staged, не __file__) → post-install digest-check.
 
-    Фикс: (1) открыть __file__ через O_NOFOLLOW — marker и expected-digest вычисляются
-    на bytes ТОГО ЖЕ fd (TOCTOU-окна между проверкой и использованием нет); (2) записать
-    эти bytes в staged temp (mkstemp, непредсказуемое имя); (3) `sudo install staged dst`
-    копирует staged, НЕ __file__ — pathname __file__ больше не ре-открывается под sudo;
-    (4) post-install digest-check: прочитанный через O_NOFOLLOW установленный helper
-    обязан совпадать с expected-digest. Расхождение → fail-closed (удаление + отказ).
+    Tree-copy (#287) расширяет ТОТ ЖЕ паттерн на N файлов (entrypoint + HELPER_TREE_MODULES),
+    сохраняя все инварианты #148 на КАЖДЫЙ файл, плюс атомарность публикации ВСЕГО дерева:
 
-    ВАЖНО: `__file__` в _read_helper_bytes_pinned — это privoxy_system.py (helper payload),
-    НЕ этот модуль. _install_helper вызывается из user-процесса и копирует именно helper payload.
+    (1) _read_helper_tree_pinned читает entrypoint+модули из Path(__file__).parent ОДНИМ
+        fd на файл (O_NOFOLLOW) — marker (только в entrypoint) и per-file digest на bytes
+        того же fd, TOCTOU-окна между проверкой и использованием нет ни для одного файла.
+    (2) _stage_helper_tree пишет все N файлов в staged root (user-owned в окне — см. (5)).
+    (3) Установка в ПРОМЕЖУТОЧНЫЕ *.new-пути (не финальные) через N раздельных `sudo install`:
+        entrypoint → helper_path.new, каждый модуль → helper_modules_dir.new/<name>. Финальные
+        пути НЕ трогаются на этом шаге — работающий (если есть) helper остаётся нетронутым,
+        пока новое дерево не полностью проверено.
+    (4) post-install digest-check КАЖДОГО установленного *.new-файла против expected-digest
+        честно прочитанных bytes (шаг 1). ЛЮБОЕ расхождение → fail-closed: cleanup всех *.new
+        путей, ни один частично установленный/подменённый файл не публикуется как финальный.
+    (5) ТОЛЬКО если ВСЕ digest сошлись — публикация: один `sudo mv -f` modules.new →
+        helper_modules_dir (atomic rename заменяет старую директорию модулей целиком), затем
+        один `sudo mv -f` helper_path.new → helper_path (atomic rename файла). Между этими
+        двумя rename есть короткое окно, где entrypoint и modules могут временно не совпадать
+        по версии при аварийном обрыве процесса ровно между ними — это НЕ security-регрессия
+        (оба rename делает тот же доверенный root-процесс install, не attacker-controlled шаг;
+        следующий protect() переустановит дерево заново с нуля). Атака была бы возможна только
+        если бы attacker мог вклиниться МЕЖДУ digest-check и install — но post-install digest
+        проверяет уже установленный *.new-файл, а не kernel-level промежуточное состояние.
 
-    ВАЖНО (observation Codex): staged создаётся в user-процессе `protect()` (НЕ root),
-    поэтому mkstemp-файл user-owned/writable. В окне [mkstemp .. sudo install] тот же
-    UID может подменить staged. Эта подмена ПОЙМАНА post-install digest-check (шаг 4):
-    install копирует staged байт-в-байт в root-owned dst, digest dst сравнивается с
-    digest честно прочитанного __file__ — расхождение = fail-closed, attacker-bytes
-    никогда не становятся валидным helper'ом. В user-процессе создать root-owned объект
-    без sudo невозможно, поэтому post-install digest — единственная полная защита этого
-    окна; она покрывает его полностью (preimage sha256 практичен только при совпадении
-    с __file__-bytes, т.е. без эскалации). Race-тест
-    test_install_helper_fail_closed_when_staged_substituted_after_mkstemp фиксирует инвариант.
+    ВАЖНО (#148 variant 3, унаследовано): staged создаётся в user-процессе `protect()` (НЕ
+    root) → mkstemp/mkdtemp дают user-owned объекты, staged user-owned/writable в окне
+    [staging .. sudo install]. Подмена ЛЮБОГО файла в этом окне ловится post-install digest
+    (шаг 4) — install копирует staged байт-в-байт в root-owned *.new, digest *.new сравнивается
+    с digest честно прочитанного оригинала. Race-тесты
+    test_install_helper_fail_closed_when_staged_substituted_after_mkstemp (single-file
+    наследие) и test_install_helper_fail_closed_when_staged_tree_file_substituted_after_stage
+    (#287, multi-file) фиксируют инвариант.
     """
     if layout is None:
         layout = privoxy_system.DEFAULT_LAYOUT
-    # (1) marker + expected-digest на bytes зафиксированного fd, не на path (path-based
-    # _managed_file проверял бы объект, который install переоткроет — TOCTOU window).
-    helper_bytes, expected_digest = privoxy_system._read_helper_bytes_pinned()
-    if helper_bytes is None:
+    # (1) marker (entrypoint) + per-file expected-digest на bytes зафиксированных fd.
+    tree = privoxy_system._read_helper_tree_pinned()
+    if tree is None:
         return privoxy_system._result(False, error="helper_source_marker_missing")
     # foreign-helper guard: helper_path — target (root-owned), path-based допустимо,
     # но читаем через O_NOFOLLOW для консистентности.
-    if layout.helper_path.exists() and not privoxy_system._helper_has_marker_fd(layout.helper_path):
+    if layout.helper_path.exists() and not privoxy_system._helper_tree_has_marker_fd(layout.helper_path):
         return privoxy_system._result(False, error="foreign_privileged_helper")
     parent = runner([privoxy_system.SUDO, privoxy_system.MKDIR, "-p", str(layout.helper_path.parent)], 30)
     if parent.get("rc") != 0:
         return privoxy_system._result(False, error=(parent.get("err") or "helper_parent_failed")[:240])
-    # (2): зафиксированные digest-проверенные bytes в staged temp (user-owned в окне,
-    # но post-check ниже ловит любую подмену — см. docstring).
-    staged = privoxy_system._stage_helper_bytes(helper_bytes)
-    if staged is None:
+    # (2): зафиксированные digest-проверенные bytes всего дерева в staged root.
+    staged_root = privoxy_system._stage_helper_tree(tree)
+    if staged_root is None:
         return privoxy_system._result(False, error="helper_stage_failed")
+
+    entry_name = next(name for name in tree if name not in privoxy_system.HELPER_TREE_MODULES)
+    modules_new = layout.helper_modules_dir.with_name(f"{layout.helper_modules_dir.name}.new")
+    entry_new = layout.helper_path.with_name(f"{layout.helper_path.name}.new")
+    new_paths_to_cleanup = [entry_new, modules_new]
     try:
-        # (3) install копирует staged, не __file__ — pathname __file__ не ре-открывается под sudo.
-        installed = runner(
-            [privoxy_system.SUDO, privoxy_system.INSTALL, "-o", "root", "-g", "wheel", "-m", "0755",
-             str(staged), str(layout.helper_path)],
+        # (3) установка в ПРОМЕЖУТОЧНЫЕ *.new-пути — финальные пути не трогаются, пока
+        # дерево не проверено целиком (см. (5) про атомарную публикацию).
+        # Сносим остатки прерванного прошлого прогона ДО mkdir: `mkdir -p` молча успешен на
+        # существующей директории, а install перезаписывает лишь файлы текущего дерева. Любой
+        # посторонний файл в .modules.new пережил бы install и въехал внутрь опубликованного
+        # root-owned дерева (публикация — rename директории целиком), не попав ни под один
+        # digest-чек. Дерево пинится целиком → стартуем всегда с чистого листа.
+        _cleanup_new_paths(runner, new_paths_to_cleanup)
+        # `install -d -m 0755 -o root -g wheel`, а НЕ `mkdir -p`: mkdir не задаёт режим и отдаёт
+        # его ambient umask root'а. Это единственная директория, из которой helper_main делает
+        # sys.path.insert + import под sudo, причём БЕЗ повторной digest-проверки в runtime
+        # (digest-pinning закрывает только момент install) — writable modules dir = arbitrary
+        # root code execution уже после того, как все fd-pinning/digest-чеки прошли.
+        # install -d ставит режим атомарно при создании, без окна mkdir→chmod.
+        mkdir_new = runner(
+            [privoxy_system.SUDO, privoxy_system.INSTALL, "-d", "-o", "root", "-g", "wheel",
+             "-m", "0755", str(modules_new)],
             30,
         )
-        if installed.get("rc") != 0:
-            return privoxy_system._result(False, error=(installed.get("err") or "helper_install_failed")[:240])
-        # (4) post-install digest-check: установленный helper обязан совпадать с
-        # expected-digest честно прочитанного __file__. Расхождение (подмена staged в
-        # окне ИЛИ вторичная подмена helper_path) → fail-closed.
-        installed_digest = privoxy_system._digest_fd_nofollow(layout.helper_path)
-        if installed_digest is None or installed_digest != expected_digest:
-            privoxy_system._remove_via_runner(runner, layout.helper_path)
-            return privoxy_system._result(False, error="helper_digest_mismatch")
+        if mkdir_new.get("rc") != 0:
+            return privoxy_system._result(False, error=(mkdir_new.get("err") or "helper_modules_new_mkdir_failed")[:240])
+        installed_digests = {}
+        for name, (_, expected_digest) in tree.items():
+            is_entry = name == entry_name
+            source = staged_root / name if is_entry else staged_root / "modules" / name
+            target = entry_new if is_entry else modules_new / name
+            mode = "0755" if is_entry else "0644"
+            installed = runner(
+                [privoxy_system.SUDO, privoxy_system.INSTALL, "-o", "root", "-g", "wheel", "-m", mode,
+                 str(source), str(target)],
+                30,
+            )
+            if installed.get("rc") != 0:
+                _cleanup_new_paths(runner, new_paths_to_cleanup)
+                return privoxy_system._result(False, error=(installed.get("err") or "helper_install_failed")[:240])
+            # (4) post-install digest-check ЭТОГО файла — до перехода к следующему, чтобы не
+            # тратить время на install остальных файлов дерева при первом же расхождении.
+            installed_digest = privoxy_system._digest_fd_nofollow(target)
+            if installed_digest is None or installed_digest != expected_digest:
+                _cleanup_new_paths(runner, new_paths_to_cleanup)
+                return privoxy_system._result(False, error="helper_digest_mismatch")
+            installed_digests[name] = installed_digest
+
+        # (5) все digest сошлись — атомарная публикация: modules first (rename заменяет
+        # старую директорию целиком), затем entrypoint (rename заменяет старый файл).
+        publish_modules = runner([privoxy_system.SUDO, "/bin/mv", "-f", str(modules_new), str(layout.helper_modules_dir)], 30)
+        if publish_modules.get("rc") != 0:
+            _cleanup_new_paths(runner, new_paths_to_cleanup)
+            return privoxy_system._result(False, error=(publish_modules.get("err") or "helper_modules_publish_failed")[:240])
+        publish_entry = runner([privoxy_system.SUDO, "/bin/mv", "-f", str(entry_new), str(layout.helper_path)], 30)
+        if publish_entry.get("rc") != 0:
+            _cleanup_new_paths(runner, [entry_new])
+            return privoxy_system._result(False, error=(publish_entry.get("err") or "helper_entry_publish_failed")[:240])
         return privoxy_system._result(True)
     finally:
         try:
-            os.unlink(staged)
+            shutil.rmtree(staged_root, ignore_errors=True)
         except OSError:
+            pass
+
+
+def _cleanup_new_paths(runner, paths):
+    """Best-effort удаление промежуточных *.new-путей (fail-closed cleanup, tree install)."""
+    for path in paths:
+        try:
+            runner([privoxy_system.SUDO, "/bin/rm", "-rf", "--", str(path)], 15)
+        except Exception:  # noqa: BLE001 — cleanup не должен маскировать основную ошибку.
             pass
 
 

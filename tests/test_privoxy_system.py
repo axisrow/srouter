@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import plistlib
 import pwd
+import shutil
 import subprocess
 
 import pytest
@@ -10,6 +11,7 @@ import dashboard
 import health
 import install_lib
 import local_state
+import privoxy_helper_launchd
 import privoxy_system
 import srouter
 
@@ -435,6 +437,48 @@ def test_root_transaction_migrates_and_restores_user_service(tmp_path, monkeypat
     assert [privoxy_system.LAUNCHCTL, "bootout", f"gui/{identity.pw_uid}/{privoxy_system.USER_LABEL}"] in calls
 
 
+def test_unprotect_as_root_removes_helper_tree_not_only_entrypoint(tmp_path):
+    """#287 tree-copy: unprotect обязан удалить ВСЁ helper-дерево (entrypoint +
+    helper_modules_dir), не только entrypoint-файл — иначе root-owned modules-директория
+    остаётся мусором после чистого uninstall (не security-дыра сама по себе: директория
+    не несёт marker и не исполняется напрямую, но нарушает clean-uninstall инвариант)."""
+    layout = _layout(tmp_path)
+    identity = pwd.getpwuid(os.getuid())
+
+    layout.config_path.parent.mkdir(parents=True)
+    layout.config_path.write_text(privoxy_system.protected_config_text(layout), encoding="utf-8")
+    layout.launchdaemon_path.parent.mkdir(parents=True)
+    layout.launchdaemon_path.write_bytes(privoxy_system.launchdaemon_bytes(layout=layout))
+    layout.manifest_path.write_text(json.dumps({
+        "uid": identity.pw_uid,
+        "gid": identity.pw_gid,
+        "user_plist": str(tmp_path / "absent.plist"),
+        "user_plist_backup": "",
+    }), encoding="utf-8")
+
+    layout.helper_path.parent.mkdir(parents=True, exist_ok=True)
+    layout.helper_path.write_text(f"#!/usr/bin/python3\n# {privoxy_system.HELPER_MARKER}\n",
+                                  encoding="utf-8")
+    layout.helper_modules_dir.mkdir(parents=True, exist_ok=True)
+    (layout.helper_modules_dir / "privoxy_helper_fs.py").write_text("# module", encoding="utf-8")
+
+    def runner(cmd, timeout):
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+
+    result = privoxy_system.unprotect_as_root(
+        restore=False,
+        layout=layout,
+        runner=runner,
+        checker=lambda: False,
+        chown=lambda path, uid, gid: None,
+        enforce_root=False,
+    )
+
+    assert result["ok"] is True, result
+    assert not layout.helper_path.exists()
+    assert not layout.helper_modules_dir.exists()
+
+
 def test_unprotect_refuses_new_user_shadow_without_original_backup(tmp_path):
     layout = _layout(tmp_path)
     identity = pwd.getpwuid(os.getuid())
@@ -502,8 +546,10 @@ def test_root_transaction_rolls_back_before_touching_user_job_on_bad_config_test
             self.now += seconds
 
     clock = FakeClock()
-    monkeypatch.setattr(privoxy_system.time, "monotonic", clock)
-    monkeypatch.setattr(privoxy_system.time, "sleep", clock.sleep)
+    # _wait_port (time.monotonic/sleep) физически в privoxy_helper_launchd.py (issue #287) —
+    # патчим там же (канон moving-caller-inverts-mock-ownership).
+    monkeypatch.setattr(privoxy_helper_launchd.time, "monotonic", clock)
+    monkeypatch.setattr(privoxy_helper_launchd.time, "sleep", clock.sleep)
 
     def runner(cmd, timeout):
         if cmd[:2] == [privoxy_system.LAUNCHCTL, "print"]:
@@ -613,12 +659,18 @@ def test_protect_as_root_runs_config_test_as_nobody_not_root(tmp_path, monkeypat
 
 
 def test_run_as_nobody_drops_privileges_before_exec(monkeypatch):
-    """_run_as_nobody обязана дропать euid/egid ДО exec, когда процесс — root."""
+    """_run_as_nobody обязана дропать euid/egid ДО exec, когда процесс — root.
+
+    _run_as_nobody физически живёт в privoxy_helper_launchd.py (issue #287, tree-copy
+    redesign) — патчим os/subprocess ТАМ, а не на facade privoxy_system (канон
+    moving-caller-inverts-mock-ownership: патч на facade стал бы тихим no-op, т.к.
+    callee резолвит свой собственный top-level `import os`/`import subprocess`).
+    """
     calls = []
-    monkeypatch.setattr(privoxy_system.os, "geteuid", lambda: 0)
-    monkeypatch.setattr(privoxy_system.os, "setgroups", lambda groups: calls.append(("setgroups", groups)))
-    monkeypatch.setattr(privoxy_system.os, "setgid", lambda gid: calls.append(("setgid", gid)))
-    monkeypatch.setattr(privoxy_system.os, "setuid", lambda uid: calls.append(("setuid", uid)))
+    monkeypatch.setattr(privoxy_helper_launchd.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(privoxy_helper_launchd.os, "setgroups", lambda groups: calls.append(("setgroups", groups)))
+    monkeypatch.setattr(privoxy_helper_launchd.os, "setgid", lambda gid: calls.append(("setgid", gid)))
+    monkeypatch.setattr(privoxy_helper_launchd.os, "setuid", lambda uid: calls.append(("setuid", uid)))
 
     captured = {}
 
@@ -628,7 +680,7 @@ def test_run_as_nobody_drops_privileges_before_exec(monkeypatch):
             preexec_fn()
         return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
 
-    monkeypatch.setattr(privoxy_system.subprocess, "run", fake_run)
+    monkeypatch.setattr(privoxy_helper_launchd.subprocess, "run", fake_run)
 
     result = privoxy_system._run_as_nobody(["/bin/true"], timeout=5)
 
@@ -739,6 +791,43 @@ def test_status_reads_system_domain_and_reports_nobody_owner(tmp_path):
     assert result["pid"] == 123
     assert result["owner"] == "nobody"
     assert [privoxy_system.LAUNCHCTL, "print", f"system/{privoxy_system.SYSTEM_LABEL}"] in calls
+
+
+def test_status_assets_writable_covers_helper_modules_dir(tmp_path):
+    """#287 tree-copy: writable helper_modules_dir — arbitrary-code-execution vector при
+    следующем `sudo <helper_path> protect` (helper_main импортирует соседние модули оттуда
+    без повторной digest-проверки — digest-pinning защищает только install-момент, не
+    runtime-import). status()'s assets_writable обязан видеть writable modules-директорию,
+    как уже видит writable helper_path/config_path/etc — иначе dashboard/health молча не
+    заметят компрометацию helper-дерева между install и следующим protect.
+
+    Изолируем ВСЕ остальные protected_assets как read-only (иначе tmp_path-владение
+    (текущий тестовый UID = владелец всех путей) сделало бы assets_writable=True
+    независимо от того, покрыта ли helper_modules_dir — тест был бы ложно-зелёным)."""
+    layout = _layout(tmp_path)
+    layout.launchdaemon_path.parent.mkdir(parents=True)
+    layout.launchdaemon_path.write_bytes(privoxy_system.launchdaemon_bytes(layout=layout))
+    layout.config_path.parent.mkdir(parents=True)
+    layout.config_path.write_text(privoxy_system.protected_config_text(layout), encoding="utf-8")
+    layout.helper_modules_dir.mkdir(parents=True)
+
+    other_assets = (
+        layout.config_dir.parent, layout.config_dir, layout.config_path,
+        layout.launchdaemon_path, layout.sudoers_path.parent if layout.sudoers_path.parent.exists() else None,
+    )
+    for path in other_assets:
+        if path is not None and path.exists():
+            os.chmod(path, 0o500 if path.is_dir() else 0o400)
+
+    def runner(cmd, timeout):
+        return {"rc": 113, "out": "", "err": "not found", "timeout": False}
+
+    result = privoxy_system.status(runner=runner, layout=layout)
+
+    assert result["assets_writable"] is True, (
+        "writable helper_modules_dir не обнаружена status() — arbitrary-code-execution "
+        "vector для следующего protect остаётся невидимым"
+    )
 
 
 def test_state_promotion_and_restore_preserve_previous_entry(tmp_path, monkeypatch):
@@ -1376,8 +1465,46 @@ def test_copy_tree_nofollow_traverses_by_dirfd_without_path_resolution(tmp_path,
     )
 
 
+def _tree_install_runner(layout):
+    """Общий fake-runner для tree-install тестов (issue #287): эмулирует MKDIR/INSTALL/mv
+    ровно так, как это делает production sudo (install копирует staged→*.new byte-в-byte,
+    mv публикует *.new в финальный путь атомарным rename)."""
+    def runner(cmd, timeout):
+        if privoxy_system.INSTALL in cmd and "-d" in cmd:
+            # install -d: создание директории с режимом (аналог mkdir -p + chmod, атомарно).
+            Path(cmd[-1]).mkdir(parents=True, exist_ok=True)
+            return {"rc": 0, "out": "", "err": "", "timeout": False}
+        if privoxy_system.INSTALL in cmd:
+            m_idx = cmd.index("-m")
+            src = Path(cmd[m_idx + 2])
+            dst = Path(cmd[-1])
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_bytes(src.read_bytes())
+            return {"rc": 0, "out": "", "err": "", "timeout": False}
+        if privoxy_system.MKDIR in cmd:
+            Path(cmd[-1]).mkdir(parents=True, exist_ok=True)
+            return {"rc": 0, "out": "", "err": "", "timeout": False}
+        if "/bin/mv" in cmd:
+            src, dst = Path(cmd[-2]), Path(cmd[-1])
+            if dst.is_dir() and not dst.is_symlink():
+                shutil.rmtree(dst)
+            elif dst.exists():
+                dst.unlink()
+            src.replace(dst)
+            return {"rc": 0, "out": "", "err": "", "timeout": False}
+        if "/bin/rm" in cmd:
+            target = Path(cmd[-1])
+            if target.is_dir() and not target.is_symlink():
+                shutil.rmtree(target, ignore_errors=True)
+            else:
+                target.unlink(missing_ok=True)
+            return {"rc": 0, "out": "", "err": "", "timeout": False}
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+    return runner
+
+
 def test_install_helper_feeds_install_pinned_bytes_not_reopened_pathname(tmp_path, monkeypatch):
-    """#148 variant 3: root code execution через helper-install (самый опасный).
+    """#148 variant 3 / #287 tree-copy: root code execution через helper-install (самый опасный).
 
     _install_helper проверяла marker на __file__, но /usr/bin/install повторно
     открывал тот же pathname под sudo. Атакующий атомарно заменяет файл во время
@@ -1385,122 +1512,207 @@ def test_install_helper_feeds_install_pinned_bytes_not_reopened_pathname(tmp_pat
     attacker-bytes как root-owned helper 0755, который protect сразу запускает
     через sudo → произвольное root-выполнение.
 
-    Фикс: до sudo открыть __file__ через O_NOFOLLOW, прочитать bytes, проверить
-    marker, вычислить digest; кормить install ЗАФИКСИРОВАННЫМИ bytes (root-owned
-    temp), не переоткрытием pathname; после install сверить digest helper'а.
+    Фикс: до sudo открыть __file__ (и соседние HELPER_TREE_MODULES) через O_NOFOLLOW,
+    прочитать bytes, проверить marker (entrypoint), вычислить digest КАЖДОГО файла;
+    кормить install ЗАФИКСИРОВАННЫМИ bytes (root-owned staged tree), не переоткрытием
+    pathname; после install сверить digest каждого установленного файла.
 
-    Этот тест требует, чтобы argv install получал src, НЕ равный __file__:
+    Этот тест требует, чтобы argv install для entrypoint получал src, НЕ равный __file__:
     install должен копировать зафиксированный root-owned файл (не сам __file__).
-    Симметрично: на уязвимом коде src == Path(__file__).resolve() = re-open pathname.
     """
     layout = _layout(tmp_path)
-    captured = {"install_src": None, "install_bytes": b""}
+    captured_srcs = []
 
-    # __file__ модуля — валидный helper (содержит HELPER_MARKER в начале файла).
     self_path = Path(privoxy_system.__file__)
+    base_runner = _tree_install_runner(layout)
 
     def runner(cmd, timeout):
         if privoxy_system.INSTALL in cmd:
-            # install -o root -g wheel -m 0755 <SRC> <DST> — SRC должен быть
-            # зафиксированным root-owned temp, НЕ __file__ (иначе TOCTOU под sudo).
             m_idx = cmd.index("-m")
-            captured["install_src"] = cmd[m_idx + 2]  # элемент после -m 0755
-            # Зафиксируем bytes немедленно — staged temp удалится в finally _install_helper.
-            staged_path = Path(captured["install_src"])
-            captured["install_bytes"] = staged_path.read_bytes()
-            # Симулируем успех install: пишем в helper_path «установленные» bytes.
-            layout.helper_path.parent.mkdir(parents=True, exist_ok=True)
-            layout.helper_path.write_bytes(captured["install_bytes"])
-            return {"rc": 0, "out": "", "err": "", "timeout": False}
-        if privoxy_system.MKDIR in cmd:
-            layout.helper_path.parent.mkdir(parents=True, exist_ok=True)
-            return {"rc": 0, "out": "", "err": "", "timeout": False}
-        return {"rc": 0, "out": "", "err": "", "timeout": False}
+            captured_srcs.append(cmd[m_idx + 2])
+        return base_runner(cmd, timeout)
 
     result = privoxy_system._install_helper(runner, layout)
 
     assert result["ok"] is True, result
-    # install-fed src обязан отличаться от __file__ — иначе pathname ре-открывается
-    # под sudo и открывает TOCTOU window.
-    assert captured["install_src"] is not None, "install не вызван"
-    assert Path(captured["install_src"]).resolve() != self_path.resolve(), (
-        "install кормится pathname __file__ → TOCTOU под sudo; нужны "
-        "зафиксированные digest-проверенные bytes"
-    )
-    # Зафиксированные bytes проходят marker-проверку (т.е. helper валиден).
-    assert privoxy_system.HELPER_MARKER.encode() in captured["install_bytes"][:16384]
+    # install-fed src'ы обязаны отличаться от __file__ — иначе pathname ре-открывается
+    # под sudo и открывает TOCTOU window. Проверяем ВСЕ вызовы install (entrypoint + модули).
+    assert captured_srcs, "install не вызван"
+    for src in captured_srcs:
+        assert Path(src).resolve() != self_path.resolve(), (
+            "install кормится pathname __file__ → TOCTOU под sudo; нужны "
+            "зафиксированные digest-проверенные bytes"
+        )
+    # Установленный entrypoint проходит marker-проверку (т.е. helper валиден).
+    assert privoxy_system.HELPER_MARKER.encode() in layout.helper_path.read_bytes()[:16384]
+    # Все модули дерева установлены рядом.
+    for module_name in privoxy_system.HELPER_TREE_MODULES:
+        assert (layout.helper_modules_dir / module_name).is_file()
 
 
 def test_install_helper_rejects_when_installed_helper_digest_mismatch(tmp_path, monkeypatch):
-    """#148 variant 3 fail-closed: digest после install обязан совпадать.
+    """#148 variant 3 / #287 fail-closed: digest после install обязан совпадать.
 
     Даже если install взял зафиксированные bytes, между install и постпроверкой
-    attacker мог подменить helper_path (например через второй race в helper_path).
-    post-install digest-check обязан отвергнуть расхождение и fail-closed.
+    attacker мог подменить установленный *.new-файл (например через второй race).
+    post-install digest-check обязан отвергнуть расхождение и fail-closed —
+    здесь на entrypoint.new (сразу после install, до чтения digest).
     """
     layout = _layout(tmp_path)
+    entry_new = layout.helper_path.with_name(f"{layout.helper_path.name}.new")
+    base_runner = _tree_install_runner(layout)
 
     def runner(cmd, timeout):
-        if privoxy_system.INSTALL in cmd:
-            # Симулируем подмену: install «успешен», но в helper_path лежит
+        result = base_runner(cmd, timeout)
+        if privoxy_system.INSTALL in cmd and Path(cmd[-1]) == entry_new:
+            # Симулируем подмену: install «успешен», но в entry_new лежит
             # НЕ зафиксированные bytes, а attacker-подмена.
-            layout.helper_path.parent.mkdir(parents=True, exist_ok=True)
-            layout.helper_path.write_text("#!/bin/sh\n# attacker-bytes\n", encoding="utf-8")
-            return {"rc": 0, "out": "", "err": "", "timeout": False}
-        if privoxy_system.MKDIR in cmd:
-            layout.helper_path.parent.mkdir(parents=True, exist_ok=True)
-            return {"rc": 0, "out": "", "err": "", "timeout": False}
-        return {"rc": 0, "out": "", "err": "", "timeout": False}
+            entry_new.write_text("#!/bin/sh\n# attacker-bytes\n", encoding="utf-8")
+        return result
 
     result = privoxy_system._install_helper(runner, layout)
     assert result["ok"] is False
     assert "helper_digest_mismatch" in result["error"]
+    assert not layout.helper_path.exists()
 
 
 def test_install_helper_fail_closed_when_staged_substituted_after_mkstemp(tmp_path, monkeypatch):
-    """#148 variant 3 (Codex observation): staged user-owned в окне [mkstemp .. sudo install].
+    """#148 variant 3 (Codex observation) / #287 tree-copy: staged user-owned в окне
+    [staging .. sudo install] — здесь подменяется ИМЕННО entrypoint staged-файл.
 
-    _stage_helper_bytes вызывается в user-процессе `protect()` (НЕ root) → mkstemp
-    создаёт USER-owned staged в /private/tmp. В окне до `sudo install staged dst`
-    тот же UID может подменить staged attacker-bytes. _install_helper обязан ловить
-    это через post-install digest-check: install копирует (подменённый) staged
-    байт-в-байт в root-owned helper, digest helper сравнивается с expected-digest
-    честно прочитанного __file__ — расхождение = fail-closed, attacker-bytes никогда
-    не становятся валидным root-owned helper'ом.
+    _stage_helper_tree вызывается в user-процессе `protect()` (НЕ root) → mkdtemp/файлы
+    в staged root USER-owned. В окне до `sudo install staged dst` тот же UID может
+    подменить staged attacker-bytes. _install_helper обязан ловить это через
+    post-install digest-check на КАЖДЫЙ файл дерева: install копирует (подменённый)
+    staged байт-в-байт в *.new, digest *.new сравнивается с expected-digest честно
+    прочитанного оригинала — расхождение = fail-closed, attacker-bytes никогда не
+    становятся частью опубликованного root-owned helper-дерева.
 
-    Симуляция: runner перехватывает sudo install, читает staged-путь из argv,
-    переписывает staged attacker-bytes (моделируя same-UID подмену в окне), затем
-    копирует подмену в helper_path (как сделал бы /usr/bin/install).
+    Симуляция: runner перехватывает sudo install ДЛЯ ENTRYPOINT (dst == helper_path.new),
+    переписывает staged attacker-bytes (моделируя same-UID подмену в окне) ДО того, как
+    делегирует в общий _tree_install_runner (который эмулирует honest install/mv/rm).
     """
     layout = _layout(tmp_path)
+    entry_new = layout.helper_path.with_name(f"{layout.helper_path.name}.new")
+    base_runner = _tree_install_runner(layout)
 
     def runner(cmd, timeout):
-        if privoxy_system.INSTALL in cmd:
+        if privoxy_system.INSTALL in cmd and Path(cmd[-1]) == entry_new:
             m_idx = cmd.index("-m")
             staged_path = Path(cmd[m_idx + 2])
             # Моделируем подмену staged attacker'ом (same-UID, в окне до sudo install).
             assert staged_path.exists(), "staged temp должен существовать к моменту install"
             staged_path.write_bytes(b"#!/bin/sh\n# attacker-substituted-staged\n")
-            # /usr/bin/install копирует staged байт-в-байт в helper_path.
-            layout.helper_path.parent.mkdir(parents=True, exist_ok=True)
-            layout.helper_path.write_bytes(staged_path.read_bytes())
-            return {"rc": 0, "out": "", "err": "", "timeout": False}
-        if privoxy_system.MKDIR in cmd:
-            layout.helper_path.parent.mkdir(parents=True, exist_ok=True)
-            return {"rc": 0, "out": "", "err": "", "timeout": False}
-        if "/bin/rm" in cmd:
-            # fail-closed cleanup: симулируем sudo rm — реально удаляем helper_path.
-            try:
-                layout.helper_path.unlink()
-            except OSError:
-                pass
-            return {"rc": 0, "out": "", "err": "", "timeout": False}
-        return {"rc": 0, "out": "", "err": "", "timeout": False}
+        return base_runner(cmd, timeout)
 
     result = privoxy_system._install_helper(runner, layout)
 
     # post-install digest-check ловит staged-substitution → fail-closed.
     assert result["ok"] is False
     assert result["error"] == "helper_digest_mismatch"
-    # helper_path удалён (fail-closed cleanup) — attacker-bytes не остаются как helper.
+    # ни промежуточный *.new, ни финальный helper_path не остаются с attacker-bytes:
+    # cleanup удаляет *.new, финальная публикация (mv) никогда не выполняется.
+    assert not entry_new.exists()
     assert not layout.helper_path.exists()
+
+
+def test_install_helper_pins_modules_dir_mode_not_ambient_umask(tmp_path):
+    """#287 tree-copy: modules-директория обязана создаваться с ЯВНЫМ режимом (root-only write),
+    а не с тем, что подвернётся из ambient umask root'а.
+
+    Корень: `mkdir -p` не задаёт режим — он отдаётся на откуп umask процесса. Это ровно та
+    самая единственная привилегированная директория во всём дереве, откуда helper_main делает
+    sys.path.insert + import под sudo, причём БЕЗ повторной digest-проверки в runtime
+    (digest-pinning закрывает только момент install). Group/world-writable режим здесь =
+    arbitrary root code execution: атакующий подменяет модуль ПОСЛЕ того, как все fd-pinning
+    и digest-чеки уже прошли.
+
+    Все остальные привилегированные директории проекта (config_dir/log_dir/backup_dir,
+    staged_root в _stage_helper_tree) чмодятся явно сразу после создания — modules-директория
+    была единственным исключением. Инвариант: никакого write-бита для group/other.
+    """
+    layout = _layout(tmp_path)
+    modules_new = layout.helper_modules_dir.with_name(f"{layout.helper_modules_dir.name}.new")
+    dir_modes = {}
+
+    base_runner = _tree_install_runner(layout)
+
+    def runner(cmd, timeout):
+        # `install -d -m MODE` создаёт директорию С режимом атомарно (без окна mkdir→chmod).
+        if privoxy_system.INSTALL in cmd and "-d" in cmd and "-m" in cmd:
+            dir_modes[Path(cmd[-1])] = cmd[cmd.index("-m") + 1]
+        return base_runner(cmd, timeout)
+
+    result = privoxy_system._install_helper(runner, layout)
+
+    assert result["ok"] is True, result
+    assert modules_new in dir_modes, (
+        "modules-директория создана без явного режима — он отдан ambient umask root'а; "
+        "writable modules dir = arbitrary root code execution при следующем sudo-запуске helper'а"
+    )
+    mode = int(dir_modes[modules_new], 8)
+    assert not (mode & 0o022), f"modules-директория group/world-writable: {dir_modes[modules_new]}"
+
+
+def test_install_helper_wipes_stale_modules_new_residue_before_reuse(tmp_path):
+    """#287 tree-copy: `.modules.new` от прошлой ПРЕРВАННОЙ установки обязана вычищаться
+    перед переиспользованием, а не переоткрываться через `mkdir -p`.
+
+    Корень: публикация дерева — атомарный rename ДИРЕКТОРИИ (`mv modules.new modules`).
+    `mkdir -p` молча успешен на уже существующей директории и ничего не удаляет; install
+    перезаписывает только файлы из текущего HELPER_TREE_MODULES. Любой посторонний файл,
+    оставшийся в `.modules.new` от прерванного/старого прогона (модуль, выпиленный из
+    HELPER_TREE_MODULES в новой версии; недописанный огрызок), переживает install и
+    въезжает внутрь опубликованного root-owned дерева целиком — при этом ни один
+    digest-чек его не видит (digest'ы считаются только по файлам tree).
+
+    Инвариант: опубликованная modules-директория содержит РОВНО HELPER_TREE_MODULES и
+    ничего сверх — дерево пинится целиком, а не пофайлово.
+    """
+    layout = _layout(tmp_path)
+    modules_new = layout.helper_modules_dir.with_name(f"{layout.helper_modules_dir.name}.new")
+    # Остаток прошлого прерванного прогона: файл, которого нет в текущем дереве.
+    modules_new.mkdir(parents=True, exist_ok=True)
+    stale = modules_new / "privoxy_helper_stale.py"
+    stale.write_bytes(b"# residue-from-interrupted-install\n")
+
+    result = privoxy_system._install_helper(_tree_install_runner(layout), layout)
+
+    assert result["ok"] is True, result
+    published = {p.name for p in layout.helper_modules_dir.iterdir()}
+    assert published == set(privoxy_system.HELPER_TREE_MODULES), (
+        "stale-остаток пережил install и опубликован внутри root-owned дерева: "
+        f"{sorted(published)}"
+    )
+
+
+def test_install_helper_fail_closed_when_staged_tree_module_substituted_after_stage(tmp_path):
+    """#287 tree-copy: подмена ОДНОГО ИЗ СОСЕДНИХ МОДУЛЕЙ (не entrypoint) в staged-окне
+    обязана ловиться так же, как подмена entrypoint — иначе tree-copy деградировал бы до
+    single-file security (модуль остался бы непроверенным, только entrypoint пинится).
+
+    Симуляция: runner подменяет staged-файл ПЕРВОГО модуля дерева (privoxy_helper_fs.py)
+    прямо перед install этого конкретного файла; entrypoint и остальные модули install'ятся
+    честно. Ни один файл не должен быть опубликован — вся публикация атомарна по дереву.
+    """
+    layout = _layout(tmp_path)
+    target_module = privoxy_system.HELPER_TREE_MODULES[0]
+    modules_new = layout.helper_modules_dir.with_name(f"{layout.helper_modules_dir.name}.new")
+    base_runner = _tree_install_runner(layout)
+
+    def runner(cmd, timeout):
+        if privoxy_system.INSTALL in cmd and Path(cmd[-1]) == modules_new / target_module:
+            m_idx = cmd.index("-m")
+            staged_path = Path(cmd[m_idx + 2])
+            assert staged_path.exists(), "staged module должен существовать к моменту install"
+            staged_path.write_bytes(b"# attacker-substituted-module\n")
+        return base_runner(cmd, timeout)
+
+    result = privoxy_system._install_helper(runner, layout)
+
+    assert result["ok"] is False
+    assert result["error"] == "helper_digest_mismatch"
+    # Fail-closed для ВСЕГО дерева: ни entrypoint, ни modules-директория не публикуются,
+    # даже если entrypoint и остальные модули были install'ены честно до этого шага.
+    assert not layout.helper_path.exists()
+    assert not layout.helper_modules_dir.exists()
