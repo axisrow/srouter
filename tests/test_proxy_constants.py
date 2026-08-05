@@ -282,23 +282,34 @@ def test_install_template_privoxy_config_follows_canonical_ports():
 
 
 def test_privoxy_system_helper_runs_isolated_without_dashboard_common(tmp_path):
-    """Regression (Codex cycle-review PR #177): privoxy_system — root-only helper, копируется
-    ОДНИМ файлом в /Library/PrivilegedHelperTools и исполняется через sudo. Рядом НЕТ
-    dashboard_common.py (и srouter_config.py). Любой верхне-уровневый `from dashboard_common
-    import ...` ронял helper ModuleNotFoundError в production — baseline main работал, PR #177
-    падал (чистая регрессия). Helper обязан быть stdlib-only: порты — локальные литералы с
-    parity-гвёрдом (test_privoxy_protected_config_follows_canonical_ports).
+    """Regression (Codex cycle-review PR #177, адаптирован #287 tree-copy redesign):
+    privoxy_system — entrypoint root-only helper-ДЕРЕВА, копируется вместе с соседними
+    HELPER_TREE_MODULES-файлами в /Library/PrivilegedHelperTools(.modules/) и исполняется
+    через sudo. Рядом НЕТ dashboard_common.py (и srouter_config.py), и НЕТ никаких других
+    модулей srouter, кроме самого дерева. Любой верхне-уровневый `from dashboard_common
+    import ...` (в entrypoint ИЛИ в любом модуле дерева) ронял бы helper
+    ModuleNotFoundError в production. Helper-дерево обязано быть stdlib-only: порты —
+    локальные литералы с parity-гвёрдом (test_privoxy_protected_config_follows_canonical_ports).
 
-    Симулируем production: копируем ТОЛЬКО privoxy_system.py в изолированную директорию,
-    запускаем как скрипт в чистом окружении (env -i, без проекта в sys.path) и требуем, чтобы
-    helper дошёл до своей первой проверки (root_required), а не упал на импорте."""
+    Симулируем production tree-copy layout: копируем entrypoint + ВСЕ HELPER_TREE_MODULES
+    в изолированную директорию (модули — в поддиректорию <entrypoint>.modules/, ровно как
+    ProtectedLayout.helper_modules_dir и sys.path-prepend в privoxy_system.py ожидают),
+    запускаем entrypoint как скрипт в чистом окружении (env -i, без проекта в sys.path) и
+    требуем, чтобы helper дошёл до своей первой проверки (root_required), а не упал на
+    импорте entrypoint ИЛИ любого соседнего модуля."""
     import shutil
     import subprocess
+
+    import privoxy_system
 
     isolated = tmp_path / "PrivilegedHelperTools"
     isolated.mkdir()
     helper = isolated / "com.srouter.privoxyctl"
     shutil.copy2(ROOT / "privoxy_system.py", helper)
+    modules_dir = isolated / f"{helper.name}.modules"
+    modules_dir.mkdir()
+    for module_name in privoxy_system.HELPER_TREE_MODULES:
+        shutil.copy2(ROOT / module_name, modules_dir / module_name)
 
     # env -i — чистое окружение launchd-стиля: НЕТ PYTHONPATH, НЕТ проекта в sys.path,
     # CWD не содержит dashboard_common. -S отключает site (максимальная изоляция от dev-окружения).
@@ -313,16 +324,49 @@ def test_privoxy_system_helper_runs_isolated_without_dashboard_common(tmp_path):
     # Helper намеренно выходит ненулевым при не-root (root_required) — это его контракт, не падение.
     # Regression-критерий: импорт верхнего уровня НЕ должен падать на ModuleNotFoundError/dashboard_common.
     assert "dashboard_common" not in result.stderr, (
-        "privoxy_system helper тянет dashboard_common на верхнем уровне → ModuleNotFoundError в "
-        f"production (cycle-review PR #177 regression). stderr={result.stderr[-400:]!r}"
+        "privoxy_system helper-дерево тянет dashboard_common на верхнем уровне → "
+        f"ModuleNotFoundError в production (cycle-review PR #177 regression). "
+        f"stderr={result.stderr[-400:]!r}"
     )
     assert "Traceback" not in result.stderr, (
         f"helper упал с traceback в изолированном окружении. stderr={result.stderr[-400:]!r}"
     )
-    # Дошёл до своей первой проверки (helper запущен не под root в тесте) — значит импорт прошёл.
+    # Дошёл до своей первой проверки (helper запущен не под root в тесте) — значит импорт
+    # entrypoint И всех соседних модулей дерева прошёл (sys.path-prepend нашёл modules_dir).
     assert "root_required" in result.stdout, (
-        f"helper не дошёл до root-проверки (импорт должен пройти без dashboard_common). "
+        f"helper не дошёл до root-проверки (импорт дерева должен пройти без dashboard_common). "
         f"stdout={result.stdout!r} stderr={result.stderr[-400:]!r}"
+    )
+
+
+def test_privoxy_system_helper_tree_isolation_fails_closed_without_modules_dir(tmp_path):
+    """Regression #287: если tree-copy install забудет скопировать modules-директорию
+    (или её потеряют/удалят из-под helper'а), entrypoint обязан упасть на импорте — НЕ
+    молча деградировать до partial-функциональности. Копируем ТОЛЬКО entrypoint (без
+    modules_dir) и требуем ModuleNotFoundError (fail-closed на неполном дереве), а не
+    успешный root_required (что означало бы, что sys.path случайно нашёл модули
+    где-то ещё — например в PYTHONPATH/CWD — маскируя неполную установку)."""
+    import shutil
+    import subprocess
+
+    isolated = tmp_path / "PrivilegedHelperTools"
+    isolated.mkdir()
+    helper = isolated / "com.srouter.privoxyctl"
+    shutil.copy2(ROOT / "privoxy_system.py", helper)
+    # НЕ создаём modules_dir и НЕ копируем HELPER_TREE_MODULES — неполное дерево.
+
+    result = subprocess.run(
+        [sys.executable, "-S", str(helper), "status"],
+        cwd="/",
+        capture_output=True,
+        text=True,
+        env={"PATH": "/usr/bin:/bin", "HOME": "/var/root"},
+        timeout=30,
+    )
+    assert result.returncode != 0
+    assert "ModuleNotFoundError" in result.stderr, (
+        "entrypoint без соседних helper-модулей обязан упасть на импорте (fail-closed), "
+        f"а не тихо деградировать. stdout={result.stdout!r} stderr={result.stderr[-400:]!r}"
     )
 
 

@@ -4,20 +4,32 @@
 Root-часть намеренно использует только stdlib, фиксированные абсолютные пути и закрытый набор
 операций. Произвольные команды, shell=True и пользовательские target-path здесь запрещены.
 
-АРХИТЕКТУРНЫЙ ИНВАРИАНТ (issue #158, декомпозиция крупных файлов — этот модуль НЕ дробится
-дальше на root-side): этот файл — root-owned helper, копируется РОВНО ОДНИМ файлом в
-/Library/PrivilegedHelperTools (_read_helper_bytes_pinned читает __file__ целиком, digest
-считается от этих байт) и исполняется ИЗОЛИРОВАННО через sudo — рядом с ним нет других модулей
-srouter (только stdlib, каноны root-helper-stdlib-only-no-shared-imports,
-helper-stdlib-only-no-dashboard-common). Весь код, транзитивно достижимый из
-helper_main→protect_as_root/unprotect_as_root/control_as_root (примитивы atomic-write,
-fd-pinning copy, backup/restore, launchd-обвязка), ФИЗИЧЕСКИ обязан оставаться в этом файле —
-разбить его на модули с `import` означало бы ModuleNotFoundError под sudo в production
-(cycle-review PR #177 уже ловил эту регрессию на попытке `from dashboard_common import`).
-Полный tree-copy редизайн install-механизма (который разрешил бы дальнейшее дробление) —
-отдельная security-критичная задача вне scope этого issue, см. issue tree-copy redesign.
+АРХИТЕКТУРНЫЙ ИНВАРИАНТ (issue #287, tree-copy redesign — заменяет прежний single-file
+инвариант issue #158): этот файл — entrypoint root-owned helper-ДЕРЕВА. Install копирует ЕГО
+и соседние helper_tree-модули (см. HELPER_TREE_MODULES ниже) ВМЕСТЕ в
+/Library/PrivilegedHelperTools/<entrypoint>(.modules/) — каждый файл дерева пиновым digest'ом
+(см. _read_helper_tree_pinned/_install_helper в privoxy_control.py), и исполняется ИЗОЛИРОВАННО
+через sudo — рядом с деревом нет других модулей srouter (только stdlib в каждом файле дерева,
+каноны root-helper-stdlib-only-no-shared-imports, helper-stdlib-only-no-dashboard-common
+ОБНОВЛЕНЫ #287: helper-модули МЕЖДУ СОБОЙ импортировать друг друга МОГУТ — это и есть дерево —
+но по-прежнему НЕ dashboard_common/srouter_config/local_state и т.п.). Модуль делает
+`sys.path.insert(0, <helper_modules_dir>)` В САМОМ НАЧАЛЕ (до import privoxy_helper_*) — под
+sudo working directory непредсказуем, соседей нужно резолвить от каталога, произведённого от
+пути entrypoint (helper_path.parent / f"{helper_path.name}.modules"), а не от CWD.
 
-Пользовательская оркестрация (protect/unprotect/control/status, установка helper'а,
+Helper payload теперь распределён по нескольким файлам-соседям (каждый — ТОЖЕ root-owned,
+ТОЖЕ stdlib-only, ТОЖЕ копируется деревом, но НЕ дробится дальше без причины):
+  - privoxy_helper_fs.py       — fd-pinning atomic-write/copy-tree/backup примитивы
+  - privoxy_helper_launchd.py  — runner/launchd-обвязка, Privoxy runtime relink+codesign
+  - privoxy_helper_config.py   — protected-config/plist/manifest/policy
+Этот файл (privoxy_system.py) — entrypoint: helper_main, protect_as_root/unprotect_as_root/
+control_as_root (транзакционная оркестрация верхнего уровня), tree digest-pinning install-примитивы.
+Top-level `import privoxy_helper_fs` и т.п. здесь БЕЗОПАСЕН (в отличие от privoxy_control) —
+tree-copy install гарантирует, что эти файлы физически рядом с entrypoint в production;
+regression-гвард test_privoxy_system_helper_runs_isolated_without_dashboard_common адаптирован
+под дерево (копирует ВСЕ файлы дерева, не один файл — см. docstring теста).
+
+Пользовательская оркестрация (protect/unprotect/control/status, установка helper-дерева,
 read-modify-write local_state) вынесена в privoxy_control.py — тот модуль выполняется в основном
 процессе srouter и НЕ копируется под sudo, поэтому безопасно импортирует local_state/sys_probe.
 Этот файл реэкспортирует его публичные имена в конце (facade re-export), полный контракт см. в
@@ -35,15 +47,32 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import plistlib
 import pwd
-import re
 import shutil
-import socket
-import stat
-import subprocess
+import sys
 import tempfile
-import time
+
+# sys.path prepend ДО импорта соседей (issue #287): под sudo рабочая директория
+# непредсказуема (production запускает helper из /Library/PrivilegedHelperTools через
+# `sudo <helper_path> ...`, CWD процесса-родителя может быть где угодно). Соседние
+# helper-модули копируются tree-copy install'ом НЕ рядом с entrypoint напрямую, а в
+# поддиректорию `<entrypoint-name>.modules/` (см. ProtectedLayout.helper_modules_dir) —
+# module-имя производится от __file__ тем же правилом, поэтому entrypoint резолвит её
+# самостоятельно, не читая ProtectedLayout (тот определён ниже в этом же файле, но
+# sys.path должен быть готов ДО import privoxy_helper_*, т.е. раньше в исполнении модуля).
+# os.path, не Path.resolve(), — на случай что __file__ уже абсолютен (typical: install
+# кладёт entrypoint по абсолютному helper_path).
+_entry_dir = os.path.dirname(os.path.abspath(__file__))
+_entry_name = os.path.basename(os.path.abspath(__file__))
+_modules_dir = os.path.join(_entry_dir, f"{_entry_name}.modules")
+# Fallback на _entry_dir, если modules-директория ещё не существует (dev/test-запуск
+# из репозитория, где helper_helper_*.py лежат рядом с privoxy_system.py напрямую, не в
+# поддиректории *.modules — см. regression-тест test_privoxy_system_helper_runs_isolated_*).
+sys.path.insert(0, _modules_dir if os.path.isdir(_modules_dir) else _entry_dir)
+
+import privoxy_helper_config
+import privoxy_helper_fs
+import privoxy_helper_launchd
 
 
 PROTECTION_VERSION = 1
@@ -64,32 +93,25 @@ OTOOL = "/usr/bin/otool"
 INSTALL_NAME_TOOL = "/usr/bin/install_name_tool"
 CODESIGN = "/usr/bin/codesign"
 
-# Прокси-порты (8118/10808). Этот модуль — root-only helper (см. docstring модуля: «намеренно
-# использует только stdlib»). Он копируется ОДНИМ файлом в /Library/PrivilegedHelperTools и
-# исполняется изолированно через sudo — рядом НЕТ dashboard_common.py (и srouter_config.py).
-# Поэтому НЕ импортируем dashboard_common (ModuleNotFoundError убил бы helper в production —
-# regression, пойманная cycle-review PR #177). Порты держим локальными литералами; anti-drift
-# гарантирует parity-гвард tests/test_proxy_constants.py::test_privoxy_protected_config_follows_canonical_ports
-# — он эмпирически сверяет listen-address/forward-socks5t из protected_config_text с каноническим
-# источником dashboard_common (та же стратегия, что для shell/config: mutation-доказуемо ловит drift).
-# Если канонический порт меняется — parity-гвард падает и указывает сюда.
-# canonical-fallback-port: гвард PR #162 (test_single_source_defines_proxy_port_constants)
-# разрешает эти локальные литералы как осознанный fallback для helper-изоляции (НЕ свежий дубли).
-_PRIVOXY_PORT = 8118  # canonical-fallback-port (helper-изоляция: stdlib-only, без dashboard_common)
-_XRAY_SOCKS_PORT = 10808  # canonical-fallback-port (helper-изоляция: stdlib-only, без dashboard_common)
+# Helper-дерево (issue #287): entrypoint (этот файл) + перечисленные соседи. ЯВНЫЙ whitelist
+# имён, НЕ directory-scan — directory-scan впустил бы в root-owned tree-copy любой файл, который
+# атакующий подложит рядом с __file__ до/во время install (тот же класс риска, что star-import
+# без явного контракта). Порядок не важен — используется только для перечисления/digest.
+HELPER_TREE_MODULES = (
+    "privoxy_helper_fs.py",
+    "privoxy_helper_launchd.py",
+    "privoxy_helper_config.py",
+)
 
-# #152: разрешённые privoxy-уровни логирования. Канон probe-semantics-from-primary-source —
-# уровень по privoxy user-manual (раздел 7.3 Debugging, битовые значения), НЕ по аналогии/имени.
-#   0 — выкл (ДЕФОЛТ, privacy: на диск не идёт даже производное контента);
-#   1 — show each GET/POST/CONNECT request = URLs / Common Log Format (ЧУВСТВИТЕЛЬНО: URL могут
-#       содержать токены/query — dictionary-атака, см. privacy-no-content-hash-on-disk); осознанно;
-#   2 — show each connection status (open/close/timeout) — приватно (без URL/body), ловит
-#       флап/таймауты к github через 8118; рекомендуемый уровень диагностики.
-# Намеренно НЕ включает:
-#   8 — show header parsing: пишет ЗНАЧЕНИЯ заголовков (auth/cookie) на диск → чувствительно,
-#       как 1 и 32768 (канон privacy-no-content-hash-on-disk); env-ускорение его не включает;
-#   32768 — raw-запросы с заголовками/телом — ручная правка конфига, не env-переключатель.
-PRIVOXY_DEBUG_LEVELS = frozenset({0, 1, 2})
+# Прокси-порты (8118/10808) — переехали в privoxy_helper_config (единственный потребитель
+# protected_config_text). Оставлены здесь как facade-алиасы для обратной совместимости атрибутов
+# (privoxy_system._PRIVOXY_PORT читается тестами и status()).
+_PRIVOXY_PORT = privoxy_helper_config._PRIVOXY_PORT
+_XRAY_SOCKS_PORT = privoxy_helper_config._XRAY_SOCKS_PORT
+
+# #152: разрешённые privoxy-уровни логирования (см. privoxy_helper_config.py docstring —
+# man-раздел 7.3 Debugging, битовые значения, канон probe-semantics-from-primary-source).
+PRIVOXY_DEBUG_LEVELS = privoxy_helper_config.PRIVOXY_DEBUG_LEVELS
 PRIVOXY_DEBUG_ENV = "SROUTER_PRIVOXY_DEBUG"
 
 
@@ -121,6 +143,17 @@ class ProtectedLayout:
     def lib_dir(self):
         return self.runtime_dir / "lib"
 
+    @property
+    def helper_modules_dir(self):
+        """Директория соседних helper-модулей (issue #287, tree-copy).
+
+        Производится от helper_path, а не отдельное поле — helper_main делает
+        sys.path.insert(0, Path(__file__).resolve().parent) и импортирует модули по
+        имени; helper_path и helper_modules_dir обязаны жить в одном родителе, иначе
+        entrypoint не найдёт соседей после install в /Library/PrivilegedHelperTools.
+        """
+        return self.helper_path.parent / f"{self.helper_path.name}.modules"
+
 
 DEFAULT_LAYOUT = ProtectedLayout()
 
@@ -129,68 +162,38 @@ def _now():
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
-def _run(cmd, timeout=30):
-    """Root-helper runner: argv only, deterministic result, never raises."""
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return {
-            "rc": proc.returncode,
-            "out": proc.stdout.strip(),
-            "err": proc.stderr.strip(),
-            "timeout": False,
-        }
-    except subprocess.TimeoutExpired as exc:
-        return {
-            "rc": None,
-            "out": (exc.stdout or "").strip() if isinstance(exc.stdout, str) else "",
-            "err": "timeout",
-            "timeout": True,
-        }
-    except OSError as exc:
-        return {"rc": None, "out": "", "err": f"{type(exc).__name__}: {exc}", "timeout": False}
-
-
-def _run_as_nobody(cmd, timeout=30):
-    """Выполняет cmd под euid/egid `nobody`, а не root.
-
-    Privoxy runtime копируется из user-writable Homebrew prefix (#122); подмена бинаря до
-    легитимного `protect --strict` иначе выполнилась бы с правами root внутри самого helper'а,
-    хотя итоговый LaunchDaemon и так запускает privoxy от `nobody`. config-test не требует root —
-    drop privileges здесь закрывает разницу между "скопировано под root" и "доверено выполнять как root".
-    """
-    nobody = pwd.getpwnam("nobody")
-
-    def _drop_privileges():
-        os.setgroups([])
-        os.setgid(nobody.pw_gid)
-        os.setuid(nobody.pw_uid)
-
-    try:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout,
-            preexec_fn=_drop_privileges if os.geteuid() == 0 else None,
-        )
-        return {
-            "rc": proc.returncode,
-            "out": proc.stdout.strip(),
-            "err": proc.stderr.strip(),
-            "timeout": False,
-        }
-    except subprocess.TimeoutExpired as exc:
-        return {
-            "rc": None,
-            "out": (exc.stdout or "").strip() if isinstance(exc.stdout, str) else "",
-            "err": "timeout",
-            "timeout": True,
-        }
-    except OSError as exc:
-        return {"rc": None, "out": "", "err": f"{type(exc).__name__}: {exc}", "timeout": False}
-
-
 def _result(ok, *, error="", **extra):
     return {"ok": bool(ok), "error": error, **extra}
 
 
+# ---- facade re-export: runner/launchd-обвязка (issue #287 → privoxy_helper_launchd.py) ----
+# Top-level import (см. заголовок модуля) — helper_tree-модули физически едут вместе с
+# entrypoint при tree-copy install, top-level импорт между НИМИ безопасен. Presence-имена
+# сохранены как атрибуты privoxy_system для обратной совместимости вызовов/тестов/patch-точек.
+_run = privoxy_helper_launchd._run
+_run_as_nobody = privoxy_helper_launchd._run_as_nobody
+_launchd_target = privoxy_helper_launchd._launchd_target
+_launchd_loaded = privoxy_helper_launchd._launchd_loaded
+_launchd_pid = privoxy_helper_launchd._launchd_pid
+_launchd_field = privoxy_helper_launchd._launchd_field
+_bootout = privoxy_helper_launchd._bootout
+_bootstrap = privoxy_helper_launchd._bootstrap
+_otool_dependencies = privoxy_helper_launchd._otool_dependencies
+
+
+def _port_open(port=_PRIVOXY_PORT):
+    return privoxy_helper_launchd._port_open(port)
+
+
+def _wait_port(expected, *, checker=_port_open, timeout=8.0, interval=0.1):
+    return privoxy_helper_launchd._wait_port(expected, checker=checker, timeout=timeout, interval=interval)
+
+
+def _install_runtime(source_binary, prefix, layout, *, runner=_run, chown=os.chown):
+    return privoxy_helper_launchd._install_runtime(source_binary, prefix, layout, runner=runner, chown=chown)
+
+
+# ---- facade re-export: protected-config/plist/manifest/policy (issue #287 → privoxy_helper_config.py) ----
 def protected_config_text(layout=DEFAULT_LAYOUT, debug=0):
     """Минимальная конфигурация bridge-only без user-writable action/filter files.
 
@@ -198,37 +201,11 @@ def protected_config_text(layout=DEFAULT_LAYOUT, debug=0):
     2=connections (приватно, ловит флап). Уровень вне whitelist PRIVOXY_DEBUG_LEVELS молча опускается
     до 0 — env-ускорение НЕ способно включить header-parsing (8, чувствительно) или raw-запросы (32768).
     """
-    debug = debug if debug in PRIVOXY_DEBUG_LEVELS else 0
-    debug_line = f"debug {debug}\n" if debug else ""
-    return (
-        f"# {PROTECTED_MARKER}\n"
-        "# Управляется только: srouter privoxy ...\n"
-        f"confdir {layout.config_dir}\n"
-        f"templdir {layout.templates_dir}\n"
-        f"logdir {layout.log_dir}\n"
-        "logfile logfile\n"
-        f"{debug_line}"
-        f"listen-address 127.0.0.1:{_PRIVOXY_PORT}\n"
-        "toggle 1\n"
-        "enable-remote-toggle 0\n"
-        "enable-edit-actions 0\n"
-        "enforce-blocks 0\n"
-        "buffer-limit 4096\n"
-        f"forward-socks5t / 127.0.0.1:{_XRAY_SOCKS_PORT} .\n"
-    )
+    return privoxy_helper_config.protected_config_text(layout, debug=debug)
 
 
 def _config_directives(text):
-    directives = {}
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        parts = line.split(None, 1)
-        if len(parts) != 2 or parts[0] in directives:
-            raise ValueError(f"bad or duplicate directive: {line[:80]}")
-        directives[parts[0]] = parts[1].strip()
-    return directives
+    return privoxy_helper_config._config_directives(text)
 
 
 def validate_protected_config(text, layout=DEFAULT_LAYOUT, debug=0):
@@ -238,574 +215,68 @@ def validate_protected_config(text, layout=DEFAULT_LAYOUT, debug=0):
     чтобы staged_config с `debug 2` прошёл точный exact-match. Контракт остаётся строгим
     (got != expected); параметризуется только уровень debug.
     """
-    if not isinstance(text, str) or len(text.encode("utf-8")) > 64 * 1024:
-        return _result(False, error="config_size_invalid")
-    if PROTECTED_MARKER not in text:
-        return _result(False, error="config_marker_missing")
-    try:
-        got = _config_directives(text)
-        expected = _config_directives(protected_config_text(layout, debug=debug))
-    except ValueError as exc:
-        return _result(False, error=str(exc))
-    if got != expected:
-        unexpected = sorted(set(got) - set(expected))
-        missing = sorted(set(expected) - set(got))
-        changed = sorted(k for k in set(got) & set(expected) if got[k] != expected[k])
-        return _result(False, error="config_contract_mismatch",
-                       unexpected=unexpected, missing=missing, changed=changed)
-    return _result(True)
+    result = privoxy_helper_config.validate_protected_config(text, layout, debug=debug)
+    return _result(result["ok"], error=result.get("error", ""),
+                   **{k: v for k, v in result.items() if k not in ("ok", "error")})
 
 
 def launchdaemon_bytes(prefix="/opt/homebrew", layout=DEFAULT_LAYOUT):
-    payload = {
-        "Label": SYSTEM_LABEL,
-        "ProgramArguments": [str(layout.binary_path), "--no-daemon", str(layout.config_path)],
-        "UserName": "nobody",
-        "GroupName": "nobody",
-        "RunAtLoad": True,
-        "KeepAlive": True,
-        "ProcessType": "Background",
-        "ThrottleInterval": 5,
-        "WorkingDirectory": str(layout.config_dir),
-        "StandardOutPath": str(layout.stdout_path),
-        "StandardErrorPath": str(layout.stderr_path),
-    }
-    raw = plistlib.dumps(payload, fmt=plistlib.FMT_XML, sort_keys=False)
-    marker = f"<!-- {PROTECTED_MARKER} -->\n".encode()
-    return raw.replace(b"?>\n", b"?>\n" + marker, 1)
+    # prefix не используется телом (наследие исходной сигнатуры) — см. privoxy_helper_config.
+    return privoxy_helper_config.launchdaemon_bytes(prefix, layout)
 
 
 def _managed_file(path, marker):
-    try:
-        return marker in Path(path).read_text(encoding="utf-8", errors="ignore")[:16384]
-    except OSError:
-        return False
+    return privoxy_helper_config._managed_file(path, marker)
 
 
 def protection_present(layout=DEFAULT_LAYOUT):
-    return (_managed_file(layout.launchdaemon_path, PROTECTED_MARKER)
-            and _managed_file(layout.config_path, PROTECTED_MARKER))
+    return privoxy_helper_config.protection_present(layout)
 
 
-def _launchd_target(domain, label):
-    return f"{domain}/{label}"
-
-
-def _launchd_loaded(domain, label, runner=_run):
-    result = runner([LAUNCHCTL, "print", _launchd_target(domain, label)], 5)
-    return result.get("rc") == 0 and bool((result.get("out") or "").strip())
-
-
-def _launchd_pid(domain, label, runner=_run):
-    result = runner([LAUNCHCTL, "print", _launchd_target(domain, label)], 5)
-    if result.get("rc") != 0:
-        return None
-    raw = _launchd_field(result.get("out") or "", "pid")
-    try:
-        return int(raw) if raw is not None else None
-    except ValueError:
-        return None
-
-
-def _port_open(port=_PRIVOXY_PORT):
-    try:
-        with socket.create_connection(("127.0.0.1", port), timeout=0.25):
-            return True
-    except OSError:
-        return False
-
-
-def _wait_port(expected, *, checker=_port_open, timeout=8.0, interval=0.1):
-    deadline = time.monotonic() + timeout
-    state = bool(checker())
-    while state != expected and time.monotonic() < deadline:
-        time.sleep(interval)
-        state = bool(checker())
-    return state == expected
-
-
-def _fchown_if_privileged(fd, uid, gid):
-    """fchown по fd ТОЛЬКО под root. fd-pinning (#148): метаданные выставляются по fd,
-    а не по пути — закрывает TOCTOU arbitrary-chown (path-based chown следует symlink).
-
-    Под non-root (тесты без sudo) fchown(0,0) дал бы EPERM и пропускается: реальный
-    chown невозможен без привилегий, security-инвариант не нарушается (production
-    helper всегда работает под root через sudo — там fchown обязателен и выполнится).
-    """
-    if os.geteuid() != 0:
-        return
-    os.fchown(fd, uid, gid)
-
-
-def _atomic_write(path, data, *, mode, uid=0, gid=0, chown=os.chown):
-    """Race-free atomic write: непредсказуемое temp-имя + O_EXCL + fchmod/fchown по fd.
-
-    Прежний temp `.name.tmp-PID` был предсказуем и жил в user-writable директории (при restore
-    user_plist это ~/Library/LaunchAgents) — атакующий подкладывал symlink с этим именем на
-    произвольный root-path, и open(temp, "wb") + chmod + chown, следуя symlink, писали/меняли
-    владельца цели (arbitrary root file write). tempfile.mkstemp даёт криптографически
-    случайное имя и создаёт файл атомарно с O_EXCL. КРИТИЧНО (#148): fchmod/fchown работают
-    по fd, а НЕ по пути. Прежний код закрывал fd через fdopen и затем звал os.chmod(temp)/
-    chown(temp) по пути — между fd-close и chmod/chown владелец parent-каталога мог
-    переименовать temp и поставить symlink с тем же именем на произвольную цель, и
-    os.chmod/chown (по умолчанию следующие symlink) меняли владельца цели (arbitrary chown).
-    Теперь fd держится открытым до конца и метаданные выставляются по fd (TOCTOU-окна нет).
-    os.replace(temp, path) безопасен по имени: temp-имя непредсказуемо, атакующий не может
-    его подменить; path — финальная цель, переименование атомарно и не даёт arbitrary chown.
-
-    Параметр `chown` сохранён в сигнатуре для обратной совместимости вызовов; fd-pinning
-    делает его избыточным (используется os.fchown). Под non-root (тесты без sudo) fchown(0,0)
-    дал бы EPERM и пропускается — под root (production) chown обязателен.
-    """
-    del chown  # fd-pinning: chown делается через os.fchown(fd), path-based хук более не нужен.
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(
-        dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
-    )
-    temp = Path(tmp_name)
-    try:
-        # НЕ передаём closefd=True — fd должен жить для fchmod/fchown после flush.
-        with os.fdopen(fd, "wb", closefd=False) as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        # Метаданные — по fd, а не по пути. fchmod/fchown не следуют symlink и не
-        # делают path-resolution: даже если temp-путь подменён symlink'ом на чужую
-        # цель, fd всё ещё указывает на оригинальный regular-файл mkstemp (#148).
-        os.fchmod(fd, mode)
-        _fchown_if_privileged(fd, uid, gid)
-        # Переименование по имени безопасно: temp-имя непредсказуемо (атакующий не
-        # знает его), path — финальная цель; rename атомарен и не открывает
-        # TOCTOU-окно для arbitrary chown.
-        os.replace(temp, path)
-        temp = None  # успех — не удалять в finally.
-        return True
-    except OSError:
-        if temp is not None:
-            try:
-                os.unlink(temp)
-            except OSError:
-                pass
-        return False
-    finally:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
+# ---- facade re-export: fd-pinning примитивы (issue #287 → privoxy_helper_fs.py) ----
+_fchown_if_privileged = privoxy_helper_fs._fchown_if_privileged
+_atomic_write = privoxy_helper_fs._atomic_write
+_read_regular_nofollow = privoxy_helper_fs._read_regular_nofollow
+_copy_file_nofollow = privoxy_helper_fs._copy_file_nofollow
+_read_fd_regular = privoxy_helper_fs._read_fd_regular
+_read_all_fd = privoxy_helper_fs._read_all_fd
+_copy_tree_fd = privoxy_helper_fs._copy_tree_fd
+_copy_tree_nofollow = privoxy_helper_fs._copy_tree_nofollow
+_reject_symlinks_in_tree = privoxy_helper_fs._reject_symlinks_in_tree
+_restore_file = privoxy_helper_fs._restore_file
+_backup_existing = privoxy_helper_fs._backup_existing
 
 
 def _safe_staged_config(path, uid, layout=DEFAULT_LAYOUT, debug=0):
-    path = Path(path)
-    try:
-        info = path.lstat()
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-            return _result(False, error="staged_config_not_regular")
-        if info.st_uid != uid:
-            return _result(False, error="staged_config_wrong_owner")
-        if info.st_mode & 0o022:
-            return _result(False, error="staged_config_writable_by_others")
-        if info.st_size > 64 * 1024:
-            return _result(False, error="staged_config_too_large")
-        text = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeError) as exc:
-        return _result(False, error=f"staged_config_unreadable: {exc}")
-    checked = validate_protected_config(text, layout, debug=debug)
-    if not checked["ok"]:
-        return checked
-    return _result(True, text=text)
+    result = privoxy_helper_config._safe_staged_config(path, uid, layout, debug=debug)
+    return _result(result["ok"], error=result.get("error", ""),
+                   **{k: v for k, v in result.items() if k not in ("ok", "error")})
 
 
 def _copy_templates(source, target, *, chown=os.chown):
-    """Копирует Homebrew templates-каталог в root-owned target (race-free одним проходом).
-
-    `source` — user-writable Homebrew prefix (#122). Копирование идёт через _copy_tree_nofollow:
-    каждый файл читается через open(O_NOFOLLOW)+fstat (symlink отвергается до чтения содержимого),
-    копируется атомарно. Никакого отдельного pre-scan-прохода перед copytree — TOCTOU-окна
-    между проверкой и копированием нет, проверка и копирование элемента — одна fd-операция.
-    """
-    source, target = Path(source), Path(target)
-    if not source.is_dir():
-        return False
-    temp = Path(tempfile.mkdtemp(dir=str(target.parent), prefix=f".{target.name}.", suffix=".tmp"))
-    try:
-        staged = temp / target.name
-        if not _copy_tree_nofollow(source, staged, chown=chown):
-            raise RuntimeError("templates_copy_rejected_symlink")
-        if target.exists():
-            shutil.rmtree(target)
-        os.replace(staged, target)
-        return True
-    except (OSError, RuntimeError):
-        try:
-            if temp.exists():
-                shutil.rmtree(temp)
-        except OSError:
-            pass
-        return False
-    finally:
-        try:
-            if temp.exists():
-                shutil.rmtree(temp)
-        except OSError:
-            pass
+    return privoxy_helper_config._copy_templates(source, target, chown=chown)
 
 
-def _otool_dependencies(path, runner=_run):
-    result = runner([OTOOL, "-L", str(path)], 10)
-    if result.get("rc") != 0:
-        return _result(False, error=f"otool_failed:{(result.get('err') or '')[:160]}")
-    dependencies = []
-    for line in (result.get("out") or "").splitlines()[1:]:
-        value = line.strip().split(" (", 1)[0]
-        if value:
-            dependencies.append(value)
-    return _result(True, dependencies=dependencies)
-
-
-def _install_runtime(source_binary, prefix, layout, *, runner=_run, chown=os.chown):
-    """Copy and relink Privoxy so the protected service never executes user-owned Homebrew files.
-
-    Sources (Homebrew binary/dylib) — user-writable prefix (#122). Копирование через
-    _copy_file_nofollow: source открывается с O_NOFOLLOW (symlink отвергается до чтения
-    содержимого), копируется атомарно. Прежний copy2(follow_symlinks=True) разыменовывал
-    symlink и копировал содержимое root-only цели как root-owned executable (0755) —
-    arbitrary-root-readable-file-disclosure + потенциально attacker-controlled Mach-O.
-    """
-    pcre_dir = Path(prefix) / "opt" / "pcre2" / "lib"
-    sources = {
-        "privoxy": Path(source_binary),
-        "libpcre2-8.0.dylib": pcre_dir / "libpcre2-8.0.dylib",
-        "libpcre2-posix.3.dylib": pcre_dir / "libpcre2-posix.3.dylib",
-    }
-    # lstat-проверка (НЕ stat/is_file, которые следуют symlink) только для раннего missing-отчёта;
-    # реальная защита — в _copy_file_nofollow ниже.
-    missing = sorted(name for name, path in sources.items() if not path.exists())
-    if missing:
-        return _result(False, error=f"protected_runtime_source_missing:{','.join(missing)}")
-
-    temp = layout.runtime_dir.with_name(f".{layout.runtime_dir.name}.tmp-{os.getpid()}")
-    try:
-        if temp.exists():
-            shutil.rmtree(temp)
-        temp_bin = temp / "bin"
-        temp_lib = temp / "lib"
-        temp_bin.mkdir(parents=True)
-        temp_lib.mkdir()
-        targets = {
-            "privoxy": temp_bin / "privoxy",
-            "libpcre2-8.0.dylib": temp_lib / "libpcre2-8.0.dylib",
-            "libpcre2-posix.3.dylib": temp_lib / "libpcre2-posix.3.dylib",
-        }
-        for name, source in sources.items():
-            if not _copy_file_nofollow(source, targets[name], mode=0o755, chown=chown):
-                return _result(False, error=f"runtime_source_not_regular:{name}")
-        for directory in (temp, temp_bin, temp_lib):
-            os.chmod(directory, 0o755)
-            chown(directory, 0, 0)
-
-        final_libraries = {
-            name: str(layout.lib_dir / name)
-            for name in ("libpcre2-8.0.dylib", "libpcre2-posix.3.dylib")
-        }
-        for name, target in targets.items():
-            dependencies = _otool_dependencies(target, runner)
-            if not dependencies["ok"]:
-                return dependencies
-            for dependency in dependencies["dependencies"]:
-                replacement = final_libraries.get(Path(dependency).name)
-                if replacement and dependency != replacement:
-                    changed = runner(
-                        [INSTALL_NAME_TOOL, "-change", dependency, replacement, str(target)],
-                        10,
-                    )
-                    if changed.get("rc") != 0:
-                        return _result(False, error=f"runtime_relink_failed:{name}")
-            if name != "privoxy":
-                changed_id = runner(
-                    [INSTALL_NAME_TOOL, "-id", final_libraries[name], str(target)],
-                    10,
-                )
-                if changed_id.get("rc") != 0:
-                    return _result(False, error=f"runtime_id_relink_failed:{name}")
-
-        for name, target in targets.items():
-            signed = runner([CODESIGN, "--force", "--sign", "-", str(target)], 15)
-            if signed.get("rc") != 0:
-                return _result(False, error=f"runtime_codesign_failed:{name}")
-            verified = runner([CODESIGN, "--verify", "--strict", str(target)], 10)
-            if verified.get("rc") != 0:
-                return _result(False, error=f"runtime_signature_invalid:{name}")
-
-        for name, target in targets.items():
-            dependencies = _otool_dependencies(target, runner)
-            if not dependencies["ok"]:
-                return dependencies
-            unsafe = [item for item in dependencies["dependencies"]
-                      if item.startswith(("/opt/homebrew/", "/usr/local/"))]
-            if unsafe:
-                return _result(False, error=f"runtime_user_owned_dependency:{name}")
-
-        if layout.runtime_dir.exists():
-            shutil.rmtree(layout.runtime_dir)
-        os.replace(temp, layout.runtime_dir)
-        return _result(True)
-    except OSError as exc:
-        return _result(False, error=f"runtime_install_failed:{exc}")
-    finally:
-        if temp.exists():
-            shutil.rmtree(temp, ignore_errors=True)
-
-
-def _read_regular_nofollow(path, *, max_size=8 * 1024 * 1024):
-    """Race-free чтение: O_NOFOLLOW делает check (не symlink) и use (чтение) одним syscall.
-
-    lstat()-затем-copy2() (прежний подход) оставляет TOCTOU-окно: атакующий меняет
-    regular-file на symlink к root-only секрету МЕЖДУ проверкой и копированием. open(O_NOFOLLOW)
-    атомарно проваливается с ELOOP, если путь уже symlink — окна для подмены не существует,
-    т.к. это единственный syscall, который и проверяет, и открывает.
-    """
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
-    try:
-        fd = os.open(str(path), flags)
-    except OSError as exc:
-        raise RuntimeError(f"backup_source_open_failed:{path}:{exc}") from exc
-    try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode):
-            raise RuntimeError(f"backup_source_not_regular:{path}")
-        if info.st_size > max_size:
-            raise RuntimeError(f"backup_source_too_large:{path}")
-        with os.fdopen(fd, "rb", closefd=True) as handle:
-            fd = -1  # fdopen приняла владение fd; не закрывать повторно в finally.
-            return handle.read()
-    finally:
-        if fd >= 0:
-            os.close(fd)
-
-
-def _copy_file_nofollow(src, dst, *, mode, chown=os.chown, max_size=64 * 1024 * 1024):
-    """Race-free копирование regular-файла без разыменования symlink.
-
-    Единый примитив для копирования user-controlled файлов в защищаемую root-зону (templates,
-    Privoxy binary/dylib). Чтение source — через _read_regular_nofollow (open(O_NOFOLLOW)+fstat:
-    symlink отвергается атомарно, содержимое root-only цели не читается), запись dst — через
-    _atomic_write (непредсказуемое temp-имя, O_EXCL). Прежний copy2(follow_symlinks=True) /
-    copytree(symlinks=False) разыменовывали symlink и копировали содержимое цели — arbitrary
-    root-readable-file-disclosure (templates → 0644; binary/dylib → 0755 executable).
-    Возвращает True при успехе, False при отказе (symlink/non-regular/нет файла).
-    """
-    src = Path(src)
-    dst = Path(dst)
-    try:
-        data = _read_regular_nofollow(src, max_size=max_size)
-    except RuntimeError:
-        return False
-    return _atomic_write(dst, data, mode=mode, uid=0, gid=0, chown=chown)
-
-
-def _read_fd_regular(fd, *, max_size=8 * 1024 * 1024):
-    """Прочитать regular-файл по fd (TOCTOU-свободно: fd уже открыт).
-
-    fstat по fd не делает path-resolution. Размер/тип проверяются по fstat того же fd,
-    что и читается — окна для подмены нет (используется в fd-tree-traversal, #148).
-    """
-    info = os.fstat(fd)
-    if not stat.S_ISREG(info.st_mode):
-        raise RuntimeError(f"fd_not_regular:mode={oct(info.st_mode)}")
-    if info.st_size > max_size:
-        raise RuntimeError(f"fd_too_large:{info.st_size}")
-    return _read_all_fd(fd, info.st_size)
-
-
-def _read_all_fd(fd, expected_size):
-    """Прочитать всё содержимое fd чанками (fd уже past-stat, контент мог измениться —
-    читаем до EOF, но отсекаем runaway-рост после fstat)."""
-    chunks = []
-    total = 0
-    while True:
-        chunk = os.read(fd, 1 << 20)
-        if not chunk:
-            break
-        chunks.append(chunk)
-        total += len(chunk)
-        if total > expected_size + (1 << 20):
-            # Файл вырос после fstat (гонка записи) — не копировать растущий объект.
-            raise RuntimeError(f"fd_grew_after_stat:{total}>{expected_size}")
-    return b"".join(chunks)
-
-
-def _copy_tree_fd(src_fd, dst, *, dir_mode, file_mode):
-    """fd-relative рекурсивное копирование дерева (TOCTOU-свободно, #148).
-
-    src_fd — уже открытый O_NOFOLLOW|O_DIRECTORY дескриптор корня. Каждый элемент
-    открывается через openat (os.open с dir_fd=src_fd) с O_NOFOLLOW: путь `name`
-    разрешается относительно зафиксированного src_fd, а НЕ повторным разрешением
-    полного src/name. Даже если атакующий атомарно подменит src-каталог на symlink
-    между lstat-root и перечислением — openat берёт name из уже открытого src_fd,
-    повторного path-resolution нет. symlink/non-regular child отвергается O_NOFOLLOW.
-
-    dst (root-owned protected зона) НЕ user-controlled: path-based mkdir/chmod/chown
-    на dst безопасны и не открывают TOCTOU (атакующий не контролирует dst-путь).
-    """
-    dst.mkdir(parents=True, exist_ok=True)
-    os.chmod(dst, dir_mode)
-    if os.geteuid() == 0:
-        os.chown(dst, 0, 0)
-    for name in sorted(os.listdir(src_fd)):
-        child_fd = os.open(
-            name,
-            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
-            dir_fd=src_fd,
-        )
-        try:
-            info = os.fstat(child_fd)
-            dst_child = dst / name
-            if stat.S_ISDIR(info.st_mode):
-                if not _copy_tree_fd(child_fd, dst_child, dir_mode=dir_mode,
-                                     file_mode=file_mode):
-                    return False
-            elif stat.S_ISREG(info.st_mode):
-                try:
-                    data = _read_fd_regular(child_fd)
-                except RuntimeError:
-                    return False
-                if not _atomic_write(dst_child, data, mode=file_mode):
-                    return False
-            else:
-                return False  # non-regular (symlink уже отсечён O_NOFOLLOW; fifo/socket/device) — отказ.
-        finally:
-            os.close(child_fd)
-    return True
-
-
-def _copy_tree_nofollow(src, dst, *, dir_mode=0o755, file_mode=0o644, chown=os.chown):
-    """Race-free копирование дерева без разыменования symlink (полный fd-pinning, #148).
-
-    Прежний _copy_templates звал _reject_symlinks_in_tree (отдельный lstat-проход) и затем
-    copytree — между ними TOCTOU-окно. Дальнейшая fd-relative версия делала src.lstat()
-    корня и затем os.listdir(src)/src_entry.lstat() ПО ПУТИ — между lstat(root) и listdir
-    атакующий атомарно подменял src на symlink к root-only дереву, и listdir по пути шёл
-    по symlink, читая чужое содержимое как 0644 world-readable.
-
-    Теперь: root открывается ОДНИМ syscall os.open(O_NOFOLLOW|O_DIRECTORY) (отказ, если
-    root сам symlink), перечисление — os.listdir(dir_fd), каждый child — через openat
-    (os.open с dir_fd=root_fd, O_NOFOLLOW). Повторного path-resolution полного src-пути
-    нет нигде — TOCTOU-окно между проверкой и travers'ом закрыто.
-    """
-    del chown  # fd-pinning: владельца dst выставляет _copy_tree_fd (inline os.chown под root), path-based хук не нужен.
-    src = Path(src)
-    dst = Path(dst)
-    try:
-        root_fd = os.open(
-            str(src),
-            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_DIRECTORY", 0)
-            | getattr(os, "O_CLOEXEC", 0),
-        )
-    except OSError:
-        return False  # root — symlink/не-каталог/нет файла (O_NOFOLLOW|O_DIRECTORY отвергает одним syscall).
-    try:
-        return _copy_tree_fd(root_fd, dst, dir_mode=dir_mode, file_mode=file_mode)
-    finally:
-        os.close(root_fd)
-
-
-def _backup_existing(path, backup_dir, name, *, chown=os.chown):
-    """Backup только regular-файла/директории, НЕ symlink (race-free через fd).
-
-    `path` (например user_plist в ~/Library/LaunchAgents) до sudo-подтверждения полностью
-    под контролем непривилегированного пользователя. root-процесс не должен читать/копировать
-    содержимое ПО symlink — иначе backup (и позже restore) превращается в arbitrary-root-file-read
-    примитив: подмени plist на symlink к root-only секрету → protect скопирует его в backup_dir →
-    unprotect --restore запишет его содержимое обратно пользователю с 0644 (#122 privileged boundary).
-    """
-    path = Path(path)
-    try:
-        info = path.lstat()
-    except OSError:
-        return ""
-    if stat.S_ISDIR(info.st_mode):
-        _reject_symlinks_in_tree(path)
-        target = Path(backup_dir) / name
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(path, target, symlinks=False)
-        return str(target)
-    if not stat.S_ISREG(info.st_mode):
-        raise RuntimeError(f"backup_source_not_regular:{path}")
-    data = _read_regular_nofollow(path)
-    target = Path(backup_dir) / name
-    target.parent.mkdir(parents=True, exist_ok=True)
-    if not _atomic_write(target, data, mode=0o600, uid=0, gid=0, chown=chown):
-        raise RuntimeError(f"backup_write_failed:{path}")
-    return str(target)
-
-
-def _reject_symlinks_in_tree(root):
-    """lstat каждого элемента дерева ДО копирования — ни один symlink не должен быть скопирован.
-
-    `copytree(symlinks=False)` разыменовывает symlink внутри дерева и материализует содержимое
-    его цели как обычный файл (задокументированное поведение shutil, не баг) — для user-writable
-    дерева (Homebrew templates) это arbitrary-root-readable-file-disclosure: подложи symlink на
-    root-only секрет внутри templates/ → root-хелпер скопирует его содержимое как root-owned
-    world-readable файл. Валидация всего дерева ДО copytree закрывает это до чтения содержимого.
-    """
-    root = Path(root)
-    top_info = root.lstat()
-    if stat.S_ISLNK(top_info.st_mode):
-        raise RuntimeError(f"tree_root_is_symlink:{root}")
-    for current, dirs, files in os.walk(root, followlinks=False):
-        current_path = Path(current)
-        for name in dirs:
-            info = (current_path / name).lstat()
-            if stat.S_ISLNK(info.st_mode):
-                raise RuntimeError(f"tree_contains_symlink_dir:{current_path / name}")
-        for name in files:
-            info = (current_path / name).lstat()
-            if stat.S_ISLNK(info.st_mode):
-                raise RuntimeError(f"tree_contains_symlink_file:{current_path / name}")
-            if not stat.S_ISREG(info.st_mode):
-                raise RuntimeError(f"tree_contains_non_regular_file:{current_path / name}")
-
-
-def _restore_file(backup, target, *, uid, gid, mode, chown=os.chown):
-    if not backup:
-        return False
-    try:
-        data = _read_regular_nofollow(backup)
-    except RuntimeError:
-        return False
-    return _atomic_write(target, data, mode=mode, uid=uid, gid=gid, chown=chown)
-
-
-def _bootout(domain, label, runner=_run):
-    return runner([LAUNCHCTL, "bootout", _launchd_target(domain, label)], 15)
-
-
-def _bootstrap(domain, plist_path, runner=_run):
-    return runner([LAUNCHCTL, "bootstrap", domain, str(plist_path)], 20)
-
-
+# ---- facade re-export: sudoers/identity/prefix/manifest policy (issue #287 → privoxy_helper_config.py) ----
 def _sudoers_text(username):
-    return (
-        f"# {SUDOERS_MARKER}\n"
-        "# Явное подтверждение требуется для каждого sudo: агенты не используют timestamp cache.\n"
-        f"Defaults:{username} timestamp_timeout=0\n"
-    )
+    return privoxy_helper_config._sudoers_text(username)
 
 
 def _valid_identity(username, uid):
-    if not re.fullmatch(r"[A-Za-z0-9_.-]+", username or ""):
-        return None
-    try:
-        record = pwd.getpwnam(username)
-    except KeyError:
-        return None
-    return record if record.pw_uid == uid else None
+    return privoxy_helper_config._valid_identity(username, uid)
 
 
 def _allowed_prefix(prefix):
-    resolved = str(Path(prefix))
-    return resolved if resolved in {"/opt/homebrew", "/usr/local"} else ""
+    return privoxy_helper_config._allowed_prefix(prefix)
+
+
+def _load_manifest(layout=DEFAULT_LAYOUT):
+    return privoxy_helper_config._load_manifest(layout)
+
+
+def _verify_managed_assets(layout=DEFAULT_LAYOUT):
+    result = privoxy_helper_config._verify_managed_assets(layout)
+    return _result(result["ok"], error=result.get("error", ""))
 
 
 def _privoxy_debug_from_env():
@@ -1058,25 +529,6 @@ def protect_as_root(*, username, uid, prefix, staged_config, layout=DEFAULT_LAYO
         return _result(False, error=error, backup_dir=str(backup_dir))
 
 
-def _load_manifest(layout=DEFAULT_LAYOUT):
-    try:
-        value = json.loads(layout.manifest_path.read_text(encoding="utf-8"))
-        return value if isinstance(value, dict) else None
-    except (OSError, ValueError):
-        return None
-
-
-def _verify_managed_assets(layout=DEFAULT_LAYOUT):
-    for path, marker in (
-        (layout.launchdaemon_path, PROTECTED_MARKER),
-        (layout.config_path, PROTECTED_MARKER),
-        (layout.sudoers_path, SUDOERS_MARKER),
-    ):
-        if path.exists() and not _managed_file(path, marker):
-            return _result(False, error=f"protected_asset_drift:{path}")
-    return _result(True)
-
-
 def unprotect_as_root(*, restore=True, layout=DEFAULT_LAYOUT, runner=_run,
                       checker=_port_open, chown=os.chown, enforce_root=True):
     if enforce_root and os.geteuid() != 0:
@@ -1136,6 +588,12 @@ def unprotect_as_root(*, restore=True, layout=DEFAULT_LAYOUT, runner=_run,
             shutil.rmtree(layout.config_dir)
         if layout.helper_path.exists() and _managed_file(layout.helper_path, HELPER_MARKER):
             layout.helper_path.unlink()
+            # #287 tree-copy: helper_modules_dir — соседи entrypoint (privoxy_helper_*.py),
+            # не несут собственного marker'а (см. _helper_tree_has_marker_fd — marker
+            # проверяется только в entrypoint). Удаляем её ВМЕСТЕ с entrypoint, guard'ится
+            # тем же marker-check на entrypoint выше — чужую/неуправляемую директорию не тронем.
+            if layout.helper_modules_dir.is_dir():
+                shutil.rmtree(layout.helper_modules_dir, ignore_errors=True)
     except OSError as exc:
         return _result(False, error=f"protected_assets_remove_failed:{exc}")
     return _result(True, restored=restored, backup_dir=manifest.get("backup_dir", ""))
@@ -1187,52 +645,6 @@ def control_as_root(action, *, layout=DEFAULT_LAYOUT, runner=_run,
     return _result(True, changed=True)
 
 
-def _launchd_field(output, key):
-    match = re.search(rf"^\s*{re.escape(key)}\s*=\s*(.*?)\s*;?\s*$", output or "", re.MULTILINE)
-    return match.group(1) if match else None
-
-
-def _read_helper_bytes_pinned():
-    """Открыть __file__ через O_NOFOLLOW, прочитать bytes, проверить marker и вычислить digest.
-
-    marker-check и digest делаются на bytes одного и того же fd — TOCTOU-окна между
-    проверкой и использованием нет. Возвращает (bytes, digest) или (None, None) если
-    файл не regular / нет marker'а.
-    """
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
-    try:
-        fd = os.open(__file__, flags)
-    except OSError:
-        return None, None
-    try:
-        try:
-            data = _read_fd_regular(fd, max_size=4 * 1024 * 1024)
-        except RuntimeError:
-            return None, None
-    finally:
-        os.close(fd)
-    if HELPER_MARKER.encode() not in data[:16384]:
-        return None, None
-    return data, hashlib.sha256(data).hexdigest()
-
-
-def _helper_has_marker_fd(path):
-    """Проверка marker на fd-чтении path (не path-based read_text — TOCTOU-свободно)."""
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
-    try:
-        fd = os.open(str(path), flags)
-    except OSError:
-        return False
-    try:
-        try:
-            data = _read_fd_regular(fd, max_size=4 * 1024 * 1024)
-        except RuntimeError:
-            return False
-    finally:
-        os.close(fd)
-    return HELPER_MARKER.encode() in data[:16384]
-
-
 def _digest_fd_nofollow(path):
     """sha256 по fd (O_NOFOLLOW). None если файл не открывается / не regular."""
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
@@ -1250,34 +662,113 @@ def _digest_fd_nofollow(path):
     return hashlib.sha256(data).hexdigest()
 
 
-def _stage_helper_bytes(data):
-    """Записать helper bytes в staged temp в /private/tmp (fd-pinning: fchmod/fchown по fd).
+def _read_file_pinned(path, *, max_size=4 * 1024 * 1024):
+    """Открыть path через O_NOFOLLOW, прочитать bytes + digest одним fd (TOCTOU-свободно).
 
-    temp живёт в /private/tmp (sticky), имя непредсказуемо (mkstemp O_EXCL). ВАЖНО
-    (#148): _stage_helper_bytes вызывается в user-процессе `protect()`, НЕ под sudo —
-    поэтому mkstemp создаёт USER-owned файл (fchown no-op'ит под non-root). staged
-    user-owned/writable в окне [mkstemp .. sudo install]. Эта подмена НЕ небезопасна:
-    post-install digest-check в _install_helper ловит любое расхождение staged↔__file__
-    (install копирует staged байт-в-байт, digest dst сравнивается с честным __file__).
-    Возвращает Path temp или None при ошибке.
+    Общий примитив для tree digest-pinning (issue #287): и entrypoint, и каждый
+    HELPER_TREE_MODULES-файл читаются через один и тот же паттерн — открытие с
+    O_NOFOLLOW делает symlink-check и чтение содержимого одной операцией, digest
+    считается на bytes ТОГО ЖЕ fd, что и прочитаны — окна между проверкой и
+    использованием нет (тот же инвариант, что был у прежнего однофайлового
+    _read_helper_bytes_pinned, #148). Возвращает (bytes, digest) или (None, None).
     """
-    fd, tmp_name = tempfile.mkstemp(prefix="srouter-helper-", suffix=".py", dir="/private/tmp")
-    temp = Path(tmp_name)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
     try:
-        with os.fdopen(fd, "wb", closefd=False) as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.fchmod(fd, 0o755)
-        _fchown_if_privileged(fd, 0, 0)
-        return temp
+        fd = os.open(str(path), flags)
+    except OSError:
+        return None, None
+    try:
+        try:
+            data = _read_fd_regular(fd, max_size=max_size)
+        except RuntimeError:
+            return None, None
+    finally:
+        os.close(fd)
+    return data, hashlib.sha256(data).hexdigest()
+
+
+def _read_helper_tree_pinned():
+    """Прочитать entrypoint (__file__) + все HELPER_TREE_MODULES из его директории, пиновым digest.
+
+    tree-copy redesign (issue #287) заменяет прежний однофайловый _read_helper_bytes_pinned:
+    helper — уже не один файл, а entrypoint + N соседних модулей (privoxy_helper_fs.py и т.п.),
+    которые install обязан скопировать ВМЕСТЕ с тем же TOCTOU-инвариантом на КАЖДЫЙ файл.
+
+    Marker (HELPER_MARKER) проверяется ТОЛЬКО в entrypoint — соседние модули не несут
+    самостоятельного marker'а (они не исполняются напрямую через sudo <path>, только
+    импортом из entrypoint после sys.path-prepend), но их digest пиннится наравне с
+    entrypoint: любая подмена соседа между "честным чтением здесь" и "install под sudo"
+    обязана быть поймана post-install digest-check по каждому файлу дерева, не только по
+    entrypoint (иначе tree-copy деградировал бы до single-file security).
+
+    Возвращает dict {relative_name: (bytes, digest)} для entrypoint (ключ — basename __file__)
+    и каждого модуля, или None целиком при любой ошибке (отсутствующий файл, symlink,
+    non-regular, missing marker) — fail-closed: неполное дерево не считается валидным.
+    """
+    root = Path(__file__).resolve().parent
+    entry_name = Path(__file__).name
+    entry_data, entry_digest = _read_file_pinned(root / entry_name)
+    if entry_data is None or HELPER_MARKER.encode() not in entry_data[:16384]:
+        return None
+    tree = {entry_name: (entry_data, entry_digest)}
+    for module_name in HELPER_TREE_MODULES:
+        data, digest = _read_file_pinned(root / module_name)
+        if data is None:
+            return None  # неполное дерево — fail-closed, а не partial install.
+        tree[module_name] = (data, digest)
+    return tree
+
+
+def _helper_tree_has_marker_fd(path):
+    """Проверка marker на fd-чтении entrypoint-path (не path-based read_text — TOCTOU-свободно)."""
+    data, _ = _read_file_pinned(path)
+    if data is None:
+        return False
+    return HELPER_MARKER.encode() in data[:16384]
+
+
+def _stage_helper_tree(tree):
+    """Записать helper-дерево в staged root в /private/tmp (fd-pinning per-file write).
+
+    `tree` — dict {relname: (bytes, digest)} от _read_helper_tree_pinned. Layout staged root:
+      <staged_root>/<entrypoint-name>          — entrypoint bytes (0755, как раньше)
+      <staged_root>/modules/<module-name>      — каждый HELPER_TREE_MODULES-файл (0644: НЕ
+                                                  исполняется напрямую, только импортируется)
+
+    ВАЖНО (#148 variant 3, унаследовано): _stage_helper_tree вызывается в user-процессе
+    `protect()` (НЕ под sudo) — mkstemp/mkdtemp создают USER-owned объекты, staged
+    user-owned/writable в окне [staging .. sudo install]. Это НЕ небезопасно: post-install
+    digest-check в _install_helper (privoxy_control.py) ловит расхождение КАЖДОГО файла
+    дерева staged↔честно-прочитанные bytes — та же защита, что раньше покрывала один файл,
+    теперь покрывает все N. Возвращает Path staged_root или None при ошибке.
+    """
+    staged_root = Path(tempfile.mkdtemp(prefix="srouter-helper-tree-", dir="/private/tmp"))
+    try:
+        os.chmod(staged_root, 0o755)
+        modules_dir = staged_root / "modules"
+        modules_dir.mkdir()
+        os.chmod(modules_dir, 0o755)
+        for relname, (data, _digest) in tree.items():
+            is_entry = "/" not in relname and relname not in HELPER_TREE_MODULES
+            target = staged_root / relname if is_entry else modules_dir / relname
+            mode = 0o755 if is_entry else 0o644
+            fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                with os.fdopen(fd, "wb", closefd=False) as handle:
+                    handle.write(data)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.fchmod(fd, mode)
+                _fchown_if_privileged(fd, 0, 0)
+            finally:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        return staged_root
     except OSError:
         try:
-            os.close(fd)
-        except OSError:
-            pass
-        try:
-            os.unlink(temp)
+            shutil.rmtree(staged_root, ignore_errors=True)
         except OSError:
             pass
         return None
