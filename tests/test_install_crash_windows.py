@@ -98,16 +98,12 @@ def _entry(env, name="privoxy"):
 # ============================ T1/T4: install фиксирует backup ДО потери ============================
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "install-половина issue #124 (state-first): backup фиксируется в state ДО мутации target. "
-    "Чинится в следующем PR; здесь тест закреплён как доказательство окна W4 в install-слое. "
-    "strict=True — когда фикс приедет, xfail станет XPASS и заставит снять маркер."))
 def test_crash_after_config_write_leaves_state_knowing_backup(tmp_path, monkeypatch):
-    """W4 (главное окно): обрыв после записи target → state ОБЯЗАН уже знать про backup.
+    """W4 (главное окно, часть 2/2 — ФИКС): обрыв после записи target → state уже знает про backup.
 
-    Сегодня backup живёт только в локальном dict до финального _write_state_after_apply, который при
-    обрыве не достигается: state-файл вообще не создаётся → ссылка на backup утеряна, хотя сам
-    backup-файл лежит на диске. Это F1/P1-3 в install-половине.
+    _record_backup_intent пишет ссылку на backup СРАЗУ после _backup, до _write_component_config —
+    поэтому обрыв в этом окне уже не теряет её (было: backup жил только в локальном dict до финального
+    _write_state_after_apply, который при обрыве не достигался). Это F1/P1-3 в install-половине.
     """
     env, config_path = _foreign_privoxy(tmp_path)
     _crash_after(monkeypatch, "_write_component_config", component="privoxy")
@@ -125,16 +121,14 @@ def test_crash_after_config_write_leaves_state_knowing_backup(tmp_path, monkeypa
     )
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "install-половина issue #124 (state-first), тот же корень, что и у W4-теста выше: локальный dict "
-    "backups испаряется при раннем return. Чинится в следующем PR; strict=True не даст забыть."))
 def test_second_component_failure_preserves_first_component_backup(tmp_path, monkeypatch):
-    """Дефект воспроизводится БЕЗ crash: штатный ранний return теряет backup уже обработанного.
+    """Дефект (часть 2/2 — ФИКС) воспроизводился БЕЗ crash: штатный ранний return терял backup.
 
-    privoxy успешно перезаписан (backup создан), затем `brew install dnsmasq` штатно падает →
-    apply_install делает ранний return `dnsmasq_install_failed`, минуя _write_state_after_apply.
-    Локальный dict `backups` испаряется вместе с ссылкой на backup privoxy. Никаких исключений,
-    никакого SIGKILL — рутинный сбой brew. Это доказывает, что окно не экзотика.
+    privoxy успешно перезаписан (backup создан + _record_backup_intent зафиксировал ссылку сразу),
+    затем `brew install dnsmasq` штатно падает → apply_install делает ранний return
+    `dnsmasq_install_failed`. Локальный dict `backups` испаряется, но ссылка в state уже записана —
+    ранний return из-за ДРУГОГО компонента больше не теряет backup privoxy. Никаких исключений,
+    никакого SIGKILL — рутинный сбой brew. Это доказывает, что окно было не экзотикой.
     """
     env, config_path = _foreign_privoxy(tmp_path)
     original_ensure = install_config._ensure_package
@@ -165,21 +159,12 @@ def test_second_component_failure_preserves_first_component_backup(tmp_path, mon
     )
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "F3/P1-2 issue #124 (install-половина): повторный apply со skip/adopt после оборванного overwrite "
-    "не должен терять ссылку на backup предыдущей попытки. Чинится в части 2/2 вместе со state-first; "
-    "strict=True гарантирует, что находка не потеряется — xfail станет XPASS и потребует снять маркер."))
 def test_retry_with_skip_after_interrupted_overwrite_keeps_backup(tmp_path, monkeypatch):
-    """F3/P1-2: обрыв overwrite, затем повторный apply со skip — backup первой попытки обязан выжить.
+    """F3/P1-2 (часть 2/2 — ФИКС, требует ОБА дефекта A+B): обрыв overwrite, потом retry со skip.
 
-    Сценарий 6 P1 из issue #124: первая попытка перезаписала конфиг (backup создан), оборвалась до
-    записи state. Оператор повторяет install, на этот раз выбрав skip для того же компонента —
-    needs_backup=False, ветка backup не выполняется, а _write_state_after_apply перезаписывает entry
-    режимом skipped. Ссылка на backup первой попытки не появляется в state ни на одном шаге.
-
-    Диск при этом ЗНАЕТ правду (backup лежит рядом с target), поэтому uninstall уже сейчас восстановит
-    оригинал — часть 1/2 закрыла последствие. Этот тест пиннит ПРИЧИНУ: state обязан перестать терять
-    ссылку, иначе оператор, читающий srouter.local.json, видит неполную картину.
+    Первая попытка перезаписала конфиг, обрывается ПОСЛЕ _record_backup_intent (дефект A уже чинит
+    W4). Повторный apply со skip раньше терял ссылку через preserve-логику, гейтившую backup=='managed'
+    (дефект B) — _write_state_after_apply теперь несёт carried_backup независимо от режима.
     """
     env, config_path = _foreign_privoxy(tmp_path)
     _crash_after(monkeypatch, "_write_component_config", component="privoxy")
@@ -217,6 +202,277 @@ def test_crash_between_backup_and_config_write_leaves_original_intact(tmp_path, 
         "обрыв до записи target обязан оставить оригинал пользователя нетронутым"
     )
     assert install_lib.MARKER not in config_path.read_text(encoding="utf-8")
+
+
+# ================== часть 2/2: форма intent-entry, fail-closed, дефект B изолированно ==================
+
+
+def test_crash_between_intent_and_target_write_leaves_clean_system(tmp_path, monkeypatch):
+    """Регресс-гвард на форму intent-entry: голый {config_path, backup}, БЕЗ management.
+
+    Если бы _record_backup_intent писал entry в managed-форме ДО мутации target, обрыв ровно в этом
+    зазоре объявил бы владение файлом, который ещё не тронут — на чистой системе (оригинал цел, рядом
+    лишь аддитивная копия) uninstall докладывал бы leftover rc=2. Это ровно stale-managed из issue #110
+    Дефект 1 — ложь оператору про то, что что-то не докатилось, хотя не докатилось НИЧЕГО.
+    Голый entry без management инертен для всех предикатов состояния (_is_managed_entry и т.д.),
+    поэтому на обоих концах окна component_facts классифицирует верно: target нетронут → none,
+    target перезаписан → orphaned_backup (см. test_crash_after_config_write_leaves_state_knowing_backup).
+    """
+    env, config_path = _foreign_privoxy(tmp_path)
+    _crash_after(monkeypatch, "_record_backup_intent")
+    with pytest.raises(_Crash):
+        _apply_overwrite_privoxy(env)
+
+    assert config_path.read_text(encoding="utf-8") == "foreign config\n", (
+        "state знает про backup, но target ещё не мутирован в момент обрыва"
+    )
+    result = install_lib.apply_uninstall(
+        env=env, confirmations={"configs": True}, runner=FakeRunner())
+    assert result["ok"] is True
+    assert result["leftover"] == [], (
+        "конфиг пользователя нетронут — intent-entry не должен объявлять владение файлом, который "
+        "ещё не перезаписан (иначе stale-managed, issue #110 Дефект 1)"
+    )
+
+
+def test_backup_state_write_failure_blocks_before_touching_target(tmp_path, monkeypatch):
+    """Fail-closed: не удалось записать state → apply обязан остановиться ДО мутации target.
+
+    Если бы порядок был обратным (сначала target, потом state), отказ save_state потерял бы ссылку
+    на уже созданный backup при живой перезаписи оригинала — тот же дефект A, просто без crash.
+    """
+    env, config_path = _foreign_privoxy(tmp_path)
+    monkeypatch.setattr(install_config.local_state, "save_state", lambda *a, **k: None)
+
+    result = _apply_overwrite_privoxy(env)
+
+    assert result["ok"] is False
+    assert "privoxy_backup_state_write_failed" in result["blocked"]
+    assert config_path.read_text(encoding="utf-8") == "foreign config\n", (
+        "target не должен мутироваться, если state не смог зафиксировать ссылку на backup"
+    )
+    assert install_lib.MARKER not in config_path.read_text(encoding="utf-8")
+
+
+def test_unreadable_state_blocks_backup_intent_and_preserves_file(tmp_path):
+    """readable=False (битый state) блокирует apply и не перезаписывает битый файл вслепую."""
+    env, config_path = _foreign_privoxy(tmp_path)
+    env.state_path.write_text("{ broken json", encoding="utf-8")
+
+    result = _apply_overwrite_privoxy(env)
+
+    assert result["ok"] is False
+    assert env.state_path.read_text(encoding="utf-8") == "{ broken json", (
+        "битый state не должен быть перезаписан вслепую — оператор ещё может его восстановить"
+    )
+    assert config_path.read_text(encoding="utf-8") == "foreign config\n"
+
+
+def test_skip_after_completed_overwrite_keeps_backup_reference(tmp_path):
+    """Дефект B изолированно (без crash): skip ПОСЛЕ завершённого overwrite не должен стирать backup.
+
+    В отличие от test_retry_with_skip_after_interrupted_overwrite_keeps_backup (который требует ОБА
+    фикса — A и B), здесь backup+managed/overwrote уже в state с самого начала (как после штатного
+    completed apply), обрыва нет вовсе. Единственная переменная — снятие гейта mode=='managed' с
+    backup-ветки preserve-логики (дефект B). Не должен зависеть от _record_backup_intent.
+    """
+    env, config_path = _foreign_privoxy(tmp_path)
+    backup_path = config_path.with_name("config.srouter-backup-2026-06-29T000000Z")
+    backup_path.write_text("foreign config\n", encoding="utf-8")
+    env.state_path.write_text(json.dumps({
+        "schema_version": 1, "nodes": [], "active_node": {"name": None, "pending": None},
+        "probes": {}, "network": {"channels": {"wifi_service": "Wi-Fi"}},
+        "traffic_guard": {"mode": "off", "domains": {}},
+        "detected_environment": {"privoxy": {
+            "config_path": str(config_path),
+            "backup": str(backup_path),
+            "management": {"mode": "managed", "managed": True, "provenance": "overwrote"},
+        }},
+        "runtime": {},
+    }), encoding="utf-8")
+
+    runner = FakeRunner()
+    result = install_lib.apply_install(
+        env=env, confirm=True,
+        choices={"privoxy": "skip", "xray": "skip", "dnsmasq": "skip"},
+        runner=runner, port_checker=_port_checker_managed_up(runner.calls))
+
+    assert result["ok"] is True
+    entry = _entry(env)
+    assert entry.get("backup") == str(backup_path), (
+        "skip после завершённого overwrite не должен терять ссылку на backup — файл на диске никуда "
+        "не делся, смена режима не отменяет его существования (issue #124 F3/P1-2)"
+    )
+    assert "provenance" not in entry.get("management", {}), (
+        "provenance — свойство ТЕКУЩЕГО apply (создали/перезаписали); при skip действия не было, "
+        "поле неприменимо (сохраняет tests/test_install_flow.py::test_install_skipped_has_no_provenance)"
+    )
+
+
+def test_adopted_keeps_backup_but_uninstall_leaves_file_untouched(tmp_path):
+    """adopted сохраняет ссылку на backup (симметрично skipped), но не даёт uninstall прав на файл.
+
+    Граница: backup — память о прошлом, она не исчезает при adopt. Но adopt — осознанное заявление
+    пользователя «это мой файл», и component_facts обязан уважать его вне зависимости от backup.
+    """
+    env, config_path = _foreign_privoxy(tmp_path)
+    backup_path = config_path.with_name("config.srouter-backup-2026-06-29T000000Z")
+    backup_path.write_text("foreign config\n", encoding="utf-8")
+    env.state_path.write_text(json.dumps({
+        "schema_version": 1, "nodes": [], "active_node": {"name": None, "pending": None},
+        "probes": {}, "network": {"channels": {"wifi_service": "Wi-Fi"}},
+        "traffic_guard": {"mode": "off", "domains": {}},
+        "detected_environment": {"privoxy": {
+            "config_path": str(config_path),
+            "backup": str(backup_path),
+            "management": {"mode": "managed", "managed": True, "provenance": "overwrote"},
+        }},
+        "runtime": {},
+    }), encoding="utf-8")
+
+    runner = FakeRunner()
+    result = install_lib.apply_install(
+        env=env, confirm=True,
+        choices={"privoxy": "adopt", "xray": "skip", "dnsmasq": "skip"},
+        runner=runner, port_checker=_port_checker_managed_up(runner.calls))
+    assert result["ok"] is True
+    assert _entry(env).get("backup") == str(backup_path), "adopt сохраняет ссылку на backup (память о прошлом)"
+
+    un_result = install_lib.apply_uninstall(
+        env=env, confirmations={"configs": True}, runner=FakeRunner())
+    assert un_result["ok"] is True
+    assert un_result["leftover"] == []
+    assert config_path.read_text(encoding="utf-8") == "foreign config\n", (
+        "adopt — осознанное заявление владения; uninstall не трогает файл вне зависимости от backup"
+    )
+
+
+def test_prefix_change_after_skip_does_not_carry_backup(tmp_path):
+    """T9-гвард, расширенный на skipped: смена --prefix не переносит backup даже при снятом managed-гейте.
+
+    Симметрично test_reinstall_does_not_carry_backup_across_config_paths (tests/test_install_flow.py),
+    но для mode='skipped' — доказывает, что единственный ограничитель preserve-логики после дефекта B
+    (prev_same_path) держит path-ownership независимо от режима.
+    """
+    env = _env(tmp_path)
+    new_config_path = env.component_paths("privoxy")["config"]
+    new_config_path.parent.mkdir(parents=True)
+    new_config_path.write_text("# srouter-managed-config-v1\nlisten-address 127.0.0.1:8118\n", encoding="utf-8")
+    old_config_path = tmp_path / "old-prefix" / "privoxy" / "config"
+    backup_of_old = tmp_path / "old-prefix-backup"
+    backup_of_old.write_text("foreign config from prefix A\n", encoding="utf-8")
+    env.state_path.write_text(json.dumps({
+        "schema_version": 1, "nodes": [], "active_node": {"name": None, "pending": None},
+        "probes": {}, "network": {"channels": {"wifi_service": "Wi-Fi"}},
+        "traffic_guard": {"mode": "off", "domains": {}},
+        "detected_environment": {"privoxy": {
+            "config_path": str(old_config_path),  # ДРУГОЙ путь (prefix A)
+            "backup": str(backup_of_old),
+            "management": {"mode": "managed", "managed": True, "provenance": "overwrote"},
+        }},
+        "runtime": {},
+    }), encoding="utf-8")
+
+    runner = FakeRunner()
+    result = install_lib.apply_install(
+        env=env, confirm=True, choices={"privoxy": "skip", "xray": "skip", "dnsmasq": "skip"},
+        runner=runner, port_checker=_port_checker_managed_up(runner.calls))
+    assert result["ok"] is True
+
+    entry = _entry(env)
+    assert entry.get("backup") != str(backup_of_old), (
+        "backup с ДРУГОГО config_path не переносится при skip — path-ownership guard держит "
+        "независимо от режима (cycle-review #111 finding 1)"
+    )
+
+
+def test_protected_privoxy_does_not_record_backup_intent(tmp_path, monkeypatch):
+    """protected privoxy (system-domain root-транзакция) не должен вызывать _record_backup_intent.
+
+    mode='protected' уходит в continue до _backup — это доказывает, что root-транзакция
+    privoxy_system остаётся единственным писателем backup/previous для protected-компонента.
+    """
+    calls = []
+    original = install_config._record_backup_intent
+
+    def spy(*args, **kwargs):
+        calls.append(args)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(install_config, "_record_backup_intent", spy)
+    monkeypatch.setattr(install_config, "_privoxy_protected_for_env", lambda env: True)
+
+    env = _env(tmp_path)
+    runner = FakeRunner()
+    install_lib.apply_install(
+        env=env, confirm=True, choices={"xray": "skip", "dnsmasq": "skip"},
+        runner=runner, port_checker=_port_checker_managed_up(runner.calls))
+
+    assert calls == [], "protected privoxy не должен проходить через _record_backup_intent"
+
+
+@pytest.mark.parametrize("mode", ["managed", "skipped", "adopted"])
+def test_backup_reference_survives_any_mode_at_same_config_path(tmp_path, mode):
+    """Инвариант: _write_state_after_apply никогда не теряет backup для того же config_path.
+
+    Ссылка может появиться или быть заменена новой, но не исчезает при простой смене режима —
+    единственный легитимный конец её жизни лежит в uninstall (_mark_component_removed/_restored).
+    """
+    env, config_path = _foreign_privoxy(tmp_path)
+    backup_path = config_path.with_name("config.srouter-backup-2026-06-29T000000Z")
+    backup_path.write_text("foreign config\n", encoding="utf-8")
+    config_path.write_text("# srouter-managed-config-v1\nlisten-address 127.0.0.1:8118\n", encoding="utf-8")
+    env.state_path.write_text(json.dumps({
+        "schema_version": 1, "nodes": [], "active_node": {"name": None, "pending": None},
+        "probes": {}, "network": {"channels": {"wifi_service": "Wi-Fi"}},
+        "traffic_guard": {"mode": "off", "domains": {}},
+        "detected_environment": {"privoxy": {
+            "config_path": str(config_path),
+            "backup": str(backup_path),
+            "management": {"mode": "managed", "managed": True, "provenance": "overwrote"},
+        }},
+        "runtime": {},
+    }), encoding="utf-8")
+
+    runner = FakeRunner()
+    choice = {"managed": None, "skipped": "skip", "adopted": "adopt"}[mode]
+    choices = {"xray": "skip", "dnsmasq": "skip"}
+    if choice:
+        choices["privoxy"] = choice
+    result = install_lib.apply_install(
+        env=env, confirm=True, choices=choices,
+        runner=runner, port_checker=_port_checker_managed_up(runner.calls))
+    assert result["ok"] is True
+    assert _entry(env).get("backup") == str(backup_path), f"mode={mode} обязан сохранить backup"
+
+
+def test_backup_reference_does_not_survive_config_path_change(tmp_path):
+    """Негативный близнец инварианта: другой config_path — backup НЕ переносится (path-ownership)."""
+    env = _env(tmp_path)
+    new_config_path = env.component_paths("privoxy")["config"]
+    new_config_path.parent.mkdir(parents=True)
+    new_config_path.write_text("# srouter-managed-config-v1\nlisten-address 127.0.0.1:8118\n", encoding="utf-8")
+    old_config_path = tmp_path / "old-prefix" / "privoxy" / "config"
+    backup_of_old = tmp_path / "old-prefix-backup"
+    backup_of_old.write_text("foreign config from prefix A\n", encoding="utf-8")
+    env.state_path.write_text(json.dumps({
+        "schema_version": 1, "nodes": [], "active_node": {"name": None, "pending": None},
+        "probes": {}, "network": {"channels": {"wifi_service": "Wi-Fi"}},
+        "traffic_guard": {"mode": "off", "domains": {}},
+        "detected_environment": {"privoxy": {
+            "config_path": str(old_config_path),
+            "backup": str(backup_of_old),
+            "management": {"mode": "managed", "managed": True, "provenance": "overwrote"},
+        }},
+        "runtime": {},
+    }), encoding="utf-8")
+
+    runner = FakeRunner()
+    result = install_lib.apply_install(
+        env=env, confirm=True, choices={"xray": "skip", "dnsmasq": "skip"},
+        runner=runner, port_checker=_port_checker_managed_up(runner.calls))
+    assert result["ok"] is True
+    assert _entry(env).get("backup") != str(backup_of_old)
 
 
 # ============================ T2/T3/T6: uninstall восстанавливает, а не теряет ============================
