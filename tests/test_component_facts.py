@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+import install_config
 import install_lib
 
 MANAGED_CONFIG = "# srouter-managed-config-v1\nlisten-address 127.0.0.1:8118\n"
@@ -365,6 +366,45 @@ def test_backup_exactly_at_created_at_boundary_still_counts(tmp_path):
 
     assert facts["recovery"] == "restore", "backup ровно на границе not_before обязан приниматься (>=)"
     assert facts["backup"] == str(backup)
+
+
+def test_resolve_backup_not_before_uses_config_path_prefix_not_naive_split(tmp_path):
+    """_resolve_backup вычисляет suffix ТЕМ ЖЕ способом, что и discover_backups (slice от длины
+    config_path.name + INFIX), а не наивным split(INFIX, 1) по первому вхождению в имени.
+
+    Гипотетический edge case (недостижим текущими тремя компонентами config/config.json/dnsmasq.conf,
+    но не должен быть предположением _resolve_backup): если бы имя target само содержало
+    ".srouter-backup-" как подстроку, split(INFIX, 1)[-1] срезал бы suffix НЕ от границы target.name,
+    а от первого вхождения INFIX где угодно в строке. Для такого имени split даёт НЕПАРСЯЩУЮСЯ строку
+    (не «сдвинутую валидную дату»), из-за чего `_parse_backup_stamp(...) or not_before` fallback'ится
+    на not_before и кандидат ЛОЖНО ПРОХОДИТ фильтр независимо от реального возраста — то есть заведомо
+    СТАРЫЙ backup (старше not_before, обязан быть отфильтрован) молча остаётся кандидатом. Ловим
+    именно это: старый backup ДОЛЖЕН отсеиваться, а с наивным split — не отсеивается.
+    """
+    weird_target_name = "weird.srouter-backup-config"
+    backup_name = weird_target_name + install_config._BACKUP_INFIX + "2020-01-01T000000Z"
+    via_slice = backup_name[len(weird_target_name + install_config._BACKUP_INFIX):]
+    via_split = backup_name.split(install_config._BACKUP_INFIX, 1)[-1]
+    assert via_slice == "2020-01-01T000000Z", "slice-способ обязан давать корректный (старый) timestamp"
+    assert install_config._parse_backup_stamp(via_split) is None, (
+        "тест-фикстура опирается на то, что наивный split даёт НЕПАРСЯЩУЮСЯ строку для этого имени "
+        "(маскирующий fallback `or not_before`), иначе тест не проверяет заявленную мутацию"
+    )
+
+    weird_target = tmp_path / weird_target_name
+    stale_backup = tmp_path / backup_name  # ЗАВЕДОМО старше not_before ниже — обязан быть отфильтрован
+    stale_backup.write_text("stale, must be rejected\n", encoding="utf-8")
+
+    from datetime import datetime, timezone
+    not_before = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    result_backup, ambiguous = install_lib._resolve_backup(
+        {}, [stale_backup], not_before=not_before, config_path=weird_target)
+
+    assert result_backup is None and ambiguous is False, (
+        "backup СТАРШЕ not_before обязан быть отфильтрован по корректно вычисленному timestamp "
+        "(2020-01-01), даже когда имя target содержит INFIX как подстроку. Наивный split дал бы "
+        "непарсящийся suffix → fallback на not_before → кандидат ложно проходит фильтр"
+    )
 
 
 def test_idempotent_created_reinstall_preserves_original_created_at(tmp_path):

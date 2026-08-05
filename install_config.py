@@ -959,7 +959,7 @@ def _is_created_entry(entry):
     return _provenance_of(entry) == "created"
 
 
-def _resolve_backup(entry, discovered, *, not_before=None):
+def _resolve_backup(entry, discovered, *, not_before=None, config_path=None):
     """Какой backup считать оригиналом пользователя: (path|None, ambiguous: bool).
 
     ПРИОРИТЕТ: названное state — сильнее найденного на диске. Discovery восполняет МОЛЧАНИЕ state
@@ -1007,8 +1007,15 @@ def _resolve_backup(entry, discovered, *, not_before=None):
             return Path(stated), False
         return None, False
     if not_before is not None:
+        # Suffix вычисляем ТЕМ ЖЕ способом, что и discover_backups (slice от длины конкретного
+        # config_path.name + INFIX), а не split(INFIX, 1) по первому вхождению: если бы имя самого
+        # target когда-нибудь содержало ".srouter-backup-" как подстроку (сейчас невозможно — три
+        # компонента с фиксированными именами config/config.json/dnsmasq.conf, но это внутренний
+        # инвариант _resolve_backup не обязан предполагать), split молча срезал бы suffix неверно и
+        # фильтр давал бы неправильный результат вместо явного None → fail-open (не сужать).
+        prefix = (Path(config_path).name + _BACKUP_INFIX) if config_path else _BACKUP_INFIX
         discovered = [candidate for candidate in discovered
-                      if (_parse_backup_stamp(candidate.name.split(_BACKUP_INFIX, 1)[-1]) or not_before)
+                      if (_parse_backup_stamp(candidate.name[len(prefix):]) or not_before)
                       >= not_before]
     if not discovered:
         return None, False
@@ -1080,7 +1087,7 @@ def component_facts(name, env, entry, *, config_path=None):
     # которого валидных backup'ов для ЭТОГО config_path быть не может. Отсекает retained-relic от
     # предыдущего install→uninstall цикла, не давая ему выдать себя за «единственного» кандидата.
     not_before = _parse_backup_stamp_or_none(entry.get("created_at")) if provenance == "created" else None
-    backup, ambiguous = _resolve_backup(entry, discovered, not_before=not_before)
+    backup, ambiguous = _resolve_backup(entry, discovered, not_before=not_before, config_path=path)
 
     facts = {
         "name": name,
