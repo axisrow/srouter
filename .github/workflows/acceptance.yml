@@ -44,3 +44,11 @@ jobs:
         run: |
           pip install pytest pytest-xdist
           pytest tests/acceptance/test_dockerignore_secrets.py::test_secret_paths_absent_from_docker_build_context -v -n 0
+
+      # issue #161: ruff-гвард против новых bare except / except Exception без обоснования
+      # (E722/BLE001, см. pyproject.toml [tool.ruff.lint]). Host-side, не в Docker-образе —
+      # быстрый lint-шаг не требует пересборки acceptance-контейнера.
+      - name: Ruff lint (E722/BLE001 except-guard, issue #161)
+        run: |
+          pip install ruff
+          ruff check .
