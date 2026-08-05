@@ -83,12 +83,23 @@ line-length = 120
 target-version = "py38"
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "BLE"]
+# Issue #161: гвардим только широкий except — не берём E/F/W целиком, чтобы не тащить
+# в CI несвязанные codestyle-ошибки (line-too-long, unused-var и т.п.) из старого кода.
+# E722: bare except (без типа исключения)
+# BLE001: except Exception / except BaseException без явного обоснования
+select = ["E722", "BLE"]
 ignore = []
 
-# BLE001: не разрешаем bare except и широкие except Exception без явного комментария
-# E722: bare except (без типа исключения)
 # Используй конкретные типы исключений: OSError, ValueError, TypeError, KeyError,
 # subprocess.CalledProcessError, json.JSONDecodeError, requests.RequestException и т.п.
-# Для осознанных широких catch добавь комментарий: # noqa: BLE001 — <причина>
-per-file-ignores = {}
+# Точечные ignore per-file для уже существующих осознанных широких catch — снимай ignore
+# по мере того как файл дочищается в отдельном PR (issue #161).
+[tool.ruff.lint.per-file-ignores]
+# BaseException ловится намеренно: dashboard_common raise SystemExit при отсутствии
+# srouter_config.py, а SystemExit не перехватывается except Exception — см. комментарий в файле.
+"codex_wrappers.py" = ["BLE001"]
+# except Exception намеренно широкий: гвард используется как best-effort детектор
+# osascript-вызовов в тестовой обвязке — см. комментарий в файле.
+"tests/conftest.py" = ["BLE001"]
+# Тестовые try/except для сбора ошибок из потоков (errors.append(e)) — см. комментарии в файле.
+"tests/test_dashboard_hotroutes.py" = ["BLE001"]
