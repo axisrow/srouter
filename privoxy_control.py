@@ -287,7 +287,23 @@ def _install_helper(runner, layout=None):
     try:
         # (3) установка в ПРОМЕЖУТОЧНЫЕ *.new-пути — финальные пути не трогаются, пока
         # дерево не проверено целиком (см. (5) про атомарную публикацию).
-        mkdir_new = runner([privoxy_system.SUDO, privoxy_system.MKDIR, "-p", str(modules_new)], 30)
+        # Сносим остатки прерванного прошлого прогона ДО mkdir: `mkdir -p` молча успешен на
+        # существующей директории, а install перезаписывает лишь файлы текущего дерева. Любой
+        # посторонний файл в .modules.new пережил бы install и въехал внутрь опубликованного
+        # root-owned дерева (публикация — rename директории целиком), не попав ни под один
+        # digest-чек. Дерево пинится целиком → стартуем всегда с чистого листа.
+        _cleanup_new_paths(runner, new_paths_to_cleanup)
+        # `install -d -m 0755 -o root -g wheel`, а НЕ `mkdir -p`: mkdir не задаёт режим и отдаёт
+        # его ambient umask root'а. Это единственная директория, из которой helper_main делает
+        # sys.path.insert + import под sudo, причём БЕЗ повторной digest-проверки в runtime
+        # (digest-pinning закрывает только момент install) — writable modules dir = arbitrary
+        # root code execution уже после того, как все fd-pinning/digest-чеки прошли.
+        # install -d ставит режим атомарно при создании, без окна mkdir→chmod.
+        mkdir_new = runner(
+            [privoxy_system.SUDO, privoxy_system.INSTALL, "-d", "-o", "root", "-g", "wheel",
+             "-m", "0755", str(modules_new)],
+            30,
+        )
         if mkdir_new.get("rc") != 0:
             return privoxy_system._result(False, error=(mkdir_new.get("err") or "helper_modules_new_mkdir_failed")[:240])
         installed_digests = {}

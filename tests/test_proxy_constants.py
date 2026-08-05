@@ -471,5 +471,27 @@ def test_diag_proxy_follows_canonical_bridge_port():
     )
 
 
+def test_privoxy_markers_single_source_not_duplicated_literals():
+    """#287 tree-copy: маркеры/label — ОДИН источник (privoxy_helper_config), не копии литерала
+    в двух модулях.
+
+    Маркеры гейтят foreign-helper guard и protection_present: их читает _managed_file внутри
+    helper-дерева (privoxy_helper_config), а privoxy_system сверяет ими же свои managed-файлы.
+    Разъезд двух копий литерала = guard перестаёт узнавать СВОЙ ЖЕ managed-файл → protect/
+    unprotect ломаются fail-closed, причём молча до самого прод-запуска под sudo.
+
+    Гвард на identity (`is`), а не на равенство: равенство зелено и для двух совпадающих
+    по значению копий, т.е. не ловило бы именно дублирование — только уже случившийся дрейф.
+    """
+    import privoxy_helper_config
+    import privoxy_system
+
+    for name in ("PROTECTED_MARKER", "SUDOERS_MARKER", "SYSTEM_LABEL"):
+        assert getattr(privoxy_system, name) is getattr(privoxy_helper_config, name), (
+            f"{name} — отдельный литерал в privoxy_system вместо алиаса "
+            f"privoxy_helper_config.{name}; два источника правды разъедутся"
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -76,10 +76,15 @@ import privoxy_helper_launchd
 
 
 PROTECTION_VERSION = 1
-PROTECTED_MARKER = "srouter-protected-privoxy-v1"
+# Маркеры/label — единственный источник в privoxy_helper_config (там их читает
+# _managed_file/protection_present внутри helper-дерева). Здесь ТОЛЬКО алиас, не копия
+# литерала: расхождение маркеров = foreign-helper guard перестаёт узнавать свой же
+# managed-файл (fail-closed → protect/unprotect ломаются) — см. parity-тест в
+# tests/test_proxy_constants.py.
+PROTECTED_MARKER = privoxy_helper_config.PROTECTED_MARKER
 HELPER_MARKER = "srouter-protected-helper-v1"
-SUDOERS_MARKER = "srouter-privoxy-no-sudo-cache-v1"
-SYSTEM_LABEL = "com.srouter.privoxy"
+SUDOERS_MARKER = privoxy_helper_config.SUDOERS_MARKER
+SYSTEM_LABEL = privoxy_helper_config.SYSTEM_LABEL
 USER_LABEL = "homebrew.mxcl.privoxy"
 SYSTEM_DOMAIN = "system"
 SUDO = "/usr/bin/sudo"
@@ -147,10 +152,12 @@ class ProtectedLayout:
     def helper_modules_dir(self):
         """Директория соседних helper-модулей (issue #287, tree-copy).
 
-        Производится от helper_path, а не отдельное поле — helper_main делает
-        sys.path.insert(0, Path(__file__).resolve().parent) и импортирует модули по
-        имени; helper_path и helper_modules_dir обязаны жить в одном родителе, иначе
-        entrypoint не найдёт соседей после install в /Library/PrivilegedHelperTools.
+        Производится от helper_path, а не отдельное поле — entrypoint на import-time
+        (module-level, до любых вызовов) делает sys.path.insert(0, <__file__>.modules)
+        и импортирует соседей по имени. Имя директории жёстко привязано к имени
+        entrypoint'а (`<entrypoint>.modules`), поэтому оба обязаны жить в одном
+        родителе, иначе entrypoint не найдёт соседей после install в
+        /Library/PrivilegedHelperTools.
         """
         return self.helper_path.parent / f"{self.helper_path.name}.modules"
 
@@ -671,6 +678,15 @@ def _read_file_pinned(path, *, max_size=4 * 1024 * 1024):
     считается на bytes ТОГО ЖЕ fd, что и прочитаны — окна между проверкой и
     использованием нет (тот же инвариант, что был у прежнего однофайлового
     _read_helper_bytes_pinned, #148). Возвращает (bytes, digest) или (None, None).
+
+    Почему НЕ _reject_symlinks_in_tree (#287 просил переиспользовать примитивы): тот —
+    lstat-препроход для shutil.copytree, который разыменовывает symlink'и, по дереву
+    НЕИЗВЕСТНОЙ формы (user-writable Homebrew templates), и он оставляет окно между
+    lstat и копированием. Здесь дерево — фиксированный whitelist HELPER_TREE_MODULES,
+    а не обход, и O_NOFOLLOW делает symlink-отказ и чтение ОДНОЙ операцией: окна нет
+    вовсе. Препроход здесь был бы строго слабее (то самое ослабление, которое #287
+    запрещает), поэтому переиспользован _copy_tree_nofollow-инвариант (O_NOFOLLOW),
+    а не его lstat-обёртка для copytree.
     """
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
     try:

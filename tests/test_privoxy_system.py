@@ -1470,6 +1470,10 @@ def _tree_install_runner(layout):
     ровно так, как это делает production sudo (install копирует staged→*.new byte-в-byte,
     mv публикует *.new в финальный путь атомарным rename)."""
     def runner(cmd, timeout):
+        if privoxy_system.INSTALL in cmd and "-d" in cmd:
+            # install -d: создание директории с режимом (аналог mkdir -p + chmod, атомарно).
+            Path(cmd[-1]).mkdir(parents=True, exist_ok=True)
+            return {"rc": 0, "out": "", "err": "", "timeout": False}
         if privoxy_system.INSTALL in cmd:
             m_idx = cmd.index("-m")
             src = Path(cmd[m_idx + 2])
@@ -1610,6 +1614,76 @@ def test_install_helper_fail_closed_when_staged_substituted_after_mkstemp(tmp_pa
     # cleanup удаляет *.new, финальная публикация (mv) никогда не выполняется.
     assert not entry_new.exists()
     assert not layout.helper_path.exists()
+
+
+def test_install_helper_pins_modules_dir_mode_not_ambient_umask(tmp_path):
+    """#287 tree-copy: modules-директория обязана создаваться с ЯВНЫМ режимом (root-only write),
+    а не с тем, что подвернётся из ambient umask root'а.
+
+    Корень: `mkdir -p` не задаёт режим — он отдаётся на откуп umask процесса. Это ровно та
+    самая единственная привилегированная директория во всём дереве, откуда helper_main делает
+    sys.path.insert + import под sudo, причём БЕЗ повторной digest-проверки в runtime
+    (digest-pinning закрывает только момент install). Group/world-writable режим здесь =
+    arbitrary root code execution: атакующий подменяет модуль ПОСЛЕ того, как все fd-pinning
+    и digest-чеки уже прошли.
+
+    Все остальные привилегированные директории проекта (config_dir/log_dir/backup_dir,
+    staged_root в _stage_helper_tree) чмодятся явно сразу после создания — modules-директория
+    была единственным исключением. Инвариант: никакого write-бита для group/other.
+    """
+    layout = _layout(tmp_path)
+    modules_new = layout.helper_modules_dir.with_name(f"{layout.helper_modules_dir.name}.new")
+    dir_modes = {}
+
+    base_runner = _tree_install_runner(layout)
+
+    def runner(cmd, timeout):
+        # `install -d -m MODE` создаёт директорию С режимом атомарно (без окна mkdir→chmod).
+        if privoxy_system.INSTALL in cmd and "-d" in cmd and "-m" in cmd:
+            dir_modes[Path(cmd[-1])] = cmd[cmd.index("-m") + 1]
+        return base_runner(cmd, timeout)
+
+    result = privoxy_system._install_helper(runner, layout)
+
+    assert result["ok"] is True, result
+    assert modules_new in dir_modes, (
+        "modules-директория создана без явного режима — он отдан ambient umask root'а; "
+        "writable modules dir = arbitrary root code execution при следующем sudo-запуске helper'а"
+    )
+    mode = int(dir_modes[modules_new], 8)
+    assert not (mode & 0o022), f"modules-директория group/world-writable: {dir_modes[modules_new]}"
+
+
+def test_install_helper_wipes_stale_modules_new_residue_before_reuse(tmp_path):
+    """#287 tree-copy: `.modules.new` от прошлой ПРЕРВАННОЙ установки обязана вычищаться
+    перед переиспользованием, а не переоткрываться через `mkdir -p`.
+
+    Корень: публикация дерева — атомарный rename ДИРЕКТОРИИ (`mv modules.new modules`).
+    `mkdir -p` молча успешен на уже существующей директории и ничего не удаляет; install
+    перезаписывает только файлы из текущего HELPER_TREE_MODULES. Любой посторонний файл,
+    оставшийся в `.modules.new` от прерванного/старого прогона (модуль, выпиленный из
+    HELPER_TREE_MODULES в новой версии; недописанный огрызок), переживает install и
+    въезжает внутрь опубликованного root-owned дерева целиком — при этом ни один
+    digest-чек его не видит (digest'ы считаются только по файлам tree).
+
+    Инвариант: опубликованная modules-директория содержит РОВНО HELPER_TREE_MODULES и
+    ничего сверх — дерево пинится целиком, а не пофайлово.
+    """
+    layout = _layout(tmp_path)
+    modules_new = layout.helper_modules_dir.with_name(f"{layout.helper_modules_dir.name}.new")
+    # Остаток прошлого прерванного прогона: файл, которого нет в текущем дереве.
+    modules_new.mkdir(parents=True, exist_ok=True)
+    stale = modules_new / "privoxy_helper_stale.py"
+    stale.write_bytes(b"# residue-from-interrupted-install\n")
+
+    result = privoxy_system._install_helper(_tree_install_runner(layout), layout)
+
+    assert result["ok"] is True, result
+    published = {p.name for p in layout.helper_modules_dir.iterdir()}
+    assert published == set(privoxy_system.HELPER_TREE_MODULES), (
+        "stale-остаток пережил install и опубликован внутри root-owned дерева: "
+        f"{sorted(published)}"
+    )
 
 
 def test_install_helper_fail_closed_when_staged_tree_module_substituted_after_stage(tmp_path):
