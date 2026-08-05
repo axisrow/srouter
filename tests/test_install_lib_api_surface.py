@@ -35,7 +35,7 @@ EXPECTED_OWN_NAMES = {
     "_port_owner", "_reclaimable_resolves_all_conflicts", "_inspect_component",
     "_discover_network", "_discover_probe_readiness", "_homebrew_available",
     "_privoxy_protected_for_env", "build_plan", "format_plan",
-    "_backup", "discover_backups", "component_facts", "_resolve_backup",
+    "_backup", "_record_backup_intent", "discover_backups", "component_facts", "_resolve_backup",
     "_write_text_atomic", "_write_component_config", "_traffic_guard_preflight_error",
     "_ensure_package", "_restart_component", "_apply_dns", "_management_for",
     "_write_state_after_apply", "apply_install",

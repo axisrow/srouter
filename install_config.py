@@ -523,6 +523,54 @@ def _backup(path, env):
         return ""
 
 
+def _record_backup_intent(env, name, config_path, backup):
+    """State-first (issue #124, часть 2/2): зафиксировать ссылку на backup ДО мутации target.
+
+    ПОЧЕМУ. backup-файл на диске и entry в state — два независимо-атомарных артефакта. До этой
+    функции state писался ОДИН раз, в самом конце apply_install (_write_state_after_apply), а между
+    созданием backup и этой записью лежат МИНУТЫ: до трёх `brew install` (timeout 180s), три
+    _restart_component (stop+poll+start+poll), _apply_dns, _install_launchagent. Любой ранний return
+    внутри цикла по COMPONENTS или обрыв процесса минуют финальную запись — и ссылка на уже созданный
+    backup испаряется вместе с локальным dict. Дефект эксплуатируется БЕЗ всякого crash: достаточно
+    штатного сбоя `brew install` на ВТОРОМ компоненте после успешного overwrite первого.
+
+    ПОЧЕМУ ГОЛЫЙ ENTRY, БЕЗ management. Владение файлом арбитрируется маркером на диске
+    (component_facts, часть 1/2), а не памятью state — entry здесь несёт ТОЛЬКО config_path и backup.
+    Managed-запись ДО мутации target объявила бы владение файлом, который ещё не тронут: обрыв в
+    зазоре между этой функцией и _write_component_config оставил бы target = чистый оригинал
+    пользователя, а state утверждал бы managed/overwrote → uninstall докладывал бы leftover rc=2 на
+    абсолютно чистой системе (issue #110 Дефект 1 — ложь оператору). Голый entry инертен для всех
+    предикатов (_is_managed_entry/_is_adopted_entry/_is_restored_entry/_provenance_of → False/None) и
+    классифицируется component_facts верно на ОБОИХ концах окна: target нетронут → 'none', target
+    перезаписан → 'orphaned_backup' (restore). Окончательную форму владения (mode/managed/provenance)
+    дописывает _write_state_after_apply при успешном завершении apply.
+
+    ПОЧЕМУ НЕ pending/promote. Канон two-phase (AGENTS.md) требует pending intent → apply → promote.
+    Здесь он не применим буквально: pending — заявка о том, что ЕЩЁ НЕ случилось, и ей нужен promote,
+    а promote заводит собственное окно, требующее своего патча (так в PR #119 родился F1). Здесь же
+    фиксируется факт, который УЖЕ случился и подтверждён на диске (shutil.copy2 отработал) — факт не
+    нуждается в промоушене, только в том, чтобы быть записанным раньше, чем станет незаменимым.
+
+    FAIL-CLOSED: не удалось прочитать/записать state → вызывающий обязан прервать apply ДО мутации
+    target — иначе конфиг пользователя был бы перезаписан, а ссылку на его копию восстановить неоткуда.
+
+    Возвращает "" при успехе, иначе код ошибки ("state_unreadable" | "state_write_failed").
+    """
+    state, readable = local_state.load_state_checked(path=env.state_path)
+    if not readable:
+        return "state_unreadable"
+    detected = state.get("detected_environment") if isinstance(state.get("detected_environment"), dict) else {}
+    prev = detected.get(name) if isinstance(detected.get(name), dict) else {}
+    entry = dict(prev)  # merge: если prev уже нёс management (idempotent/reclaimable) — не сносим его
+    entry["config_path"] = str(config_path)
+    entry["backup"] = str(backup)
+    detected[name] = entry
+    state["detected_environment"] = detected
+    if local_state.save_state(state, path=env.state_path) is None:
+        return "state_write_failed"
+    return ""
+
+
 def _parse_backup_stamp(name):
     """'2026-06-29T000000Z' → datetime, иначе None. Единственный источник правды о формате имени.
 
@@ -726,14 +774,24 @@ def _write_state_after_apply(env, plan, modes, backups, launchagent_action=None)
         # #111 finding 1). Привязка ownership к пути — тот же канон, что _inspect_component state_owns_path.
         prev_same_path = (str(Path(prev.get("config_path") or "")) == str(item.get("config_path"))
                           if prev.get("config_path") else False)
-        if (mode == "managed" and not backups.get(name) and _is_managed_entry(prev)
-                and prev.get("backup") and prev_same_path):
+        # issue #124 (F3/P1-2), часть 2/2: backup — свойство ПРОШЛОГО (файл .srouter-backup-* лежит
+        # на диске и не исчезает от смены режима), provenance — свойство ТЕКУЩЕГО apply (создали/
+        # перезаписали именно сейчас). Поэтому carried_backup вычисляется по одному-единственному
+        # ограничителю (prev_same_path — path-ownership guard, cycle-review #111 finding 1) и НЕ
+        # гейтится mode=='managed': раньше обе ветки preserve гейтились managed, и повторный apply со
+        # skip/adopt после оборванного overwrite перезаписывал entry БЕЗ backup — оригинал пользователя
+        # осиротевал, хотя его копия лежала рядом с target (_record_backup_intent пишет голый entry
+        # без management, поэтому _is_managed_entry(prev) на нём ложен — гейтить backup-ветку им нельзя).
+        # provenance-ветка гейт managed СОХРАНЯЕТ: при skip/adopt действия «создали/перезаписали» не
+        # было, поле неприменимо (test_install_skipped_has_no_provenance) и не влияет на классификацию
+        # component_facts для не-managed entry — писать его значило бы плодить противоречивый мусор.
+        carried_backup = prev.get("backup") if prev_same_path else None
+        if mode == "managed" and not backups.get(name) and _is_managed_entry(prev) and carried_backup:
             provenance = _provenance_of(prev) or "overwrote"
         detected[name] = _management_for(mode, item, provenance=provenance)
-        if backups.get(name):
-            detected[name]["backup"] = backups[name]
-        elif mode == "managed" and _is_managed_entry(prev) and prev.get("backup") and prev_same_path:
-            detected[name]["backup"] = prev["backup"]  # preserve backup оригинала (idempotent reinstall, тот же путь)
+        backup_ref = backups.get(name) or carried_backup
+        if backup_ref:
+            detected[name]["backup"] = backup_ref
     if launchagent_action:
         launchagent = plan.get("launchagent") or {}
         detected["launchagent"] = {
@@ -826,6 +884,15 @@ def apply_install(env=None, *, confirm=False, choices=None, runner=run, port_che
             backup = _backup(config_path, env)
             if not backup:
                 return {"ok": False, "blocked": [f"{name}_backup_failed"], "actions": actions, "plan": plan}
+            # state-first (issue #124): порядок «backup на диск → state знает → мутация target»
+            # обязателен без исключений. Между _backup и следующим оператором, способным завершить
+            # функцию (включая xray endpoint-guard ниже — он бэкапится ДО этой проверки при
+            # choices['xray']=='overwrite'/reclaimable), ничего не должно быть, иначе окно остаётся,
+            # просто уже. Fail-closed: не смогли зафиксировать — не продолжаем, target не мутирован.
+            intent_error = _record_backup_intent(env, name, config_path, backup)
+            if intent_error:
+                return {"ok": False, "blocked": [f"{name}_backup_state_write_failed"],
+                        "error": intent_error, "actions": actions, "plan": plan}
             backups[name] = backup
         # #200: защита от перезаписи рабочего xray config placeholder'ом. gen_xray_config генерит из
         # local_state.active_node() — если state держит placeholder test-IP 203.0.113.x, а существующий
