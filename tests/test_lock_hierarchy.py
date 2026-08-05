@@ -18,6 +18,8 @@ import pytest
 import lock_hierarchy
 import node_selector
 
+pytestmark = pytest.mark.locks
+
 
 # ============================ ordering-guard (подход A) ============================
 
