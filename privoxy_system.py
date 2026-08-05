@@ -1317,6 +1317,13 @@ def __getattr__(name):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
+def __dir__():
+    # PEP 562: без этого dir(privoxy_system)/hasattr-интроспекция не видит lazy user-side имена
+    # (только то, что реально в globals() на момент вызова). Явный __dir__ держит полный
+    # re-export surface видимым — тот же паттерн, что local_state.py (см. его __dir__).
+    return sorted(set(globals()) | set(_USER_SIDE_NAMES))
+
+
 def helper_main(argv=None):
     parser = argparse.ArgumentParser(prog="com.srouter.privoxyctl")
     sub = parser.add_subparsers(dest="command", required=True)

@@ -33,9 +33,6 @@ from pathlib import Path
 
 import privoxy_system
 
-SUDO = privoxy_system.SUDO
-
-
 def status(*, runner=None, layout=None):
     """Read-only статус доступен без sudo."""
     if layout is None:
@@ -214,7 +211,7 @@ def _parse_helper_output(result):
 
 
 def _sudo_reset(runner):
-    return runner([SUDO, "-k"], 5)
+    return runner([privoxy_system.SUDO, "-k"], 5)
 
 
 def _install_helper(runner, layout=None):
@@ -258,7 +255,7 @@ def _install_helper(runner, layout=None):
     # но читаем через O_NOFOLLOW для консистентности.
     if layout.helper_path.exists() and not privoxy_system._helper_has_marker_fd(layout.helper_path):
         return privoxy_system._result(False, error="foreign_privileged_helper")
-    parent = runner([SUDO, privoxy_system.MKDIR, "-p", str(layout.helper_path.parent)], 30)
+    parent = runner([privoxy_system.SUDO, privoxy_system.MKDIR, "-p", str(layout.helper_path.parent)], 30)
     if parent.get("rc") != 0:
         return privoxy_system._result(False, error=(parent.get("err") or "helper_parent_failed")[:240])
     # (2): зафиксированные digest-проверенные bytes в staged temp (user-owned в окне,
@@ -269,7 +266,7 @@ def _install_helper(runner, layout=None):
     try:
         # (3) install копирует staged, не __file__ — pathname __file__ не ре-открывается под sudo.
         installed = runner(
-            [SUDO, privoxy_system.INSTALL, "-o", "root", "-g", "wheel", "-m", "0755",
+            [privoxy_system.SUDO, privoxy_system.INSTALL, "-o", "root", "-g", "wheel", "-m", "0755",
              str(staged), str(layout.helper_path)],
             30,
         )
@@ -293,7 +290,7 @@ def _install_helper(runner, layout=None):
 def _remove_via_runner(runner, path):
     """Best-effort удаление скомпрометированного helper (fail-closed cleanup)."""
     try:
-        runner([SUDO, "/bin/rm", "-f", "--", str(path)], 15)
+        runner([privoxy_system.SUDO, "/bin/rm", "-f", "--", str(path)], 15)
     except Exception:  # noqa: BLE001 — cleanup не должен маскировать основную ошибку.
         pass
 
@@ -302,7 +299,7 @@ def _rollback_protection(runner, layout=None):
     if layout is None:
         layout = privoxy_system.DEFAULT_LAYOUT
     privoxy_system._sudo_reset(runner)
-    rollback = runner([SUDO, str(layout.helper_path), "unprotect", "--restore"], 90)
+    rollback = runner([privoxy_system.SUDO, str(layout.helper_path), "unprotect", "--restore"], 90)
     privoxy_system._sudo_reset(runner)
     return privoxy_system._parse_helper_output(rollback)
 
@@ -359,7 +356,7 @@ def protect(*, state_path, prefix="/opt/homebrew", runner=None, require_tty=True
             privoxy_system._mark_failed(state_path, installed["error"])
             return installed
         invoked = runner(
-            [SUDO, str(layout.helper_path), "protect",
+            [privoxy_system.SUDO, str(layout.helper_path), "protect",
              "--username", pwd.getpwuid(os.getuid()).pw_name,
              "--uid", str(os.getuid()),
              "--prefix", str(prefix),
@@ -373,7 +370,7 @@ def protect(*, state_path, prefix="/opt/homebrew", runner=None, require_tty=True
             privoxy_system._mark_failed(state_path, outcome["error"])
             return outcome
 
-        no_cache = runner([SUDO, "-n", str(layout.helper_path), "status"], 10)
+        no_cache = runner([privoxy_system.SUDO, "-n", str(layout.helper_path), "status"], 10)
         if no_cache.get("rc") == 0:
             detail = privoxy_system._rollback_protection(runner, layout)
             error = "sudo_without_fresh_authorization"
@@ -421,7 +418,7 @@ def control(action, *, runner=None, require_tty=True, layout=None):
     if not privoxy_system.protection_present(layout):
         return privoxy_system._result(False, error="protected_service_not_installed")
     privoxy_system._sudo_reset(runner)
-    invoked = runner([SUDO, str(layout.helper_path), action], 90)
+    invoked = runner([privoxy_system.SUDO, str(layout.helper_path), action], 90)
     privoxy_system._sudo_reset(runner)
     outcome = privoxy_system._parse_helper_output(invoked)
     outcome["status"] = privoxy_system.status(runner=runner, layout=layout)
@@ -440,7 +437,7 @@ def unprotect(*, state_path, restore=True, runner=None, require_tty=True, layout
     if not privoxy_system._write_unprotect_pending(state_path):
         return privoxy_system._result(False, error="pending_state_write_failed")
     privoxy_system._sudo_reset(runner)
-    cmd = [SUDO, str(layout.helper_path), "unprotect"]
+    cmd = [privoxy_system.SUDO, str(layout.helper_path), "unprotect"]
     if restore:
         cmd.append("--restore")
     invoked = runner(cmd, 90)

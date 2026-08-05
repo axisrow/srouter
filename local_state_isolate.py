@@ -10,8 +10,6 @@ token обязателен к персисту — без него disable_isola
 """
 import local_state
 
-_is_valid_host = local_state._is_valid_host
-
 
 def _valid_isolate_ports(ports):
     """Список портов 1..65535 или None. Только положительные целые — попадут в shell."""
@@ -41,7 +39,7 @@ def validate_isolate(isolate):
     else:
         norm = []
         for d in domains:
-            if isinstance(d, str) and _is_valid_host(d):
+            if isinstance(d, str) and local_state._is_valid_host(d):
                 norm.append(d)
             else:
                 errors.append(f"невалидный домен: {d!r}")
@@ -72,7 +70,7 @@ def _valid_active_isolate(entry):
         return False
     domains = entry.get("domains")
     if not isinstance(domains, list) or not all(
-        isinstance(d, str) and _is_valid_host(d) for d in domains
+        isinstance(d, str) and local_state._is_valid_host(d) for d in domains
     ):
         return False
     if _valid_isolate_ports(entry.get("ports")) is None:

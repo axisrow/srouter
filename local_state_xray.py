@@ -17,8 +17,6 @@ from pathlib import Path
 
 import local_state
 
-_is_valid_host = local_state._is_valid_host
-
 # Куда gen_xray_config пишет рабочий конфиг (источник истины address узла).
 XRAY_CONFIG_PATH = "/opt/homebrew/etc/xray/config.json"
 
@@ -60,7 +58,7 @@ def read_xray_active_address(config_path=XRAY_CONFIG_PATH):
         vnext = (ob.get("settings") or {}).get("vnext") or []
         if vnext and isinstance(vnext[0], dict):
             addr = vnext[0].get("address")
-            if isinstance(addr, str) and _is_valid_host(addr):
+            if isinstance(addr, str) and local_state._is_valid_host(addr):
                 return {"status": "ok", "address": addr}
     # active-outbound есть, но без валидного address; ИЛИ active-outbound'а нет вовсе
     return {"status": "no_active", "address": ""}
@@ -138,7 +136,7 @@ def active_endpoint_host(path=None):
     """
     node = local_state.active_node(path)
     host = node.get("endpoint_host") if isinstance(node, dict) else None
-    if not isinstance(host, str) or not host or not _is_valid_host(host):
+    if not isinstance(host, str) or not host or not local_state._is_valid_host(host):
         return ""
     return host
 

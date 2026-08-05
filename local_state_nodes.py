@@ -8,8 +8,6 @@ import socket
 
 import local_state
 
-_is_valid_host = local_state._is_valid_host
-
 
 def _is_valid_node(n):
     """Запись узла валидна, если это dict с name + валидными endpoint_host/route_ip."""
@@ -17,12 +15,12 @@ def _is_valid_node(n):
         return False
     if not isinstance(n.get("name"), str) or not n.get("name"):
         return False
-    if not _is_valid_host(n.get("endpoint_host")):
+    if not local_state._is_valid_host(n.get("endpoint_host")):
         return False
     # route_ip может отсутствовать (вычисляется через resolve_route_ip),
     # но если есть — обязан быть валидным хостом.
     rip = n.get("route_ip")
-    if rip is not None and not _is_valid_host(rip):
+    if rip is not None and not local_state._is_valid_host(rip):
         return False
     return True
 
@@ -134,16 +132,16 @@ def resolve_route_ip(node, path=None):
     if not isinstance(node, dict):
         return ""
     rip = node.get("route_ip")
-    if isinstance(rip, str) and rip and _is_valid_host(rip):
+    if isinstance(rip, str) and rip and local_state._is_valid_host(rip):
         return rip
     host = node.get("endpoint_host")
-    if not isinstance(host, str) or not host or not _is_valid_host(host):
+    if not isinstance(host, str) or not host or not local_state._is_valid_host(host):
         return ""
     if _looks_like_ip(host):
         return host  # уже IP — passthrough
     try:
         resolved = socket.gethostbyname(host)
-        if resolved and _is_valid_host(resolved):
+        if resolved and local_state._is_valid_host(resolved):
             return resolved
     except (OSError, ValueError):
         # OSError: сетевые/DNS ошибки (gaierror/herror — подклассы OSError); ValueError: невалидный host

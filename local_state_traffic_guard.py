@@ -16,9 +16,6 @@ local_state.py. Этот модуль обращается к нему ЧЕРЕ�
 """
 import local_state
 
-# D2: валидация хоста — переиспользуем из фасада (канон _is_valid_host — единственный источник).
-_is_valid_host = local_state._is_valid_host
-
 _TRAFFIC_GUARD_MODES = {"on", "off", "auto"}
 _TRAFFIC_GUARD_POLICIES = {"block", "allow"}
 _TRAFFIC_GUARD_CHANNELS = {"wifi", "usb_tether", "metered"}
@@ -33,7 +30,7 @@ def _normalize_traffic_guard_domain(domain):
     if not normalized or normalized.startswith(".") or ".." in normalized:
         return ""
     # Traffic Guard принимает домены, не host:port/IPv6; shell-символы всё равно режет _HOST_RE.
-    if ":" in normalized or not _is_valid_host(normalized):
+    if ":" in normalized or not local_state._is_valid_host(normalized):
         return ""
     return normalized
 

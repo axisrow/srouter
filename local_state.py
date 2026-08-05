@@ -258,80 +258,106 @@ def _copy_default():
 def _nodes_from_state(state):
     """Тонкая обёртка над local_state_nodes._nodes_from_state — используется local_state_xray
     и local_state_routing через фасад (facade-lookup), см. docstring модуля."""
+    import local_state_nodes
     return local_state_nodes._nodes_from_state(state)
 
 
-# ============================ подмодули (facade re-export) ============================
-# Импортируются В КОНЦЕ файла: к этому моменту core I/O (load_state/save_state/_load_state_checked/
-# _atomic_write_text/_routing_config_lock/_is_valid_host/_DEFAULT_PATH) уже определён в globals
-# этого модуля — подмодули могут безопасно резолвить `local_state.<name>` при вызове функций
-# (facade-lookup, не при импорте). star-import-reexport-contract: реэкспортируем ВСЮ публичную и
-# внутреннюю (используемую снаружи как local_state._X, см. grep-consumer surface) поверхность.
+# ============================ подмодули (lazy facade re-export) ============================
+# КРИТИЧНО: реэкспорт делается ЛЕНИВО через module-level __getattr__ (PEP 562), НЕ module-level
+# bound assignment (`_is_valid_node = local_state_nodes._is_valid_node`). Двусторонний импорт
+# (local_state.py импортирует local_state_nodes.py В КОНЦЕ файла; local_state_nodes.py импортирует
+# local_state в НАЧАЛЕ) сам по себе не циклится — Python спокойно регистрирует оба модуля в
+# sys.modules без обращения к их атрибутам. Но если бы local_state.py в конце файла СРАЗУ читал
+# `local_state_nodes._is_valid_node` (module-level assignment), а кто-то извне импортировал бы
+# `local_state_nodes` НАПРЯМУЮ (раньше `local_state`), то `local_state_nodes.py` начал бы с
+# `import local_state`, что запустило бы ВЕСЬ local_state.py с начала (включая его собственный
+# `import local_state_nodes` в конце) — а local_state_nodes уже в sys.modules, но недоинициализирован
+# (Python видит частично выполненный модуль) → AttributeError "partially initialized module".
+# Воспроизводится эмпирически: `python3 -c "import local_state_nodes"` в изолированной копии
+# (без предварительного `import local_state`) падал именно так до этого фикса. __getattr__
+# резолвит имя ТОЛЬКО когда кто-то реально обращается к `local_state.<name>` (после того, как оба
+# модуля уже полностью проинициализированы) — тот же паттерн, что privoxy_system.py применяет для
+# privoxy_control.py (см. его docstring). star-import-reexport-contract: экспортируем ВСЮ
+# публичную и внутреннюю (используемую снаружи как local_state._X, см. grep-consumer surface)
+# поверхность.
 
-import local_state_nodes  # noqa: E402 — намеренно после core (facade-lookup)
-import local_state_traffic_guard  # noqa: E402
-import local_state_isolate  # noqa: E402
-import local_state_xray  # noqa: E402
-import local_state_routing  # noqa: E402
+_SUBMODULE_NAMES = {
+    # --- nodes ---
+    "_is_valid_node": "local_state_nodes",
+    "load_nodes": "local_state_nodes",
+    "enabled_nodes": "local_state_nodes",
+    "get_node": "local_state_nodes",
+    "active_node": "local_state_nodes",
+    "begin_active_node_change": "local_state_nodes",
+    "commit_active_node_change": "local_state_nodes",
+    "clear_pending": "local_state_nodes",
+    "_looks_like_ip": "local_state_nodes",
+    "resolve_route_ip": "local_state_nodes",
+    # --- traffic guard ---
+    "_TRAFFIC_GUARD_MODES": "local_state_traffic_guard",
+    "_TRAFFIC_GUARD_POLICIES": "local_state_traffic_guard",
+    "_TRAFFIC_GUARD_CHANNELS": "local_state_traffic_guard",
+    "_TRAFFIC_GUARD_AUTO_DOMAINS_ERROR": "local_state_traffic_guard",
+    "_normalize_traffic_guard_domain": "local_state_traffic_guard",
+    "_traffic_guard_domain_matches": "local_state_traffic_guard",
+    "_normalize_traffic_guard_channel": "local_state_traffic_guard",
+    "_validate_traffic_guard_domain_map": "local_state_traffic_guard",
+    "_validate_traffic_guard_channel_domains": "local_state_traffic_guard",
+    "_normalized_traffic_guard_domain_map": "local_state_traffic_guard",
+    "_normalized_traffic_guard_channel_domains": "local_state_traffic_guard",
+    "_traffic_guard_state_channel": "local_state_traffic_guard",
+    "_traffic_guard_domains_for_channel": "local_state_traffic_guard",
+    "validate_traffic_guard": "local_state_traffic_guard",
+    "traffic_guard_config": "local_state_traffic_guard",
+    "_valid_throttle_rate": "local_state_traffic_guard",
+    "validate_throttle_request": "local_state_traffic_guard",
+    "_valid_active_throttle": "local_state_traffic_guard",
+    "load_active_throttle": "local_state_traffic_guard",
+    "save_active_throttle": "local_state_traffic_guard",
+    "clear_active_throttle": "local_state_traffic_guard",
+    # --- PF isolate ---
+    "_valid_isolate_ports": "local_state_isolate",
+    "validate_isolate": "local_state_isolate",
+    "_valid_active_isolate": "local_state_isolate",
+    "load_active_isolate": "local_state_isolate",
+    "save_active_isolate": "local_state_isolate",
+    "clear_active_isolate": "local_state_isolate",
+    "_valid_active_codex_isolate": "local_state_isolate",
+    "load_active_codex_isolate": "local_state_isolate",
+    "save_active_codex_isolate": "local_state_isolate",
+    "clear_active_codex_isolate": "local_state_isolate",
+    # --- xray endpoint sync (#200) ---
+    "XRAY_CONFIG_PATH": "local_state_xray",
+    "_TESTNET_203_PREFIX": "local_state_xray",
+    "read_xray_active_address": "local_state_xray",
+    "_read_xray_vless_address": "local_state_xray",
+    "sync_route_ip_from_xray": "local_state_xray",
+    "_is_testnet_placeholder": "local_state_xray",
+    "active_endpoint_host": "local_state_xray",
+    "compare_endpoint_with_xray": "local_state_xray",
+    "sync_endpoint_from_xray": "local_state_xray",
+    # --- routing domains (#136) ---
+    "ROUTING_MARKER": "local_state_routing",
+    "DEFAULT_ROUTING_OUTBOUND": "local_state_routing",
+    "routing_plan": "local_state_routing",
+    "_routing_find_managed_rule": "local_state_routing",
+    "_routing_domains_hash": "local_state_routing",
+    "routing_apply": "local_state_routing",
+    "_routing_apply_locked": "local_state_routing",
+}
 
-# --- nodes ---
-_is_valid_node = local_state_nodes._is_valid_node
-load_nodes = local_state_nodes.load_nodes
-enabled_nodes = local_state_nodes.enabled_nodes
-get_node = local_state_nodes.get_node
-active_node = local_state_nodes.active_node
-begin_active_node_change = local_state_nodes.begin_active_node_change
-commit_active_node_change = local_state_nodes.commit_active_node_change
-clear_pending = local_state_nodes.clear_pending
-_looks_like_ip = local_state_nodes._looks_like_ip
-resolve_route_ip = local_state_nodes.resolve_route_ip
 
-# --- traffic guard ---
-_normalize_traffic_guard_domain = local_state_traffic_guard._normalize_traffic_guard_domain
-_traffic_guard_domain_matches = local_state_traffic_guard._traffic_guard_domain_matches
-_normalize_traffic_guard_channel = local_state_traffic_guard._normalize_traffic_guard_channel
-_validate_traffic_guard_domain_map = local_state_traffic_guard._validate_traffic_guard_domain_map
-_validate_traffic_guard_channel_domains = local_state_traffic_guard._validate_traffic_guard_channel_domains
-_normalized_traffic_guard_domain_map = local_state_traffic_guard._normalized_traffic_guard_domain_map
-_normalized_traffic_guard_channel_domains = local_state_traffic_guard._normalized_traffic_guard_channel_domains
-_traffic_guard_state_channel = local_state_traffic_guard._traffic_guard_state_channel
-_traffic_guard_domains_for_channel = local_state_traffic_guard._traffic_guard_domains_for_channel
-validate_traffic_guard = local_state_traffic_guard.validate_traffic_guard
-traffic_guard_config = local_state_traffic_guard.traffic_guard_config
-_valid_throttle_rate = local_state_traffic_guard._valid_throttle_rate
-validate_throttle_request = local_state_traffic_guard.validate_throttle_request
-_valid_active_throttle = local_state_traffic_guard._valid_active_throttle
-load_active_throttle = local_state_traffic_guard.load_active_throttle
-save_active_throttle = local_state_traffic_guard.save_active_throttle
-clear_active_throttle = local_state_traffic_guard.clear_active_throttle
+def __getattr__(name):
+    module_name = _SUBMODULE_NAMES.get(name)
+    if module_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    import importlib
+    submodule = importlib.import_module(module_name)
+    return getattr(submodule, name)
 
-# --- PF isolate ---
-_valid_isolate_ports = local_state_isolate._valid_isolate_ports
-validate_isolate = local_state_isolate.validate_isolate
-_valid_active_isolate = local_state_isolate._valid_active_isolate
-load_active_isolate = local_state_isolate.load_active_isolate
-save_active_isolate = local_state_isolate.save_active_isolate
-clear_active_isolate = local_state_isolate.clear_active_isolate
-_valid_active_codex_isolate = local_state_isolate._valid_active_codex_isolate
-load_active_codex_isolate = local_state_isolate.load_active_codex_isolate
-save_active_codex_isolate = local_state_isolate.save_active_codex_isolate
-clear_active_codex_isolate = local_state_isolate.clear_active_codex_isolate
 
-# --- xray endpoint sync (#200) ---
-XRAY_CONFIG_PATH = local_state_xray.XRAY_CONFIG_PATH
-read_xray_active_address = local_state_xray.read_xray_active_address
-_read_xray_vless_address = local_state_xray._read_xray_vless_address
-sync_route_ip_from_xray = local_state_xray.sync_route_ip_from_xray
-_is_testnet_placeholder = local_state_xray._is_testnet_placeholder
-active_endpoint_host = local_state_xray.active_endpoint_host
-compare_endpoint_with_xray = local_state_xray.compare_endpoint_with_xray
-sync_endpoint_from_xray = local_state_xray.sync_endpoint_from_xray
-
-# --- routing domains (#136) ---
-ROUTING_MARKER = local_state_routing.ROUTING_MARKER
-DEFAULT_ROUTING_OUTBOUND = local_state_routing.DEFAULT_ROUTING_OUTBOUND
-routing_plan = local_state_routing.routing_plan
-_routing_find_managed_rule = local_state_routing._routing_find_managed_rule
-_routing_domains_hash = local_state_routing._routing_domains_hash
-routing_apply = local_state_routing.routing_apply
-_routing_apply_locked = local_state_routing._routing_apply_locked
+def __dir__():
+    # PEP 562: без этого dir(local_state)/hasattr-интроспекция не видит lazy-реэкспортированные
+    # имена (только то, что реально в globals() на момент вызова). Явный __dir__ держит полный
+    # re-export surface видимым для интроспекции, не только для прямого атрибутного доступа.
+    return sorted(set(globals()) | set(_SUBMODULE_NAMES))
