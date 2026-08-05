@@ -705,3 +705,136 @@ def test_uninstall_resets_dns_for_orphaned_backup_dnsmasq(tmp_path, monkeypatch)
         "restorable=True (orphaned_backup) обязан сбрасывать DNS, а не оставлять его указывать на "
         "127.0.0.1 после того, как srouter-конфиг уже удалён с диска (Codex round 2 P1)"
     )
+
+
+# ==================================================================================================
+# cycle-review этого PR, round 3 (Codex): ТРЕТИЙ подряд FIX-цикл того же класса дефекта — устаревшее
+# ИЛИ неполное state, оставшееся от обрыва ДО финальной _write_state_after_apply, трактуется как
+# истина без проверки актуальности. Round 1 закрыл это для backup discovery (not_before/created_at),
+# round 2 — для adopted/restored mode и managed-гейта в services/dns. Round 3 нашёл ТУ ЖЕ болезнь в
+# ДВУХ полях, которые предыдущие раунды не трогали: (а) сам backup-pointer в state.entry может быть
+# УСТАРЕВШИМ (указывать не на последний backup, а на backup из более раннего цикла) даже когда режим
+# уже корректно распознан как orphaned_backup; (б) state['network']['channels'] пуст на «холодном»
+# первом-ever apply, обрывающемся до финальной записи, — DNS-сброс no-op'ится молча.
+#
+# По канону cycle-review "3-cycle cap = сигнал, не просто лимит": это НЕ 7-й точечный патч, а сигнал
+# нарушенного ИНВАРИАНТА — batched-at-tail-end запись state трактуется как proof of recency для полей,
+# чей реальный side-effect произошёл РАНЬШЕ этой записи. Каждый раунд закрывал ОДНО конкретное поле
+# (backup-приоритет → mode-устаревание → и вот снова: backup-freshness + network-cache) — это открытое
+# перечисление полей, а не структурное решение. Согласно правилу, здесь остановка на диагнозе, а не
+# четвёртый патч: xfail(strict=True) пиннит обе находки для решения пользователем (закрыть точечно /
+# перейти на per-effect durability вместо batched-записи / вынести в explicit follow-up issue).
+
+
+@pytest.mark.xfail(strict=True, reason=(
+    "cycle-review round 3 (Codex), issue #124: _resolve_backup доверяет entry['backup'] безусловно, "
+    "даже когда этот pointer УСТАРЕЛ (из предыдущего restored-цикла), а на диске уже лежит более "
+    "свежий backup (созданный текущим, оборвавшимся apply). Пользовательские правки, сделанные между "
+    "restore и следующим overwrite, теряются молча — uninstall восстанавливает старый backup вместо "
+    "нового, report ok=True. 3-й подряд FIX-цикл того же класса (устаревшее state = истина без "
+    "проверки recency) — остановка на диагнозе по правилу 3-cycle cap, не точечный патч."))
+def test_stale_restored_backup_pointer_loses_user_edits_after_manual_edit(tmp_path, monkeypatch):
+    """round-3 P1: entry['backup'] может указывать на СТАРЫЙ backup, когда на диске уже лежит новый.
+
+    Сценарий: install overwrite foreign A (backup_1) → uninstall restore A (entry: mode='restored',
+    backup=backup_1) → пользователь ВРУЧНУЮ редактирует восстановленный файл (не через install) →
+    новый apply overwrite создаёт backup_2 (копию правок пользователя) → crash ДО финальной записи
+    state оставляет entry всё ещё указывающим на backup_1. _resolve_backup видит entry['backup']=
+    backup_1 (живой файл — is_file()=True) и берёт его безусловно, хотя backup_2 (реальные, более
+    свежие правки пользователя) на диске тоже существует и остаётся orphaned навсегда.
+    """
+    env = _env(tmp_path)
+    config_path = env.component_paths("privoxy")["config"]
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text("ORIGINAL-FOREIGN\n", encoding="utf-8")
+
+    runner1 = FakeRunner()
+    result1 = install_lib.apply_install(
+        env=env, confirm=True,
+        choices={"privoxy": "overwrite", "xray": "skip", "dnsmasq": "skip"},
+        runner=runner1, port_checker=_port_checker_managed_up(runner1.calls))
+    assert result1["ok"] is True
+    backup_1 = _entry(env).get("backup")
+    assert backup_1, "backup_1 обязан быть записан после первого overwrite"
+
+    result2 = install_lib.apply_uninstall(
+        env=env, confirmations={"configs": True}, runner=FakeRunner())
+    assert result2["ok"] is True
+    assert config_path.read_text(encoding="utf-8") == "ORIGINAL-FOREIGN\n"
+
+    config_path.write_text("EDITED-BY-USER\n", encoding="utf-8")  # пользователь редактирует вручную
+
+    env2 = install_lib.InstallEnv(
+        root=env.root, prefix=env.prefix, state_path=env.state_path,
+        launchagent_dir=env.launchagent_dir, now="2026-06-29T00:10:00Z")
+    _crash_after(monkeypatch, "_write_component_config", component="privoxy")
+    runner3 = FakeRunner()
+    with pytest.raises(_Crash):
+        install_lib.apply_install(
+            env=env2, confirm=True,
+            choices={"privoxy": "overwrite", "xray": "skip", "dnsmasq": "skip"},
+            runner=runner3, port_checker=_port_checker_managed_up(runner3.calls))
+
+    backups_on_disk = install_config.discover_backups(config_path)
+    assert len(backups_on_disk) == 2, "backup_1 (ORIGINAL) и backup_2 (EDITED) обязаны сосуществовать"
+    backup_2_path = next(p for p in backups_on_disk if str(p) != backup_1)
+    assert backup_2_path.read_text(encoding="utf-8") == "EDITED-BY-USER\n"
+
+    install_lib.apply_uninstall(env=env2, confirmations={"configs": True}, runner=FakeRunner())
+
+    assert config_path.read_text(encoding="utf-8") == "EDITED-BY-USER\n", (
+        "самый свежий backup (пользовательские правки) обязан быть восстановлен, а не устаревший "
+        "pointer из предыдущего restored-цикла"
+    )
+
+
+@pytest.mark.xfail(strict=True, reason=(
+    "cycle-review round 3 (Codex), issue #124: на «холодном» первом-ever apply (нет state-файла "
+    "вовсе до этого apply) crash после _apply_dns оставляет DNS указывающим на 127.0.0.1, а "
+    "state['network']['channels'] никогда не был записан (пишется только финальной "
+    "_write_state_after_apply). apply_uninstall останавливает dnsmasq (services-гейт round 2 работает "
+    "корректно через restorable), но _restore_dns не может найти wifi_service в пустых channels → "
+    "no-op, DNS не сбрасывается, при этом report ok=True — полный DNS outage под видом успеха. "
+    "3-й подряд FIX-цикл того же класса — остановка на диагнозе по правилу 3-cycle cap."))
+def test_cold_start_crash_after_apply_dns_leaves_dns_broken_reported_ok(tmp_path, monkeypatch):
+    """round-3 P1: холодный старт (нет state вовсе) — DNS не сбрасывается, хотя сервис остановлен.
+
+    В отличие от test_uninstall_resets_dns_for_orphaned_backup_dnsmasq (есть bootstrap-шаг, поэтому
+    state.network уже заполнен от предыдущего успешного apply), здесь state_path вообще не существует
+    до этого apply — типичный первый запуск install на чистой машине.
+    """
+    env = _env(tmp_path)
+    assert not env.state_path.exists(), "precondition: ни одного успешного apply раньше не было"
+
+    _write_config_without_marker(env, "privoxy")
+    dnsmasq_config = env.component_paths("dnsmasq")["config"]
+    dnsmasq_config.parent.mkdir(parents=True, exist_ok=True)
+    dnsmasq_config.write_text("foreign dnsmasq config\n", encoding="utf-8")
+
+    _crash_after(monkeypatch, "_apply_dns")
+    runner = _WifiAwareRunner()
+    with pytest.raises(_Crash):
+        install_lib.apply_install(
+            env=env, confirm=True,
+            choices={"privoxy": "skip", "xray": "skip", "dnsmasq": "overwrite"},
+            runner=runner, port_checker=_port_checker_managed_up(runner.calls))
+
+    dns_calls_during_install = [c for c in runner.calls
+                                 if install_config.NETWORKSETUP in c and "127.0.0.1" in c]
+    assert dns_calls_during_install, "install реально применил DNS=127.0.0.1 до обрыва"
+    assert not env.state_path.exists(), "холодный старт: state-файл вообще не создан"
+
+    uninstall_runner = _WifiAwareRunner()
+    result = install_lib.apply_uninstall(
+        env=env, confirmations={"configs": True, "services": True, "dns": True},
+        runner=uninstall_runner)
+
+    stop_calls = [c for c in uninstall_runner.calls if "stop" in c and "dnsmasq" in c]
+    dns_reset_calls = [c for c in uninstall_runner.calls
+                        if install_config.NETWORKSETUP in c and "Empty" in c]
+    assert result["ok"] is True
+    assert stop_calls, "dnsmasq реально остановлен (restorable=True путь работает)"
+    assert dns_reset_calls, (
+        "DNS обязан быть сброшен даже когда state['network']['channels'] пуст (холодный старт) — "
+        "иначе dnsmasq остановлен, а DNS всё ещё указывает на 127.0.0.1, при report ok=True"
+    )
