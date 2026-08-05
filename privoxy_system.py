@@ -1,9 +1,27 @@
 #!/usr/bin/python3
 """Защищённый system-режим Privoxy для macOS.
 
-Пользовательская часть модуля готовит конфигурацию и вызывает root-owned helper через sudo.
 Root-часть намеренно использует только stdlib, фиксированные абсолютные пути и закрытый набор
 операций. Произвольные команды, shell=True и пользовательские target-path здесь запрещены.
+
+АРХИТЕКТУРНЫЙ ИНВАРИАНТ (issue #158, декомпозиция крупных файлов — этот модуль НЕ дробится
+дальше на root-side): этот файл — root-owned helper, копируется РОВНО ОДНИМ файлом в
+/Library/PrivilegedHelperTools (_read_helper_bytes_pinned читает __file__ целиком, digest
+считается от этих байт) и исполняется ИЗОЛИРОВАННО через sudo — рядом с ним нет других модулей
+srouter (только stdlib, каноны root-helper-stdlib-only-no-shared-imports,
+helper-stdlib-only-no-dashboard-common). Весь код, транзитивно достижимый из
+helper_main→protect_as_root/unprotect_as_root/control_as_root (примитивы atomic-write,
+fd-pinning copy, backup/restore, launchd-обвязка), ФИЗИЧЕСКИ обязан оставаться в этом файле —
+разбить его на модули с `import` означало бы ModuleNotFoundError под sudo в production
+(cycle-review PR #177 уже ловил эту регрессию на попытке `from dashboard_common import`).
+Полный tree-copy редизайн install-механизма (который разрешил бы дальнейшее дробление) —
+отдельная security-критичная задача вне scope этого issue, см. issue tree-copy redesign.
+
+Пользовательская оркестрация (protect/unprotect/control/status, установка helper'а,
+read-modify-write local_state) вынесена в privoxy_control.py — тот модуль выполняется в основном
+процессе srouter и НЕ копируется под sudo, поэтому безопасно импортирует local_state/sys_probe.
+Этот файл реэкспортирует его публичные имена в конце (facade re-export), полный контракт см. в
+docstring privoxy_control.py.
 """
 
 from __future__ import annotations
@@ -24,7 +42,6 @@ import shutil
 import socket
 import stat
 import subprocess
-import sys
 import tempfile
 import time
 
@@ -1175,249 +1192,6 @@ def _launchd_field(output, key):
     return match.group(1) if match else None
 
 
-def status(*, runner=None, layout=DEFAULT_LAYOUT):
-    """Read-only статус доступен без sudo."""
-    if runner is None:
-        from sys_probe import run as runner
-    result = runner([LAUNCHCTL, "print", _launchd_target(SYSTEM_DOMAIN, SYSTEM_LABEL)], 5)
-    output = result.get("out") or ""
-    loaded = result.get("rc") == 0 and bool(output.strip())
-    pid = None
-    raw_pid = _launchd_field(output, "pid") if loaded else None
-    try:
-        pid = int(raw_pid) if raw_pid is not None else None
-    except ValueError:
-        pid = None
-    owner = ""
-    if pid:
-        ps = runner([PS, "-o", "user=", "-p", str(pid)], 3)
-        owner = (ps.get("out") or "").strip()
-    user_shadow = runner(
-        [LAUNCHCTL, "print", _launchd_target(f"gui/{os.getuid()}", USER_LABEL)], 5
-    )
-    protected_assets = (
-        layout.config_dir.parent,
-        layout.config_dir,
-        layout.config_path,
-        layout.runtime_dir,
-        layout.binary_path,
-        layout.launchdaemon_path,
-        layout.helper_path,
-        layout.sudoers_path,
-    )
-    return {
-        "protected": protection_present(layout),
-        "loaded": loaded,
-        "pid": pid,
-        "owner": owner,
-        "state": _launchd_field(output, "state") if loaded else None,
-        "port_up": _port_open(),
-        "config_writable": os.access(layout.config_path, os.W_OK) if layout.config_path.exists() else None,
-        "binary_writable": os.access(layout.binary_path, os.W_OK) if layout.binary_path.exists() else None,
-        "assets_writable": any(path.exists() and os.access(path, os.W_OK)
-                               for path in protected_assets),
-        "user_shadow_loaded": user_shadow.get("rc") == 0 and bool((user_shadow.get("out") or "").strip()),
-        "error": "" if loaded else (result.get("err") or "not loaded")[:240],
-    }
-
-
-def state_protected(state_path):
-    try:
-        import local_state
-        state = local_state.load_state(path=state_path)
-    except (OSError, ValueError, TypeError, ImportError) as exc:
-        return False
-    detected = state.get("detected_environment") if isinstance(state.get("detected_environment"), dict) else {}
-    entry = detected.get("privoxy") if isinstance(detected.get("privoxy"), dict) else {}
-    protection = entry.get("protection") if isinstance(entry.get("protection"), dict) else {}
-    return protection.get("service_scope") == "system" and protection.get("label") == SYSTEM_LABEL
-
-
-def _write_pending(state_path, previous):
-    import local_state
-    state, readable = local_state.load_state_checked(path=state_path)
-    if not readable:
-        return False
-    runtime = state.get("runtime") if isinstance(state.get("runtime"), dict) else {}
-    runtime["privoxy_protection_pending"] = {
-        "action": "protect",
-        "started_at": _now(),
-        "previous": previous,
-    }
-    state["runtime"] = runtime
-    return local_state.save_state(state, path=state_path) is not None
-
-
-def _write_unprotect_pending(state_path):
-    import local_state
-    state, readable = local_state.load_state_checked(path=state_path)
-    if not readable:
-        return False
-    detected = state.get("detected_environment") if isinstance(state.get("detected_environment"), dict) else {}
-    current = detected.get("privoxy") if isinstance(detected.get("privoxy"), dict) else {}
-    runtime = state.get("runtime") if isinstance(state.get("runtime"), dict) else {}
-    runtime["privoxy_protection_pending"] = {
-        "action": "unprotect",
-        "started_at": _now(),
-        "previous": current,
-    }
-    state["runtime"] = runtime
-    return local_state.save_state(state, path=state_path) is not None
-
-
-def _mark_failed(state_path, error):
-    import local_state
-    state, readable = local_state.load_state_checked(path=state_path)
-    if not readable:
-        return
-    runtime = state.get("runtime") if isinstance(state.get("runtime"), dict) else {}
-    pending = runtime.get("privoxy_protection_pending")
-    if isinstance(pending, dict):
-        pending["failed_at"] = _now()
-        pending["error"] = error
-    runtime["last_error"] = error
-    state["runtime"] = runtime
-    local_state.save_state(state, path=state_path)
-
-
-def _promote_state(state_path, *, backup_dir, layout=DEFAULT_LAYOUT):
-    import local_state
-    state, readable = local_state.load_state_checked(path=state_path)
-    if not readable:
-        return False
-    detected = state.get("detected_environment") if isinstance(state.get("detected_environment"), dict) else {}
-    previous = detected.get("privoxy") if isinstance(detected.get("privoxy"), dict) else {}
-    runtime = state.get("runtime") if isinstance(state.get("runtime"), dict) else {}
-    pending = runtime.get("privoxy_protection_pending")
-    if isinstance(pending, dict) and isinstance(pending.get("previous"), dict):
-        previous = pending["previous"]
-    detected["privoxy"] = {
-        "config_path": str(layout.config_path),
-        "port": _PRIVOXY_PORT,
-        "service": "protected-system",
-        "management": {"mode": "managed", "managed": True, "provenance": "protected"},
-        "protection": {
-            "version": PROTECTION_VERSION,
-            "mode": "strict",
-            "service_scope": "system",
-            "label": SYSTEM_LABEL,
-            "backup_dir": backup_dir,
-            "previous": previous,
-            "activated_at": _now(),
-        },
-    }
-    detected["last_checked_at"] = _now()
-    state["detected_environment"] = detected
-    runtime.pop("privoxy_protection_pending", None)
-    runtime["last_apply"] = _now()
-    runtime["last_error"] = None
-    state["runtime"] = runtime
-    return local_state.save_state(state, path=state_path) is not None
-
-
-def _restore_state_after_unprotect(state_path):
-    import local_state
-    state, readable = local_state.load_state_checked(path=state_path)
-    if not readable:
-        return False
-    detected = state.get("detected_environment") if isinstance(state.get("detected_environment"), dict) else {}
-    entry = detected.get("privoxy") if isinstance(detected.get("privoxy"), dict) else {}
-    protection = entry.get("protection") if isinstance(entry.get("protection"), dict) else {}
-    previous = protection.get("previous") if isinstance(protection.get("previous"), dict) else None
-    detected["privoxy"] = previous
-    detected["last_checked_at"] = _now()
-    state["detected_environment"] = detected
-    runtime = state.get("runtime") if isinstance(state.get("runtime"), dict) else {}
-    runtime.pop("privoxy_protection_pending", None)
-    runtime["last_apply"] = _now()
-    runtime["last_error"] = None
-    state["runtime"] = runtime
-    return local_state.save_state(state, path=state_path) is not None
-
-
-def _parse_helper_output(result):
-    for line in reversed((result.get("out") or "").splitlines()):
-        try:
-            value = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(value, dict) and "ok" in value:
-            return value
-    return _result(False, error=(result.get("err") or result.get("out") or "helper_failed")[:240])
-
-
-def _sudo_reset(runner):
-    return runner([SUDO, "-k"], 5)
-
-
-def _install_helper(runner, layout=DEFAULT_LAYOUT):
-    """Установка root-owned helper через fd-pinning + post-install digest (TOCTOU-свободно, #148 variant 3).
-
-    Прежний код проверял marker на __file__ и затем звал `sudo install __file__ dst` —
-    /usr/bin/install ПОВТОРНО открывал тот же pathname под sudo. Атакующий атомарно
-    заменял файл во время password-prompt: Python шёл по безопасному control flow, а
-    install клал attacker-bytes как root-owned helper 0755, который protect сразу
-    запускал через sudo → произвольное root-выполнение.
-
-    Фикс: (1) открыть __file__ через O_NOFOLLOW — marker и expected-digest вычисляются
-    на bytes ТОГО ЖЕ fd (TOCTOU-окна между проверкой и использованием нет); (2) записать
-    эти bytes в staged temp (mkstemp, непредсказуемое имя); (3) `sudo install staged dst`
-    копирует staged, НЕ __file__ — pathname __file__ больше не ре-открывается под sudo;
-    (4) post-install digest-check: прочитанный через O_NOFOLLOW установленный helper
-    обязан совпадать с expected-digest. Расхождение → fail-closed (удаление + отказ).
-
-    ВАЖНО (observation Codex): staged создаётся в user-процессе `protect()` (НЕ root),
-    поэтому mkstemp-файл user-owned/writable. В окне [mkstemp .. sudo install] тот же
-    UID может подменить staged. Эта подмена ПОЙМАНА post-install digest-check (шаг 4):
-    install копирует staged байт-в-байт в root-owned dst, digest dst сравнивается с
-    digest честно прочитанного __file__ — расхождение = fail-closed, attacker-bytes
-    никогда не становятся валидным helper'ом. В user-процессе создать root-owned объект
-    без sudo невозможно, поэтому post-install digest — единственная полная защита этого
-    окна; она покрывает его полностью (preimage sha256 практичен только при совпадении
-    с __file__-bytes, т.е. без эскалации). Race-тест
-    test_install_helper_fail_closed_when_staged_substituted_after_mkstemp фиксирует инвариант.
-    """
-    # (1) marker + expected-digest на bytes зафиксированного fd, не на path (path-based
-    # _managed_file проверял бы объект, который install переоткроет — TOCTOU window).
-    helper_bytes, expected_digest = _read_helper_bytes_pinned()
-    if helper_bytes is None:
-        return _result(False, error="helper_source_marker_missing")
-    # foreign-helper guard: helper_path — target (root-owned), path-based допустимо,
-    # но читаем через O_NOFOLLOW для консистентности.
-    if layout.helper_path.exists() and not _helper_has_marker_fd(layout.helper_path):
-        return _result(False, error="foreign_privileged_helper")
-    parent = runner([SUDO, MKDIR, "-p", str(layout.helper_path.parent)], 30)
-    if parent.get("rc") != 0:
-        return _result(False, error=(parent.get("err") or "helper_parent_failed")[:240])
-    # (2): зафиксированные digest-проверенные bytes в staged temp (user-owned в окне,
-    # но post-check ниже ловит любую подмену — см. docstring).
-    staged = _stage_helper_bytes(helper_bytes)
-    if staged is None:
-        return _result(False, error="helper_stage_failed")
-    try:
-        # (3) install копирует staged, не __file__ — pathname __file__ не ре-открывается под sudo.
-        installed = runner(
-            [SUDO, INSTALL, "-o", "root", "-g", "wheel", "-m", "0755",
-             str(staged), str(layout.helper_path)],
-            30,
-        )
-        if installed.get("rc") != 0:
-            return _result(False, error=(installed.get("err") or "helper_install_failed")[:240])
-        # (4) post-install digest-check: установленный helper обязан совпадать с
-        # expected-digest честно прочитанного __file__. Расхождение (подмена staged в
-        # окне ИЛИ вторичная подмена helper_path) → fail-closed.
-        installed_digest = _digest_fd_nofollow(layout.helper_path)
-        if installed_digest is None or installed_digest != expected_digest:
-            _remove_via_runner(runner, layout.helper_path)
-            return _result(False, error="helper_digest_mismatch")
-        return _result(True)
-    finally:
-        try:
-            os.unlink(staged)
-        except OSError:
-            pass
-
-
 def _read_helper_bytes_pinned():
     """Открыть __file__ через O_NOFOLLOW, прочитать bytes, проверить marker и вычислить digest.
 
@@ -1509,158 +1283,45 @@ def _stage_helper_bytes(data):
         return None
 
 
-def _remove_via_runner(runner, path):
-    """Best-effort удаление скомпрометированного helper (fail-closed cleanup)."""
-    try:
-        runner([SUDO, "/bin/rm", "-f", "--", str(path)], 15)
-    except Exception:  # noqa: BLE001 — cleanup не должен маскировать основную ошибку.
-        pass
+# ============================ user-side фасад (lazy facade re-export) ============================
+# privoxy_control.py — оркестрация protect/unprotect/control/status, выполняется в ОСНОВНОМ
+# процессе srouter (НЕ копируется под sudo, см. docstring модуля выше и docstring
+# privoxy_control.py).
+#
+# КРИТИЧНО: импорт privoxy_control НЕ может быть top-level здесь. Regression-тест
+# test_privoxy_system_helper_runs_isolated_without_dashboard_common копирует ТОЛЬКО этот файл
+# в изолированную директорию и запускает `python3 -S com.srouter.privoxyctl status` — ровно то,
+# что делает production sudo-запуск (helper копируется ОДНИМ файлом, privoxy_control.py рядом
+# физически отсутствует). Top-level `import privoxy_control` уронил бы helper_main
+# ModuleNotFoundError на самой первой строке — та же регрессия, что cycle-review PR #177 поймал
+# на `from dashboard_common import`.
+#
+# Решение — module-level __getattr__ (PEP 562): `privoxy_system.status`/`.protect`/... резолвятся
+# ЛЕНИВО, импорт privoxy_control происходит только при фактическом обращении к атрибуту (вызов из
+# srouter_cli.py/health.py/install_config.py и т.п. — основной процесс, где privoxy_control.py
+# физически рядом). helper_main обращается только к helper-side именам (protect_as_root и т.д.,
+# уже в globals этого модуля) — __getattr__ для них не вызывается, privoxy_control не
+# импортируется, изоляция сохраняется.
+_USER_SIDE_NAMES = frozenset({
+    "status", "state_protected", "_write_pending", "_write_unprotect_pending", "_mark_failed",
+    "_promote_state", "_restore_state_after_unprotect", "_parse_helper_output", "_sudo_reset",
+    "_install_helper", "_remove_via_runner", "_rollback_protection", "protect", "control",
+    "unprotect",
+})
 
 
-def _rollback_protection(runner, layout=DEFAULT_LAYOUT):
-    _sudo_reset(runner)
-    rollback = runner([SUDO, str(layout.helper_path), "unprotect", "--restore"], 90)
-    _sudo_reset(runner)
-    return _parse_helper_output(rollback)
+def __getattr__(name):
+    if name in _USER_SIDE_NAMES:
+        import privoxy_control
+        return getattr(privoxy_control, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-def protect(*, state_path, prefix="/opt/homebrew", runner=None, require_tty=True,
-            layout=DEFAULT_LAYOUT, debug=None):
-    if runner is None:
-        from sys_probe import run as runner
-    if require_tty and not sys.stdin.isatty():
-        return _result(False, error="interactive_terminal_required")
-    # #152: уровень privoxy-логирования. По умолчанию (None) — из SROUTER_PRIVOXY_DEBUG (privacy:
-    # 0 если env не задан). Явный аргумент переопределяет env (для тестов/programmatic-call).
-    if debug is None:
-        debug = _privoxy_debug_from_env()
-    current = status(runner=runner, layout=layout)
-    secure = (
-        current["protected"]
-        and current["loaded"]
-        and current["port_up"]
-        and current["owner"] == "nobody"
-        and current["config_writable"] is False
-        and current["binary_writable"] is False
-        and current["assets_writable"] is False
-        and not current["user_shadow_loaded"]
-    )
-    if secure:
-        if not state_protected(state_path):
-            manifest = _load_manifest(layout) or {}
-            if not _promote_state(state_path, backup_dir=manifest.get("backup_dir", ""), layout=layout):
-                return _result(False, error="state_repair_failed", status=current)
-            return _result(True, changed=True, repaired_state=True, status=current)
-        return _result(True, changed=False, status=current)
-
-    import local_state
-    state, readable = local_state.load_state_checked(path=state_path)
-    if not readable:
-        return _result(False, error="state_unreadable")
-    detected = state.get("detected_environment") if isinstance(state.get("detected_environment"), dict) else {}
-    previous = detected.get("privoxy") if isinstance(detected.get("privoxy"), dict) else {}
-    if not _write_pending(state_path, previous):
-        return _result(False, error="pending_state_write_failed")
-
-    staged_dir = Path(tempfile.mkdtemp(prefix="srouter-privoxy-protect-", dir="/private/tmp"))
-    staged_config = staged_dir / "config"
-    try:
-        os.chmod(staged_dir, 0o700)
-        staged_config.write_text(protected_config_text(layout, debug=debug), encoding="utf-8")
-        os.chmod(staged_config, 0o600)
-        _sudo_reset(runner)
-        installed = _install_helper(runner, layout)
-        if not installed["ok"]:
-            _mark_failed(state_path, installed["error"])
-            return installed
-        invoked = runner(
-            [SUDO, str(layout.helper_path), "protect",
-             "--username", pwd.getpwuid(os.getuid()).pw_name,
-             "--uid", str(os.getuid()),
-             "--prefix", str(prefix),
-             "--config", str(staged_config),
-             "--debug", str(debug)],
-            120,
-        )
-        outcome = _parse_helper_output(invoked)
-        _sudo_reset(runner)
-        if not outcome["ok"]:
-            _mark_failed(state_path, outcome["error"])
-            return outcome
-
-        no_cache = runner([SUDO, "-n", str(layout.helper_path), "status"], 10)
-        if no_cache.get("rc") == 0:
-            detail = _rollback_protection(runner, layout)
-            error = "sudo_without_fresh_authorization"
-            if not detail.get("ok"):
-                error += f"; rollback_failed:{detail.get('error')}"
-            _mark_failed(state_path, error)
-            return _result(False, error=error)
-
-        current = status(runner=runner, layout=layout)
-        if not (current["protected"] and current["loaded"] and current["port_up"]
-                and current["owner"] == "nobody" and current["config_writable"] is False
-                and current["binary_writable"] is False and current["assets_writable"] is False
-                and not current["user_shadow_loaded"]):
-            rollback_result = _rollback_protection(runner, layout)
-            error = "post_protect_verification_failed"
-            if not rollback_result.get("ok"):
-                error += f"; rollback_failed:{rollback_result.get('error')}"
-            _mark_failed(state_path, error)
-            return _result(False, error=error, status=current)
-        if not _promote_state(state_path, backup_dir=outcome.get("backup_dir", ""), layout=layout):
-            # Файлы/служба уже применены, но active-state не зафиксирован — это не success.
-            # Откатываем той же whitelisted root-операцией и оставляем pending с причиной.
-            rollback_result = _rollback_protection(runner, layout)
-            _mark_failed(state_path, "state_promote_failed")
-            return _result(False, error=("state_promote_failed" if rollback_result.get("ok")
-                                         else f"state_promote_failed; rollback_failed:{rollback_result.get('error')}"),
-                           status=current)
-        return _result(True, changed=True, status=current, backup_dir=outcome.get("backup_dir", ""))
-    finally:
-        shutil.rmtree(staged_dir, ignore_errors=True)
-
-
-def control(action, *, runner=None, require_tty=True, layout=DEFAULT_LAYOUT):
-    if action not in {"start", "stop", "restart"}:
-        return _result(False, error="action_not_allowed")
-    if runner is None:
-        from sys_probe import run as runner
-    if require_tty and not sys.stdin.isatty():
-        return _result(False, error="interactive_terminal_required")
-    if not protection_present(layout):
-        return _result(False, error="protected_service_not_installed")
-    _sudo_reset(runner)
-    invoked = runner([SUDO, str(layout.helper_path), action], 90)
-    _sudo_reset(runner)
-    outcome = _parse_helper_output(invoked)
-    outcome["status"] = status(runner=runner, layout=layout)
-    return outcome
-
-
-def unprotect(*, state_path, restore=True, runner=None, require_tty=True,
-              layout=DEFAULT_LAYOUT):
-    if runner is None:
-        from sys_probe import run as runner
-    if require_tty and not sys.stdin.isatty():
-        return _result(False, error="interactive_terminal_required")
-    if not protection_present(layout):
-        return _result(True, changed=False)
-    if not _write_unprotect_pending(state_path):
-        return _result(False, error="pending_state_write_failed")
-    _sudo_reset(runner)
-    cmd = [SUDO, str(layout.helper_path), "unprotect"]
-    if restore:
-        cmd.append("--restore")
-    invoked = runner(cmd, 90)
-    outcome = _parse_helper_output(invoked)
-    _sudo_reset(runner)
-    if not outcome["ok"]:
-        _mark_failed(state_path, outcome["error"])
-        return outcome
-    if not _restore_state_after_unprotect(state_path):
-        return _result(False, error="state_restore_failed")
-    return _result(True, changed=True, restored=outcome.get("restored", False))
+def __dir__():
+    # PEP 562: без этого dir(privoxy_system)/hasattr-интроспекция не видит lazy user-side имена
+    # (только то, что реально в globals() на момент вызова). Явный __dir__ держит полный
+    # re-export surface видимым — тот же паттерн, что local_state.py (см. его __dir__).
+    return sorted(set(globals()) | set(_USER_SIDE_NAMES))
 
 
 def helper_main(argv=None):
