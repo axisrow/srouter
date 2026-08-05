@@ -76,6 +76,7 @@ from install_config import (  # noqa: F401  (реэкспорт — фасад i
     build_plan,
     format_plan,
     _backup,
+    discover_backups,
     _write_component_config,
     _traffic_guard_preflight_error,
     _ensure_package,
@@ -89,6 +90,8 @@ from install_config import (  # noqa: F401  (реэкспорт — фасад i
     _is_restored_entry,
     _provenance_of,
     _is_created_entry,
+    _resolve_backup,
+    component_facts,
 )
 from install_cleanup import (  # noqa: F401  (реэкспорт — фасад install_lib)
     UNINSTALL_CATEGORIES,

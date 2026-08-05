@@ -21,6 +21,7 @@ from install_config import (
     InstallEnv,
     NETWORKSETUP,
     SUDO,
+    _BACKUP_INFIX,
     _has_marker,
     _is_adopted_entry,
     _is_managed_entry,
@@ -28,6 +29,7 @@ from install_config import (
     _provenance_of,
     apply_install,
     build_plan,
+    component_facts,
     format_plan,
 )
 from install_plist import (
@@ -43,45 +45,68 @@ UNINSTALL_CATEGORIES = ("configs", "services", "dns", "launchagent")
 
 
 def _component_uninstall_item(name, env, detected):
+    """Uninstall-представление компонента: перевод recovery из component_facts в поля плана.
+
+    До issue #124 здесь жила ВТОРАЯ, независимая реализация вывода состояния (первая —
+    _inspect_component на стороне install). Именно расхождение двух реализаций было корнем #110
+    («install верил файлу, uninstall верил state») и рецидивом стало в #124 на третьем факте: install
+    знал про backup, а uninstall узнать не мог — ссылка терялась при обрыве, и пользовательский
+    оригинал оставался orphaned навсегда (P1-3). Теперь оба слоя читают ОДИН редьюсер.
+
+    Что uninstall узнаёт: факты о мире (маркер в файле, backup'ы на диске, запись в state). Чего НЕ
+    узнаёт: механику записи install'а — был ли обрыв, в какой фазе, существуют ли промежуточные
+    состояния. Утечка этой механики сюда и провалила PR #119 (гвард — tests/test_install_layering.py).
+    """
     entry = detected.get(name) if isinstance(detected.get(name), dict) else {}
-    config_path = Path(entry.get("config_path") or env.component_paths(name)["config"])
-    backup_path = Path(entry["backup"]) if entry.get("backup") else None
-    marker_present = config_path.exists() and _has_marker(config_path)
-    managed = _is_managed_entry(entry)
-    adopted = _is_adopted_entry(entry)
-    restored = _is_restored_entry(entry)
-    provenance = _provenance_of(entry)
-    restorable = managed and marker_present and bool(backup_path and backup_path.exists())
-    # removable (issue #112 Часть 2, РЕШЕНИЕ 1 — fail-closed двойной арбитраж): created-конфиг удаляется
-    # ТОЛЬКО при подтверждении двумя арбитрами — provenance='created' (из state: srouter создал с нуля)
-    # И живой srouter-маркер в файле (файл действительно наш, не подменён). Без маркера → НЕ удалять
-    # (state drift / crash-during-install / подмена) — fail-safe leftover. Канон «никогда молча не adopt».
-    removable = managed and provenance == "created" and marker_present
-    if adopted:
-        status = "adopted — left untouched"
-    elif restored:
-        status = "restored — left untouched"
-    elif removable:
+    facts = component_facts(name, env, entry)
+    recovery = facts["recovery"]
+    managed = facts["managed"]
+    marker_present = facts["marker_present"]
+    provenance = facts["provenance"]
+
+    # restore покрывает и штатный overwrite (recovery='restore'), и обрыв ДО записи state
+    # (recovery='orphaned_backup'): для действия они неразличимы — есть доказанный backup нашего
+    # конфига, оригинал пользователя подлежит возврату. Различие лишь в происхождении знания, и оно
+    # отражается в status для оператора, а не в правах.
+    restorable = recovery in ("restore", "orphaned_backup")
+    # removable (issue #112 Часть 2, fail-closed двойной арбитраж): created-конфиг удаляется ТОЛЬКО
+    # при подтверждении двумя арбитрами — provenance='created' в state И живой srouter-маркер в файле.
+    # Плюс третий, добавленный #124: рядом НЕТ backup'а. Backup доказывает, что overwrite всё-таки
+    # был (state деградировал) — тогда восстанавливаем, а не удаляем (F2/P1-1).
+    removable = recovery == "remove"
+
+    if recovery == "none":
+        if facts["adopted"]:
+            status = "adopted — left untouched"
+        elif facts["restored"]:
+            status = "restored — left untouched"
+        else:
+            status = "unmanaged — left untouched"
+    elif recovery == "remove":
         status = "managed — created config, remove available"
-    elif restorable:
+    elif recovery == "restore":
         status = "managed — restore available"
+    elif recovery == "orphaned_backup":
+        status = "orphaned backup — interrupted install, restore available"
+    elif recovery == "ambiguous":
+        status = "ambiguous backups — operator must choose, left untouched"
     elif managed and provenance == "created" and not marker_present:
         status = "managed — created config, marker missing (fail-safe leftover)"
-    elif managed:
-        status = "managed — no safe backup/marker, left untouched"
     else:
-        status = "unmanaged — left untouched"
+        status = "managed — no safe backup/marker, left untouched"
     return {
         "name": name,
-        "config_path": str(config_path),
-        "backup": str(backup_path) if backup_path else "",
+        "config_path": facts["config_path"],
+        "backup": facts["backup"],
         "managed": managed,
-        "adopted": adopted,
-        "restored": restored,
+        "adopted": facts["adopted"],
+        "restored": facts["restored"],
         "provenance": provenance,
         "marker_present": marker_present,
         "restorable": restorable,
         "removable": removable,
+        "recovery": recovery,
+        "discovered_backups": facts["discovered_backups"],
         "status": status,
     }
 
@@ -129,7 +154,9 @@ def build_uninstall_plan(env=None, runner=run):
         "user_data_retained": [
             "srouter.local.json",
             "generated key/deploy bundles",
-            "*.srouter-backup-*",
+            # шаблон из источника правды (install_config) — не дублируем литерал имени backup:
+            # его формат задаёт _backup, и расхождение копии молча соврало бы оператору.
+            f"*{_BACKUP_INFIX}*",
         ],
     }
 
@@ -235,9 +262,10 @@ def _mark_component_removed(env, item):
     entry["config_path"] = item.get("config_path")
     # created-конфиг удалён — нечего восстанавливать. Чистим backup-ссылку (её не было для created,
     # но defensive: state-drift мог оставить). provenance=None (больше не managed).
+    # issue #124: снятые здесь ранее pending_backup/pending_written_at были мёртвым остатком WAL из
+    # PR #119 — их никто не писал. Их присутствие означало, что uninstall знает про промежуточные
+    # фазы записи install'а; новая архитектура такого знания не требует (см. component_facts).
     entry.pop("backup", None)
-    entry.pop("pending_backup", None)
-    entry.pop("pending_written_at", None)
     entry["management"] = {"mode": "removed", "managed": False, "provenance": None}
     entry["removed_at"] = env.now
     detected[item["name"]] = entry
@@ -305,16 +333,35 @@ def apply_uninstall(env=None, *, confirmations=None, runner=run):
                 actions.append({"category": "configs", "component": item["name"], "changed": True})
                 continue
             if not item.get("restorable"):
+                # ambiguous (issue #124): несколько валидных backup'ов, state не разрешает, какой из
+                # них оригинал пользователя. Автовыбор «самого свежего» — ловушка: при обрыве второго
+                # install свежий backup является копией srouter-конфига, а оригинал лежит в самом
+                # старом. Молча угадать = потерять ровно так же, как теряла старая архитектура.
+                # Отдаём выбор оператору со списком путей, конфиг не трогаем (fail-closed).
+                if item.get("recovery") == "ambiguous":
+                    leftover.append({
+                        "name": item["name"], "status": item.get("status", "unknown"),
+                        "reason": ("несколько backup-кандидатов, state не указывает оригинал — "
+                                   "выберите вручную: " + ", ".join(item.get("discovered_backups") or [])),
+                    })
+                    continue
                 # created БЕЗ маркера (двойной арбитраж не пройден) → fail-safe leftover, не удалять.
                 # stale-managed (legacy без provenance, маркер пропал) → leftover (как #110 Дефект 1).
                 # Маркер на месте для legacy-without-provenance → НЕ leftover (определённое состояние, оставляем).
                 if item.get("managed") and not item.get("marker_present"):
                     if item.get("provenance") == "created":
-                        reason = "created-config: marker missing (crash-during-install / подмена) — fail-safe, не удалено"
+                        reason = "created-config: marker missing (обрыв install / подмена) — fail-safe, не удалено"
                     else:
                         reason = "stale-managed: not restorable and marker missing"
                     leftover.append({"name": item["name"], "status": item.get("status", "unknown"),
                                      "reason": reason})
+                # Наш конфиг (маркер жив), но истории нет и backup рядом нет: восстанавливать нечем,
+                # удалять вслепую нельзя. Сообщаем, чтобы молчаливого «всё откатилось» не случилось.
+                elif item.get("recovery") == "leftover" and not item.get("managed"):
+                    leftover.append({
+                        "name": item["name"], "status": item.get("status", "unknown"),
+                        "reason": "srouter-маркер в конфиге, но ни backup, ни записи в state — не откатано",
+                    })
                 continue
             if not _restore_backup(Path(item["backup"]), Path(item["config_path"])):
                 return {"ok": False, "blocked": [f"{item['name']}_restore_failed"], "actions": actions, "plan": plan}

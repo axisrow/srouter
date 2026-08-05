@@ -504,16 +504,85 @@ def format_plan(plan):
     return "\n".join(lines)
 
 
+_BACKUP_INFIX = ".srouter-backup-"
+
+
+def _backup_suffix(now):
+    """Timestamp-суффикс имени backup: env.now с вырезанными недопустимыми в имени файла символами."""
+    return now.replace(":", "").replace("/", "-")
+
+
 def _backup(path, env):
     if not path.exists():
         return ""
-    suffix = env.now.replace(":", "").replace("/", "-")
-    backup = path.with_name(path.name + f".srouter-backup-{suffix}")
+    backup = path.with_name(path.name + _BACKUP_INFIX + _backup_suffix(env.now))
     try:
         shutil.copy2(path, backup)
         return str(backup)
     except OSError:
         return ""
+
+
+def _parse_backup_stamp(name):
+    """'2026-06-29T000000Z' → datetime, иначе None. Единственный источник правды о формате имени.
+
+    Формат задаёт _backup: _backup_suffix(env.now), где env.now — ISO-8601 UTC-Z из _now() с
+    вырезанными ':' и '/'. Разбор ОБРАТНОЙ операцией (а не «почти-regex» вроде \\d+) — канон
+    probe-semantics-from-primary-source / loose-validator-recurring-leak: не парсится этим форматом —
+    значит файл создан не нами.
+    """
+    try:
+        return datetime.strptime(name, "%Y-%m-%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return None
+
+
+def discover_backups(config_path):
+    """Валидные srouter-backup'ы, лежащие рядом с config_path, от старых к новым (issue #124).
+
+    ЗАЧЕМ. Ссылка на backup хранится в state, но между созданием backup-файла и записью state лежат
+    минуты (brew install/restart всех компонентов). Обрыв в этом окне терял ссылку, и uninstall
+    оставлял пользовательский оригинал orphaned навсегда (P1-3, самый дорогой из 6 P1 issue #124).
+    Backup-файл самоописывающийся и лежит ВПЛОТНУЮ к target, поэтому он обнаружим из одного лишь
+    config_path — как srouter-маркер в самом конфиге, который проект уже канонизировал как «живой
+    арбитр» (_has_marker). Разница между «state помнит backup» и «backup сам себя предъявляет» — это
+    разница между памятью и доказательством; канон verify-dont-guess требует второго.
+
+    ГРАНИЦА СЛОЯ. Функция отвечает на вопрос о МИРЕ («какие backup'ы этого конфига существуют»), а не
+    о механике install'а («был ли crash / в какой фазе / был ли pending»). Поэтому её вправе звать и
+    uninstall — он не узнаёт ничего о том, как install пишет. Утечка WAL-механики в uninstall и была
+    провалом PR #119 (см. tests/test_install_layering.py).
+
+    FAIL-CLOSED. Похожее имя ещё не делает файл нашим:
+      - fullmatch с якорем, а не glob: glob('config.srouter-backup-*') поймал бы хвостовой
+        'config.srouter-backup-x.tmp' от атомарной записи и вложенный двойной суффикс;
+      - суффикс обязан парситься форматом _backup (_parse_backup_stamp);
+      - только regular file: симлинк с валидным именем — вектор подмены (restore записал бы
+        содержимое по чужому пути), directory — не backup.
+    Возврат отсортирован по метке времени ДЕТЕРМИНИРОВАННО — для воспроизводимых сообщений оператору,
+    но НЕ для автовыбора «самого свежего»: при обрыве второго install свежий backup — копия
+    srouter-конфига, а оригинал пользователя в самом старом (см. _resolve_backup).
+    """
+    path = Path(config_path)
+    try:
+        candidates = list(path.parent.iterdir())
+    except OSError:
+        return []
+    prefix = path.name + _BACKUP_INFIX
+    found = []
+    for candidate in candidates:
+        if not candidate.name.startswith(prefix):
+            continue
+        stamp = _parse_backup_stamp(candidate.name[len(prefix):])
+        if stamp is None:
+            continue
+        try:
+            if candidate.is_symlink() or not candidate.is_file():
+                continue
+        except OSError:
+            continue
+        found.append((stamp, candidate))
+    return [candidate for _stamp, candidate in sorted(found, key=lambda pair: (pair[0], pair[1].name))]
 
 
 def _write_component_config(name, env):
@@ -852,3 +921,132 @@ def _provenance_of(entry):
 
 def _is_created_entry(entry):
     return _provenance_of(entry) == "created"
+
+
+def _resolve_backup(entry, discovered):
+    """Какой backup считать оригиналом пользователя: (path|None, ambiguous: bool).
+
+    Политика при НЕСКОЛЬКИХ кандидатах — не угадывать. Цикл install→uninstall→install штатно
+    оставляет несколько .srouter-backup-*, и «взять самый свежий» — ловушка: при обрыве ВТОРОГО
+    install самый свежий backup является копией srouter-конфига, а оригинал пользователя лежит в
+    самом СТАРОМ. Молчаливый автовыбор потерял бы его — ровно тот класс последствий, что мы чиним.
+      0 кандидатов          → (None, False)  — восстанавливать нечего;
+      1                     → (он, False);
+      >1 и state указывает на одного из них → (он, False) — state как tie-breaker, но НЕ как
+                              единственный источник (в этом и была дыра: state теряется при обрыве);
+      >1 и state молчит/врёт → (None, True)  — ambiguous: оператору список, fail-closed.
+    """
+    stated = entry.get("backup") if isinstance(entry, dict) else None
+    if not discovered:
+        # state может ссылаться на backup вне parent-директории target (legacy/ручной путь) —
+        # уважаем его, если файл существует: discovery дополняет state, а не отменяет его.
+        if stated and Path(stated).is_file():
+            return Path(stated), False
+        return None, False
+    if len(discovered) == 1:
+        return discovered[0], False
+    if stated:
+        for candidate in discovered:
+            if str(candidate) == str(Path(stated)):
+                return candidate, False
+    return None, True
+
+
+def component_facts(name, env, entry, *, config_path=None):
+    """Единый редьюсер состояния компонента: три факта о мире → безопасное действие (issue #124).
+
+    ЗАЧЕМ ОДНА ФУНКЦИЯ НА ДВА ПОТОКА. До неё вывод «что это за компонент» существовал в двух
+    независимых реализациях — _inspect_component (install) и _component_uninstall_item (uninstall).
+    Корень issue #110 был сформулирован ровно так: «install верил файлу, uninstall верил state».
+    issue #124 — рецидив того же на третьем факте (backup): install знал про backup, uninstall не мог
+    узнать. Общий редьюсер закрывает класс, а не очередной экземпляр.
+
+    ТРИ ИСТОЧНИКА (ничего не пишет, subprocess не зовёт — чистая функция от диска и state):
+      1. target на диске: существует ли, есть ли srouter-маркер («живой арбитр», _has_marker);
+      2. backup'ы на диске: discover_backups рядом с config_path (доказательство);
+      3. state-entry: management.mode/managed/provenance + backup (память).
+
+    КЛЮЧЕВОЕ СВОЙСТВО: функция НЕ ЗНАЕТ, был ли crash. Она не различает «install завершился» и
+    «install оборвался» — смотрит на три факта и выводит, что безопасно сделать. Поэтому crash
+    перестаёт быть отдельным случаем, требующим отдельной ветки кода; шесть P1 issue #124 — это шесть
+    комбинаций тех же трёх фактов, и все шесть попадают в одну таблицу ниже.
+
+    recovery:
+      none            — трогать нечего (конфига нет / он чужой без нашей истории);
+      restore         — вернуть оригинал пользователя из backup;
+      remove          — удалить конфиг, созданный srouter'ом с нуля (provenance='created', backup нет);
+      orphaned_backup — наш конфиг + backup на диске, но state молчит (обрыв ДО записи state):
+                        восстановимо, отличается от restore только происхождением знания;
+      ambiguous       — несколько backup'ов, state не разрешает → оператору (fail-closed);
+      leftover        — состояние определённо небезопасное для записи → сообщить, ничего не трогать.
+
+    Таблица (маркер | state.managed | state.backup | disk backups → recovery):
+      нет маркера, файла нет            → none              ничего не делали
+      маркер, managed, backup жив       → restore           штатный overwrite
+      маркер, managed, backup мёртв, 0  → leftover          state лжёт — не удалять вслепую
+      маркер, managed created, 0        → remove            штатный created
+      маркер, managed created, >=1      → restore           F2/P1-1: диск бьёт деградировавший state
+      маркер, entry НЕТ, >=1            → orphaned_backup   P1-3/F1: обрыв до записи state
+      маркер, entry НЕТ, 0              → leftover          наш конфиг без backup — не гадаем
+      любое, >1 backup, state молчит    → ambiguous         не выбираем «свежий»
+      БЕЗ маркера, managed              → leftover          stale-managed (#110 Дефект 1)
+    """
+    path = Path(config_path or (entry.get("config_path") if isinstance(entry, dict) else None)
+                or env.component_paths(name)["config"])
+    entry = entry if isinstance(entry, dict) else {}
+    marker_present = path.exists() and _has_marker(path)
+    managed = _is_managed_entry(entry)
+    adopted = _is_adopted_entry(entry)
+    restored = _is_restored_entry(entry)
+    provenance = _provenance_of(entry)
+    discovered = discover_backups(path)
+    backup, ambiguous = _resolve_backup(entry, discovered)
+
+    facts = {
+        "name": name,
+        "config_path": str(path),
+        "config_present": path.exists(),
+        "marker_present": marker_present,
+        "managed": managed,
+        "adopted": adopted,
+        "restored": restored,
+        "provenance": provenance,
+        "backup": str(backup) if backup else "",
+        "discovered_backups": [str(p) for p in discovered],
+        "state_backup_missing": bool(entry.get("backup")) and not Path(entry["backup"]).is_file(),
+    }
+
+    # adopted/restored — srouter намеренно не владеет файлом; чужая история не даёт прав (канон
+    # «никогда молча не adopt» в обратную сторону: и не откатывать чужое молча).
+    if adopted or restored:
+        facts["recovery"] = "none"
+        return facts
+    if ambiguous:
+        # Неоднозначность важнее всего остального: любое действие рискует записать не тот контент.
+        facts["recovery"] = "ambiguous"
+        return facts
+    if not marker_present:
+        # Живой арбитр говорит «файл не наш». Единственное, что может требовать внимания, — след в
+        # state о том, что srouter сюда ставил (stale-managed, #110 Дефект 1) → leftover, не запись.
+        facts["recovery"] = "leftover" if managed else "none"
+        return facts
+    # Дальше: маркер на месте — файл ДОКАЗАННО наш, писать по нему безопасно.
+    if backup:
+        # backup есть — значит был overwrite, и у пользователя есть что вернуть. Работает и когда
+        # state деградировал до provenance='created' (F2/P1-1), и когда entry потерян целиком
+        # (P1-3/F1): диск — доказательство, state — лишь память о нём.
+        facts["recovery"] = "restore" if managed else "orphaned_backup"
+        return facts
+    if managed and provenance == "created":
+        facts["recovery"] = "remove"
+        return facts
+    if managed and entry.get("backup"):
+        # state обещает backup, которого на диске нет — состояние неопределённое: удалить нельзя
+        # (вдруг оригинал ещё вернётся), восстановить нечем. Сообщаем, не трогаем.
+        facts["recovery"] = "leftover"
+        return facts
+    # Наш конфиг (маркер), но история неизвестна: legacy-state без provenance либо обрыв до любой
+    # записи state и без backup (значит и overwrite не было — терять нечего, но и удалять вслепую
+    # нельзя: канон fail-safe leftover, как created-без-маркера в issue #112 Часть 2).
+    facts["recovery"] = "leftover" if managed or facts["config_present"] else "none"
+    return facts
