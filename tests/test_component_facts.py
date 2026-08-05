@@ -277,3 +277,145 @@ def test_backup_discovery_is_scoped_to_its_own_config_path(tmp_path):
 
     assert install_lib.discover_backups(privoxy) == [], "чужой backup не виден для privoxy"
     assert _facts(env, {}, name="privoxy")["recovery"] == "leftover"
+
+
+# ==================== cycle-review: retained backup от прошлого install-цикла (P1) ====================
+#
+# Codex и /review НЕЗАВИСИМО нашли один и тот же дефект: retained backup (сохраняется НАМЕРЕННО,
+# user_data_retained в build_uninstall_plan) от давно завершённого install→uninstall цикла физически
+# неотличим от backup'а ТЕКУЩЕГО цикла — оба лежат рядом с config_path и парсятся как валидный
+# timestamp. Без границы not_before/created_at единственный retained-relic проходил бы через
+# "state молчит, ровно 1 кандидат" и выдавал бы себя за доказательство overwrite СВЕЖЕГО created-конфига.
+
+
+def test_stale_retained_backup_does_not_hijack_fresh_created_config(tmp_path):
+    """P1 cycle-review (Codex+/review): backup СТАРШЕ created_at — не кандидат, даже если единственный.
+
+    Сценарий: backup остался от прошлого install-цикла (retained), пользователь вручную удалил тогда
+    восстановленный файл, новый install создал конфиг с нуля (provenance='created', created_at
+    зафиксирован в момент создания). Без фильтра единственный retained backup прошёл бы через
+    len(discovered)==1 → restore, восстанавливая устаревший чужой контент поверх свежего конфига.
+    """
+    env = _env(tmp_path)
+    target = _target(env)
+    # backup СТАРШЕ created_at — доказанный remnant предыдущего цикла, а не этого install'а.
+    _backup_next_to(target, "2020-01-01T000000Z", "STALE FROM PREVIOUS CYCLE\n")
+    entry = _entry(target, provenance="created")
+    entry["created_at"] = "2026-06-29T00:00:00Z"
+
+    facts = _facts(env, entry)
+
+    assert facts["recovery"] == "remove", (
+        "backup старше created_at — retained relic предыдущего цикла, не доказательство ЭТОГО overwrite"
+    )
+    assert facts["backup"] == "", "retained-relic не должен становиться «тем самым» backup'ом"
+
+
+def test_backup_created_after_created_at_still_counts(tmp_path):
+    """Граница not_before не режет валидные кейсы: backup ПОЗЖЕ created_at — легитимный кандидат.
+
+    F2/P1-1 не должен сломаться этим фильтром: если backup появился уже ПОСЛЕ того, как текущий
+    конфиг был создан (например, crash между backup и записью state в рамках ТЕКУЩЕГО install'а),
+    он обязан по-прежнему приниматься как доказательство overwrite.
+    """
+    env = _env(tmp_path)
+    target = _target(env)
+    backup = _backup_next_to(target, "2026-06-29T000000Z", "original from THIS cycle\n")
+    entry = _entry(target, provenance="created")
+    entry["created_at"] = "2026-06-01T00:00:00Z"  # раньше backup'а
+
+    facts = _facts(env, entry)
+
+    assert facts["recovery"] == "restore", "backup после created_at — легитимное доказательство overwrite"
+    assert facts["backup"] == str(backup)
+
+
+def test_missing_created_at_does_not_narrow_discovery(tmp_path):
+    """Fail-open по границе (не по данным): нет created_at — фильтр не сужает discovery.
+
+    Legacy state (записан до этого фикса) не несёт created_at. Отсутствие границы НЕ должно ложно
+    отбрасывать настоящих кандидатов — иначе фикс регрессировал бы уже закрытый P1-3/F1.
+    """
+    env = _env(tmp_path)
+    target = _target(env)
+    backup = _backup_next_to(target, "2020-01-01T000000Z", "legacy backup\n")
+    entry = _entry(target, provenance="created")  # created_at отсутствует (legacy entry)
+
+    facts = _facts(env, entry)
+
+    assert facts["recovery"] == "restore", "без created_at граница не применяется — legacy-поведение цело"
+    assert facts["backup"] == str(backup)
+
+
+def test_backup_exactly_at_created_at_boundary_still_counts(tmp_path):
+    """Граничный случай: backup СОВПАДАЕТ по timestamp'у с created_at — считается валидным (>=, не >).
+
+    created_at пишется ТОЛЬКО когда backups[name] пуст в этом apply — то есть _backup() не вызывался
+    для этого компонента в цикле, который зафиксировал created_at. Совпадение timestamp'ов означает
+    секундную коллизию, не порядок «раньше». Отбрасывать по строгому > — терять легитимного кандидата
+    без всякой причины; граница обязана быть fail-open в сторону «не сузить лишнего».
+    """
+    env = _env(tmp_path)
+    target = _target(env)
+    backup = _backup_next_to(target, "2026-06-29T000000Z", "boundary case\n")
+    entry = _entry(target, provenance="created")
+    entry["created_at"] = "2026-06-29T00:00:00Z"  # ровно тот же момент, что и backup
+
+    facts = _facts(env, entry)
+
+    assert facts["recovery"] == "restore", "backup ровно на границе not_before обязан приниматься (>=)"
+    assert facts["backup"] == str(backup)
+
+
+def test_idempotent_created_reinstall_preserves_original_created_at(tmp_path):
+    """created_at НЕ обновляется на повторном install с тем же provenance='created' по тому же пути.
+
+    Если бы created_at сбрасывался на новый env.now при каждом idempotent reinstall, окно доверия
+    молча расширялось бы, и тот самый retained backup, что фильтр обязан отсекать, снова прошёл бы.
+    Регресс-гвард на конкретное поведение _write_state_after_apply (не component_facts напрямую).
+    """
+    import json
+
+    import install_lib as lib
+
+    env = lib.InstallEnv(
+        root=Path(__file__).resolve().parent.parent,
+        prefix=tmp_path / "homebrew",
+        state_path=tmp_path / "srouter.local.json",
+        launchagent_dir=tmp_path / "LaunchAgents",
+        now="2026-07-01T00:00:00Z",
+    )
+    target = _target(env)
+    stale_backup = _backup_next_to(target, "2020-01-01T000000Z", "ancient retained backup\n")
+    env.state_path.write_text(json.dumps({
+        "schema_version": 1, "nodes": [], "active_node": {"name": None, "pending": None},
+        "probes": {}, "network": {"channels": {"wifi_service": "Wi-Fi"}},
+        "traffic_guard": {"mode": "off", "domains": {}},
+        "detected_environment": {"privoxy": {
+            "config_path": str(target),
+            "management": {"mode": "managed", "managed": True, "provenance": "created"},
+            "created_at": "2026-01-01T00:00:00Z",  # оригинальный момент создания — РАНЬШЕ backup'а
+        }},
+        "runtime": {},
+    }), encoding="utf-8")
+
+    from test_install_flow import FakeRunner, _port_checker_managed_up
+
+    runner = FakeRunner()
+    result = lib.apply_install(
+        env=env, confirm=True, choices={"xray": "skip", "dnsmasq": "skip"},
+        runner=runner, port_checker=_port_checker_managed_up(runner.calls))
+    assert result["ok"] is True
+
+    state = json.loads(env.state_path.read_text(encoding="utf-8"))
+    entry = state["detected_environment"]["privoxy"]
+    assert entry.get("created_at") == "2026-01-01T00:00:00Z", (
+        "idempotent reinstall не должен сдвигать created_at — иначе окно доверия молча расширяется "
+        "и старый backup снова становится «доказательством» для нового окна"
+    )
+    assert entry["management"]["provenance"] == "created"
+
+    facts = lib.component_facts("privoxy", env, entry)
+    assert facts["recovery"] == "remove", (
+        f"stale backup {stale_backup} старше сохранённого created_at — не должен подменять remove"
+    )

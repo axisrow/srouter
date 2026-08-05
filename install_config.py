@@ -537,6 +537,24 @@ def _parse_backup_stamp(name):
         return None
 
 
+def _parse_backup_stamp_or_none(value):
+    """entry['created_at'] (ISO-8601 из env.now, формат _now()) → datetime, иначе None.
+
+    Отдельно от _parse_backup_stamp: created_at хранится в НЕОБРЕЗАННОМ ISO-8601 (с ':'), потому что
+    он пишется в state как обычная временная метка (симметрично restored_at/removed_at), а не как
+    часть имени файла — обрезка нужна только там, где ':' недопустим в имени. Разбор обратной
+    операцией к _now(); не парсится — значит поле повреждено/чужеродно, границу не применяем
+    (fail-closed в сторону «не сужать» — отсутствие валидной границы не должно ложно отбрасывать
+    настоящие кандидаты).
+    """
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
 def discover_backups(config_path):
     """Валидные srouter-backup'ы, лежащие рядом с config_path, от старых к новым (issue #124).
 
@@ -734,6 +752,24 @@ def _write_state_after_apply(env, plan, modes, backups, launchagent_action=None)
             detected[name]["backup"] = backups[name]
         elif mode == "managed" and _is_managed_entry(prev) and prev.get("backup") and prev_same_path:
             detected[name]["backup"] = prev["backup"]  # preserve backup оригинала (idempotent reinstall, тот же путь)
+        # cycle-review этого PR (Codex + /review, независимо): created_at — нижняя граница возраста
+        # backup'а, который discover_backups вправе засчитать за «доказательство overwrite ЭТОГО
+        # install». Без неё retained backup (сохраняется НАМЕРЕННО, user_data_retained) от давно
+        # завершённого install→uninstall цикла неотличим от backup'а текущего цикла: пользователь
+        # вручную удаляет восстановленный файл, следующий install создаёт конфиг с нуля
+        # (provenance='created', backup не пишется), а uninstall всё ещё находит СТАРЫЙ backup рядом
+        # и восстанавливает устаревший чужой контент вместо удаления свежесозданного конфига.
+        # Пишем только при 'created' — тем самым фиксируя момент, раньше которого валидных backup'ов
+        # для ЭТОГО конфига быть не может; 'overwrote' в этой границе не нуждается (backup уже
+        # известен по имени). Idempotent reinstall (той же строкой provenance) обязан СОХРАНИТЬ
+        # исходный created_at, а не обновлять его на новый env.now — иначе повторный install молча
+        # расширял бы окно доверия и снова впускал тот же старый backup.
+        if provenance == "created":
+            detected[name]["created_at"] = (
+                prev.get("created_at")
+                if mode == "managed" and _is_managed_entry(prev) and prev_same_path and prev.get("created_at")
+                else env.now
+            )
     if launchagent_action:
         launchagent = plan.get("launchagent") or {}
         detected["launchagent"] = {
@@ -923,7 +959,7 @@ def _is_created_entry(entry):
     return _provenance_of(entry) == "created"
 
 
-def _resolve_backup(entry, discovered):
+def _resolve_backup(entry, discovered, *, not_before=None):
     """Какой backup считать оригиналом пользователя: (path|None, ambiguous: bool).
 
     ПРИОРИТЕТ: названное state — сильнее найденного на диске. Discovery восполняет МОЛЧАНИЕ state
@@ -932,14 +968,29 @@ def _resolve_backup(entry, discovered):
       state назвал backup, файл жив   → (он, False)  — даже вне parent-директории target;
       state назвал backup, файл мёртв → (None, False) — НЕ подставляем найденное; component_facts
                                         даст leftover по state_backup_missing (оператор узнает);
-      state молчит, 0 кандидатов      → (None, False) — восстанавливать нечего;
-      state молчит, ровно 1           → (он, False)  — ради этого случая и затевалась discovery;
-      state молчит, >1                → (None, True) — ambiguous: оператору список, fail-closed.
+      state молчит, 0 кандидатов (после фильтра not_before) → (None, False) — восстанавливать нечего;
+      state молчит, ровно 1 (после фильтра)                 → (он, False)  — ради этого случая и
+                                                                затевалась disk-discovery;
+      state молчит, >1 (после фильтра)                      → (None, True) — ambiguous: оператору
+                                                                список, fail-closed.
 
     Политика при НЕСКОЛЬКИХ кандидатах — не угадывать. Цикл install→uninstall→install штатно
     оставляет несколько .srouter-backup-*, и «взять самый свежий» — ловушка: при обрыве ВТОРОГО
     install самый свежий backup является копией srouter-конфига, а оригинал пользователя лежит в
     самом СТАРОМ. Молчаливый автовыбор потерял бы его — ровно тот класс последствий, что мы чиним.
+
+    ФИЛЬТР not_before (cycle-review этого PR, Codex + /review независимо, оба нашли один P1): backup,
+    ОСТАВШИЙСЯ от давно завершённого install→uninstall цикла (retained НАМЕРЕННО, user_data_retained),
+    физически неотличим от backup'а ЭТОГО цикла — оба лежат рядом с config_path и парсятся как валидный
+    timestamp. Без фильтра: install перезаписал foreign A (backup создан) → uninstall восстановил A,
+    backup остался на диске → пользователь вручную удалил A → новый install создал конфиг с нуля
+    (provenance='created', backup не пишется — нечего было бэкапить) → uninstall снова находит СТАРЫЙ
+    backup как единственного кандидата → component_facts классифицирует как restore вместо remove →
+    восстанавливается устаревший чужой контент поверх только что созданного конфига. not_before —
+    момент создания ТЕКУЩЕГО конфига (entry['created_at'], пишет _write_state_after_apply только для
+    provenance='created'); кандидаты со stamp строго раньше этого момента доказанно принадлежат
+    ПРЕДЫДУЩЕМУ install-циклу и отбрасываются ДО подсчёта len(discovered) — иначе retained-relic мог бы
+    выдать себя за «единственного» и обойти даже политику ambiguous.
     """
     stated = entry.get("backup") if isinstance(entry, dict) else None
     if stated:
@@ -955,6 +1006,10 @@ def _resolve_backup(entry, discovered):
         if Path(stated).is_file():
             return Path(stated), False
         return None, False
+    if not_before is not None:
+        discovered = [candidate for candidate in discovered
+                      if (_parse_backup_stamp(candidate.name.split(_BACKUP_INFIX, 1)[-1]) or not_before)
+                      >= not_before]
     if not discovered:
         return None, False
     if len(discovered) == 1:
@@ -976,7 +1031,8 @@ def component_facts(name, env, entry, *, config_path=None):
     ТРИ ИСТОЧНИКА (ничего не пишет, subprocess не зовёт — чистая функция от диска и state):
       1. target на диске: существует ли, есть ли srouter-маркер («живой арбитр», _has_marker);
       2. backup'ы на диске: discover_backups рядом с config_path (доказательство);
-      3. state-entry: management.mode/managed/provenance + backup (память).
+      3. state-entry: management.mode/managed/provenance + backup (память) + created_at (нижняя
+         граница возраста backup'а, которую cycle-review этого PR добавил вместе с фиксом P1 ниже).
 
     КЛЮЧЕВОЕ СВОЙСТВО: функция НЕ ЗНАЕТ, был ли crash. Она не различает «install завершился» и
     «install оборвался» — смотрит на три факта и выводит, что безопасно сделать. Поэтому crash
@@ -997,7 +1053,10 @@ def component_facts(name, env, entry, *, config_path=None):
       маркер, managed, backup жив       → restore           штатный overwrite
       маркер, managed, backup мёртв, 0  → leftover          state лжёт — не удалять вслепую
       маркер, managed created, 0        → remove            штатный created
-      маркер, managed created, >=1      → restore           F2/P1-1: диск бьёт деградировавший state
+      маркер, managed created, >=1      → restore           F2/P1-1: диск бьёт деградировавший state,
+                                                              НО только backup ⩾ created_at (cycle-review
+                                                              этого PR: retained-relic прошлого цикла
+                                                              не считается — см. _resolve_backup not_before)
       маркер, entry НЕТ, ровно 1        → orphaned_backup   P1-3/F1: обрыв до записи state
       маркер, entry НЕТ, 0              → leftover          наш конфиг без backup — не гадаем
       маркер, >1 backup, state молчит   → ambiguous         не выбираем «свежий»
@@ -1017,7 +1076,11 @@ def component_facts(name, env, entry, *, config_path=None):
     restored = _is_restored_entry(entry)
     provenance = _provenance_of(entry)
     discovered = discover_backups(path)
-    backup, ambiguous = _resolve_backup(entry, discovered)
+    # not_before (cycle-review этого PR): для created-конфига entry несёт created_at — момент, раньше
+    # которого валидных backup'ов для ЭТОГО config_path быть не может. Отсекает retained-relic от
+    # предыдущего install→uninstall цикла, не давая ему выдать себя за «единственного» кандидата.
+    not_before = _parse_backup_stamp_or_none(entry.get("created_at")) if provenance == "created" else None
+    backup, ambiguous = _resolve_backup(entry, discovered, not_before=not_before)
 
     facts = {
         "name": name,

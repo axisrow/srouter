@@ -486,3 +486,64 @@ def test_backup_discovery_finds_real_backup(tmp_path):
     real.write_text("foreign config\n", encoding="utf-8")
 
     assert install_lib.discover_backups(target) == [real]
+
+
+# ============= cycle-review этого PR (Codex + /review независимо): retained backup через два ============
+# ============================ полных install→uninstall→install→uninstall цикла ============================
+
+
+def test_two_full_lifecycles_do_not_resurrect_stale_config(tmp_path):
+    """P1: retained backup от ЗАВЕРШЁННОГО цикла не должен всплыть в СЛЕДУЮЩЕМ цикле как «оригинал».
+
+    End-to-end через реальные apply_install/apply_uninstall (не мок редьюсера напрямую — доказывает,
+    что фикс держится по всей цепочке: _backup → _write_state_after_apply(created_at) →
+    component_facts(not_before) → apply_uninstall).
+
+    Цикл 1: install перезаписывает чужой config A (backup создан) → uninstall восстанавливает A,
+    backup остаётся на диске (user_data_retained — политика намеренная, не баг).
+    Пользователь вручную удаляет восстановленный A.
+    Цикл 2: install создаёт конфиг с нуля (provenance='created', backup не пишется — нечего было
+    бэкапить). БЕЗ фикса: uninstall нашёл бы retained backup цикла 1 как единственного кандидата и
+    восстановил бы устаревшее содержимое A вместо удаления свежесозданного конфига.
+    """
+    env1 = _env(tmp_path)
+    config_path = _write_config_without_marker(env1, "privoxy", content="FOREIGN-CONTENT-A\n")
+
+    runner1 = FakeRunner()
+    result1 = install_lib.apply_install(
+        env=env1, confirm=True,
+        choices={"privoxy": "overwrite", "xray": "skip", "dnsmasq": "skip"},
+        runner=runner1, port_checker=_port_checker_managed_up(runner1.calls))
+    assert result1["ok"] is True
+    retained_backups = list(config_path.parent.glob("config.srouter-backup-*"))
+    assert retained_backups, "цикл 1 обязан создать backup оригинала A"
+
+    result_restore = install_lib.apply_uninstall(
+        env=env1, confirmations={"configs": True}, runner=FakeRunner())
+    assert result_restore["ok"] is True
+    assert config_path.read_text(encoding="utf-8") == "FOREIGN-CONTENT-A\n"
+    assert retained_backups[0].exists(), "backup остаётся на диске после restore (user_data_retained)"
+
+    config_path.unlink()  # пользователь вручную удалил восстановленный файл
+
+    env2 = install_lib.InstallEnv(
+        root=env1.root, prefix=env1.prefix, state_path=env1.state_path,
+        launchagent_dir=env1.launchagent_dir, now="2026-07-15T00:00:00Z")
+    runner2 = FakeRunner()
+    result2 = install_lib.apply_install(
+        env=env2, confirm=True,
+        choices={"privoxy": "overwrite", "xray": "skip", "dnsmasq": "skip"},
+        runner=runner2, port_checker=_port_checker_managed_up(runner2.calls))
+    assert result2["ok"] is True
+    state2 = json.loads(env2.state_path.read_text(encoding="utf-8"))
+    entry2 = state2["detected_environment"]["privoxy"]
+    assert entry2["management"]["provenance"] == "created", entry2
+    assert "backup" not in entry2, "created-конфиг не должен нести backup — нечего было бэкапить"
+
+    result_uninstall2 = install_lib.apply_uninstall(
+        env=env2, confirmations={"configs": True}, runner=FakeRunner())
+    assert result_uninstall2["ok"] is True
+    assert not config_path.exists(), (
+        "свежесозданный конфиг обязан быть УДАЛЁН (provenance='created'), а не заменён устаревшим "
+        "содержимым retained-backup'а из ЗАВЕРШЁННОГО предыдущего install-цикла (issue #124 cycle-review P1)"
+    )
