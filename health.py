@@ -24,7 +24,6 @@ from pathlib import Path
 import json
 import logging
 import os
-import re
 import socket  # noqa: F401 — re-export для monkeypatch health.socket.getaddrinfo (health_probes._resolve_host)
 import subprocess
 import time  # noqa: F401 — re-export для monkeypatch health.time.sleep (health_codenv._codenv_unloaded_is_persistent)
@@ -331,12 +330,6 @@ def _notify(msg, sound="Glass"):
     except (OSError, subprocess.SubprocessError) as exc:  # noqa: BLE001 — best-effort нотификация,
         # не роняет watchdog при сбое osascript (top-level defensive fallback #109).
         _log.debug("osascript notify failed: %s — нотификация пропущена, watchdog продолжает", exc)
-
-
-def _launchd_field(output, key):
-    """Первое scalar-поле из `launchctl print`; nested endpoint state не перетирает root state."""
-    match = re.search(rf"^\s*{re.escape(key)}\s*=\s*(.*?)\s*;?\s*$", output or "", re.MULTILINE)
-    return match.group(1) if match else None
 
 
 def _launchd_int(output, key):

@@ -421,7 +421,7 @@ def _network_interface_up():
       up=False  — нет сети (detail: «нет активного интерфейса/маршрута — подключи интернет»).
     Не бросает (probe-канон, как _upstream_vps_reachable/_port_up).
     """
-    iface = _route_default_interface()
+    iface = _health_facade._route_default_interface()
     if iface:
         return {"up": True, "detail": f"сеть активна: default route через {iface}"}
     inet_iface = _inet_interface()

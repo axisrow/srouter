@@ -9,8 +9,6 @@ from pathlib import Path
 import logging
 from urllib.parse import urlparse
 
-import health as _health_facade  # noqa: E402 — резолвит intra-module вызовы через health для monkeypatch (канон #158)
-
 _log = logging.getLogger("srouter.health")
 
 # star-import re-export (канон star-import-reexport-contract) — см. health_probes.py докстринг __all__.

@@ -137,7 +137,8 @@ def _desktop_proxy_check():
         return {"status": "unknown",
                 "detail": "launchctl proxy не задан — Desktop App идёт напрямую (ok для NO_PROXY-доменов, не защищён PF для остальных)"}
     # SOCKS-scheme в ЛЮБОМ ключе → down (Claude Code/Desktop App через SOCKS не умеют, #127).
-    # urlparse по scheme, не подстрока — канон loose-validator (health.py:313).
+    # urlparse по scheme, не подстрока — канон loose-validator (см. _tunnel_target_up в health_probes.py:
+    # bad-code/upstream-error парсится структурно, не подстрокой).
     socks_keys = {k: v for k, v in keys.items()
                   if urlparse(v).scheme.lower() in {"socks", "socks5", "socks5h"}}
     if socks_keys:
