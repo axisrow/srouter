@@ -1105,7 +1105,20 @@ def component_facts(name, env, entry, *, config_path=None):
 
     # adopted/restored — srouter намеренно не владеет файлом; чужая история не даёт прав (канон
     # «никогда молча не adopt» в обратную сторону: и не откатывать чужое молча).
-    if adopted or restored:
+    #
+    # cycle-review этого PR (Codex, round 2): доверяем adopted/restored ТОЛЬКО когда маркер на target
+    # отсутствует. Сценарий-нарушитель: компонент adopted → пользователь ЯВНО выбирает overwrite в
+    # следующем apply (modes строится из choices.get(name), prev-state НЕ проверяется — adopted не
+    # блокирует выбор overwrite) → target реально перезаписан srouter'ом, backup adopted-оригинала
+    # создан → crash ДО финальной _write_state_after_apply → entry в state ВСЁ ЕЩЁ несёт mode='adopted'
+    # (запись, которая заменила бы его, не состоялась). Без этой проверки component_facts короткое
+    # замыкание на устаревшем adopted=True игнорировало бы живой маркер и новый backup — uninstall
+    # репортил бы «adopted — left untouched», оставляя srouter-конфиг на месте и осиротив backup
+    # истинного adopted-оригинала НАВСЕГДА (тот же класс потери, что и P1-3, просто через adopted/
+    # restored вместо managed). Живой маркер — то же самое доказательство «install реально произошёл
+    # ПОСЛЕ adopt/restore», что уже используется для managed-веток ниже (state деградировал, диск
+    # бьёт); симметрия здесь обязательна, а не опция.
+    if (adopted or restored) and not marker_present:
         facts["recovery"] = "none"
         return facts
     if not marker_present:

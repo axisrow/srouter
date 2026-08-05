@@ -226,13 +226,43 @@ def test_stale_managed_without_marker_is_leftover(tmp_path):
 
 
 @pytest.mark.parametrize("mode", ["adopted", "restored"])
-def test_adopted_and_restored_are_never_touched(tmp_path, mode):
-    """adopted/restored — srouter намеренно не владеет файлом; даже backup рядом не даёт прав."""
+def test_adopted_and_restored_without_marker_are_never_touched(tmp_path, mode):
+    """adopted/restored БЕЗ живого маркера — target остаётся тем, что было adopted; backup не даёт прав.
+
+    Уточнено cycle-review этого PR (Codex, round 2): исходная версия теста писала МАРКИРОВАННЫЙ target
+    (_target default = MANAGED_CONFIG) — то есть на самом деле проверяла ровно тот сценарий, который
+    оказался P1 (stale adopted state после реального overwrite). Здесь target — НЕ srouter-managed
+    (символизирует «то, что пользователь усыновил и что остаётся его файлом»), маркера нет.
+    """
     env = _env(tmp_path)
-    target = _target(env)
+    target = _target(env, FOREIGN_CONFIG)  # без маркера — target остаётся «чужим», не перезаписан
     _backup_next_to(target)
     facts = _facts(env, _entry(target, mode=mode, managed=False))
     assert facts["recovery"] == "none"
+
+
+@pytest.mark.parametrize("mode", ["adopted", "restored"])
+def test_stale_adopted_or_restored_with_live_marker_yields_to_disk_evidence(tmp_path, mode):
+    """P1 cycle-review (Codex, round 2): устаревший adopted/restored НЕ должен перебивать живой маркер.
+
+    Сценарий: компонент был adopted/restored (state.mode); пользователь ЯВНО выбрал overwrite в
+    следующем apply (choices не смотрят на prev-state — adopted не блокирует overwrite); target реально
+    перезаписан srouter'ом (маркер жив), backup adopted/restored-оригинала создан; crash ДО финальной
+    _write_state_after_apply оставляет entry со старым mode='adopted'/'restored'. Без фикса
+    component_facts короткое замыкание на устаревшем флаге игнорировало бы живой маркер и backup —
+    uninstall репортил бы «adopted — left untouched», оставляя srouter-конфиг и осиротив backup
+    истинного оригинала НАВСЕГДА. Живой маркер обязан перебивать устаревший state — симметрично тому,
+    как диск уже бьёт деградировавший managed/created state в других ветках этой же функции.
+    """
+    env = _env(tmp_path)
+    target = _target(env)  # MANAGED_CONFIG — маркер живой: install РЕАЛЬНО перезаписал target
+    backup = _backup_next_to(target, content="original adopted/restored content\n")
+    facts = _facts(env, _entry(target, mode=mode, managed=False))
+    assert facts["recovery"] == "orphaned_backup", (
+        "живой маркер + backup обязаны перебить устаревший adopted/restored — обрыв ДО финальной "
+        "записи state неотличим от orphaned_backup по тем же фактам, что и managed-путь"
+    )
+    assert facts["backup"] == str(backup)
 
 
 def test_facts_never_write_anything(tmp_path):

@@ -547,3 +547,161 @@ def test_two_full_lifecycles_do_not_resurrect_stale_config(tmp_path):
         "свежесозданный конфиг обязан быть УДАЛЁН (provenance='created'), а не заменён устаревшим "
         "содержимым retained-backup'а из ЗАВЕРШЁННОГО предыдущего install-цикла (issue #124 cycle-review P1)"
     )
+
+
+# ============= cycle-review этого PR, round 2 (Codex): устаревший adopted/restored и ============
+# ============= services/DNS, оставленные активными для orphaned_backup-компонента ============
+
+
+def test_overwrite_after_adopt_survives_crash_before_state_write(tmp_path, monkeypatch):
+    """P1 (Codex round 2): explicit overwrite ПОСЛЕ adopt не должен теряться на устаревшем entry.
+
+    Компонент был adopted (state.mode='adopted') → пользователь ЯВНО выбирает overwrite в следующем
+    apply (choices не смотрят на prev-state — adopted НЕ блокирует выбор overwrite, mode строится
+    только из choices.get(name)) → target реально перезаписан srouter'ом (маркер жив), backup
+    adopted-оригинала создан → crash ДО финальной _write_state_after_apply оставляет entry со старым
+    mode='adopted'. Без фикса component_facts короткое замыкание на устаревшем adopted=True
+    игнорировало бы живой маркер и backup — uninstall репортил бы «adopted — left untouched»,
+    оставляя srouter-конфиг и осиротив backup истинного adopted-оригинала НАВСЕГДА.
+    """
+    env = _env(tmp_path)
+    config_path = env.component_paths("privoxy")["config"]
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text("ADOPTED-BY-USER\n", encoding="utf-8")
+
+    runner1 = FakeRunner()
+    result1 = install_lib.apply_install(
+        env=env, confirm=True,
+        choices={"privoxy": "adopt", "xray": "skip", "dnsmasq": "skip"},
+        runner=runner1, port_checker=_port_checker_managed_up(runner1.calls))
+    assert result1["ok"] is True
+
+    _crash_after(monkeypatch, "_write_component_config", component="privoxy")
+    runner2 = FakeRunner()
+    with pytest.raises(_Crash):
+        install_lib.apply_install(
+            env=env, confirm=True,
+            choices={"privoxy": "overwrite", "xray": "skip", "dnsmasq": "skip"},
+            runner=runner2, port_checker=_port_checker_managed_up(runner2.calls))
+
+    assert install_lib.MARKER in config_path.read_text(encoding="utf-8"), "target перезаписан srouter'ом"
+    stale_backups = list(config_path.parent.glob("config.srouter-backup-*"))
+    assert stale_backups, "overwrite создал backup adopted-оригинала перед перезаписью"
+
+    result = install_lib.apply_uninstall(
+        env=env, confirmations={"configs": True}, runner=FakeRunner())
+    assert result["ok"] is True
+    assert config_path.read_text(encoding="utf-8") == "ADOPTED-BY-USER\n", (
+        "живой маркер + backup обязаны перебить устаревший adopted=True — иначе adopted-оригинал "
+        "orphaned навсегда, а srouter-конфиг остаётся на месте без единого предупреждения"
+    )
+
+
+def test_uninstall_stops_service_and_resets_dns_for_orphaned_backup(tmp_path, monkeypatch):
+    """P1 (Codex round 2): orphaned_backup обязан останавливать сервис/сбрасывать DNS, не только конфиг.
+
+    Обрыв ПОСЛЕ _restart_component (сервис реально перезапущен на srouter-конфиг), но ДО финальной
+    записи state — entry пуст, managed=False. Секции services/dns apply_uninstall раньше гейтились
+    ТОЛЬКО на managed, который для orphaned_backup всегда False (пустой state-entry, не отсутствие
+    реального restart/apply_dns). Итог без фикса: configs-секция восстанавливает файл (restorable=True
+    работает), а сервис остаётся крутиться на только что удалённый с диска srouter-конфиг, DNS — на
+    127.0.0.1, при report ok=True — тихий privacy/availability риск поверх «успешного» отката.
+    """
+    env, config_path = _foreign_privoxy(tmp_path)
+    _crash_after(monkeypatch, "_restart_component", component="privoxy")
+    runner = FakeRunner()
+    with pytest.raises(_Crash):
+        install_lib.apply_install(
+            env=env, confirm=True,
+            choices={"privoxy": "overwrite", "xray": "skip", "dnsmasq": "skip"},
+            runner=runner, port_checker=_port_checker_managed_up(runner.calls))
+
+    restart_calls = [c for c in runner.calls if "services" in c]
+    assert restart_calls, "install реально перезапустил privoxy до обрыва"
+    assert _entry(env) == {}, "state-entry пуст — обрыв ДО финальной записи"
+
+    uninstall_runner = FakeRunner()
+    result = install_lib.apply_uninstall(
+        env=env, confirmations={"configs": True, "services": True, "dns": True},
+        runner=uninstall_runner)
+    assert result["ok"] is True
+    assert config_path.read_text(encoding="utf-8") == "foreign config\n"
+
+    stop_calls = [c for c in uninstall_runner.calls if "stop" in c and "privoxy" in c]
+    assert stop_calls, (
+        "restorable=True (orphaned_backup) обязан останавливать реально запущенный сервис, а не "
+        "оставлять его крутиться на конфиг, которого только что не стало на диске (Codex round 2 P1)"
+    )
+
+
+class _WifiAwareRunner(FakeRunner):
+    """FakeRunner + Wi-Fi service в _discover_network — иначе _apply_dns/_restore_dns короткое
+    замыкание на "wifi service not found" ДО проверки managed/restorable гейта, и мутация,
+    ломающая именно этот гейт, останется незамеченной."""
+
+    def __call__(self, cmd, timeout):
+        if list(cmd) == [install_config.NETWORKSETUP, "-listallnetworkservices"]:
+            self.calls.append(list(cmd))
+            return {"rc": 0, "out": "Wi-Fi\n", "err": "", "timeout": False}
+        return super().__call__(cmd, timeout)
+
+
+def test_uninstall_resets_dns_for_orphaned_backup_dnsmasq(tmp_path, monkeypatch):
+    """P1 (Codex round 2), симметрично сервисам: orphaned_backup dnsmasq обязан сбрасывать DNS.
+
+    _restore_dns раньше гейтился ТОЛЬКО на managed, который для orphaned_backup всегда False (пустой
+    state-entry — обрыв ДО финальной записи, а не отсутствие реального _apply_dns). Обрыв ПОСЛЕ
+    _apply_dns (DNS реально указывает на 127.0.0.1), но до финальной записи state → без фикса
+    uninstall восстановил бы конфиг, но НЕ сбросил DNS — privacy-риск поверх report ok=True.
+
+    Требует bootstrap-шаг (успешный apply ДО обрыва): state['network']['channels']['wifi_service']
+    пишется ТОЛЬКО в финальном _write_state_after_apply, поэтому «холодный» первый-ever apply без
+    предыстории не даёт _restore_dns узнать сервис вообще — отдельное, более глубокое ограничение
+    (build_uninstall_plan осознанно read-only, `del runner`, не переоткрывает network заново), не
+    входящее в scope этого фикса. Здесь тестируется типичный случай: N-ный apply после хотя бы
+    одного успешного bootstrap, что и покрывает заявленный Codex сценарий.
+    """
+    env, _config_path = _foreign_privoxy(tmp_path)
+    dnsmasq_config = env.component_paths("dnsmasq")["config"]
+    dnsmasq_config.parent.mkdir(parents=True, exist_ok=True)
+    dnsmasq_config.write_text("foreign dnsmasq config\n", encoding="utf-8")
+
+    # Bootstrap: успешный apply, фиксирующий wifi_service в state.network (симметрично тому, что
+    # в реальном deployment apply уже происходил хотя бы раз до нового overwrite/reinstall).
+    bootstrap_runner = _WifiAwareRunner()
+    bootstrap = install_lib.apply_install(
+        env=env, confirm=True,
+        choices={"privoxy": "skip", "xray": "skip", "dnsmasq": "skip"},
+        runner=bootstrap_runner, port_checker=_port_checker_managed_up(bootstrap_runner.calls))
+    assert bootstrap["ok"] is True
+
+    _crash_after(monkeypatch, "_apply_dns")
+    runner = _WifiAwareRunner()
+    with pytest.raises(_Crash):
+        install_lib.apply_install(
+            env=env, confirm=True,
+            choices={"privoxy": "skip", "xray": "skip", "dnsmasq": "overwrite"},
+            runner=runner, port_checker=_port_checker_managed_up(runner.calls))
+
+    dns_calls_during_install = [c for c in runner.calls
+                                 if install_config.NETWORKSETUP in c and "127.0.0.1" in c]
+    assert dns_calls_during_install, "install реально применил DNS=127.0.0.1 до обрыва"
+    stale_entry = _entry(env, "dnsmasq")
+    assert stale_entry.get("management", {}).get("mode") == "skipped", (
+        "state-entry несёт mode ИЗ BOOTSTRAP'а (skipped) — второй apply оборвался ДО финальной "
+        "записи, значит его managed='overwrote' entry не попал в state вовсе"
+    )
+
+    uninstall_runner = _WifiAwareRunner()
+    result = install_lib.apply_uninstall(
+        env=env, confirmations={"configs": True, "services": True, "dns": True},
+        runner=uninstall_runner)
+    assert result["ok"] is True
+    assert dnsmasq_config.read_text(encoding="utf-8") == "foreign dnsmasq config\n"
+
+    dns_reset_calls = [c for c in uninstall_runner.calls
+                        if install_config.NETWORKSETUP in c and "Empty" in c]
+    assert dns_reset_calls, (
+        "restorable=True (orphaned_backup) обязан сбрасывать DNS, а не оставлять его указывать на "
+        "127.0.0.1 после того, как srouter-конфиг уже удалён с диска (Codex round 2 P1)"
+    )

@@ -326,7 +326,15 @@ def _stop_service(name, runner):
 
 def _restore_dns(plan, runner):
     dnsmasq = next((item for item in plan.get("components", []) if item.get("name") == "dnsmasq"), {})
-    if not dnsmasq.get("managed"):
+    # cycle-review этого PR (Codex, round 2): managed в одиночку — не тот вопрос. managed приходит
+    # ТОЛЬКО из state-entry, который для recovery='orphaned_backup' пуст (обрыв ДО финальной записи) —
+    # но _apply_dns install реально мог успеть выполнить ДО обрыва (apply_install зовёт _apply_dns
+    # сразу после _restart_component, задолго до финальной _write_state_after_apply). Гейтить
+    # restorable-компонент на managed=False значило бы восстановить конфиг (секция configs это
+    # делает), но оставить DNS указывать на 127.0.0.1 — молчаливый privacy/availability риск поверх
+    # успешного «ok» отката. item.get("restorable") — тот же признак, которым apply_uninstall уже
+    # решает, восстанавливать ли configs; DNS обязан следовать той же логике, а не своей отдельной.
+    if not (dnsmasq.get("managed") or dnsmasq.get("restorable")):
         return {"rc": 0, "out": "", "err": "dnsmasq unmanaged", "timeout": False}
     channels = plan.get("network", {}).get("channels") if isinstance(plan.get("network"), dict) else {}
     service = channels.get("wifi_service") if isinstance(channels, dict) else ""
@@ -393,7 +401,15 @@ def apply_uninstall(env=None, *, confirmations=None, runner=run):
 
     if confirmations.get("services"):
         for item in plan["components"]:
-            if not item.get("managed"):
+            # cycle-review этого PR (Codex, round 2), симметрично _restore_dns: managed=False на
+            # orphaned_backup — свойство ПУСТОГО state-entry (обрыв ДО финальной записи), а не
+            # доказательство того, что _restart_component не выполнялся. apply_install зовёт
+            # _restart_component для каждого компонента задолго до финальной записи — реальный сервис
+            # мог быть остановлен/запущен на новый (srouter) конфиг, который configs-секция уже
+            # восстановила выше. Гейтить stop только на managed оставляло бы этот сервис работающим
+            # на образ, которого только что не стало на диске, при report ok=True — тихий availability
+            # риск поверх успешного отката.
+            if not (item.get("managed") or item.get("restorable")):
                 continue
             stopped = _stop_service(item["name"], runner)
             if stopped.get("timeout") or stopped.get("rc") != 0:
