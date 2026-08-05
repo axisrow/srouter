@@ -107,6 +107,8 @@ def _component_uninstall_item(name, env, detected):
         "removable": removable,
         "recovery": recovery,
         "discovered_backups": facts["discovered_backups"],
+        # state обещал backup, а файла нет — повод громко доложить (leftover), см. apply_uninstall.
+        "state_backup_missing": facts["state_backup_missing"],
         "status": status,
     }
 
@@ -355,12 +357,18 @@ def apply_uninstall(env=None, *, confirmations=None, runner=run):
                         reason = "stale-managed: not restorable and marker missing"
                     leftover.append({"name": item["name"], "status": item.get("status", "unknown"),
                                      "reason": reason})
-                # Наш конфиг (маркер жив), но истории нет и backup рядом нет: восстанавливать нечем,
-                # удалять вслепую нельзя. Сообщаем, чтобы молчаливого «всё откатилось» не случилось.
-                elif item.get("recovery") == "leftover" and not item.get("managed"):
+                # state обещает backup, которого на диске НЕТ (state_backup_missing): восстанавливать
+                # нечем, удалять вслепую нельзя. Молчать тоже нельзя — это ровно «своё не откатилось»
+                # (#110 Дефект 1), и молчание здесь было бы обманом: оператор увидел бы «Откат
+                # завершён», а srouter-конфиг остался бы лежать поверх невосстановимого оригинала.
+                # ГРАНИЦА (#111 cycle 2 finding B): marker-managed БЕЗ обещанного backup — НЕ leftover
+                # (определённое состояние, rc=0), см. test_apply_uninstall_no_leftover_for_fresh_
+                # install_without_backup. Кричим только когда state сам заявил backup и соврал.
+                elif item.get("state_backup_missing"):
                     leftover.append({
                         "name": item["name"], "status": item.get("status", "unknown"),
-                        "reason": "srouter-маркер в конфиге, но ни backup, ни записи в state — не откатано",
+                        "reason": ("state ссылается на backup, которого нет на диске — оригинал "
+                                   "невосстановим, конфиг оставлен без изменений"),
                     })
                 continue
             if not _restore_backup(Path(item["backup"]), Path(item["config_path"])):

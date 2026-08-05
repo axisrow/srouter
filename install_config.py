@@ -986,10 +986,15 @@ def component_facts(name, env, entry, *, config_path=None):
       маркер, managed, backup мёртв, 0  → leftover          state лжёт — не удалять вслепую
       маркер, managed created, 0        → remove            штатный created
       маркер, managed created, >=1      → restore           F2/P1-1: диск бьёт деградировавший state
-      маркер, entry НЕТ, >=1            → orphaned_backup   P1-3/F1: обрыв до записи state
+      маркер, entry НЕТ, ровно 1        → orphaned_backup   P1-3/F1: обрыв до записи state
       маркер, entry НЕТ, 0              → leftover          наш конфиг без backup — не гадаем
-      любое, >1 backup, state молчит    → ambiguous         не выбираем «свежий»
+      маркер, >1 backup, state молчит   → ambiguous         не выбираем «свежий»
       БЕЗ маркера, managed              → leftover          stale-managed (#110 Дефект 1)
+      БЕЗ маркера, не managed           → none              true-foreign: чужое рядом легитимно (#110)
+      adopted/restored (любые факты)    → none              srouter намеренно не владеет файлом
+
+    Порядок ветвления — часть контракта: adopted/restored → «не наш файл» (маркер) → ambiguous →
+    действия. Каждая следующая проверка имеет смысл только если предыдущая подтвердила право писать.
     """
     path = Path(config_path or (entry.get("config_path") if isinstance(entry, dict) else None)
                 or env.component_paths(name)["config"])
@@ -1021,14 +1026,20 @@ def component_facts(name, env, entry, *, config_path=None):
     if adopted or restored:
         facts["recovery"] = "none"
         return facts
-    if ambiguous:
-        # Неоднозначность важнее всего остального: любое действие рискует записать не тот контент.
-        facts["recovery"] = "ambiguous"
-        return facts
     if not marker_present:
-        # Живой арбитр говорит «файл не наш». Единственное, что может требовать внимания, — след в
-        # state о том, что srouter сюда ставил (stale-managed, #110 Дефект 1) → leftover, не запись.
+        # Живой арбитр говорит «файл не наш». Проверяется РАНЬШЕ ambiguous: неоднозначность backup'ов
+        # имеет смысл только для файла, который мы вправе трогать. Иначе чужой конфиг, рядом с которым
+        # случайно лежат похожие по имени файлы (остатки давнего install по этому пути), попадал бы в
+        # ambiguous → leftover → rc=2, нарушая границу #110: «true-foreign (srouter не ставил) → НЕ
+        # leftover, чужое рядом легитимно» (cycle-review #111 cycle 2 finding B).
+        # Единственное, что требует внимания, — след в state о том, что srouter сюда ставил
+        # (stale-managed, #110 Дефект 1) → leftover, но по-прежнему без записи на диск.
         facts["recovery"] = "leftover" if managed else "none"
+        return facts
+    if ambiguous:
+        # Файл наш (маркер), но какой из backup'ов оригинал пользователя — неизвестно. Любое действие
+        # рискует записать не тот контент, поэтому раньше remove/restore и без записи на диск.
+        facts["recovery"] = "ambiguous"
         return facts
     # Дальше: маркер на месте — файл ДОКАЗАННО наш, писать по нему безопасно.
     if backup:

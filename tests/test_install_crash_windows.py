@@ -165,6 +165,41 @@ def test_second_component_failure_preserves_first_component_backup(tmp_path, mon
     )
 
 
+@pytest.mark.xfail(strict=True, reason=(
+    "F3/P1-2 issue #124 (install-половина): повторный apply со skip/adopt после оборванного overwrite "
+    "не должен терять ссылку на backup предыдущей попытки. Чинится в части 2/2 вместе со state-first; "
+    "strict=True гарантирует, что находка не потеряется — xfail станет XPASS и потребует снять маркер."))
+def test_retry_with_skip_after_interrupted_overwrite_keeps_backup(tmp_path, monkeypatch):
+    """F3/P1-2: обрыв overwrite, затем повторный apply со skip — backup первой попытки обязан выжить.
+
+    Сценарий 6 P1 из issue #124: первая попытка перезаписала конфиг (backup создан), оборвалась до
+    записи state. Оператор повторяет install, на этот раз выбрав skip для того же компонента —
+    needs_backup=False, ветка backup не выполняется, а _write_state_after_apply перезаписывает entry
+    режимом skipped. Ссылка на backup первой попытки не появляется в state ни на одном шаге.
+
+    Диск при этом ЗНАЕТ правду (backup лежит рядом с target), поэтому uninstall уже сейчас восстановит
+    оригинал — часть 1/2 закрыла последствие. Этот тест пиннит ПРИЧИНУ: state обязан перестать терять
+    ссылку, иначе оператор, читающий srouter.local.json, видит неполную картину.
+    """
+    env, config_path = _foreign_privoxy(tmp_path)
+    _crash_after(monkeypatch, "_write_component_config", component="privoxy")
+    with pytest.raises(_Crash):
+        _apply_overwrite_privoxy(env)
+    backups = list(config_path.parent.glob("config.srouter-backup-*"))
+    assert backups, "первая попытка создала backup"
+
+    monkeypatch.undo()
+    runner = FakeRunner()
+    install_lib.apply_install(
+        env=env, confirm=True,
+        choices={"privoxy": "skip", "xray": "skip", "dnsmasq": "skip"},
+        runner=runner, port_checker=_port_checker_managed_up(runner.calls))
+
+    assert _entry(env).get("backup") == str(backups[0]), (
+        "повторный apply со skip не должен терять ссылку на backup оборванной попытки (F3/P1-2)"
+    )
+
+
 def test_crash_between_backup_and_config_write_leaves_original_intact(tmp_path, monkeypatch):
     """W2/W3 (регресс-гвард, зелёный и до фикса): обрыв сразу после _backup не трогает оригинал.
 
@@ -286,6 +321,65 @@ def test_multiple_disk_backups_block_uninstall_as_ambiguous(tmp_path):
         "при неоднозначности конфиг не трогаем"
     assert older.read_text(encoding="utf-8") == "original user config\n", "backup'ы не удаляются"
     assert newer.exists()
+
+
+def test_uninstall_reports_leftover_when_state_backup_vanished(tmp_path):
+    """cycle-review: state обещает backup, которого нет на диске → leftover (rc=2), не молчание.
+
+    Молчание здесь — обман того же класса, что #110 Дефект 1: оператор увидел бы «Откат завершён»,
+    а srouter-конфиг остался бы лежать поверх невосстановимого оригинала. Восстанавливать нечем,
+    удалять вслепую нельзя — единственный честный исход громко сообщить.
+    """
+    env = _env(tmp_path)
+    config_path = env.component_paths("privoxy")["config"]
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        "# srouter-managed-config-v1\nlisten-address 127.0.0.1:8118\n", encoding="utf-8")
+    env.state_path.write_text(json.dumps({
+        "schema_version": 1, "nodes": [], "active_node": {"name": None, "pending": None},
+        "probes": {}, "network": {"channels": {"wifi_service": "Wi-Fi"}},
+        "traffic_guard": {"mode": "off", "domains": {}},
+        "detected_environment": {"privoxy": {
+            "config_path": str(config_path),
+            "backup": str(tmp_path / "vanished.backup"),  # файла НЕТ
+            "management": {"mode": "managed", "managed": True, "provenance": "overwrote"},
+        }},
+        "runtime": {},
+    }), encoding="utf-8")
+
+    result = install_lib.apply_uninstall(
+        env=env, confirmations={"configs": True}, runner=FakeRunner())
+
+    assert result["ok"] is True
+    assert any(item["name"] == "privoxy" for item in result["leftover"]), (
+        "мёртвая ссылка на backup обязана попасть в leftover (rc=2) — молчание = ложный «откат завершён»"
+    )
+    assert config_path.exists(), "конфиг не удаляем: восстановить нечем, но и терять нельзя"
+
+
+def test_uninstall_does_not_report_foreign_config_with_stray_backups(tmp_path):
+    """Граница #110 сквозь весь поток: чужой конфиг + похожие по имени файлы → НЕ leftover, rc=0.
+
+    Регресс-гвард к порядку проверок в component_facts: ambiguous не должен срабатывать раньше, чем
+    подтверждено право трогать файл. Иначе «чужое рядом» шумело бы как частичный откат.
+    """
+    env = _env(tmp_path)
+    config_path = _write_config_without_marker(env, "privoxy", content="foreign config\n")
+    for stamp in ("2026-06-01T000000Z", "2026-06-29T000000Z"):
+        config_path.with_name(f"config.srouter-backup-{stamp}").write_text("stray\n", encoding="utf-8")
+    env.state_path.write_text(json.dumps({
+        "schema_version": 1, "nodes": [], "active_node": {"name": None, "pending": None},
+        "probes": {}, "network": {"channels": {"wifi_service": "Wi-Fi"}},
+        "traffic_guard": {"mode": "off", "domains": {}},
+        "detected_environment": {}, "runtime": {},
+    }), encoding="utf-8")
+
+    result = install_lib.apply_uninstall(
+        env=env, confirmations={"configs": True}, runner=FakeRunner())
+
+    assert result["ok"] is True
+    assert result["leftover"] == [], "true-foreign не становится partial-откатом из-за соседних файлов"
+    assert config_path.read_text(encoding="utf-8") == "foreign config\n", "чужой конфиг не тронут"
 
 
 # ============================ T7: discovery не принимает чужое за своё ============================

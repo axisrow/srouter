@@ -151,6 +151,38 @@ def test_multiple_backups_with_state_pointer_resolves(tmp_path):
     assert facts["backup"] == str(older), "state разрешает неоднозначность в пользу СТАРОГО backup"
 
 
+def test_true_foreign_with_stray_lookalike_backups_is_none(tmp_path):
+    """cycle-review: маркера НЕТ и записи в state нет → none, СКОЛЬКО БЫ backup'ов рядом ни лежало.
+
+    Порядок проверок — часть контракта: marker_present раньше ambiguous. Иначе чужой конфиг, рядом с
+    которым остались похожие по имени файлы от давнего install по этому пути, классифицировался бы
+    ambiguous → leftover → rc=2. Это нарушает границу #110 / cycle-review #111 cycle 2 finding B:
+    «true-foreign (srouter не ставил) → НЕ leftover, чужое рядом легитимно».
+    """
+    env = _env(tmp_path)
+    target = _target(env, FOREIGN_CONFIG)  # без srouter-маркера
+    _backup_next_to(target, "2026-06-01T000000Z")
+    _backup_next_to(target, "2026-06-29T000000Z")
+
+    facts = _facts(env, {})
+
+    assert facts["recovery"] == "none", "чужой файл не становится нашим из-за соседних файлов"
+
+
+def test_marker_without_state_and_two_backups_is_ambiguous(tmp_path):
+    """Граница строки таблицы «entry НЕТ»: orphaned_backup только при РОВНО одном кандидате.
+
+    С двумя кандидатами и молчащим state выбрать оригинал нечем → ambiguous (не orphaned_backup).
+    Докстринг-таблица обязана совпадать с кодом построчно, иначе она вводит в заблуждение.
+    """
+    env = _env(tmp_path)
+    target = _target(env)
+    _backup_next_to(target, "2026-06-01T000000Z", "original user config\n")
+    _backup_next_to(target, "2026-06-29T000000Z", MANAGED_CONFIG)
+
+    assert _facts(env, {})["recovery"] == "ambiguous"
+
+
 def test_stale_managed_without_marker_is_leftover(tmp_path):
     """#110 Дефект 1 сохранён: state managed, маркер пропал → leftover, файл не трогаем."""
     env = _env(tmp_path)
