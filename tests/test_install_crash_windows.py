@@ -357,6 +357,77 @@ def test_uninstall_reports_leftover_when_state_backup_vanished(tmp_path):
     assert config_path.exists(), "конфиг не удаляем: восстановить нечем, но и терять нельзя"
 
 
+def test_dead_state_backup_is_not_substituted_by_stray_neighbour(tmp_path):
+    """cycle-review P1: state НАЗВАЛ backup, файл мёртв → НЕ подставлять случайного соседа молча.
+
+    Дыра была в `len(discovered) == 1`: ветка возвращала единственного найденного кандидата, ни разу
+    не сверившись с тем, что назвал state. Сценарий реален — старые .srouter-backup-* никто не
+    удаляет (build_uninstall_plan сам декларирует их в user_data_retained), поэтому ровно один
+    посторонний сосед — рядовая ситуация. Итог: uninstall восстанавливал ЧУЖОЙ контент поверх
+    конфига и докладывал ok=True с пустым leftover — «откат завершён» вместо правды.
+
+    Discovery существует, чтобы восполнить МОЛЧАНИЕ state (обрыв до записи), а не переспорить его.
+    """
+    env = _env(tmp_path)
+    config_path = env.component_paths("privoxy")["config"]
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text("# srouter-managed-config-v1\nsrouter current\n", encoding="utf-8")
+    stale = config_path.with_name("config.srouter-backup-2020-01-01T000000Z")
+    stale.write_text("STALE UNRELATED CONTENT\n", encoding="utf-8")
+    env.state_path.write_text(json.dumps({
+        "schema_version": 1, "nodes": [], "active_node": {"name": None, "pending": None},
+        "probes": {}, "network": {"channels": {"wifi_service": "Wi-Fi"}},
+        "traffic_guard": {"mode": "off", "domains": {}},
+        "detected_environment": {"privoxy": {
+            "config_path": str(config_path),
+            "backup": str(tmp_path / "vanished.backup"),  # state назвал ДРУГОЙ файл, и его нет
+            "management": {"mode": "managed", "managed": True, "provenance": "overwrote"},
+        }},
+        "runtime": {},
+    }), encoding="utf-8")
+
+    result = install_lib.apply_uninstall(
+        env=env, confirmations={"configs": True}, runner=FakeRunner())
+
+    assert result["ok"] is True
+    assert config_path.read_text(encoding="utf-8") != "STALE UNRELATED CONTENT\n", (
+        "посторонний сосед НЕ должен подменять названный state backup — это тихое восстановление "
+        "чужого контента под видом успешного отката"
+    )
+    assert any(item["name"] == "privoxy" for item in result["leftover"]), (
+        "мёртвая ссылка обязана попасть в leftover (rc=2), а не маскироваться подстановкой"
+    )
+
+
+def test_uninstall_reports_leftover_for_marked_config_without_any_history(tmp_path):
+    """Регресс-гвард: маркер жив, записи в state нет, backup'ов нет → leftover, не молчание.
+
+    Эту ветку потеряла правка предыдущего раунда cycle-review (условие сузилось на
+    state_backup_missing и перестало ловить «истории нет вообще»). Классификация редьюсера была
+    верной всё это время — терялся именно доклад оператору, то есть ровно то, что чиним.
+    """
+    env = _env(tmp_path)
+    config_path = env.component_paths("privoxy")["config"]
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text("# srouter-managed-config-v1\nours\n", encoding="utf-8")
+    env.state_path.write_text(json.dumps({
+        "schema_version": 1, "nodes": [], "active_node": {"name": None, "pending": None},
+        "probes": {}, "network": {"channels": {"wifi_service": "Wi-Fi"}},
+        "traffic_guard": {"mode": "off", "domains": {}},
+        "detected_environment": {},  # записи нет вовсе
+        "runtime": {},
+    }), encoding="utf-8")
+
+    result = install_lib.apply_uninstall(
+        env=env, confirmations={"configs": True}, runner=FakeRunner())
+
+    assert result["ok"] is True
+    assert any(item["name"] == "privoxy" for item in result["leftover"]), (
+        "наш конфиг (маркер) без истории — не откатан; молчание = ложный «Откат завершён»"
+    )
+    assert config_path.exists(), "удалять вслепую нельзя — восстанавливать нечем"
+
+
 def test_uninstall_does_not_report_foreign_config_with_stray_backups(tmp_path):
     """Граница #110 сквозь весь поток: чужой конфиг + похожие по имени файлы → НЕ leftover, rc=0.
 

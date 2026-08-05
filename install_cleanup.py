@@ -113,6 +113,43 @@ def _component_uninstall_item(name, env, detected):
     }
 
 
+def _leftover_reason(item):
+    """Почему компонент не откатился — текст для оператора, либо "" если докладывать нечего.
+
+    ЕДИНСТВЕННЫЙ вход — item['recovery'], который вычислил component_facts. Раньше apply_uninstall
+    пересобирал условия сам (managed/marker_present/provenance/state_backup_missing), и cycle-review
+    этого PR дважды поймал одно и то же следствие: ветка срабатывала не на том случае, а её правка
+    молча теряла соседний. Это ровно корневой класс #110/#124 — две реализации одной истины.
+
+    Молчание здесь = обман (#110 Дефект 1): оператор увидел бы «Откат завершён», а конфиг остался бы
+    лежать. Поэтому докладываем ВСЕ неоткатившиеся состояния. Единственное исключение — 'none'
+    (srouter к файлу непричастен: adopted/restored/true-foreign; «чужое рядом» легитимно) и 'remove'/
+    'restore' (сюда не попадают — они обрабатываются как действия выше по потоку).
+    """
+    recovery = item.get("recovery")
+    if recovery == "ambiguous":
+        # Автовыбор «самого свежего» — ловушка: при обрыве второго install свежий backup является
+        # копией srouter-конфига, а оригинал пользователя лежит в самом старом. Отдаём выбор оператору.
+        return ("несколько backup-кандидатов, state не указывает оригинал — выберите вручную: "
+                + ", ".join(item.get("discovered_backups") or []))
+    if recovery != "leftover":
+        return ""
+    if item.get("state_backup_missing"):
+        return ("state ссылается на backup, которого нет на диске — оригинал невосстановим, "
+                "конфиг оставлен без изменений")
+    if item.get("managed") and not item.get("marker_present"):
+        # created БЕЗ маркера (двойной арбитраж #112 не пройден) / stale-managed (#110 Дефект 1).
+        if item.get("provenance") == "created":
+            return "created-config: marker missing (обрыв install / подмена) — fail-safe, не удалено"
+        return "stale-managed: not restorable and marker missing"
+    # Маркер жив, но истории нет: ни backup рядом, ни записи в state. Восстанавливать нечем, удалять
+    # вслепую нельзя. ГРАНИЦА #111 cycle 2 finding B: legacy marker-managed БЕЗ provenance — состояние
+    # ОПРЕДЕЛЁННОЕ (конфиг наш и валиден), это не partial → rc=0, не leftover.
+    if item.get("managed"):
+        return ""
+    return "srouter-маркер в конфиге, но ни backup, ни записи в state — не откатано"
+
+
 def _launchagent_uninstall_item(env, detected):
     entry = detected.get("launchagent") if isinstance(detected.get("launchagent"), dict) else {}
     plist_path = Path(entry.get("plist_path") or env.launchagent_path())
@@ -335,41 +372,15 @@ def apply_uninstall(env=None, *, confirmations=None, runner=run):
                 actions.append({"category": "configs", "component": item["name"], "changed": True})
                 continue
             if not item.get("restorable"):
-                # ambiguous (issue #124): несколько валидных backup'ов, state не разрешает, какой из
-                # них оригинал пользователя. Автовыбор «самого свежего» — ловушка: при обрыве второго
-                # install свежий backup является копией srouter-конфига, а оригинал лежит в самом
-                # старом. Молча угадать = потерять ровно так же, как теряла старая архитектура.
-                # Отдаём выбор оператору со списком путей, конфиг не трогаем (fail-closed).
-                if item.get("recovery") == "ambiguous":
-                    leftover.append({
-                        "name": item["name"], "status": item.get("status", "unknown"),
-                        "reason": ("несколько backup-кандидатов, state не указывает оригинал — "
-                                   "выберите вручную: " + ", ".join(item.get("discovered_backups") or [])),
-                    })
-                    continue
-                # created БЕЗ маркера (двойной арбитраж не пройден) → fail-safe leftover, не удалять.
-                # stale-managed (legacy без provenance, маркер пропал) → leftover (как #110 Дефект 1).
-                # Маркер на месте для legacy-without-provenance → НЕ leftover (определённое состояние, оставляем).
-                if item.get("managed") and not item.get("marker_present"):
-                    if item.get("provenance") == "created":
-                        reason = "created-config: marker missing (обрыв install / подмена) — fail-safe, не удалено"
-                    else:
-                        reason = "stale-managed: not restorable and marker missing"
+                # Классификацию УЖЕ сделал component_facts — здесь только перевод её в текст для
+                # оператора. Не пересобираем условия заново: две реализации одной истины и есть
+                # корневой класс #110/#124, и в cycle-review этого PR он воспроизвёлся дважды
+                # (ветка ловила не тот случай, а её правка потеряла соседний). Единственный вход —
+                # item['recovery'].
+                reason = _leftover_reason(item)
+                if reason:
                     leftover.append({"name": item["name"], "status": item.get("status", "unknown"),
                                      "reason": reason})
-                # state обещает backup, которого на диске НЕТ (state_backup_missing): восстанавливать
-                # нечем, удалять вслепую нельзя. Молчать тоже нельзя — это ровно «своё не откатилось»
-                # (#110 Дефект 1), и молчание здесь было бы обманом: оператор увидел бы «Откат
-                # завершён», а srouter-конфиг остался бы лежать поверх невосстановимого оригинала.
-                # ГРАНИЦА (#111 cycle 2 finding B): marker-managed БЕЗ обещанного backup — НЕ leftover
-                # (определённое состояние, rc=0), см. test_apply_uninstall_no_leftover_for_fresh_
-                # install_without_backup. Кричим только когда state сам заявил backup и соврал.
-                elif item.get("state_backup_missing"):
-                    leftover.append({
-                        "name": item["name"], "status": item.get("status", "unknown"),
-                        "reason": ("state ссылается на backup, которого нет на диске — оригинал "
-                                   "невосстановим, конфиг оставлен без изменений"),
-                    })
                 continue
             if not _restore_backup(Path(item["backup"]), Path(item["config_path"])):
                 return {"ok": False, "blocked": [f"{item['name']}_restore_failed"], "actions": actions, "plan": plan}

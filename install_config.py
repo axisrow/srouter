@@ -926,29 +926,41 @@ def _is_created_entry(entry):
 def _resolve_backup(entry, discovered):
     """Какой backup считать оригиналом пользователя: (path|None, ambiguous: bool).
 
+    ПРИОРИТЕТ: названное state — сильнее найденного на диске. Discovery восполняет МОЛЧАНИЕ state
+    (обрыв до записи), но не переспаривает его: подменить названный backup «похожим» соседом значит
+    тихо восстановить чужой контент, выдав это за успешный откат.
+      state назвал backup, файл жив   → (он, False)  — даже вне parent-директории target;
+      state назвал backup, файл мёртв → (None, False) — НЕ подставляем найденное; component_facts
+                                        даст leftover по state_backup_missing (оператор узнает);
+      state молчит, 0 кандидатов      → (None, False) — восстанавливать нечего;
+      state молчит, ровно 1           → (он, False)  — ради этого случая и затевалась discovery;
+      state молчит, >1                → (None, True) — ambiguous: оператору список, fail-closed.
+
     Политика при НЕСКОЛЬКИХ кандидатах — не угадывать. Цикл install→uninstall→install штатно
     оставляет несколько .srouter-backup-*, и «взять самый свежий» — ловушка: при обрыве ВТОРОГО
     install самый свежий backup является копией srouter-конфига, а оригинал пользователя лежит в
     самом СТАРОМ. Молчаливый автовыбор потерял бы его — ровно тот класс последствий, что мы чиним.
-      0 кандидатов          → (None, False)  — восстанавливать нечего;
-      1                     → (он, False);
-      >1 и state указывает на одного из них → (он, False) — state как tie-breaker, но НЕ как
-                              единственный источник (в этом и была дыра: state теряется при обрыве);
-      >1 и state молчит/врёт → (None, True)  — ambiguous: оператору список, fail-closed.
     """
     stated = entry.get("backup") if isinstance(entry, dict) else None
-    if not discovered:
-        # state может ссылаться на backup вне parent-директории target (legacy/ручной путь) —
-        # уважаем его, если файл существует: discovery дополняет state, а не отменяет его.
-        if stated and Path(stated).is_file():
+    if stated:
+        # state НАЗВАЛ конкретный backup — это сильнейшее из доступных утверждений о том, где лежит
+        # оригинал. Discovery существует, чтобы восполнить МОЛЧАНИЕ state (обрыв до записи), а не
+        # чтобы переспорить его: подмена названного файла найденным «похожим» тихо восстановила бы
+        # чужой контент. Поэтому:
+        #   - названный файл жив → берём его (даже вне parent-директории target: legacy/ручной путь);
+        #   - названный файл мёртв → НЕ подставляем найденное молча (cycle-review #124 P1: ровно один
+        #     случайный сосед подменял названный backup, и apply_uninstall докладывал ok без leftover).
+        #     Возвращаем «нечего восстанавливать» — дальше component_facts даст leftover по
+        #     state_backup_missing, и оператор увидит, что откат НЕ состоялся.
+        if Path(stated).is_file():
             return Path(stated), False
         return None, False
+    if not discovered:
+        return None, False
     if len(discovered) == 1:
+        # state молчит (обрыв до записи) — единственный кандидат однозначен: это ровно тот случай,
+        # ради которого затевалась disk-discovery (P1-3/F1).
         return discovered[0], False
-    if stated:
-        for candidate in discovered:
-            if str(candidate) == str(Path(stated)):
-                return candidate, False
     return None, True
 
 

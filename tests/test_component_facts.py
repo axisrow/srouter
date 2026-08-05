@@ -90,6 +90,38 @@ def test_managed_with_dead_backup_reference_is_leftover(tmp_path):
     assert facts["state_backup_missing"] is True
 
 
+def test_dead_state_pointer_is_not_replaced_by_single_discovered(tmp_path):
+    """cycle-review P1: state назвал backup и соврал → единственный найденный сосед НЕ подставляется.
+
+    Приоритет: названное state сильнее найденного на диске. Discovery восполняет МОЛЧАНИЕ state,
+    но не переспаривает его — иначе восстановился бы чужой контент под видом успешного отката.
+    """
+    env = _env(tmp_path)
+    target = _target(env)
+    _backup_next_to(target, "2020-01-01T000000Z", "STALE UNRELATED\n")
+    entry = _entry(target, provenance="overwrote", backup=tmp_path / "vanished.backup")
+
+    facts = _facts(env, entry)
+
+    assert facts["state_backup_missing"] is True
+    assert facts["recovery"] == "leftover", "мёртвая ссылка → доклад оператору, не тихая подстановка"
+    assert facts["backup"] == "", "посторонний сосед не становится «тем самым» backup'ом"
+
+
+def test_state_pointer_wins_over_discovered_when_alive(tmp_path):
+    """Обратная сторона того же приоритета: живой названный backup используется, даже если рядом есть другой."""
+    env = _env(tmp_path)
+    target = _target(env)
+    _backup_next_to(target, "2020-01-01T000000Z", "NOT THE ONE\n")
+    stated = tmp_path / "explicit.backup"
+    stated.write_text(FOREIGN_CONFIG, encoding="utf-8")
+
+    facts = _facts(env, _entry(target, provenance="overwrote", backup=stated))
+
+    assert facts["recovery"] == "restore"
+    assert facts["backup"] == str(stated)
+
+
 def test_managed_created_without_backup_is_remove(tmp_path):
     """Штатный created: srouter создал конфиг с нуля, восстанавливать нечего → удалить (issue #112)."""
     env = _env(tmp_path)
