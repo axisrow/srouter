@@ -3,571 +3,48 @@
 Контракт (#2): функции НИКОГДА не бросают; невалидный ввод деградирует в empty/default.
 Path по умолчанию — рядом с модулем (не cwd), чтобы работал под launchd.
 Каждая public функция принимает path= для тестов (tmp_path fixture).
+
+Этот модуль — core state I/O (default state, load/save, atomic write, cross-process lock,
+_is_valid_host) + фасад с полным ре-экспортом (issue #158, декомпозиция крупных файлов, канон
+star-import-reexport-contract). Специализированная логика вынесена в подмодули по обязанностям:
+  - local_state_traffic_guard.py — Traffic Guard валидация/config + throttle runtime-lease
+  - local_state_isolate.py       — PF-изоляция доменов + codex-изоляция (#168), runtime-lease
+  - local_state_nodes.py         — узлы: CRUD, active_node, resolve_route_ip
+  - local_state_xray.py          — #200: sync endpoint local.json ↔ рабочий xray-конфиг
+  - local_state_routing.py       — #136: routing-domains в production xray-config (hybrid adopt)
+
+Подмодули обращаются к core I/O ЧЕРЕЗ этот фасад (`import local_state`,
+`local_state._load_state_checked(...)`), а не через прямой импорт друг друга — канон
+moving-caller-inverts-mock-ownership: тесты патчат `local_state._load_state_checked` /
+`local_state.save_state` и ожидают, что функции-обёртки (sync_route_ip_from_xray, routing_apply,
+save_active_isolate, ...) это увидят. Если бы caller и callee физически разъехались и caller
+резолвил callee забинженной ссылкой на другой подмодуль (`from local_state_core import X`), патчи
+на фасаде стали бы тихим no-op. Facade-lookup (module-attribute lookup в момент вызова, а не при
+импорте) сохраняет существующий контракт патчинга без изменений в тестах. Цикла импорта нет —
+`import local_state` внутри подмодулей только регистрирует модуль в sys.modules; атрибуты читаются
+в момент ВЫЗОВА функции, когда local_state.py уже полностью инициализирован (подмодули
+импортируются последними, в самом низу этого файла).
 """
 import json
 import os
 import re
-import socket
+import socket  # noqa: F401 — re-export surface: local_state.socket патчится тестами (canon
+                # star-import-reexport-contract), реальный resolve_route_ip теперь в
+                # local_state_nodes.py, но это ТОТ ЖЕ объект модуля socket (sys.modules) — патч
+                # local_state.socket.gethostbyname виден и там.
 from pathlib import Path
 
 # Путь к локальному state по умолчанию — рядом с этим модулем, не cwd.
 _DEFAULT_PATH = Path(__file__).resolve().parent / "srouter.local.json"
 
 # D2: валидация хоста — только безопасные символы, shell-метасимволы запрещены.
-# Переиспользовано из закрытого PR #19; закреплено в #2.
+# Переиспользовано из закрытого PR #19; закреплено в #2. Единственный источник для всех подмодулей.
 _HOST_RE = re.compile(r"^[A-Za-z0-9.:_-]+\Z")
-_TRAFFIC_GUARD_MODES = {"on", "off", "auto"}
-_TRAFFIC_GUARD_POLICIES = {"block", "allow"}
-_TRAFFIC_GUARD_CHANNELS = {"wifi", "usb_tether", "metered"}
-_TRAFFIC_GUARD_AUTO_DOMAINS_ERROR = "traffic_guard.domains must define channel policies for auto mode"
 
 
 def _is_valid_host(host):
     """True если строка содержит только безопасные для shell символы."""
     return bool(isinstance(host, str) and _HOST_RE.match(host))
-
-
-def _normalize_traffic_guard_domain(domain):
-    """Нормализовать domain-rule для exact+subdomain match; пустая строка значит reject."""
-    if not isinstance(domain, str):
-        return ""
-    normalized = domain.strip().lower().rstrip(".")
-    if not normalized or normalized.startswith(".") or ".." in normalized:
-        return ""
-    # Traffic Guard принимает домены, не host:port/IPv6; shell-символы всё равно режет _HOST_RE.
-    if ":" in normalized or not _is_valid_host(normalized):
-        return ""
-    return normalized
-
-
-def _traffic_guard_domain_matches(candidate, rule_domain):
-    """Xray `domain:example.com` матчится на example.com и любые *.example.com."""
-    candidate_norm = _normalize_traffic_guard_domain(candidate)
-    rule_norm = _normalize_traffic_guard_domain(rule_domain)
-    if not candidate_norm or not rule_norm:
-        return False
-    return candidate_norm == rule_norm or candidate_norm.endswith("." + rule_norm)
-
-
-def _normalize_traffic_guard_channel(channel):
-    """Нормализовать канал из #10/#11; пустая строка значит reject/unknown."""
-    if not isinstance(channel, str):
-        return ""
-    normalized = channel.strip().lower().replace("-", "_").replace(" ", "_")
-    if normalized in {"wifi", "wi_fi"}:
-        return "wifi"
-    if normalized in {"usb", "usb_tether", "usbtether"}:
-        return "usb_tether"
-    if normalized == "metered":
-        return "metered"
-    return ""
-
-
-def _validate_traffic_guard_domain_map(domains, errors, context):
-    if domains is None:
-        return {}
-    if not isinstance(domains, dict):
-        errors.append(f"{context} must be an object")
-        return {}
-
-    normalized = {}
-    for domain, policy in domains.items():
-        domain_norm = _normalize_traffic_guard_domain(domain)
-        if not domain_norm:
-            errors.append(f"{context} domain is invalid: {domain!r}")
-            continue
-        if policy == "throttle":
-            errors.append(f'{context} policy "throttle" is not supported in v1: {domain_norm}')
-            continue
-        if not isinstance(policy, str) or policy not in _TRAFFIC_GUARD_POLICIES:
-            errors.append(f'{context} policy must be "block" or "allow": {domain_norm}')
-            continue
-        previous = normalized.get(domain_norm)
-        if previous is not None and previous != policy:
-            errors.append(f"conflicting {context} policies for {domain_norm}: {previous} vs {policy}")
-            continue
-        normalized[domain_norm] = policy
-
-    ordered = sorted(normalized.items(), key=lambda item: item[0].count("."))
-    for index, (parent, parent_policy) in enumerate(ordered):
-        for child, child_policy in ordered[index + 1 :]:
-            if parent_policy != child_policy and _traffic_guard_domain_matches(child, parent):
-                errors.append(f"conflicting {context} policies: {parent}={parent_policy} vs {child}={child_policy}")
-    return normalized
-
-
-def _validate_traffic_guard_channel_domains(domains, errors):
-    if domains is None:
-        return {}
-    if not isinstance(domains, dict):
-        errors.append("traffic_guard.domains must be an object")
-        return {}
-
-    normalized = {}
-    for channel, channel_domains in domains.items():
-        channel_norm = _normalize_traffic_guard_channel(channel)
-        if not channel_norm:
-            errors.append(f"traffic_guard channel is invalid: {channel!r}")
-            continue
-        if channel_norm in normalized:
-            errors.append(f"duplicate traffic_guard channel: {channel_norm}")
-            continue
-        context = f"traffic_guard.domains.{channel_norm}"
-        if not isinstance(channel_domains, dict):
-            errors.append(f"{context} must be an object")
-            continue
-        before_error_count = len(errors)
-        channel_map = _validate_traffic_guard_domain_map(channel_domains, errors, context)
-        if not channel_map and len(errors) == before_error_count:
-            errors.append(f"{context} must define at least one policy")
-            continue
-        normalized[channel_norm] = channel_map
-    return normalized
-
-
-def _normalized_traffic_guard_domain_map(domains):
-    normalized = {}
-    if not isinstance(domains, dict):
-        return normalized
-    for domain, policy in domains.items():
-        domain_norm = _normalize_traffic_guard_domain(domain)
-        if domain_norm and policy in _TRAFFIC_GUARD_POLICIES:
-            normalized[domain_norm] = policy
-    return normalized
-
-
-def _normalized_traffic_guard_channel_domains(domains):
-    normalized = {}
-    if not isinstance(domains, dict):
-        return normalized
-    for channel, channel_domains in domains.items():
-        channel_norm = _normalize_traffic_guard_channel(channel)
-        if not channel_norm or channel_norm in normalized:
-            continue
-        normalized[channel_norm] = _normalized_traffic_guard_domain_map(channel_domains)
-    return normalized
-
-
-def _traffic_guard_state_channel(guard, state, channel):
-    for candidate in (channel, guard.get("channel"), guard.get("active_channel")):
-        channel_norm = _normalize_traffic_guard_channel(candidate)
-        if channel_norm:
-            return channel_norm
-    network = state.get("network") if isinstance(state, dict) else {}
-    if isinstance(network, dict):
-        for candidate in (
-            network.get("traffic_guard_channel"),
-            network.get("active_channel"),
-            network.get("channel"),
-        ):
-            channel_norm = _normalize_traffic_guard_channel(candidate)
-            if channel_norm:
-                return channel_norm
-    return ""
-
-
-def _traffic_guard_domains_for_channel(channels, channel):
-    if not isinstance(channels, dict):
-        return {}
-    channel_norm = _normalize_traffic_guard_channel(channel)
-    if not channel_norm:
-        return {}
-    if isinstance(channels.get(channel_norm), dict):
-        return dict(channels[channel_norm])
-    # USB tether в #10 является очевидно metered; общий metered-набор служит fallback.
-    if channel_norm == "usb_tether" and isinstance(channels.get("metered"), dict):
-        return dict(channels["metered"])
-    return {}
-
-
-def validate_traffic_guard(guard):
-    """Вернуть список явных ошибок Traffic Guard v1. Не бросает.
-
-    mode:auto opt-in: domains становится картой channel -> domain policies.
-    throttle по-прежнему отклоняется валидацией, а не молча приводится к другой семантике.
-    """
-    errors = []
-    if guard is None or guard is False:
-        return errors
-    if not isinstance(guard, dict):
-        return ["traffic_guard must be an object"]
-
-    mode = guard.get("mode", "off")
-    if not isinstance(mode, str) or mode not in _TRAFFIC_GUARD_MODES:
-        errors.append('traffic_guard.mode must be "on", "off", or "auto"')
-
-    if mode == "auto":
-        domains = guard.get("domains")
-        if domains is None or domains == {}:
-            errors.append(_TRAFFIC_GUARD_AUTO_DOMAINS_ERROR)
-            return errors
-        _validate_traffic_guard_channel_domains(domains, errors)
-    else:
-        domains = guard.get("domains", {})
-        if domains is None:
-            return errors
-        _validate_traffic_guard_domain_map(domains, errors, "traffic_guard.domains")
-    return errors
-
-
-def traffic_guard_config(path=None, state=None, channel=None):
-    """Нормализованный Traffic Guard для generator/probe.
-
-    Возвращает dict с valid/errors; при ошибках безопасно отключает правила, но
-    сохраняет явную причину для status/apply-слоёв.
-    """
-    if state is None:
-        state = load_state(path)
-    guard = state.get("traffic_guard") if isinstance(state, dict) else {}
-    errors = validate_traffic_guard(guard)
-    if errors:
-        return {"mode": "off", "domains": {}, "channels": {}, "channel": "", "valid": False, "errors": errors}
-    if not isinstance(guard, dict):
-        guard = {}
-    domains = guard.get("domains") if isinstance(guard.get("domains"), dict) else {}
-    mode = guard.get("mode", "off")
-    mode = mode if mode in _TRAFFIC_GUARD_MODES else "off"
-    if mode == "auto":
-        channels = _normalized_traffic_guard_channel_domains(domains)
-        active_channel = _traffic_guard_state_channel(guard, state, channel)
-        return {
-            "mode": "auto",
-            "domains": _traffic_guard_domains_for_channel(channels, active_channel),
-            "channels": channels,
-            "channel": active_channel,
-            "valid": True,
-            "errors": [],
-        }
-    return {
-        "mode": mode,
-        "domains": _normalized_traffic_guard_domain_map(domains),
-        "channels": {},
-        "channel": "",
-        "valid": True,
-        "errors": [],
-    }
-
-
-# ============================ Traffic Guard throttle runtime (#13/#22) ============================
-# Throttle — плоский v1 (без auto-каналов) поверх одно-pipe'ового движка traffic_shape.
-# Валидация ВХОДА (domain/rate) — не policy-конфиг, а параметры privileged-вызова:
-# держим её здесь, чтобы роут и любой другой вызывающий резали невалидное одинаково
-# (fail-closed) ДО того, как значения дойдут до shell traffic_shape.
-
-
-def _valid_throttle_rate(rate):
-    """Положительное целое (int или строка из одних цифр) -> int, иначе None.
-
-    Согласовано с traffic_shape._valid_rate (Kbit/s), но без импорта движка (иначе
-    цикл import). bool отсекаем явно: True/False — не rate. Ноль/отрицательное — None.
-    """
-    if isinstance(rate, bool):
-        return None
-    if isinstance(rate, int):
-        n = rate
-    elif isinstance(rate, str) and rate.isdigit():
-        n = int(rate)
-    else:
-        return None
-    return n if n > 0 else None
-
-
-def validate_throttle_request(domain, rate):
-    """Свести пользовательский (domain, rate) к (domain_norm, rate_int) или (None, None).
-
-    Единый fail-closed валидатор для apply-запроса throttle: domain нормализуется тем
-    же _normalize_traffic_guard_domain (exact+subdomain семантика, shell-небезопасное
-    режется), rate — положительное целое. Любая невалидность -> (None, None), чтобы
-    вызывающий не звал движок. Не бросает.
-    """
-    domain_norm = _normalize_traffic_guard_domain(domain)
-    rate_int = _valid_throttle_rate(rate)
-    if not domain_norm or rate_int is None:
-        return None, None
-    return domain_norm, rate_int
-
-
-def _valid_active_throttle(entry):
-    """True если entry — валидная запись активного throttle-lease.
-
-    Требуем ровно те поля, что нужны clear после рестарта: domain (нормализуемый),
-    rate (положит. целое), token (числовой — идёт в pfctl -X). applied_at
-    необязателен по типу (метка времени), но при наличии обязан быть числом/строкой.
-    """
-    if not isinstance(entry, dict):
-        return False
-    if not _normalize_traffic_guard_domain(entry.get("domain")):
-        return False
-    if _valid_throttle_rate(entry.get("rate")) is None:
-        return False
-    token = entry.get("token")
-    # Токен pf enable-ref: только цифры (или int>=0) — он попадёт в shell (pfctl -X).
-    if isinstance(token, bool) or not (
-        (isinstance(token, int) and token >= 0) or (isinstance(token, str) and token.isdigit())
-    ):
-        return False
-    # applied_at — метка времени; необязателен (None), но при наличии обязан быть
-    # числом/строкой, иначе мусорное значение попадёт в публичный GET-ответ.
-    applied_at = entry.get("applied_at")
-    if applied_at is not None and not isinstance(applied_at, (int, float, str)):
-        return False
-    # needs_cleanup — опциональный булев маркер cleanup-lease (token жив на pf, но
-    # throttle не активен как политика — ждёт освобождения). При наличии обязан быть bool.
-    needs_cleanup = entry.get("needs_cleanup")
-    if needs_cleanup is not None and not isinstance(needs_cleanup, bool):
-        return False
-    return True
-
-
-def load_active_throttle(path=None):
-    """Активный throttle-lease ({domain, rate, token, applied_at}) или None.
-
-    None когда throttle не активен ИЛИ запись битая/невалидная (fail-safe: лучше
-    считать «нет активного», чем отдать мусорный token в pfctl -X). Не бросает.
-    """
-    state = load_state(path)
-    runtime = state.get("runtime") if isinstance(state, dict) else {}
-    if not isinstance(runtime, dict):
-        return None
-    entry = runtime.get("active_throttle")
-    return entry if _valid_active_throttle(entry) else None
-
-
-def save_active_throttle(entry, path=None, needs_cleanup=False):
-    """Записать активный throttle-lease в runtime.active_throttle. Возвращает entry|None.
-
-    Валидирует entry (fail-closed: невалидное НЕ пишем — иначе clear получит мусорный
-    token). Остальной state сохраняется (read-modify-write через save_state, atomic).
-    readable=False (битый существующий файл) -> не перезаписываем вслепую, вернём None.
-    needs_cleanup=True маркирует cleanup-lease: pf-токен ЖИВ на pf, но throttle не
-    активирован как политика (apply упал post--E, либо rollback не подтверждён) — lease
-    нужен, чтобы token был recoverable для последующего clear. Не бросает.
-    """
-    if not _valid_active_throttle(entry):
-        return None
-    state, readable = _load_state_checked(path)
-    if not readable:
-        return None
-    runtime = state.get("runtime")
-    if not isinstance(runtime, dict):
-        runtime = {}
-    # Нормализуем на запись: те же поля, никакого лишнего пользовательского мусора.
-    runtime["active_throttle"] = {
-        "domain": _normalize_traffic_guard_domain(entry.get("domain")),
-        "rate": _valid_throttle_rate(entry.get("rate")),
-        "token": str(entry.get("token")),
-        "applied_at": entry.get("applied_at"),
-        "needs_cleanup": bool(needs_cleanup),
-    }
-    state["runtime"] = runtime
-    return None if save_state(state, path) is None else runtime["active_throttle"]
-
-
-def clear_active_throttle(path=None):
-    """Сбросить runtime.active_throttle в None (после успешного clear_throttle).
-
-    Возвращает True при успешной записи, False при сбое/неперезаписываемом файле.
-    Идемпотентно: уже None -> просто перезапишет None. Не бросает.
-    """
-    state, readable = _load_state_checked(path)
-    if not readable:
-        return False
-    runtime = state.get("runtime")
-    if not isinstance(runtime, dict):
-        runtime = {}
-    runtime["active_throttle"] = None
-    state["runtime"] = runtime
-    return save_state(state, path) is not None
-
-
-# ============================ PF-изоляция доменов (isolate) ============================
-# Lease симметричен throttle: {domains, ips, unresolved, token, applied_at, ports, phase}.
-# token обязателен к персисту — без него disable_isolation не освободит pf enable-ref
-# (pfctl -X) после рестарта. phase: "strict" (страховка подсетей) | "working" (конкретные IP).
-def _valid_isolate_ports(ports):
-    """Список портов 1..65535 или None. Только положительные целые — попадут в shell."""
-    if not isinstance(ports, list) or not ports:
-        return None
-    out = []
-    for p in ports:
-        if isinstance(p, bool) or not isinstance(p, int) or not (1 <= p <= 65535):
-            return None
-        out.append(p)
-    return out if out else None
-
-
-def validate_isolate(isolate):
-    """Валидация секции isolate из state. Возвращает (normalized, errors).
-
-    domains: список валидных host (через _is_valid_host). ports: список int 1..65535.
-    enabled: bool. Никаких лишних полей. Не бросает.
-    """
-    errors = []
-    if not isinstance(isolate, dict):
-        return None, ["isolate должен быть объектом"]
-    domains = isolate.get("domains")
-    if not isinstance(domains, list) or not domains:
-        errors.append("isolate.domains должен быть непустым списком доменов")
-        domains = []
-    else:
-        norm = []
-        for d in domains:
-            if isinstance(d, str) and _is_valid_host(d):
-                norm.append(d)
-            else:
-                errors.append(f"невалидный домен: {d!r}")
-        domains = norm
-    ports = _valid_isolate_ports(isolate.get("ports"))
-    if ports is None:
-        if "ports" in isolate and isolate.get("ports") is not None:
-            errors.append("isolate.ports должен быть списком целых 1..65535")
-        ports = [80, 443]
-    enabled = bool(isolate.get("enabled", False))
-    if errors:
-        return None, errors
-    return {"enabled": enabled, "domains": domains, "ports": ports}, []
-
-
-def _valid_active_isolate(entry):
-    """True если entry — валидный isolate-lease для recover после рестарта.
-
-    Требуем token (числовой — pfctl -X), domains (список host), ports, applied_at, phase.
-    ips/unresolved опциональны (снимок для дашборда).
-    """
-    if not isinstance(entry, dict):
-        return False
-    token = entry.get("token")
-    if isinstance(token, bool) or not (
-        (isinstance(token, int) and token >= 0) or (isinstance(token, str) and token.isdigit())
-    ):
-        return False
-    domains = entry.get("domains")
-    if not isinstance(domains, list) or not all(
-        isinstance(d, str) and _is_valid_host(d) for d in domains
-    ):
-        return False
-    if _valid_isolate_ports(entry.get("ports")) is None:
-        return False
-    phase = entry.get("phase")
-    if phase not in ("strict", "working"):
-        return False
-    applied_at = entry.get("applied_at")
-    if applied_at is not None and not isinstance(applied_at, (int, float, str)):
-        return False
-    return True
-
-
-def load_active_isolate(path=None):
-    """Активный isolate-lease или None. Fail-safe: битая запись → None (нет мусорного token)."""
-    state = load_state(path)
-    runtime = state.get("runtime") if isinstance(state, dict) else {}
-    if not isinstance(runtime, dict):
-        return None
-    entry = runtime.get("active_isolate")
-    return entry if _valid_active_isolate(entry) else None
-
-
-def save_active_isolate(entry, path=None):
-    """Записать isolate-lease в runtime.active_isolate. Возвращает entry|None.
-
-    fail-closed: невалидное НЕ пишем (иначе disable получит мусорный token). Atomic.
-    """
-    if not _valid_active_isolate(entry):
-        return None
-    state, readable = _load_state_checked(path)
-    if not readable:
-        return None
-    runtime = state.get("runtime")
-    if not isinstance(runtime, dict):
-        runtime = {}
-    runtime["active_isolate"] = {
-        "domains": list(entry.get("domains", [])),
-        "ips": entry.get("ips", {}) if isinstance(entry.get("ips"), dict) else {},
-        "unresolved": list(entry.get("unresolved", [])),
-        "ports": list(entry.get("ports", [80, 443])),
-        "token": str(entry.get("token")),
-        "applied_at": entry.get("applied_at"),
-        "phase": entry.get("phase", "working"),
-    }
-    state["runtime"] = runtime
-    return None if save_state(state, path) is None else runtime["active_isolate"]
-
-
-def clear_active_isolate(path=None):
-    """Сброс runtime.active_isolate в None (после disable_isolation). Идемпотентно."""
-    state, readable = _load_state_checked(path)
-    if not readable:
-        return False
-    runtime = state.get("runtime")
-    if not isinstance(runtime, dict):
-        runtime = {}
-    runtime["active_isolate"] = None
-    state["runtime"] = runtime
-    return save_state(state, path) is not None
-
-
-def _valid_active_codex_isolate(entry):
-    """True если entry — валидный codex-isolate-lease (PF codex-изоляция, issue #168).
-
-    Отдельный от _valid_active_isolate: codex-изоляция по source-UID (не по доменам),
-    поэтому НЕ содержит domains/ports/phase — только token (pfctl -X, числовой) и
-    applied_at (опциональный снимок). fail-closed: невалидное → None (нет мусорного token).
-    """
-    if not isinstance(entry, dict):
-        return False
-    token = entry.get("token")
-    if isinstance(token, bool) or not (
-        (isinstance(token, int) and token >= 0) or (isinstance(token, str) and token.isdigit())
-    ):
-        return False
-    applied_at = entry.get("applied_at")
-    if applied_at is not None and not isinstance(applied_at, (int, float, str)):
-        return False
-    return True
-
-
-def load_active_codex_isolate(path=None):
-    """Активный codex-isolate-lease или None. Fail-safe: битая запись → None."""
-    state = load_state(path)
-    runtime = state.get("runtime") if isinstance(state, dict) else {}
-    if not isinstance(runtime, dict):
-        return None
-    entry = runtime.get("active_codex_isolate")
-    return entry if _valid_active_codex_isolate(entry) else None
-
-
-def save_active_codex_isolate(entry, path=None):
-    """Записать codex-isolate-lease в runtime.active_codex_isolate. Возвращает entry|None.
-
-    fail-closed: невалидное НЕ пишем (иначе disable получит мусорный token). Atomic.
-    """
-    if not _valid_active_codex_isolate(entry):
-        return None
-    state, readable = _load_state_checked(path)
-    if not readable:
-        return None
-    runtime = state.get("runtime")
-    if not isinstance(runtime, dict):
-        runtime = {}
-    runtime["active_codex_isolate"] = {
-        "token": str(entry.get("token")),
-        "applied_at": entry.get("applied_at"),
-    }
-    state["runtime"] = runtime
-    return None if save_state(state, path) is None else runtime["active_codex_isolate"]
-
-
-def clear_active_codex_isolate(path=None):
-    """Сброс runtime.active_codex_isolate в None (после disable_codex_isolation). Идемпотентно."""
-    state, readable = _load_state_checked(path)
-    if not readable:
-        return False
-    runtime = state.get("runtime")
-    if not isinstance(runtime, dict):
-        runtime = {}
-    runtime["active_codex_isolate"] = None
-    state["runtime"] = runtime
-    return save_state(state, path) is not None
 
 
 # Safe-default state: секции v1 (#2). probes — эталонные defaults (G3);
@@ -778,636 +255,83 @@ def _copy_default():
     return copy.deepcopy(_DEFAULT_STATE)
 
 
-def _is_valid_node(n):
-    """Запись узла валидна, если это dict с name + валидными endpoint_host/route_ip."""
-    if not isinstance(n, dict):
-        return False
-    if not isinstance(n.get("name"), str) or not n.get("name"):
-        return False
-    if not _is_valid_host(n.get("endpoint_host")):
-        return False
-    # route_ip может отсутствовать (вычисляется через resolve_route_ip),
-    # но если есть — обязан быть валидным хостом.
-    rip = n.get("route_ip")
-    if rip is not None and not _is_valid_host(rip):
-        return False
-    return True
-
-
-def load_nodes(path=None):
-    """Список валидных узлов; невалидные отбрасываются. Никогда не бросает."""
-    state = load_state(path)
-    return _nodes_from_state(state)
-
-
 def _nodes_from_state(state):
-    nodes = state.get("nodes")
-    if not isinstance(nodes, list):
-        return []
-    return [n for n in nodes if _is_valid_node(n)]
-
-
-def enabled_nodes(path=None):
-    """Только узлы с enabled is True (строго)."""
-    return [n for n in load_nodes(path) if n.get("enabled") is True]
-
-
-def get_node(name, path=None):
-    """Узел по имени или {} если нет."""
-    if not isinstance(name, str):
-        return {}
-    for n in load_nodes(path):
-        if n.get("name") == name:
-            return n
-    return {}
-
-
-def active_node(path=None):
-    """Активный узел. active_name обязан разрешаться в enabled узел;
-    иначе fallback на первый enabled; иначе {}.
-    """
-    enabled = enabled_nodes(path)
-    if not enabled:
-        return {}
-    state = load_state(path)
-    an = state.get("active_node") or {}
-    name = an.get("name") if isinstance(an, dict) else None
-    for n in enabled:
-        if n.get("name") == name:
-            return n
-    return enabled[0]  # fallback на первый enabled
-
-
-def begin_active_node_change(name, path=None):
-    """Записать pending intent только для валидного enabled узла. Возвращает state."""
-    state, readable = _load_state_checked(path)
-    if not readable:
-        return state
-    an = state.get("active_node")
-    if not isinstance(an, dict):
-        an = {"name": None, "pending": None}
-    if any(n.get("name") == name and n.get("enabled") is True for n in _nodes_from_state(state)):
-        an["pending"] = name
-    state["active_node"] = an
-    save_state(state, path)
-    return state
-
-
-def commit_active_node_change(name, path=None):
-    """Промотировать pending -> active только если pending совпадает с name.
-    Вызывается ТОЛЬКО после успеха generator/restart (#8).
-    """
-    state, readable = _load_state_checked(path)
-    if not readable:
-        return
-    an = state.get("active_node")
-    if not isinstance(an, dict):
-        return
-    if an.get("pending") == name:
-        an["name"] = name
-        an["pending"] = None
-        state["active_node"] = an
-        save_state(state, path)
-
-
-def clear_pending(path=None):
-    """Сбросить pending intent (после неудачи generator/restart)."""
-    state, readable = _load_state_checked(path)
-    if not readable:
-        return
-    an = state.get("active_node")
-    if isinstance(an, dict) and an.get("pending") is not None:
-        an["pending"] = None
-        state["active_node"] = an
-        save_state(state, path)
-
-
-def _looks_like_ip(host):
-    """True если строка — IPv4/IPv6-подобная (без DNS-запроса)."""
-    if not isinstance(host, str) or not host:
-        return False
-    parts = host.split(".")
-    if len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
-        if any(len(p) > 1 and p.startswith("0") for p in parts):
-            return False
-        return True
-    return ":" in host  # грубый IPv6-эвристик
-
-
-def resolve_route_ip(node, path=None):
-    """route_ip узла. Приоритет: уже заданный route_ip -> DNS-resolve endpoint_host
-    -> fallback на endpoint_host -> ''. D1: никогда не бросает.
-    """
-    if not isinstance(node, dict):
-        return ""
-    rip = node.get("route_ip")
-    if isinstance(rip, str) and rip and _is_valid_host(rip):
-        return rip
-    host = node.get("endpoint_host")
-    if not isinstance(host, str) or not host or not _is_valid_host(host):
-        return ""
-    if _looks_like_ip(host):
-        return host  # уже IP — passthrough
-    try:
-        resolved = socket.gethostbyname(host)
-        if resolved and _is_valid_host(resolved):
-            return resolved
-    except (OSError, ValueError):
-        # OSError: сетевые/DNS ошибки (gaierror/herror — подклассы OSError); ValueError: невалидный host
-        pass
-    return host  # fallback на endpoint_host
-
-
-# Куда gen_xray_config пишет рабочий конфиг (источник истины address узла).
-XRAY_CONFIG_PATH = "/opt/homebrew/etc/xray/config.json"
-
-
-def read_xray_active_address(config_path=XRAY_CONFIG_PATH):
-    """Прочитать address АКТИВНОГО Reality-узла из рабочего xray-конфига с различением состояний.
-
-    Возвращает {status, address}:
-      - absent    — файла нет (fresh install): применять fresh-install-логику (нечего ломать);
-      - unreadable — файл существует, но битый (не JSON / не dict): fail-closed, НЕ fresh install;
-      - no_active — валидный JSON, но нет outbound с tag="active" (или без валидного address);
-      - ok        — address активного outbound'а.
-    Канон verify-dont-guess + fail-closed (cycle-review Codex critical 0.94): absent и unreadable
-    РАЗНЫЕ состояния — раньше оба давали '' → apply-гард считал битый рабочий config fresh-install'ом
-    и перезаписывал его (outage). Не бросает (probe-канон).
-    """
-    p = Path(config_path)
-    if not p.exists():
-        return {"status": "absent", "address": ""}
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        # OSError: ошибки файла/чтения; ValueError: невалидные данные (JSONDecodeError — подкласс ValueError)
-        return {"status": "unreadable", "address": ""}
-    if not isinstance(data, dict):
-        return {"status": "unreadable", "address": ""}
-    # АКТИВНЫЙ outbound = tag=="active" (канон gen_xray_config: active_outbound = _vless_outbound(active, "active")).
-    # cycle-review Codex critical 0.98: gen_xray_config эмиттит probe-out-* vless ПЕРЕД active → первый
-    # vless = probe-узел (чужой endpoint). Выбор по tag=active, а не «первый vless», иначе sync/compare/
-    # guard работают с endpoint probe-узла, не active (sync импортил бы чужой endpoint в active-узел).
-    for ob in data.get("outbounds") or []:
-        if not isinstance(ob, dict) or ob.get("tag") != "active":
-            continue
-        vnext = (ob.get("settings") or {}).get("vnext") or []
-        if vnext and isinstance(vnext[0], dict):
-            addr = vnext[0].get("address")
-            if isinstance(addr, str) and _is_valid_host(addr):
-                return {"status": "ok", "address": addr}
-    # active-outbound есть, но без валидного address; ИЛИ active-outbound'а нет вовсе
-    return {"status": "no_active", "address": ""}
-
-
-def _read_xray_vless_address(config_path=XRAY_CONFIG_PATH):
-    """Прочитать address АКТИВНОГО Reality-узла из рабочего xray-конфига. Возвращает '' если не ok.
-
-    Тонкая обёртка над read_xray_active_address для backwards-compat (sync_route_ip_from_xray #136,
-    consumer'ы, которым нужен просто address). Для новой логики #200 использовать read_xray_active_address
-    (различает absent/unreadable/no_active — нужно для apply fail-closed). Не бросает.
-    """
-    return read_xray_active_address(config_path)["address"]
-
-
-def sync_route_ip_from_xray(name, xray_config_path=XRAY_CONFIG_PATH, path=None):
-    """Синхронизировать route_ip узла <name> из рабочего xray-конфига.
-
-    xray-конфиг — источник истины (туда gen_xray_config пишет resolve_route_ip). Если state держит
-    placeholder/rассинхрон — берём реальный address из xray и пишем в node.route_ip. После этого и
-    gen_xray, и node_selector._route_node_ip читают консистентный IP. Не бросает.
-
-    Возвращает {ok: bool, route_ip: str}. ok=False если xray-конфига нет / узел не найден / битый.
-    """
-    address = _read_xray_vless_address(xray_config_path)
-    if not address:
-        return {"ok": False, "route_ip": ""}
-    try:
-        state, readable = _load_state_checked(path)
-        if not readable:
-            return {"ok": False, "route_ip": ""}
-    except (OSError, ValueError, TypeError):
-        # OSError: ошибки файла; ValueError: ошибки структуры; TypeError: ошибки типа данных
-        return {"ok": False, "route_ip": ""}
-    nodes = _nodes_from_state(state)
-    updated = False
-    for n in nodes:
-        if isinstance(n, dict) and n.get("name") == name:
-            if n.get("route_ip") != address:
-                n["route_ip"] = address
-                updated = True
-            break
-    else:
-        return {"ok": False, "route_ip": ""}  # узел не найден
-    if updated:
-        try:
-            save_state(state, path)
-        except (OSError, ValueError, TypeError):
-            # OSError: ошибки записи; ValueError: ошибки структуры; TypeError: ошибки типа данных
-            return {"ok": False, "route_ip": ""}
-    return {"ok": True, "route_ip": address}
-
-
-# ============================ #200: рассинхрон endpoint local.json ↔ xray config ============================
-# Единый источник правды: srouter.local.json — canonical state (active_node.endpoint_host). Но РАБОЧИЙ
-# xray config (туда gen_xray_config._vless_outbound пишет resolve_route_ip) держит РЕАЛЬНЫЙ VPS-address,
-# а local.json мог остаться placeholder'ом (test-IP 203.0.113.x, RFC 5737 — вписан в example / старая
-# генерация / ручная правка xray в обход srouter). В этом окне gen_xray_config.generate_config генерит из
-# local_state.active_node() → `srouter apply` ПЕРЕЗАПИШЕТ рабочий xray config placeholder'ом и сломает
-# прокси (когда VPS оживёт). Эти функции: detect drift, sync endpoint из xray, и apply-защита поверх них.
-
-# TEST-NET 203.0.113.0/24 (RFC 5737) — документационные адреса, НЕ маршрутизируются в интернете.
-# Встречаются в srouter.local.example.json / srouter_config.example.py (placeholder). Та же константа
-# живет в health._TESTNET_203_PREFIX (#194); здесь — canonical источник для apply/doctor (#200).
-_TESTNET_203_PREFIX = "203.0.113."
-
-
-def _is_testnet_placeholder(host):
-    """True если host — TEST-NET 203.0.113.x (RFC 5737) placeholder, не реальный VPS.
-
-    Только IPv4-форму 203.0.113.NNN: count('.')==3 + префикс. Невалидный host → False (не placeholder).
-    Канон: test-IP не маршрутизируется → его нельзя писать в рабочий xray config и по нему нельзя
-    судить о реальном endpoint (verify-dont-guess).
-    """
-    if not isinstance(host, str) or not host:
-        return False
-    if host.count(".") != 3 or not host.startswith(_TESTNET_203_PREFIX):
-        return False
-    octet = host[len(_TESTNET_203_PREFIX):]
-    return octet.isdigit() and 0 <= int(octet) <= 255
-
-
-def active_endpoint_host(path=None):
-    """endpoint_host активного узла из canonical state (или ''). Никогда не бросает.
-
-    active_node() уже разрешает active->enabled-fallback; здесь лишь достаём endpoint_host. ''
-    когда узла нет / нет endpoint_host / host невалиден. Это — то, что gen_xray_config возьмёт
-    для генерации address (через resolve_route_ip), т.е. candidate для placeholder-overwrite.
-    """
-    node = active_node(path)
-    host = node.get("endpoint_host") if isinstance(node, dict) else None
-    if not isinstance(host, str) or not host or not _is_valid_host(host):
-        return ""
-    return host
-
-
-def compare_endpoint_with_xray(state_path=None, xray_config_path=XRAY_CONFIG_PATH):
-    """Сравнить endpoint активного узла (canonical state) с address из рабочего xray config (#200).
-
-    xray config — runtime-истина (gen_xray_config пишет туда resolve_route_ip(node)). Если state
-    рассинхронизирован (placeholder), xray держит реальный рабочий IP. Возвращает:
-      {synced: bool, local: str, xray: str, placeholder: bool, xray_status: str}
-      - local   — endpoint_host активного узла ('' если нет);
-      - xray    — address из tag=active outbound ('' если нет/бит/без active);
-      - xray_status — absent (fresh install) / unreadable (битый, fail-closed) / no_active / ok;
-      - placeholder — local — TEST-NET 203.0.113.x (auto-sync применим);
-      - synced  — True когда нет дрейфа: xray absent (fresh install, нечего ломать) ИЛИ local==xray.
-                  False на unreadable/no_active (apply должен иметь шанс fail-closed, cycle-review
-                  Codex critical 0.94) ИЛИ когда local != xray.
-    Не бросает (probe-канон). Применяется и в apply-защите, и в doctor.
-    """
-    local = active_endpoint_host(state_path)
-    xr = read_xray_active_address(xray_config_path)
-    xray_status, xray = xr["status"], xr["address"]
-    base = {"local": local, "xray": xray, "placeholder": _is_testnet_placeholder(local),
-            "xray_status": xray_status}
-    # absent xray (fresh install) — нечего сравнивать/ломать → synced (apply свободен).
-    if xray_status == "absent":
-        return {**base, "synced": True}
-    # unreadable/no_active существующего config — НЕ fresh install: synced=False, чтобы apply-гард
-    # мог fail-closed (пользователь решает, через --force или чинит config), а не молча перезаписывал.
-    if xray_status != "ok":
-        return {**base, "synced": False}
-    # ok: synced если совпадает (нет local — тоже synced: нет узла, не с чем сравнивать active).
-    if not local:
-        return {**base, "synced": True}
-    return {**base, "synced": local == xray}
-
-
-def sync_endpoint_from_xray(xray_config_path=XRAY_CONFIG_PATH, path=None):
-    """Импортировать реальный address из xray config в endpoint_host активного узла (#200 sync).
-
-    Применяется когда local.json — placeholder (TEST-NET), а рабочий xray config держит реальный VPS.
-    Единый источник правды = local.json canonical: sync делает его правдивым (перезаписывает placeholder
-    реальным address из xray). После этого и gen_xray, и apply читают консистентный endpoint.
-
-    Target-узел резолвится ЧЕРЕЗ active_node() — ровно тот же объект, что compare_endpoint_with_xray и
-    apply-гард считают активным (cycle-review /review medium): раньше sync искал по active_node.name
-    литерально и мог писать endpoint в disabled-узел (имя=disabled), пока active_node() брал fallback
-    enabled-узел → sync «успешен», но compare всё ещё видит placeholder → бесконечный цикл.
-
-    НЕ авто-overwrite когда local уже реальный (НЕ placeholder) и расходится с xray: оба «настоящие»
-    адреса — выбор пользователя, detect-only (compare_endpoint_with_xray), не молчаливая подмена
-    (канон no-hidden-magic / privileged-boundary: не угадываем, какой «правильнее»).
-
-    Возвращает {ok: bool, endpoint: str, changed: bool}. ok=False если xray-конфига нет / узла нет /
-    local не placeholder. Не бросает (fail-soft как sync_route_ip_from_xray).
-    """
-    xr = read_xray_active_address(xray_config_path)
-    address = xr["address"]
-    if xr["status"] != "ok" or not address:
-        return {"ok": False, "endpoint": "", "changed": False}
-    try:
-        state, readable = _load_state_checked(path)
-        if not readable:
-            return {"ok": False, "endpoint": "", "changed": False}
-    except (OSError, ValueError, TypeError):
-        # OSError: ошибки файла; ValueError: ошибки структуры; TypeError: ошибки типа данных
-        return {"ok": False, "endpoint": "", "changed": False}
-
-    # Резолв target через active_node() — единственный источник правды «какой узел активен».
-    # active_node() уже внутри делает read state (тот же path); но нам нужна мутируемая ссылка на
-    # запись в state["nodes"], чтобы save_state записал изменение. Поэтому ищем запись по имени
-    # активного узла (после active_node()-резолва), НЕ по литеральному active_node.name из state.
-    active = active_node(path) if path else active_node()
-    active_name = active.get("name") if isinstance(active, dict) else None
-    if not active_name:
-        return {"ok": False, "endpoint": "", "changed": False}
-    nodes = _nodes_from_state(state)
-    target = next((n for n in nodes if isinstance(n, dict) and n.get("name") == active_name), None)
-    if target is None:
-        return {"ok": False, "endpoint": "", "changed": False}
-
-    local_host = target.get("endpoint_host")
-    # Только placeholder → auto-sync. Реальный расходящийся local — отказ (detect-only выше).
-    if not _is_testnet_placeholder(local_host):
-        if local_host == address:
-            return {"ok": True, "endpoint": address, "changed": False}
-        return {"ok": False, "endpoint": address, "changed": False}
-
-    target["endpoint_host"] = address
-    # route_ip для IP-literal endpoint == сам endpoint (resolve_route_ip passthrough). Держим синхронно,
-    # иначе gen_xray возьмёт route_ip=placeholder из старого состояния. Только если route_ip тоже
-    # placeholder/пуст — не подменяем уже-валидный пользовательский route_ip без нужды.
-    rip = target.get("route_ip")
-    if not isinstance(rip, str) or not rip or _is_testnet_placeholder(rip):
-        target["route_ip"] = address
-    try:
-        if save_state(state, path) is None:
-            return {"ok": False, "endpoint": "", "changed": False}
-    except (OSError, ValueError, TypeError):
-        # OSError: ошибки записи; ValueError: ошибки структуры; TypeError: ошибки типа данных
-        return {"ok": False, "endpoint": "", "changed": False}
-    return {"ok": True, "endpoint": address, "changed": True}
-
-
-# ============================ #136: routing-domains в production xray-config (hybrid adopt) ============================
-# srouter управляет routing.rules секцией reality-out: adopt существующего rule (маркер _srouter_managed
-# на уровне rule, НЕ top-level — foreign-конфиг не захватывается целиком), домены хранит в state
-# (active + last_applied_hash для drift-detection). Two-phase: backup → modify → restart → promote.
-# Эталон read-xray: _read_xray_vless_address; atomic-save: save_state; restart: install_lib._restart_component.
-
-ROUTING_MARKER = "_srouter_managed"  # ключ в rule (xray игнорирует неизвестные ключи — безопасно)
-DEFAULT_ROUTING_OUTBOUND = "reality-out"
-
-
-def routing_plan(current_domains, hosts, action="add"):
-    """Построить новый домен-список: добавить/убрать hosts в current_domains. Чистая функция, без записи.
-
-    hosts — bare hostnames ('telegram.org'); нормализуются в 'domain:<host>' (xray exact+subdomains).
-    action='add' — добавить недостающие (idempotent: дубль игнорируется);
-    action='remove' — убрать совпадающие.
-    Возвращает новый список (сохраняя порядок current + new в конце для add).
-    """
-    if not isinstance(current_domains, list):
-        current_domains = []
-    if not isinstance(hosts, list):
-        hosts = [hosts] if isinstance(hosts, str) else []
-    norm = [f"domain:{h}" if not str(h).startswith("domain:") else str(h) for h in hosts if h]
-    if action == "remove":
-        rm = set(norm)
-        return [d for d in current_domains if d not in rm]
-    # add: сохранить порядок, дубли пропустить
-    existing = set(current_domains)
-    out = list(current_domains)
-    for d in norm:
-        if d not in existing:
-            out.append(d)
-            existing.add(d)
-    return out
-
-
-def _routing_find_managed_rule(rules):
-    """Найти индекс rule с _srouter_managed:true. -1 если нет..Raise если их >1 (ambiguous)."""
-    idxs = [i for i, r in enumerate(rules)
-            if isinstance(r, dict) and r.get(ROUTING_MARKER) is True]
-    if len(idxs) > 1:
-        return -2  # ambiguous — несколько managed-секций, отказать
-    return idxs[0] if idxs else -1
-
-
-def _routing_domains_hash(domains):
-    """Стабильный hash домен-списка для drift-detection (сортировка → не зависит от порядка)."""
-    import hashlib
-    ordered = "\n".join(sorted(domains))
-    return hashlib.sha256(ordered.encode("utf-8")).hexdigest()[:16]
-
-
-def routing_apply(hosts, *, action="add", adopt=False, outbound=DEFAULT_ROUTING_OUTBOUND,
-                  config_path=XRAY_CONFIG_PATH, state_path=None, runner=None, port_checker=None):
-    """Применить изменение routing-доменов в production xray-config + restart xray (two-phase).
-
-    Hybrid adopt: foreign-config без маркера → требует adopt=True (захватить секцию). После adopt
-    rule помечается _srouter_managed, домены + hash пишутся в state. Locate по маркеру, не по tag
-    (защита от переименования outbound). Hash-drift (конфиг меняли руками) → refuse.
-    Транзакционность: state пишется ДО restart xray; при провале ЛЮБОГО шага (unreadable state,
-    state-write, restart) — откат к исходному config (и state, если restart упал после успешной
-    записи state), никогда не оставляя config и state рассинхронизированными. Существующий, но
-    битый state-файл никогда не заменяется дефолтом (data-loss guard).
-    Concurrency/atomicity (#139): критическая секция (read backup-snapshot → modify → restart)
-    под process-safe flock на xray-config.json — конкурирующие apply сериализуются, нет lost-update.
-    Все записи конфига (modify + ОБОИ rollback-ветки) атомарны (_atomic_write_text: tmp+fsync+rename),
-    ENOSPC/IO-error при rollback не повреждают production-файл.
-
-    Возвращает {ok, changed, err}. Не бросает (fail-soft как sync_route_ip_from_xray).
-    """
-    # lazy import чтобы не тащить зависимость модуля при простом чтении state
-    try:
-        import install_lib
-    except ImportError:
-        install_lib = None
-
-    # ВСЯ транзакция (read config → read state → backup → modify → restart) под process-safe
-    # exclusive flock на xray-config: критическая секция начинается С ЧТЕНИЯ config, не с записи —
-    # иначе второй apply успевает закешировать stale snapshot ДО блокировки и затирает первый при
-    # своей записи (lost-update). flock сериализует конкурирующие apply (ручной `srouter routing` ×
-    # install/будущий gen_xray_config). #139 Finding 2.
-    try:
-        with _routing_config_lock(config_path):
-            return _routing_apply_locked(
-                config_path, state_path, outbound, hosts, action, adopt, runner, port_checker,
-                install_lib,
-            )
-    except OSError:
-        # lockfile не создался/не открылся — fail-closed: не мутируем config без сериализации.
-        return {"ok": False, "changed": False, "err": "config_lock_failed"}
-
-
-def _routing_apply_locked(config_path, state_path, outbound, hosts, action, adopt, runner,
-                          port_checker, install_lib):
-    """Шаги 1..6 routing_apply под _routing_config_lock. Вынесено, чтобы lock держался от чтения
-    config до завершения restart/recovery (включая все stale-snapshot-чувствительные шаги).
-
-    Внутри lock: read config/state → backup → atomic modify → state-write → restart (с atomic
-    rollback при провале). Rollback-записи атомарны (_atomic_write_text), не truncate+write —
-    #139 Finding 1. Возвращает {ok, changed, err}. Не бросает (fail-soft)."""
-    # 1. читать config (fail-soft)
-    try:
-        data = json.loads(Path(config_path).read_text(encoding="utf-8"))
-    except (OSError, ValueError, TypeError):
-        # OSError: ошибки файла/чтения; ValueError: невалидные данные (JSONDecodeError — подкласс ValueError);
-        # TypeError: ошибки типа данных
-        return {"ok": False, "changed": False, "err": "config_unreadable"}
-    if not isinstance(data, dict):
-        return {"ok": False, "changed": False, "err": "config_not_dict"}
-    routing = data.get("routing")
-    if not isinstance(routing, dict):
-        return {"ok": False, "changed": False, "err": "no_routing_section"}
-    rules = routing.get("rules")
-    if not isinstance(rules, list) or not rules:
-        return {"ok": False, "changed": False, "err": "no_routing_rules"}
-
-    idx = _routing_find_managed_rule(rules)
-    if idx == -2:
-        return {"ok": False, "changed": False, "err": "ambiguous_managed_rules"}
-
-    if idx == -1:
-        # нет managed-секции
-        if not adopt:
-            return {"ok": False, "changed": False, "err": "foreign_config_needs_adopt"}
-        # adopt: найти rule по outboundTag (ровно один)
-        matches = [i for i, r in enumerate(rules)
-                   if isinstance(r, dict) and r.get("outboundTag") == outbound
-                   and isinstance(r.get("domain"), list)]
-        if len(matches) != 1:
-            return {"ok": False, "changed": False, "err": f"adopt_needs_one_{outbound}_rule"}
-        idx = matches[0]
-
-    rule = rules[idx]
-    current_domains = list(rule.get("domain") or [])
-
-    # 2. читать state ОДИН раз здесь (readable проверяем всегда, drift — только когда есть с чем
-    #    сравнивать). Битый существующий state-файл → fail-closed ДО любых мутаций конфига: не смеем
-    #    ни читать активный набор для drift-сравнения, ни (ниже, в state-write) заменять его дефолтом
-    #    (data-loss — теряет nodes/active_node/traffic_guard/isolate пользователя).
-    try:
-        state, state_readable = _load_state_checked(state_path)
-    except (OSError, ValueError, TypeError):
-        # OSError: ошибки файла; ValueError: ошибки структуры; TypeError: ошибки типа данных
-        state, state_readable = None, False
-    if not state_readable or not isinstance(state, dict):
-        return {"ok": False, "changed": False, "err": "state_unreadable"}
-    if adopt is False or rule.get(ROUTING_MARKER) is True:
-        rt = state.get("routing") if isinstance(state.get("routing"), dict) else {}
-        stored_hash = rt.get("last_applied_hash")
-        if stored_hash and _routing_domains_hash(current_domains) != stored_hash:
-            return {"ok": False, "changed": False, "err": "hash_drift_config_changed_externally"}
-
-    new_domains = routing_plan(current_domains, hosts, action=action)
-    if new_domains == current_domains:
-        return {"ok": True, "changed": False, "err": ""}  # idempotent, restart не нужен
-
-    # 3. backup (two-phase: восстановим при ошибке restart) — читаем СВЕЖИЙ config под lock.
-    #    state_text — raw-снимок state ДО любых мутаций (шаг 5 может добавить секцию routing в
-    #    legacy-state без неё; реконструкция только routing-полей при rollback оставила бы state
-    #    мутированным → byte-exact rollback через raw-снимок, как для config. Codex round-3 P2).
-    config_p = Path(config_path)
-    backup_text = config_p.read_text(encoding="utf-8")
-    state_p = Path(state_path) if state_path else _DEFAULT_PATH
-    state_existed = state_p.exists()
-    original_state_text = state_p.read_text(encoding="utf-8") if state_existed else ""
-
-    # 4. modify rule in-place copy + atomic write (tmp+fsync+replace — единый _atomic_write_text)
-    new_rule = dict(rule)
-    new_rule["domain"] = new_domains
-    new_rule[ROUTING_MARKER] = True
-    new_rules = list(rules)
-    new_rules[idx] = new_rule
-    new_data = dict(data)
-    new_data["routing"] = dict(routing)
-    new_data["routing"]["rules"] = new_rules
-    if not _atomic_write_text(config_p, json.dumps(new_data, ensure_ascii=False, indent=2) + "\n"):
-        return {"ok": False, "changed": False, "err": "config_write_failed"}
-
-    # 5. state-write ДО restart (транзакционность: если state не запишется — откатываем config и НЕ
-    #    трогаем xray вовсе, не оставляя рассинхрон config↔state). state гарантированно readable dict
-    #    (шаг 2 fail-closed на unreadable state ДО этой точки — исключений здесь не бывает).
-    try:
-        if not isinstance(state.get("routing"), dict):
-            state["routing"] = {}
-        state["routing"]["active"] = new_domains
-        state["routing"]["outbound"] = outbound
-        state["routing"]["last_applied_hash"] = _routing_domains_hash(new_domains)
-        state_write_ok = save_state(state, state_path) is not None
-    except (OSError, ValueError, TypeError):
-        # OSError: ошибки записи; ValueError: ошибки структуры; TypeError: ошибки типа данных
-        state_write_ok = False
-    if not state_write_ok:
-        # atomic rollback: tmp+fsync+replace, не truncate+write (ENOSPC не повредит production).
-        # ПРОВЕРЯЕМ результат rollback (Codex P1): провал rollback-replace оставляет config новым,
-        # а state не записан → рассинхрон config↔state. Явно сообщаем rollback_failed, не маскируем
-        # под state_write_failed (иначе хранитель рассинхрона в неведении о реальном состоянии config).
-        rollback_ok = _atomic_write_text(config_p, backup_text)
-        err = "state_write_failed" if rollback_ok else "state_write_failed_rollback_failed"
-        return {"ok": False, "changed": not rollback_ok, "err": err}
-
-    # 6. restart xray (fail-closed: при провале — восстановить config+state И повторно перезапустить
-    #    xray СО СТАРЫМ восстановленным конфигом. _restart_component уже сделал stop к моменту провала
-    #    start — без recovery-рестарта xray остаётся down до ручного вмешательства, превращая рутинную
-    #    неудачную операцию routing add-domain в постоянный простой всего прокси, Codex round 2).
-    if runner is not None and install_lib is not None:
-        try:
-            res = install_lib._restart_component("xray", runner, port_checker=port_checker)
-        except Exception:  # noqa: BLE001 — транзакционная граница, осознанно широкий (issue #238 шаг 3)
-            # _restart_component делает stop ДО start и дёргает ИНЖЕКТИРУЕМЫЙ runner напрямую, поэтому
-            # тип исключения здесь не под нашим контролем (RuntimeError из runner'а — реальный кейс).
-            # Любая утечка отсюда фатальна: config+state уже записаны, xray уже остановлен → прокси
-            # лежит без откатов и без recovery-рестарта (каноны fail-closed-proxy-down,
-            # srouter-critical-infra-24-7). Ловим всё и уходим в штатный rollback ниже.
-            res = {"rc": 1, "err": "restart_exception"}
-        if res.get("rc") != 0 or res.get("timeout"):
-            # atomic rollback к backup (tmp+fsync+replace); провал записи не оставляет config
-            # усечённым/молча неоткаченным — #139 Finding 1. ПРОВЕРЯЕМ результат config-rollback
-            # (Codex P1 round-1): если rollback не удался — config остаётся новым. Тогда state НЕ
-            # откатываем (иначе рассинхрон в обратную сторону: config новый, state откатан).
-            # ПРОВЕРЯЕМ результат state-rollback (Codex P1 round-2): save_state может вернуть None
-            # (ENOSPC) → config старый, state новый → рассинхрон. Оба исхода отражаются в err,
-            # changed = False только при ПОЛНОМ успешном rollback (durable == исходное).
-            config_rollback_ok = _atomic_write_text(config_p, backup_text)
-            # state-rollback: byte-exact восстановление raw-снимка original_state_text (а не
-            # реконструкция routing-полей — иначе legacy-state без секции routing остаётся
-            # мутированным после успешной записи, changed=False лжив. Codex round-3 P2).
-            # Если state-файла изначально не было — удаляем созданный шагом-5.
-            state_rollback_ok = False
-            if config_rollback_ok:
-                try:
-                    if state_existed:
-                        state_rollback_ok = _atomic_write_text(state_p, original_state_text)
-                    else:
-                        state_p.unlink(missing_ok=True)
-                        state_rollback_ok = True
-                except OSError:
-                    state_rollback_ok = False
-            # err-признаки рассинхрона
-            note = ""
-            if not config_rollback_ok:
-                note = "; rollback_failed_config_kept_new"
-            elif not state_rollback_ok:
-                note = "; rollback_failed_state_kept_new"
-            recovery_err = ""
-            try:
-                recovery = install_lib._restart_component("xray", runner, port_checker=port_checker)
-                if recovery.get("rc") != 0 or recovery.get("timeout"):
-                    recovery_err = f"; recovery_restart_failed:{recovery.get('err', 'unknown')}"
-            except Exception:  # noqa: BLE001 — last-resort recovery, осознанно широкий (issue #238 шаг 3)
-                # Симметрично основному restart-catch: утечка отсюда оставила бы xray down с уже
-                # откаченным config'ом и без диагностики в err. Recovery — последний шанс поднять
-                # прокси, он обязан пережить любой тип сбоя runner'а.
-                recovery_err = "; recovery_restart_exception"
-            # changed=True если что-то осталось изменённым (не полный rollback); False при полном откате
-            changed = not (config_rollback_ok and state_rollback_ok)
-            return {"ok": False, "changed": changed,
-                    "err": f"restart_failed:{res.get('err', 'unknown')}{note}{recovery_err}"}
-
-    return {"ok": True, "changed": True, "err": ""}
-
+    """Тонкая обёртка над local_state_nodes._nodes_from_state — используется local_state_xray
+    и local_state_routing через фасад (facade-lookup), см. docstring модуля."""
+    return local_state_nodes._nodes_from_state(state)
+
+
+# ============================ подмодули (facade re-export) ============================
+# Импортируются В КОНЦЕ файла: к этому моменту core I/O (load_state/save_state/_load_state_checked/
+# _atomic_write_text/_routing_config_lock/_is_valid_host/_DEFAULT_PATH) уже определён в globals
+# этого модуля — подмодули могут безопасно резолвить `local_state.<name>` при вызове функций
+# (facade-lookup, не при импорте). star-import-reexport-contract: реэкспортируем ВСЮ публичную и
+# внутреннюю (используемую снаружи как local_state._X, см. grep-consumer surface) поверхность.
+
+import local_state_nodes  # noqa: E402 — намеренно после core (facade-lookup)
+import local_state_traffic_guard  # noqa: E402
+import local_state_isolate  # noqa: E402
+import local_state_xray  # noqa: E402
+import local_state_routing  # noqa: E402
+
+# --- nodes ---
+_is_valid_node = local_state_nodes._is_valid_node
+load_nodes = local_state_nodes.load_nodes
+enabled_nodes = local_state_nodes.enabled_nodes
+get_node = local_state_nodes.get_node
+active_node = local_state_nodes.active_node
+begin_active_node_change = local_state_nodes.begin_active_node_change
+commit_active_node_change = local_state_nodes.commit_active_node_change
+clear_pending = local_state_nodes.clear_pending
+_looks_like_ip = local_state_nodes._looks_like_ip
+resolve_route_ip = local_state_nodes.resolve_route_ip
+
+# --- traffic guard ---
+_normalize_traffic_guard_domain = local_state_traffic_guard._normalize_traffic_guard_domain
+_traffic_guard_domain_matches = local_state_traffic_guard._traffic_guard_domain_matches
+_normalize_traffic_guard_channel = local_state_traffic_guard._normalize_traffic_guard_channel
+_validate_traffic_guard_domain_map = local_state_traffic_guard._validate_traffic_guard_domain_map
+_validate_traffic_guard_channel_domains = local_state_traffic_guard._validate_traffic_guard_channel_domains
+_normalized_traffic_guard_domain_map = local_state_traffic_guard._normalized_traffic_guard_domain_map
+_normalized_traffic_guard_channel_domains = local_state_traffic_guard._normalized_traffic_guard_channel_domains
+_traffic_guard_state_channel = local_state_traffic_guard._traffic_guard_state_channel
+_traffic_guard_domains_for_channel = local_state_traffic_guard._traffic_guard_domains_for_channel
+validate_traffic_guard = local_state_traffic_guard.validate_traffic_guard
+traffic_guard_config = local_state_traffic_guard.traffic_guard_config
+_valid_throttle_rate = local_state_traffic_guard._valid_throttle_rate
+validate_throttle_request = local_state_traffic_guard.validate_throttle_request
+_valid_active_throttle = local_state_traffic_guard._valid_active_throttle
+load_active_throttle = local_state_traffic_guard.load_active_throttle
+save_active_throttle = local_state_traffic_guard.save_active_throttle
+clear_active_throttle = local_state_traffic_guard.clear_active_throttle
+
+# --- PF isolate ---
+_valid_isolate_ports = local_state_isolate._valid_isolate_ports
+validate_isolate = local_state_isolate.validate_isolate
+_valid_active_isolate = local_state_isolate._valid_active_isolate
+load_active_isolate = local_state_isolate.load_active_isolate
+save_active_isolate = local_state_isolate.save_active_isolate
+clear_active_isolate = local_state_isolate.clear_active_isolate
+_valid_active_codex_isolate = local_state_isolate._valid_active_codex_isolate
+load_active_codex_isolate = local_state_isolate.load_active_codex_isolate
+save_active_codex_isolate = local_state_isolate.save_active_codex_isolate
+clear_active_codex_isolate = local_state_isolate.clear_active_codex_isolate
+
+# --- xray endpoint sync (#200) ---
+XRAY_CONFIG_PATH = local_state_xray.XRAY_CONFIG_PATH
+read_xray_active_address = local_state_xray.read_xray_active_address
+_read_xray_vless_address = local_state_xray._read_xray_vless_address
+sync_route_ip_from_xray = local_state_xray.sync_route_ip_from_xray
+_is_testnet_placeholder = local_state_xray._is_testnet_placeholder
+active_endpoint_host = local_state_xray.active_endpoint_host
+compare_endpoint_with_xray = local_state_xray.compare_endpoint_with_xray
+sync_endpoint_from_xray = local_state_xray.sync_endpoint_from_xray
+
+# --- routing domains (#136) ---
+ROUTING_MARKER = local_state_routing.ROUTING_MARKER
+DEFAULT_ROUTING_OUTBOUND = local_state_routing.DEFAULT_ROUTING_OUTBOUND
+routing_plan = local_state_routing.routing_plan
+_routing_find_managed_rule = local_state_routing._routing_find_managed_rule
+_routing_domains_hash = local_state_routing._routing_domains_hash
+routing_apply = local_state_routing.routing_apply
+_routing_apply_locked = local_state_routing._routing_apply_locked
