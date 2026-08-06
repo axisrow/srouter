@@ -130,9 +130,8 @@ def test_conflict_resolution_via_explicit_choice(tmp_path, choice):
     Все три — реальный `python3 install_lib.py apply` subprocess, не FakeRunner/юнит-мок.
 
     Scope: покрывает только happy-path одного apply-вызова (single-process, без сбоя посередине).
-    Crash-window сценарии вокруг in-place overwrite (сбой между backup и promote, повторный install
-    после partial-write) — отдельный WAL-durability эпик issue #124 (вынесен из cycle-review #114/#119
-    Часть 3), не в scope этого полигона.
+    Crash-window сценарии — issue #124, закрыты частями 1/2 (disk-discovery) и 2/2 (state-first);
+    end-to-end покрытие через реальный CLI — test_retry_with_skip_after_overwrite_survives_backup ниже.
     """
     env = _cli_env(tmp_path)
     _write_foreign_xray_config(tmp_path)
@@ -183,6 +182,66 @@ def test_conflict_resolution_via_explicit_choice(tmp_path, choice):
             f"adopt должен записать management.mode=adopted (не skipped/managed), "
             f"получено: {xray_management}"
         )
+
+
+def test_retry_with_skip_after_overwrite_survives_backup(tmp_path):
+    """issue #124 F3/P1-2 end-to-end: apply overwrite, затем повторный apply со skip того же
+    компонента — ссылка на backup первой попытки обязана пережить смену режима, а uninstall — вернуть
+    оригинал пользователя.
+
+    Реальный SIGKILL mid-apply не воспроизводим детерминированно через subprocess-полигон (нет точки
+    синхронизации внутри чужого процесса), поэтому здесь пиннится наблюдаемое СЛЕДСТВИЕ дефекта B
+    (часть 2/2, tests/test_install_crash_windows.py::test_skip_after_completed_overwrite_keeps_backup_reference
+    и test_retry_with_skip_after_interrupted_overwrite_keeps_backup покрывают причину юнит-тестами с
+    monkeypatch): overwrite создаёт backup, retry со skip не должен его терять, и financial-invariant —
+    uninstall восстанавливает оригинал пользователя, а не оставляет его orphaned.
+    """
+    env = _cli_env(tmp_path)
+    _write_foreign_xray_config(tmp_path)
+    xray_config = tmp_path / "homebrew" / "etc" / "xray" / "config.json"
+    original_content = xray_config.read_text(encoding="utf-8")
+
+    overwrite = subprocess.run(
+        ["python3", "install_lib.py", "apply", "-y",
+         "--xray", "overwrite", "--privoxy", "skip", "--dnsmasq", "skip",
+         "--state", env["SROUTER_STATE_PATH"], "--prefix", env["SROUTER_PREFIX"],
+         "--launchagents-dir", env["SROUTER_LAUNCHAGENTS_DIR"]],
+        cwd="/srouter", env=env, capture_output=True, timeout=30,
+    )
+    assert overwrite.returncode == 0, (
+        f"первый apply --xray overwrite должен пройти rc=0. rc={overwrite.returncode}\n"
+        f"stderr:\n{overwrite.stderr.decode(errors='replace')}"
+    )
+    backups = list(xray_config.parent.glob("config.json.srouter-backup-*"))
+    assert backups, "overwrite должен создать backup оригинала"
+
+    retry = subprocess.run(
+        ["python3", "install_lib.py", "apply", "-y",
+         "--xray", "skip", "--privoxy", "skip", "--dnsmasq", "skip",
+         "--state", env["SROUTER_STATE_PATH"], "--prefix", env["SROUTER_PREFIX"],
+         "--launchagents-dir", env["SROUTER_LAUNCHAGENTS_DIR"]],
+        cwd="/srouter", env=env, capture_output=True, timeout=30,
+    )
+    assert retry.returncode == 0, (
+        f"повторный apply --xray skip должен пройти rc=0. rc={retry.returncode}\n"
+        f"stderr:\n{retry.stderr.decode(errors='replace')}"
+    )
+
+    state = json.loads(Path(env["SROUTER_STATE_PATH"]).read_text(encoding="utf-8"))
+    xray_entry = state.get("detected_environment", {}).get("xray", {})
+    assert xray_entry.get("backup") == str(backups[0]), (
+        "retry со skip не должен терять ссылку на backup первой попытки overwrite (F3/P1-2)"
+    )
+
+    uninstall = subprocess.run(["srouter", "uninstall", "-y"], env=env, capture_output=True, timeout=60)
+    assert uninstall.returncode == 0, (
+        f"uninstall должен пройти rc=0 (backup жив, ссылка на него сохранена). rc={uninstall.returncode}\n"
+        f"stdout:\n{uninstall.stdout.decode(errors='replace')}\n"
+        f"stderr:\n{uninstall.stderr.decode(errors='replace')}"
+    )
+    assert xray_config.read_text(encoding="utf-8") == original_content, (
+        "uninstall обязан восстановить оригинал пользователя, а не оставить его orphaned"
+    )
 
 
 def test_fresh_install_without_backup_reports_no_leftover(tmp_path):
