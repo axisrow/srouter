@@ -815,6 +815,66 @@ def test_two_full_lifecycles_do_not_resurrect_stale_config(tmp_path):
     )
 
 
+def test_legacy_named_stated_backup_does_not_survive_into_created_entry(tmp_path):
+    """cycle-review этого PR (Codex): not_before фильтрует stated backup только когда его ИМЯ
+    парсится форматом _parse_backup_stamp (config_path.name + INFIX + ISO-timestamp). У backup'а с
+    ПРОИЗВОЛЬНЫМ именем (legacy/ручной путь — код явно его поддерживает, см. комментарий в
+    _resolve_backup "даже вне parent-директории target: legacy/ручной путь") stated_stamp = None,
+    условие `not_before is not None and stated_stamp is not None and ...` не срабатывает, и код
+    падает в безусловный accept `Path(stated).is_file()`.
+
+    Сценарий: prev-entry mode='restored' с backup=<произвольное имя без srouter-timestamp суффикса>
+    по ТОМУ ЖЕ config_path (carried_backup гейтится только prev_same_path, НЕ _is_managed_entry —
+    часть 2/2 сняла гейт с backup-ветки ради F3/P1-2). target отсутствует → apply создаёт конфиг с
+    нуля (provenance='created'). carried_backup протаскивает legacy-pointer в entry2 БЕЗ проверки
+    recency (not_before не может отфильтровать непарсящееся имя) → component_facts классифицирует
+    как restore вместо remove → uninstall восстанавливает УСТАРЕВШЕЕ содержимое поверх свежесозданного
+    конфига. Это ровно тот класс потери, что not_before был призван закрыть (test выше), но фильтр
+    молча не покрывает non-canonical имена.
+    """
+    env = _env(tmp_path)
+    config_path = env.component_paths("privoxy")["config"]
+    config_path.parent.mkdir(parents=True)
+    legacy_backup = config_path.with_name("manual-backup-2020")  # НЕ srouter-формат имени
+    legacy_backup.write_text("LEGACY-ORIGINAL-CONTENT\n", encoding="utf-8")
+    env.state_path.write_text(json.dumps({
+        "schema_version": 1, "nodes": [], "active_node": {"name": None, "pending": None},
+        "probes": {}, "network": {"channels": {"wifi_service": "Wi-Fi"}},
+        "traffic_guard": {"mode": "off", "domains": {}},
+        "detected_environment": {"privoxy": {
+            "config_path": str(config_path),
+            "backup": str(legacy_backup),
+            "management": {"mode": "restored"},
+        }},
+        "runtime": {},
+    }), encoding="utf-8")
+
+    runner = FakeRunner()
+    result = install_lib.apply_install(
+        env=env, confirm=True, choices={"privoxy": "overwrite", "xray": "skip", "dnsmasq": "skip"},
+        runner=runner, port_checker=_port_checker_managed_up(runner.calls))
+    assert result["ok"] is True
+
+    state = json.loads(env.state_path.read_text(encoding="utf-8"))
+    entry = state["detected_environment"]["privoxy"]
+    assert entry["management"]["provenance"] == "created", entry
+
+    facts = install_lib.component_facts("privoxy", env, entry)
+    assert facts["recovery"] == "remove", (
+        f"legacy-именованный stated backup без парсимого timestamp обязан быть отсечён not_before "
+        f"так же, как retained-relic в discovered — иначе устаревший pointer обходит защиту: {facts}"
+    )
+
+    uninstall_result = install_lib.apply_uninstall(
+        env=env, confirmations={"configs": True}, runner=FakeRunner())
+    assert uninstall_result["ok"] is True
+    assert not config_path.exists(), (
+        "provenance='created' конфиг обязан быть УДАЛЁН (recovery='remove'), а не заменён "
+        "legacy-содержимым устаревшего stated backup'а (issue #124 cycle-review PR #294: "
+        "stale legacy backup survives into created lifecycle)"
+    )
+
+
 # ============= cycle-review этого PR, round 2 (Codex): устаревший adopted/restored и ============
 # ============= services/DNS, оставленные активными для orphaned_backup-компонента ============
 

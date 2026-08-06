@@ -1081,9 +1081,22 @@ def _resolve_backup(entry, discovered, *, not_before=None, config_path=None):
         # not_before (created_at) — тот же сигнал, которым мы уже отсекаем retained-relic в discovered;
         # применяем его симметрично и к stated, иначе устаревший pointer обходит защиту через «сильный»
         # приоритет над discovery.
+        #
+        # cycle-review PR #294 (Codex): непарсимое имя — НЕ доказательство recency, а её ОТСУТСТВИЕ.
+        # Названный backup вправе иметь произвольное (legacy/ручное) имя — _parse_backup_stamp вернёт
+        # None не только для retained-relic, но и для ЛЮБОГО non-canonical имени. Раньше stated_stamp
+        # is None пропускал ветку not_before целиком (конъюнкция требовала stated_stamp is not None) и
+        # падал в безусловный accept ниже — устаревший legacy-pointer, унесённый carried_backup из
+        # mode='restored'/'adopted' prev-entry (гейт по нему снят, только prev_same_path), обходил
+        # not_before и восстанавливался поверх свежесозданного (provenance='created') конфига (issue
+        # #124 P1: silent data loss, воспроизведено end-to-end). Fail-closed: когда recency вообще
+        # нельзя подтвердить (not_before задан, а имя не парсится), не доверяем — так же, как мёртвому
+        # named backup ниже.
         stated_stamp = _parse_backup_stamp(Path(stated).name[len(Path(config_path).name + _BACKUP_INFIX):]) \
             if config_path and Path(stated).name.startswith(Path(config_path).name + _BACKUP_INFIX) else None
-        if not_before is not None and stated_stamp is not None and stated_stamp < not_before:
+        if not_before is not None and stated_stamp is None:
+            stated = None
+        elif not_before is not None and stated_stamp < not_before:
             stated = None
         elif Path(stated).is_file():
             return Path(stated), False
