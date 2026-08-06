@@ -794,7 +794,17 @@ def test_two_full_lifecycles_do_not_resurrect_stale_config(tmp_path):
     state2 = json.loads(env2.state_path.read_text(encoding="utf-8"))
     entry2 = state2["detected_environment"]["privoxy"]
     assert entry2["management"]["provenance"] == "created", entry2
-    assert "backup" not in entry2, "created-конфиг не должен нести backup — нечего было бэкапить"
+    # После слияния с частью 2/2: preserve-логика carried_backup переносит backup НЕЗАВИСИМО от
+    # provenance (round-2 фикс F3/P1-2 — backup не исчезает от смены РЕЖИМА). Здесь меняется не
+    # режим, а сам ЖИЗНЕННЫЙ ЦИКЛ конфига (created = target создан с нуля), поэтому entry2 честно
+    # несёт УСТАРЕВШИЙ backup_1 как «память» — но это безопасно: _resolve_backup применяет
+    # not_before (created_at) СИММЕТРИЧНО к stated-ветке (не только к discovered), поэтому при
+    # чтении entry для recovery-решения устаревший pointer отбрасывается. Проверяем это напрямую.
+    facts = install_lib.component_facts("privoxy", env2, entry2)
+    assert facts["recovery"] == "remove", (
+        f"not_before обязан отсечь устаревший backup_1 из entry2 при вычислении recovery: {facts}"
+    )
+    assert facts["backup"] == "", "устаревший stated backup не должен считаться доказательством"
 
     result_uninstall2 = install_lib.apply_uninstall(
         env=env2, confirmations={"configs": True}, runner=FakeRunner())
@@ -874,7 +884,14 @@ def test_uninstall_stops_service_and_resets_dns_for_orphaned_backup(tmp_path, mo
 
     restart_calls = [c for c in runner.calls if "services" in c]
     assert restart_calls, "install реально перезапустил privoxy до обрыва"
-    assert _entry(env) == {}, "state-entry пуст — обрыв ДО финальной записи"
+    # После слияния с частью 2/2 (state-first): _record_backup_intent пишет ГОЛЫЙ entry
+    # ({config_path, backup}, без management) сразу после _backup, до мутации target — entry уже НЕ
+    # пуст на этой точке обрыва. managed по-прежнему False (голый entry инертен для _is_managed_entry),
+    # так что orphaned_backup-классификация и весь сценарий теста остаются в силе — изменилось только
+    # ЧТО именно лежит в state к моменту обрыва, не смысл проверки managed/restorable гейта ниже.
+    entry_at_crash = _entry(env)
+    assert entry_at_crash.get("backup"), "state-first (часть 2/2) уже знает про backup к этой точке"
+    assert "management" not in entry_at_crash, "голый intent-entry не несёт management (часть 2/2)"
 
     uninstall_runner = FakeRunner()
     result = install_lib.apply_uninstall(
@@ -982,22 +999,22 @@ def test_uninstall_resets_dns_for_orphaned_backup_dnsmasq(tmp_path, monkeypatch)
 # перейти на per-effect durability вместо batched-записи / вынести в explicit follow-up issue).
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "cycle-review round 3 (Codex), issue #124: _resolve_backup доверяет entry['backup'] безусловно, "
-    "даже когда этот pointer УСТАРЕЛ (из предыдущего restored-цикла), а на диске уже лежит более "
-    "свежий backup (созданный текущим, оборвавшимся apply). Пользовательские правки, сделанные между "
-    "restore и следующим overwrite, теряются молча — uninstall восстанавливает старый backup вместо "
-    "нового, report ok=True. 3-й подряд FIX-цикл того же класса (устаревшее state = истина без "
-    "проверки recency) — остановка на диагнозе по правилу 3-cycle cap, не точечный патч."))
 def test_stale_restored_backup_pointer_loses_user_edits_after_manual_edit(tmp_path, monkeypatch):
-    """round-3 P1: entry['backup'] может указывать на СТАРЫЙ backup, когда на диске уже лежит новый.
+    """round-3 P1a — ЗАКРЫТ композицией части 2/2 (state-first) + доп. фикс not_before на stated.
+
+    Найден Codex round 3 как незакрытый P1 в install-половине (часть 1/2 одна). После слияния с
+    частью 2/2: _record_backup_intent пишет ссылку на backup СРАЗУ после создания backup_2 (до
+    финальной записи state) — entry больше не остаётся «замороженным» на backup_1. Плюс: not_before
+    (created_at) в _resolve_backup применяется теперь СИММЕТРИЧНО и к названному state backup (не
+    только к discovered) — устаревший stated-pointer из более раннего цикла того же пути отсекается
+    так же, как retained-relic в discovery. xfail-маркер снят: тест был XPASS(strict) после слияния —
+    исходный docstring ниже описывает сценарий-нарушитель, который теперь не воспроизводится.
 
     Сценарий: install overwrite foreign A (backup_1) → uninstall restore A (entry: mode='restored',
     backup=backup_1) → пользователь ВРУЧНУЮ редактирует восстановленный файл (не через install) →
     новый apply overwrite создаёт backup_2 (копию правок пользователя) → crash ДО финальной записи
-    state оставляет entry всё ещё указывающим на backup_1. _resolve_backup видит entry['backup']=
-    backup_1 (живой файл — is_file()=True) и берёт его безусловно, хотя backup_2 (реальные, более
-    свежие правки пользователя) на диске тоже существует и остаётся orphaned навсегда.
+    state. Раньше: entry всё ещё указывал на backup_1, _resolve_backup брал его безусловно. Теперь:
+    _record_backup_intent уже обновил ссылку на backup_2 до крэша.
     """
     env = _env(tmp_path)
     config_path = env.component_paths("privoxy")["config"]

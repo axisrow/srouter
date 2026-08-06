@@ -1070,9 +1070,25 @@ def _resolve_backup(entry, discovered, *, not_before=None, config_path=None):
         #     случайный сосед подменял названный backup, и apply_uninstall докладывал ok без leftover).
         #     Возвращаем «нечего восстанавливать» — дальше component_facts даст leftover по
         #     state_backup_missing, и оператор увидит, что откат НЕ состоялся.
-        if Path(stated).is_file():
+        #
+        # ИСКЛЮЧЕНИЕ (найдено при слиянии части 1/2 с частью 2/2, до открытия PR): not_before обязан
+        # применяться и здесь, не только к discovered ниже. preserve-логика _write_state_after_apply
+        # (carried_backup) переносит backup НЕЗАВИСИМО от provenance — значит entry с
+        # provenance='created' (target пересоздан с нуля, needs_backup=False в ЭТОМ apply) теперь
+        # может нести stated backup из ПРЕДЫДУЩЕГО managed/restored-цикла того же пути. Раньше эта
+        # комбинация была недостижима (created гарантированно означал backup=None), поэтому проверка
+        # здесь отсутствовала — но once carried_backup стал не гейтиться managed, гарантия исчезла.
+        # not_before (created_at) — тот же сигнал, которым мы уже отсекаем retained-relic в discovered;
+        # применяем его симметрично и к stated, иначе устаревший pointer обходит защиту через «сильный»
+        # приоритет над discovery.
+        stated_stamp = _parse_backup_stamp(Path(stated).name[len(Path(config_path).name + _BACKUP_INFIX):]) \
+            if config_path and Path(stated).name.startswith(Path(config_path).name + _BACKUP_INFIX) else None
+        if not_before is not None and stated_stamp is not None and stated_stamp < not_before:
+            stated = None
+        elif Path(stated).is_file():
             return Path(stated), False
-        return None, False
+        else:
+            return None, False
     if not_before is not None:
         # Suffix вычисляем ТЕМ ЖЕ способом, что и discover_backups (slice от длины конкретного
         # config_path.name + INFIX), а не split(INFIX, 1) по первому вхождению: если бы имя самого
