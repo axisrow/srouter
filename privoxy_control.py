@@ -371,9 +371,26 @@ def _install_helper(runner, layout=None):
         if publish_entry.get("rc") != 0:
             # Rollback: вернуть СТАРЫЕ modules на место, снести только что опубликованные новые —
             # entrypoint (старый, если был) и modules остаются консистентной парой, не смешанными.
-            runner([privoxy_system.SUDO, "/bin/rm", "-rf", "--", str(layout.helper_modules_dir)], 15)
+            # КРИТИЧНО (Codex round 2): каждый rollback-шаг обязан быть ПРОВЕРЕН, а не best-effort —
+            # непроверенный `rm -rf` может не снести helper_modules_dir (I/O-ошибка, busy fs), и
+            # тогда следующий `mv modules_old helper_modules_dir` попадёт на ту же mv-в-директорию
+            # ловушку, что этот фикс закрывает: modules_old вложится ВНУТРЬ ещё не снесённой новой
+            # helper_modules_dir, "успешно", и rollback молча провалится — та же проблема, но теперь
+            # уже в rollback-пути. Различаем rollback failure от исходного publish failure: caller
+            # обязан знать, что диск может быть в неопределённом состоянии, а не просто "publish failed".
+            removed_new_modules = runner([privoxy_system.SUDO, "/bin/rm", "-rf", "--", str(layout.helper_modules_dir)], 15)
+            if removed_new_modules.get("rc") != 0:
+                return privoxy_system._result(
+                    False,
+                    error=f"helper_entry_publish_failed_rollback_remove_failed:{(publish_entry.get('err') or '')[:120]}",
+                )
             if had_previous_modules:
-                runner([privoxy_system.SUDO, "/bin/mv", "-f", str(modules_old), str(layout.helper_modules_dir)], 30)
+                restored = runner([privoxy_system.SUDO, "/bin/mv", "-f", str(modules_old), str(layout.helper_modules_dir)], 30)
+                if restored.get("rc") != 0 or not layout.helper_modules_dir.is_dir():
+                    return privoxy_system._result(
+                        False,
+                        error=f"helper_entry_publish_failed_rollback_restore_failed:{(publish_entry.get('err') or '')[:120]}",
+                    )
             _cleanup_new_paths(runner, [entry_new])
             return privoxy_system._result(False, error=(publish_entry.get("err") or "helper_entry_publish_failed")[:240])
         if had_previous_modules:

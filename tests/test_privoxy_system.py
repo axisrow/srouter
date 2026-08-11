@@ -1743,6 +1743,47 @@ def test_install_helper_upgrade_replaces_existing_modules_dir_with_real_mv(tmp_p
     )
 
 
+def test_install_helper_reports_rollback_failure_distinctly_when_rollback_remove_fails(tmp_path):
+    """#287 cycle-review round 2 (Codex, confidence 0.98): rollback-шаги сами обязаны быть
+    ПРОВЕРЕНЫ, а не best-effort. Если entry-publish падает и последующий `rm -rf` на только что
+    опубликованной helper_modules_dir (новые модули) тоже падает (I/O-ошибка, busy fs), rollback
+    не может продолжить `mv modules_old helper_modules_dir` — та же mv-в-директорию ловушка,
+    которую этот фикс закрывает, ударила бы теперь ПО ROLLBACK-пути: modules_old вложился бы
+    ВНУТРЬ ещё не снесённой новой директории, "успешно", маскируя реальное disk-состояние.
+
+    Инвариант: если rollback remove падает, caller обязан узнать РАЗЛИЧИМУЮ ошибку
+    (rollback-failure, не просто исходный publish-failure) — не может делать вид, что откат
+    прошёл, когда диск реально в неопределённом/смешанном состоянии.
+    """
+    layout = _layout(tmp_path)
+    layout.helper_modules_dir.mkdir(parents=True)
+    stale_module = layout.helper_modules_dir / privoxy_system.HELPER_TREE_MODULES[0]
+    stale_module.write_bytes(b"# stale-module-from-previous-install\n")
+
+    base_runner = _real_mv_install_runner(layout)
+
+    def runner(cmd, timeout):
+        if "/bin/mv" in cmd and Path(cmd[-1]) == layout.helper_path:
+            return {"rc": 1, "out": "", "err": "simulated_entry_publish_failure", "timeout": False}
+        if "/bin/rm" in cmd and Path(cmd[-1]) == layout.helper_modules_dir:
+            return {"rc": 1, "out": "", "err": "simulated_rollback_remove_failure", "timeout": False}
+        return base_runner(cmd, timeout)
+
+    result = privoxy_system._install_helper(runner, layout)
+
+    assert result["ok"] is False
+    assert "rollback" in result["error"], (
+        f"rollback remove упал, но error не отражает это отдельно от исходного publish-failure: {result['error']!r}"
+    )
+    # rollback НЕ должен был продолжить mv modules_old поверх ещё живой новой директории —
+    # содержимое helper_modules_dir остаётся тем, что было опубликовано ДО провала rollback
+    # (новые модули), не смешанным вложением modules_old внутрь них.
+    published = {p.name for p in layout.helper_modules_dir.iterdir()}
+    assert "modules.old" not in " ".join(published), (
+        f"modules_old не должен был быть вложен внутрь неснесённой helper_modules_dir: {sorted(published)}"
+    )
+
+
 def test_install_helper_rolls_back_modules_publish_when_entry_publish_fails(tmp_path):
     """#287 cycle-review: если modules-publish УСПЕШЕН, но следующий entry-publish ПАДАЕТ,
     старое дерево modules обязано быть восстановлено на место — не оставлять новые modules

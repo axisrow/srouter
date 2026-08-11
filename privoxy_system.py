@@ -599,8 +599,13 @@ def unprotect_as_root(*, restore=True, layout=DEFAULT_LAYOUT, runner=_run,
             # не несут собственного marker'а (см. _helper_tree_has_marker_fd — marker
             # проверяется только в entrypoint). Удаляем её ВМЕСТЕ с entrypoint, guard'ится
             # тем же marker-check на entrypoint выше — чужую/неуправляемую директорию не тронем.
+            # НЕ ignore_errors=True (round 2 cycle-review): entrypoint.unlink() выше не глотает
+            # OSError — modules-dir removal обязана вести себя так же, иначе caller не узнает,
+            # что helper_modules_dir реально осталась на диске (следующий protect() всё равно
+            # это переживёт — фикс выше делает upgrade-install fail-closed на существующую
+            # директорию — но unprotect() не должен молча врать про "успешную" очистку).
             if layout.helper_modules_dir.is_dir():
-                shutil.rmtree(layout.helper_modules_dir, ignore_errors=True)
+                shutil.rmtree(layout.helper_modules_dir)
     except OSError as exc:
         return _result(False, error=f"protected_assets_remove_failed:{exc}")
     return _result(True, restored=restored, backup_dir=manifest.get("backup_dir", ""))
