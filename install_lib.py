@@ -76,6 +76,7 @@ from install_config import (  # noqa: F401  (реэкспорт — фасад i
     build_plan,
     format_plan,
     _backup,
+    _record_backup_intent,
     discover_backups,
     _write_component_config,
     _traffic_guard_preflight_error,
