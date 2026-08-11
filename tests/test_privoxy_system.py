@@ -1686,6 +1686,105 @@ def test_install_helper_wipes_stale_modules_new_residue_before_reuse(tmp_path):
     )
 
 
+def _real_mv_install_runner(layout):
+    """Как _tree_install_runner, но `/bin/mv` вызывается ПО-НАСТОЯЩЕМУ (subprocess), а не
+    эмулируется вручную через shutil.rmtree+replace.
+
+    Корень бага (issue #287 cycle-review): `_tree_install_runner`'s fake `/bin/mv` branch
+    делает `if dst.is_dir(): shutil.rmtree(dst)` перед `src.replace(dst)` — то есть тест
+    вручную удаляет существующую dst-директорию перед "переименованием". Реальный POSIX
+    `mv -f src dst`, когда dst — уже существующая директория, НЕ заменяет её: перемещает
+    src ВНУТРЬ dst как `dst/<src-basename>`, возвращает exit 0 (успех). Ни один из
+    существующих tree-install тестов не вызывает настоящий `/bin/mv` на upgrade-сценарии
+    (helper_modules_dir уже существует), поэтому маскировали расхождение с production.
+    """
+    def runner(cmd, timeout):
+        if "/bin/mv" in cmd:
+            src, dst = Path(cmd[-2]), Path(cmd[-1])
+            completed = subprocess.run(["/bin/mv", "-f", str(src), str(dst)],
+                                        capture_output=True, text=True, timeout=timeout)
+            return {"rc": completed.returncode, "out": completed.stdout.strip(),
+                    "err": completed.stderr.strip(), "timeout": False}
+        return _tree_install_runner(layout)(cmd, timeout)
+    return runner
+
+
+def test_install_helper_upgrade_replaces_existing_modules_dir_with_real_mv(tmp_path):
+    """#287 cycle-review: upgrade-install (helper_modules_dir УЖЕ существует от прошлой
+    установки — стандартный repair/re-protect путь, не гипотетика) обязан ПОЛНОСТЬЮ
+    заменить старые модули новыми. Использует настоящий `/bin/mv`, не fake-эмуляцию, —
+    _tree_install_runner маскировал этот баг, вручную делая rmtree(dst) перед "rename".
+
+    Реальный `/bin/mv -f modules.new modules`, когда `modules` уже существует, НЕ заменяет
+    её — перемещает modules.new ВНУТРЬ modules (exit 0, "успех"). Итог: opубликованный
+    entrypoint новый, но helper_modules_dir всё ещё содержит СТАРЫЕ модули (плюс мёртвый
+    груз modules/modules.new/ с новыми staged-файлами, которые никогда не импортируются).
+    """
+    layout = _layout(tmp_path)
+    # Симулируем предыдущую установку: helper_modules_dir уже существует со СТАРЫМ содержимым.
+    layout.helper_modules_dir.mkdir(parents=True)
+    stale_module = layout.helper_modules_dir / privoxy_system.HELPER_TREE_MODULES[0]
+    stale_module.write_bytes(b"# stale-module-from-previous-install\n")
+
+    result = privoxy_system._install_helper(_real_mv_install_runner(layout), layout)
+
+    assert result["ok"] is True, result
+    published = {p.name for p in layout.helper_modules_dir.iterdir()}
+    assert published == set(privoxy_system.HELPER_TREE_MODULES), (
+        "upgrade обязан полностью заменить старое дерево модулей новым, но найдено: "
+        f"{sorted(published)} (старый файл и/или вложенная modules.new-поддиректория "
+        "пережили 'успешный' install)"
+    )
+    installed_module = layout.helper_modules_dir / privoxy_system.HELPER_TREE_MODULES[0]
+    assert installed_module.read_bytes() != b"# stale-module-from-previous-install\n", (
+        "старый (stale) модуль остался опубликован после 'успешного' upgrade-install — "
+        "entrypoint обновлён, но соседние модули, которые он импортирует под sudo, всё "
+        "ещё старые (security-stale code, не пойман post-install digest-check)"
+    )
+
+
+def test_install_helper_rolls_back_modules_publish_when_entry_publish_fails(tmp_path):
+    """#287 cycle-review: если modules-publish УСПЕШЕН, но следующий entry-publish ПАДАЕТ,
+    старое дерево modules обязано быть восстановлено на место — не оставлять новые modules
+    в паре со старым entrypoint (рассинхронизированное helper-дерево на диске).
+
+    До фикса: cleanup при провале publish_entry удалял только entry_new, оставляя уже
+    опубликованный helper_modules_dir (новые модули) нетронутым — старый entrypoint
+    (или отсутствующий, при первой установке) остался бы работать/не работать с новыми
+    модулями, версии рассинхронизированы, и функция вернула бы ошибку, не отражающую
+    реальное состояние диска.
+    """
+    layout = _layout(tmp_path)
+    layout.helper_modules_dir.mkdir(parents=True)
+    stale_module = layout.helper_modules_dir / privoxy_system.HELPER_TREE_MODULES[0]
+    stale_module.write_bytes(b"# stale-module-from-previous-install\n")
+
+    base_runner = _real_mv_install_runner(layout)
+
+    def runner(cmd, timeout):
+        if "/bin/mv" in cmd and Path(cmd[-1]) == layout.helper_path:
+            return {"rc": 1, "out": "", "err": "simulated_entry_publish_failure", "timeout": False}
+        return base_runner(cmd, timeout)
+
+    result = privoxy_system._install_helper(runner, layout)
+
+    assert result["ok"] is False
+    assert result["error"] == "simulated_entry_publish_failure"
+    # Rollback обязан вернуть СТАРОЕ дерево modules на место — не смешанное с новым.
+    assert layout.helper_modules_dir.exists(), "modules-директория не должна исчезнуть при откате"
+    published = {p.name for p in layout.helper_modules_dir.iterdir()}
+    assert published == {privoxy_system.HELPER_TREE_MODULES[0]}, (
+        f"после отката ожидалось СТАРОЕ дерево (только {privoxy_system.HELPER_TREE_MODULES[0]}), "
+        f"получено: {sorted(published)} — новые модули остались опубликованы вперемешку со старым entrypoint"
+    )
+    assert stale_module.read_bytes() == b"# stale-module-from-previous-install\n", (
+        "старый модуль должен быть восстановлен байт-в-байт, не подменён новым содержимым"
+    )
+    # Никаких *.new/*.old остатков на диске после отката.
+    assert not layout.helper_modules_dir.with_name(f"{layout.helper_modules_dir.name}.new").exists()
+    assert not layout.helper_modules_dir.with_name(f"{layout.helper_modules_dir.name}.old").exists()
+
+
 def test_install_helper_fail_closed_when_staged_tree_module_substituted_after_stage(tmp_path):
     """#287 tree-copy: подмена ОДНОГО ИЗ СОСЕДНИХ МОДУЛЕЙ (не entrypoint) в staged-окне
     обязана ловиться так же, как подмена entrypoint — иначе tree-copy деградировал бы до

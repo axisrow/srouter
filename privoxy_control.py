@@ -243,15 +243,26 @@ def _install_helper(runner, layout=None):
     (4) post-install digest-check КАЖДОГО установленного *.new-файла против expected-digest
         честно прочитанных bytes (шаг 1). ЛЮБОЕ расхождение → fail-closed: cleanup всех *.new
         путей, ни один частично установленный/подменённый файл не публикуется как финальный.
-    (5) ТОЛЬКО если ВСЕ digest сошлись — публикация: один `sudo mv -f` modules.new →
-        helper_modules_dir (atomic rename заменяет старую директорию модулей целиком), затем
-        один `sudo mv -f` helper_path.new → helper_path (atomic rename файла). Между этими
-        двумя rename есть короткое окно, где entrypoint и modules могут временно не совпадать
+    (5) ТОЛЬКО если ВСЕ digest сошлись — публикация. `mv -f src dst`, когда dst уже
+        существующая ДИРЕКТОРИЯ (upgrade/repair-путь: helper_modules_dir остался от предыдущей
+        установки), НЕ заменяет её целиком — POSIX-семантика перемещает src ВНУТРЬ dst как
+        `dst/<src-basename>` и возвращает успех. Публикация тогда молча оставила бы старые
+        модули опубликованными (плюс мёртвый груз новых staged-файлов в поддиректории), пока
+        entrypoint уже обновлён — ни один digest-чек это не ловит (те проверяют *.new ДО
+        публикации, не финальный путь). Поэтому: если helper_modules_dir уже существовала —
+        убираем её В СТОРОНУ под временное имя (`sudo mv` в helper_modules_dir.old) ДО
+        публикации новых modules, тогда dst для publish-mv гарантированно не существует и
+        mv отрабатывает как настоящий atomic rename директории. Затем один `sudo mv -f`
+        helper_path.new → helper_path (atomic rename файла). Между modules-publish и
+        entry-publish есть короткое окно, где entrypoint и modules могут временно не совпадать
         по версии при аварийном обрыве процесса ровно между ними — это НЕ security-регрессия
         (оба rename делает тот же доверенный root-процесс install, не attacker-controlled шаг;
-        следующий protect() переустановит дерево заново с нуля). Атака была бы возможна только
-        если бы attacker мог вклиниться МЕЖДУ digest-check и install — но post-install digest
-        проверяет уже установленный *.new-файл, а не kernel-level промежуточное состояние.
+        следующий protect() переустановит дерево заново с нуля). На сбой ЛЮБОГО из двух publish-
+        шагов — fail-closed rollback: modules.old возвращается на место helper_modules_dir
+        (см. код ниже), новые *.new/*.old чистятся — либо оба mv успешны и дерево консистентно,
+        либо публикация не происходит вовсе. Атака была бы возможна только если бы attacker мог
+        вклиниться МЕЖДУ digest-check и install — но post-install digest проверяет уже
+        установленный *.new-файл, а не kernel-level промежуточное состояние.
 
     ВАЖНО (#148 variant 3, унаследовано): staged создаётся в user-процессе `protect()` (НЕ
     root) → mkstemp/mkdtemp дают user-owned объекты, staged user-owned/writable в окне
@@ -328,16 +339,45 @@ def _install_helper(runner, layout=None):
                 return privoxy_system._result(False, error="helper_digest_mismatch")
             installed_digests[name] = installed_digest
 
-        # (5) все digest сошлись — атомарная публикация: modules first (rename заменяет
-        # старую директорию целиком), затем entrypoint (rename заменяет старый файл).
+        # (5) все digest сошлись — атомарная публикация. `mv -f src dst`, когда dst уже
+        # существующая ДИРЕКТОРИЯ (upgrade/repair-путь: helper_modules_dir остался от
+        # предыдущей установки), НЕ заменяет её — POSIX-семантика перемещает src ВНУТРЬ dst
+        # как `dst/<src-basename>`, exit 0 ("успех"). Публикация тогда молча оставляет
+        # СТАРЫЕ модули опубликованными (плюс мёртвый груз новых staged-файлов в поддиректории),
+        # пока entrypoint уже обновлён на новый — security-stale code, не пойман ни одним
+        # digest-чеком (те проверяют *.new ДО публикации, не финальный путь). Фикс: старую
+        # helper_modules_dir (если была) убираем В СТОРОНУ под временное имя ДО mv — тогда
+        # dst гарантированно не существует и mv отрабатывает как настоящий atomic rename.
+        # Старая директория хранится до успешной публикации entrypoint — на любой сбой ниже
+        # откатываем modules обратно на старое место (fail-closed: не оставляем половинчатое
+        # дерево — либо оба mv успешны, либо ничего не публикуется).
+        modules_old = layout.helper_modules_dir.with_name(f"{layout.helper_modules_dir.name}.old")
+        runner([privoxy_system.SUDO, "/bin/rm", "-rf", "--", str(modules_old)], 15)
+        had_previous_modules = layout.helper_modules_dir.exists()
+        if had_previous_modules:
+            moved_aside = runner(
+                [privoxy_system.SUDO, "/bin/mv", "-f", str(layout.helper_modules_dir), str(modules_old)], 30
+            )
+            if moved_aside.get("rc") != 0:
+                _cleanup_new_paths(runner, new_paths_to_cleanup)
+                return privoxy_system._result(False, error=(moved_aside.get("err") or "helper_modules_old_move_failed")[:240])
         publish_modules = runner([privoxy_system.SUDO, "/bin/mv", "-f", str(modules_new), str(layout.helper_modules_dir)], 30)
         if publish_modules.get("rc") != 0:
+            if had_previous_modules:
+                runner([privoxy_system.SUDO, "/bin/mv", "-f", str(modules_old), str(layout.helper_modules_dir)], 30)
             _cleanup_new_paths(runner, new_paths_to_cleanup)
             return privoxy_system._result(False, error=(publish_modules.get("err") or "helper_modules_publish_failed")[:240])
         publish_entry = runner([privoxy_system.SUDO, "/bin/mv", "-f", str(entry_new), str(layout.helper_path)], 30)
         if publish_entry.get("rc") != 0:
+            # Rollback: вернуть СТАРЫЕ modules на место, снести только что опубликованные новые —
+            # entrypoint (старый, если был) и modules остаются консистентной парой, не смешанными.
+            runner([privoxy_system.SUDO, "/bin/rm", "-rf", "--", str(layout.helper_modules_dir)], 15)
+            if had_previous_modules:
+                runner([privoxy_system.SUDO, "/bin/mv", "-f", str(modules_old), str(layout.helper_modules_dir)], 30)
             _cleanup_new_paths(runner, [entry_new])
             return privoxy_system._result(False, error=(publish_entry.get("err") or "helper_entry_publish_failed")[:240])
+        if had_previous_modules:
+            runner([privoxy_system.SUDO, "/bin/rm", "-rf", "--", str(modules_old)], 15)
         return privoxy_system._result(True)
     finally:
         try:
