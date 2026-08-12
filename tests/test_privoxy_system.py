@@ -1900,6 +1900,75 @@ def test_install_helper_reports_rollback_failure_distinctly_when_modules_publish
     assert "restore" in result["error"]
 
 
+def test_read_helper_tree_pinned_fail_closed_when_entry_file_is_symlink(tmp_path, monkeypatch):
+    """#287 cycle-review round 4 (Codex, no-ship): symlink НА САМ __file__ обязан быть
+    отклонён honest-read'ом. Эмпирически подтверждено прямым os.open-экспериментом:
+    `os.open(Path(link).resolve(), O_NOFOLLOW)` открывает attacker-target без ошибки
+    (resolve() уже разрешил symlink в строке пути), тогда как `os.open(link, O_NOFOLLOW)`
+    (путь БЕЗ resolve) честно падает с ELOOP на самом symlink'е.
+
+    Атака: атакующий, способный подменить __file__ symlink'ом на attacker-controlled файл
+    с валидным marker'ом, прошёл бы весь honest-read → digest-pin → sudo install →
+    post-install digest-check pipeline без единого сбоя — post-install digest сравнивается
+    с digest ТЕХ ЖЕ attacker bytes, не с ожидаемым содержимым.
+    """
+    entry_name = "com.srouter.privoxyctl"
+    attacker_file = tmp_path / "attacker_payload.py"
+    attacker_file.write_text(f"#!/usr/bin/python3\n# {privoxy_system.HELPER_MARKER}\n# attacker\n")
+
+    entry_symlink = tmp_path / entry_name
+    entry_symlink.symlink_to(attacker_file)
+    for module_name in privoxy_system.HELPER_TREE_MODULES:
+        (tmp_path / module_name).write_text(f"# {module_name}\n")
+
+    monkeypatch.setattr(privoxy_system, "__file__", str(entry_symlink))
+
+    tree = privoxy_system._read_helper_tree_pinned()
+
+    assert tree is None, (
+        "entrypoint — symlink на attacker-controlled файл, но _read_helper_tree_pinned "
+        "вернул дерево вместо fail-closed None"
+    )
+
+
+def test_read_helper_tree_pinned_fail_closed_when_parent_dir_is_symlink(tmp_path, monkeypatch):
+    """#287 cycle-review round 4 (Codex, no-ship, confidence 0.98): symlink НА
+    РОДИТЕЛЬСКУЮ ДИРЕКТОРИЮ __file__ — самостоятельный вектор, отдельный от symlink на
+    сам файл. O_NOFOLLOW на строковом пути защищает ТОЛЬКО последний компонент — ни
+    `Path(__file__).resolve()`, ни `os.path.abspath(__file__)` этого не меняют: если
+    директория-предок сама symlink на attacker-controlled путь, `os.open(parent/name,
+    O_NOFOLLOW)` честно откроет attacker-файл (тот — обычный файл ВНУТРИ attacker-
+    директории, symlink'а на последнем шаге нет). Эмпирически подтверждено прямым
+    os.open-экспериментом с обоими вариантами root-резолва.
+
+    Fix: родительская директория открывается РОВНО ОДИН РАЗ через
+    `O_NOFOLLOW|O_DIRECTORY` (получаем dir_fd, привязанный к конкретному inode), затем
+    entrypoint и все модули читаются fd-relative (`dir_fd=parent_fd`) — ни один
+    последующий open() не резолвит строку пути заново, поэтому symlink-подмена
+    родителя невозможна в принципе (dir_fd — открытый fd, не строка).
+    """
+    entry_name = "com.srouter.privoxyctl"
+    attacker_dir = tmp_path / "attacker_dir"
+    attacker_dir.mkdir()
+    (attacker_dir / entry_name).write_text(f"#!/usr/bin/python3\n# {privoxy_system.HELPER_MARKER}\n# attacker\n")
+    for module_name in privoxy_system.HELPER_TREE_MODULES:
+        (attacker_dir / module_name).write_text(f"# attacker-{module_name}\n")
+
+    symlink_dir = tmp_path / "symlink_dir"
+    symlink_dir.symlink_to(attacker_dir)
+    monkeypatch.setattr(privoxy_system, "__file__", str(symlink_dir / entry_name))
+
+    tree = privoxy_system._read_helper_tree_pinned()
+
+    assert tree is None, (
+        "родительская директория __file__ — symlink на attacker_dir, но "
+        "_read_helper_tree_pinned вернул дерево вместо fail-closed None — O_NOFOLLOW "
+        "на строковом пути не защищает промежуточные (не последние) компоненты пути; "
+        "требуется fd-relative open через dir_fd, привязанный к родительской директории "
+        "до чтения любого файла в ней"
+    )
+
+
 def test_install_helper_fail_closed_when_staged_tree_module_substituted_after_stage(tmp_path):
     """#287 tree-copy: подмена ОДНОГО ИЗ СОСЕДНИХ МОДУЛЕЙ (не entrypoint) в staged-окне
     обязана ловиться так же, как подмена entrypoint — иначе tree-copy деградировал бы до

@@ -674,7 +674,7 @@ def _digest_fd_nofollow(path):
     return hashlib.sha256(data).hexdigest()
 
 
-def _read_file_pinned(path, *, max_size=4 * 1024 * 1024):
+def _read_file_pinned(path, *, max_size=4 * 1024 * 1024, dir_fd=None):
     """Открыть path через O_NOFOLLOW, прочитать bytes + digest одним fd (TOCTOU-свободно).
 
     Общий примитив для tree digest-pinning (issue #287): и entrypoint, и каждый
@@ -683,6 +683,17 @@ def _read_file_pinned(path, *, max_size=4 * 1024 * 1024):
     считается на bytes ТОГО ЖЕ fd, что и прочитаны — окна между проверкой и
     использованием нет (тот же инвариант, что был у прежнего однофайлового
     _read_helper_bytes_pinned, #148). Возвращает (bytes, digest) или (None, None).
+
+    `dir_fd`, если передан, делает open() fd-relative (`name` резолвится относительно
+    уже открытого dir_fd, а не заново пройденной строки пути) — обязательно для защиты
+    от symlink НА РОДИТЕЛЬСКУЮ ДИРЕКТОРИЮ (Codex round 4, no-ship): O_NOFOLLOW на строковом
+    пути защищает только ПОСЛЕДНИЙ компонент — если директория-предок сама является
+    symlink'ом на attacker-controlled путь, open(str(path), O_NOFOLLOW) честно откроет
+    attacker-файл (последний компонент — обычный файл, не symlink). fd-relative open с
+    dir_fd, открытым через O_NOFOLLOW|O_DIRECTORY, устраняет это: dir_fd уже привязан к
+    конкретному inode директории на момент открытия, независимо от того, как к нему
+    привели (либо родитель — не symlink, и open дал dir_fd на неё; либо был symlink, и
+    родительский open с O_NOFOLLOW отказал раньше, чем мы сюда дошли).
 
     Почему НЕ _reject_symlinks_in_tree (#287 просил переиспользовать примитивы): тот —
     lstat-препроход для shutil.copytree, который разыменовывает symlink'и, по дереву
@@ -694,8 +705,9 @@ def _read_file_pinned(path, *, max_size=4 * 1024 * 1024):
     а не его lstat-обёртка для copytree.
     """
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    name = os.path.basename(str(path)) if dir_fd is not None else str(path)
     try:
-        fd = os.open(str(path), flags)
+        fd = os.open(name, flags, dir_fd=dir_fd) if dir_fd is not None else os.open(name, flags)
     except OSError:
         return None, None
     try:
@@ -725,19 +737,44 @@ def _read_helper_tree_pinned():
     Возвращает dict {relative_name: (bytes, digest)} для entrypoint (ключ — basename __file__)
     и каждого модуля, или None целиком при любой ошибке (отсутствующий файл, symlink,
     non-regular, missing marker) — fail-closed: неполное дерево не считается валидным.
+
+    КРИТИЧНО (Codex round 4, no-ship): ни `Path(__file__).resolve()`, ни `os.path.abspath()`
+    не защищают от symlink НА РОДИТЕЛЬСКУЮ ДИРЕКТОРИЮ __file__ — O_NOFOLLOW в
+    _read_file_pinned проверяет только ПОСЛЕДНИЙ компонент строкового пути; если
+    директория-предок сама symlink на attacker-controlled путь, `os.open(root/name,
+    O_NOFOLLOW)` честно откроет attacker-файл (тот — обычный файл внутри attacker-
+    директории, не symlink на последнем шаге). Атакующий, подменивший директорию, из
+    которой user-side protect() читает helper-source, symlink'ом на attacker-controlled
+    дерево с валидным marker'ом, прошёл бы весь pipeline (honest-read → digest-pin →
+    sudo install → post-install digest-check) без единого сбоя — post-install digest
+    сверяется с digest ТЕХ ЖЕ attacker-bytes. Fix: открыть родительскую директорию РОВНО
+    ОДИН РАЗ через `O_NOFOLLOW|O_DIRECTORY` (получаем dir_fd, привязанный к конкретному
+    inode — либо родитель не был symlink и open дал честный dir_fd, либо был, и open
+    отказал раньше, чем мы дошли до чтения файлов), затем читать entrypoint и все модули
+    fd-relative (`dir_fd=parent_fd`) — ни один из последующих open() не резолвит строку
+    пути заново, поэтому symlink-подмена родителя МЕЖДУ открытием parent_fd и чтением
+    файлов невозможна в принципе (dir_fd — это открытый fd, не строка).
     """
-    root = Path(__file__).resolve().parent
-    entry_name = Path(__file__).name
-    entry_data, entry_digest = _read_file_pinned(root / entry_name)
-    if entry_data is None or HELPER_MARKER.encode() not in entry_data[:16384]:
+    entry_name = os.path.basename(__file__)
+    parent_dir = os.path.dirname(os.path.abspath(__file__))
+    dir_flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        parent_fd = os.open(parent_dir, dir_flags)
+    except OSError:
         return None
-    tree = {entry_name: (entry_data, entry_digest)}
-    for module_name in HELPER_TREE_MODULES:
-        data, digest = _read_file_pinned(root / module_name)
-        if data is None:
-            return None  # неполное дерево — fail-closed, а не partial install.
-        tree[module_name] = (data, digest)
-    return tree
+    try:
+        entry_data, entry_digest = _read_file_pinned(entry_name, dir_fd=parent_fd)
+        if entry_data is None or HELPER_MARKER.encode() not in entry_data[:16384]:
+            return None
+        tree = {entry_name: (entry_data, entry_digest)}
+        for module_name in HELPER_TREE_MODULES:
+            data, digest = _read_file_pinned(module_name, dir_fd=parent_fd)
+            if data is None:
+                return None  # неполное дерево — fail-closed, а не partial install.
+            tree[module_name] = (data, digest)
+        return tree
+    finally:
+        os.close(parent_fd)
 
 
 def _helper_tree_has_marker_fd(path):
