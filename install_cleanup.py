@@ -22,6 +22,7 @@ from install_config import (
     NETWORKSETUP,
     SUDO,
     _BACKUP_INFIX,
+    _discover_network,
     _has_marker,
     _is_adopted_entry,
     _is_managed_entry,
@@ -338,6 +339,15 @@ def _restore_dns(plan, runner):
         return {"rc": 0, "out": "", "err": "dnsmasq unmanaged", "timeout": False}
     channels = plan.get("network", {}).get("channels") if isinstance(plan.get("network"), dict) else {}
     service = channels.get("wifi_service") if isinstance(channels, dict) else ""
+    if not service:
+        # issue #293 (P1b, cycle-review round 3 PR #290): холодный старт — на первом-ever apply
+        # state-файл ещё не существует, поэтому state['network']['channels'] никогда не был записан
+        # (пишется только финальной _write_state_after_apply в конце apply_install), хотя _apply_dns
+        # реально мог успеть выполниться до обрыва. Симметрично тому, как discover_backups уже
+        # переоткрывает backup'ы вживую вместо доверия одной state-записи: здесь для restorable/managed
+        # компонента переоткрываем wifi_service вживую через runner, а не молча no-op'имся на пустой
+        # кэш — иначе dnsmasq останавливается, а DNS так и указывает на 127.0.0.1 под видом успеха.
+        service = _discover_network(runner).get("channels", {}).get("wifi_service", "")
     if not service:
         return {"rc": 0, "out": "", "err": "wifi service not found", "timeout": False}
     return runner([NETWORKSETUP, "-setdnsservers", service, "Empty"], 20)

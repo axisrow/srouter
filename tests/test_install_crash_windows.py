@@ -25,6 +25,7 @@ import pytest
 
 import install_config
 import install_lib
+import local_state
 
 from test_install_flow import (
     FakeRunner,
@@ -1050,13 +1051,12 @@ def test_uninstall_resets_dns_for_orphaned_backup_dnsmasq(tmp_path, monkeypatch)
 # уже корректно распознан как orphaned_backup; (б) state['network']['channels'] пуст на «холодном»
 # первом-ever apply, обрывающемся до финальной записи, — DNS-сброс no-op'ится молча.
 #
-# По канону cycle-review "3-cycle cap = сигнал, не просто лимит": это НЕ 7-й точечный патч, а сигнал
-# нарушенного ИНВАРИАНТА — batched-at-tail-end запись state трактуется как proof of recency для полей,
-# чей реальный side-effect произошёл РАНЬШЕ этой записи. Каждый раунд закрывал ОДНО конкретное поле
-# (backup-приоритет → mode-устаревание → и вот снова: backup-freshness + network-cache) — это открытое
-# перечисление полей, а не структурное решение. Согласно правилу, здесь остановка на диагнозе, а не
-# четвёртый патч: xfail(strict=True) пиннит обе находки для решения пользователем (закрыть точечно /
-# перейти на per-effect durability вместо batched-записи / вынести в explicit follow-up issue).
+# issue #293: (а) закрыт композицией части 2/2 (state-first, PR #294) + not_before симметрично на
+# stated backup — _record_backup_intent пишет ссылку сразу после создания backup, entry больше не
+# замерзает на устаревшем pointer. (б) закрыт точечно: _restore_dns переоткрывает wifi_service вживую
+# через runner (_discover_network), когда state['network']['channels'] пуст, а компонент managed/
+# restorable — симметрично тому, как discover_backups уже переоткрывает backup'ы вместо доверия одной
+# state-записи.
 
 
 def test_stale_restored_backup_pointer_loses_user_edits_after_manual_edit(tmp_path, monkeypatch):
@@ -1121,20 +1121,23 @@ def test_stale_restored_backup_pointer_loses_user_edits_after_manual_edit(tmp_pa
     )
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "cycle-review round 3 (Codex), issue #124: на «холодном» первом-ever apply (нет state-файла "
-    "вовсе до этого apply) crash после _apply_dns оставляет DNS указывающим на 127.0.0.1, а "
-    "state['network']['channels'] никогда не был записан (пишется только финальной "
-    "_write_state_after_apply). apply_uninstall останавливает dnsmasq (services-гейт round 2 работает "
-    "корректно через restorable), но _restore_dns не может найти wifi_service в пустых channels → "
-    "no-op, DNS не сбрасывается, при этом report ok=True — полный DNS outage под видом успеха. "
-    "3-й подряд FIX-цикл того же класса — остановка на диагнозе по правилу 3-cycle cap."))
 def test_cold_start_crash_after_apply_dns_leaves_dns_broken_reported_ok(tmp_path, monkeypatch):
-    """round-3 P1: холодный старт (нет state вовсе) — DNS не сбрасывается, хотя сервис остановлен.
+    """round-3 P1b — ЗАКРЫТ (issue #293): холодный старт, DNS теперь сбрасывается корректно.
+
+    _restore_dns раньше no-op'ился молча, когда state['network']['channels'] пуст (холодный первый-
+    ever apply, обрывающийся до финальной _write_state_after_apply). Теперь при пустом channels
+    переоткрывает wifi_service вживую через runner (_discover_network) — симметрично тому, как
+    discover_backups уже переоткрывает backup'ы вместо доверия одной state-записи.
 
     В отличие от test_uninstall_resets_dns_for_orphaned_backup_dnsmasq (есть bootstrap-шаг, поэтому
     state.network уже заполнен от предыдущего успешного apply), здесь state_path вообще не существует
     до этого apply — типичный первый запуск install на чистой машине.
+
+    Примечание (issue #293): с state-first (часть 2/2, PR #294) state-файл к моменту обрыва уже может
+    существовать — _record_backup_intent пишет голый backup-pointer entry ДО _apply_dns, когда у
+    dnsmasq есть что бэкапить (foreign config, choice=overwrite). Это не регрессия холодного старта:
+    важное для этого сценария свойство — что state['network']['channels'] так и остался пустым,
+    именно это и проверяем.
     """
     env = _env(tmp_path)
     assert not env.state_path.exists(), "precondition: ни одного успешного apply раньше не было"
@@ -1155,7 +1158,11 @@ def test_cold_start_crash_after_apply_dns_leaves_dns_broken_reported_ok(tmp_path
     dns_calls_during_install = [c for c in runner.calls
                                  if install_config.NETWORKSETUP in c and "127.0.0.1" in c]
     assert dns_calls_during_install, "install реально применил DNS=127.0.0.1 до обрыва"
-    assert not env.state_path.exists(), "холодный старт: state-файл вообще не создан"
+    state_after_crash = local_state.load_state(path=env.state_path) or {}
+    assert not state_after_crash.get("network", {}).get("channels"), (
+        "холодный старт: network.channels никогда не был записан (пишется только финальной "
+        "_write_state_after_apply) — это и есть предпосылка, которую _restore_dns обязан пережить"
+    )
 
     uninstall_runner = _WifiAwareRunner()
     result = install_lib.apply_uninstall(
