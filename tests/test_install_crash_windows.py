@@ -1178,3 +1178,62 @@ def test_cold_start_crash_after_apply_dns_leaves_dns_broken_reported_ok(tmp_path
         "DNS обязан быть сброшен даже когда state['network']['channels'] пуст (холодный старт) — "
         "иначе dnsmasq остановлен, а DNS всё ещё указывает на 127.0.0.1, при report ok=True"
     )
+
+
+class _DiscoveryFailingRunner(FakeRunner):
+    """FakeRunner, у которого сам live-discovery запрос (-listallnetworkservices) деградирует —
+    имитирует transient-сбой (timeout/nonzero rc), а не легитимно-пустой список сервисов."""
+
+    def __call__(self, cmd, timeout):
+        if list(cmd) == [install_config.NETWORKSETUP, "-listallnetworkservices"]:
+            self.calls.append(list(cmd))
+            return {"rc": 1, "out": "", "err": "networksetup: timed out", "timeout": True}
+        return super().__call__(cmd, timeout)
+
+
+def test_cold_start_dns_discovery_failure_is_not_silently_reported_ok(tmp_path, monkeypatch):
+    """cycle-review PR #295 (Codex): _restore_dns не обязан путать transient-сбой live-discovery
+    (-listallnetworkservices упал/протаймаутил) с легитимно-пустым списком сетевых сервисов.
+
+    До фикса: _discover_network читает только `.get("out")`, отбрасывая rc/timeout вызова
+    networksetup. Если этот вызов сам деградировал, service остаётся "" — неотличимо от случая
+    "Wi-Fi сервис реально не найден" — и _restore_dns возвращает {rc: 0, err: "wifi service not
+    found"}. apply_uninstall трактует rc==0 как успех (guard на timeout/rc!=0 не срабатывает) и
+    репортит ok=True, хотя dnsmasq уже остановлен, а DNS так и не сброшен с 127.0.0.1 — тот же
+    класс молчаливого DNS outage, который issue #293 (P1b) требует закрыть, только с другим
+    триггером (сбой discovery-запроса, а не отсутствие state-записи).
+    """
+    env = _env(tmp_path)
+    assert not env.state_path.exists(), "precondition: холодный старт, ни одного apply раньше не было"
+
+    _write_config_without_marker(env, "privoxy")
+    dnsmasq_config = env.component_paths("dnsmasq")["config"]
+    dnsmasq_config.parent.mkdir(parents=True, exist_ok=True)
+    dnsmasq_config.write_text("foreign dnsmasq config\n", encoding="utf-8")
+
+    _crash_after(monkeypatch, "_apply_dns")
+    runner = _WifiAwareRunner()
+    with pytest.raises(_Crash):
+        install_lib.apply_install(
+            env=env, confirm=True,
+            choices={"privoxy": "skip", "xray": "skip", "dnsmasq": "overwrite"},
+            runner=runner, port_checker=_port_checker_managed_up(runner.calls))
+
+    state_after_crash = local_state.load_state(path=env.state_path) or {}
+    assert not state_after_crash.get("network", {}).get("channels"), (
+        "precondition: холодный старт — network.channels пуст, _restore_dns обязан переоткрыть "
+        "wifi_service вживую через _discover_network"
+    )
+
+    uninstall_runner = _DiscoveryFailingRunner()
+    result = install_lib.apply_uninstall(
+        env=env, confirmations={"configs": True, "services": True, "dns": True},
+        runner=uninstall_runner)
+
+    dns_reset_calls = [c for c in uninstall_runner.calls
+                        if install_config.NETWORKSETUP in c and "Empty" in c]
+    assert not dns_reset_calls, "discovery сам провалился — DNS-сброс не мог реально произойти"
+    assert result["ok"] is False, (
+        "деградированный live-discovery (timeout/nonzero rc у -listallnetworkservices) обязан "
+        "блокировать ok=True — иначе dnsmasq остановлен, DNS всё ещё на 127.0.0.1, а отчёт молчит"
+    )

@@ -347,7 +347,19 @@ def _restore_dns(plan, runner):
         # переоткрывает backup'ы вживую вместо доверия одной state-записи: здесь для restorable/managed
         # компонента переоткрываем wifi_service вживую через runner, а не молча no-op'имся на пустой
         # кэш — иначе dnsmasq останавливается, а DNS так и указывает на 127.0.0.1 под видом успеха.
-        service = _discover_network(runner).get("channels", {}).get("wifi_service", "")
+        discovered = _discover_network(runner)
+        service = discovered.get("channels", {}).get("wifi_service", "")
+        if not service and not discovered.get("services_probe", {}).get("ok", True):
+            # cycle-review PR #295 (Codex): сам live-discovery запрос (-listallnetworkservices)
+            # провалился/протаймаутил — это НЕ то же самое, что легитимно-пустой список сервисов.
+            # Трактовать как "wifi service not found" (rc=0) означало бы репортить успешный откат,
+            # хотя DNS реально не проверен и мог остаться указывать на 127.0.0.1.
+            probe = discovered["services_probe"]
+            return {
+                "rc": probe.get("rc") if probe.get("rc") not in (None, 0) else 1,
+                "out": "", "err": "wifi service discovery failed",
+                "timeout": bool(probe.get("timeout")),
+            }
     if not service:
         return {"rc": 0, "out": "", "err": "wifi service not found", "timeout": False}
     return runner([NETWORKSETUP, "-setdnsservers", service, "Empty"], 20)

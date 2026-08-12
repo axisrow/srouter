@@ -373,7 +373,16 @@ def _discover_network(runner):
         if not usb_service and ("usb" in low or "iphone" in low or "tether" in low):
             usb_service = name
 
-    return {"gateway": gateway, "channels": {"wifi_service": wifi_service, "usb_tether_service": usb_service}}
+    # cycle-review PR #295 (Codex): вызывающий код (_restore_dns) обязан отличать "сервисов
+    # реально нет" от "сам запрос -listallnetworkservices провалился/протаймаутил" — иначе
+    # transient-сбой discovery молча трактуется как легитимно-пустой список. Пробрасываем
+    # rc/timeout самого probe-вызова отдельным полем, не трогая существующую форму channels.
+    probe_ok = not services.get("timeout") and services.get("rc") == 0
+    return {
+        "gateway": gateway,
+        "channels": {"wifi_service": wifi_service, "usb_tether_service": usb_service},
+        "services_probe": {"ok": probe_ok, "rc": services.get("rc"), "timeout": services.get("timeout")},
+    }
 
 
 def _discover_probe_readiness(state_path, port_checker):
