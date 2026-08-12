@@ -1826,6 +1826,80 @@ def test_install_helper_rolls_back_modules_publish_when_entry_publish_fails(tmp_
     assert not layout.helper_modules_dir.with_name(f"{layout.helper_modules_dir.name}.old").exists()
 
 
+def test_install_helper_reports_precleanup_failure_when_stale_modules_old_survives(tmp_path):
+    """#287 cycle-review round 3 (Codex, confidence 0.98): pre-cleanup `rm -rf modules_old`
+    (сносящий остаток прошлого прерванного прогона ДО move-aside) обязан быть проверен так
+    же, как rollback-шаги round 2 — не только rc, но и постусловие (path больше не существует).
+
+    Если pre-cleanup молча не снёс остаток (I/O-ошибка, busy fs) и функция продолжила бы
+    работу, следующий move-aside `mv helper_modules_dir modules_old` попал бы в ТУ ЖЕ
+    mv-в-директорию ловушку, которую весь этот PR закрывает: helper_modules_dir вложился бы
+    ВНУТРЬ неснесённого modules_old, "успешно", маскируя реальное disk-состояние. Функция
+    обязана остановиться СРАЗУ на pre-cleanup failure, не доходя до move-aside.
+    """
+    layout = _layout(tmp_path)
+    layout.helper_modules_dir.mkdir(parents=True)
+    current_module = layout.helper_modules_dir / privoxy_system.HELPER_TREE_MODULES[0]
+    current_module.write_bytes(b"# current-module\n")
+
+    modules_old = layout.helper_modules_dir.with_name(f"{layout.helper_modules_dir.name}.old")
+    modules_old.mkdir(parents=True)
+    leftover = modules_old / "leftover-from-interrupted-run.py"
+    leftover.write_bytes(b"# leftover\n")
+
+    base_runner = _real_mv_install_runner(layout)
+
+    def runner(cmd, timeout):
+        if "/bin/rm" in cmd and Path(cmd[-1]) == modules_old:
+            # Симулируем сбой pre-cleanup: rc=0 (лжеуспех), но путь на самом деле не снесён.
+            return {"rc": 0, "out": "", "err": "", "timeout": False}
+        return base_runner(cmd, timeout)
+
+    result = privoxy_system._install_helper(runner, layout)
+
+    assert result["ok"] is False
+    assert result["error"] == "helper_modules_old_precleanup_failed"
+    # Move-aside не должен был случиться — helper_modules_dir остаётся на месте нетронутым.
+    assert layout.helper_modules_dir.exists()
+    assert current_module.read_bytes() == b"# current-module\n"
+    # Стейл-остаток тоже никуда не делся (лжеуспешный rm его не снёс).
+    assert leftover.exists()
+
+
+def test_install_helper_reports_rollback_failure_distinctly_when_modules_publish_restore_fails(tmp_path):
+    """#287 cycle-review round 3 (Codex, confidence 0.98): если `mv modules.new
+    helper_modules_dir` (publish_modules) падает И последующий restore (`mv modules_old
+    helper_modules_dir`) ТОЖЕ падает, caller обязан получить различимую ошибку
+    (rollback-failure), а не обычный publish-failure — round 2 фикс проверял только
+    rollback ПОСЛЕ publish_entry fail, оставляя ветку publish_modules fail с непроверенным
+    restore (round 1 код).
+    """
+    layout = _layout(tmp_path)
+    layout.helper_modules_dir.mkdir(parents=True)
+    stale_module = layout.helper_modules_dir / privoxy_system.HELPER_TREE_MODULES[0]
+    stale_module.write_bytes(b"# stale-module-from-previous-install\n")
+
+    base_runner = _real_mv_install_runner(layout)
+    modules_old = layout.helper_modules_dir.with_name(f"{layout.helper_modules_dir.name}.old")
+    modules_new = layout.helper_modules_dir.with_name(f"{layout.helper_modules_dir.name}.new")
+
+    def runner(cmd, timeout):
+        if "/bin/mv" in cmd and Path(cmd[-2]) == modules_new and Path(cmd[-1]) == layout.helper_modules_dir:
+            return {"rc": 1, "out": "", "err": "simulated_modules_publish_failure", "timeout": False}
+        if "/bin/mv" in cmd and Path(cmd[-2]) == modules_old and Path(cmd[-1]) == layout.helper_modules_dir:
+            return {"rc": 1, "out": "", "err": "simulated_restore_failure", "timeout": False}
+        return base_runner(cmd, timeout)
+
+    result = privoxy_system._install_helper(runner, layout)
+
+    assert result["ok"] is False
+    assert "rollback" in result["error"], (
+        f"restore после provider publish_modules-failure упал, но error не отражает это "
+        f"отдельно от исходного publish-failure: {result['error']!r}"
+    )
+    assert "restore" in result["error"]
+
+
 def test_install_helper_fail_closed_when_staged_tree_module_substituted_after_stage(tmp_path):
     """#287 tree-copy: подмена ОДНОГО ИЗ СОСЕДНИХ МОДУЛЕЙ (не entrypoint) в staged-окне
     обязана ловиться так же, как подмена entrypoint — иначе tree-copy деградировал бы до

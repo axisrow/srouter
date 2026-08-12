@@ -351,20 +351,33 @@ def _install_helper(runner, layout=None):
         # Старая директория хранится до успешной публикации entrypoint — на любой сбой ниже
         # откатываем modules обратно на старое место (fail-closed: не оставляем половинчатое
         # дерево — либо оба mv успешны, либо ничего не публикуется).
+        # КРИТИЧНО (Codex round 3): КАЖДЫЙ шаг вокруг modules_old — pre-cleanup, move-aside,
+        # restore-на-любом-сбое — обязан быть проверен, не только restore после publish_entry
+        # (round 2 фикс). Непроверенный pre-cleanup `rm -rf modules_old` может не снести старый
+        # остаток предыдущего прерванного прогона; тогда move-aside `mv helper_modules_dir
+        # modules_old` попадает в ТУ ЖЕ mv-в-директорию ловушку, которую весь этот фикс закрывает,
+        # но уже на шаге pre-cleanup. Общий helper проверяет rc И постусловие (is_dir на ожидаемом
+        # месте) на каждом шаге восстановления, отдельно от rc самого mv/rm.
         modules_old = layout.helper_modules_dir.with_name(f"{layout.helper_modules_dir.name}.old")
-        runner([privoxy_system.SUDO, "/bin/rm", "-rf", "--", str(modules_old)], 15)
+        pre_cleanup = runner([privoxy_system.SUDO, "/bin/rm", "-rf", "--", str(modules_old)], 15)
+        if pre_cleanup.get("rc") != 0 or modules_old.exists():
+            _cleanup_new_paths(runner, new_paths_to_cleanup)
+            return privoxy_system._result(False, error="helper_modules_old_precleanup_failed")
         had_previous_modules = layout.helper_modules_dir.exists()
         if had_previous_modules:
             moved_aside = runner(
                 [privoxy_system.SUDO, "/bin/mv", "-f", str(layout.helper_modules_dir), str(modules_old)], 30
             )
-            if moved_aside.get("rc") != 0:
+            if moved_aside.get("rc") != 0 or not modules_old.is_dir() or layout.helper_modules_dir.exists():
                 _cleanup_new_paths(runner, new_paths_to_cleanup)
                 return privoxy_system._result(False, error=(moved_aside.get("err") or "helper_modules_old_move_failed")[:240])
         publish_modules = runner([privoxy_system.SUDO, "/bin/mv", "-f", str(modules_new), str(layout.helper_modules_dir)], 30)
         if publish_modules.get("rc") != 0:
-            if had_previous_modules:
-                runner([privoxy_system.SUDO, "/bin/mv", "-f", str(modules_old), str(layout.helper_modules_dir)], 30)
+            if had_previous_modules and not _restore_modules_old(runner, layout, modules_old):
+                return privoxy_system._result(
+                    False,
+                    error=f"helper_modules_publish_failed_rollback_restore_failed:{(publish_modules.get('err') or '')[:120]}",
+                )
             _cleanup_new_paths(runner, new_paths_to_cleanup)
             return privoxy_system._result(False, error=(publish_modules.get("err") or "helper_modules_publish_failed")[:240])
         publish_entry = runner([privoxy_system.SUDO, "/bin/mv", "-f", str(entry_new), str(layout.helper_path)], 30)
@@ -379,18 +392,16 @@ def _install_helper(runner, layout=None):
             # уже в rollback-пути. Различаем rollback failure от исходного publish failure: caller
             # обязан знать, что диск может быть в неопределённом состоянии, а не просто "publish failed".
             removed_new_modules = runner([privoxy_system.SUDO, "/bin/rm", "-rf", "--", str(layout.helper_modules_dir)], 15)
-            if removed_new_modules.get("rc") != 0:
+            if removed_new_modules.get("rc") != 0 or layout.helper_modules_dir.exists():
                 return privoxy_system._result(
                     False,
                     error=f"helper_entry_publish_failed_rollback_remove_failed:{(publish_entry.get('err') or '')[:120]}",
                 )
-            if had_previous_modules:
-                restored = runner([privoxy_system.SUDO, "/bin/mv", "-f", str(modules_old), str(layout.helper_modules_dir)], 30)
-                if restored.get("rc") != 0 or not layout.helper_modules_dir.is_dir():
-                    return privoxy_system._result(
-                        False,
-                        error=f"helper_entry_publish_failed_rollback_restore_failed:{(publish_entry.get('err') or '')[:120]}",
-                    )
+            if had_previous_modules and not _restore_modules_old(runner, layout, modules_old):
+                return privoxy_system._result(
+                    False,
+                    error=f"helper_entry_publish_failed_rollback_restore_failed:{(publish_entry.get('err') or '')[:120]}",
+                )
             _cleanup_new_paths(runner, [entry_new])
             return privoxy_system._result(False, error=(publish_entry.get("err") or "helper_entry_publish_failed")[:240])
         if had_previous_modules:
@@ -410,6 +421,19 @@ def _cleanup_new_paths(runner, paths):
             runner([privoxy_system.SUDO, "/bin/rm", "-rf", "--", str(path)], 15)
         except Exception:  # noqa: BLE001 — cleanup не должен маскировать основную ошибку.
             pass
+
+
+def _restore_modules_old(runner, layout, modules_old):
+    """Проверенное восстановление modules_old → helper_modules_dir (rollback-примитив).
+
+    Проверяет и rc, и постусловие (is_dir на ожидаемом месте) — непроверенный
+    `mv` мог молча попасть в ту же mv-в-директорию ловушку, если целевой путь
+    уже существует (см. комментарий у modules_old в _install_helper).
+    """
+    restored = runner(
+        [privoxy_system.SUDO, "/bin/mv", "-f", str(modules_old), str(layout.helper_modules_dir)], 30
+    )
+    return restored.get("rc") == 0 and layout.helper_modules_dir.is_dir()
 
 
 def _remove_via_runner(runner, path):
