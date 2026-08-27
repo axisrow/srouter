@@ -81,6 +81,7 @@ py-modules = [
     "privileged_ops",
     "lock_hierarchy",
     "direct_first",
+    "proxy_registry",
     "proxy_effective",
     "system_proxy",
 ]
