@@ -57,11 +57,18 @@ def probe_services():
     }
 
 
-def _curl_through(url, proxy=True):
+def _curl_through(url, proxy=True, proxy_url=None):
+    """curl к url напрямую (proxy=False) или через прокси. {code, ms, up}.
+
+    proxy_url задаёт КАКОЙ прокси (issue: централизованный статус): потребители ходят
+    разными путями — Claude Code через privoxy(HTTP), git/codex через xray(SOCKS5), —
+    и замер обязан бить в тот же путь, что и потребитель, иначе вердикт не про него.
+    None -> HTTP_PROXY_URL (privoxy), историческое поведение всех прежних call-site'ов.
+    """
     cmd = [CURL, "-sS", "-o", "/dev/null", "--connect-timeout", "4", "--max-time", "8",
            "-w", "%{http_code} %{time_total}"]
     if proxy:
-        cmd += ["-x", HTTP_PROXY_URL]
+        cmd += ["-x", proxy_url or HTTP_PROXY_URL]
     cmd.append(url)
     r = sys_probe.run(cmd, timeout=10)
     if r["timeout"] or not r["out"]:
