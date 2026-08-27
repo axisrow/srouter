@@ -24,6 +24,7 @@ import git_proxy  # вкл/откл git-прокси для github (через g
 import claude_proxy  # вкл/откл HTTPS_PROXY для Claude Code (~/.claude/settings.json)
 import health  # check_all для /health эндпоинта
 import proxy_registry  # единая картина прокси: кто настроен + идёт ли трафик
+import concurrent.futures  # bounded-ожидание apply: git_proxy берёт БЛОКИРУЮЩИЙ flock
 import privoxy_system  # protected system-service gate (#122)
 
 _log = logging.getLogger("srouter.dashboard_routes")
@@ -743,6 +744,55 @@ def api_proxy_overview():
     # Вайтлист значения, а не bool(строки): "0"/"false" — это ВЫКЛ, а не «непустая строка».
     probe = (request.args.get("probe") or "").strip().lower() in ("1", "true", "yes")
     return jsonify(proxy_registry.overview(probe=probe))
+
+
+# ============================ единый write-путь прокси (/api/proxy/<action>) ============================
+# Заменяет разрозненные /api/git-proxy/* и /api/claude-proxy/*: одна точка на всех
+# управляемых потребителей реестра.
+#
+# Бюджет на мутацию. git_proxy берёт БЛОКИРУЮЩИЙ cross-process flock (fcntl.LOCK_EX): если
+# лок занят CLI-процессом (`srouter install`), прямой вызов повесил бы HTTP-запрос навсегда —
+# lock_hierarchy этот путь не покрывает (там только threading.Lock, а flock межпроцессный).
+# Поэтому apply уходит в отдельный поток с ограниченным ожиданием: превышение бюджета — это
+# честный ok=false с причиной, а не бесконечный висяк на глазах у пользователя.
+_PROXY_APPLY_TIMEOUT_SEC = 25
+
+_PROXY_ACTIONS = ("enable", "disable")
+
+
+@app.post("/api/proxy/<action>")
+def api_proxy_apply(action):
+    """Включить/выключить прокси у потребителей реестра. {ok, results:[{id, ok, err}]}.
+
+    Тело: {"ids": ["git", ...]} либо {} — все управляемые. Вайтлист action в роуте
+    (канон: мутирующий роут валидирует сам, не полагаясь на нижний слой).
+    """
+    if action not in _PROXY_ACTIONS:
+        return jsonify({"ok": False, "err": f"unknown action: {action}"}), 404
+
+    payload = request.get_json(silent=True) or {}
+    ids = payload.get("ids")
+    if ids is not None and not isinstance(ids, list):
+        return jsonify({"ok": False, "err": "ids must be a list"}), 400
+    if isinstance(ids, list) and not all(isinstance(i, str) for i in ids):
+        return jsonify({"ok": False, "err": "ids must be strings"}), 400
+
+    # Зовём через атрибут модуля (proxy_registry.apply), а не через from-import: тесты
+    # подменяют именно атрибут — канон moving-caller-inverts-mock-ownership.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(lambda: proxy_registry.apply(ids, action=action))
+        try:
+            result = future.result(timeout=_PROXY_APPLY_TIMEOUT_SEC)
+        except concurrent.futures.TimeoutError:
+            # Поток остаётся висеть на flock — прервать его нельзя, но запрос отпускаем.
+            return jsonify({
+                "ok": False,
+                "err": (f"таймаут {_PROXY_APPLY_TIMEOUT_SEC}s: операция не завершилась — "
+                        "вероятно, конфиг занят другим процессом (srouter install?)"),
+                "results": [],
+            }), 504
+
+    return jsonify(result), (200 if result.get("ok") else 500)
 
 
 # ============================ /health (лёгкий healthcheck) ============================
