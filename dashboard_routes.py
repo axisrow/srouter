@@ -23,6 +23,7 @@ import isolate_firewall  # PF-изоляция доменов: зовём чер
 import git_proxy  # вкл/откл git-прокси для github (через git config --global)
 import claude_proxy  # вкл/откл HTTPS_PROXY для Claude Code (~/.claude/settings.json)
 import health  # check_all для /health эндпоинта
+import proxy_registry  # единая картина прокси: кто настроен + идёт ли трафик
 import privoxy_system  # protected system-service gate (#122)
 
 _log = logging.getLogger("srouter.dashboard_routes")
@@ -725,6 +726,23 @@ def api_claude_proxy_enable():
 def api_claude_proxy_disable():
     """Удалить env proxy-ключи из ~/.claude/settings.json. Идемпотентно."""
     return jsonify(claude_proxy.disable()), 200
+
+
+# ============================ единая картина прокси (/api/proxy/overview) ============================
+# Зачем отдельный роут, а не поле в /api/status или /health: /health документирован как
+# «мгновенный, лёгкий» (внешний мониторинг), а gather_status живёт с бюджетом 12s и кэшем
+# 1.5s на телеметрию. Парный замер direct-vs-proxy стоит секунды и нужен ПО ТРЕБОВАНИЮ.
+# GET (не POST) -> не попадает под _MUTATION_LOCK: чтение картины не должно ловить 409.
+@app.get("/api/proxy/overview")
+def api_proxy_overview():
+    """Кто куда настроен + идёт ли трафик физически.
+
+    ?probe=1 — включить runtime-пробы и парный замер (секунды). Без параметра —
+    только чтение конфигов, чтобы открытие страницы оставалось лёгким.
+    """
+    # Вайтлист значения, а не bool(строки): "0"/"false" — это ВЫКЛ, а не «непустая строка».
+    probe = (request.args.get("probe") or "").strip().lower() in ("1", "true", "yes")
+    return jsonify(proxy_registry.overview(probe=probe))
 
 
 # ============================ /health (лёгкий healthcheck) ============================
