@@ -91,7 +91,8 @@ def sync_route_ip_from_xray(name, xray_config_path=XRAY_CONFIG_PATH, path=None):
 
     Возвращает {ok: bool, route_ip: str}. ok=False если xray-конфига нет / узел не найден / битый.
     """
-    address = _read_xray_vless_address(xray_config_path)
+    tag = _routing_outbound_tag(path)
+    address = _read_xray_vless_address(xray_config_path, tag=tag)
     if not address:
         return {"ok": False, "route_ip": ""}
     try:
@@ -158,6 +159,11 @@ def _routing_outbound_tag(state_path=None):
     физически не имеет и не будет иметь tag="active" (не сгенерирован через gen_xray_config), поэтому
     read_xray_active_address должна искать именно ЭТОТ тег, а не жёстко "active". Не бросает
     (fail-soft: любая аномалия state → "active", прежнее поведение).
+
+    Используется ВСЕМИ consumer'ами read_xray_active_address/_read_xray_vless_address —
+    compare_endpoint_with_xray (detect), sync_endpoint_from_xray и sync_route_ip_from_xray (fix) —
+    иначе detect и fix расходятся по тегу (Codex cycle-review PR #313: adopt-режим считался
+    рассинхронизированным правильно, но sync молча отказывал, ища tag="active").
     """
     try:
         state, readable = local_state._load_state_checked(state_path)
@@ -226,7 +232,8 @@ def sync_endpoint_from_xray(xray_config_path=XRAY_CONFIG_PATH, path=None):
     Возвращает {ok: bool, endpoint: str, changed: bool}. ok=False если xray-конфига нет / узла нет /
     local не placeholder. Не бросает (fail-soft как sync_route_ip_from_xray).
     """
-    xr = read_xray_active_address(xray_config_path)
+    tag = _routing_outbound_tag(path)
+    xr = read_xray_active_address(xray_config_path, tag=tag)
     address = xr["address"]
     if xr["status"] != "ok" or not address:
         return {"ok": False, "endpoint": "", "changed": False}
