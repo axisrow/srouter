@@ -5,6 +5,8 @@ cross-process flock (git_proxy.py, fcntl.LOCK_EX). Flask-хендлер уже �
 _MUTATION_LOCK; если flock занят CLI-процессом (`srouter install`), HTTP-запрос повиснет
 без таймаута — lock_hierarchy этот путь не покрывает (там только threading.Lock).
 """
+import time
+
 import dashboard
 import dashboard_routes
 import proxy_registry
@@ -90,3 +92,38 @@ def test_blocking_flock_cannot_hang_the_request(monkeypatch):
     assert started.is_set()
     assert r.status_code != 200
     assert "timeout" in str(r.get_json()).lower() or "таймаут" in str(r.get_json()).lower()
+
+
+def test_timeout_response_is_actually_bounded_by_wall_clock(monkeypatch):
+    """ДЫРА (cycle-review PR #300, Codex confidence 0.99): предыдущий тест проверял только
+    статус-код/тело ответа, не реальное время. `with ThreadPoolExecutor(...) as pool:` на
+    выходе из блока вызывает pool.__exit__ -> shutdown(wait=True) БЕЗУСЛОВНО, даже когда
+    future.result() уже кинул TimeoutError раньше — return внутри with не освобождает HTTP-
+    ответ немедленно, Python сначала дожидается shutdown(wait=True), который блокируется на
+    зависшем потоке. Заявленный бюджет _PROXY_APPLY_TIMEOUT_SEC честен только на бумаге:
+    реальная latency ответа равна max(timeout, время_зависшего_потока), не timeout.
+    """
+    import threading
+    started = threading.Event()
+    STUB_SLEEP = 2.0
+    TIMEOUT = 0.3
+
+    def never_returns(ids=None, *, action):
+        started.set()
+        threading.Event().wait(STUB_SLEEP)
+        return {"ok": True, "results": []}
+
+    monkeypatch.setattr(proxy_registry, "apply", never_returns)
+    monkeypatch.setattr(dashboard_routes, "_PROXY_APPLY_TIMEOUT_SEC", TIMEOUT)
+    t0 = time.monotonic()
+    r = _post("/api/proxy/enable", {"ids": ["git"]})
+    elapsed = time.monotonic() - t0
+    assert started.is_set()
+    assert r.status_code != 200
+    # Реальный HTTP-ответ обязан вернуться в пределах заявленного бюджета (+запас на
+    # накладные расходы), а не ждать, пока зависший поток отработает свои STUB_SLEEP секунд.
+    assert elapsed < TIMEOUT + 1.0, (
+        f"ответ занял {elapsed:.2f}s при заявленном таймауте {TIMEOUT}s — "
+        f"ThreadPoolExecutor.__exit__ заблокировал возврат на зависшем потоке "
+        f"({STUB_SLEEP}s stub sleep), заявленный бюджет не соблюдается"
+    )

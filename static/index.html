@@ -1540,7 +1540,16 @@
       if (!cid) return;
       if (!tryBeginMutation('proxy:' + cid)) return;
       var row = (PROXY_DATA && PROXY_DATA.consumers || []).filter(function (c) { return c.id === cid; })[0];
-      var action = (row && row.configured === true) ? 'disable' : 'enable';
+      if (!row) {
+        // Устаревший PROXY_DATA или cid не найден — НЕ гадаем про действие (было: тихий
+        // fallback на 'enable' даже для уже настроенного потребителя, cycle-review PR #300).
+        // Честная ошибка + перечитать состояние с сервера, вместо угадывания намерения.
+        finishMutation();
+        toast(t('proxy_failed', cid).slice(0, 220), 'err');
+        loadProxyPanel(false);
+        return;
+      }
+      var action = row.configured === true ? 'disable' : 'enable';
       var orig = btn.innerHTML;
       btn.disabled = true;
       btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span>';

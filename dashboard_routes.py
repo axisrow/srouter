@@ -779,18 +779,25 @@ def api_proxy_apply(action):
 
     # Зовём через атрибут модуля (proxy_registry.apply), а не через from-import: тесты
     # подменяют именно атрибут — канон moving-caller-inverts-mock-ownership.
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(lambda: proxy_registry.apply(ids, action=action))
-        try:
-            result = future.result(timeout=_PROXY_APPLY_TIMEOUT_SEC)
-        except concurrent.futures.TimeoutError:
-            # Поток остаётся висеть на flock — прервать его нельзя, но запрос отпускаем.
-            return jsonify({
-                "ok": False,
-                "err": (f"таймаут {_PROXY_APPLY_TIMEOUT_SEC}s: операция не завершилась — "
-                        "вероятно, конфиг занят другим процессом (srouter install?)"),
-                "results": [],
-            }), 504
+    #
+    # НЕ используем `with ThreadPoolExecutor(...) as pool:` — pool.__exit__ безусловно
+    # вызывает shutdown(wait=True), который заблокирует ЭТОТ return до завершения зависшего
+    # потока, обесценивая timeout (cycle-review PR #300, Codex: заявленный бюджет был не
+    # bounded на практике). shutdown(wait=False) отпускает HTTP-ответ немедленно; поток на
+    # flock всё равно не прервать (тот же факт, что и раньше), но он больше не держит нас.
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = pool.submit(lambda: proxy_registry.apply(ids, action=action))
+    try:
+        result = future.result(timeout=_PROXY_APPLY_TIMEOUT_SEC)
+    except concurrent.futures.TimeoutError:
+        pool.shutdown(wait=False)
+        return jsonify({
+            "ok": False,
+            "err": (f"таймаут {_PROXY_APPLY_TIMEOUT_SEC}s: операция не завершилась — "
+                    "вероятно, конфиг занят другим процессом (srouter install?)"),
+            "results": [],
+        }), 504
+    pool.shutdown(wait=False)
 
     return jsonify(result), (200 if result.get("ok") else 500)
 
