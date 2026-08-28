@@ -291,8 +291,14 @@ def check_all(*, active_claude=False):
         # curl к github/z.ai = сетевой overhead/поверхность, не для лёгкого /health/watchdog (как
         # _installed_versions_check/_codex_isolation_check). Каскад #201: ...→VPS→прокси→GFW per-domain.
         gfw = _gfw_domain_check()
+        # category несёт НАСТОЯЩИЙ статус пробы (канон vendor-outage у туннеля, #207): ok=False
+        # означает лишь «не подтверждено здоровым» и покрывает И gfw, И info («контрольный домен
+        # недоступен — тест неприменим»). Совет «GFW режет домен» верен ТОЛЬКО для gfw, поэтому
+        # _print_report гейтится на category, а не восстанавливает статус из перегруженного ok.
         gfw_check = {"name": "GFW per-domain (github vs z.ai прямой curl)",
                      "ok": gfw["status"] == "ok", "info": True, "detail": gfw["detail"]}
+        if gfw["status"] == "gfw":
+            gfw_check["category"] = "gfw"
         checks.append(gfw_check)
         # #197 direct-first: какие candidate-домены (z.ai BUILTIN + user direct_domains) идут
         # напрямую (NO_PROXY) — переживают смерть VPS. info-only ВСЕГДА (как GFW-чек выше) — картина,
@@ -512,13 +518,16 @@ def _print_report(result):
             print("  • upstream VPS: прямой TCP-зонд до endpoint не прошёл — VPS мёртв (не локальный прокси!).")
             print("    Проверь: заплачен/запущен ли VPS, не упал ли хостинг, верный ли endpoint_host:port в узле")
         # #206: GFW режет домен избирательно. Чек info-only (не driver) → не в failed_names; сканируем
-        # checks напрямую по имени + ok=False (status=="gfw"). GFW — scoped-диагностика домена:
+        # checks напрямую по имени + category=="gfw". Гейт именно на category, НЕ на ok=False: ok
+        # у info-чеков означает «подтверждено здоровым», и «контрольный домен недоступен» (info —
+        # проба явно говорит «не GFW») тоже даёт ok=False. Совет по нему был бы ложью («контрольный
+        # домен отвечает» при мёртвой сети) и уводил бы от настоящей причины. GFW — scoped-диагностика домена:
         # VPS/прокси НЕ виноваты, режущийся домен блокируется по TLS-fingerprint. Подсказка — прокси/VPS
         # для домена. Конкретные имена доменов НЕ хардкодим тут (как раньше «github»): detail чека уже
         # generic по GFW_PROBE_DOMAINS — если список расширится (anthropic и др.), совет останется верным.
         # Канон: verify-dont-guess (точная причина — прямой curl: target режется, контрольный z.ai ок).
         gfw_check = next((c for c in result["checks"] if "GFW per-domain" in c["name"]), None)
-        if gfw_check and not gfw_check["ok"]:
+        if gfw_check and gfw_check.get("category") == "gfw":
             print(f"  • GFW режет домен: {gfw_check.get('detail', 'домен')} — это НЕ «VPS мёртв» и НЕ "
                   f"«локальный прокси» (GFW избирательно блокирует по TLS, контрольный домен отвечает).")
             print("    Решение: гони режущийся домен через прокси/VPS (gh: env -u снимает scoped git-proxy; "

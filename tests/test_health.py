@@ -1828,6 +1828,64 @@ def test_no_check_claims_ok_while_status_not_ok(monkeypatch):
     assert not liars, f"ok=True при status != ok — ✅ на непроверенном: {liars}"
 
 
+# ===== GFW-совет гейтится на status=="gfw", а не на ok (cycle-review PR #296, раунд 3) =====
+# РЕГРЕССИЯ, внесённая в 4fc8d84 (Codex P2): _print_report читал `not gfw_check["ok"]` как прокси
+# для «status == gfw» — комментарий рядом это прямо и декларировал. После выравнивания ok на
+# `status == "ok"` условие стало истинным и для status="info" («контрольный домен недоступен —
+# GFW-тест неприменим»), и doctor при ОБЩЕМ СБОЕ СЕТИ уверенно советовал «GFW режет домен...
+# контрольный домен отвечает» — прямо противореча пробе и уводя от настоящей причины.
+# Корень тот же, что у всего PR: потребитель склеивал две оси (здесь «не ok» ≠ «GFW»). Чиним
+# как везде — несём НАСТОЯЩИЙ статус в чек (канон category, как vendor-outage у туннеля #207),
+# а не откатываем ok обратно в перегруженный флаг.
+
+
+def test_gfw_advice_only_when_domain_actually_cut(monkeypatch, capsys):
+    """status="gfw" → совет про GFW печатается (положительный путь сохранён)."""
+    health._print_report({"status": "degraded", "checks": [
+        {"name": "privoxy (8118)", "ok": False, "detail": "порт закрыт"},
+        {"name": "GFW per-domain (github vs z.ai прямой curl)", "ok": False, "info": True,
+         "category": "gfw", "detail": "github режется, контрольный z.ai отвечает"},
+    ]})
+    out = capsys.readouterr().out
+    assert "GFW режет домен" in out, f"реальный GFW обязан давать совет, got:\n{out}"
+
+
+def test_no_gfw_advice_when_probe_inapplicable(capsys):
+    """status="info" («контрольный домен недоступен») → совета про GFW НЕТ.
+
+    Общий сбой сети: проба явно говорит «не GFW». Совет «контрольный домен отвечает» здесь
+    ложь и уводит от настоящей причины (сеть/DNS), которую doctor печатает выше.
+    """
+    health._print_report({"status": "degraded", "checks": [
+        {"name": "privoxy (8118)", "ok": False, "detail": "порт закрыт"},
+        {"name": "GFW per-domain (github vs z.ai прямой curl)", "ok": False, "info": True,
+         "detail": "контрольный домен недоступен — GFW-тест неприменим (общий сбой сети)"},
+    ]})
+    out = capsys.readouterr().out
+    assert "GFW режет домен" not in out, \
+        f"«не смогли проверить» ≠ «GFW режет» — ложный совет уводит от причины, got:\n{out}"
+
+
+def test_gfw_check_carries_status_category(monkeypatch):
+    """check_all несёт настоящий статус GFW-пробы в category (не восстанавливать его из ok)."""
+    _all_up_monkey(monkeypatch)
+    monkeypatch.setattr(health, "_gfw_domain_check",
+                        lambda *a, **kw: {"status": "gfw", "detail": "github режется"})
+    c = _check_by_name(health.check_all(active_claude=True), "GFW per-domain")
+    assert c.get("category") == "gfw", f"реальный GFW помечен category=gfw, got: {c}"
+    assert c["ok"] is False and c.get("info") is True, f"GFW не driver, но и не ✅, got: {c}"
+
+
+def test_gfw_check_info_is_not_categorized_gfw(monkeypatch):
+    """status="info" не получает category=gfw — иначе совет вернётся через другую дверь."""
+    _all_up_monkey(monkeypatch)
+    monkeypatch.setattr(health, "_gfw_domain_check",
+                        lambda *a, **kw: {"status": "info", "detail": "контрольный домен недоступен"})
+    c = _check_by_name(health.check_all(active_claude=True), "GFW per-domain")
+    assert c.get("category") != "gfw", f"«неприменимо» ≠ GFW, got: {c}"
+    assert c["ok"] is False, f"непроверенное ≠ ✅ (инвариант раунда 2), got: {c}"
+
+
 # --- #207 edge-cases (Codex cycle-review P1#2, P2#4): vacuous-truth guard + no-response/bad-code ---
 def _tunnel_curl_raw_per_target(responses):
     """Мок sys_probe.run с RAW-ответом per-URL: {"anthropic": {"out": "", "timeout": False}, ...}.
