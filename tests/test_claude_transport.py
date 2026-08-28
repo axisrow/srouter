@@ -203,3 +203,70 @@ def test_dashboard_health_and_watchdog_never_request_active_probe(monkeypatch, t
     assert response.status_code == 200
     assert health.cmd_watchdog() == 0
     assert seen == [False, False]
+
+
+# --- Regression: детектор 401 разошёлся с реальным форматом stream-json ------------------
+#
+# Захвачено с живого Claude Code 2.1.250 (замер 2026-08-28): успешный транспорт приходит
+# СТРОКОЙ api_retry с полем error_status, а НЕ result-строкой с api_error_status.
+# Исходный детектор (#127, ac99000) искал api_error_status — ключ, которого CLI не пишет:
+# grep -c api_error_status по живому выводу = 0. Успешная ветка была недостижима ПРИ ЛЮБОМ
+# состоянии сети, а сам 401 поглощался веткой _has_api_retry → "Connection error / timeout".
+# Моки старых тестов воспроизводили несуществующий формат и консервировали дефект.
+_REAL_CLI_401_LINE = json.dumps({
+    "type": "system", "subtype": "api_retry", "attempt": 1, "max_retries": 10,
+    "retry_delay_ms": 523, "error_status": 401, "error": "authentication_failed",
+    "session_id": "1aa59d24-10b4-4c71-a0f2-477e9fa9a0d1",
+})
+# Тот же CLI, но прокси мёртв (контроль, порт 9): error_status=null, error=unknown.
+_REAL_CLI_DEAD_PROXY_LINE = json.dumps({
+    "type": "system", "subtype": "api_retry", "attempt": 1, "max_retries": 10,
+    "retry_delay_ms": 532, "error_status": None, "error": "unknown",
+    "session_id": "1aa59d24-10b4-4c71-a0f2-477e9fa9a0d1",
+})
+
+
+def test_real_cli_stream_json_401_is_transport_proof(monkeypatch):
+    """error_status=401 внутри api_retry = транспорт работает.
+
+    Регрессия: детектор искал api_error_status (CLI такого не пишет) и классифицировал
+    успешный 401 как "Connection error / timeout" — ложноотрицательный ❌ в srouter doctor
+    при полностью исправном канале.
+    """
+    monkeypatch.setattr(health, "_find_claude_binary", lambda: "/fake/claude")
+    monkeypatch.setattr(
+        health.sys_probe, "run",
+        lambda cmd, timeout, *, env=None: _result(out=_REAL_CLI_401_LINE, timeout=True),
+    )
+
+    result = health._claude_transport_once(HTTP_PROXY)
+
+    assert result["status"] == "ok", result["detail"]
+    assert result["api_status"] == 401
+    assert "Connection error" not in result["detail"]
+
+
+def test_real_cli_retry_without_api_response_stays_down(monkeypatch):
+    """error_status=null (мёртвый прокси) — по-прежнему down. Защита от переусердствования."""
+    monkeypatch.setattr(health, "_find_claude_binary", lambda: "/fake/claude")
+    monkeypatch.setattr(
+        health.sys_probe, "run",
+        lambda cmd, timeout, *, env=None: _result(out=_REAL_CLI_DEAD_PROXY_LINE, timeout=True),
+    )
+
+    result = health._claude_transport_once(HTTP_PROXY)
+
+    assert result["status"] == "down"
+    assert "Connection error" in result["detail"]
+
+
+def test_legacy_api_error_status_401_still_accepted(monkeypatch):
+    """Старый формат result/api_error_status не ломаем — версии CLI могут отличаться."""
+    monkeypatch.setattr(health, "_find_claude_binary", lambda: "/fake/claude")
+    payload = json.dumps({"type": "result", "is_error": True, "api_error_status": 401})
+    monkeypatch.setattr(
+        health.sys_probe, "run",
+        lambda cmd, timeout, *, env=None: _result(out=payload),
+    )
+
+    assert health._claude_transport_once(HTTP_PROXY)["status"] == "ok"

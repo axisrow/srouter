@@ -158,14 +158,25 @@ def _find_claude_binary():
 
 
 def _has_expected_api_401(output):
-    """Только structured api_error_status=401 считается положительным transport proof."""
+    """Structured 401 от API — положительный transport proof (ответ реально дошёл).
+
+    Два ключа, потому что формат stream-json разошёлся по версиям CLI: живой Claude Code
+    2.1.x пишет error_status внутри строки api_retry, а исходный детектор (#127) искал
+    api_error_status, которого CLI не выдаёт — успешная ветка была недостижима ПРИ ЛЮБОМ
+    состоянии сети, и здоровый транспорт печатался как "Connection error / timeout".
+    Сравниваем строго с 401: error_status=null (мёртвый прокси — контрольный замер на
+    порту 9) НЕ должен пройти как успех, иначе проба перестанет отличать живой канал.
+    """
     for line in output.splitlines():
         try:
             payload = json.loads(line)
         except (TypeError, ValueError):
             continue
-        if isinstance(payload, dict) and payload.get("api_error_status") == 401:
-            return True
+        if not isinstance(payload, dict):
+            continue
+        for key in ("api_error_status", "error_status"):
+            if payload.get(key) == 401:
+                return True
     return False
 
 
