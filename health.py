@@ -113,7 +113,7 @@ def check_all(*, active_claude=False):
     # placeholder TEST-NET / нет узла → info (картина, не сбой). Канон: verify-don't-guess.
     vps = _upstream_vps_reachable()
     vps_check = {"name": "upstream VPS (TCP-коннект до endpoint, минуя прокси)",
-                 "ok": True, "info": True, "detail": vps["detail"]}
+                 "ok": vps["status"] == "ok", "info": True, "detail": vps["detail"]}
     if net["up"] and dns["up"] and not tun_ok and vps["status"] == "down":
         # VPS мёртв + туннель fail + сеть есть + DNS работает → driver: усиливаем до DOWN.
         vps_check["ok"] = False
@@ -163,8 +163,12 @@ def check_all(*, active_claude=False):
     # driver держал вердикт на degraded, даже когда все реальные driver-чеки (порты/туннель/прокси)
     # мертвы. status у _endpoint_override_check() — только ok/info (никогда down/warn), значит он
     # органически не может сигналить о сбое стека — driver-роль была ошибкой агрегации.
+    # ok отражает СТАТУС чека, а не «не роняй вердикт» (роль info): status=info у этого чека
+    # означает WARN (override уводит CC мимо туннеля, #129) — захардкоженный ok=True выдавал его
+    # за подтверждённое здоровье. Раньше это скрывала info-ветка рендера; ok-first её убрал.
     eo = _endpoint_override_check()
-    eo_check = {"name": "endpoint (ANTHROPIC_BASE_URL)", "ok": True, "info": True, "detail": eo["detail"]}
+    eo_check = {"name": "endpoint (ANTHROPIC_BASE_URL)", "ok": eo["status"] == "ok",
+                "info": True, "detail": eo["detail"]}
     checks.append(eo_check)
     # endpoint-xray sync (#200): рассинхрон active_node (local.json) ↔ рабочий xray config.
     # info-only ВСЕГДА (как endpoint-override) — картина для диагностики + подсказка `srouter sync`,
@@ -172,7 +176,7 @@ def check_all(*, active_claude=False):
     # warn (рассинхрон) показываем в detail, но НЕ driver: apply-защита (#200 в install_lib) —
     # настоящая fail-closed граница от перезаписи; doctor лишь подсвечивает расхождение.
     exs = _endpoint_xray_sync_check()
-    exs_check = {"name": "endpoint (local.json ↔ xray sync)", "ok": exs["status"] != "warn",
+    exs_check = {"name": "endpoint (local.json ↔ xray sync)", "ok": exs["status"] == "ok",
                  "info": True, "detail": exs["detail"]}
     checks.append(exs_check)
     # Desktop App proxy (#134): SOCKS5 в launchctl = broken Desktop App; warn = CLI/Desktop
@@ -211,13 +215,17 @@ def check_all(*, active_claude=False):
     # указывает на несуществующий путь → down DRIVER. Реальный инцидент: 1419 падений подряд в
     # тишине — doctor читал plist-артефакт, а не состояние job'а. Без codenv Codex после ребута
     # идёт напрямую за GFW (fail-closed-proxy-down) → это настоящий сбой стека, не info-шёпот.
-    # ok (здоровый job) — обычный ✅ БЕЗ info-флага: _print_report рендерит любой info-чек жёлтым
-    # ⚠️, что для здоровой установки и есть запрещённый каноном #135 шум (cycle-review PR #262).
+    # ok (здоровый job) — обычный ✅ БЕЗ info-флага: подтверждённо здоров ≠ «не смогли проверить».
+    # (Исторически PR #262 выбрал ok ещё и потому, что _print_report красил ЛЮБОЙ info-чек жёлтым;
+    # тот баг рендера исправлен — ok читается первым — но выбор верен по существу, а не как обход.)
     # unknown (job не загружен — codenv опционален / launchctl недоступен / exit-код неизвестен) —
     # info-only: не роняет вердикт, но и не притворяется подтверждённо здоровым.
     cj = _codenv_job_check()
+    # ok == «проверено и прошло» (только status ok), НЕ «не down»: unknown — это «не смогли
+    # проверить», и ok=True выдавал его за здоровье (✅ «состояние не определено» — fail-open).
+    # info=True держит его вне агрегации вердикта — обе оси остаются независимыми.
     cj_check = {"name": "codenv LaunchAgent (job launchd)",
-                "ok": cj["status"] != "down", "detail": cj["detail"]}
+                "ok": cj["status"] == "ok", "detail": cj["detail"]}
     if cj["status"] == "unknown":
         cj_check["info"] = True
     checks.append(cj_check)
@@ -227,7 +235,7 @@ def check_all(*, active_claude=False):
     # одного клиента (codex-расширение), не общий вердикт стека. Runtime-маршрут codex ловит cx_check выше.
     vp = _vscode_proxy_check()
     vp_check = {"name": "codex vscode-proxy (http.proxy)",
-                "ok": vp["status"] != "down", "info": True, "detail": vp["detail"]}
+                "ok": vp["status"] == "ok", "info": True, "detail": vp["detail"]}
     checks.append(vp_check)
     # gh/git VPS-независимый dev-workflow (#199): github доступен напрямую через gh (Go-стек обходит
     # GFW TLS); scoped git-proxy → privoxy делает git pull/push VPS-зависимым. info-only ВСЕГДА (как
@@ -235,7 +243,7 @@ def check_all(*, active_claude=False):
     # (git-proxy ВКЛ) подсказывает env -u, не роняя вердикт. Лёгкий чек (git config --get, как git_proxy).
     gh = _github_direct_check()
     gh_check = {"name": "gh/git direct (github env -u)",
-                "ok": gh["status"] != "warn", "info": True, "detail": gh["detail"]}
+                "ok": gh["status"] == "ok", "info": True, "detail": gh["detail"]}
     checks.append(gh_check)
     # Установленные codex/claude-code binary на диске (#145): инвентаризация, info-only ВСЕГДА
     # (несколько версий — ранний сигнал конфликта #135, не сбой стека). unknown (ничего не установлено)
@@ -257,13 +265,13 @@ def check_all(*, active_claude=False):
         checks.append(rmo_check)
         iv = _installed_versions_check()
         iv_check = {"name": "версии (codex/claude-code на диске)",
-                    "ok": True, "info": True, "detail": iv["detail"]}
+                    "ok": iv["status"] == "ok", "info": True, "detail": iv["detail"]}
         checks.append(iv_check)
         # Privoxy-log observability (#152): молчалив ли privoxy? debug включён? logfile пишет?
         # info-only (не driver) — картина для диагностики флапа к github через 8118; WARN в detail.
         plo = _privoxy_log_observability_check()
         plo_check = {"name": "privoxy-log (observability)",
-                     "ok": plo["status"] != "warn", "info": True, "detail": plo["detail"]}
+                     "ok": plo["status"] == "ok", "info": True, "detail": plo["detail"]}
         checks.append(plo_check)
         # PF codex kill-switch (#186): info-only ВСЕГДА (не driver) — незамкнутая граница на
         # нормальных установках (codex под user-UID 501, sudo -u = follow-up) — НЕ роняет вердикт
@@ -283,8 +291,14 @@ def check_all(*, active_claude=False):
         # curl к github/z.ai = сетевой overhead/поверхность, не для лёгкого /health/watchdog (как
         # _installed_versions_check/_codex_isolation_check). Каскад #201: ...→VPS→прокси→GFW per-domain.
         gfw = _gfw_domain_check()
+        # category несёт НАСТОЯЩИЙ статус пробы (канон vendor-outage у туннеля, #207): ok=False
+        # означает лишь «не подтверждено здоровым» и покрывает И gfw, И info («контрольный домен
+        # недоступен — тест неприменим»). Совет «GFW режет домен» верен ТОЛЬКО для gfw, поэтому
+        # _print_report гейтится на category, а не восстанавливает статус из перегруженного ok.
         gfw_check = {"name": "GFW per-domain (github vs z.ai прямой curl)",
-                     "ok": gfw["status"] != "gfw", "info": True, "detail": gfw["detail"]}
+                     "ok": gfw["status"] == "ok", "info": True, "detail": gfw["detail"]}
+        if gfw["status"] == "gfw":
+            gfw_check["category"] = "gfw"
         checks.append(gfw_check)
         # #197 direct-first: какие candidate-домены (z.ai BUILTIN + user direct_domains) идут
         # напрямую (NO_PROXY) — переживают смерть VPS. info-only ВСЕГДА (как GFW-чек выше) — картина,
@@ -454,9 +468,14 @@ def _print_report(result):
     """Человекочитаемый отчёт check_all (для doctor). Вывод в stdout."""
     print(f"srouter health: {result['status'].upper()}\n")
     for c in result["checks"]:
-        # info-only check: endpoint-override (WARN), claude-proxy idle (нейтрально).
-        # ⚠️ — жёлтый треугольник (привлекает внимание, но не ❌): override/idle, а не «всё мертво».
-        mark = "⚠️" if c.get("info") else ("✅" if c["ok"] else "❌")
+        # info — ось «не участвует в агрегации вердикта» (drivers ниже), ОРТОГОНАЛЬНАЯ оси
+        # «прошло/не прошло». ok читается ПЕРВЫМ: иначе info перекрывает его и успешные проверки
+        # («DNS резолвит», «сеть активна») рисуются жёлтым — шум, в котором тонут реальные ❌.
+        # ⚠️ = не-driver требует внимания (намеренный tradeoff #189, PF-lease «по выбору»), не «сломано».
+        if c["ok"]:
+            mark = "✅"
+        else:
+            mark = "⚠️" if c.get("info") else "❌"
         detail = f" ({c['detail']})" if c.get("detail") else ""
         print(f"  {mark} {c['name']}{detail}")
     if result["status"] != "ok":
@@ -499,13 +518,16 @@ def _print_report(result):
             print("  • upstream VPS: прямой TCP-зонд до endpoint не прошёл — VPS мёртв (не локальный прокси!).")
             print("    Проверь: заплачен/запущен ли VPS, не упал ли хостинг, верный ли endpoint_host:port в узле")
         # #206: GFW режет домен избирательно. Чек info-only (не driver) → не в failed_names; сканируем
-        # checks напрямую по имени + ok=False (status=="gfw"). GFW — scoped-диагностика домена:
+        # checks напрямую по имени + category=="gfw". Гейт именно на category, НЕ на ok=False: ok
+        # у info-чеков означает «подтверждено здоровым», и «контрольный домен недоступен» (info —
+        # проба явно говорит «не GFW») тоже даёт ok=False. Совет по нему был бы ложью («контрольный
+        # домен отвечает» при мёртвой сети) и уводил бы от настоящей причины. GFW — scoped-диагностика домена:
         # VPS/прокси НЕ виноваты, режущийся домен блокируется по TLS-fingerprint. Подсказка — прокси/VPS
         # для домена. Конкретные имена доменов НЕ хардкодим тут (как раньше «github»): detail чека уже
         # generic по GFW_PROBE_DOMAINS — если список расширится (anthropic и др.), совет останется верным.
         # Канон: verify-dont-guess (точная причина — прямой curl: target режется, контрольный z.ai ок).
         gfw_check = next((c for c in result["checks"] if "GFW per-domain" in c["name"]), None)
-        if gfw_check and not gfw_check["ok"]:
+        if gfw_check and gfw_check.get("category") == "gfw":
             print(f"  • GFW режет домен: {gfw_check.get('detail', 'домен')} — это НЕ «VPS мёртв» и НЕ "
                   f"«локальный прокси» (GFW избирательно блокирует по TLS, контрольный домен отвечает).")
             print("    Решение: гони режущийся домен через прокси/VPS (gh: env -u снимает scoped git-proxy; "

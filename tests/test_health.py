@@ -1569,6 +1569,322 @@ def test_print_report_tunnel_fail_no_vendor_outage_advises_node(monkeypatch, cap
     assert health.VENDOR_OUTAGE_MARKER not in out
 
 
+# ==================== рендер _print_report: info ⊥ ok (две независимые оси) ====================
+# ДЫРА: `mark = "⚠️" if c.get("info") else (...)` читал info РАНЬШЕ ok → для info-чека ok не
+# читался никогда. Но info означает «не участвует в агрегации вердикта» (drivers), а НЕ «есть о
+# чём предупредить». Оси ортогональны; рендер склеил их и потерял ok → 12 успешных проверок
+# (DNS резолвит, сеть активна, VPS доступен...) рисовались жёлтым, и в этом шуме тонули
+# реальные ❌. PR #262 обошёл это точечно для codenv, деформировав семантику одного чека
+# вместо одной строки рендера. Канон: fix-once-document-decisions.
+_MARK_OK, _MARK_WARN, _MARK_FAIL = "✅", "⚠️", "❌"
+
+
+
+def test_print_report_healthy_info_check_renders_ok_not_warning(capsys):
+    """info + ok=True → ✅, НЕ ⚠️ (главный кейс: «DNS резолвит» помечался предупреждением)."""
+    health._print_report({"status": "ok", "checks": [
+        {"name": "DNS (резолв тестового домена)", "ok": True, "info": True,
+         "detail": "DNS резолвит: github.com (резолвер работает)"},
+    ]})
+    out = capsys.readouterr().out
+    assert _MARK_OK in out, f"здоровый info-чек = ✅ (info ≠ предупреждение), got:\n{out}"
+    assert _MARK_WARN not in out, \
+        f"успешная проверка НЕ может быть ⚠️ — info это «не driver», а не «сломано», got:\n{out}"
+
+
+def test_print_report_info_check_not_ok_stays_warning(capsys):
+    """info + ok=False → ⚠️ сохраняется (намеренный tradeoff #189 / PF-lease «по выбору»).
+
+    Гвард от переусердствования: чиня жёлтое-на-здоровом, нельзя убить жёлтое-на-больном.
+    """
+    health._print_report({"status": "degraded", "checks": [
+        {"name": "desktop proxy (launchctl)", "ok": False, "info": True,
+         "detail": "SOCKS5 в launchctl = srouter codenv (#189) — намеренный tradeoff"},
+    ]})
+    out = capsys.readouterr().out
+    assert _MARK_WARN in out, f"не-driver требует внимания = ⚠️, got:\n{out}"
+    assert _MARK_FAIL not in out, f"info-чек НЕ ❌ (не роняет вердикт), got:\n{out}"
+
+
+def test_print_report_driver_marks_unchanged(capsys):
+    """driver-чеки (без info) не затронуты: ok→✅, fail→❌."""
+    health._print_report({"status": "degraded", "checks": [
+        {"name": "privoxy (8118)", "ok": True, "detail": ""},
+        {"name": "codex-proxy (маршрут TUI)", "ok": False, "detail": "идёт напрямую"},
+    ]})
+    out = capsys.readouterr().out
+    privoxy_line = next(ln for ln in out.splitlines() if "privoxy" in ln)
+    codex_line = next(ln for ln in out.splitlines() if "codex-proxy" in ln)
+    assert _MARK_OK in privoxy_line, f"driver ok = ✅, got: {privoxy_line}"
+    assert _MARK_FAIL in codex_line, f"driver fail = ❌, got: {codex_line}"
+    assert _MARK_WARN not in out, f"driver-чеки не жёлтые, got:\n{out}"
+
+
+def test_print_report_healthy_stack_has_no_warning_noise(capsys):
+    """Интеграция: здоровый стек не даёт ⚠️-шума, реальный ❌ видно сразу.
+
+    Ровно тот отчёт, с которым пришёл пользователь: 16 жёлтых строк при 2 настоящих сбоях.
+    """
+    healthy_info = [
+        {"name": n, "ok": True, "info": True, "detail": d} for n, d in (
+            ("сеть (default route / активный интерфейс)", "сеть активна: default route через ppp0"),
+            ("DNS (резолв тестового домена)", "DNS резолвит: github.com"),
+            ("upstream VPS (TCP-коннект до endpoint)", "endpoint placeholder TEST-NET"),
+            ("локальный прокси (privoxy/xray service-status)", "локальный прокси жив"),
+            ("gh/git direct (github env -u)", "github идёт напрямую"),
+        )
+    ]
+    checks = ([{"name": "privoxy (8118)", "ok": True, "detail": ""}] + healthy_info
+              + [{"name": "codex-proxy (маршрут TUI)", "ok": False, "detail": "напрямую"}])
+    health._print_report({"status": "degraded", "checks": checks})
+    out = capsys.readouterr().out
+    assert out.count(_MARK_WARN) == 0, \
+        f"здоровые info-чеки не шумят жёлтым (было 16 таких строк), got:\n{out}"
+    assert out.count(_MARK_FAIL) == 1, f"единственный реальный сбой виден, got:\n{out}"
+    assert out.count(_MARK_OK) == 6, f"5 info-ok + 1 driver-ok = ✅, got:\n{out}"
+
+
+
+# ===== ok ≠ «не смогли проверить»: третья ось, склеенная в ok у производителей (cycle-review PR #296) =====
+# ДЫРА (Codex P2): рендер стал читать ok ПЕРВЫМ — корректно. Но два производителя ставили ok=True
+# не в значении «прошло», а в значении «не роняй вердикт»: codenv unknown («launchctl недоступен»)
+# и endpoint-override (докстринг _endpoint_override_check: «Иначе → info (WARN)», а check_all
+# хардкодил ok=True). Раньше их скрывала info-ветка рендера; после фикса рендера они рисуются ✅ —
+# «состояние не определено» и «нестандартный endpoint в обход туннеля» выдаются за подтверждённое
+# здоровье. Это fail-open (verify-dont-guess), и чинить его надо У ИСТОЧНИКА: ok обязан значить
+# «проверено и прошло», иначе рендер снова придётся деформировать под потребителя (fix-once).
+
+
+def _check_by_name(result, needle):
+    """Единственный чек, чьё имя содержит needle (падает громко, если ноль/несколько)."""
+    hits = [c for c in result["checks"] if needle.lower() in c["name"].lower()]
+    assert len(hits) == 1, f"ожидался ровно один чек с {needle!r}, got: {[c['name'] for c in hits]}"
+    return hits[0]
+
+
+def test_codenv_unknown_is_not_ok_in_check_all(monkeypatch):
+    """codenv unknown («launchctl недоступен») → ok=False + info=True, НЕ ok=True.
+
+    info говорит «не driver» (вердикт не роняем), ok=False — «здоровье НЕ подтверждено».
+    Комментарий check_all обещает ровно это: «не притворяется подтверждённо здоровым».
+    """
+    _all_up_monkey(monkeypatch)
+    monkeypatch.setattr(health, "_codenv_job_check", lambda *a, **kw: {
+        "status": "unknown", "detail": "состояние не определено (launchctl print недоступен/таймаут)"})
+    cj = _check_by_name(health.check_all(), "codenv")
+    assert cj.get("info") is True, f"unknown не роняет вердикт (info), got: {cj}"
+    assert cj["ok"] is False, f"«не смогли проверить» ≠ ok — иначе рендер даст ✅, got: {cj}"
+
+
+def test_codenv_ok_stays_ok_in_check_all(monkeypatch):
+    """Гвард от переусердствования: ДОКАЗАННО здоровый codenv остаётся ok=True без info."""
+    _all_up_monkey(monkeypatch)
+    monkeypatch.setattr(health, "_codenv_job_check", lambda *a, **kw: {
+        "status": "ok", "detail": "codenv LaunchAgent загружен и здоров (last exit code = 0)"})
+    cj = _check_by_name(health.check_all(), "codenv")
+    assert cj["ok"] is True and not cj.get("info"), f"здоровый codenv = driver-✅, got: {cj}"
+
+
+def test_endpoint_override_is_not_ok_in_check_all(monkeypatch):
+    """Нестандартный endpoint (status=info=WARN) → ok=False + info=True, НЕ захардкоженный ok=True.
+
+    #129: CC уходит мимо туннеля на чужой endpoint. Это ровно то, о чём doctor обязан
+    предупредить — ✅ здесь скрывает утечку trust boundary за «здоровьем».
+    """
+    _all_up_monkey(monkeypatch)
+    monkeypatch.setattr(health, "_read_endpoint_config", lambda: {
+        "base_url": "https://api.z.ai/api/anthropic", "no_proxy": "", "source": "settings.json"})
+    eo = _check_by_name(health.check_all(), "ANTHROPIC_BASE_URL")
+    assert eo.get("info") is True, f"endpoint-override не driver (info), got: {eo}"
+    assert eo["ok"] is False, f"override = WARN, а не подтверждённое здоровье, got: {eo}"
+
+
+def test_endpoint_standard_is_ok_in_check_all(monkeypatch):
+    """Гвард: стандартный endpoint (status=ok) остаётся ok=True + info=True → ✅ без шума."""
+    _all_up_monkey(monkeypatch)
+    monkeypatch.setattr(health, "_read_endpoint_config",
+                        lambda: {"base_url": "", "no_proxy": "", "source": "shell"})
+    eo = _check_by_name(health.check_all(), "ANTHROPIC_BASE_URL")
+    assert eo["ok"] is True and eo.get("info") is True, f"стандартный endpoint = тихий ✅, got: {eo}"
+
+
+def test_unverified_checks_render_warning_not_ok(monkeypatch, capsys):
+    """Связка check_all → _print_report: «не смогли проверить» и override дают ⚠️, не ✅.
+
+    Именно эту связку сломал бы фикс рендера в одиночку: обе строки печатались ✅ с текстом
+    «состояние не определено» / «нестандартный endpoint» — fail-open в лицо пользователю.
+    """
+    _all_up_monkey(monkeypatch)
+    monkeypatch.setattr(health, "_codenv_job_check", lambda *a, **kw: {
+        "status": "unknown", "detail": "состояние не определено (launchctl print недоступен/таймаут)"})
+    monkeypatch.setattr(health, "_read_endpoint_config", lambda: {
+        "base_url": "https://api.z.ai/api/anthropic", "no_proxy": "", "source": "settings.json"})
+    health._print_report(health.check_all())
+    out = capsys.readouterr().out
+    codenv_line = next(ln for ln in out.splitlines() if "codenv" in ln.lower())
+    endpoint_line = next(ln for ln in out.splitlines() if "ANTHROPIC_BASE_URL" in ln)
+    assert _MARK_WARN in codenv_line, f"непроверенное здоровье = ⚠️, got: {codenv_line}"
+    assert _MARK_OK not in codenv_line, f"«не определено» НЕ ✅, got: {codenv_line}"
+    assert _MARK_WARN in endpoint_line, f"endpoint-override = ⚠️, got: {endpoint_line}"
+    assert _MARK_OK not in endpoint_line, f"override мимо туннеля НЕ ✅, got: {endpoint_line}"
+
+
+# ===== ok-misuse — КЛАСС, а не отдельные случаи (cycle-review PR #296, раунд 2) =====
+# Раунд 1 починил codenv и endpoint-override. Codex (P2, раунд 2) показал vscode-proxy с той же
+# формулой `ok = status != "down"`. Аудит check_all нашёл ЕЩЁ ЧЕТЫРЕ производителя того же класса:
+# хардкод ok=True (upstream VPS, версии) и `!= "warn"` (xray-sync, gh-direct, privoxy-log).
+# Инвариант (а не перечень случаев): ok == «проверено и прошло» == status == "ok". Всё остальное
+# (unknown «не смогли проверить», warn, info «неприменим», down) — НЕ ok. Ось «не роняй вердикт»
+# выражается ТОЛЬКО через info. Худший кейс: «VPS не отвечает: TCP timeout» печатался ✅.
+# Канон: fix-once-document-decisions — чиним инвариант, иначе следующий вариант придёт третьим раундом.
+
+_OK_INVARIANT_CASES = [
+    # (needle имени чека, имя мокаемого чека, статус «не ok», ожидаемый detail-фрагмент)
+    ("vscode-proxy", "_vscode_proxy_check", "unknown", "не задан"),
+    ("local.json ↔ xray", "_endpoint_xray_sync_check", "info", "неприменим"),
+    ("gh/git direct", "_github_direct_check", "unknown", "timeout"),
+    ("версии", "_installed_versions_check", "unknown", "не установлено"),
+    ("privoxy-log", "_privoxy_log_observability_check", "info", "неприменим"),
+    ("GFW per-domain", "_gfw_domain_check", "info", "нет доменов для GFW-теста"),
+]
+
+
+@_pytest.mark.parametrize("needle,attr,status,detail", _OK_INVARIANT_CASES,
+                          ids=[c[0] for c in _OK_INVARIANT_CASES])
+def test_non_ok_status_is_not_rendered_ok(monkeypatch, needle, attr, status, detail):
+    """Ни один info-чек со статусом != ok не имеет ok=True (иначе рендер даёт ✅ на непроверенном)."""
+    _all_up_monkey(monkeypatch)
+    payload = {"status": status, "detail": detail}
+    if attr == "_installed_versions_check":
+        payload |= {"codex": [], "claude_code": []}
+    monkeypatch.setattr(health, attr, lambda *a, **kw: payload)
+    c = _check_by_name(health.check_all(active_claude=True), needle)
+    assert c.get("info") is True, f"{needle}: остаётся не-driver (info), got: {c}"
+    assert c["ok"] is False, f"{needle}: status={status} ≠ подтверждённое здоровье, got: {c}"
+
+
+@_pytest.mark.parametrize("needle,attr", [(c[0], c[1]) for c in _OK_INVARIANT_CASES],
+                          ids=[c[0] for c in _OK_INVARIANT_CASES])
+def test_ok_status_stays_ok(monkeypatch, needle, attr):
+    """Гвард от переусердствования: status=ok у тех же чеков остаётся ok=True (тихий ✅)."""
+    _all_up_monkey(monkeypatch)
+    payload = {"status": "ok", "detail": "mock: проверено и прошло"}
+    if attr == "_installed_versions_check":
+        payload |= {"codex": [], "claude_code": []}
+    monkeypatch.setattr(health, attr, lambda *a, **kw: payload)
+    c = _check_by_name(health.check_all(active_claude=True), needle)
+    assert c["ok"] is True, f"{needle}: подтверждённо здоровый = ✅, got: {c}"
+
+
+def test_upstream_vps_down_is_not_ok_when_tunnel_alive(monkeypatch):
+    """VPS мёртв при живом туннеле → ok=False + info=True, НЕ захардкоженный ok=True.
+
+    Худший кейс класса: doctor печатал ✅ «VPS не отвечает: TCP timeout». info здесь верен
+    (туннель жив → вердикт не роняем, #194), но ok=True превращал реальный сбой в зелёную галочку.
+    """
+    _all_up_monkey(monkeypatch)
+    monkeypatch.setattr(health, "_upstream_vps_reachable",
+                        lambda *a, **kw: {"status": "down", "detail": "VPS не отвечает: TCP timeout"})
+    vps = _check_by_name(health.check_all(), "upstream VPS")
+    assert vps.get("info") is True, f"туннель жив → VPS-чек не driver, got: {vps}"
+    assert vps["ok"] is False, f"«VPS не отвечает» ≠ ✅, got: {vps}"
+
+
+def test_upstream_vps_down_stays_driver_when_tunnel_fails(monkeypatch):
+    """Гвард #194: VPS down + туннель fail + сеть/DNS живы → DRIVER (info снят), вердикт падает."""
+    _all_up_monkey(monkeypatch)
+    monkeypatch.setattr(health, "_upstream_vps_reachable",
+                        lambda *a, **kw: {"status": "down", "detail": "VPS не отвечает: TCP timeout"})
+    monkeypatch.setattr(health, "_tunnel_up", lambda *a, **kw: (False, "mock: туннель мёртв", False))
+    vps = _check_by_name(health.check_all(), "upstream VPS")
+    assert not vps.get("info"), f"#194: VPS-смерть при мёртвом туннеле = driver, got: {vps}"
+    assert vps["ok"] is False, f"driver-сбой, got: {vps}"
+
+
+def test_no_check_claims_ok_while_status_not_ok(monkeypatch):
+    """Гвард класса: НИ ОДИН чек не помечен ok=True, когда все производители вернули не-ok.
+
+    Ловит следующего носителя формулы `!= "down"` / хардкода ok=True, не дожидаясь ревью.
+    """
+    _all_up_monkey(monkeypatch)
+    for attr, payload in (
+        ("_vscode_proxy_check", {"status": "unknown", "detail": "not-ok: vscode"}),
+        ("_endpoint_xray_sync_check", {"status": "info", "detail": "not-ok: sync"}),
+        ("_github_direct_check", {"status": "unknown", "detail": "not-ok: gh"}),
+        ("_privoxy_log_observability_check", {"status": "info", "detail": "not-ok: plo"}),
+        ("_upstream_vps_reachable", {"status": "down", "detail": "not-ok: vps"}),
+        ("_codenv_job_check", {"status": "unknown", "detail": "not-ok: codenv"}),
+        ("_gfw_domain_check", {"status": "info", "detail": "not-ok: gfw"}),
+        ("_installed_versions_check",
+         {"status": "unknown", "detail": "not-ok: versions", "codex": [], "claude_code": []}),
+    ):
+        monkeypatch.setattr(health, attr, lambda *a, _p=payload, **kw: _p)
+    monkeypatch.setattr(health, "_read_endpoint_config",
+                        lambda: {"base_url": "https://api.z.ai/x", "no_proxy": "", "source": "mock"})
+    # Сверяем только те чеки, чьи производители мы принудили в не-ok (маркер в detail) — прочие
+    # info-чеки идут через _all_up_monkey со status=ok и обязаны остаться ✅.
+    liars = [c["name"] for c in health.check_all(active_claude=True)["checks"]
+             if c.get("info") and c["ok"] and (c.get("detail") or "").startswith("not-ok:")]
+    assert not liars, f"ok=True при status != ok — ✅ на непроверенном: {liars}"
+
+
+# ===== GFW-совет гейтится на status=="gfw", а не на ok (cycle-review PR #296, раунд 3) =====
+# РЕГРЕССИЯ, внесённая в 4fc8d84 (Codex P2): _print_report читал `not gfw_check["ok"]` как прокси
+# для «status == gfw» — комментарий рядом это прямо и декларировал. После выравнивания ok на
+# `status == "ok"` условие стало истинным и для status="info" («контрольный домен недоступен —
+# GFW-тест неприменим»), и doctor при ОБЩЕМ СБОЕ СЕТИ уверенно советовал «GFW режет домен...
+# контрольный домен отвечает» — прямо противореча пробе и уводя от настоящей причины.
+# Корень тот же, что у всего PR: потребитель склеивал две оси (здесь «не ok» ≠ «GFW»). Чиним
+# как везде — несём НАСТОЯЩИЙ статус в чек (канон category, как vendor-outage у туннеля #207),
+# а не откатываем ok обратно в перегруженный флаг.
+
+
+def test_gfw_advice_only_when_domain_actually_cut(monkeypatch, capsys):
+    """status="gfw" → совет про GFW печатается (положительный путь сохранён)."""
+    health._print_report({"status": "degraded", "checks": [
+        {"name": "privoxy (8118)", "ok": False, "detail": "порт закрыт"},
+        {"name": "GFW per-domain (github vs z.ai прямой curl)", "ok": False, "info": True,
+         "category": "gfw", "detail": "github режется, контрольный z.ai отвечает"},
+    ]})
+    out = capsys.readouterr().out
+    assert "GFW режет домен" in out, f"реальный GFW обязан давать совет, got:\n{out}"
+
+
+def test_no_gfw_advice_when_probe_inapplicable(capsys):
+    """status="info" («контрольный домен недоступен») → совета про GFW НЕТ.
+
+    Общий сбой сети: проба явно говорит «не GFW». Совет «контрольный домен отвечает» здесь
+    ложь и уводит от настоящей причины (сеть/DNS), которую doctor печатает выше.
+    """
+    health._print_report({"status": "degraded", "checks": [
+        {"name": "privoxy (8118)", "ok": False, "detail": "порт закрыт"},
+        {"name": "GFW per-domain (github vs z.ai прямой curl)", "ok": False, "info": True,
+         "detail": "контрольный домен недоступен — GFW-тест неприменим (общий сбой сети)"},
+    ]})
+    out = capsys.readouterr().out
+    assert "GFW режет домен" not in out, \
+        f"«не смогли проверить» ≠ «GFW режет» — ложный совет уводит от причины, got:\n{out}"
+
+
+def test_gfw_check_carries_status_category(monkeypatch):
+    """check_all несёт настоящий статус GFW-пробы в category (не восстанавливать его из ok)."""
+    _all_up_monkey(monkeypatch)
+    monkeypatch.setattr(health, "_gfw_domain_check",
+                        lambda *a, **kw: {"status": "gfw", "detail": "github режется"})
+    c = _check_by_name(health.check_all(active_claude=True), "GFW per-domain")
+    assert c.get("category") == "gfw", f"реальный GFW помечен category=gfw, got: {c}"
+    assert c["ok"] is False and c.get("info") is True, f"GFW не driver, но и не ✅, got: {c}"
+
+
+def test_gfw_check_info_is_not_categorized_gfw(monkeypatch):
+    """status="info" не получает category=gfw — иначе совет вернётся через другую дверь."""
+    _all_up_monkey(monkeypatch)
+    monkeypatch.setattr(health, "_gfw_domain_check",
+                        lambda *a, **kw: {"status": "info", "detail": "контрольный домен недоступен"})
+    c = _check_by_name(health.check_all(active_claude=True), "GFW per-domain")
+    assert c.get("category") != "gfw", f"«неприменимо» ≠ GFW, got: {c}"
+    assert c["ok"] is False, f"непроверенное ≠ ✅ (инвариант раунда 2), got: {c}"
+
 
 # --- #207 edge-cases (Codex cycle-review P1#2, P2#4): vacuous-truth guard + no-response/bad-code ---
 def _tunnel_curl_raw_per_target(responses):
