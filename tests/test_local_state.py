@@ -599,6 +599,34 @@ def test_sync_route_ip_from_xray_updates_node(tmp_path):
     assert node["route_ip"] == "198.51.100.20"
 
 
+def test_sync_route_ip_from_xray_recognizes_adopt_mode_outbound_tag(tmp_path):
+    """#136/#200: sync_route_ip_from_xray в adopt-режиме тоже обязана читать по routing.outbound.
+
+    Как и sync_endpoint_from_xray, эта функция вызывает _read_xray_vless_address без tag → жёстко
+    ищет "active". В adopt-режиме тега "active" нет (реальный тег из routing.outbound) → sync
+    молча отказывает (ok=False), хотя compare/doctor видят рассинхрон (Codex review PR #313).
+    """
+    state_p = tmp_path / "srouter.local.json"
+    xray_p = tmp_path / "xray-config.json"
+    xray_p.write_text(json.dumps({
+        "outbounds": [
+            {"tag": "direct", "protocol": "freedom"},
+            {"tag": "reality-out", "protocol": "vless",
+             "settings": {"vnext": [{"address": "198.51.100.20", "port": 443}]}},
+        ]
+    }), encoding="utf-8")
+    _write(state_p, {
+        "nodes": [{"name": "sg-1", "endpoint_host": "203.0.113.10",
+                   "route_ip": "203.0.113.10", "enabled": True}],
+        "routing": {"outbound": "reality-out", "active": ["domain:example.com"]},
+    })
+    r = local_state.sync_route_ip_from_xray("sg-1", xray_config_path=str(xray_p), path=state_p)
+    assert r["ok"] is True, r
+    assert r["route_ip"] == "198.51.100.20", r
+    node = local_state.get_node("sg-1", path=state_p)
+    assert node["route_ip"] == "198.51.100.20"
+
+
 def test_sync_route_ip_idempotent(tmp_path):
     """route_ip уже = xray address → no-op (ok, unchanged)."""
     state_p = tmp_path / "srouter.local.json"
@@ -1407,6 +1435,71 @@ def test_endpoint_xray_sync_no_active_node(tmp_path):
     cmp = local_state.compare_endpoint_with_xray(state_path=state_p, xray_config_path=xray_p)
     assert cmp["synced"] is True
     assert cmp["local"] == ""
+
+
+def test_endpoint_xray_sync_recognizes_adopt_mode_outbound_tag(tmp_path):
+    """#136/#200: hybrid-adopt режим (routing.outbound != "active") — read по ПРАВИЛЬНОМУ тегу.
+
+    Реальный сценарий (verify-dont-guess, воспроизведено на живой машине): пользователь усыновил
+    (`srouter routing add-domain --adopt`) СТОРОННИЙ/руками настроенный xray-config через #136
+    hybrid-adopt — там outbound называется не "active" (gen_xray_config-контракт #200), а как
+    задано в DEFAULT_ROUTING_OUTBOUND ("reality-out") или другим именем, записанным в
+    state["routing"]["outbound"]. read_xray_active_address ранее ВСЕГДА искала tag=="active" —
+    в adopt-режиме такого тега никогда нет → xray_status="no_active" даже когда config полностью
+    валиден и реально работает. compare_endpoint_with_xray обязана учитывать
+    state["routing"]["outbound"], если он задан, вместо жёстко "active".
+    """
+    state_p = tmp_path / "srouter.local.json"
+    xray_p = tmp_path / "xray-config.json"
+    xray_p.write_text(json.dumps({
+        "outbounds": [
+            {"tag": "direct", "protocol": "freedom"},
+            {"tag": "reality-out", "protocol": "vless",
+             "settings": {"vnext": [{"address": "85.136.181.198", "port": 443}]}},
+        ]
+    }), encoding="utf-8")
+    _write(state_p, {
+        "nodes": [{"name": "sg-1", "endpoint_host": "85.136.181.198",
+                   "route_ip": "85.136.181.198", "enabled": True}],
+        "active_node": {"name": "sg-1", "pending": None},
+        "routing": {"outbound": "reality-out", "active": ["domain:example.com"]},
+    })
+    cmp = local_state.compare_endpoint_with_xray(state_path=state_p, xray_config_path=xray_p)
+    assert cmp["xray_status"] == "ok", cmp
+    assert cmp["xray"] == "85.136.181.198", cmp
+    assert cmp["synced"] is True, cmp
+
+
+def test_sync_endpoint_from_xray_recognizes_adopt_mode_outbound_tag(tmp_path):
+    """#136/#200: sync_endpoint_from_xray в adopt-режиме должна читать по routing.outbound, не "active".
+
+    compare_endpoint_with_xray уже учитывает routing["outbound"] (см. test_endpoint_xray_sync_
+    recognizes_adopt_mode_outbound_tag), но sync_endpoint_from_xray независимо вызывает
+    read_xray_active_address без tag → жёстко ищет "active". В adopt-режиме такого тега нет
+    (реальный тег — "reality-out" из routing.outbound) → sync молча отказывает (ok=False), хотя
+    compare/doctor уже видят рассинхрон и предлагают sync как fix. detect и fix обязаны
+    соглашаться про тег (Codex review PR #313).
+    """
+    state_p = tmp_path / "srouter.local.json"
+    xray_p = tmp_path / "xray-config.json"
+    xray_p.write_text(json.dumps({
+        "outbounds": [
+            {"tag": "direct", "protocol": "freedom"},
+            {"tag": "reality-out", "protocol": "vless",
+             "settings": {"vnext": [{"address": "85.136.181.198", "port": 443}]}},
+        ]
+    }), encoding="utf-8")
+    _write(state_p, {
+        "nodes": [{"name": "sg-1", "endpoint_host": "203.0.113.10",
+                   "route_ip": "203.0.113.10", "enabled": True}],
+        "active_node": {"name": "sg-1", "pending": None},
+        "routing": {"outbound": "reality-out", "active": ["domain:example.com"]},
+    })
+    r = local_state.sync_endpoint_from_xray(xray_config_path=xray_p, path=state_p)
+    assert r["ok"] is True, r
+    assert r["endpoint"] == "85.136.181.198", r
+    node = local_state.get_node("sg-1", path=state_p)
+    assert node["endpoint_host"] == "85.136.181.198"
 
 
 def test_sync_endpoint_from_xray_imports_real_into_placeholder(tmp_path):
