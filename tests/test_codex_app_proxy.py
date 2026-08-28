@@ -221,3 +221,51 @@ def test_app_proxy_detects_chatgpt_app_path(monkeypatch):
     monkeypatch.setattr(health.sys_probe, "run", _fake(ps, _gui_env({})))
     res = health._codex_app_proxy_check()
     assert res["status"] == "unknown", f"CLI-codex (не App) → App не запущен → unknown; got {res}"
+
+
+# Chromium network-service helper ChatGPT.app (регрессия #189 follow-up, verify-dont-guess):
+# comm — полный путь ВНУТРИ .app/-бандла, basename НЕ "codex" (не матчит _is_codex_binary_comm) →
+# старый AND-детект (_is_codex_binary_comm И _is_codex_app_comm) отбрасывал этот процесс целиком,
+# несмотря на то что он реально течёт мимо прокси (эмпирика: lsof показал ~37 SYN_SENT сокетов
+# напрямую к 192.168.1.x/китайский IPv6, ни одного к 10808/8118, при корректном gui-env SOCKS5).
+CHROMIUM_HELPER_COMM = (
+    "/Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/"
+    "151.0.7922.170/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)"
+)
+
+
+def test_app_proxy_detects_chromium_helper_without_codex_basename(monkeypatch):
+    """Chromium network-service helper (comm НЕ basename 'codex', но путь /ChatGPT.app/) детектится
+    как App-related процесс — НЕ должен давать ложный unknown «App не запущен».
+
+    Баг: _codex_app_proxy_check раньше матчил App-PID через _is_codex_binary_comm(comm) AND
+    _is_codex_app_comm(comm) — basename-условие отсеивало любой helper с comm вида
+    ".../Codex (Service).app/Contents/MacOS/Codex (Service)" (basename "Codex (Service)" ≠ "codex").
+    Единственный процесс ChatGPT.app в ps-выводе — этот helper (Rust app-server не запущен отдельно) →
+    старый код видел app_pids=[] → status="unknown" "не запущен", хотя стек активен и течёт мимо прокси.
+    """
+    ps = f"71234 {CHROMIUM_HELPER_COMM}\n"
+    monkeypatch.setattr(health.sys_probe, "run", _fake(ps, _gui_env({})))
+    res = health._codex_app_proxy_check()
+    assert res["status"] != "unknown", (
+        f"Chromium network-service helper активен — не должно быть ложного "
+        f"'App не запущен'; got {res}"
+    )
+    assert "не запущен" not in res["detail"].lower(), f"detail лжёт 'не запущен'; got {res}"
+
+
+def test_app_proxy_down_when_chromium_helper_leaks_direct_despite_gui_socks5(monkeypatch):
+    """Chromium helper держит external ESTABLISHED мимо прокси, хотя gui-env SOCKS5 корректен → down.
+
+    Живая эмпирика сессии: launchctl getenv показывал верный socks5h://127.0.0.1:10808, НО Chromium
+    network-service процесс (comm без basename 'codex') слал ~37 сокетов напрямую — ни один не шёл
+    через 10808/8118. Это ровно симптом net::ERR_CONNECTION_TIMED_OUT в UI (GFW режет прямой путь).
+    """
+    ps = f"71234 {CHROMIUM_HELPER_COMM}\n"
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _fake(ps, _gui_env({"HTTPS_PROXY": SOCKS5, "ALL_PROXY": SOCKS5}),
+                              lsof_out=_lsof_external("71234")))
+    res = health._codex_app_proxy_check()
+    assert res["status"] == "down", (
+        f"Chromium helper течёt мимо прокси (gui-env SOCKS5 корректен, lsof external) → down; got {res}"
+    )

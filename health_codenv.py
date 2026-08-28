@@ -600,15 +600,49 @@ def _codenv_job_check(runner=None, *, wait=_CODENV_RELOAD_SETTLE_WAIT):
 
 
 def _codex_app_proxy_check():
-    """ChatGPT.app Rust app-server без прокси (codenv снят/битый) → down DRIVER (issue #189).
+    """ChatGPT.app (ЛЮБОЙ из двух независимых сетевых стеков) без прокси → down DRIVER (issue #189, #189-follow-up).
 
-    Эмпирика (verify, lsof per-process): ChatGPT.app = Electron-оболочка над Rust-бинарником. Rust
-    app-server (/Applications/ChatGPT.app/.../codex, основной WS к wss://chatgpt.com) НЕ уважает
-    системный SOCKS (Rust reqwest без SystemConfiguration), берёт ТОЛЬКО env SOCKS5 из launchd gui-домена
-    (codenv LaunchAgent). codenv снят/битый (plist-шаблон с placeholder'ами после #185 деактивации
-    install) → gui-env пуст → Rust app-server напрямую → GFW рвёт ('failed to connect... TimedOut').
+    Эмпирика (verify, lsof per-process): ChatGPT.app = Electron/Chromium-обёртка + отдельный Rust
+    app-server бинарник — ДВА независимых сетевых стека:
+      (а) Rust app-server (/Applications/ChatGPT.app/.../codex, basename "codex") — основной WS к
+          wss://chatgpt.com. НЕ уважает системный SOCKS (Rust reqwest без SystemConfiguration), берёт
+          ТОЛЬКО env SOCKS5 из launchd gui-домена (codenv LaunchAgent).
+      (б) Chromium network-service helper (comm — полный путь ВНУТРИ .app/-бандла, например
+          ".../Codex Framework.framework/Versions/<ver>/Helpers/Codex (Service).app/Contents/MacOS/
+          Codex (Service)", basename ≠ "codex") — Chromium-подпроцесс UI/telemetry. Читает системные
+          прокси-настройки по-своему (не всегда через launchctl gui-env напрямую) и может течь мимо
+          прокси НЕЗАВИСИМО от Rust-стека.
+    Живая эмпирика (эта сессия, воспроизведено дважды включая после Cmd+Q restart): lsof по PID
+    Chromium network-service helper показал ~37 TCP-сокетов в SYN_SENT, ВСЕ напрямую (192.168.1.x /
+    китайский мобильный IPv6), НИ ОДИН не шёл через 127.0.0.1:10808/8118 — при этом launchctl getenv
+    в тот же момент показывал корректный socks5h://127.0.0.1:10808. Это ровно симптом UI
+    net::ERR_CONNECTION_TIMED_OUT (GFW режет прямой путь): Chromium-стек течёт мимо прокси
+    НЕЗАВИСИМО от того, что Rust-стек (или его отсутствие) может быть исправен.
 
-    Чек: (1) App-codex активен (ps по _is_codex_app_comm); (2) gui-env через _read_gui_proxy_env.
+    Регрессия до фикса: детект App-PID требовал `_is_codex_binary_comm(comm) AND _is_codex_app_comm(comm)`
+    — basename-условие (_is_codex_binary_comm) матчит ТОЛЬКО "codex"/"codex-<arch>-apple-darwin", что
+    отсекает Chromium helper целиком (basename "Codex (Service)" ≠ "codex"). Если на машине Rust
+    app-server не запущен отдельным процессом (или ещё не стартовал), единственный процесс ChatGPT.app
+    в ps — этот helper → AND-условие давало app_pids=[] → ложный status="unknown" "App не запущен",
+    хотя стек явно активен и течёт мимо прокси (verify-dont-guess: проверено эмпирически regex'ами
+    на реальных comm-строках, не гипотеза).
+
+    Решение: убрали _is_codex_binary_comm из ЭТОГО детект-пути — App-PID матчится ТОЛЬКО по
+    _is_codex_app_comm (path-сегмент /ChatGPT.app/ или /Codex.app/, канон health_codex.py). Это НЕ
+    расширяет TUI/CLI-чек _codex_proxy_probe (там basename-условие остаётся — он различает CLI-codex
+    от прочих процессов вне .app-бандла, где path-сегмент неприменим).
+    Trade-off осознан: путь /ChatGPT.app/ содержит МНОГО helper-типов (GPU-process, storage-service,
+    crashpad и т.п.), не все из них обязаны использовать прокси (например GPU-process рисует UI
+    локально). Различить подтип надёжно без ps args (comm не отдаёт --type=/--utility-sub-type=)
+    нельзя — а расширять сам `ps` вызов на args ради одного chatgpt-специфичного чека не оправдано.
+    Поэтому НЕ репортим down по самому факту наличия helper-процесса — down/warn ставится ТОЛЬКО
+    когда lsof РЕАЛЬНО показывает non-proxied external сокет у хотя бы одного App-related PID
+    (см. _app_pids_route) — то же правило, что уже было для Rust-стека. GPU/storage helper без
+    сетевой активности просто не даст external-сокетов → не заматчится ни в один из трёх сетов
+    (external/socks/privoxy) → чек остаётся unknown/idle для него, false-positive не возникает.
+
+    Чек: (1) App-related PID активны (ps по _is_codex_app_comm, ЛЮБОЙ helper внутри .app/-бандла);
+    (2) gui-env через _read_gui_proxy_env; (3) реальный runtime-маршрут через _app_pids_route (lsof).
       status="down"    — App активен, gui-env пуст (codenv не загружен) — DRIVER;
       status="warn"    — App активен, gui-env только HTTP (privoxy рвёт WS #120) — DRIVER;
       status="ok"      — App активен, gui-env SOCKS5 (codenv работает) — DRIVER;
@@ -616,7 +650,9 @@ def _codex_app_proxy_check():
     App-PID здесь, НЕ в _codex_proxy_probe (TUI-чек исключил App-PID, чтобы не давать ложный mixed/down
     на нерелевантном PID — баг «❌ на VSCode PID 56748»).
     """
-    # 1. App-codex процессы активны?
+    # 1. App-related процессы активны? Матч ТОЛЬКО по path-сегменту .app/ (_is_codex_app_comm) —
+    # НЕ требуем basename=="codex" здесь: Chromium network-service helper (basename ≠ "codex") тоже
+    # App-related и тоже может течь мимо прокси (см. докстринг выше, регрессия #189-follow-up).
     r = sys_probe.run([PS, "-axo", "pid=,comm="], timeout=3)
     if r.get("timeout"):
         return {"status": "unknown", "source": "n/a", "detail": "timeout ps"}
@@ -626,7 +662,7 @@ def _codex_app_proxy_check():
         if len(parts) < 2:
             continue
         pid_s, comm = parts[0].strip(), parts[1].strip()
-        if pid_s.isdigit() and _health_facade._is_codex_binary_comm(comm) and _health_facade._is_codex_app_comm(comm):
+        if pid_s.isdigit() and _health_facade._is_codex_app_comm(comm):
             app_pids.append(pid_s)
     if not app_pids:
         return {"status": "unknown", "source": "n/a",
