@@ -113,7 +113,7 @@ def check_all(*, active_claude=False):
     # placeholder TEST-NET / нет узла → info (картина, не сбой). Канон: verify-don't-guess.
     vps = _upstream_vps_reachable()
     vps_check = {"name": "upstream VPS (TCP-коннект до endpoint, минуя прокси)",
-                 "ok": True, "info": True, "detail": vps["detail"]}
+                 "ok": vps["status"] == "ok", "info": True, "detail": vps["detail"]}
     if net["up"] and dns["up"] and not tun_ok and vps["status"] == "down":
         # VPS мёртв + туннель fail + сеть есть + DNS работает → driver: усиливаем до DOWN.
         vps_check["ok"] = False
@@ -176,7 +176,7 @@ def check_all(*, active_claude=False):
     # warn (рассинхрон) показываем в detail, но НЕ driver: apply-защита (#200 в install_lib) —
     # настоящая fail-closed граница от перезаписи; doctor лишь подсвечивает расхождение.
     exs = _endpoint_xray_sync_check()
-    exs_check = {"name": "endpoint (local.json ↔ xray sync)", "ok": exs["status"] != "warn",
+    exs_check = {"name": "endpoint (local.json ↔ xray sync)", "ok": exs["status"] == "ok",
                  "info": True, "detail": exs["detail"]}
     checks.append(exs_check)
     # Desktop App proxy (#134): SOCKS5 в launchctl = broken Desktop App; warn = CLI/Desktop
@@ -235,7 +235,7 @@ def check_all(*, active_claude=False):
     # одного клиента (codex-расширение), не общий вердикт стека. Runtime-маршрут codex ловит cx_check выше.
     vp = _vscode_proxy_check()
     vp_check = {"name": "codex vscode-proxy (http.proxy)",
-                "ok": vp["status"] != "down", "info": True, "detail": vp["detail"]}
+                "ok": vp["status"] == "ok", "info": True, "detail": vp["detail"]}
     checks.append(vp_check)
     # gh/git VPS-независимый dev-workflow (#199): github доступен напрямую через gh (Go-стек обходит
     # GFW TLS); scoped git-proxy → privoxy делает git pull/push VPS-зависимым. info-only ВСЕГДА (как
@@ -243,7 +243,7 @@ def check_all(*, active_claude=False):
     # (git-proxy ВКЛ) подсказывает env -u, не роняя вердикт. Лёгкий чек (git config --get, как git_proxy).
     gh = _github_direct_check()
     gh_check = {"name": "gh/git direct (github env -u)",
-                "ok": gh["status"] != "warn", "info": True, "detail": gh["detail"]}
+                "ok": gh["status"] == "ok", "info": True, "detail": gh["detail"]}
     checks.append(gh_check)
     # Установленные codex/claude-code binary на диске (#145): инвентаризация, info-only ВСЕГДА
     # (несколько версий — ранний сигнал конфликта #135, не сбой стека). unknown (ничего не установлено)
@@ -265,13 +265,13 @@ def check_all(*, active_claude=False):
         checks.append(rmo_check)
         iv = _installed_versions_check()
         iv_check = {"name": "версии (codex/claude-code на диске)",
-                    "ok": True, "info": True, "detail": iv["detail"]}
+                    "ok": iv["status"] == "ok", "info": True, "detail": iv["detail"]}
         checks.append(iv_check)
         # Privoxy-log observability (#152): молчалив ли privoxy? debug включён? logfile пишет?
         # info-only (не driver) — картина для диагностики флапа к github через 8118; WARN в detail.
         plo = _privoxy_log_observability_check()
         plo_check = {"name": "privoxy-log (observability)",
-                     "ok": plo["status"] != "warn", "info": True, "detail": plo["detail"]}
+                     "ok": plo["status"] == "ok", "info": True, "detail": plo["detail"]}
         checks.append(plo_check)
         # PF codex kill-switch (#186): info-only ВСЕГДА (не driver) — незамкнутая граница на
         # нормальных установках (codex под user-UID 501, sudo -u = follow-up) — НЕ роняет вердикт
@@ -292,7 +292,7 @@ def check_all(*, active_claude=False):
         # _installed_versions_check/_codex_isolation_check). Каскад #201: ...→VPS→прокси→GFW per-domain.
         gfw = _gfw_domain_check()
         gfw_check = {"name": "GFW per-domain (github vs z.ai прямой curl)",
-                     "ok": gfw["status"] != "gfw", "info": True, "detail": gfw["detail"]}
+                     "ok": gfw["status"] == "ok", "info": True, "detail": gfw["detail"]}
         checks.append(gfw_check)
         # #197 direct-first: какие candidate-домены (z.ai BUILTIN + user direct_domains) идут
         # напрямую (NO_PROXY) — переживают смерть VPS. info-only ВСЕГДА (как GFW-чек выше) — картина,

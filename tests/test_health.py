@@ -1729,6 +1729,105 @@ def test_unverified_checks_render_warning_not_ok(monkeypatch, capsys):
     assert _MARK_OK not in endpoint_line, f"override мимо туннеля НЕ ✅, got: {endpoint_line}"
 
 
+# ===== ok-misuse — КЛАСС, а не отдельные случаи (cycle-review PR #296, раунд 2) =====
+# Раунд 1 починил codenv и endpoint-override. Codex (P2, раунд 2) показал vscode-proxy с той же
+# формулой `ok = status != "down"`. Аудит check_all нашёл ЕЩЁ ЧЕТЫРЕ производителя того же класса:
+# хардкод ok=True (upstream VPS, версии) и `!= "warn"` (xray-sync, gh-direct, privoxy-log).
+# Инвариант (а не перечень случаев): ok == «проверено и прошло» == status == "ok". Всё остальное
+# (unknown «не смогли проверить», warn, info «неприменим», down) — НЕ ok. Ось «не роняй вердикт»
+# выражается ТОЛЬКО через info. Худший кейс: «VPS не отвечает: TCP timeout» печатался ✅.
+# Канон: fix-once-document-decisions — чиним инвариант, иначе следующий вариант придёт третьим раундом.
+
+_OK_INVARIANT_CASES = [
+    # (needle имени чека, имя мокаемого чека, статус «не ok», ожидаемый detail-фрагмент)
+    ("vscode-proxy", "_vscode_proxy_check", "unknown", "не задан"),
+    ("local.json ↔ xray", "_endpoint_xray_sync_check", "info", "неприменим"),
+    ("gh/git direct", "_github_direct_check", "unknown", "timeout"),
+    ("версии", "_installed_versions_check", "unknown", "не установлено"),
+    ("privoxy-log", "_privoxy_log_observability_check", "info", "неприменим"),
+    ("GFW per-domain", "_gfw_domain_check", "info", "нет доменов для GFW-теста"),
+]
+
+
+@_pytest.mark.parametrize("needle,attr,status,detail", _OK_INVARIANT_CASES,
+                          ids=[c[0] for c in _OK_INVARIANT_CASES])
+def test_non_ok_status_is_not_rendered_ok(monkeypatch, needle, attr, status, detail):
+    """Ни один info-чек со статусом != ok не имеет ok=True (иначе рендер даёт ✅ на непроверенном)."""
+    _all_up_monkey(monkeypatch)
+    payload = {"status": status, "detail": detail}
+    if attr == "_installed_versions_check":
+        payload |= {"codex": [], "claude_code": []}
+    monkeypatch.setattr(health, attr, lambda *a, **kw: payload)
+    c = _check_by_name(health.check_all(active_claude=True), needle)
+    assert c.get("info") is True, f"{needle}: остаётся не-driver (info), got: {c}"
+    assert c["ok"] is False, f"{needle}: status={status} ≠ подтверждённое здоровье, got: {c}"
+
+
+@_pytest.mark.parametrize("needle,attr", [(c[0], c[1]) for c in _OK_INVARIANT_CASES],
+                          ids=[c[0] for c in _OK_INVARIANT_CASES])
+def test_ok_status_stays_ok(monkeypatch, needle, attr):
+    """Гвард от переусердствования: status=ok у тех же чеков остаётся ok=True (тихий ✅)."""
+    _all_up_monkey(monkeypatch)
+    payload = {"status": "ok", "detail": "mock: проверено и прошло"}
+    if attr == "_installed_versions_check":
+        payload |= {"codex": [], "claude_code": []}
+    monkeypatch.setattr(health, attr, lambda *a, **kw: payload)
+    c = _check_by_name(health.check_all(active_claude=True), needle)
+    assert c["ok"] is True, f"{needle}: подтверждённо здоровый = ✅, got: {c}"
+
+
+def test_upstream_vps_down_is_not_ok_when_tunnel_alive(monkeypatch):
+    """VPS мёртв при живом туннеле → ok=False + info=True, НЕ захардкоженный ok=True.
+
+    Худший кейс класса: doctor печатал ✅ «VPS не отвечает: TCP timeout». info здесь верен
+    (туннель жив → вердикт не роняем, #194), но ok=True превращал реальный сбой в зелёную галочку.
+    """
+    _all_up_monkey(monkeypatch)
+    monkeypatch.setattr(health, "_upstream_vps_reachable",
+                        lambda *a, **kw: {"status": "down", "detail": "VPS не отвечает: TCP timeout"})
+    vps = _check_by_name(health.check_all(), "upstream VPS")
+    assert vps.get("info") is True, f"туннель жив → VPS-чек не driver, got: {vps}"
+    assert vps["ok"] is False, f"«VPS не отвечает» ≠ ✅, got: {vps}"
+
+
+def test_upstream_vps_down_stays_driver_when_tunnel_fails(monkeypatch):
+    """Гвард #194: VPS down + туннель fail + сеть/DNS живы → DRIVER (info снят), вердикт падает."""
+    _all_up_monkey(monkeypatch)
+    monkeypatch.setattr(health, "_upstream_vps_reachable",
+                        lambda *a, **kw: {"status": "down", "detail": "VPS не отвечает: TCP timeout"})
+    monkeypatch.setattr(health, "_tunnel_up", lambda *a, **kw: (False, "mock: туннель мёртв", False))
+    vps = _check_by_name(health.check_all(), "upstream VPS")
+    assert not vps.get("info"), f"#194: VPS-смерть при мёртвом туннеле = driver, got: {vps}"
+    assert vps["ok"] is False, f"driver-сбой, got: {vps}"
+
+
+def test_no_check_claims_ok_while_status_not_ok(monkeypatch):
+    """Гвард класса: НИ ОДИН чек не помечен ok=True, когда все производители вернули не-ok.
+
+    Ловит следующего носителя формулы `!= "down"` / хардкода ok=True, не дожидаясь ревью.
+    """
+    _all_up_monkey(monkeypatch)
+    for attr, payload in (
+        ("_vscode_proxy_check", {"status": "unknown", "detail": "not-ok: vscode"}),
+        ("_endpoint_xray_sync_check", {"status": "info", "detail": "not-ok: sync"}),
+        ("_github_direct_check", {"status": "unknown", "detail": "not-ok: gh"}),
+        ("_privoxy_log_observability_check", {"status": "info", "detail": "not-ok: plo"}),
+        ("_upstream_vps_reachable", {"status": "down", "detail": "not-ok: vps"}),
+        ("_codenv_job_check", {"status": "unknown", "detail": "not-ok: codenv"}),
+        ("_gfw_domain_check", {"status": "info", "detail": "not-ok: gfw"}),
+        ("_installed_versions_check",
+         {"status": "unknown", "detail": "not-ok: versions", "codex": [], "claude_code": []}),
+    ):
+        monkeypatch.setattr(health, attr, lambda *a, _p=payload, **kw: _p)
+    monkeypatch.setattr(health, "_read_endpoint_config",
+                        lambda: {"base_url": "https://api.z.ai/x", "no_proxy": "", "source": "mock"})
+    # Сверяем только те чеки, чьи производители мы принудили в не-ok (маркер в detail) — прочие
+    # info-чеки идут через _all_up_monkey со status=ok и обязаны остаться ✅.
+    liars = [c["name"] for c in health.check_all(active_claude=True)["checks"]
+             if c.get("info") and c["ok"] and (c.get("detail") or "").startswith("not-ok:")]
+    assert not liars, f"ok=True при status != ok — ✅ на непроверенном: {liars}"
+
+
 # --- #207 edge-cases (Codex cycle-review P1#2, P2#4): vacuous-truth guard + no-response/bad-code ---
 def _tunnel_curl_raw_per_target(responses):
     """Мок sys_probe.run с RAW-ответом per-URL: {"anthropic": {"out": "", "timeout": False}, ...}.
