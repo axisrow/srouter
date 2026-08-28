@@ -286,3 +286,25 @@ def test_app_proxy_down_when_chromium_helper_leaks_direct_despite_gui_socks5(mon
     assert res["status"] == "down", (
         f"Chromium helper течёt мимо прокси (gui-env SOCKS5 корректен, lsof external) → down; got {res}"
     )
+
+
+# Generic .app-helper (ни rust, ни chromium network-service) — _codex_app_process_kind классифицирует
+# его как "helper" (docstring health_codex.py:73 «must not be reported as the Rust app-server»), но
+# _codex_app_proxy_check проверяет external_by_kind ТОЛЬКО по "chromium"/"rust" (health_codenv.py
+# :700-713) — leak с "helper"-kind PID падает в generic Rust-ветку и врёт диагнозом.
+GENERIC_HELPER_COMM = "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"
+
+
+def test_app_proxy_down_diagnosis_does_not_blame_rust_for_generic_helper_leak(monkeypatch):
+    """Non-rust non-chromium .app-helper течёт мимо прокси → down НЕ должен обвинять Rust app-server
+    (никакого 'Resources/codex' PID вообще не запущено — обвинение было бы ложным).
+    """
+    ps = f"81234 {GENERIC_HELPER_COMM}\n"
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _fake(ps, _gui_env({"HTTPS_PROXY": SOCKS5, "ALL_PROXY": SOCKS5}),
+                              lsof_out=_lsof_external("81234")))
+    res = health._codex_app_proxy_check()
+    assert res["status"] == "down", f"generic helper leak должен быть down; got {res}"
+    assert "rust app-server" not in res["detail"].lower(), (
+        f"detail ложно обвиняет Rust app-server, хотя течёт non-rust non-chromium helper; got {res}"
+    )

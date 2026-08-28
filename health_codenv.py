@@ -699,16 +699,27 @@ def _codex_app_proxy_check():
             external_by_kind = route.get("external_by_kind") or {}
             chromium_ext = sorted(external_by_kind.get("chromium", set()))
             rust_ext = sorted(external_by_kind.get("rust", set()))
-            if chromium_ext and not rust_ext:
+            if rust_ext:
+                # Rust app-server (/Resources/codex) сам держит external-сокет — только этот случай
+                # реально "STALE App" (setenv не ретроактивен).
+                return {"status": "down", "source": "runtime",
+                        "detail": (f"ChatGPT.app Rust app-server НАПРЯМУЮ (gui-env SOCKS5 есть, но App PID "
+                                   f"{ext} "
+                                   f"держит external-сокеты) — STALE App: запущен ДО codenv, setenv не ретроактивен. "
+                                   f"Полностью перезапусти ChatGPT.app (Cmd+Q из Dock, не закрыть окно). "
+                                   f"codenv gui-env: {found}")}
+            if chromium_ext:
                 return {"status": "down", "source": "runtime",
                         "detail": (f"ChatGPT.app Chromium helper НАПРЯМУЮ (PID {','.join(chromium_ext)} "
                                    f"держит external-сокеты; gui-env SOCKS5 есть) — App запущен без "
                                    f"Chromium --proxy-server. Запусти через ~/bin/codex-app-proxy. "
                                    f"codenv gui-env: {found}")}
+            # Ни rust, ни chromium — leak идёт от другого .app-helper (generic-kind, см.
+            # _codex_app_process_kind docstring). Не приписываем Rust/Chromium, чтобы не врать
+            # диагнозом на процесс, который к их стекам не относится.
             return {"status": "down", "source": "runtime",
-                    "detail": (f"ChatGPT.app Rust app-server НАПРЯМУЮ (gui-env SOCKS5 есть, но App PID "
-                               f"{ext} "
-                               f"держит external-сокеты) — STALE App: запущен ДО codenv, setenv не ретроактивен. "
+                    "detail": (f"ChatGPT.app helper НАПРЯМУЮ (PID {ext} держит external-сокеты; "
+                               f"gui-env SOCKS5 есть) — процесс внутри .app-бандла течёт мимо прокси. "
                                f"Полностью перезапусти ChatGPT.app (Cmd+Q из Dock, не закрыть окно). "
                                f"codenv gui-env: {found}")}
         if route.get("privoxy"):
