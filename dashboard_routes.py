@@ -770,7 +770,17 @@ def api_proxy_apply(action):
     if action not in _PROXY_ACTIONS:
         return jsonify({"ok": False, "err": f"unknown action: {action}"}), 404
 
-    payload = request.get_json(silent=True) or {}
+    # get_json(silent=True) возвращает None и для malformed/non-JSON тела, И для валидного
+    # JSON null — оба случая раньше схлопывались в `{}` через `or {}`, что означает
+    # ids=None -> apply КО ВСЕМ управляемым потребителям (cycle-review PR #306, Codex:
+    # ошибка транспорта/битое тело не должна незаметно мутировать git/Claude/VSCode).
+    # Различаем: отсутствующее/невалидное тело -> 400; валидный non-dict JSON -> 400;
+    # валидный {} -> осознанный apply-all (ids=None), как и раньше.
+    payload = request.get_json(silent=True)
+    if payload is None:
+        return jsonify({"ok": False, "err": "malformed or missing JSON body"}), 400
+    if not isinstance(payload, dict):
+        return jsonify({"ok": False, "err": "JSON body must be an object"}), 400
     ids = payload.get("ids")
     if ids is not None and not isinstance(ids, list):
         return jsonify({"ok": False, "err": "ids must be a list"}), 400

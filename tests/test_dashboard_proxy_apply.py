@@ -20,6 +20,17 @@ def _post(path, payload=None):
     )
 
 
+def _post_raw(path, *, data, content_type="application/json"):
+    """POST с сырым телом (не через json=) — единственный способ отправить malformed JSON
+    или non-JSON content-type, который Flask.get_json(silent=True) не распарсит."""
+    return dashboard.app.test_client().post(
+        path,
+        data=data,
+        content_type=content_type,
+        headers={"Origin": "http://127.0.0.1:8787"},
+    )
+
+
 def test_enable_delegates_to_registry(monkeypatch):
     seen = {}
 
@@ -52,6 +63,40 @@ def test_non_list_ids_is_rejected():
     """ids приходит от клиента — форму проверяем до передачи в реестр."""
     r = _post("/api/proxy/enable", {"ids": "git"})
     assert r.status_code == 400
+
+
+def test_malformed_json_body_is_rejected_not_treated_as_apply_all(monkeypatch):
+    """ДЫРА (cycle-review PR #306, Codex confidence 0.98): `request.get_json(silent=True)
+    or {}` не различает «валидное пустое тело {}» (осознанное apply-ко-всем) от «битое тело/
+    ошибка транспорта» — оба схлопываются в {} -> ids=None -> все управляемые потребители.
+    Сбой транспорта или неверный Content-Type не должен незаметно включить/выключить
+    прокси у git/Claude/VSCode — должен быть честный 400, а не молчаливый apply-all."""
+    called = []
+    monkeypatch.setattr(proxy_registry, "apply",
+                        lambda ids=None, *, action: called.append(ids) or {"ok": True, "results": []})
+    r = _post_raw("/api/proxy/enable", data=b"{not valid json", content_type="application/json")
+    assert r.status_code == 400, f"malformed JSON должен давать 400, получили {r.status_code}"
+    assert called == [], "proxy_registry.apply не должен был вызываться с malformed телом"
+
+
+def test_null_json_body_is_rejected_not_treated_as_apply_all(monkeypatch):
+    """Тело `null` — валидный JSON, но не object; тоже не должно стать ids=None-apply-all."""
+    called = []
+    monkeypatch.setattr(proxy_registry, "apply",
+                        lambda ids=None, *, action: called.append(ids) or {"ok": True, "results": []})
+    r = _post_raw("/api/proxy/enable", data=b"null", content_type="application/json")
+    assert r.status_code == 400
+    assert called == []
+
+
+def test_empty_object_body_still_means_apply_all(monkeypatch):
+    """Контрольный случай: явный {} — валидный apply-all запрос, НЕ должен сломаться фиксом."""
+    called = []
+    monkeypatch.setattr(proxy_registry, "apply",
+                        lambda ids=None, *, action: called.append(ids) or {"ok": True, "results": []})
+    r = _post("/api/proxy/enable", {})
+    assert r.status_code == 200
+    assert called == [None]
 
 
 def test_ids_omitted_means_all_manageable(monkeypatch):
