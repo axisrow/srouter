@@ -120,6 +120,23 @@ def test_app_proxy_down_when_stale_app_direct_despite_gui_socks5(monkeypatch):
         f"detail объясняет: нужен рестарт App (setenv не ретроактивен); got {res}"
 
 
+def test_app_proxy_distinguishes_chromium_helper_direct_from_rust_stale(monkeypatch):
+    """Direct Chromium helper gets a Chromium-specific diagnosis, not a false Rust stale diagnosis."""
+    helper = (
+        "/Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/"
+        "151.0.7922.170/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)"
+    )
+    ps = f"96016 {helper}\n"
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _fake(ps, _gui_env({"ALL_PROXY": SOCKS5}),
+                              lsof_out=_lsof_external("96016")))
+    res = health._codex_app_proxy_check()
+    assert res["status"] == "down"
+    detail = res["detail"].lower()
+    assert "chromium" in detail or "helper" in detail
+    assert "rust app-server" not in detail
+
+
 def test_app_proxy_unknown_when_app_idle_no_socks_socket(monkeypatch):
     """App активен + gui-env SOCKS5, но lsof НЕ показал 10808 (idle/нет ESTABLISHED) → unknown, НЕ ok.
 

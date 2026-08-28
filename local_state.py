@@ -84,7 +84,14 @@ _DEFAULT_STATE = {
     # НЕ policy: держим отдельно от traffic_guard.domains (одно-pipe'овый движок,
     # один активный throttle за раз). Секретов нет; Reality-ключи/конфиги не трогаем.
     "runtime": {"last_apply": None, "last_error": None, "active_throttle": None,
-                 "active_isolate": None, "active_codex_isolate": None},
+                 "active_isolate": None, "active_codex_isolate": None,
+                 # system_proxy — runtime-lease системного macOS SOCKS-repair (srouter system-proxy
+                 # repair/restore). active пишется ПОСЛЕ подтверждённого успеха (previous endpoint
+                 # для честного restore) — НЕ двухфазный pending/active контракт active_throttle/
+                 # active_isolate: networksetup-мутация атомарна за один вызов, восстанавливать
+                 # промежуточное состояние между командами не нужно. Отдельный ключ, т.к. это
+                 # независимая привилегированная операция (repair CLI, не Traffic Guard/PF).
+                 "system_proxy": {"active": None}},
     # auto_route_sync — opt-in split-route до VPS через en0 (мимо VPN). Top-level ключ (читается
     # node_selector._auto_route_sync_enabled строго is True). По умолчанию ON — «пофигу VPN»:
     # watchdog (ensure_split_route) держит route через физический шлюз при любом состоянии VPN.

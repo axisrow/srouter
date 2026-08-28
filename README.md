@@ -301,9 +301,16 @@ binary/exec.LookPath), поэтому границей служит именно
   перед вызовом реального codex (`socks5h` = DNS резолвится прокси, важно за GFW). Имя `codex-srouter`
   (не `codex`) убирает коллизию неймспейса wrapper↔real-binary (issue #169). В интерактивном zsh
   shell-функция `codex()` зовёт его по абсолютному пути — привычный `codex …` сохранён.
-- **`~/bin/codex-app-proxy`** — wrapper App: `open -na Codex.app --args --proxy-server=socks5://...`
-  (Chromium flag; env не дублирует). **Codex.app запускать через него, а не иконку Dock**
-  (Dock не передаёт `--proxy-server`).
+- **`~/bin/codex-app-proxy`** — резервный wrapper App: `open -na Codex.app --args
+  --proxy-server=socks5://...` (Chromium flag; env не дублирует). Нужен только как ручной
+  workaround, если системный SOCKS почему-то нельзя починить/включить — **обычный запуск из
+  Dock работает штатно**: Chromium-оболочка ChatGPT.app/Codex.app читает СИСТЕМНЫЙ macOS SOCKS
+  активного network service (`networksetup -getsocksfirewallproxy`), а не launchctl gui-env.
+  Если Chromium течёт мимо прокси при живом Dock-запуске, причина почти всегда — выключенный/
+  неверный системный SOCKS, а не отсутствие `--proxy-server`: `srouter doctor` покажет её явно
+  и подскажет `srouter system-proxy repair` (настраивает и включает SOCKS `127.0.0.1:10808` на
+  активном network service, бэкапя чужой выключенный endpoint; отказывает без мутации, если там
+  уже настроен чужой ВКЛЮЧЁННЫЙ прокси). `srouter system-proxy restore` возвращает бэкап.
 - **LaunchAgent `com.srouter.codenv` (восстановлен, #189/#190)** — глобальный env
   (`socks5h://127.0.0.1:10808` + `NO_PROXY=localhost,127.0.0.1,::1`) в launchd gui-домен: агент
   (RunAtLoad + StartInterval=300, переживает ребут) запускает скрипт `srouter-codex-env.sh`, который
@@ -359,7 +366,7 @@ binary/exec.LookPath), поэтому границей служит именно
 | Инструмент | Подключение |
 |---|---|
 | **Claude Code** | `HTTPS_PROXY=http://127.0.0.1:8118` в `~/.claude/settings.json` (privoxy HTTP; SOCKS5 CC не умеет) |
-| **Codex CLI/App** | **напрямую SOCKS5 в xray** (`socks5h://127.0.0.1:10808`) тремя живыми путями, минуя privoxy: wrappers (CLI + `--proxy-server` для Chromium-оболочки App), LaunchAgent `com.srouter.codenv` (gui-SOCKS5 env для Rust app-server ChatGPT.app, #189/#190; setenv не ретроактивен — запущенный до install ChatGPT.app перезапустите Cmd+Q), scoped VSCode `http.proxy` (расширение `openai.chatgpt`, #185; только если install обновил существующий settings.json); + **PF kill-switch в ядре** (#168) как будущая fail-closed граница (режет прямой TCP-выход codex на en0–en6/ppp0–ppp1, разрешая loopback SOCKS5 по TCP; пока дормантен — пользователь uid 503 уже создаётся install (#186), активируется после полной активации: запуск codex под uid 503 **независимо от wrapper'а** (не sudo -u в wrapper) + доменная изоляция + TCP на en/ppp, отдельный follow-up). privoxy портит WS-стриминг Codex (`Reconnecting`/`request timed out`); `[network] proxy_url` в `~/.codex/config.toml` мёртв в codex 0.146 (управляет execution-scoped sandbox-прокси для субпроцессов, не клиентом) — поэтому wrappers в `~/bin/codex-srouter` (CLI, имя `codex-srouter` убирает коллизию wrapper↔real-binary #169) + `~/bin/codex-app-proxy` (App Chromium) + `com.srouter.codenv` (Rust app-server) + scoped VSCode `http.proxy` (расширение). Запускать Codex **App** через `~/bin/codex-app-proxy`, а не иконку Dock (Dock не передаёт `--proxy-server`). См. раздел «Изоляция Codex». |
+| **Codex CLI/App** | **напрямую SOCKS5 в xray** (`socks5h://127.0.0.1:10808`) несколькими живыми путями, минуя privoxy: CLI-wrapper (env), СИСТЕМНЫЙ macOS SOCKS активного network service для Chromium-оболочки App (обычный запуск из Dock — `srouter doctor`/`srouter system-proxy repair` чинят выключенный/неверный SOCKS без переустановки), LaunchAgent `com.srouter.codenv` (gui-SOCKS5 env для Rust app-server ChatGPT.app, #189/#190; setenv не ретроактивен — запущенный до install ChatGPT.app перезапустите Cmd+Q), scoped VSCode `http.proxy` (расширение `openai.chatgpt`, #185; только если install обновил существующий settings.json); + **PF kill-switch в ядре** (#168) как будущая fail-closed граница (режет прямой TCP-выход codex на en0–en6/ppp0–ppp1, разрешая loopback SOCKS5 по TCP; пока дормантен — пользователь uid 503 уже создаётся install (#186), активируется после полной активации: запуск codex под uid 503 **независимо от wrapper'а** (не sudo -u в wrapper) + доменная изоляция + TCP на en/ppp, отдельный follow-up). privoxy портит WS-стриминг Codex (`Reconnecting`/`request timed out`); `[network] proxy_url` в `~/.codex/config.toml` мёртв в codex 0.146 (управляет execution-scoped sandbox-прокси для субпроцессов, не клиентом) — поэтому CLI-wrapper `~/bin/codex-srouter` (имя убирает коллизию wrapper↔real-binary #169) + системный SOCKS (App Chromium) + `com.srouter.codenv` (Rust app-server) + scoped VSCode `http.proxy` (расширение). `~/bin/codex-app-proxy` остаётся резервным ручным workaround'ом, не основным путём запуска App. См. раздел «Изоляция Codex». |
 | **git / gh** | scoped git-прокси `http.https://github.com.proxy → socks5h://127.0.0.1:10808` (xray, `git_proxy.py`); gh работает **напрямую** через Go-стек (GFW не режет) → для VPS-независимости: `gh` через `env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy` (оба регистра), `git` через `git -c http.https://github.com.proxy=` (env -u НЕ трогает git-config) — см. раздел «gh / git: прямой доступ» |
 | **Браузер** | системный SOCKS5 `127.0.0.1:10808` (вайтлист разруливает сам) |
 
@@ -714,9 +721,16 @@ optimization (they route traffic through the right channel without relying on th
   calling the real codex (`socks5h` = DNS resolved by the proxy, matters behind GFW). The name
   `codex-srouter` (not `codex`) removes the wrapper↔real-binary namespace collision (issue #169). In
   interactive zsh a shell function `codex()` calls it by absolute path — the familiar `codex …` stays.
-- **`~/bin/codex-app-proxy`** — App wrapper: `open -na Codex.app --args --proxy-server=socks5://...`
-  (Chromium flag; no env duplication). **Launch Codex.app via this, not the Dock icon** (Dock doesn't
-  pass `--proxy-server`).
+- **`~/bin/codex-app-proxy`** — fallback App wrapper: `open -na Codex.app --args
+  --proxy-server=socks5://...` (Chromium flag; no env duplication). Only needed as a manual
+  workaround if the system SOCKS can't be fixed/enabled for some reason — **launching from the
+  Dock icon works normally**: ChatGPT.app/Codex.app's Chromium shell reads the SYSTEM macOS SOCKS
+  proxy of the active network service (`networksetup -getsocksfirewallproxy`), not launchd
+  gui-env. If Chromium leaks direct traffic on a normal Dock launch, the cause is almost always a
+  disabled/wrong system SOCKS endpoint, not a missing `--proxy-server`: `srouter doctor` names it
+  and points at `srouter system-proxy repair` (sets and enables SOCKS `127.0.0.1:10808` on the
+  active network service, backing up a disabled foreign endpoint; refuses without mutating if an
+  ENABLED foreign proxy is already there). `srouter system-proxy restore` reverts the backup.
 - **LaunchAgent `com.srouter.codenv` (restored, #189/#190)** — global env
   (`socks5h://127.0.0.1:10808` + `NO_PROXY=localhost,127.0.0.1,::1`) into the launchd gui-domain: the
   agent (RunAtLoad + StartInterval=300, survives reboot) runs `srouter-codex-env.sh`, which calls
@@ -927,7 +941,7 @@ remove it).
 | Tool | Wiring |
 |---|---|
 | **Claude Code** | `HTTPS_PROXY=http://127.0.0.1:8118` in `~/.claude/settings.json` |
-| **Codex** | **straight to xray** (`socks5h://127.0.0.1:10808`) via three live paths that bypass privoxy: wrappers (CLI + `--proxy-server` for the App Chromium shell), the `com.srouter.codenv` LaunchAgent (gui-SOCKS5 env for ChatGPT.app's Rust app-server, #189/#190; setenv is non-retroactive — restart an already-running ChatGPT.app with Cmd+Q), and scoped VSCode `http.proxy` (the `openai.chatgpt` extension, #185; only if install updated an existing settings.json); + **a PF kill-switch in the kernel** (#168) as the future fail-closed boundary (cuts codex direct TCP egress on en0–en6/ppp0–ppp1, allowing TCP to loopback SOCKS5; dormant today — the uid 503 user is already created by install (#186), and activation requires full activation: launching codex under uid 503 **independently of the wrapper** (not via wrapper sudo -u) + domain isolation + TCP on en/ppp, a separate follow-up). `[network] proxy_url` in `~/.codex/config.toml` is dead in codex 0.146 (it configures the execution-scoped sandbox proxy for spawned `codex` subprocesses, not the client) — hence wrappers + codenv + VSCode http.proxy. See the "Codex isolation" section. |
+| **Codex** | **straight to xray** (`socks5h://127.0.0.1:10808`) via several live paths that bypass privoxy: a CLI env wrapper, the SYSTEM macOS SOCKS proxy of the active network service for the App Chromium shell (normal Dock launch — `srouter doctor`/`srouter system-proxy repair` fix a disabled/wrong SOCKS endpoint without reinstalling), the `com.srouter.codenv` LaunchAgent (gui-SOCKS5 env for ChatGPT.app's Rust app-server, #189/#190; setenv is non-retroactive — restart an already-running ChatGPT.app with Cmd+Q), and scoped VSCode `http.proxy` (the `openai.chatgpt` extension, #185; only if install updated an existing settings.json); + **a PF kill-switch in the kernel** (#168) as the future fail-closed boundary (cuts codex direct TCP egress on en0–en6/ppp0–ppp1, allowing TCP to loopback SOCKS5; dormant today — the uid 503 user is already created by install (#186), and activation requires full activation: launching codex under uid 503 **independently of the wrapper** (not via wrapper sudo -u) + domain isolation + TCP on en/ppp, a separate follow-up). `[network] proxy_url` in `~/.codex/config.toml` is dead in codex 0.146 (it configures the execution-scoped sandbox proxy for spawned `codex` subprocesses, not the client) — hence the CLI wrapper + system SOCKS + codenv + VSCode http.proxy. `~/bin/codex-app-proxy` remains a manual fallback, not the primary launch path. See the "Codex isolation" section. |
 | **git / gh** | scoped git proxy `http.https://github.com.proxy → socks5h://127.0.0.1:10808` (xray, `git_proxy.py`); gh works **direct** via its Go stack (GFW does not cut it) → for VPS-independence: `gh` with `env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy` (both cases), `git` with `git -c http.https://github.com.proxy=` (env -u does NOT touch git-config) — see "gh / git: direct access" |
 | **Browser** | system SOCKS5 `127.0.0.1:10808` |
 

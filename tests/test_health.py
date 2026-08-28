@@ -65,6 +65,10 @@ def _all_up_monkey(monkeypatch, *, probe_status="ok", probe_detail="runtime: к�
     # вердикт (как _claude_proxy_probe/_codex_proxy_probe выше).
     monkeypatch.setattr(health, "_codex_app_proxy_check",
                         lambda: {"status": "unknown", "source": "n/a", "detail": "App не запущен (mock)"})
+    # Chromium system-proxy check (живая регрессия 2026-08-28) — та же причина, что и
+    # _codex_app_proxy_check выше: дёргает ps/lsof, живой ChatGPT.app на dev-машине драйвил бы вердикт.
+    monkeypatch.setattr(health, "_codex_app_chromium_proxy_check",
+                        lambda: {"status": "unknown", "source": "n/a", "detail": "NetworkService не активен (mock)"})
     monkeypatch.setattr(health, "_desktop_proxy_check",
                         lambda: {"status": "unknown", "detail": "launchctl (mock)"})
     # #205: _dns_up дёргает _resolve_host (socket.getaddrinfo github.com) — мокаем резолв ok, иначе

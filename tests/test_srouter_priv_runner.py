@@ -15,6 +15,10 @@ def _cases():
     return [
         # (cmd, is_privileged, описание)
         ([NETWORKSETUP, "-setdnsservers", "Wi-Fi", "127.0.0.1"], True, "DNS mutation"),
+        ([NETWORKSETUP, "-setsocksfirewallproxy", "Wi-Fi", "127.0.0.1", "10808"], True,
+         "system SOCKS endpoint mutation"),
+        ([NETWORKSETUP, "-setsocksfirewallproxystate", "Wi-Fi", "on"], True,
+         "system SOCKS state mutation"),
         ([NETWORKSETUP, "-listallnetworkservices"], False, "list services (read)"),
         ([SUDO, BREW, "services", "restart", "dnsmasq"], True, "sudo brew dnsmasq (port 53)"),
         ([BREW, "services", "restart", "xray"], False, "brew xray (user service)"),

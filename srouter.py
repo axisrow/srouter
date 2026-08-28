@@ -126,6 +126,7 @@ from srouter_cli import (  # noqa: F401 — намеренный re-export пу�
     cmd_status,
     cmd_stop,
     cmd_sync,
+    cmd_system_proxy,
     cmd_uninstall,
     format_plan,
     format_uninstall_plan,
@@ -141,6 +142,7 @@ from srouter_cli import (  # noqa: F401 — намеренный re-export пу�
     privoxy_system,
     run,
     sys,
+    system_proxy_control,
     version,
     vscode_proxy,
 )

@@ -52,6 +52,7 @@ COMMAND_FUNCS = [
     "cmd_restart",
     "cmd_status",
     "cmd_doctor",
+    "cmd_system_proxy",
     "cmd_sync",
     "cmd_privoxy",
     "cmd_routing",
@@ -113,7 +114,7 @@ class TestParserSurface:
         top = {p[0] for p in surface if len(p) == 1}
         assert top == {
             "install", "uninstall", "start", "stop", "restart",
-            "status", "doctor", "sync", "routing", "privoxy",
+            "status", "doctor", "sync", "system-proxy", "routing", "privoxy",
         }
 
     def test_nested_subcommand_paths_preserved(self, surface):
@@ -123,6 +124,9 @@ class TestParserSurface:
             ("routing", "add-domain"),
             ("routing", "remove-domain"),
             ("routing", "list"),
+            ("system-proxy", "status"),
+            ("system-proxy", "repair"),
+            ("system-proxy", "restore"),
             ("privoxy", "status"),
             ("privoxy", "protect"),
             ("privoxy", "start"),
@@ -151,6 +155,9 @@ class TestParserSurface:
             (("doctor",), "state"),
             (("sync",), "state"),
             (("sync",), "xray_config"),
+            (("system-proxy", "status"), "state"),
+            (("system-proxy", "repair"), "state"),
+            (("system-proxy", "restore"), "state"),
             (("routing", "list"), "outbound"),
             (("routing", "list"), "xray_config"),
             (("routing", "add-domain"), "host"),
@@ -179,6 +186,9 @@ class TestParserSurface:
             ["install", "--force-endpoint-overwrite"],
             ["status", "--launchagents-dir", "/tmp/la"],
             ["sync", "--xray-config", "/tmp/c"],
+            ["system-proxy", "status"],
+            ["system-proxy", "repair", "--state", "/tmp/s"],
+            ["system-proxy", "restore"],
             ["routing", "list", "--outbound", "reality-out"],
             ["routing", "add-domain", "example.com", "--adopt"],
             ["privoxy", "protect", "--strict"],
@@ -204,6 +214,7 @@ class TestDispatchContract:
             (["restart"], "cmd_restart"),
             (["status"], "cmd_status"),
             (["doctor"], "cmd_doctor"),
+            (["system-proxy", "status"], "cmd_system_proxy"),
             (["sync"], "cmd_sync"),
             (["routing", "list"], "cmd_routing"),
             (["privoxy", "status"], "cmd_privoxy"),

@@ -231,6 +231,9 @@ def _machine_state_monkey(monkeypatch):
     # ChatGPT.app отдаёт не-info degraded и драйвит вердикт.
     monkeypatch.setattr(health, "_codex_app_proxy_check",
                         lambda: {"status": "unknown", "source": "n/a", "detail": "App не запущен (mock)"})
+    # Chromium system-proxy check — та же причина, что и _codex_app_proxy_check выше.
+    monkeypatch.setattr(health, "_codex_app_chromium_proxy_check",
+                        lambda: {"status": "unknown", "source": "n/a", "detail": "NetworkService не активен (mock)"})
     # #205: _dns_up → _resolve_host (реальный getaddrinfo github.com).
     monkeypatch.setattr(health, "_resolve_host", lambda host: True)
     # #204: _local_proxy_up → _service_running (реальный launchctl print).

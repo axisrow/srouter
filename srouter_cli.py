@@ -57,6 +57,7 @@ import health  # doctor-проверки стека
 import privoxy_audit  # пассивный root-owned аудит lifecycle-команд Privoxy (#122)
 import privoxy_system  # root-gated system LaunchDaemon для Privoxy (#122)
 import privileged_ops  # noqa: F401 — единая osascript/sudo-обёртка + whitelist (#156)
+import system_proxy_control  # explicit repair/restore системного SOCKS (Dock-запуск ChatGPT.app)
 
 # Привилегированный слой — единый владелец srouter_privileged (#259). Импортируем ИМЕНА
 # (а не модуль), чтобы `monkeypatch.setattr(srouter_cli, "make_privileged_runner", ...)`
@@ -601,6 +602,51 @@ def cmd_sync(args) -> int:
     return 0
 
 
+def cmd_system_proxy(args) -> int:
+    """Явный repair/restore/status системного macOS SOCKS активного network service.
+
+    Отдельная explicit-операция (НЕ часть install/start/watchdog): чинит обычный запуск
+    ChatGPT.app/Codex.app из Dock, когда системный SOCKS выключен/настроен неверно — без
+    переустановки стека и без перезапуска приложения. См. докстринг health_codenv.py
+    _codex_app_chromium_proxy_check и system_proxy_control.py.
+    """
+    action = getattr(args, "system_proxy_action", None)
+    state_path = getattr(args, "state", None)
+    runner = make_privileged_runner(run)
+
+    if action == "status":
+        st = system_proxy_control.status(runner=runner)
+        if st["status"] != "ok":
+            print(f"system-proxy: {st.get('detail', 'состояние не определено')}", file=sys.stderr)
+            return 1
+        socks = st["socks"]
+        marker = "✅ (target)" if st["target"] else "⚠️"
+        print(f"system-proxy: сервис={st['service']} (interface={st['interface']}) {marker}")
+        print(f"  SOCKS: enabled={socks['enabled']} {socks['server']}:{socks['port']} "
+              f"authenticated={socks['authenticated']}")
+        return 0 if st["target"] else 1
+
+    if action == "repair":
+        r = system_proxy_control.repair(path=state_path, runner=runner)
+        if r["ok"]:
+            print("system-proxy: repair выполнен — системный SOCKS настроен и включён "
+                  f"({'изменения применены' if r.get('changed') else 'уже был настроен'}).")
+            return 0
+        print(f"system-proxy: repair не выполнен — {r.get('err', 'unknown error')}", file=sys.stderr)
+        return 1
+
+    if action == "restore":
+        r = system_proxy_control.restore(path=state_path, runner=runner)
+        if r["ok"]:
+            print("system-proxy: восстановлен прежний системный SOCKS.")
+            return 0
+        print(f"system-proxy: restore не выполнен — {r.get('err', 'unknown error')}", file=sys.stderr)
+        return 1
+
+    print(f"system-proxy: неизвестное действие {action!r}", file=sys.stderr)
+    return 2
+
+
 def cmd_privoxy(args) -> int:
     """Ручное root-gated управление защищённым Privoxy (#122)."""
     action = getattr(args, "privoxy_action", None)
@@ -857,6 +903,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_sync.add_argument("--xray-config", default=local_state.XRAY_CONFIG_PATH,
                         help="Путь к production xray-config.json.")
     p_sync.set_defaults(func=cmd_sync)
+
+    # system-proxy: explicit repair/restore/status системного macOS SOCKS активного network
+    # service (Wi-Fi/Ethernet). Отдельная команда, НЕ часть install/start/watchdog — чинит обычный
+    # Dock-запуск ChatGPT.app/Codex.app, когда системный SOCKS выключен/настроен неверно, без
+    # переустановки и без перезапуска приложения. См. health_codenv._codex_app_chromium_proxy_check.
+    p_sysproxy = sub.add_parser(
+        "system-proxy",
+        help="Явный repair/restore/status системного SOCKS macOS (обычный Dock-запуск ChatGPT.app).")
+    p_sysproxy_sub = p_sysproxy.add_subparsers(dest="system_proxy_action", required=True)
+    for sub_name, sub_help in (
+        ("status", "Показать текущее состояние системного SOCKS активного network service."),
+        ("repair", "Настроить и включить наш SOCKS endpoint (бэкапит чужой, если он выключен)."),
+        ("restore", "Вернуть endpoint, сохранённый последним repair (если состояние не менялось извне)."),
+    ):
+        sp = p_sysproxy_sub.add_parser(sub_name, help=sub_help)
+        sp.add_argument("--state", default=None, help="Путь к srouter.local.json.")
+        sp.set_defaults(func=cmd_system_proxy)
 
     # routing (#136): управление routing-доменами production xray-config. Отдельная подкоманда —
     # свои sub-subcommands (add-domain/remove-domain/list). НЕ "route" (конфликт с split-route).
