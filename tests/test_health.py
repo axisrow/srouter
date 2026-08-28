@@ -2087,6 +2087,41 @@ def test_watchdog_recovery_push_on_down_to_ok(monkeypatch, tmp_path):
     assert "восстановлен" in notified[0][0]
 
 
+# ============ watchdog-plist запускает health.py КАК СКРИПТ — self-import должен это пережить ============
+# launchagents/com.srouter.watchdog.plist (srouter_cli.py:_install_generic_launchagent script_path=
+# env.root / "health.py") вызывает `<python> .../health.py watchdog` — прямой запуск файла, НЕ
+# `-m health`. При таком запуске исполняемый модуль регистрируется в sys.modules как '__main__', а
+# не 'health'. health_probes.py делает `import health as _health_facade` (циклический self-import
+# для monkeypatch-совместимости, канон #158) — при запуске как __main__ Python не находит 'health' в
+# sys.modules и заново импортирует/исполняет health.py под ключом 'health', создавая ВТОРОЙ,
+# независимый объект модуля. У этого второго объекта _tunnel_up() (health_probes.py) обращается к
+# _health_facade.TUNNEL_TARGETS ДО того, как звёздный ре-экспорт `from health_probes import *`
+# (внутри его же, второй, инициализации) успевает связать имя — AttributeError.
+def test_health_py_runs_standalone_via_watchdog_invocation(tmp_path):
+    """Точь-в-точь вызов watchdog-plist: `<python> health.py watchdog` не должен падать.
+
+    Реальный launchd ProgramArguments = [python_bin, str(env.root / "health.py"), "watchdog"]
+    (srouter_cli.py). subprocess здесь — единственный способ воспроизвести __main__ vs 'health'
+    дуализацию: обычный `import health` (как делает srouter.py:_cmd_doctor) не задевает баг.
+    """
+    import subprocess
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    repo_root = _Path(__file__).resolve().parent.parent
+    env = dict(os.environ)
+    # Реальные сетевые probe (privoxy/xray/tunnel) не подняты в CI/sandbox — это ожидаемо и не
+    # предмет теста; предмет теста — что процесс не падает с AttributeError на TUNNEL_TARGETS.
+    result = subprocess.run(
+        [_sys.executable, str(repo_root / "health.py"), "watchdog"],
+        cwd=str(repo_root), env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert "AttributeError" not in result.stderr, (
+        f"watchdog-инвокация упала с AttributeError (self-import __main__ vs 'health'):\n{result.stderr}"
+    )
+    assert "TUNNEL_TARGETS" not in result.stderr, result.stderr
+
+
 # ============================ cycle-review #133: table-driven transition matrix ============================
 # Codex C1: degraded→degraded спамило (is_ok collapse). Exact-state transitions решают.
 # Полная матрица: каждый (prev, cur) → ожидаемое количество пушей.
