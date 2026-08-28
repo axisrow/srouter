@@ -86,6 +86,24 @@ def test_chromium_check_down_when_one_network_pid_socks_and_other_external(monke
     )
 
 
+def test_chromium_check_does_not_claim_system_socks_correct_when_status_unverified(monkeypatch):
+    """codex-review (Codex adversarial-review, PR #314): external-leak доказан, но
+    system_proxy_control.status() вернул unknown (route/networksetup не читаются) — старый fallback
+    безусловно утверждал 'системный SOCKS настроен корректно', скрывая совет 'system-proxy repair'
+    именно на пути, где сам status() не смог ничего проверить.
+    """
+    monkeypatch.setattr(health.sys_probe, "run", _run(NETWORK_PROCESS, _route("96016", "8.8.8.8:443")))
+    monkeypatch.setattr(system_proxy_control, "status",
+                        lambda: {"status": "unknown", "target": False, "socks": None,
+                                 "detail": "нет активного default route"})
+    res = health._codex_app_chromium_proxy_check()
+    assert res["status"] == "down"
+    assert "настроен корректно" not in res["detail"].lower(), (
+        f"detail ложно заявляет, что системный SOCKS настроен корректно, хотя status() не смог "
+        f"это подтвердить (unknown); got {res}"
+    )
+
+
 def test_non_network_chromium_helpers_are_ignored(monkeypatch):
     monkeypatch.setattr(health.sys_probe, "run", _run(GPU_PROCESS, _route("96015", "8.8.8.8:443")))
     monkeypatch.setattr(system_proxy_control, "status",
