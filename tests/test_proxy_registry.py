@@ -164,3 +164,23 @@ def test_not_configured_but_leaking_still_reports_down(monkeypatch):
     monkeypatch.setattr(proxy_registry, "_effective", lambda: {"status": "ok"})
     git = _spec(proxy_registry.overview(probe=True), "git")
     assert git["runtime"] == "down"
+
+
+def test_broken_status_fn_forces_unknown_runtime_even_if_health_fn_succeeds(monkeypatch):
+    """ДЫРА (cycle-review PR #299, claim C): упавший status_fn -> configured=None должен
+    ЧЕСТНО занулять runtime в 'unknown', даже если health_fn независимо отработал и вернул
+    'ok'/'down' — иначе панель покажет «не проверяли, настроен ли» + «физически ok/down»,
+    хотя мы вообще не знаем, задействован ли прокси-путь этого потребителя. Существующий
+    guard (`if ... and runtime == "n/a"`) ловит только n/a-случай, но не общий."""
+    def boom():
+        raise RuntimeError("git config сломался")
+    monkeypatch.setattr(proxy_registry.git_proxy, "status", boom)
+    monkeypatch.setattr(proxy_registry, "_health_call",
+                        lambda fn: {"status": "ok", "detail": "git идёт напрямую"})
+    monkeypatch.setattr(proxy_registry, "_effective", lambda: {"status": "ok"})
+    git = _spec(proxy_registry.overview(probe=True), "git")
+    assert git["configured"] is None
+    assert git["runtime"] == "unknown", (
+        f"status_fn упал -> мы не знаем, настроен ли потребитель, значит runtime тоже "
+        f"честный unknown, а не значение здоровой (но независимой) health-пробы: {git}"
+    )

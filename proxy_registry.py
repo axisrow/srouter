@@ -209,9 +209,12 @@ def _row(spec, want_runtime):
     # Обратное НЕ маскируем: down/warn — доказанная утечка или поломка, её показываем всегда.
     if configured is False and runtime in ("ok", "unknown"):
         runtime = "n/a"
-    # Упавший status_fn -> configured=None; для таких строк runtime тоже честно unknown,
-    # иначе панель показала бы «не настроен, но работает», чего мы не проверяли.
-    if spec.status_fn is not None and configured is None and runtime == "n/a":
+    # Упавший status_fn -> configured=None; для таких строк runtime тоже честно unknown —
+    # НЕЗАВИСИМО от того, что вернул health_fn (cycle-review PR #299, claim C: раньше guard
+    # ловил только runtime=='n/a', пропуская случай «status_fn упал, health_fn всё равно
+    # отработал и вернул ok/down» — панель показала бы «не проверяли, настроен ли» +
+    # утверждение о физической работе, которого мы не проверяли).
+    if spec.status_fn is not None and configured is None:
         runtime = "unknown"
 
     return {
