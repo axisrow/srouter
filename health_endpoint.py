@@ -106,7 +106,9 @@ def _endpoint_xray_sync_check(state_path=None, xray_config_path=None):
       ok   — endpoint активного узла (canonical state) == address из xray (синхрон);
       warn — рассинхрон: local.json — placeholder test-IP, а xray держит реальный address. detail
              показывает РЕАЛЬНЫЙ endpoint (из xray) и подсказку `srouter sync` (импорт в local.json);
-      info — нет xray config (fresh install) / нет активного узла (apply не настроен).
+      warn — рабочий xray config СУЩЕСТВУЕТ, но битый (unreadable) или без outbound tag=active
+             (no_active) — НЕ fresh install, это аномалия конфига, требующая внимания;
+      info — нет xray config вовсе (absent, fresh install) / нет активного узла (apply не настроен).
     Канон: local.json = canonical источник, но рабочий xray — runtime-истина. apply-защита (#200
     в install_lib) блокирует перезапись рабочего config placeholder'ом; doctor показывает картину.
     Не бросает (probe-канон: compare_endpoint_with_xray сам fail-soft).
@@ -114,17 +116,32 @@ def _endpoint_xray_sync_check(state_path=None, xray_config_path=None):
     sp = state_path or _health_facade._ENDPOINT_SYNC_STATE_PATH
     xp = xray_config_path or _health_facade._ENDPOINT_SYNC_XRAY_PATH
     cmp = local_state.compare_endpoint_with_xray(state_path=sp, xray_config_path=xp)
-    local, xray, placeholder = cmp["local"], cmp["xray"], cmp["placeholder"]
+    local, xray, placeholder, xray_status = cmp["local"], cmp["xray"], cmp["placeholder"], cmp["xray_status"]
     # нет активного узла в local.json → endpoint не настроен через srouter; sync-чек неприменим
     # (даже если рабочий xray есть — apply не использует local.json без узла). info, не warn.
     if not local:
         return {"status": "info",
                 "detail": "нет активного узла / endpoint_host в local.json (sync-чек неприменим)"}
-    # нет рабочего xray config → local.json единственный источник (fresh install), дрейфа нет.
-    if not xray:
+    # #200 regression: read_xray_active_address кладёт address="" И для absent (файла нет), И для
+    # unreadable (файл есть, но битый), И для no_active (файл есть, валиден, но без tag=active) —
+    # `if not xray:` раньше схлопывал все три в одно сообщение "fresh install", маскируя реальную
+    # аномалию (config СУЩЕСТВУЕТ, просто не тот). xray_status различает их (canonical источник —
+    # local_state_xray.read_xray_active_address докстринг) — разветвляем по нему, не по пустой строке.
+    if xray_status == "absent":
+        # файла вообще нет → local.json единственный источник (fresh install), дрейфа нет.
         return {"status": "info",
                 "detail": f"endpoint {local}: рабочий xray config отсутствует (fresh install) — "
                           f"sync-чек неприменим, local.json — единственный источник"}
+    if xray_status == "unreadable":
+        return {"status": "warn",
+                "detail": f"endpoint {local}: рабочий xray config существует, но повреждён/не "
+                          f"парсится — apply может fail-closed, проверь конфиг xray"}
+    if xray_status == "no_active":
+        return {"status": "warn",
+                "detail": f"endpoint {local}: рабочий xray config существует, но без outbound "
+                          f"tag=active (возможно сгенерирован не через gen_xray_config, или "
+                          f"устаревшим форматом); endpoint из local.json ({local}) не подтверждён "
+                          f"— сверь runtime вручную"}
     if cmp["synced"]:
         return {"status": "ok",
                 "detail": f"endpoint синхронизирован: local.json == xray == {local}"}
