@@ -163,8 +163,12 @@ def check_all(*, active_claude=False):
     # driver держал вердикт на degraded, даже когда все реальные driver-чеки (порты/туннель/прокси)
     # мертвы. status у _endpoint_override_check() — только ok/info (никогда down/warn), значит он
     # органически не может сигналить о сбое стека — driver-роль была ошибкой агрегации.
+    # ok отражает СТАТУС чека, а не «не роняй вердикт» (роль info): status=info у этого чека
+    # означает WARN (override уводит CC мимо туннеля, #129) — захардкоженный ok=True выдавал его
+    # за подтверждённое здоровье. Раньше это скрывала info-ветка рендера; ok-first её убрал.
     eo = _endpoint_override_check()
-    eo_check = {"name": "endpoint (ANTHROPIC_BASE_URL)", "ok": True, "info": True, "detail": eo["detail"]}
+    eo_check = {"name": "endpoint (ANTHROPIC_BASE_URL)", "ok": eo["status"] == "ok",
+                "info": True, "detail": eo["detail"]}
     checks.append(eo_check)
     # endpoint-xray sync (#200): рассинхрон active_node (local.json) ↔ рабочий xray config.
     # info-only ВСЕГДА (как endpoint-override) — картина для диагностики + подсказка `srouter sync`,
@@ -217,8 +221,11 @@ def check_all(*, active_claude=False):
     # unknown (job не загружен — codenv опционален / launchctl недоступен / exit-код неизвестен) —
     # info-only: не роняет вердикт, но и не притворяется подтверждённо здоровым.
     cj = _codenv_job_check()
+    # ok == «проверено и прошло» (только status ok), НЕ «не down»: unknown — это «не смогли
+    # проверить», и ok=True выдавал его за здоровье (✅ «состояние не определено» — fail-open).
+    # info=True держит его вне агрегации вердикта — обе оси остаются независимыми.
     cj_check = {"name": "codenv LaunchAgent (job launchd)",
-                "ok": cj["status"] != "down", "detail": cj["detail"]}
+                "ok": cj["status"] == "ok", "detail": cj["detail"]}
     if cj["status"] == "unknown":
         cj_check["info"] = True
     checks.append(cj_check)

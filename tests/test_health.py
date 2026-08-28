@@ -1645,6 +1645,90 @@ def test_print_report_healthy_stack_has_no_warning_noise(capsys):
 
 
 
+# ===== ok ≠ «не смогли проверить»: третья ось, склеенная в ok у производителей (cycle-review PR #296) =====
+# ДЫРА (Codex P2): рендер стал читать ok ПЕРВЫМ — корректно. Но два производителя ставили ok=True
+# не в значении «прошло», а в значении «не роняй вердикт»: codenv unknown («launchctl недоступен»)
+# и endpoint-override (докстринг _endpoint_override_check: «Иначе → info (WARN)», а check_all
+# хардкодил ok=True). Раньше их скрывала info-ветка рендера; после фикса рендера они рисуются ✅ —
+# «состояние не определено» и «нестандартный endpoint в обход туннеля» выдаются за подтверждённое
+# здоровье. Это fail-open (verify-dont-guess), и чинить его надо У ИСТОЧНИКА: ok обязан значить
+# «проверено и прошло», иначе рендер снова придётся деформировать под потребителя (fix-once).
+
+
+def _check_by_name(result, needle):
+    """Единственный чек, чьё имя содержит needle (падает громко, если ноль/несколько)."""
+    hits = [c for c in result["checks"] if needle.lower() in c["name"].lower()]
+    assert len(hits) == 1, f"ожидался ровно один чек с {needle!r}, got: {[c['name'] for c in hits]}"
+    return hits[0]
+
+
+def test_codenv_unknown_is_not_ok_in_check_all(monkeypatch):
+    """codenv unknown («launchctl недоступен») → ok=False + info=True, НЕ ok=True.
+
+    info говорит «не driver» (вердикт не роняем), ok=False — «здоровье НЕ подтверждено».
+    Комментарий check_all обещает ровно это: «не притворяется подтверждённо здоровым».
+    """
+    _all_up_monkey(monkeypatch)
+    monkeypatch.setattr(health, "_codenv_job_check", lambda *a, **kw: {
+        "status": "unknown", "detail": "состояние не определено (launchctl print недоступен/таймаут)"})
+    cj = _check_by_name(health.check_all(), "codenv")
+    assert cj.get("info") is True, f"unknown не роняет вердикт (info), got: {cj}"
+    assert cj["ok"] is False, f"«не смогли проверить» ≠ ok — иначе рендер даст ✅, got: {cj}"
+
+
+def test_codenv_ok_stays_ok_in_check_all(monkeypatch):
+    """Гвард от переусердствования: ДОКАЗАННО здоровый codenv остаётся ok=True без info."""
+    _all_up_monkey(monkeypatch)
+    monkeypatch.setattr(health, "_codenv_job_check", lambda *a, **kw: {
+        "status": "ok", "detail": "codenv LaunchAgent загружен и здоров (last exit code = 0)"})
+    cj = _check_by_name(health.check_all(), "codenv")
+    assert cj["ok"] is True and not cj.get("info"), f"здоровый codenv = driver-✅, got: {cj}"
+
+
+def test_endpoint_override_is_not_ok_in_check_all(monkeypatch):
+    """Нестандартный endpoint (status=info=WARN) → ok=False + info=True, НЕ захардкоженный ok=True.
+
+    #129: CC уходит мимо туннеля на чужой endpoint. Это ровно то, о чём doctor обязан
+    предупредить — ✅ здесь скрывает утечку trust boundary за «здоровьем».
+    """
+    _all_up_monkey(monkeypatch)
+    monkeypatch.setattr(health, "_read_endpoint_config", lambda: {
+        "base_url": "https://api.z.ai/api/anthropic", "no_proxy": "", "source": "settings.json"})
+    eo = _check_by_name(health.check_all(), "ANTHROPIC_BASE_URL")
+    assert eo.get("info") is True, f"endpoint-override не driver (info), got: {eo}"
+    assert eo["ok"] is False, f"override = WARN, а не подтверждённое здоровье, got: {eo}"
+
+
+def test_endpoint_standard_is_ok_in_check_all(monkeypatch):
+    """Гвард: стандартный endpoint (status=ok) остаётся ok=True + info=True → ✅ без шума."""
+    _all_up_monkey(monkeypatch)
+    monkeypatch.setattr(health, "_read_endpoint_config",
+                        lambda: {"base_url": "", "no_proxy": "", "source": "shell"})
+    eo = _check_by_name(health.check_all(), "ANTHROPIC_BASE_URL")
+    assert eo["ok"] is True and eo.get("info") is True, f"стандартный endpoint = тихий ✅, got: {eo}"
+
+
+def test_unverified_checks_render_warning_not_ok(monkeypatch, capsys):
+    """Связка check_all → _print_report: «не смогли проверить» и override дают ⚠️, не ✅.
+
+    Именно эту связку сломал бы фикс рендера в одиночку: обе строки печатались ✅ с текстом
+    «состояние не определено» / «нестандартный endpoint» — fail-open в лицо пользователю.
+    """
+    _all_up_monkey(monkeypatch)
+    monkeypatch.setattr(health, "_codenv_job_check", lambda *a, **kw: {
+        "status": "unknown", "detail": "состояние не определено (launchctl print недоступен/таймаут)"})
+    monkeypatch.setattr(health, "_read_endpoint_config", lambda: {
+        "base_url": "https://api.z.ai/api/anthropic", "no_proxy": "", "source": "settings.json"})
+    health._print_report(health.check_all())
+    out = capsys.readouterr().out
+    codenv_line = next(ln for ln in out.splitlines() if "codenv" in ln.lower())
+    endpoint_line = next(ln for ln in out.splitlines() if "ANTHROPIC_BASE_URL" in ln)
+    assert _MARK_WARN in codenv_line, f"непроверенное здоровье = ⚠️, got: {codenv_line}"
+    assert _MARK_OK not in codenv_line, f"«не определено» НЕ ✅, got: {codenv_line}"
+    assert _MARK_WARN in endpoint_line, f"endpoint-override = ⚠️, got: {endpoint_line}"
+    assert _MARK_OK not in endpoint_line, f"override мимо туннеля НЕ ✅, got: {endpoint_line}"
+
+
 # --- #207 edge-cases (Codex cycle-review P1#2, P2#4): vacuous-truth guard + no-response/bad-code ---
 def _tunnel_curl_raw_per_target(responses):
     """Мок sys_probe.run с RAW-ответом per-URL: {"anthropic": {"out": "", "timeout": False}, ...}.
