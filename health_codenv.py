@@ -871,6 +871,14 @@ def _codex_app_chromium_proxy_check():
                            f"системный SOCKS-прокси {service} выключен/настроен неверно "
                            f"(enabled={socks.get('enabled')}, {socks.get('server')}:{socks.get('port')}). "
                            f"Почини: srouter system-proxy repair")}
+    if sys_status.get("status") != "ok":
+        # codex-review (adversarial-review, PR #314): status() сам не смог проверить системный SOCKS
+        # (unknown — нет default route/networksetup не читается) — НЕ заявляем "настроен корректно"
+        # (мы этого не знаем), не прячем совет по фиксу.
+        return {"status": "down", "source": "runtime",
+                "detail": (f"ChatGPT.app Chromium network-service идёт напрямую (PID {ext}); системный "
+                           f"SOCKS не удалось проверить ({sys_status.get('detail', 'unknown')}). "
+                           f"Проверь: srouter system-proxy status / repair")}
     return {"status": "down", "source": "runtime",
             "detail": (f"ChatGPT.app Chromium network-service идёт напрямую (PID {ext}), хотя "
                        f"системный SOCKS настроен корректно — проверь вручную: "
