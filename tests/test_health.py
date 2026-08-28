@@ -1569,6 +1569,81 @@ def test_print_report_tunnel_fail_no_vendor_outage_advises_node(monkeypatch, cap
     assert health.VENDOR_OUTAGE_MARKER not in out
 
 
+# ==================== рендер _print_report: info ⊥ ok (две независимые оси) ====================
+# ДЫРА: `mark = "⚠️" if c.get("info") else (...)` читал info РАНЬШЕ ok → для info-чека ok не
+# читался никогда. Но info означает «не участвует в агрегации вердикта» (drivers), а НЕ «есть о
+# чём предупредить». Оси ортогональны; рендер склеил их и потерял ok → 12 успешных проверок
+# (DNS резолвит, сеть активна, VPS доступен...) рисовались жёлтым, и в этом шуме тонули
+# реальные ❌. PR #262 обошёл это точечно для codenv, деформировав семантику одного чека
+# вместо одной строки рендера. Канон: fix-once-document-decisions.
+_MARK_OK, _MARK_WARN, _MARK_FAIL = "✅", "⚠️", "❌"
+
+
+
+def test_print_report_healthy_info_check_renders_ok_not_warning(capsys):
+    """info + ok=True → ✅, НЕ ⚠️ (главный кейс: «DNS резолвит» помечался предупреждением)."""
+    health._print_report({"status": "ok", "checks": [
+        {"name": "DNS (резолв тестового домена)", "ok": True, "info": True,
+         "detail": "DNS резолвит: github.com (резолвер работает)"},
+    ]})
+    out = capsys.readouterr().out
+    assert _MARK_OK in out, f"здоровый info-чек = ✅ (info ≠ предупреждение), got:\n{out}"
+    assert _MARK_WARN not in out, \
+        f"успешная проверка НЕ может быть ⚠️ — info это «не driver», а не «сломано», got:\n{out}"
+
+
+def test_print_report_info_check_not_ok_stays_warning(capsys):
+    """info + ok=False → ⚠️ сохраняется (намеренный tradeoff #189 / PF-lease «по выбору»).
+
+    Гвард от переусердствования: чиня жёлтое-на-здоровом, нельзя убить жёлтое-на-больном.
+    """
+    health._print_report({"status": "degraded", "checks": [
+        {"name": "desktop proxy (launchctl)", "ok": False, "info": True,
+         "detail": "SOCKS5 в launchctl = srouter codenv (#189) — намеренный tradeoff"},
+    ]})
+    out = capsys.readouterr().out
+    assert _MARK_WARN in out, f"не-driver требует внимания = ⚠️, got:\n{out}"
+    assert _MARK_FAIL not in out, f"info-чек НЕ ❌ (не роняет вердикт), got:\n{out}"
+
+
+def test_print_report_driver_marks_unchanged(capsys):
+    """driver-чеки (без info) не затронуты: ok→✅, fail→❌."""
+    health._print_report({"status": "degraded", "checks": [
+        {"name": "privoxy (8118)", "ok": True, "detail": ""},
+        {"name": "codex-proxy (маршрут TUI)", "ok": False, "detail": "идёт напрямую"},
+    ]})
+    out = capsys.readouterr().out
+    privoxy_line = next(ln for ln in out.splitlines() if "privoxy" in ln)
+    codex_line = next(ln for ln in out.splitlines() if "codex-proxy" in ln)
+    assert _MARK_OK in privoxy_line, f"driver ok = ✅, got: {privoxy_line}"
+    assert _MARK_FAIL in codex_line, f"driver fail = ❌, got: {codex_line}"
+    assert _MARK_WARN not in out, f"driver-чеки не жёлтые, got:\n{out}"
+
+
+def test_print_report_healthy_stack_has_no_warning_noise(capsys):
+    """Интеграция: здоровый стек не даёт ⚠️-шума, реальный ❌ видно сразу.
+
+    Ровно тот отчёт, с которым пришёл пользователь: 16 жёлтых строк при 2 настоящих сбоях.
+    """
+    healthy_info = [
+        {"name": n, "ok": True, "info": True, "detail": d} for n, d in (
+            ("сеть (default route / активный интерфейс)", "сеть активна: default route через ppp0"),
+            ("DNS (резолв тестового домена)", "DNS резолвит: github.com"),
+            ("upstream VPS (TCP-коннект до endpoint)", "endpoint placeholder TEST-NET"),
+            ("локальный прокси (privoxy/xray service-status)", "локальный прокси жив"),
+            ("gh/git direct (github env -u)", "github идёт напрямую"),
+        )
+    ]
+    checks = ([{"name": "privoxy (8118)", "ok": True, "detail": ""}] + healthy_info
+              + [{"name": "codex-proxy (маршрут TUI)", "ok": False, "detail": "напрямую"}])
+    health._print_report({"status": "degraded", "checks": checks})
+    out = capsys.readouterr().out
+    assert out.count(_MARK_WARN) == 0, \
+        f"здоровые info-чеки не шумят жёлтым (было 16 таких строк), got:\n{out}"
+    assert out.count(_MARK_FAIL) == 1, f"единственный реальный сбой виден, got:\n{out}"
+    assert out.count(_MARK_OK) == 6, f"5 info-ok + 1 driver-ok = ✅, got:\n{out}"
+
+
 
 # --- #207 edge-cases (Codex cycle-review P1#2, P2#4): vacuous-truth guard + no-response/bad-code ---
 def _tunnel_curl_raw_per_target(responses):

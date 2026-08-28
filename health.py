@@ -211,8 +211,9 @@ def check_all(*, active_claude=False):
     # указывает на несуществующий путь → down DRIVER. Реальный инцидент: 1419 падений подряд в
     # тишине — doctor читал plist-артефакт, а не состояние job'а. Без codenv Codex после ребута
     # идёт напрямую за GFW (fail-closed-proxy-down) → это настоящий сбой стека, не info-шёпот.
-    # ok (здоровый job) — обычный ✅ БЕЗ info-флага: _print_report рендерит любой info-чек жёлтым
-    # ⚠️, что для здоровой установки и есть запрещённый каноном #135 шум (cycle-review PR #262).
+    # ok (здоровый job) — обычный ✅ БЕЗ info-флага: подтверждённо здоров ≠ «не смогли проверить».
+    # (Исторически PR #262 выбрал ok ещё и потому, что _print_report красил ЛЮБОЙ info-чек жёлтым;
+    # тот баг рендера исправлен — ok читается первым — но выбор верен по существу, а не как обход.)
     # unknown (job не загружен — codenv опционален / launchctl недоступен / exit-код неизвестен) —
     # info-only: не роняет вердикт, но и не притворяется подтверждённо здоровым.
     cj = _codenv_job_check()
@@ -454,9 +455,14 @@ def _print_report(result):
     """Человекочитаемый отчёт check_all (для doctor). Вывод в stdout."""
     print(f"srouter health: {result['status'].upper()}\n")
     for c in result["checks"]:
-        # info-only check: endpoint-override (WARN), claude-proxy idle (нейтрально).
-        # ⚠️ — жёлтый треугольник (привлекает внимание, но не ❌): override/idle, а не «всё мертво».
-        mark = "⚠️" if c.get("info") else ("✅" if c["ok"] else "❌")
+        # info — ось «не участвует в агрегации вердикта» (drivers ниже), ОРТОГОНАЛЬНАЯ оси
+        # «прошло/не прошло». ok читается ПЕРВЫМ: иначе info перекрывает его и успешные проверки
+        # («DNS резолвит», «сеть активна») рисуются жёлтым — шум, в котором тонут реальные ❌.
+        # ⚠️ = не-driver требует внимания (намеренный tradeoff #189, PF-lease «по выбору»), не «сломано».
+        if c["ok"]:
+            mark = "✅"
+        else:
+            mark = "⚠️" if c.get("info") else "❌"
         detail = f" ({c['detail']})" if c.get("detail") else ""
         print(f"  {mark} {c['name']}{detail}")
     if result["status"] != "ok":
