@@ -1,5 +1,7 @@
 """Сетевые probe-хелперы dashboard без импорта Flask/dashboard."""
 
+import os
+
 import sys_probe
 from dashboard_common import (
     BREW,
@@ -64,13 +66,26 @@ def _curl_through(url, proxy=True, proxy_url=None):
     разными путями — Claude Code через privoxy(HTTP), git/codex через xray(SOCKS5), —
     и замер обязан бить в тот же путь, что и потребитель, иначе вердикт не про него.
     None -> HTTP_PROXY_URL (privoxy), историческое поведение всех прежних call-site'ов.
+
+    proxy=False обязан МИНОВАТЬ прокси и через env, не только через -x: unset proxy-vars
+    (оба регистра), иначе subprocess наследует HTTP_PROXY/ALL_PROXY процесса и «прямой»
+    замер тихо уйдёт через посторонний прокси — контрольная группа парного замера
+    (proxy_effective.py) перестаёт быть контрольной (cycle-review PR #298, canon —
+    тот же приём, что и в probe_manager.direct_probe).
     """
     cmd = [CURL, "-sS", "-o", "/dev/null", "--connect-timeout", "4", "--max-time", "8",
            "-w", "%{http_code} %{time_total}"]
+    kwargs = {}
     if proxy:
         cmd += ["-x", proxy_url or HTTP_PROXY_URL]
+    else:
+        env = os.environ.copy()
+        for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+                    "http_proxy", "https_proxy", "all_proxy", "no_proxy"):
+            env.pop(key, None)
+        kwargs["env"] = env
     cmd.append(url)
-    r = sys_probe.run(cmd, timeout=10)
+    r = sys_probe.run(cmd, timeout=10, **kwargs)
     if r["timeout"] or not r["out"]:
         return {"code": "000", "ms": None, "up": False}
     parts = r["out"].split()

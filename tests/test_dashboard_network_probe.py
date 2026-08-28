@@ -9,8 +9,9 @@ import dashboard_network
 
 def _run_returning(out, *, timed_out=False, rc=0):
     """Фабрика fake sys_probe.run с фиксированным stdout. `timeout` в сигнатуре — это
-    аргумент ВЫЗОВА (секунды), не флаг результата; флаг результата фиксируем через timed_out."""
-    return lambda cmd, timeout=None: {"rc": rc, "out": out, "err": "", "timeout": timed_out}
+    аргумент ВЫЗОВА (секунды), не флаг результата; флаг результата фиксируем через timed_out.
+    `env` принимается и игнорируется — proxy=False теперь зовёт sys_probe.run(..., env=...)."""
+    return lambda cmd, timeout=None, env=None: {"rc": rc, "out": out, "err": "", "timeout": timed_out}
 
 
 # ============================ #3: _curl_through / probe_tunnel HTTP semantics ============================
@@ -121,6 +122,44 @@ def test_probe_direct_down_on_5xx(monkeypatch):
     monkeypatch.setattr(dashboard_network.sys_probe, "run", _run_returning("502 0.200000"))
     r = dashboard_network.probe_direct()
     assert r["status"] == "down", f"5xx на прямом probe = down, получили {r}"
+
+
+def test_curl_through_direct_strips_proxy_env(monkeypatch):
+    """ДЫРА (cycle-review PR #298): proxy=False обязан МИНУТЬ прокси через env -u, иначе
+    unвыведенный HTTP_PROXY/ALL_PROXY в окружении процесса тихо перенаправит «прямой» замер
+    через посторонний прокси — контрольная группа перестаёт быть контрольной (canon
+    probe_manager.direct_probe уже делает это очищение для того же класса замера)."""
+    monkeypatch.setenv("HTTP_PROXY", "http://evil-proxy.example:9999")
+    monkeypatch.setenv("ALL_PROXY", "socks5://evil-proxy.example:9999")
+
+    seen_env = {}
+
+    def fake_run(cmd, timeout=None, env=None):
+        seen_env["env"] = env
+        return {"rc": 0, "out": "200 0.050000", "err": "", "timeout": False}
+
+    monkeypatch.setattr(dashboard_network.sys_probe, "run", fake_run)
+    dashboard_network._curl_through("https://api.anthropic.com/", proxy=False)
+
+    assert seen_env["env"] is not None, "proxy=False обязан передавать очищенный env, а не наследовать процесс"
+    for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+                "http_proxy", "https_proxy", "all_proxy", "no_proxy"):
+        assert key not in seen_env["env"], f"{key} просочился в direct-замер"
+
+
+def test_curl_through_via_proxy_does_not_strip_env(monkeypatch):
+    """proxy=True — обычный вызов через явный -x proxy_url, очищать env не нужно (не тот
+    контракт: сюда никто не передаёт env=, отсутствие ключа в kwargs — ожидаемое поведение)."""
+    seen = {}
+
+    def fake_run(cmd, timeout=None, env=None):
+        seen["env"] = env
+        return {"rc": 0, "out": "200 0.050000", "err": "", "timeout": False}
+
+    monkeypatch.setattr(dashboard_network.sys_probe, "run", fake_run)
+    dashboard_network._curl_through("https://api.anthropic.com/", proxy=True)
+
+    assert seen["env"] is None
 
 
 # ============================ #7: probe_ping packet loss ============================
