@@ -81,6 +81,8 @@ py-modules = [
     "privileged_ops",
     "lock_hierarchy",
     "direct_first",
+    "proxy_effective",
+    "system_proxy",
 ]
 
 [tool.setuptools.package-data]
