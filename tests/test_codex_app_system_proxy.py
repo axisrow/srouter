@@ -65,6 +65,27 @@ def test_chromium_check_still_down_if_configured_but_runtime_direct(monkeypatch)
     assert "codex-app-proxy" not in res["detail"]
 
 
+NETWORK_PROCESS_2 = (
+    "96017 /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/"
+    "151/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service) "
+    "--type=utility --utility-sub-type=network.mojom.NetworkService\n"
+)
+
+
+def test_chromium_check_down_when_one_network_pid_socks_and_other_external(monkeypatch):
+    """codex-review (Codex rescue, PR #314): два NetworkService PID одновременно (перезапуск/апдейт
+    App) — один держит SOCKS5, другой течёт external напрямую. Наличие ЛЮБОГО socks-сокета не должно
+    маскировать реальный direct-leak другого PID (mixed → down, не ok)."""
+    ps_out = NETWORK_PROCESS + NETWORK_PROCESS_2
+    lsof_out = _route("96016", "127.0.0.1:10808") + _route("96017", "8.8.8.8:443")
+    monkeypatch.setattr(health.sys_probe, "run", _run(ps_out, lsof_out))
+    monkeypatch.setattr(system_proxy_control, "status", lambda: _status(enabled=True))
+    res = health._codex_app_chromium_proxy_check()
+    assert res["status"] == "down", (
+        f"один PID external ДОЛЖЕН давать down, даже если другой PID через SOCKS5; got {res}"
+    )
+
+
 def test_non_network_chromium_helpers_are_ignored(monkeypatch):
     monkeypatch.setattr(health.sys_probe, "run", _run(GPU_PROCESS, _route("96015", "8.8.8.8:443")))
     monkeypatch.setattr(system_proxy_control, "status",

@@ -98,8 +98,17 @@ def _service_for_interface(iface, runner):
             pending_name = line.split(")", 1)[1].strip()
             continue
         if line.startswith("(Hardware Port"):
-            if f"Device: {iface}" in line or f"Device: {iface})" in line:
-                return pending_name
+            # codex-review (PR #314): "Device: {iface}" as substring матчил "en1" внутри "en10" —
+            # точное имя устройства кончается либо на ')' (последний в строке), либо на ', ' (перед
+            # следующим полем, напр. "Ethernet Address: ..."). Парсим значение целиком и сравниваем
+            # точным равенством, не подстрокой.
+            marker = "Device: "
+            idx = line.find(marker)
+            if idx != -1:
+                rest = line[idx + len(marker):]
+                device = rest.split(")", 1)[0].split(",", 1)[0].strip()
+                if device == iface:
+                    return pending_name
     return ""
 
 

@@ -268,7 +268,11 @@ def test_app_proxy_detects_chromium_helper_without_codex_basename(monkeypatch):
         f"Chromium network-service helper активен — не должно быть ложного "
         f"'App не запущен'; got {res}"
     )
-    assert "не запущен" not in res["detail"].lower(), f"detail лжёт 'не запущен'; got {res}"
+    # codex-review (PR #314): detail теперь честно уточняет, что именно Rust app-server не запущен
+    # (Chromium жив) — это НЕ тот баг, для которого написан тест (старый код видел app_pids=[] и
+    # лгал «ChatGPT.app/Codex.app не запущен» целиком, хотя Chromium-стек активен).
+    assert "chatgpt.app/codex.app не запущен" not in res["detail"].lower(), \
+        f"detail лжёт про весь App целиком; got {res}"
 
 
 def test_app_proxy_down_when_chromium_helper_leaks_direct_despite_gui_socks5(monkeypatch):
@@ -293,6 +297,24 @@ def test_app_proxy_down_when_chromium_helper_leaks_direct_despite_gui_socks5(mon
 # _codex_app_proxy_check проверяет external_by_kind ТОЛЬКО по "chromium"/"rust" (health_codenv.py
 # :700-713) — leak с "helper"-kind PID падает в generic Rust-ветку и врёт диагнозом.
 GENERIC_HELPER_COMM = "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"
+
+
+def test_app_proxy_empty_gui_env_does_not_blame_rust_when_only_chromium_running(monkeypatch):
+    """codex-review (Codex rescue, PR #314): единственный живой процесс — Chromium network-service
+    helper (Rust app-server НЕ запущен). gui-env пуст — это НОРМАЛЬНО (codenv нужен только Rust'у,
+    не Chromium — тот берёт прокси из системного SOCKS через отдельный
+    _codex_app_chromium_proxy_check). Старый текст «ChatGPT.app Rust app-server без прокси... srouter
+    install (codenv)» здесь ложный диагноз: Rust не запущен, и codenv install ничего не чинит для
+    чисто-Chromium случая.
+    """
+    ps = f"71234 {CHROMIUM_HELPER_COMM}\n"
+    monkeypatch.setattr(health.sys_probe, "run", _fake(ps, _gui_env({})))
+    res = health._codex_app_proxy_check()
+    detail = res["detail"].lower()
+    assert "srouter install (codenv)" not in detail and "восстановить: srouter install" not in detail, (
+        f"detail советует чинить codenv для Rust, хотя Rust не запущен (только Chromium); got {res}"
+    )
+    assert "не запущен" in detail, f"detail должен честно называть причину: Rust не запущен; got {res}"
 
 
 def test_app_proxy_down_diagnosis_does_not_blame_rust_for_generic_helper_leak(monkeypatch):

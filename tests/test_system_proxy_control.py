@@ -51,6 +51,34 @@ def _args(tmp_path, action):
     return SimpleNamespace(system_proxy_action=action, state=str(tmp_path / "state.json"))
 
 
+ROUTE_EN1 = "   route to: default\n  interface: en1\n"
+SERVICE_ORDER_EN1_EN10 = """An asterisk (*) denotes that a network service is disabled.
+(1) USB 10G LAN
+(Hardware Port: USB 10G LAN, Device: en10)
+(2) Thunderbolt Ethernet
+(Hardware Port: Thunderbolt Ethernet, Device: en1)
+"""
+
+
+def test_service_for_interface_does_not_substring_match_en1_into_en10():
+    """codex-review (Codex rescue, PR #314): _service_for_interface матчит `Device: {iface}` подстрокой
+    — default interface 'en1' матчит и строку 'Device: en10)', если en10 идёт РАНЬШЕ en1 в service order.
+    repair() тогда мутирует SOCKS не того адаптера (en10, не активный en1) — привилегированная операция
+    на неверном канале, живой канал остаётся без прокси, а лог заявляет успех.
+    """
+    def runner(cmd, timeout):
+        if cmd == [system_proxy_control.ROUTE, "-n", "get", "default"]:
+            return {"rc": 0, "out": ROUTE_EN1, "err": "", "timeout": False}
+        if cmd[1:] == ["-listnetworkserviceorder"]:
+            return {"rc": 0, "out": SERVICE_ORDER_EN1_EN10, "err": "", "timeout": False}
+        return {"rc": 1, "out": "", "err": f"unexpected: {cmd}", "timeout": False}
+
+    service = system_proxy_control._service_for_interface("en1", runner)
+    assert service == "Thunderbolt Ethernet", (
+        f"'en1' должен матчить ТОЛЬКО точный Device: en1, не 'en10' по substring; got {service!r}"
+    )
+
+
 def test_status_resolves_active_service_from_default_interface():
     runner = ProxyRunner(enabled=False)
     st = system_proxy_control.status(runner=runner)

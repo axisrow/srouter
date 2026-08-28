@@ -680,8 +680,20 @@ def _codex_app_proxy_check():
                           f"launchctl getenv gui/$(id -u) HTTPS_PROXY (App PID {','.join(app_pids)})"}
     keys = gui.get("keys") or {}
     pid_hint = f"PID {','.join(app_pids)}"
+    rust_pids = [p for p in app_pids if app_kinds.get(p) == "rust"]
 
     if not keys:
+        if not rust_pids:
+            # codex-review (PR #314): gui-env пуст, но живы только Chromium/generic-helper PID —
+            # Rust app-server НЕ запущен. codenv нужен только Rust'у (Chromium берёт прокси из
+            # системного SOCKS, см. _codex_app_chromium_proxy_check) — не приписываем Rust'у.
+            # Статус остаётся down (App-related процесс без launchd-прокси — по-прежнему сигнал,
+            # не unknown), но detail честно называет причину непричастности codenv.
+            return {"status": "down", "source": "gui-env",
+                    "detail": (f"ChatGPT.app: Rust app-server не запущен (только non-rust "
+                               f"App-процессы, {pid_hint}), gui-env codenv пуст — codenv нужен только "
+                               f"Rust app-server, для текущих процессов неприменим. Если Chromium "
+                               f"network-service течёт мимо прокси — см. отдельный system-proxy check.")}
         return {"status": "down", "source": "gui-env",
                 "detail": (f"ChatGPT.app Rust app-server без прокси: launchctl gui-env пуст — codenv "
                            f"не загружен/битый ({pid_hint}). WS к chatgpt.com рвётся (GFW). "
@@ -837,11 +849,14 @@ def _codex_app_chromium_proxy_check():
     if not route.get("verifiable"):
         return {"status": "unknown", "source": "runtime",
                 "detail": f"lsof не подтвердил маршрут (PID {','.join(network_pids)})"}
-    if route.get("socks"):
-        return {"status": "ok", "source": "runtime",
-                "detail": (f"ChatGPT.app Chromium network-service через SOCKS5 "
-                           f"(lsof PID {','.join(sorted(route['socks']))} -> {XRAY_PORT})")}
+    # codex-review (PR #314): external проверяем ПЕРВЫМ. Два NetworkService PID одновременно
+    # (перезапуск/апдейт App) — один может держать SOCKS5, другой течь external напрямую; наличие
+    # ЛЮБОГО socks-сокета раньше маскировало реальный direct-leak другого PID (false-ok на mixed).
     if not route.get("external"):
+        if route.get("socks"):
+            return {"status": "ok", "source": "runtime",
+                    "detail": (f"ChatGPT.app Chromium network-service через SOCKS5 "
+                               f"(lsof PID {','.join(sorted(route['socks']))} -> {XRAY_PORT})")}
         return {"status": "unknown", "source": "runtime",
                 "detail": f"ChatGPT.app Chromium network-service активен, но нет доказанного маршрута "
                           f"(idle, PID {','.join(network_pids)})"}
