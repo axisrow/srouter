@@ -2110,6 +2110,12 @@ def test_health_py_runs_standalone_via_watchdog_invocation(tmp_path):
 
     repo_root = _Path(__file__).resolve().parent.parent
     env = dict(os.environ)
+    # HOME → tmp_path уводит WATCHDOG_LIFECYCLE_LOG/WATCHDOG_NOTIFY_LOG (Path.home()-based) из-под
+    # реального пользователя, чтобы subprocess не гонялся с живым launchd-watchdog за один лог-файл
+    # и не слал спурионные macOS-уведомления (cycle-review #311). WATCHDOG_STATE/LIFECYCLE_STATE
+    # остаются хардкодом /tmp/srouter-watchdog.* (health.py) — не параметризуемы через env, вне
+    # скоупа этого фикса (self-import, не state-path рефакторинг).
+    env["HOME"] = str(tmp_path)
     # Реальные сетевые probe (privoxy/xray/tunnel) не подняты в CI/sandbox — это ожидаемо и не
     # предмет теста; предмет теста — что процесс не падает с AttributeError на TUNNEL_TARGETS.
     result = subprocess.run(
@@ -2120,6 +2126,14 @@ def test_health_py_runs_standalone_via_watchdog_invocation(tmp_path):
         f"watchdog-инвокация упала с AttributeError (self-import __main__ vs 'health'):\n{result.stderr}"
     )
     assert "TUNNEL_TARGETS" not in result.stderr, result.stderr
+    # Traceback — самостоятельная проверка (cycle-review #311, Codex): падение с ЛЮБЫМ другим
+    # исключением (TypeError/NameError и т.п. от будущего регресса) не должно проходить незамеченным
+    # только потому, что в stderr нет буквальных строк "AttributeError"/"TUNNEL_TARGETS". returncode
+    # НЕ используется — cmd_watchdog() легитимно возвращает 1 при status != "ok" (health.py:605),
+    # это не крах, а fail-closed health-контракт; ассертить нужно "процесс не упал", не "стек здоров".
+    assert "Traceback (most recent call last)" not in result.stderr, (
+        f"watchdog-инвокация упала с необработанным исключением:\n{result.stderr}"
+    )
 
 
 # ============================ cycle-review #133: table-driven transition matrix ============================
