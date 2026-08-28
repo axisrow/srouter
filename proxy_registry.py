@@ -238,6 +238,14 @@ def _stack():
     }
 
 
+def _short(text, limit=200):
+    """Выжимка многострочного detail: health-пробы возвращают инструкции в сотни символов
+    с переносами строк (напр. _github_direct_check ~700), а warning должен читаться одной
+    строкой. Полный текст остаётся в поле detail соответствующего потребителя."""
+    flat = " ".join(str(text or "").split())
+    return flat if len(flat) <= limit else flat[:limit] + "…"
+
+
 def _warnings(rows, stack, effective):
     """Расхождения, ради которых панель и существует — человеческим языком, по-русски."""
     out = []
@@ -245,13 +253,13 @@ def _warnings(rows, stack, effective):
         # Главное расхождение, ради которого панель и существует: намерение есть,
         # доказательства нет. Именно эта строка отвечает на «работает ли вообще».
         if r["configured"] is True and r["runtime"] == "down":
-            out.append(f"{r['title']} ({r['id']}): настроен, но трафик не идёт — {r['detail']}")
+            out.append(f"{r['title']}: настроен, но трафик не идёт — {_short(r['detail'])}")
     if not stack.get("privoxy"):
         out.append("privoxy не слушает 8118 — HTTP-потребители (Claude Code) пойдут напрямую")
     if not stack.get("xray"):
         out.append("xray не слушает 10808 — SOCKS-потребители (git, codex) пойдут напрямую")
     if effective and effective.get("verdict") == "proxy-broken":
-        out.append(f"физический замер: {effective.get('detail', 'прокси не работает')}")
+        out.append(f"физический замер: {_short(effective.get('detail', 'прокси не работает'))}")
     return out
 
 

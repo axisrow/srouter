@@ -179,25 +179,21 @@
     </div>
   </div>
 
+  <!-- Единая панель прокси (вместо разрозненных карточек git/claude): одна таблица, где
+       ДВЕ НЕЗАВИСИМЫЕ КОЛОНКИ — «настроен» (конфиг) и «физически» (замер трафика). Их
+       расхождение и есть ответ на «работает ли прокси вообще». -->
   <div class="card mt-3">
-    <div class="card-header d-flex align-items-center">
-      <i class="bi bi-git me-2"></i>
-      <span data-i18n="gitproxy_title">Git proxy (github)</span>
-      <span class="ms-auto badge bg-secondary ops" id="gitproxy-badge">—</span>
+    <div class="card-header d-flex align-items-center flex-wrap gap-2">
+      <i class="bi bi-shield-lock me-2"></i>
+      <span data-i18n="proxy_panel_title">Proxy</span>
+      <span class="badge bg-secondary ops" id="proxy-panel-badge">—</span>
+      <div class="ms-auto d-flex gap-2">
+        <button type="button" class="btn btn-sm btn-outline-secondary act" id="proxy-measure"
+                data-i18n="proxy_measure">Check</button>
+      </div>
     </div>
     <div class="card-body">
-      <div id="gitproxy-editor"></div>
-    </div>
-  </div>
-
-  <div class="card mt-3">
-    <div class="card-header d-flex align-items-center">
-      <i class="bi bi-robot me-2"></i>
-      <span data-i18n="cproxy_title">Claude Code proxy</span>
-      <span class="ms-auto badge bg-secondary ops" id="cproxy-badge">—</span>
-    </div>
-    <div class="card-body">
-      <div id="cproxy-editor"></div>
+      <div id="proxy-panel"></div>
     </div>
   </div>
 
@@ -284,6 +280,17 @@
         isolate_inactive: "Isolation inactive", isolate_cleanup_unrecoverable: "Cleanup token could not be persisted.",
         isolate_unresolved: "Unresolved", isolate_applied: "Isolation enabled", isolate_cleared: "Isolation disabled",
         isolate_refreshed: "IPs refreshed", isolate_cancelled: "Cancelled (password dialog)", isolate_failed: "Isolation failed: {0}",
+        proxy_panel_title: "Proxy", proxy_measure: "Check",
+        proxy_col_consumer: "Consumer", proxy_col_configured: "configured",
+        proxy_col_effective: "actually working", proxy_col_where: "where",
+        proxy_yes: "yes", proxy_no: "no", proxy_unknown: "?",
+        proxy_works: "working", proxy_broken: "not flowing", proxy_na: "—",
+        proxy_state_unknown: "unknown", proxy_mixed: "partial",
+        proxy_on: "Enable", proxy_off: "Disable",
+        proxy_mismatch: "MISMATCH", proxy_ok_badge: "OK",
+        proxy_applied: "Proxy enabled", proxy_cleared: "Proxy disabled",
+        proxy_failed: "Proxy action failed: {0}",
+        proxy_consumer_not_found: "Panel data is outdated — reloading",
         gitproxy_title: "Git proxy (github)", gitproxy_help: "Route git to github via SOCKS5 (xray) — fixes broken direct IPv4 to github (github has no IPv6). Scoped to github.com only.",
         gitproxy_on: "Enable", gitproxy_off: "Disable", gitproxy_enabled: "Enabled: git → github via {0}",
         gitproxy_disabled: "Disabled: git → github direct", gitproxy_applied: "Git proxy enabled",
@@ -379,6 +386,17 @@
         isolate_inactive: "Изоляция выключена", isolate_cleanup_unrecoverable: "Токен очистки не сохранён.",
         isolate_unresolved: "Не резолвятся", isolate_applied: "Изоляция включена", isolate_cleared: "Изоляция выключена",
         isolate_refreshed: "IP обновлены", isolate_cancelled: "Отменено (диалог пароля)", isolate_failed: "Ошибка изоляции: {0}",
+        proxy_panel_title: "Прокси", proxy_measure: "Проверить",
+        proxy_col_consumer: "Потребитель", proxy_col_configured: "настроен",
+        proxy_col_effective: "физически работает", proxy_col_where: "куда",
+        proxy_yes: "да", proxy_no: "нет", proxy_unknown: "?",
+        proxy_works: "работает", proxy_broken: "не идёт", proxy_na: "—",
+        proxy_state_unknown: "неизвестно", proxy_mixed: "частично",
+        proxy_on: "Включить", proxy_off: "Выключить",
+        proxy_mismatch: "РАСХОЖДЕНИЕ", proxy_ok_badge: "ОК",
+        proxy_applied: "Прокси включён", proxy_cleared: "Прокси выключен",
+        proxy_failed: "Ошибка прокси: {0}",
+        proxy_consumer_not_found: "Данные панели устарели — перезагружаю",
         gitproxy_title: "Git-прокси (github)", gitproxy_help: "Пустить git к github через SOCKS5 (xray) — чинит сломанный прямой IPv4 к github (у github нет IPv6). Только для github.com.",
         gitproxy_on: "Включить", gitproxy_off: "Выключить", gitproxy_enabled: "Включено: git → github через {0}",
         gitproxy_disabled: "Выключено: git → github напрямую", gitproxy_applied: "Git-прокси включён",
@@ -474,7 +492,18 @@
         isolate_inactive: "隔离未启用", isolate_cleanup_unrecoverable: "清理令牌未能持久化。",
         isolate_unresolved: "未解析", isolate_applied: "隔离已启用", isolate_cleared: "隔离已禁用",
         isolate_refreshed: "IP 已刷新", isolate_cancelled: "已取消（密码对话框）", isolate_failed: "隔离失败：{0}",
-        gitproxy_title: "Git 代理 (github)", gitproxy_help: "通过 privoxy 将 git 流量导向 github — 修复到 github 的直连 IPv4 故障（github 无 IPv6）。仅限 github.com。",
+        proxy_panel_title: "代理", proxy_measure: "检测",
+        proxy_col_consumer: "使用方", proxy_col_configured: "已配置",
+        proxy_col_effective: "实际可用", proxy_col_where: "去向",
+        proxy_yes: "是", proxy_no: "否", proxy_unknown: "?",
+        proxy_works: "正常", proxy_broken: "不通", proxy_na: "—",
+        proxy_state_unknown: "未知", proxy_mixed: "部分",
+        proxy_on: "启用", proxy_off: "停用",
+        proxy_mismatch: "不一致", proxy_ok_badge: "正常",
+        proxy_applied: "代理已启用", proxy_cleared: "代理已停用",
+        proxy_failed: "代理操作失败: {0}",
+        proxy_consumer_not_found: "面板数据已过期 — 正在重新加载",
+        gitproxy_title: "Git 代理 (github)", gitproxy_help: "通过 SOCKS5 (xray) 将 git 流量导向 github — 修复到 github 的直连 IPv4 故障（github 无 IPv6）。仅限 github.com。",
         gitproxy_on: "启用", gitproxy_off: "禁用", gitproxy_enabled: "已启用：git → github 经由 {0}",
         gitproxy_disabled: "已禁用：git → github 直连", gitproxy_applied: "Git 代理已启用",
         gitproxy_cleared: "Git 代理已禁用", gitproxy_failed: "Git 代理失败：{0}",
@@ -1388,140 +1417,170 @@
     function disableIsolate(btn) { isolateRequest({ action: 'disable' }, btn, 'isolate_cleared'); }
     function refreshIsolate(btn) { isolateRequest({ action: 'refresh' }, btn, 'isolate_refreshed'); }
 
-    /* ============================ Git proxy (github) ============================
-       Одна кнопка-тумблер: вкл/откл git config --global http.https://github.com.proxy.
-       Состояние читается из GET /api/git-proxy при загрузке (не из /api/status — это не телеметрия). */
-    var GIT_PROXY_ON = false;
-    var GIT_PROXY_URL = '';
-    function renderGitProxy() {
-      var box = document.getElementById('gitproxy-editor');
-      if (!box) return;
-      var busy = mutationInFlight();
-      var on = GIT_PROXY_ON;
-      var badge = document.getElementById('gitproxy-badge');
-      if (badge) {
-        badge.className = 'ms-auto badge ops ' + (on ? 'bg-success' : 'bg-secondary');
-        badge.textContent = on ? 'ON' : 'OFF';
+    /* ============================ Панель прокси ============================
+       Единая таблица потребителей вместо разрозненных карточек git/claude.
+
+       Зачем редизайн: старый UI показывал ОДНУ ось — «включено/выключено» из конфига — и
+       поэтому рапортовал зелёный ON, когда туннель был мёртв, а трафик шёл напрямую.
+       Здесь ДВЕ НЕЗАВИСИМЫЕ КОЛОНКИ: «настроен» (намерение, из родного конфига потребителя)
+       и «физически» (доказательство, замер трафика). Отвечает на вопрос именно их
+       расхождение: настроен ✓ + физически ✕ = прокси прописан, но не работает.
+
+       Данные — GET /api/proxy/overview (не /api/status: это не телеметрия, а картина
+       конфигурации; тяжёлый замер идёт только по кнопке «Проверить», ?probe=1). */
+    var PROXY_DATA = null;
+
+    /* Чистая функция (тестируется node-ом, см. tests/test_dashboard_proxy_panel.py):
+       одна строка таблицы. Всё, что пришло с сервера, экранируется — detail несёт
+       вывод health-проб (PID, пути, текст команд). */
+    function proxyRowHtml(c) {
+      var confMap = { true: 'proxy_yes', false: 'proxy_no' };
+      var confKey = confMap[String(c.configured)] || 'proxy_unknown';
+      var confCls = c.configured === true ? 'text-success'
+                  : (c.configured === false ? 'text-secondary' : 'text-warning');
+
+      var runMap = {
+        ok: ['proxy_works', 'text-success'],
+        down: ['proxy_broken', 'text-danger'],
+        warn: ['proxy_mixed', 'text-warning'],
+        mixed: ['proxy_mixed', 'text-warning'],
+        'n/a': ['proxy_na', 'text-secondary'],
+        unknown: ['proxy_state_unknown', 'text-secondary']
+      };
+      var run = runMap[c.runtime] || runMap.unknown;
+
+      // Расхождение «настроен, но не идёт» подсвечиваем строкой целиком — это главный сигнал.
+      var rowCls = (c.configured === true && c.runtime === 'down') ? ' class="table-danger"' : '';
+
+      var btn = '';
+      if (c.manageable) {
+        var on = c.configured === true;
+        btn = '<button type="button" class="btn btn-sm ' +
+              (on ? 'btn-outline-danger' : 'btn-outline-primary') +
+              ' act proxy-toggle" data-consumer="' + esc(c.id) + '">' +
+              esc(t(on ? 'proxy_off' : 'proxy_on')) + '</button>';
       }
-      var statusHtml = on
-        ? '<div class="alert alert-success py-2 mb-2"><i class="bi bi-check-circle me-1"></i>' +
-          esc(t('gitproxy_enabled', GIT_PROXY_URL || 'privoxy')) + '</div>'
-        : '<div class="text-secondary ops mb-2">' + esc(t('gitproxy_disabled')) + '</div>';
-      box.innerHTML =
-        '<div class="d-flex align-items-center gap-2 mb-2">' +
-          '<span class="fw-semibold">' + esc(t('gitproxy_title')) + '</span>' +
-        '</div>' +
-        statusHtml +
-        '<div class="d-flex flex-wrap gap-2 mb-2">' +
-          '<button type="button" class="btn btn-sm ' + (on ? 'btn-outline-danger' : 'btn-primary') + ' act" id="git-proxy-toggle"' +
-            (busy ? ' disabled' : '') + '>' +
-            '<span class="lbl"><i class="bi ' + (on ? 'bi-x-octagon' : 'bi-git') + '"></i> ' +
-            esc(on ? t('gitproxy_off') : t('gitproxy_on')) + '</span></button>' +
-        '</div>' +
-        '<div class="sub text-secondary">' + esc(t('gitproxy_help')) + '</div>';
-    }
-    function toggleGitProxy(btn) {
-      if (!tryBeginMutation('gitproxy')) return;
-      var lbl = btn ? btn.querySelector('.lbl') : null;
-      var orig = lbl ? lbl.innerHTML : '';
-      if (lbl) lbl.innerHTML = '<span class="spinner-border spinner-border-sm"></span>';
-      renderGitProxy();
-      var action = GIT_PROXY_ON ? 'disable' : 'enable';
-      fetch('/api/git-proxy/' + action, {
-        method: 'POST',
-        headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
-        body: '{}'
-      })
-        .then(function (r) {
-          return r.json().catch(function () { return { ok: false, err: 'HTTP ' + r.status }; })
-            .then(function (res) { res._status = r.status; return res; });
-        })
-        .then(function (res) {
-          if (res && res.ok) {
-            toast(action === 'enable' ? t('gitproxy_applied') : t('gitproxy_cleared'), 'ok');
-          } else {
-            var msg = (res && res.err) ? String(res.err).slice(0, 220) : ('HTTP ' + ((res && res._status) || 500));
-            toast(t('gitproxy_failed', msg), 'err');
-          }
-          // Перечитаем состояние с сервера (единый источник правды — ~/.gitconfig).
-          return fetchJson('/api/git-proxy').then(function (p) {
-            GIT_PROXY_ON = !!(p && p.enabled);
-            GIT_PROXY_URL = (p && p.proxy) || '';
-          }).catch(function () {});
-        })
-        .catch(function (e) { toast(t('gitproxy_failed', e.message), 'err'); })
-        .finally(function () {
-          finishMutation();
-          if (lbl) lbl.innerHTML = orig;
-          renderGitProxy();
-        });
+
+      // detail приходит из health-проб и бывает многострочной инструкцией в сотни символов
+      // (например _github_direct_check). В ячейку таблицы такое полотно не помещается —
+      // показываем первую строку-выжимку, полный текст кладём в title (tooltip).
+      var detailRow = '';
+      if (c.detail) {
+        var flat = String(c.detail).replace(/\s+/g, ' ').trim();
+        var short = flat.length > 160 ? flat.slice(0, 160) + '…' : flat;
+        detailRow = '<tr' + rowCls + '><td colspan="5" class="sub text-secondary pt-0 border-0" title="' +
+                    esc(flat) + '">' + esc(short) + '</td></tr>';
+      }
+
+      return '<tr' + rowCls + '>' +
+        '<td class="fw-semibold">' + esc(c.title) + '</td>' +
+        '<td class="' + confCls + '">' + esc(t(confKey)) + '</td>' +
+        '<td class="' + run[1] + '">' + esc(t(run[0])) + '</td>' +
+        '<td class="ops text-secondary text-break">' + esc(c.proxy || '—') + '</td>' +
+        '<td class="text-end">' + btn + '</td>' +
+        '</tr>' + detailRow;
     }
 
-    /* ============================ Claude Code proxy ============================
-       Одна кнопка-тумблер: вкл/откл HTTPS_PROXY в ~/.claude/settings.json (env секция).
-       Требуется при включённой изоляции Anthropic — иначе CLI не достучится до api.anthropic.com. */
-    var CPROXY_ON = false;
-    var CPROXY_URL = '';
-    function renderCProxy() {
-      var box = document.getElementById('cproxy-editor');
+    function renderProxyPanel() {
+      var box = document.getElementById('proxy-panel');
       if (!box) return;
-      var busy = mutationInFlight();
-      var on = CPROXY_ON;
-      var badge = document.getElementById('cproxy-badge');
-      if (badge) {
-        badge.className = 'ms-auto badge ops ' + (on ? 'bg-success' : 'bg-secondary');
-        badge.textContent = on ? 'ON' : 'OFF';
-      }
-      var statusHtml = on
-        ? '<div class="alert alert-success py-2 mb-2"><i class="bi bi-check-circle me-1"></i>' +
-          esc(t('cproxy_enabled', CPROXY_URL || 'privoxy')) + '</div>'
-        : '<div class="text-secondary ops mb-2">' + esc(t('cproxy_disabled')) + '</div>';
+      var d = PROXY_DATA;
+      if (!d) { box.innerHTML = '<div class="text-secondary ops">' + esc(t('no_data')) + '</div>'; return; }
+
+      var rows = (d.consumers || []).map(proxyRowHtml).join('');
+      var stack = d.stack || {};
+      var stackHtml =
+        '<div class="sub text-secondary mt-2">' +
+          'privoxy ' + (stack.privoxy ? '✓' : '✕') + ' 8118 · ' +
+          'xray ' + (stack.xray ? '✓' : '✕') + ' 10808' +
+        '</div>';
+
+      var warn = (d.warnings || []).map(function (w) {
+        return '<div class="alert alert-warning py-2 mb-2 sub">' + esc(w) + '</div>';
+      }).join('');
+
       box.innerHTML =
-        '<div class="d-flex align-items-center gap-2 mb-2">' +
-          '<span class="fw-semibold">' + esc(t('cproxy_title')) + '</span>' +
-        '</div>' +
-        statusHtml +
-        '<div class="d-flex flex-wrap gap-2 mb-2">' +
-          '<button type="button" class="btn btn-sm ' + (on ? 'btn-outline-danger' : 'btn-primary') + ' act" id="claude-proxy-toggle"' +
-            (busy ? ' disabled' : '') + '>' +
-            '<span class="lbl"><i class="bi ' + (on ? 'bi-x-octagon' : 'bi-robot') + '"></i> ' +
-            esc(on ? t('cproxy_off') : t('cproxy_on')) + '</span></button>' +
-        '</div>' +
-        '<div class="sub text-secondary">' + esc(t('cproxy_help')) + '</div>';
+        warn +
+        '<div class="table-responsive"><table class="table table-sm align-middle mb-0">' +
+          '<thead><tr class="text-secondary sub">' +
+            '<th>' + esc(t('proxy_col_consumer')) + '</th>' +
+            '<th>' + esc(t('proxy_col_configured')) + '</th>' +
+            '<th>' + esc(t('proxy_col_effective')) + '</th>' +
+            '<th>' + esc(t('proxy_col_where')) + '</th>' +
+            '<th></th>' +
+          '</tr></thead><tbody>' + rows + '</tbody>' +
+        '</table></div>' + stackHtml;
+
+      var badge = document.getElementById('proxy-panel-badge');
+      if (badge) {
+        // Бейдж панели = есть ли хоть одно расхождение «настроен, но не идёт».
+        var bad = (d.consumers || []).some(function (c) {
+          return c.configured === true && c.runtime === 'down';
+        });
+        badge.className = 'badge ops ' + (bad ? 'bg-danger' : 'bg-secondary');
+        badge.textContent = bad ? t('proxy_mismatch') : t('proxy_ok_badge');
+      }
     }
-    function toggleCProxy(btn) {
-      if (!tryBeginMutation('cproxy')) return;
+
+    function loadProxyPanel(probe) {
+      return fetchJson('/api/proxy/overview' + (probe ? '?probe=1' : ''))
+        .then(function (d) { PROXY_DATA = d; })
+        .catch(function () {})
+        .then(function () { renderProxyPanel(); });
+    }
+
+    function measureProxy(btn) {
       var lbl = btn ? btn.querySelector('.lbl') : null;
-      var orig = lbl ? lbl.innerHTML : '';
-      if (lbl) lbl.innerHTML = '<span class="spinner-border spinner-border-sm"></span>';
-      renderCProxy();
-      var action = CPROXY_ON ? 'disable' : 'enable';
-      fetch('/api/claude-proxy/' + action, {
+      var orig = btn ? btn.innerHTML : '';
+      if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span>'; }
+      return loadProxyPanel(true).finally(function () {
+        if (btn) { btn.disabled = false; btn.innerHTML = orig; }
+      });
+    }
+
+    function toggleProxyConsumer(btn) {
+      var cid = btn ? btn.getAttribute('data-consumer') : '';
+      if (!cid) return;
+      if (!tryBeginMutation('proxy:' + cid)) return;
+      var row = (PROXY_DATA && PROXY_DATA.consumers || []).filter(function (c) { return c.id === cid; })[0];
+      if (!row) {
+        // Устаревший PROXY_DATA или cid не найден — НЕ гадаем про действие (было: тихий
+        // fallback на 'enable' даже для уже настроенного потребителя, cycle-review PR #300).
+        // Честная ошибка + перечитать состояние с сервера, вместо угадывания намерения.
+        // proxy_consumer_not_found — отдельный ключ, не proxy_failed('{0}'=cid): тот шаблон
+        // ожидает текст ОШИБКИ в {0}, а не id потребителя (cycle-review PR #306, /review).
+        finishMutation();
+        toast(t('proxy_consumer_not_found'), 'err');
+        loadProxyPanel(false);
+        return;
+      }
+      var action = row.configured === true ? 'disable' : 'enable';
+      var orig = btn.innerHTML;
+      btn.disabled = true;
+      btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span>';
+      fetch('/api/proxy/' + action, {
         method: 'POST',
         headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
-        body: '{}'
+        body: JSON.stringify({ ids: [cid] })
       })
         .then(function (r) {
-          return r.json().catch(function () { return { ok: false, err: 'HTTP ' + r.status }; })
-            .then(function (res) { res._status = r.status; return res; });
+          return r.json().catch(function () { return { ok: false, err: 'HTTP ' + r.status }; });
         })
         .then(function (res) {
           if (res && res.ok) {
-            toast(action === 'enable' ? t('cproxy_applied') : t('cproxy_cleared'), 'ok');
+            toast(t(action === 'enable' ? 'proxy_applied' : 'proxy_cleared'), 'ok');
           } else {
-            var msg = (res && res.err) ? String(res.err).slice(0, 220) : ('HTTP ' + ((res && res._status) || 500));
-            toast(t('cproxy_failed', msg), 'err');
+            var first = (res && res.results && res.results[0]) || {};
+            toast(t('proxy_failed', String(first.err || (res && res.err) || '')).slice(0, 220), 'err');
           }
-          return fetchJson('/api/claude-proxy').then(function (p) {
-            CPROXY_ON = !!(p && p.enabled);
-            CPROXY_URL = (p && p.proxy) || '';
-          }).catch(function () {});
+          // Правда — только с сервера: перечитываем состояние, не доверяя оптимистичному локальному состоянию.
+          return loadProxyPanel(false);
         })
-        .catch(function (e) { toast(t('cproxy_failed', e.message), 'err'); })
+        .catch(function (e) { toast(t('proxy_failed', e.message), 'err'); })
         .finally(function () {
           finishMutation();
-          if (lbl) lbl.innerHTML = orig;
-          renderCProxy();
+          btn.disabled = false;
+          btn.innerHTML = orig;
         });
     }
 
@@ -2018,12 +2077,12 @@
         refreshIsolate(btn);
         return;
       }
-      if (btn.id === 'git-proxy-toggle') {
-        toggleGitProxy(btn);
+      if (btn.id === 'proxy-measure') {
+        measureProxy(btn);
         return;
       }
-      if (btn.id === 'claude-proxy-toggle') {
-        toggleCProxy(btn);
+      if (btn.classList && btn.classList.contains('proxy-toggle')) {
+        toggleProxyConsumer(btn);
         return;
       }
       if (!tryBeginMutation('action', ev)) return;
@@ -2068,8 +2127,7 @@
       readThrottleInputFromDom();
       renderThrottle();
       renderIsolate();
-      renderGitProxy();
-      renderCProxy();
+      renderProxyPanel();
       poll(true);
     });
     applyStaticI18n();
@@ -2092,19 +2150,10 @@
     renderGuard();     // пустой каркас редактора сразу, до первого ответа сервера
     renderThrottle();  // каркас throttle-контрола (inactive) до ответа сервера
     renderIsolate();   // каркас isolate-контрола (inactive) до ответа сервера
-    renderGitProxy();  // каркас git-proxy (inactive) до ответа сервера
-    renderCProxy();    // каркас claude-proxy (inactive) до ответа сервера
+    renderProxyPanel();  // каркас панели прокси до ответа сервера
     loadGuard();       // подтянуть block/allow правила + активный throttle из /api/guard
-    fetchJson('/api/git-proxy').then(function (p) {
-      GIT_PROXY_ON = !!(p && p.enabled);
-      GIT_PROXY_URL = (p && p.proxy) || '';
-      renderGitProxy();
-    }).catch(function () { /* тихо: останется каркас */ });
-    fetchJson('/api/claude-proxy').then(function (p) {
-      CPROXY_ON = !!(p && p.enabled);
-      CPROXY_URL = (p && p.proxy) || '';
-      renderCProxy();
-    }).catch(function () { /* тихо: останется каркас */ });
+    // Лёгкая загрузка: только конфиги. Тяжёлый замер трафика — по кнопке «Проверить».
+    loadProxyPanel(false);
     poll(true);
     setInterval(poll, 5000);
   })();
