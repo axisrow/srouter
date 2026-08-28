@@ -26,11 +26,26 @@ import logging
 import os
 import socket  # noqa: F401 — re-export для monkeypatch health.socket.getaddrinfo (health_probes._resolve_host)
 import subprocess
+import sys as _sys
 import time  # noqa: F401 — re-export для monkeypatch health.time.sleep (health_codenv._codenv_unloaded_is_persistent)
 
 import local_state  # noqa: F401 — re-export для monkeypatch health.local_state.* (health_probes/health_endpoint)
 import privoxy_system
 import sys_probe
+
+# Watchdog-launchagent запускает этот файл напрямую (`<python> health.py watchdog`, см.
+# launchagents/com.srouter.watchdog.plist) — тогда исполняющийся модуль регистрируется в
+# sys.modules как '__main__', НЕ 'health' (тот же эффект и у `python -m health`: runpy тоже
+# исполняет модуль под именем '__main__'). health_probes.py ниже делает `import health as
+# _health_facade` (циклический self-import для monkeypatch-совместимости, канон #158) — при
+# запуске как __main__ Python не находит 'health' в sys.modules и заново импортирует/исполняет
+# ЭТОТ ЖЕ файл под ключом 'health' — создаётся ВТОРОЙ, независимый объект модуля, у которого
+# звёздный ре-экспорт (from health_probes import * ниже) ещё не связал имена (TUNNEL_TARGETS и
+# т.п.) на момент обращения из health_probes._tunnel_up() → AttributeError. Регистрируем себя под
+# именем 'health' ДО импорта health_probes — тогда его циклический `import health` находит ЭТОТ
+# ЖЕ, уже строящийся модуль (как при обычном `import health`), а не запускает повторную
+# инициализацию с нуля.
+_sys.modules.setdefault("health", _sys.modules[__name__])
 
 from health_constants import _PROXY, DASHBOARD_PORT, PRIVOXY_PORT, XRAY_PORT  # noqa: F401 re-export
 from health_probes import *  # noqa: F401,F403 re-export — probes/сеть/туннель/VPS (канон #158)
