@@ -120,6 +120,23 @@ def test_app_proxy_down_when_stale_app_direct_despite_gui_socks5(monkeypatch):
         f"detail объясняет: нужен рестарт App (setenv не ретроактивен); got {res}"
 
 
+def test_app_proxy_distinguishes_chromium_helper_direct_from_rust_stale(monkeypatch):
+    """Direct Chromium helper gets a Chromium-specific diagnosis, not a false Rust stale diagnosis."""
+    helper = (
+        "/Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/"
+        "151.0.7922.170/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)"
+    )
+    ps = f"96016 {helper}\n"
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _fake(ps, _gui_env({"ALL_PROXY": SOCKS5}),
+                              lsof_out=_lsof_external("96016")))
+    res = health._codex_app_proxy_check()
+    assert res["status"] == "down"
+    detail = res["detail"].lower()
+    assert "chromium" in detail or "helper" in detail
+    assert "rust app-server" not in detail
+
+
 def test_app_proxy_unknown_when_app_idle_no_socks_socket(monkeypatch):
     """App активен + gui-env SOCKS5, но lsof НЕ показал 10808 (idle/нет ESTABLISHED) → unknown, НЕ ok.
 
@@ -221,3 +238,95 @@ def test_app_proxy_detects_chatgpt_app_path(monkeypatch):
     monkeypatch.setattr(health.sys_probe, "run", _fake(ps, _gui_env({})))
     res = health._codex_app_proxy_check()
     assert res["status"] == "unknown", f"CLI-codex (не App) → App не запущен → unknown; got {res}"
+
+
+# Chromium network-service helper ChatGPT.app (регрессия #189 follow-up, verify-dont-guess):
+# comm — полный путь ВНУТРИ .app/-бандла, basename НЕ "codex" (не матчит _is_codex_binary_comm) →
+# старый AND-детект (_is_codex_binary_comm И _is_codex_app_comm) отбрасывал этот процесс целиком,
+# несмотря на то что он реально течёт мимо прокси (эмпирика: lsof показал ~37 SYN_SENT сокетов
+# напрямую к 192.168.1.x/китайский IPv6, ни одного к 10808/8118, при корректном gui-env SOCKS5).
+CHROMIUM_HELPER_COMM = (
+    "/Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/"
+    "151.0.7922.170/Helpers/Codex (Service).app/Contents/MacOS/Codex (Service)"
+)
+
+
+def test_app_proxy_detects_chromium_helper_without_codex_basename(monkeypatch):
+    """Chromium network-service helper (comm НЕ basename 'codex', но путь /ChatGPT.app/) детектится
+    как App-related процесс — НЕ должен давать ложный unknown «App не запущен».
+
+    Баг: _codex_app_proxy_check раньше матчил App-PID через _is_codex_binary_comm(comm) AND
+    _is_codex_app_comm(comm) — basename-условие отсеивало любой helper с comm вида
+    ".../Codex (Service).app/Contents/MacOS/Codex (Service)" (basename "Codex (Service)" ≠ "codex").
+    Единственный процесс ChatGPT.app в ps-выводе — этот helper (Rust app-server не запущен отдельно) →
+    старый код видел app_pids=[] → status="unknown" "не запущен", хотя стек активен и течёт мимо прокси.
+    """
+    ps = f"71234 {CHROMIUM_HELPER_COMM}\n"
+    monkeypatch.setattr(health.sys_probe, "run", _fake(ps, _gui_env({})))
+    res = health._codex_app_proxy_check()
+    assert res["status"] != "unknown", (
+        f"Chromium network-service helper активен — не должно быть ложного "
+        f"'App не запущен'; got {res}"
+    )
+    # codex-review (PR #314): detail теперь честно уточняет, что именно Rust app-server не запущен
+    # (Chromium жив) — это НЕ тот баг, для которого написан тест (старый код видел app_pids=[] и
+    # лгал «ChatGPT.app/Codex.app не запущен» целиком, хотя Chromium-стек активен).
+    assert "chatgpt.app/codex.app не запущен" not in res["detail"].lower(), \
+        f"detail лжёт про весь App целиком; got {res}"
+
+
+def test_app_proxy_down_when_chromium_helper_leaks_direct_despite_gui_socks5(monkeypatch):
+    """Chromium helper держит external ESTABLISHED мимо прокси, хотя gui-env SOCKS5 корректен → down.
+
+    Живая эмпирика сессии: launchctl getenv показывал верный socks5h://127.0.0.1:10808, НО Chromium
+    network-service процесс (comm без basename 'codex') слал ~37 сокетов напрямую — ни один не шёл
+    через 10808/8118. Это ровно симптом net::ERR_CONNECTION_TIMED_OUT в UI (GFW режет прямой путь).
+    """
+    ps = f"71234 {CHROMIUM_HELPER_COMM}\n"
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _fake(ps, _gui_env({"HTTPS_PROXY": SOCKS5, "ALL_PROXY": SOCKS5}),
+                              lsof_out=_lsof_external("71234")))
+    res = health._codex_app_proxy_check()
+    assert res["status"] == "down", (
+        f"Chromium helper течёt мимо прокси (gui-env SOCKS5 корректен, lsof external) → down; got {res}"
+    )
+
+
+# Generic .app-helper (ни rust, ни chromium network-service) — _codex_app_process_kind классифицирует
+# его как "helper" (docstring health_codex.py:73 «must not be reported as the Rust app-server»), но
+# _codex_app_proxy_check проверяет external_by_kind ТОЛЬКО по "chromium"/"rust" (health_codenv.py
+# :700-713) — leak с "helper"-kind PID падает в generic Rust-ветку и врёт диагнозом.
+GENERIC_HELPER_COMM = "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"
+
+
+def test_app_proxy_empty_gui_env_does_not_blame_rust_when_only_chromium_running(monkeypatch):
+    """codex-review (Codex rescue, PR #314): единственный живой процесс — Chromium network-service
+    helper (Rust app-server НЕ запущен). gui-env пуст — это НОРМАЛЬНО (codenv нужен только Rust'у,
+    не Chromium — тот берёт прокси из системного SOCKS через отдельный
+    _codex_app_chromium_proxy_check). Старый текст «ChatGPT.app Rust app-server без прокси... srouter
+    install (codenv)» здесь ложный диагноз: Rust не запущен, и codenv install ничего не чинит для
+    чисто-Chromium случая.
+    """
+    ps = f"71234 {CHROMIUM_HELPER_COMM}\n"
+    monkeypatch.setattr(health.sys_probe, "run", _fake(ps, _gui_env({})))
+    res = health._codex_app_proxy_check()
+    detail = res["detail"].lower()
+    assert "srouter install (codenv)" not in detail and "восстановить: srouter install" not in detail, (
+        f"detail советует чинить codenv для Rust, хотя Rust не запущен (только Chromium); got {res}"
+    )
+    assert "не запущен" in detail, f"detail должен честно называть причину: Rust не запущен; got {res}"
+
+
+def test_app_proxy_down_diagnosis_does_not_blame_rust_for_generic_helper_leak(monkeypatch):
+    """Non-rust non-chromium .app-helper течёт мимо прокси → down НЕ должен обвинять Rust app-server
+    (никакого 'Resources/codex' PID вообще не запущено — обвинение было бы ложным).
+    """
+    ps = f"81234 {GENERIC_HELPER_COMM}\n"
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _fake(ps, _gui_env({"HTTPS_PROXY": SOCKS5, "ALL_PROXY": SOCKS5}),
+                              lsof_out=_lsof_external("81234")))
+    res = health._codex_app_proxy_check()
+    assert res["status"] == "down", f"generic helper leak должен быть down; got {res}"
+    assert "rust app-server" not in res["detail"].lower(), (
+        f"detail ложно обвиняет Rust app-server, хотя течёт non-rust non-chromium helper; got {res}"
+    )

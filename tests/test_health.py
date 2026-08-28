@@ -65,6 +65,10 @@ def _all_up_monkey(monkeypatch, *, probe_status="ok", probe_detail="runtime: к�
     # вердикт (как _claude_proxy_probe/_codex_proxy_probe выше).
     monkeypatch.setattr(health, "_codex_app_proxy_check",
                         lambda: {"status": "unknown", "source": "n/a", "detail": "App не запущен (mock)"})
+    # Chromium system-proxy check (живая регрессия 2026-08-28) — та же причина, что и
+    # _codex_app_proxy_check выше: дёргает ps/lsof, живой ChatGPT.app на dev-машине драйвил бы вердикт.
+    monkeypatch.setattr(health, "_codex_app_chromium_proxy_check",
+                        lambda: {"status": "unknown", "source": "n/a", "detail": "NetworkService не активен (mock)"})
     monkeypatch.setattr(health, "_desktop_proxy_check",
                         lambda: {"status": "unknown", "detail": "launchctl (mock)"})
     # #205: _dns_up дёргает _resolve_host (socket.getaddrinfo github.com) — мокаем резолв ok, иначе
@@ -345,6 +349,16 @@ def test_check_all_down_when_everything_dead(monkeypatch):
     # issue #189: _codex_app_proxy_check тоже дёргает ps — мокаем (иначе живой ChatGPT.app → ok → не down).
     monkeypatch.setattr(health, "_codex_app_proxy_check",
                         lambda: {"status": "down", "source": "gui-env", "detail": "down"})
+    # #189 follow-up round 2: _codex_app_chromium_proxy_check — новый driver (system-proxy для
+    # Chromium network-service ChatGPT.app), тоже дёргает ps/lsof — мокаем (иначе живой ChatGPT.app
+    # с рабочим системным SOCKS5 → ok → any_ok=True → degraded вместо down).
+    monkeypatch.setattr(health, "_codex_app_chromium_proxy_check",
+                        lambda: {"status": "down", "source": "runtime", "detail": "down"})
+    # #250: _codenv_job_check тоже driver (не info на ok) — на машине с реально загруженным и
+    # здоровым codenv LaunchAgent даёт живой ok → any_ok=True → degraded вместо down. Мокаем для
+    # machine-independence (канон unmocked-probe-is-both-slow-and-machine-dependent).
+    monkeypatch.setattr(health, "_codenv_job_check",
+                        lambda **kw: {"status": "down", "detail": "down"})
     # #205: _dns_up дёргает реальный getaddrinfo — мокаем (детерминизм; «всё мёртво» → DNS-down ok).
     _mock_dns(monkeypatch, resolves=False)
 

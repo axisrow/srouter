@@ -20,7 +20,7 @@ _log = logging.getLogger("srouter.health")
 
 # star-import re-export (канон star-import-reexport-contract) — см. health_probes.py докстринг __all__.
 __all__ = [
-    "_is_codex_app_comm", "_is_codex_binary_comm", "_codex_proxy_probe",
+    "_is_codex_app_comm", "_codex_app_process_kind", "_is_codex_binary_comm", "_codex_proxy_probe",
     "_codex_wrapper_path", "_which_all", "_binary_version", "_is_srouter_codex_wrapper",
     "_codex_provenance", "_claude_provenance", "_scan_codex_binaries", "_scan_claude_code_binaries",
     "_format_versions_detail", "_privoxy_log_observability_check", "_installed_versions_check",
@@ -62,6 +62,25 @@ def _is_codex_app_comm(comm):
     а /ChatGPT.app/ (com.openai.codex ребрендинг) и /Codex.app/ оба покрыты одним regex.
     """
     return bool(comm and _CODEX_APP_PATH_RE.search(comm))
+
+
+def _codex_app_process_kind(comm):
+    """Classify a process inside ChatGPT/Codex.app without confusing its stacks.
+
+    ``ps comm`` is intentionally the only input: the Rust app-server has a stable
+    ``Contents/Resources/codex`` path, while Chromium network-service helpers are
+    nested below ``Frameworks/.../Helpers/*.app`` and have names such as
+    ``Codex (Service)``.  Other app helpers remain observable as ``helper`` but
+    must not be reported as the Rust app-server.
+    """
+    if not _is_codex_app_comm(comm):
+        return None
+    normalized = comm.replace("\\", "/").lower()
+    if "/contents/resources/codex" in normalized and normalized.endswith("/codex"):
+        return "rust"
+    if "/helpers/" in normalized and ".app/contents/macos/" in normalized:
+        return "chromium"
+    return "helper"
 
 
 def _is_codex_binary_comm(comm):

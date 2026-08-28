@@ -73,6 +73,13 @@ def is_allowed(cmd) -> bool:
     # route -n delete — удаление split-route.
     if head == ROUTE and len(cmd) > 2 and cmd[1] == "-n" and cmd[2] == "delete":
         return True
+    # networksetup -setsocksfirewallproxy <service> <server> <port> — системный SOCKS endpoint.
+    # Точный формат: ровно 5 аргументов, port — целое число (fail-closed на malformed вызов).
+    if head == NETWORKSETUP and len(cmd) == 5 and cmd[1] == "-setsocksfirewallproxy":
+        return cmd[4].isdigit()
+    # networksetup -setsocksfirewallproxystate <service> on|off — вкл/выкл системного SOCKS.
+    if head == NETWORKSETUP and len(cmd) == 4 and cmd[1] == "-setsocksfirewallproxystate":
+        return cmd[3] in ("on", "off")
     return False
 
 

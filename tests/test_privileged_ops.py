@@ -46,6 +46,22 @@ def test_whitelist_networksetup_dns_mutation_allowed():
     ) is True
 
 
+def test_exact_system_socks_mutations_are_allowed():
+    assert privileged_ops.is_allowed(
+        [NETWORKSETUP, "-setsocksfirewallproxy", "Wi-Fi", "127.0.0.1", "10808"])
+    assert privileged_ops.is_allowed(
+        [NETWORKSETUP, "-setsocksfirewallproxystate", "Wi-Fi", "on"])
+    assert privileged_ops.is_allowed(
+        [NETWORKSETUP, "-setsocksfirewallproxystate", "Wi-Fi", "off"])
+
+
+def test_malformed_system_socks_mutations_are_rejected():
+    assert not privileged_ops.is_allowed(
+        [NETWORKSETUP, "-setsocksfirewallproxystate", "Wi-Fi", "maybe"])
+    assert not privileged_ops.is_allowed(
+        [NETWORKSETUP, "-setsocksfirewallproxy", "Wi-Fi", "host", "not-a-port"])
+
+
 def test_whitelist_networksetup_read_not_allowed():
     """-listallnetworkservices — чтение, НЕ требует osascript (не в whitelist привилегированных)."""
     assert privileged_ops.is_allowed([NETWORKSETUP, "-listallnetworkservices"]) is False

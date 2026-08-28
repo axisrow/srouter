@@ -103,6 +103,9 @@ def test_install_creates_wrappers(monkeypatch, tmp_path):
     # App wrapper: --proxy-server (Chromium flag, env от install-plist не дублируется).
     app_text = (bin_dir / "codex-app-proxy").read_text(encoding="utf-8")
     assert "--proxy-server=socks5://" in app_text, "App передаёт Chromium --proxy-server"
+    assert "ChatGPT.app" in app_text, "App wrapper поддерживает фактическое имя ChatGPT.app"
+    assert "CFBundleExecutable" in app_text, "App wrapper не предполагает executable Codex"
+    assert 'pkill -x "$APP_EXEC_NAME"' in app_text, "App wrapper завершает фактический executable, не только Codex"
 
 
 def test_install_marker_gate_foreign_not_touched(monkeypatch, tmp_path):

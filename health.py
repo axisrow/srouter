@@ -226,6 +226,19 @@ def check_all(*, active_claude=False):
     elif ap["status"] == "warn":
         ap_check["ok"] = False  # App на privoxy — degraded (WS порвётся #120)
     checks.append(ap_check)
+    # ChatGPT.app Chromium network-service system-proxy (живая регрессия 2026-08-28): обычный
+    # запуск из Dock идёт через СИСТЕМНЫЙ macOS SOCKS активного network service, не через
+    # launchd gui-env (тот покрывает только Rust app-server, см. ap_check выше). Down здесь
+    # означает конкретную и чинимую причину — выключенный/неверный системный SOCKS, лечится
+    # `srouter system-proxy repair`, БЕЗ переустановки/перезапуска App. unknown (NetworkService
+    # не активен/idle) — info-only, как остальные App-пробы (fail-closed). НЕ под active_claude
+    # gate — чек лёгкий (ps + lsof, тот же бюджет, что ap_check).
+    acp = _codex_app_chromium_proxy_check()
+    acp_check = {"name": "codex-app-proxy (ChatGPT.app Chromium system-proxy)",
+                 "ok": acp["status"] == "ok", "detail": acp["detail"]}
+    if acp["status"] == "unknown":
+        acp_check["info"] = True
+    checks.append(acp_check)
     # codenv launchd-job (#250): job загружен, но падает (exit != 0) / осиротел (plist удалён) /
     # указывает на несуществующий путь → down DRIVER. Реальный инцидент: 1419 падений подряд в
     # тишине — doctor читал plist-артефакт, а не состояние job'а. Без codenv Codex после ребута
