@@ -3356,6 +3356,68 @@ def test_endpoint_xray_sync_check_info_when_no_active_node(tmp_path):
     assert chk["status"] == "info", chk
 
 
+def test_endpoint_xray_sync_check_no_active_is_not_reported_as_fresh_install(tmp_path):
+    """#200 regression: xray config СУЩЕСТВУЕТ, но без tag=active → НЕ "fresh install" враньё.
+
+    Реальный сценарий (verify-dont-guess, воспроизведено на живой машине): рабочий xray config
+    существует и валиден, но outbound назван "reality-out" (не сгенерирован через gen_xray_config
+    с его контрактом tag="active" — сторонний/устаревший конфиг). read_xray_active_address тогда
+    отдаёт xray_status="no_active" (НЕ "absent"), но _endpoint_xray_sync_check раньше сворачивал
+    оба случая в один текст через `if not xray:` (xray == "" для обоих), маскируя реальность
+    "config есть, но не тот тег" под "конфига вообще нет (fresh install)".
+    """
+    state_p = tmp_path / "srouter.local.json"
+    xray_p = tmp_path / "xray-config.json"
+    state_p.write_text(json.dumps({
+        "nodes": [{"name": "sg-1", "endpoint_host": "203.0.113.10",
+                   "route_ip": "203.0.113.10", "enabled": True}],
+        "active_node": {"name": "sg-1", "pending": None},
+    }), encoding="utf-8")
+    # outbound БЕЗ tag="active" (реальный tag="reality-out") — xray_status станет "no_active".
+    xray_p.write_text(json.dumps({"outbounds": [
+        {"tag": "reality-out", "protocol": "vless",
+         "settings": {"vnext": [{"address": "85.136.181.198", "port": 443}]}},
+        {"tag": "direct", "protocol": "freedom"},
+    ]}), encoding="utf-8")
+
+    chk = health._endpoint_xray_sync_check(state_path=str(state_p), xray_config_path=str(xray_p))
+    assert chk["status"] == "warn", chk
+    detail = chk["detail"].lower()
+    assert "fresh install" not in detail, (
+        f"конфиг СУЩЕСТВУЕТ (просто без tag=active) — 'fresh install' здесь ложь: {chk['detail']}"
+    )
+    # Точная формулировка ветки no_active — не соседняя ветка "оба реальных, но разные" (mutation:
+    # если сравнение xray_status=="no_active" сломать тайпо, выполнение проваливается в generic
+    # "рассинхрон... оба реальные" ветку — тоже без "fresh install", но БЕЗ "tag=active" в тексте).
+    assert "tag=active" in detail, f"detail должен явно называть отсутствующий tag=active: {chk['detail']}"
+    assert "рассинхрон" not in detail, (
+        f"это НЕ generic-рассинхрон ветка (оба реальных адреса) — это специфичная no_active: {chk['detail']}"
+    )
+
+
+def test_endpoint_xray_sync_check_unreadable_is_not_reported_as_fresh_install(tmp_path):
+    """#200 regression: xray config СУЩЕСТВУЕТ, но битый (не JSON) → НЕ "fresh install" враньё."""
+    state_p = tmp_path / "srouter.local.json"
+    xray_p = tmp_path / "xray-config.json"
+    state_p.write_text(json.dumps({
+        "nodes": [{"name": "sg-1", "endpoint_host": "203.0.113.10",
+                   "route_ip": "203.0.113.10", "enabled": True}],
+        "active_node": {"name": "sg-1", "pending": None},
+    }), encoding="utf-8")
+    xray_p.write_text("{not valid json", encoding="utf-8")
+
+    chk = health._endpoint_xray_sync_check(state_path=str(state_p), xray_config_path=str(xray_p))
+    assert chk["status"] == "warn", chk
+    detail = chk["detail"].lower()
+    assert "fresh install" not in detail, (
+        f"конфиг СУЩЕСТВУЕТ (просто битый) — 'fresh install' здесь ложь: {chk['detail']}"
+    )
+    assert "повреждён" in detail or "не парсится" in detail or "unreadable" in detail
+    # Отличается от no_active-ветки (не про tag=active) и от generic-рассинхрон ветки.
+    assert "tag=active" not in detail, f"unreadable — не про отсутствующий тег: {chk['detail']}"
+    assert "рассинхрон" not in detail, f"unreadable — не generic-рассинхрон: {chk['detail']}"
+
+
 def test_endpoint_xray_sync_check_is_info_only_in_check_all(tmp_path, monkeypatch):
     """Чек интегрирован в check_all как info-only (не driver — картина, не сбой стека)."""
     import local_state
