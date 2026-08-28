@@ -85,6 +85,17 @@ def test_missing_row_does_not_silently_default_to_enable():
     assert res["mutation"] is None
 
 
+def test_missing_row_toast_uses_dedicated_key_not_cid_as_error_text():
+    """ДЫРА (cycle-review PR #306, /review): раньше toast звал t('proxy_failed', cid) — шаблон
+    'Ошибка прокси: {0}' ожидает ТЕКСТ ОШИБКИ в {0}, но получал id потребителя ('git'), давая
+    бессмысленное 'Ошибка прокси: git' вместо объяснения проблемы. Отдельный ключ без cid как
+    аргумента — единственный способ гарантировать осмысленный текст независимо от языка."""
+    res = _run_toggle(proxy_data=None, cid="vscode")
+    msg = res["calls"]["toast"][0]["msg"]
+    assert "vscode" not in msg, f"cid не должен утекать в текст toast как будто это причина ошибки: {msg!r}"
+    assert msg == "proxy_consumer_not_found", f"ожидали ключ без аргументов, получили: {msg!r}"
+
+
 def test_null_proxy_data_does_not_silently_default_to_enable():
     """PROXY_DATA ещё не загружен (null) — тот же честный отказ, не угаданный action."""
     res = _run_toggle(proxy_data=None, cid="git")

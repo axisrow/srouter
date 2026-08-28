@@ -290,6 +290,7 @@
         proxy_mismatch: "MISMATCH", proxy_ok_badge: "OK",
         proxy_applied: "Proxy enabled", proxy_cleared: "Proxy disabled",
         proxy_failed: "Proxy action failed: {0}",
+        proxy_consumer_not_found: "Panel data is outdated — reloading",
         gitproxy_title: "Git proxy (github)", gitproxy_help: "Route git to github via SOCKS5 (xray) — fixes broken direct IPv4 to github (github has no IPv6). Scoped to github.com only.",
         gitproxy_on: "Enable", gitproxy_off: "Disable", gitproxy_enabled: "Enabled: git → github via {0}",
         gitproxy_disabled: "Disabled: git → github direct", gitproxy_applied: "Git proxy enabled",
@@ -395,6 +396,7 @@
         proxy_mismatch: "РАСХОЖДЕНИЕ", proxy_ok_badge: "ОК",
         proxy_applied: "Прокси включён", proxy_cleared: "Прокси выключен",
         proxy_failed: "Ошибка прокси: {0}",
+        proxy_consumer_not_found: "Данные панели устарели — перезагружаю",
         gitproxy_title: "Git-прокси (github)", gitproxy_help: "Пустить git к github через SOCKS5 (xray) — чинит сломанный прямой IPv4 к github (у github нет IPv6). Только для github.com.",
         gitproxy_on: "Включить", gitproxy_off: "Выключить", gitproxy_enabled: "Включено: git → github через {0}",
         gitproxy_disabled: "Выключено: git → github напрямую", gitproxy_applied: "Git-прокси включён",
@@ -500,6 +502,7 @@
         proxy_mismatch: "不一致", proxy_ok_badge: "正常",
         proxy_applied: "代理已启用", proxy_cleared: "代理已停用",
         proxy_failed: "代理操作失败: {0}",
+        proxy_consumer_not_found: "面板数据已过期 — 正在重新加载",
         gitproxy_title: "Git 代理 (github)", gitproxy_help: "通过 SOCKS5 (xray) 将 git 流量导向 github — 修复到 github 的直连 IPv4 故障（github 无 IPv6）。仅限 github.com。",
         gitproxy_on: "启用", gitproxy_off: "禁用", gitproxy_enabled: "已启用：git → github 经由 {0}",
         gitproxy_disabled: "已禁用：git → github 直连", gitproxy_applied: "Git 代理已启用",
@@ -1544,8 +1547,10 @@
         // Устаревший PROXY_DATA или cid не найден — НЕ гадаем про действие (было: тихий
         // fallback на 'enable' даже для уже настроенного потребителя, cycle-review PR #300).
         // Честная ошибка + перечитать состояние с сервера, вместо угадывания намерения.
+        // proxy_consumer_not_found — отдельный ключ, не proxy_failed('{0}'=cid): тот шаблон
+        // ожидает текст ОШИБКИ в {0}, а не id потребителя (cycle-review PR #306, /review).
         finishMutation();
-        toast(t('proxy_failed', cid).slice(0, 220), 'err');
+        toast(t('proxy_consumer_not_found'), 'err');
         loadProxyPanel(false);
         return;
       }
