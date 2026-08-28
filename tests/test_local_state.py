@@ -1409,6 +1409,39 @@ def test_endpoint_xray_sync_no_active_node(tmp_path):
     assert cmp["local"] == ""
 
 
+def test_endpoint_xray_sync_recognizes_adopt_mode_outbound_tag(tmp_path):
+    """#136/#200: hybrid-adopt режим (routing.outbound != "active") — read по ПРАВИЛЬНОМУ тегу.
+
+    Реальный сценарий (verify-dont-guess, воспроизведено на живой машине): пользователь усыновил
+    (`srouter routing add-domain --adopt`) СТОРОННИЙ/руками настроенный xray-config через #136
+    hybrid-adopt — там outbound называется не "active" (gen_xray_config-контракт #200), а как
+    задано в DEFAULT_ROUTING_OUTBOUND ("reality-out") или другим именем, записанным в
+    state["routing"]["outbound"]. read_xray_active_address ранее ВСЕГДА искала tag=="active" —
+    в adopt-режиме такого тега никогда нет → xray_status="no_active" даже когда config полностью
+    валиден и реально работает. compare_endpoint_with_xray обязана учитывать
+    state["routing"]["outbound"], если он задан, вместо жёстко "active".
+    """
+    state_p = tmp_path / "srouter.local.json"
+    xray_p = tmp_path / "xray-config.json"
+    xray_p.write_text(json.dumps({
+        "outbounds": [
+            {"tag": "direct", "protocol": "freedom"},
+            {"tag": "reality-out", "protocol": "vless",
+             "settings": {"vnext": [{"address": "85.136.181.198", "port": 443}]}},
+        ]
+    }), encoding="utf-8")
+    _write(state_p, {
+        "nodes": [{"name": "sg-1", "endpoint_host": "85.136.181.198",
+                   "route_ip": "85.136.181.198", "enabled": True}],
+        "active_node": {"name": "sg-1", "pending": None},
+        "routing": {"outbound": "reality-out", "active": ["domain:example.com"]},
+    })
+    cmp = local_state.compare_endpoint_with_xray(state_path=state_p, xray_config_path=xray_p)
+    assert cmp["xray_status"] == "ok", cmp
+    assert cmp["xray"] == "85.136.181.198", cmp
+    assert cmp["synced"] is True, cmp
+
+
 def test_sync_endpoint_from_xray_imports_real_into_placeholder(tmp_path):
     """ТДД #200-3: srouter sync импортит реальный address из xray в local.json endpoint_host.
 

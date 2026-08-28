@@ -26,13 +26,20 @@ XRAY_CONFIG_PATH = "/opt/homebrew/etc/xray/config.json"
 _TESTNET_203_PREFIX = "203.0.113."
 
 
-def read_xray_active_address(config_path=XRAY_CONFIG_PATH):
+def read_xray_active_address(config_path=XRAY_CONFIG_PATH, tag="active"):
     """Прочитать address АКТИВНОГО Reality-узла из рабочего xray-конфига с различением состояний.
+
+    tag — какой outbound считать «активным» (default "active" — canonical gen_xray_config-контракт
+    #200). #136 hybrid-adopt режим ("srouter routing add-domain --adopt" поверх стороннего/руками
+    настроенного xray-конфига) хранит РЕАЛЬНОЕ имя тега в state["routing"]["outbound"]
+    (DEFAULT_ROUTING_OUTBOUND="reality-out") — вызывающий (compare_endpoint_with_xray) обязан
+    передать его сюда явно, иначе adopt-режим всегда даёт no_active (тега "active" там нет и не
+    будет — конфиг не сгенерирован через gen_xray_config).
 
     Возвращает {status, address}:
       - absent    — файла нет (fresh install): применять fresh-install-логику (нечего ломать);
       - unreadable — файл существует, но битый (не JSON / не dict): fail-closed, НЕ fresh install;
-      - no_active — валидный JSON, но нет outbound с tag="active" (или без валидного address);
+      - no_active — валидный JSON, но нет outbound с tag==<tag> (или без валидного address);
       - ok        — address активного outbound'а.
     Канон verify-dont-guess + fail-closed (cycle-review Codex critical 0.94): absent и unreadable
     РАЗНЫЕ состояния — раньше оба давали '' → apply-гард считал битый рабочий config fresh-install'ом
@@ -48,12 +55,13 @@ def read_xray_active_address(config_path=XRAY_CONFIG_PATH):
         return {"status": "unreadable", "address": ""}
     if not isinstance(data, dict):
         return {"status": "unreadable", "address": ""}
-    # АКТИВНЫЙ outbound = tag=="active" (канон gen_xray_config: active_outbound = _vless_outbound(active, "active")).
-    # cycle-review Codex critical 0.98: gen_xray_config эмиттит probe-out-* vless ПЕРЕД active → первый
-    # vless = probe-узел (чужой endpoint). Выбор по tag=active, а не «первый vless», иначе sync/compare/
-    # guard работают с endpoint probe-узла, не active (sync импортил бы чужой endpoint в active-узел).
+    # АКТИВНЫЙ outbound = tag==<tag> (canonical gen_xray_config: "active"; adopt-режим: то, что
+    # реально стоит в конфиге, из state["routing"]["outbound"]). cycle-review Codex critical 0.98:
+    # gen_xray_config эмиттит probe-out-* vless ПЕРЕД active → первый vless = probe-узел (чужой
+    # endpoint). Выбор строго по тегу, а не «первый vless», иначе sync/compare/guard работают с
+    # endpoint probe-узла, не active (sync импортил бы чужой endpoint в active-узел).
     for ob in data.get("outbounds") or []:
-        if not isinstance(ob, dict) or ob.get("tag") != "active":
+        if not isinstance(ob, dict) or ob.get("tag") != tag:
             continue
         vnext = (ob.get("settings") or {}).get("vnext") or []
         if vnext and isinstance(vnext[0], dict):
@@ -64,14 +72,14 @@ def read_xray_active_address(config_path=XRAY_CONFIG_PATH):
     return {"status": "no_active", "address": ""}
 
 
-def _read_xray_vless_address(config_path=XRAY_CONFIG_PATH):
+def _read_xray_vless_address(config_path=XRAY_CONFIG_PATH, tag="active"):
     """Прочитать address АКТИВНОГО Reality-узла из рабочего xray-конфига. Возвращает '' если не ok.
 
     Тонкая обёртка над read_xray_active_address для backwards-compat (sync_route_ip_from_xray #136,
     consumer'ы, которым нужен просто address). Для новой логики #200 использовать read_xray_active_address
     (различает absent/unreadable/no_active — нужно для apply fail-closed). Не бросает.
     """
-    return read_xray_active_address(config_path)["address"]
+    return read_xray_active_address(config_path, tag=tag)["address"]
 
 
 def sync_route_ip_from_xray(name, xray_config_path=XRAY_CONFIG_PATH, path=None):
@@ -141,6 +149,29 @@ def active_endpoint_host(path=None):
     return host
 
 
+def _routing_outbound_tag(state_path=None):
+    """Тег outbound'а, который state считает «активным» — из state["routing"]["outbound"] (#136).
+
+    Canonical gen_xray_config-режим (#200) не пишет эту секцию вовсе → default "active". Hybrid-adopt
+    режим ("srouter routing add-domain --adopt" поверх стороннего/руками настроенного xray-конфига,
+    local_state_routing.DEFAULT_ROUTING_OUTBOUND="reality-out") пишет реальное имя тега сюда — конфиг
+    физически не имеет и не будет иметь tag="active" (не сгенерирован через gen_xray_config), поэтому
+    read_xray_active_address должна искать именно ЭТОТ тег, а не жёстко "active". Не бросает
+    (fail-soft: любая аномалия state → "active", прежнее поведение).
+    """
+    try:
+        state, readable = local_state._load_state_checked(state_path)
+    except (OSError, ValueError, TypeError):
+        return "active"
+    if not readable or not isinstance(state, dict):
+        return "active"
+    routing = state.get("routing")
+    if not isinstance(routing, dict):
+        return "active"
+    tag = routing.get("outbound")
+    return tag if isinstance(tag, str) and tag else "active"
+
+
 def compare_endpoint_with_xray(state_path=None, xray_config_path=XRAY_CONFIG_PATH):
     """Сравнить endpoint активного узла (canonical state) с address из рабочего xray config (#200).
 
@@ -148,7 +179,8 @@ def compare_endpoint_with_xray(state_path=None, xray_config_path=XRAY_CONFIG_PAT
     рассинхронизирован (placeholder), xray держит реальный рабочий IP. Возвращает:
       {synced: bool, local: str, xray: str, placeholder: bool, xray_status: str}
       - local   — endpoint_host активного узла ('' если нет);
-      - xray    — address из tag=active outbound ('' если нет/бит/без active);
+      - xray    — address из активного outbound'а ('' если нет/бит/не найден); тег определяется
+                  state["routing"]["outbound"] (#136 hybrid-adopt) или "active" (#200 canonical, default);
       - xray_status — absent (fresh install) / unreadable (битый, fail-closed) / no_active / ok;
       - placeholder — local — TEST-NET 203.0.113.x (auto-sync применим);
       - synced  — True когда нет дрейфа: xray absent (fresh install, нечего ломать) ИЛИ local==xray.
@@ -157,7 +189,8 @@ def compare_endpoint_with_xray(state_path=None, xray_config_path=XRAY_CONFIG_PAT
     Не бросает (probe-канон). Применяется и в apply-защите, и в doctor.
     """
     local = active_endpoint_host(state_path)
-    xr = read_xray_active_address(xray_config_path)
+    tag = _routing_outbound_tag(state_path)
+    xr = read_xray_active_address(xray_config_path, tag=tag)
     xray_status, xray = xr["status"], xr["address"]
     base = {"local": local, "xray": xray, "placeholder": _is_testnet_placeholder(local),
             "xray_status": xray_status}
