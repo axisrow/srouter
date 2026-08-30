@@ -54,6 +54,7 @@ py-modules = [
     "dashboard_hotroutes",
     "hot_routes",
     "metrics_store",
+    "proxy_errors",
     "node_selector",
     "sys_probe",
     "probe_manager",

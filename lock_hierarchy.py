@@ -1,10 +1,10 @@
 """Явная иерархия захвата блокировок + watchdog-таймаут для 24/7-инфраструктуры.
 
-issue #159 — аудит 6 threading.Lock в srouter без явной иерархии захвата.
+issue #159 — аудит threading.Lock в srouter без явной иерархии захвата.
 
 ========================= ГРАФ ЗАХВАТА (investigation-first) =========================
 
-Построен по коду (канон verify-dont-guess — не догадка). В проекте ровно 6 threading.Lock:
+Построен по коду (канон verify-dont-guess — не догадка). В проекте ровно 8 threading.Lock:
 
   MUTATION  dashboard._MUTATION_LOCK   — non-blocking acquire в before_request (dashboard.py),
                                           держится весь POST-handler; занято → 409. Off вне POST.
@@ -14,12 +14,16 @@ issue #159 — аудит 6 threading.Lock в srouter без явной иера
           dashboard_geo._geo_lock      — geo IP-кэш (curl ВНЕ лока).
           dashboard_nodes._nodes_lock  — snapshot-кэш (dict-only внутри).
           dashboard_hotroutes._lock    — hot-routes probe-кэш (dict/set-only внутри).
+          proxy_errors._lock           — throttle/error-state 5xx-кэша (dict-only внутри;
+                                          парсинг лога и запись кэша — ВНЕ лока).
+          dashboard_routes._metrics_cache_lock — TTL-кэш /api/metrics/tunnel (dict-only
+                                          внутри; чтение JSONL/лога — ВНЕ лока).
 
 Единственное ребро вложенности «держа A, берётся B»:
 
         _MUTATION_LOCK  ──►  _SELECT_LOCK        (api_node_select → node_selector.select_node)
 
-Все 5 остальных локов — ЛИСТЬЯ: внутри их `with`-блоков только dict/set-доступ, внешние
+Все 7 остальных локов — ЛИСТЬЯ: внутри их `with`-блоков только dict/set-доступ, внешние
 вызовы (curl, probes, subprocess) вынесены за пределы лока; _SELECT_LOCK внутри зовёт
 только local_state.*/gen_xray_config/subprocess — ни один не берёт threading.Lock.
 

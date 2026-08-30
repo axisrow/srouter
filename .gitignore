@@ -10,6 +10,8 @@ srouter.local.json.tmp
 # Opt-in локальный кэш hot_routes (домены+счётчики, privacy) — НИКОГДА не коммитить
 srouter.hot_routes.json
 srouter.hot_routes.json.tmp
+srouter.proxy_errors.json
+srouter.proxy_errors.json.tmp
 
 # Секреты окружения
 .env

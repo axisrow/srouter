@@ -7,6 +7,7 @@
 """
 import logging
 import re
+import threading
 import time
 from flask import jsonify, request
 
@@ -24,8 +25,11 @@ import git_proxy  # вкл/откл git-прокси для github (через g
 import claude_proxy  # вкл/откл HTTPS_PROXY для Claude Code (~/.claude/settings.json)
 import health  # check_all для /health эндпоинта
 import proxy_registry  # единая картина прокси: кто настроен + идёт ли трафик
+import metrics_store  # heartbeat-метрики туннеля (JSONL watchdog'а) для /api/metrics/tunnel
+import proxy_errors  # пассивный 5xx-rate из privoxy access-лога (observe-only)
 import concurrent.futures  # bounded-ожидание apply: git_proxy берёт БЛОКИРУЮЩИЙ flock
 import privoxy_system  # protected system-service gate (#122)
+import lock_hierarchy  # #159: кэш-лок роута метрик — в графе, захват bounded
 
 _log = logging.getLogger("srouter.dashboard_routes")
 
@@ -810,6 +814,104 @@ def api_proxy_apply(action):
     pool.shutdown(wait=False)
 
     return jsonify(result), (200 if result.get("ok") else 500)
+
+
+# ============================ качество туннеля (/api/metrics/tunnel) ============================
+# Зачем отдельный роут, а не поле в /api/status (как /api/proxy/overview): здесь для
+# baseline-тренда читается 7-дневный хвост metrics-JSONL и инкрементально парсится
+# privoxy-лог (throttle 60s внутри proxy_errors) — это не для 5-секундного поллинга
+# статуса. GET → не попадает под _MUTATION_LOCK: observe-only чтение не ловит 409.
+_METRICS_HOURS_MIN, _METRICS_HOURS_MAX = 1, 168
+# TTL-кэш сводки (как dashboard._cache у gather_status): writer пишет точку раз в
+# interval_sec, поэтому чаще пересобирать 7-дневный хвост бессмысленно — несколько
+# вкладок/F5 не должны каждый раз стоить полного парса JSONL.
+_METRICS_CACHE_TTL_SEC = 30.0
+_metrics_cache = {"key": None, "at": 0.0, "payload": None}
+_metrics_cache_lock = threading.Lock()
+
+
+def _metrics_empty_payload(hours, opts):
+    """Пустой ответ роута: latest/baseline/ratio/trend берутся у самой summarize([]),
+    а блок 5xx — у proxy_errors._empty_payload. Форму empty-state описывает тот, кто
+    её производит, — иначе три копии контракта разъезжаются молча."""
+    summary = metrics_store.summarize([])
+    return {
+        "status": "no-data", "hours": hours,
+        "interval_sec": opts["interval_sec"], "retention_days": opts["retention_days"],
+        "enabled": opts["enabled"], "last_event_at": None, "series": [],
+        "latest": summary["latest"], "baseline": summary["baseline"],
+        "ratio": summary["ratio"], "trend": summary["trend"],
+        "proxy_errors": proxy_errors._empty_payload("disabled", 1),
+    }
+
+
+def _metrics_payload(hours):
+    """Собрать ответ роута (тяжёлое чтение JSONL + инкремент privoxy-лога)."""
+    opts = health._metrics_probe_options()
+    payload = _metrics_empty_payload(hours, opts)
+    if not opts["enabled"]:
+        # Kill-switch обязан гасить сам сбор, а не только отрисовку (как
+        # probe_hot_routes при enabled=false: лог/кэш не трогаются вообще).
+        payload["status"] = "disabled"
+        return payload
+    events = metrics_store.read_timing_events(hours=None)  # весь retention для baseline
+    if events:
+        summary = metrics_store.summarize(events)
+        now = time.time()
+        window_events = [e for e in events if e.get("ts", 0) >= now - hours * 3600.0]
+        payload.update({
+            "status": "ok",
+            "last_event_at": events[-1].get("timestamp"),
+            "series": metrics_store.thin_series(window_events),
+            "latest": summary["latest"],
+            "baseline": summary["baseline"],
+            "ratio": summary["ratio"],
+            "trend": summary["trend"],
+        })
+    payload["proxy_errors"] = proxy_errors.probe_error_rate(window_hours=1)
+    return payload
+
+
+@app.get("/api/metrics/tunnel")
+def api_metrics_tunnel():
+    """Временной ряд качества туннеля: heartbeat-тайминги watchdog + пассивный 5xx-rate.
+
+    ?hours= — окно серии/спарклайна (1..168, default 24). Baseline-тренд всегда
+    считается по всему retention-окну (7 дней), независимо от hours. Observe-only:
+    тренд ни на что не влияет, только показывается. Fail-soft: сбой чтения -> 200
+    со status=warn (probe-канон), не 500.
+    """
+    raw = (request.args.get("hours") or "").strip()
+    hours = 24
+    if raw:
+        try:
+            hours = int(raw)
+        except ValueError:
+            return jsonify({"status": "warn", "error": "hours must be an integer"}), 400
+        if not _METRICS_HOURS_MIN <= hours <= _METRICS_HOURS_MAX:
+            return jsonify({"status": "warn", "error": "hours must be 1..168"}), 400
+    now = time.time()
+    try:
+        with lock_hierarchy.bounded_acquire(
+            _metrics_cache_lock, name="metrics-route", level=lock_hierarchy.LEVEL_CACHE
+        ):
+            if _metrics_cache["key"] == hours and now - _metrics_cache["at"] < _METRICS_CACHE_TTL_SEC:
+                return jsonify(_metrics_cache["payload"])
+    except lock_hierarchy.LockAcquireTimeout:
+        pass  # кэш занят — считаем заново (медленнее, но роут не висит)
+    try:
+        payload = _metrics_payload(hours)
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        return jsonify({"status": "warn", "hours": hours,
+                        "error": str(exc) or exc.__class__.__name__})
+    try:
+        with lock_hierarchy.bounded_acquire(
+            _metrics_cache_lock, name="metrics-route", level=lock_hierarchy.LEVEL_CACHE
+        ):
+            _metrics_cache.update({"key": hours, "at": now, "payload": payload})
+    except lock_hierarchy.LockAcquireTimeout:
+        pass  # не закэшировали — ответ всё равно корректный
+    return jsonify(payload)
 
 
 # ============================ /health (лёгкий healthcheck) ============================
