@@ -197,6 +197,21 @@
     </div>
   </div>
 
+  <!-- Качество туннеля (observe-only): heartbeat-тайминги watchdog (разложение
+       connect/TLS/TTFB/total из уже идущих проб — ноль доп. трафика) + пассивный
+       5xx-rate реального трафика из privoxy-лога. Тренд = медиана 15 мин против
+       baseline «тот же час прошлых дней»; ничего не переключает автоматически. -->
+  <div class="card mt-3">
+    <div class="card-header d-flex align-items-center flex-wrap gap-2">
+      <i class="bi bi-activity me-2"></i>
+      <span data-i18n="metrics_title">Tunnel quality (trend)</span>
+      <span class="badge bg-secondary ops" id="metrics-badge">—</span>
+    </div>
+    <div class="card-body">
+      <div id="metrics-panel"></div>
+    </div>
+  </div>
+
   <div class="toast-container position-fixed bottom-0 end-0 p-3"></div>
 
   <script src="/static/bootstrap.bundle.min.js"></script>
@@ -310,7 +325,21 @@
         channel_manual_hint: "Manual failover only — the dashboard never switches channels automatically.",
         card_hot_routes: "Popular domains", hot_routes_disabled: "disabled in local state",
         hot_routes_empty: "no cached domains yet", hot_routes_count: "count",
-        hot_routes_help: "Observe-only: the cache stays local and is not uploaded."
+        hot_routes_help: "Observe-only: the cache stays local and is not uploaded.",
+        metrics_title: "Tunnel quality (trend)",
+        metrics_phase_connect: "connect → proxy", metrics_phase_tls: "path + TLS",
+        metrics_phase_ttfb: "server response", metrics_phase_total: "total",
+        metrics_window_note: "median, last 15 min · {0} samples · fail {1}%",
+        metrics_trend_stable: "stable", metrics_trend_degraded: "degrading", metrics_trend_insufficient: "not enough data",
+        metrics_vs_baseline: "×{0} vs baseline ({1})",
+        metrics_baseline_hour: "same hour, past days", metrics_baseline_trail: "2–24 h ago",
+        metrics_baseline_none: "no baseline yet",
+        metrics_errors_title: "client traffic 5xx (1h)",
+        metrics_errors_rate: "{0} / {1} ({2}%)",
+        metrics_errors_zero: "no 5xx in window",
+        metrics_errors_disabled: "privoxy access log is off — enable debug 1 to see the error rate",
+        metrics_no_data: "no metrics yet — watchdog records a point every minute",
+        metrics_disabled: "disabled in local state (probes.metrics_enabled)"
       },
       ru: {
         brand: "Tunnel Dashboard", theme_title: "Тема", theme_auto: "Авто",
@@ -416,7 +445,21 @@
         channel_manual_hint: "Только ручной failover — дашборд никогда не переключает канал автоматически.",
         card_hot_routes: "Популярные домены", hot_routes_disabled: "отключено в local state",
         hot_routes_empty: "в кэше пока нет доменов", hot_routes_count: "счётчик",
-        hot_routes_help: "Только наблюдение: кэш остаётся локальным и не загружается наружу."
+        hot_routes_help: "Только наблюдение: кэш остаётся локальным и не загружается наружу.",
+        metrics_title: "Качество туннеля (тренд)",
+        metrics_phase_connect: "connect → прокси", metrics_phase_tls: "путь + TLS",
+        metrics_phase_ttfb: "ответ сервера", metrics_phase_total: "итог",
+        metrics_window_note: "медиана за 15 мин · {0} замеров · сбои {1}%",
+        metrics_trend_stable: "стабильно", metrics_trend_degraded: "деградация", metrics_trend_insufficient: "мало данных",
+        metrics_vs_baseline: "×{0} к базовой ({1})",
+        metrics_baseline_hour: "тот же час прошлых дней", metrics_baseline_trail: "2–24 ч назад",
+        metrics_baseline_none: "базы ещё нет",
+        metrics_errors_title: "5xx клиентского трафика (1ч)",
+        metrics_errors_rate: "{0} / {1} ({2}%)",
+        metrics_errors_zero: "5xx в окне нет",
+        metrics_errors_disabled: "access-лог privoxy выключен — включите debug 1, чтобы видеть ошибки",
+        metrics_no_data: "метрик ещё нет — watchdog пишет точку каждую минуту",
+        metrics_disabled: "выключено в local state (probes.metrics_enabled)"
       },
       zh: {
         brand: "隧道仪表盘", theme_title: "主题", theme_auto: "自动",
@@ -522,7 +565,21 @@
         channel_manual_hint: "仅手动故障转移 — 仪表盘不会自动切换通道。",
         card_hot_routes: "热门域名", hot_routes_disabled: "已在本地状态中关闭",
         hot_routes_empty: "缓存中暂无域名", hot_routes_count: "计数",
-        hot_routes_help: "仅观察：缓存保留在本机，不会上传。"
+        hot_routes_help: "仅观察：缓存保留在本机，不会上传。",
+        metrics_title: "隧道质量（趋势）",
+        metrics_phase_connect: "连接 → 代理", metrics_phase_tls: "链路 + TLS",
+        metrics_phase_ttfb: "服务器响应", metrics_phase_total: "总计",
+        metrics_window_note: "近 15 分钟中位数 · {0} 次采样 · 失败 {1}%",
+        metrics_trend_stable: "稳定", metrics_trend_degraded: "退化中", metrics_trend_insufficient: "数据不足",
+        metrics_vs_baseline: "相对基线 ×{0}（{1}）",
+        metrics_baseline_hour: "往日同一小时", metrics_baseline_trail: "2–24 小时前",
+        metrics_baseline_none: "暂无基线",
+        metrics_errors_title: "客户端流量 5xx（1小时）",
+        metrics_errors_rate: "{0} / {1}（{2}%）",
+        metrics_errors_zero: "窗口内无 5xx",
+        metrics_errors_disabled: "privoxy 访问日志未开启 — 开启 debug 1 以查看错误率",
+        metrics_no_data: "暂无指标 — watchdog 每分钟记录一个点",
+        metrics_disabled: "已在 local state 停用（probes.metrics_enabled）"
       }
     };
 
@@ -627,30 +684,38 @@
       a.push(ms);
       if (a.length > MAXH) a.shift();
     }
-    function sparkline(key, color) {
-      var a = HISTORY[key] || [];
+    // Единственный рендерер спарклайна. vals — массив чисел, где null = пропуск
+    // (провальный замер): точка не рисуется, но временно'е положение соседей сохраняется.
+    // Два фидера: HISTORY[key] (клиентская сессия) и серия с /api/metrics/tunnel.
+    function sparklineFromValues(vals, color) {
       var W = 110, H = 30, pad = 2;
-      if (a.length < 2) {
+      var idx = (vals || []).map(function (v, i) {
+        return (typeof v === 'number' && isFinite(v)) ? i : -1;
+      }).filter(function (i) { return i >= 0; });
+      if (idx.length < 2) {
         return '<svg class="spark" width="' + W + '" height="' + H + '" role="img" aria-label="' + esc(t('spark_empty')) + '">' +
                '<text x="' + (W / 2) + '" y="' + (H / 2 + 4) + '" text-anchor="middle" ' +
                'font-size="10" fill="currentColor" opacity="0.5">—</text></svg>';
       }
-      var min = Math.min.apply(null, a), max = Math.max.apply(null, a);
+      var nonNull = idx.map(function (i) { return vals[i]; });
+      var min = Math.min.apply(null, nonNull), max = Math.max.apply(null, nonNull);
       var span = (max - min) || 1;
-      var n = a.length;
-      var pts = a.map(function (v, i) {
-        var x = pad + (W - 2 * pad) * (i / (n - 1));
-        var y = pad + (H - 2 * pad) * (1 - (v - min) / span);
+      var pts = idx.map(function (pos, k) {
+        var x = pad + (W - 2 * pad) * (k / (idx.length - 1));
+        var y = pad + (H - 2 * pad) * (1 - (vals[pos] - min) / span);
         return x.toFixed(1) + ',' + y.toFixed(1);
       });
-      var last = a[a.length - 1];
+      var last = nonNull[nonNull.length - 1];
       var lastPt = pts[pts.length - 1].split(',');
       return '<svg class="spark" width="' + W + '" height="' + H + '" role="img" ' +
-             'aria-label="' + esc(t('spark_label', n, last)) + '">' +
+             'aria-label="' + esc(t('spark_label', nonNull.length, last)) + '">' +
              '<polyline fill="none" stroke="' + color + '" stroke-width="1.5" ' +
              'stroke-linejoin="round" stroke-linecap="round" points="' + pts.join(' ') + '"/>' +
              '<circle cx="' + lastPt[0] + '" cy="' + lastPt[1] + '" r="2" fill="' + color + '"/>' +
              '</svg>';
+    }
+    function sparkline(key, color) {
+      return sparklineFromValues(HISTORY[key] || [], color);
     }
     function sparkColor(status) {
       return status === 'down' ? '#dc3545' : status === 'warn' ? '#ffc107' : '#0d6efd';
@@ -1584,6 +1649,109 @@
         });
     }
 
+    /* ============================ Tunnel quality panel (observe-only) ============================ */
+    var METRICS_DATA = null;
+
+    function metricsTrendBadge(trend) {
+      if (trend === 'degraded') return { cls: 'bg-danger', key: 'metrics_trend_degraded' };
+      if (trend === 'stable') return { cls: 'bg-success', key: 'metrics_trend_stable' };
+      return { cls: 'bg-secondary', key: 'metrics_trend_insufficient' };
+    }
+
+    function metricsRowHtml(labelKey, valueMs) {
+      var v = (typeof valueMs === 'number' && isFinite(valueMs))
+        ? Math.round(valueMs) + ' ' + t('ms') : '—';
+      return '<div class="node-metric"><span class="k">' + esc(t(labelKey)) + '</span>' +
+             '<span class="mono fw-semibold">' + esc(v) + '</span></div>';
+    }
+
+    function metricsBaselineLabel(source) {
+      if (source === 'same-hour') return t('metrics_baseline_hour');
+      if (source === 'trailing') return t('metrics_baseline_trail');
+      return t('metrics_baseline_none');
+    }
+
+    function renderMetricsPanel() {
+      var box = document.getElementById('metrics-panel');
+      if (!box) return;
+      var badge = document.getElementById('metrics-badge');
+      var d = METRICS_DATA;
+      if (!d) {
+        box.innerHTML = '<div class="text-secondary ops">' + esc(t('no_data')) + '</div>';
+        if (badge) { badge.className = 'badge ops bg-secondary'; badge.textContent = '—'; }
+        return;
+      }
+      if (d.enabled === false) {
+        box.innerHTML = '<div class="text-secondary ops">' + esc(t('metrics_disabled')) + '</div>';
+        if (badge) { badge.className = 'badge ops bg-secondary'; badge.textContent = t('off'); }
+        return;
+      }
+      var latest = d.latest;
+      if (!latest) {
+        box.innerHTML = '<div class="text-secondary ops">' + esc(t('metrics_no_data')) + '</div>';
+        if (badge) {
+          badge.className = 'badge ops bg-secondary';
+          badge.textContent = t('metrics_trend_insufficient');
+        }
+        return;
+      }
+      var rows =
+        metricsRowHtml('metrics_phase_connect', latest.connect_ms) +
+        metricsRowHtml('metrics_phase_tls', latest.tls_ms) +
+        metricsRowHtml('metrics_phase_ttfb', latest.ttfb_ms) +
+        metricsRowHtml('metrics_phase_total', latest.total_ms);
+      var sparkColorKey = d.trend === 'degraded' ? 'down' : (d.trend === 'stable' ? 'ok' : 'warn');
+      // Серверная серия {ts, total_ms} → значения общего рендерера; провальные
+      // замеры (без total_ms) приходят как null и разрывают линию, не сдвигая соседей.
+      var vals = (d.series || []).map(function (p) { return p && p.total_ms; });
+      var spark = '<div class="mt-2 text-secondary">' +
+        sparklineFromValues(vals, sparkColor(sparkColorKey)) + '</div>';
+      var failPct = Math.round((latest.failure_rate || 0) * 100);
+      var note = '<div class="sub text-secondary mt-2">' +
+        esc(t('metrics_window_note', latest.samples, failPct)) + '</div>';
+      var baseSrc = (d.baseline || {}).source || 'none';
+      var trendHtml = d.ratio != null
+        ? t('metrics_vs_baseline', d.ratio, metricsBaselineLabel(baseSrc))
+        : metricsBaselineLabel(baseSrc);
+      var trendLine = '<div class="sub mt-1"><strong>' + esc(trendHtml) + '</strong></div>';
+
+      // Один билдер строки 5xx: сначала решаем {cls, text, codes}, потом рендерим.
+      var pe = d.proxy_errors || {};
+      var errCls = 'text-secondary', errText, errCodes = '';
+      if (pe.status === 'disabled') {
+        errText = t('metrics_errors_disabled');
+      } else if (pe.total > 0) {
+        // error_rate null только при total == 0 (контракт probe_error_rate) — сюда не попадёт.
+        errCls = pe.errors > 0 ? 'text-danger' : 'text-secondary';
+        errText = t('metrics_errors_title') + ': ' +
+          t('metrics_errors_rate', pe.errors, pe.total, Math.round(pe.error_rate * 1000) / 10);
+        errCodes = Object.keys(pe.by_code || {}).sort().map(function (c) {
+          return esc(c) + '×' + pe.by_code[c];
+        }).join(' · ');
+      } else {
+        errText = t('metrics_errors_title') + ': ' + t('metrics_errors_zero');
+      }
+      var errorsHtml = '<div class="' + errCls + ' sub">' + esc(errText) +
+        (errCodes ? ' <span class="ops">' + errCodes + '</span>' : '') + '</div>';
+
+      box.innerHTML =
+        '<div class="node-metrics">' + rows + '</div>' +
+        spark + note + trendLine + '<hr class="my-2">' + errorsHtml;
+
+      if (badge) {
+        var tb = metricsTrendBadge(d.trend);
+        badge.className = 'badge ops ' + tb.cls;
+        badge.textContent = t(tb.key);
+      }
+    }
+
+    function loadMetricsPanel() {
+      return fetchJson('/api/metrics/tunnel')
+        .then(function (d) { METRICS_DATA = d; })
+        .catch(function () {})
+        .then(function () { renderMetricsPanel(); });
+    }
+
     function render(d, ranking) {
       LAST_STATUS = d;
       LAST_RANKING = ranking || {};
@@ -2128,6 +2296,7 @@
       renderThrottle();
       renderIsolate();
       renderProxyPanel();
+      renderMetricsPanel();
       poll(true);
     });
     applyStaticI18n();
@@ -2151,11 +2320,14 @@
     renderThrottle();  // каркас throttle-контрола (inactive) до ответа сервера
     renderIsolate();   // каркас isolate-контрола (inactive) до ответа сервера
     renderProxyPanel();  // каркас панели прокси до ответа сервера
+    renderMetricsPanel();  // каркас панели качества туннеля до ответа сервера
     loadGuard();       // подтянуть block/allow правила + активный throttle из /api/guard
     // Лёгкая загрузка: только конфиги. Тяжёлый замер трафика — по кнопке «Проверить».
     loadProxyPanel(false);
+    loadMetricsPanel();  // тренд качества: данные минутной гранулярности — реже, чем poll статуса
     poll(true);
     setInterval(poll, 5000);
+    setInterval(loadMetricsPanel, 60000);
   })();
   </script>
 </body>
