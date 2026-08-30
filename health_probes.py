@@ -55,7 +55,7 @@ TUNNEL_TARGETS = ("https://api.anthropic.com/", "https://api.openai.com/")
 
 # #207: маркер vendor outage в detail _tunnel_up — единый источник правды для человекочитаемого
 # префикса (канон issue #155: константа, не разбросанные подстроки). Программный дискриминатор
-# едёт структурно (check["category"]=="vendor-outage" в check_all, см. _tunnel_up return 3-tuple),
+# едёт структурно (check["category"]=="vendor-outage" в check_all, см. _tunnel_up return-кортеж),
 # а НЕ парсом этой строки — канон loose-validator-recurring-leak. Маркер — только display-текст.
 VENDOR_OUTAGE_MARKER = "vendor outage"
 
@@ -277,31 +277,90 @@ def _direct_first_check():
     return {"status": "info", "detail": "direct-first: нет candidate-доменов"}
 
 
+# Разложение времени того же curl-запроса (observe-only, ноль доп. трафика): код +
+# time_connect (TCP до локального прокси) + time_appconnect (TLS через туннель — весь
+# путь до таргета) + time_starttransfer (первый байт ответа) + time_total. Watchdog
+# пишет это в metrics_store; рост connect_ms = затор локального прокси, рост
+# tls_ms = потери/DPI на канале, рост total_ms при стабильном handshake = троттлинг полосы.
+_TIMING_WRITE_FORMAT = (
+    "%{http_code} %{time_connect} %{time_appconnect} %{time_starttransfer} %{time_total}"
+)
+
+
+def _timing_from_tokens(tokens, url, kind):
+    """timing-dict из токенов curl -w (код уже исключён из tokens[1:]). None-мс за мусор.
+
+    tls_ms = appconnect − connect, ttfb_ms = starttransfer − appconnect; всё в мс,
+    кламп ≥ 0. Каждое поле None, если curl его не выдал (частичный провал).
+    """
+    def _ms(index):
+        try:
+            return round(float(tokens[index]) * 1000)
+        except (IndexError, TypeError, ValueError):
+            return None
+
+    connect_ms, appconnect_ms, starttransfer_ms, total_ms = (
+        _ms(1), _ms(2), _ms(3), _ms(4))
+    tls_ms = ttfb_ms = None
+    if connect_ms is not None and appconnect_ms is not None:
+        tls_ms = max(0, appconnect_ms - connect_ms)
+    if appconnect_ms is not None and starttransfer_ms is not None:
+        ttfb_ms = max(0, starttransfer_ms - appconnect_ms)
+    host = None
+    try:
+        from urllib.parse import urlsplit
+        host = urlsplit(url).hostname
+    except ValueError:
+        host = None
+    return {
+        "target": host,
+        "code": tokens[0] if tokens else None,
+        "status": kind,
+        "connect_ms": connect_ms,
+        "tls_ms": tls_ms,
+        "ttfb_ms": ttfb_ms,
+        "total_ms": total_ms,
+    }
+
+
 def _tunnel_target_up(url):
-    """Один таргет через прокси: (ok, detail, kind). Живой = сервер ответил HTTP < 500
-    (sys_probe.tunnel_code_up). 000/timeout/5xx — не жив. Не бросает.
+    """Один таргет через прокси: (ok, detail, kind, timing). Живой = сервер ответил
+    HTTP < 500 (sys_probe.tunnel_code_up). 000/timeout/5xx — не жив. Не бросает.
 
     kind — структурный дискриминатор провала (канон loose-validator-recurring-leak: не парсим
     его из detail-строки). Один из: ok | timeout | no-response | connection-failed | bad-code |
     upstream-error. #207: upstream-error = HTTP 5xx (сервер ответил через туннель → канал жив,
-    но сам вендор лежит); прочие = curl не достучался (сеть/VPS)."""
+    но сам вендор лежит); прочие = curl не достучался (сеть/VPS).
+
+    timing — dict разложения времени ЭТОГО ЖЕ curl-запроса (connect_ms/tls_ms/ttfb_ms/
+    total_ms + target/code/status=kind): watcher пишет его в metrics_store, не делая
+    ни одного дополнительного сетевого запроса. None только при sys_probe timeout
+    (процесс убит до вывода -w)."""
     r = sys_probe.run([CURL, "-sS", "-o", "/dev/null", "-x", _PROXY,
                        "--connect-timeout", "4", "--max-time", "8",
-                       "-w", "%{http_code}", url], timeout=10)
+                       "-w", _TIMING_WRITE_FORMAT, url], timeout=10)
     if r.get("timeout"):
-        return False, "timeout", "timeout"
-    code = (r.get("out") or "").strip()
+        return False, "timeout", "timeout", None
+    tokens = (r.get("out") or "").strip().split()
+    code = tokens[0] if tokens else ""
+    # Сначала классифицируем (ok, detail, kind), timing собираем ОДИН раз в конце:
+    # иначе kind дублировался бы литералом на каждом выходе и мог разъехаться с
+    # timing["status"] незамеченным (metrics_store молча перепишет его в "down").
     if not code:
-        return False, "no-response", "no-response"
-    if code == "000":
-        return False, "connection-failed", "connection-failed"
-    try:
-        code_int = int(code)
-    except ValueError:
-        return False, f"bad-code {code}", "bad-code"
-    if not sys_probe.tunnel_code_up(code_int):
-        return False, f"upstream-error HTTP {code}", "upstream-error"
-    return True, f"HTTP {code}", "ok"
+        ok, detail, kind = False, "no-response", "no-response"
+    elif code == "000":
+        ok, detail, kind = False, "connection-failed", "connection-failed"
+    else:
+        try:
+            code_int = int(code)
+        except ValueError:
+            ok, detail, kind = False, f"bad-code {code}", "bad-code"
+        else:
+            if sys_probe.tunnel_code_up(code_int):
+                ok, detail, kind = True, f"HTTP {code}", "ok"
+            else:
+                ok, detail, kind = False, f"upstream-error HTTP {code}", "upstream-error"
+    return ok, detail, kind, _timing_from_tokens(tokens, url, kind)
 
 
 def _tunnel_up():
@@ -315,16 +374,21 @@ def _tunnel_up():
     #207: если ВСЕ таргеты дали HTTP 5xx (kind=="upstream-error" — сервер ответил через туннель,
     значит канал жив, но сами вендоры лежат) → detail = «vendor outage», is_vendor_outage=True.
     Это различает HTTP-level vendor-down от network/VPS-death (timeout/connection-failed/...).
-    Возвращает (ok, detail, is_vendor_outage). is_vendor_outage — структурный сигнал (не parse
-    detail-строки), consumer'ы (check_all → _print_report) читают его, а не подстроку.
+    Возвращает (ok, detail, is_vendor_outage, first_timing). is_vendor_outage — структурный
+    сигнал (не parse detail-строки), consumer'ы (check_all → _print_report) читают его, а не
+    подстроку. first_timing — timing-замер ПЕРВОГО таргета (стабильная серия для тренда
+    metrics_store: замер всегда по одному и тому же таргету, даже когда up по второму).
     """
     if not _health_facade.TUNNEL_TARGETS:
-        return False, "no tunnel targets", False
+        return False, "no tunnel targets", False, None
     details, kinds = [], []
+    first_timing = None
     for url in _health_facade.TUNNEL_TARGETS:
-        ok, detail, kind = _tunnel_target_up(url)
+        ok, detail, kind, timing = _tunnel_target_up(url)
+        if first_timing is None:
+            first_timing = timing
         if ok:
-            return True, detail, False  # любой живой таргет = туннель жив (как up = a OR o)
+            return True, detail, False, first_timing  # любой живой таргет = туннель жив
         details.append(detail)
         kinds.append(kind)
     # ни один таргет не ответил живым HTTP < 500 → туннель/прокси down.
@@ -332,8 +396,8 @@ def _tunnel_up():
     # дискриминатор по kind, не parse detail-строки (канон loose-validator-recurring-leak).
     is_vendor_outage = all(k == "upstream-error" for k in kinds)
     if is_vendor_outage:
-        return False, f"{VENDOR_OUTAGE_MARKER} — оба вендора лежат, канал жив ({'; '.join(details)})", True
-    return False, "; ".join(details), False
+        return False, f"{VENDOR_OUTAGE_MARKER} — оба вендора лежат, канал жив ({'; '.join(details)})", True, first_timing
+    return False, "; ".join(details), False, first_timing
 
 
 # ============================ #203: активный сетевой интерфейс/маршрут (нет сети vs VPS мёртв) ============================

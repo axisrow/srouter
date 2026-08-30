@@ -218,7 +218,7 @@ def _machine_state_monkey(monkeypatch):
     test_machine_state_mock_guard.py падает, если канонический набор перестанет быть
     подмножеством этого (issue #267)."""
     monkeypatch.setattr(health, "_port_up", lambda port: True)
-    monkeypatch.setattr(health, "_tunnel_up", lambda: (True, "HTTP 200", False))
+    monkeypatch.setattr(health, "_tunnel_up", lambda: (True, "HTTP 200", False, None))
     monkeypatch.setattr(health, "_claude_proxy_probe",
                         lambda: {"status": "unknown", "source": "n/a", "detail": "CC не запущен"})
     monkeypatch.setattr(health, "_codex_proxy_probe",

@@ -124,7 +124,7 @@ def test_socks_failure_with_http_401_control_is_proxy_specific(monkeypatch):
 
 def _passive_health(monkeypatch):
     monkeypatch.setattr(health, "_port_up", lambda port: True)
-    monkeypatch.setattr(health, "_tunnel_up", lambda: (True, "HTTP 200", False))
+    monkeypatch.setattr(health, "_tunnel_up", lambda: (True, "HTTP 200", False, None))
     monkeypatch.setattr(
         health, "_claude_proxy_probe",
         lambda: {"status": "unknown", "source": "runtime", "detail": "idle"},

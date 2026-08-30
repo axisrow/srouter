@@ -60,7 +60,7 @@ def test_vscode_check_registered_info_only(monkeypatch):
     _patch_paths(monkeypatch, [])  # unknown → info
     # #252 perf: без мока _tunnel_up бьёт реальным curl к api.anthropic.com через прокси (~1s,
     # cProfile). Предмет теста — только vscode-proxy wiring, не туннель.
-    monkeypatch.setattr(health, "_tunnel_up", lambda: (True, "HTTP 200", False))
+    monkeypatch.setattr(health, "_tunnel_up", lambda: (True, "HTTP 200", False, None))
     result = health.check_all()
     names = [c["name"] for c in result["checks"]]
     assert any("vscode" in n.lower() and "proxy" in n.lower() for n in names), (
