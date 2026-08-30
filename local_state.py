@@ -58,6 +58,12 @@ _DEFAULT_STATE = {
         "throughput_targets": [{"url": "https://speed.cloudflare.com/__down?bytes=1048576", "bytes": 1048576}],
         "connect_timeout_sec": 4,
         "max_time_sec": 8,
+        # Heartbeat-метрики туннеля (observe-only): timing уже идущего curl-watchdog
+        # пишется в ~/Library/Logs/srouter-watchdog.metrics.jsonl. Включено по
+        # умолчанию — доп. сетевого трафика ноль.
+        "metrics_enabled": True,
+        "metrics_interval_sec": 60,
+        "metrics_retention_days": 7,
     },
     "network": {"gateway": "", "vpn_server": "", "vpn_exit_ip": "", "channels": {}},
     "traffic_guard": {"mode": "off", "domains": {}},

@@ -3542,3 +3542,125 @@ def test_check_all_tunnel_check_carries_structural_id(monkeypatch):
     monkeypatch.setattr(health, "_tunnel_up", lambda: (True, "HTTP 200", False, None))
     result = health.check_all(active_claude=False)
     assert any(c.get("id") == "tunnel" for c in result["checks"])
+
+
+# ============================ _metrics_probe_options ============================
+
+def _mock_state(monkeypatch, probes):
+    import local_state
+    monkeypatch.setattr(local_state, "load_state", lambda path=None: {"probes": probes})
+
+
+def test_metrics_probe_options_defaults(monkeypatch):
+    _mock_state(monkeypatch, {})
+    opts = health._metrics_probe_options()
+    assert opts == {"enabled": True, "interval_sec": 60, "retention_days": 7}
+
+
+def test_metrics_probe_options_respects_config(monkeypatch):
+    _mock_state(monkeypatch, {"metrics_enabled": False, "metrics_interval_sec": 300,
+                              "metrics_retention_days": 3})
+    opts = health._metrics_probe_options()
+    assert opts == {"enabled": False, "interval_sec": 300, "retention_days": 3}
+
+
+def test_metrics_probe_options_clamps_garbage(monkeypatch):
+    _mock_state(monkeypatch, {"metrics_interval_sec": 1, "metrics_retention_days": 0})
+    opts = health._metrics_probe_options()
+    assert opts["interval_sec"] == 20      # чаще watchdog-тика (~20с) бессмысленно
+    assert opts["retention_days"] == 1
+
+
+# ============================ _record_watchdog_metrics ============================
+
+def _metrics_env(monkeypatch, tmp_path, probes=None):
+    """Мок окружения записи метрик: state-файл + JSONL в tmp, конфиг probes."""
+    import local_state
+    monkeypatch.setattr(health, "WATCHDOG_METRICS_STATE", tmp_path / "metrics.last.json")
+    monkeypatch.setattr(health.metrics_store, "METRICS_LOG", tmp_path / "metrics.jsonl")
+    _mock_state(monkeypatch, probes if probes is not None else {})
+    # legacy-блок lifecycle не нужен: _record_watchdog_lifecycle закрыт autouse-фикстурой
+    _ = local_state
+
+
+def _tunnel_result(timing=None, ok=True):
+    # id — структурный ключ чека: consumer находит туннель по нему, а не по префиксу
+    # человекочитаемого name (переименование строки не должно гасить метрики).
+    check = {"id": "tunnel", "name": "туннель (api.anthropic.com через прокси)", "ok": ok,
+             "detail": "HTTP 200", "timing": timing}
+    return {"status": "ok" if ok else "down", "checks": [check]}
+
+
+def test_record_watchdog_metrics_writes_timing_event(monkeypatch, tmp_path):
+    _metrics_env(monkeypatch, tmp_path)
+    health._record_watchdog_metrics(_tunnel_result(
+        timing={"target": "api.anthropic.com", "code": "200", "status": "ok",
+                "connect_ms": 1, "tls_ms": 40, "ttfb_ms": 60, "total_ms": 150}))
+    import metrics_store
+    events = metrics_store.read_timing_events(log_path=tmp_path / "metrics.jsonl")
+    assert len(events) == 1
+    assert events[0]["total_ms"] == 150
+    assert events[0]["status"] == "ok"
+    assert (tmp_path / "metrics.last.json").exists()
+
+
+def test_record_watchdog_metrics_throttles_by_interval(monkeypatch, tmp_path):
+    _metrics_env(monkeypatch, tmp_path, probes={"metrics_interval_sec": 3600})
+    res = _tunnel_result(timing={"status": "ok", "total_ms": 100})
+    health._record_watchdog_metrics(res)
+    health._record_watchdog_metrics(res)
+    import metrics_store
+    events = metrics_store.read_timing_events(log_path=tmp_path / "metrics.jsonl")
+    assert len(events) == 1, "внутри interval_sec повторная запись подавлена"
+
+
+def test_record_watchdog_metrics_down_event_without_timing(monkeypatch, tmp_path):
+    """timing None (curl убит таймаутом) — фиксируем статус провала: failure_rate окна
+    обязан видеть и падения, не только выжившие замеры."""
+    _metrics_env(monkeypatch, tmp_path)
+    health._record_watchdog_metrics(_tunnel_result(timing=None, ok=False))
+    import metrics_store
+    events = metrics_store.read_timing_events(log_path=tmp_path / "metrics.jsonl")
+    assert len(events) == 1
+    assert events[0]["status"] == "down"
+    assert events[0]["total_ms"] is None
+
+
+def test_record_watchdog_metrics_finds_tunnel_by_id_not_name(monkeypatch, tmp_path):
+    """Туннель ищется по структурному id, а не по префиксу name: переименование
+    (или i18n) человекочитаемой строки не должно тихо гасить запись метрик."""
+    _metrics_env(monkeypatch, tmp_path)
+    res = _tunnel_result(timing={"status": "ok", "total_ms": 111})
+    res["checks"][0]["name"] = "tunnel (renamed label)"
+    health._record_watchdog_metrics(res)
+    import metrics_store
+    events = metrics_store.read_timing_events(log_path=tmp_path / "metrics.jsonl")
+    assert len(events) == 1 and events[0]["total_ms"] == 111
+
+
+def test_record_watchdog_metrics_disabled_writes_nothing(monkeypatch, tmp_path):
+    _metrics_env(monkeypatch, tmp_path, probes={"metrics_enabled": False})
+    health._record_watchdog_metrics(_tunnel_result(timing={"status": "ok"}))
+    assert not (tmp_path / "metrics.jsonl").exists()
+
+
+def test_record_watchdog_metrics_never_raises(monkeypatch, tmp_path):
+    _metrics_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(health.metrics_store, "append_timing_event",
+                        lambda event, log_path=None: (_ for _ in ()).throw(OSError("disk full")))
+    health._record_watchdog_metrics(_tunnel_result(timing={"status": "ok"}))  # не бросает
+
+
+def test_cmd_watchdog_records_metrics(monkeypatch, tmp_path):
+    """Интеграция: cmd_watchdog после check_all пишет метрику (best-effort, без мока
+    check_all упадёт на сетевых пробах — мокаем целиком, как transition-тесты)."""
+    _metrics_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(health, "check_all",
+                        lambda **kw: _tunnel_result(timing={"status": "ok", "total_ms": 120}))
+    monkeypatch.setattr(health, "WATCHDOG_STATE", tmp_path / "watchdog.last")
+    monkeypatch.setattr(health, "_notify", lambda msg, sound="Glass": None)
+    health.cmd_watchdog()
+    health.cmd_watchdog()  # второй тик — внутри интервала, записи нет
+    import metrics_store
+    events = metrics_store.read_timing_events(log_path=tmp_path / "metrics.jsonl")
+    assert len(events) == 1

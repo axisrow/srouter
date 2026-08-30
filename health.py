@@ -30,6 +30,7 @@ import sys as _sys
 import time  # noqa: F401 — re-export для monkeypatch health.time.sleep (health_codenv._codenv_unloaded_is_persistent)
 
 import local_state  # noqa: F401 — re-export для monkeypatch health.local_state.* (health_probes/health_endpoint)
+import metrics_store
 import privoxy_system
 import sys_probe
 
@@ -67,6 +68,9 @@ WATCHDOG_STATE = Path("/tmp/srouter-watchdog.last")
 WATCHDOG_NOTIFY_LOG = Path.home() / "Library" / "Logs" / "srouter-watchdog.notify.log"
 WATCHDOG_LIFECYCLE_STATE = Path("/tmp/srouter-watchdog.launchd.json")
 WATCHDOG_LIFECYCLE_LOG = Path.home() / "Library" / "Logs" / "srouter-watchdog.lifecycle.jsonl"
+# Heartbeat-метрики туннеля (observe-only): {last_write, last_rotate} в /tmp — как
+# WATCHDOG_STATE, не переживает ребут и не должен (interval-троттлинг внутренний).
+WATCHDOG_METRICS_STATE = Path("/tmp/srouter-watchdog.metrics.last.json")
 
 
 def check_all(*, active_claude=False):
@@ -498,6 +502,122 @@ def _record_watchdog_lifecycle():
                      "считать это baseline", exc)
 
 
+# Нижняя граница metrics_interval_sec (кламп): чаще прогона watchdog писать бессмысленно.
+# Вынесена в константу — pre-check троттлинга в _record_watchdog_metrics обязан использовать
+# ту же грань, иначе дешёвая проверка отбросила бы запись, разрешённую конфигом.
+_METRICS_INTERVAL_MIN_SEC = 20
+
+
+def _metrics_probe_options(state_path=None):
+    """probes.metrics_* из srouter.local.json, defensive (битое -> дефолты).
+
+    metrics_enabled по умолчанию True: доп. сетевого трафика нет вообще — пишется
+    timing curl-пробы, которую watchdog и так выполняет каждые ~20с. Клампы:
+    interval ≥ 20с (чаще прогона watchdog бессмысленно), retention 1..90 дней.
+    """
+    # Дефолты — из local_state._DEFAULT_STATE (единый источник схемы probes, как
+    # dashboard_common._probe_defaults), а не четвёртая копия чисел здесь.
+    try:
+        defaults = local_state._DEFAULT_STATE.get("probes", {})
+    except AttributeError:
+        defaults = {}
+    try:
+        state = local_state.load_state(path=state_path)
+        raw = state.get("probes") if isinstance(state.get("probes"), dict) else {}
+    except (OSError, ValueError, TypeError) as exc:
+        _log.debug("metrics options: local state недоступен (%s) — дефолты", exc)
+        raw = {}
+
+    def _int_or(key, fallback, lo, hi):
+        default = defaults.get(key, fallback)
+        try:
+            value = int(raw.get(key))
+        except (TypeError, ValueError):
+            try:
+                return max(lo, min(hi, int(default)))
+            except (TypeError, ValueError):
+                return fallback
+        return max(lo, min(hi, value))
+
+    return {
+        "enabled": raw.get("metrics_enabled", defaults.get("metrics_enabled")) is not False,
+        "interval_sec": _int_or("metrics_interval_sec", metrics_store.DEFAULT_INTERVAL_SEC,
+                                _METRICS_INTERVAL_MIN_SEC, 86400),
+        "retention_days": _int_or("metrics_retention_days", metrics_store.DEFAULT_RETENTION_DAYS, 1, 90),
+    }
+
+
+def _read_watchdog_state(path):
+    """Прочитать sidecar-state watchdog'а (JSON-dict). Missing/битый -> {}. Не бросает."""
+    try:
+        if not Path(path).exists():
+            return {}
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        _log.debug("watchdog state read failed (%s): %s — считаем fresh", path, exc)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_watchdog_state(path, state):
+    """Атомарно записать sidecar-state (канон local_state._atomic_write_text: tmp+fsync+rename —
+    оборванная запись не оставляет пустой/битый файл). Возвращает True/False, не бросает."""
+    return local_state._atomic_write_text(
+        path, json.dumps(state, ensure_ascii=False, sort_keys=True))
+
+
+def _state_float(state, key):
+    """Числовое поле sidecar-state; отсутствующее/битое -> 0.0 (=== «никогда не делали»)."""
+    try:
+        return float(state.get(key) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _record_watchdog_metrics(result):
+    """Дописать heartbeat-метрики туннеля в metrics_store JSONL (observe-only).
+
+    Ноль дополнительного сетевого трафика: timing берётся из curl-пробы, которую
+    check_all() и так выполнил в этом прогоне. Пишем не чаще probes.metrics_interval_sec
+    (default 60с при watchdog-тике ~20с); ретеншн-ротация — не чаще раза в час.
+    Best-effort, как _record_watchdog_lifecycle: сбой записи не роняет watchdog.
+    """
+    try:
+        tun_check = next(
+            (c for c in result.get("checks", []) if c.get("id") == "tunnel"), None)
+        if tun_check is None:
+            return
+        now = time.time()
+        state = _read_watchdog_state(WATCHDOG_METRICS_STATE)
+        # Троттлинг проверяем ДО чтения local state: на 2 тиках из 3 (тик 20с, интервал
+        # 60с) запись не состоится — незачем открывать и парсить srouter.local.json.
+        interval_floor = min(metrics_store.DEFAULT_INTERVAL_SEC, _METRICS_INTERVAL_MIN_SEC)
+        if now - _state_float(state, "last_write") < interval_floor:
+            return
+        opts = _metrics_probe_options()
+        if not opts["enabled"] or now - _state_float(state, "last_write") < opts["interval_sec"]:
+            return
+
+        timing = tun_check.get("timing")
+        if isinstance(timing, dict):
+            event = metrics_store.build_event(timing, now=now)
+        else:
+            # curl не успел вывести -w (sys_probe timeout) — фиксируем сам факт
+            # провала как замер: failure_rate окна обязан видеть и падения тоже.
+            event = metrics_store.build_event(
+                {"status": "down" if not tun_check.get("ok") else "unknown"}, now=now)
+        metrics_store.append_timing_event(event)
+
+        if now - _state_float(state, "last_rotate") >= metrics_store.RETENTION_CHECK_INTERVAL_SEC:
+            metrics_store.rotate_metrics_log(retention_days=opts["retention_days"])
+            state["last_rotate"] = now
+
+        state["last_write"] = now
+        _write_watchdog_state(WATCHDOG_METRICS_STATE, state)
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        _log.debug("watchdog metrics recording failed: %s — метрики пропущены", exc)
+
+
 def _print_report(result):
     """Человекочитаемый отчёт check_all (для doctor). Вывод в stdout."""
     print(f"srouter health: {result['status'].upper()}\n")
@@ -595,6 +715,7 @@ def cmd_watchdog():
     """
     result = check_all(active_claude=False)
     _record_watchdog_lifecycle()
+    _record_watchdog_metrics(result)
     cur = result["status"]
     try:
         prev = WATCHDOG_STATE.read_text().strip() if WATCHDOG_STATE.exists() else ""
