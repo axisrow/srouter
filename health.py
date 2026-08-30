@@ -80,12 +80,18 @@ def check_all(*, active_claude=False):
     checks.append({"name": f"privoxy ({PRIVOXY_PORT})", "ok": _port_up(PRIVOXY_PORT)})
     checks.append({"name": f"xray ({XRAY_PORT})", "ok": _port_up(XRAY_PORT)})
     checks.append({"name": f"dashboard ({DASHBOARD_PORT})", "ok": _port_up(DASHBOARD_PORT)})
-    tun_ok, tun_detail, tun_vendor_outage = _tunnel_up()
+    tun_ok, tun_detail, tun_vendor_outage, tun_timing = _tunnel_up()
     # #207: vendor outage (оба вендора HTTP 5xx = канал жив, вендоры лежат) структурно помечаем
     # в check["category"] (как vps_check["info"] / lp_check["info"] ниже) — _print_report читает
     # поле, а не парсит detail-строку. Каскад #201: ...→сеть→VPS→туннель→vendor outage. При vendor
     # outage туннель driver-down, но VPS/local-proxy чеки ниже остаются info (они живы).
-    tun_check = {"name": "туннель (api.anthropic.com через прокси)", "ok": tun_ok, "detail": tun_detail}
+    # tun_timing — разложение времени того же curl-запроса (connect/tls/ttfb/total):
+    # consumer (heartbeat-метрики) читает его, не делая доп. сетевых запросов.
+    # id — структурный ключ чека (как category ниже): consumer'ы находят туннель по нему,
+    # а не по префиксу человекочитаемого name (канон loose-validator-recurring-leak:
+    # переименование строки не должно тихо гасить потребителя).
+    tun_check = {"id": "tunnel", "name": "туннель (api.anthropic.com через прокси)", "ok": tun_ok,
+                 "detail": tun_detail, "timing": tun_timing}
     if tun_vendor_outage:
         tun_check["category"] = "vendor-outage"
     checks.append(tun_check)

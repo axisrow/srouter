@@ -177,7 +177,7 @@ def _all_up_monkey(monkeypatch, *, probe_status="ok", probe_detail="runtime: ÐºÐ
     """
     import local_state
     monkeypatch.setattr(health, "_port_up", lambda port: True)
-    monkeypatch.setattr(health, "_tunnel_up", lambda: (True, "HTTP 200", False))
+    monkeypatch.setattr(health, "_tunnel_up", lambda: (True, "HTTP 200", False, None))
     monkeypatch.setattr(health, "_upstream_vps_reachable",
                         lambda node=None: {"status": "ok", "detail": "VPS reachable"})
     monkeypatch.setattr(health, "_claude_proxy_probe",
