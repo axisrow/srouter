@@ -639,6 +639,13 @@ SROUTER_PRIVOXY_DEBUG=2 srouter privoxy protect --strict   # debug 2 = connectio
 # protect with a new SROUTER_PRIVOXY_DEBUG (transactional reconfigure without unprotect is a follow-up).
 # `srouter doctor` shows: is debug on? empty logfile while on → WARN.
 
+# Tunnel quality heartbeat (observe-only): the watchdog already curls the tunnel every ~20s;
+# it now records that same request's timing split (connect / path+TLS / server response /
+# total) to ~/Library/Logs/srouter-watchdog.metrics.jsonl once a minute — ZERO extra network
+# traffic. Nothing acts on the data yet (automation ladder: observe first); the dashboard
+# panel that reads it arrives in a follow-up. Config (srouter.local.json -> probes):
+# metrics_enabled (default true), metrics_interval_sec (60), metrics_retention_days (7).
+
 # Passively record future attempts to mutate Privoxy (#122):
 srouter privoxy audit install     # asks for authorization; /usr/bin/eslogger needs Full Disk Access
 srouter privoxy audit status      # read-only auditor state
