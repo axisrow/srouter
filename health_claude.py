@@ -33,8 +33,13 @@ LSOF = "/usr/sbin/lsof"
 PS = "/bin/ps"
 
 # Real Claude Code transport probe is doctor-only: failed proxy negotiation may spend several
-# seconds in retries. Dashboard /health and watchdog keep using lightweight passive checks.
-CLAUDE_TRANSPORT_TIMEOUT = 8
+# seconds in retries. Dashboard /health и watchdog остаются на lightweight passive checks.
+# 20s (не 8s): эмпирически (2026-08-31) CLI init до первой строки api_retry занимает нестабильно
+# 3.4-8+ сек (холодный старт с изолированным HOME/CLAUDE_CONFIG_DIR), а CLI не завершается сам
+# после успешного 401 — уходит в retry-backoff (до 10 попыток). subprocess.run(timeout=...)
+# ждёт завершения процесса, а не первой подходящей строки stdout — при 8s часть прогонов
+# убивались раньше, чем 401 успевал попасть в захваченный буфер (ложный ❌ при живом канале).
+CLAUDE_TRANSPORT_TIMEOUT = 20
 CLAUDE_API_BASE_URL = "https://api.anthropic.com"
 CLAUDE_DUMMY_API_KEY = "sk-ant-srouter-transport-probe-invalid"
 

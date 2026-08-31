@@ -100,6 +100,14 @@ def test_completed_api_retries_without_http_are_normalized(monkeypatch):
     assert result["error"] == "Connection error / timeout"
 
 
+def test_transport_timeout_has_race_safety_margin():
+    """CLAUDE_TRANSPORT_TIMEOUT=8s наблюдаемо race'ился с CLI init (3.4-8+s замерено эмпирически,
+    2026-08-31) — CLI не завершается сам после 401 (уходит в retry-backoff), а sys_probe.run
+    ждёт завершения процесса, не первой подходящей строки. Регрессия против возврата таймаута
+    к недостаточному значению; см. claude-transport-probe-timeout-race (memory)."""
+    assert health.CLAUDE_TRANSPORT_TIMEOUT >= 20
+
+
 def test_socks_failure_with_http_401_control_is_proxy_specific(monkeypatch):
     calls = []
 
