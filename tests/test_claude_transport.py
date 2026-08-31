@@ -100,11 +100,19 @@ def test_completed_api_retries_without_http_are_normalized(monkeypatch):
     assert result["error"] == "Connection error / timeout"
 
 
+def test_transport_timeout_has_race_safety_margin():
+    """CLAUDE_TRANSPORT_TIMEOUT=8s наблюдаемо race'ился с CLI init (3.4-8+s замерено эмпирически,
+    2026-08-31) — CLI не завершается сам после 401 (уходит в retry-backoff), а sys_probe.run
+    ждёт завершения процесса, не первой подходящей строки. Регрессия против возврата таймаута
+    к недостаточному значению; см. claude-transport-probe-timeout-race (memory)."""
+    assert health.CLAUDE_TRANSPORT_TIMEOUT >= 20
+
+
 def test_socks_failure_with_http_401_control_is_proxy_specific(monkeypatch):
     calls = []
 
     def fake_once(proxy, timeout=None):
-        calls.append(proxy)
+        calls.append((proxy, timeout))
         if proxy == HTTP_PROXY:
             return {"status": "ok", "proxy": proxy, "api_status": 401,
                     "error": "", "detail": "API returned expected 401"}
@@ -114,12 +122,32 @@ def test_socks_failure_with_http_401_control_is_proxy_specific(monkeypatch):
     monkeypatch.setattr(health, "_claude_transport_once", fake_once)
     result = health._claude_transport_probe(SOCKS_PROXY)
 
-    assert calls == [SOCKS_PROXY, HTTP_PROXY]
+    assert [proxy for proxy, _ in calls] == [SOCKS_PROXY, HTTP_PROXY]
     assert result["status"] == "down"
     assert result["error"] == "UnsupportedProxyProtocol"
-    assert "HTTP control" in result["detail"]
-    assert "expected 401" in result["detail"]
-    assert "HTTP bridge" in result["detail"]
+
+
+def test_socks_failure_control_probe_uses_shorter_timeout(monkeypatch):
+    """Codex cycle-review (PR #321): control-проба — диагностика уже сломанного SOCKS-пути,
+    ей не нужен тот же 20s запас, что и решающей проверке. Без cap worst-case doctor-прогона
+    (configured + control, оба по CLAUDE_TRANSPORT_TIMEOUT) вырос с 16s до 40s."""
+    calls = []
+
+    def fake_once(proxy, timeout=None):
+        calls.append((proxy, timeout))
+        return {"status": "down", "proxy": proxy, "api_status": None,
+                "error": "UnsupportedProxyProtocol", "detail": "UnsupportedProxyProtocol"}
+
+    monkeypatch.setattr(health, "_claude_transport_once", fake_once)
+    health._claude_transport_probe(SOCKS_PROXY)
+
+    assert len(calls) == 2
+    configured_timeout = calls[0][1]
+    control_timeout = calls[1][1]
+    assert control_timeout is not None
+    assert control_timeout < (configured_timeout or health.CLAUDE_TRANSPORT_TIMEOUT)
+    # Суммарный worst-case (оба вызова down) должен остаться в разумных пределах doctor'а.
+    assert (configured_timeout or health.CLAUDE_TRANSPORT_TIMEOUT) + control_timeout <= 30
 
 
 def _passive_health(monkeypatch):

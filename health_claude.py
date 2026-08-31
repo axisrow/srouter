@@ -26,6 +26,7 @@ __all__ = [
     "_find_claude_binary", "_has_expected_api_401", "_has_api_retry",
     "_claude_transport_once", "_configured_claude_proxy", "_claude_transport_probe",
     "CLAUDE_TRANSPORT_TIMEOUT", "CLAUDE_API_BASE_URL", "CLAUDE_DUMMY_API_KEY",
+    "CONTROL_PROBE_TIMEOUT",
 ]
 
 # Абсолютные пути: launchd/GUI PATH их не содержит (канон проекта).
@@ -33,8 +34,13 @@ LSOF = "/usr/sbin/lsof"
 PS = "/bin/ps"
 
 # Real Claude Code transport probe is doctor-only: failed proxy negotiation may spend several
-# seconds in retries. Dashboard /health and watchdog keep using lightweight passive checks.
-CLAUDE_TRANSPORT_TIMEOUT = 8
+# seconds in retries. Dashboard /health и watchdog остаются на lightweight passive checks.
+# 20s (не 8s): эмпирически (2026-08-31) CLI init до первой строки api_retry занимает нестабильно
+# 3.4-8+ сек (холодный старт с изолированным HOME/CLAUDE_CONFIG_DIR), а CLI не завершается сам
+# после успешного 401 — уходит в retry-backoff (до 10 попыток). subprocess.run(timeout=...)
+# ждёт завершения процесса, а не первой подходящей строки stdout — при 8s часть прогонов
+# убивались раньше, чем 401 успевал попасть в захваченный буфер (ложный ❌ при живом канале).
+CLAUDE_TRANSPORT_TIMEOUT = 20
 CLAUDE_API_BASE_URL = "https://api.anthropic.com"
 CLAUDE_DUMMY_API_KEY = "sk-ant-srouter-transport-probe-invalid"
 
@@ -271,6 +277,15 @@ def _configured_claude_proxy():
         return ""
 
 
+# Control-проба (HTTP bridge) запускается только когда сконфигурированный SOCKS уже упал —
+# это диагностика уже сломанного пути, не решающая проверка. Codex cycle-review (PR #321):
+# без отдельного (более короткого) бюджета оба вызова _claude_transport_once по умолчанию
+# используют CLAUDE_TRANSPORT_TIMEOUT (20s) — worst-case одного doctor-прогона вырастал до
+# ~40s. CONTROL_PROBE_TIMEOUT короче: control нужен лишь чтобы подтвердить/опровергнуть "HTTP
+# bridge жив, а SOCKS — нет", 401 там либо приходит быстро, либо путь тоже мёртв.
+CONTROL_PROBE_TIMEOUT = 10
+
+
 def _claude_transport_probe(proxy=None):
     """Doctor-only active proof. Для failed SOCKS запускает известный HTTP control."""
     configured = proxy if proxy is not None else _configured_claude_proxy()
@@ -283,7 +298,7 @@ def _claude_transport_probe(proxy=None):
     if result["status"] != "down" or scheme not in {"socks", "socks5", "socks5h"}:
         return result
 
-    control = _health_facade._claude_transport_once(_PROXY)
+    control = _health_facade._claude_transport_once(_PROXY, timeout=CONTROL_PROBE_TIMEOUT)
     detail = f"configured proxy {configured}: {result['detail']}; HTTP control {_PROXY}: {control['detail']}"
     if control["status"] == "ok":
         detail += "; configured SOCKS path is unusable — configure Claude Code to use the HTTP bridge"
