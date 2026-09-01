@@ -57,6 +57,35 @@ def test_build_event_garbage_status_becomes_down():
     assert ev["status"] == "down"
 
 
+def test_build_event_includes_rc_and_err():
+    """#315 п.5: rc/err пробы в событии — сигнатуры отказов #301 (exit 56/35/28) видны
+    в JSONL ретроспективно, без повторения инцидента."""
+    ev = metrics_store.build_event(
+        {"status": "connection-failed", "code": "000", "rc": 28,
+         "err": "curl: (28) Connection timed out after 4001 milliseconds"},
+        now=1700000000.0,
+    )
+    assert ev["rc"] == 28
+    assert ev["err"] == "curl: (28) Connection timed out after 4001 milliseconds"
+
+
+def test_build_event_rc_err_sanitized():
+    """rc-мусор → None (bool — не rc); err bounded: одна строка, ≤ 200 символов."""
+    ev = metrics_store.build_event(
+        {"status": "ok", "rc": True, "err": "x" * 500 + "\nsecond line"},
+        now=1700000000.0,
+    )
+    assert ev["rc"] is None
+    assert "\n" not in (ev["err"] or "")
+    assert len(ev["err"]) <= 200
+
+
+def test_build_event_rc_err_absent_stays_none():
+    ev = metrics_store.build_event({"status": "ok", "code": "200"}, now=1.0)
+    assert ev["rc"] is None
+    assert ev["err"] is None
+
+
 # ============================ append/read ============================
 
 def test_append_and_read_roundtrip(tmp_path):

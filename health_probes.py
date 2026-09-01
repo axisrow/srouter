@@ -287,11 +287,14 @@ _TIMING_WRITE_FORMAT = (
 )
 
 
-def _timing_from_tokens(tokens, url, kind):
+def _timing_from_tokens(tokens, url, kind, rc=None, err=None):
     """timing-dict из токенов curl -w (код уже исключён из tokens[1:]). None-мс за мусор.
 
     tls_ms = appconnect − connect, ttfb_ms = starttransfer − appconnect; всё в мс,
     кламп ≥ 0. Каждое поле None, если curl его не выдал (частичный провал).
+    rc/err (#315 п.5) — exit-код и stderr ЭТОЙ же пробы (ProbeManager.run их уже
+    возвращал, но до #315 отбрасывались): сигнатуры отказов #301 (exit 56/35/28 ↔
+    xray-мёртв/узел-отказал/узел-висит) протекают в metrics_store без нового запроса.
     """
     def _ms(index):
         try:
@@ -320,6 +323,8 @@ def _timing_from_tokens(tokens, url, kind):
         "tls_ms": tls_ms,
         "ttfb_ms": ttfb_ms,
         "total_ms": total_ms,
+        "rc": rc,
+        "err": err,
     }
 
 
@@ -340,7 +345,19 @@ def _tunnel_target_up(url):
                        "--connect-timeout", "4", "--max-time", "8",
                        "-w", _TIMING_WRITE_FORMAT, url], timeout=10)
     if r.get("timeout"):
-        return False, "timeout", "timeout", None
+        # timing-минимум, не None (#315 round 2 / Codex P2-4): rc/err причины доступны
+        # даже когда процесс убит до вывода -w — timeout-класс не терял бы err в metrics.
+        # target — hostname по контракту metrics (urlsplit), не полный URL (Codex F2 r3).
+        try:
+            from urllib.parse import urlsplit
+            host = urlsplit(url).hostname
+        except ValueError:
+            host = None
+        return False, "timeout", "timeout", {
+            "target": host, "code": "000", "status": "timeout",
+            "connect_ms": None, "tls_ms": None, "ttfb_ms": None, "total_ms": None,
+            "rc": r.get("rc"), "err": r.get("err"),
+        }
     tokens = (r.get("out") or "").strip().split()
     code = tokens[0] if tokens else ""
     # Сначала классифицируем (ok, detail, kind), timing собираем ОДИН раз в конце:
@@ -360,7 +377,8 @@ def _tunnel_target_up(url):
                 ok, detail, kind = True, f"HTTP {code}", "ok"
             else:
                 ok, detail, kind = False, f"upstream-error HTTP {code}", "upstream-error"
-    return ok, detail, kind, _timing_from_tokens(tokens, url, kind)
+    return ok, detail, kind, _timing_from_tokens(
+        tokens, url, kind, rc=r.get("rc"), err=r.get("err"))
 
 
 def _tunnel_up():

@@ -21,6 +21,7 @@ main остаются здесь: тесты monkeypatch'ат отдельные
 `from health import X` в коде/тестах продолжают работать без изменений (grep-consumer verified).
 """
 from pathlib import Path
+import fcntl  # macOS-only проект (PF/osascript/launchd) — flock для watchdog-лока
 import json
 import logging
 import os
@@ -71,6 +72,15 @@ WATCHDOG_LIFECYCLE_LOG = Path.home() / "Library" / "Logs" / "srouter-watchdog.li
 # Heartbeat-метрики туннеля (observe-only): {last_write, last_rotate} в /tmp — как
 # WATCHDOG_STATE, не переживает ребут и не должен (interval-троттлинг внутренний).
 WATCHDOG_METRICS_STATE = Path("/tmp/srouter-watchdog.metrics.last.json")
+# Audit-JSONL истории статуса (#315 п.2): событие при каждом изменении {status, failed} —
+# ретроспективный анализ осцилляций ok↔degraded (диагностика #315 была слепа без него).
+WATCHDOG_STATUS_LOG = Path.home() / "Library" / "Logs" / "srouter-watchdog.status.jsonl"
+# Cooldown (сек) degraded-класса нотификаций — «деградировал»/«состав изменился» (#315 п.1/п.3):
+# против спама от ok↔degraded-осцилляции PID-зависимых MIXED-чеков (каждые 1–7 мин по
+# форензике #315). «упал»/«восстановлен» НЕ троттлятся (переходы статуса — редкие события).
+# Env-параметризуемо (канон more-options-better): 0 — выключить троттлинг.
+_DEGRADED_NOTIFY_COOLDOWN_DEFAULT_SEC = 900
+_DEGRADED_NOTIFY_COOLDOWN_ENV = "SROUTER_WATCHDOG_DEGRADED_COOLDOWN"
 
 
 def check_all(*, active_claude=False):
@@ -703,42 +713,207 @@ def _print_report(result):
             print("    через privoxy 8118 long-lived WS рвётся (#120); нужен SOCKS5 10808 (~/bin/codex-srouter)")
 
 
+def _degraded_notify_cooldown_sec():
+    """Cooldown degraded-класса нотификаций из env (#315): 0..86400с, мусор → дефолт."""
+    raw = os.environ.get(_DEGRADED_NOTIFY_COOLDOWN_ENV)
+    if raw is None:
+        return _DEGRADED_NOTIFY_COOLDOWN_DEFAULT_SEC
+    try:
+        return max(0, min(86400, int(raw)))
+    except ValueError:
+        return _DEGRADED_NOTIFY_COOLDOWN_DEFAULT_SEC
+
+
+def _read_watchdog_prev_state():
+    """Prev-state watchdog'а: JSON-dict | legacy-строка | None. Не бросает.
+
+    #315: state мигрировал с голой строки («ok») на JSON {status, failed, last_degraded_push}
+    ради детекта смены СОСТАВА упавших драйверов (п.3) и cooldown-троттлинга (п.1).
+    Legacy-строка → failed=None («набор неизвестен»): смену состава не детектим, но
+    статус-переходы работают — старый state-файл после апгрейда не ломает watchdog.
+    None = файла нет/пустой (fresh: первый прогон).
+    """
+    try:
+        raw = WATCHDOG_STATE.read_text().strip() if WATCHDOG_STATE.exists() else ""
+    except OSError as exc:
+        _log.debug("watchdog state read failed: %s — считаем fresh (пустой prev)", exc)
+        return None
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        parsed = None
+    if isinstance(parsed, dict):
+        status = parsed.get("status")
+        try:
+            last_push = float(parsed.get("last_degraded_push") or 0.0)
+        except (TypeError, ValueError):
+            last_push = 0.0
+        # Кламп [0, now] (PR #326 review P3): nan/inf/отрицательный из битого state
+        # навсегда глушат degraded-класс (сравнение с nan всегда False) — сбрасываем в 0.
+        if not (0.0 <= last_push <= time.time()):
+            last_push = 0.0
+
+        def _canon_names(value):
+            # sorted-канонизация набора имён (round 4 P2: перестановка — не смена
+            # состава). Не-строки из битого state отбрасываем, а не роняем парсер:
+            # sorted([3, 'x']) — TypeError ДО записи state = crash-loop каждого тика
+            # (/tmp world-writable), нотификации мертвы до ручной чистки (review P3).
+            if not isinstance(value, list):
+                return None
+            return sorted(x for x in value if isinstance(x, str))
+
+        return {
+            "status": status if isinstance(status, str) else "",
+            "failed": _canon_names(parsed.get("failed")),
+            # notified_failed — последний УВЕДОМЛЁННЫЙ состав (Codex P1-1 round 2): при
+            # подавлении cooldown'ом НЕ продвигается, чтобы событие не терялось навсегда.
+            "notified_failed": _canon_names(parsed.get("notified_failed")),
+            "last_degraded_push": last_push,
+        }
+    # Legacy: голая строка статуса (в т.ч. закавыченная валидным JSON — тоже строка).
+    legacy = parsed if isinstance(parsed, str) else raw
+    return {"status": legacy.strip(), "failed": None, "notified_failed": None,
+            "last_degraded_push": 0.0}
+
+
+def _append_watchdog_status_event(previous, current):
+    """Audit-JSONL статуса (#315 п.2): событие при изменении {status, failed}.
+
+    Канон _record_watchdog_lifecycle: best-effort (сбой записи не роняет watchdog),
+    без изменения — не пишем (не раздуваем лог на каждом тике).
+    """
+    if previous == current:
+        return
+    try:
+        from datetime import datetime
+
+        WATCHDOG_STATUS_LOG.parent.mkdir(parents=True, exist_ok=True)
+        event = {
+            "timestamp": datetime.now().astimezone().isoformat(),
+            "previous": previous,
+            "current": current,
+        }
+        with open(WATCHDOG_STATUS_LOG, "a", encoding="utf-8") as log_file:
+            log_file.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+    except OSError as exc:
+        _log.warning("watchdog status-log write failed: %s — событие не записано", exc)
+
+
 def cmd_watchdog():
     """Один прогон watchdog'а (запускается launchd раз в ~20с).
 
-    Нотификация только при ПЕРЕХОДЕ состояния (ok→down — громко, down→ok — тихо), не при каждом
-    прогоне — чтобы не спамить. State в WATCHDOG_STATE (/tmp).
+    Нотификация при ПЕРЕХОДЕ состояния, не при каждом прогоне (не спамим). #315-симметрия:
+    «упал» = →down (Basso); «восстановлен» = down→ok (Glass; degraded→ok молчит — не падение);
+    «деградировал» = ok/fresh→degraded и «состав изменился» = смена набора упавших драйверов при
+    том же не-ok статусе (Ping) — с cooldown SROUTER_WATCHDOG_DEGRADED_COOLDOWN (дефолт 900с).
+    История статусов пишется в WATCHDOG_STATUS_LOG (#315 п.2). State — JSON в WATCHDOG_STATE (/tmp).
 
     Split-route НЕ делается тут — это ответственность ppp-hook (/etc/ppp/ip-up, мгновенно при VPN
     up, от root без osascript). Watchdog только детектит падение туннеля и нотифицирует. Если
     ppp-hook не сработал (utun-VPN) — пользователь видит нотификацию и手动но ensure-split-route-root.
     """
     result = check_all(active_claude=False)
+    cur = result["status"]
+
+    # Межпроцессный lock (Codex P1-2/P1-3, round 2): launchd-тик + ручной прогон могут
+    # идти параллельно — без lock оба читают один prev (дубли пушей/аудита, потеря state,
+    # double-write metrics). Занят → тик пропускаем: следующий через ~20с, потеря недопустима.
+    # LOCK_NB: watchdog не должен висеть на чужом прогоне. Сам lock — best-effort: не
+    # открылся (нет каталога и т.п.) → гоним без лока, watchdog не падает из-за форензики.
+    lock_file = None
+    try:
+        lock_path = Path(str(WATCHDOG_STATE) + ".lock")
+        lock_file = open(lock_path, "w")
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            _log.debug("watchdog: параллельный прогон держит lock — тик пропущен")
+            lock_file.close()
+            lock_file = None
+            return 0 if cur == "ok" else 1
+    except OSError as exc:
+        if lock_file is not None:
+            lock_file.close()
+            lock_file = None
+        _log.warning("watchdog: lock-файл недоступен (%s) — прогон без лока", exc)
+    try:
+        return _cmd_watchdog_locked(result)
+    finally:
+        if lock_file is not None:
+            lock_file.close()  # освобождает flock
+
+
+def _cmd_watchdog_locked(result):
+    """Критическая секция watchdog'а — вызывается только под flock (см. cmd_watchdog)."""
     _record_watchdog_lifecycle()
     _record_watchdog_metrics(result)
     cur = result["status"]
-    try:
-        prev = WATCHDOG_STATE.read_text().strip() if WATCHDOG_STATE.exists() else ""
-    except OSError as exc:
-        _log.debug("watchdog state read failed: %s — считаем fresh (пустой prev)", exc)
-        prev = ""
+    # Канонический вид набора (round 4 P2): sorted — порядок перечисления драйверов не
+    # событие, иначе перестановка [a,b]→[b,a] давала ложный Ping и ложный audit-diff.
+    failed = sorted({c["name"] for c in result["checks"] if not c["ok"] and not c.get("info")})
+    prev = _read_watchdog_prev_state()
+    prev_status = prev["status"] if prev else ""
+    prev_failed = prev["failed"] if prev else None
+    # notified_failed — последний УВЕДОМЛЁННЫЙ состав (Codex P1-1): не продвигается при
+    # подавленном cooldown'ом событии, иначе подавленная смена состава терялась бы навсегда.
+    notified_failed = prev["notified_failed"] if prev else None
 
-    # Exact-state transitions (#109 + cycle-review #133 C1):
-    # Пуш при переходе ok/degraded → down (новое падение). Не пушить degraded→degraded (спам!).
-    # Восстановление при down/degraded → ok.
-    if cur == "down" and prev in ("ok", "degraded", ""):
-        # Новое падение (ok→down, degraded→down, fresh→down).
-        failed = ", ".join(c["name"] for c in result["checks"] if not c["ok"] and not c.get("info"))
-        _notify(f"туннель/стек упал ({failed})", "Basso")
-    elif cur == "ok" and prev in ("down", "degraded", ""):
-        # Восстановление (down→ok, degraded→ok, fresh→ok не пушим — fresh = первый прогон).
-        if prev in ("down", "degraded"):
-            _notify("стек восстановлен", "Glass")
-    # down→down, degraded→degraded, ok→degraded — молча (не спамим).
-    # ok→degraded НЕ пушим (degraded — не «упал», просто «часть жива»).
+    # Audit-JSONL статуса (#315 п.2): ДО нотификаций и без cooldown — форензика полная,
+    # даже когда звук затроттлен. Fresh-прогон (prev=None) — тихий baseline, как lifecycle.
+    if prev is not None:
+        _append_watchdog_status_event(
+            {"status": prev_status, "failed": prev_failed},
+            {"status": cur, "failed": failed})
+
+    # Exact-state transitions (#109 + #133 C1 + #315 симметрия):
+    # - «упал»: переход ok/degraded/fresh → down (громко, без троттлинга).
+    # - «восстановлен»: ТОЛЬКО down → ok (#315 п.1: degraded→ok — не восстановление,
+    #   иначе осцилляция ok↔degraded порождает «восстановлен» без единого «упал» —
+    #   воспринимается как флап прокси, хотя down-переходов не было).
+    # - «деградировал» (#315 п.1): ok/fresh → degraded — событие с cooldown (п.1),
+    #   против спама MIXED-осцилляции.
+    # - «состав изменился» (#315 п.3): не-ok статус, а уведомлённый состав отличается
+    #   от фактического — включая подавленный cooldown'ом (P1-1) — событие с cooldown.
+    last_push = prev["last_degraded_push"] if prev else 0.0
+    if cur == "down" and prev_status in ("ok", "degraded", ""):
+        _notify(f"туннель/стек упал ({', '.join(failed)})", "Basso")
+        notified_failed = failed
+    elif cur == "ok" and prev_status == "down":
+        _notify("стек восстановлен", "Glass")
+        notified_failed = []
+    elif cur in ("degraded", "down"):
+        # Гейт cur in (degraded, down) обязателен (Codex F1 round 3): без него ok-прогон с
+        # «не уведомлённым» составом прошлого degraded пушит ложное «стек деградировал ()».
+        new_degradation = cur == "degraded" and prev_status in ("ok", "")
+        # Состав не уведомлён: либо сменился, либо был подавлен cooldown'ом (P1-1).
+        unnotified = notified_failed is not None and list(notified_failed) != failed
+        if (new_degradation or unnotified) and \
+                time.time() - last_push >= _degraded_notify_cooldown_sec():
+            # Лейбл по prev_status (PR #326 review P3): «деградировал» — только вход из
+            # ok/fresh; не-ok→не-ok (в т.ч. down→degraded с СОКРАТИВШИМСЯ набором) —
+            # «состав изменился», не ложное ухудшение в момент улучшения.
+            if prev_status in ("", "ok"):
+                label = "стек деградировал"
+            else:
+                label = "состав отказа изменился" if cur == "down" else "состав деградации изменился"
+            _notify(f"{label} ({', '.join(failed)})", "Ping")
+            notified_failed = failed
+            last_push = time.time()
 
     try:
-        WATCHDOG_STATE.write_text(result["status"])
+        # _write_watchdog_state сам делает json.dumps + atomic-write (tmp+fsync+rename,
+        # канон local_state): передаём dict, не строку. notified_failed=None (legacy-строка
+        # или битый JSON) → baseline текущим составом (Codex F3 round 3): тихая миграция
+        # один раз, все ПОСЛЕДУЮЩИЕ смены состава детектятся (не null навсегда).
+        _write_watchdog_state(WATCHDOG_STATE, {
+            "status": cur,
+            "failed": failed,
+            "notified_failed": (notified_failed if notified_failed is not None else failed)
+            if cur != "ok" else [],
+            "last_degraded_push": last_push,
+        })
     except OSError as exc:
         _log.warning("watchdog state write failed: %s — следующий прогон может ложно "
                      "считать переход fresh", exc)
