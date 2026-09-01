@@ -118,13 +118,17 @@ def _curl_through(url, proxy=True, proxy_url=None, capture_headers=False):
             env.pop(key, None)
         kwargs["env"] = env
     cmd.append(url)
-    r = sys_probe.run(cmd, timeout=10, **kwargs)
-    headers = _parse_header_dump(header_file) if capture_headers else None
-    if header_file:
-        try:
-            os.unlink(header_file)
-        except OSError:
-            pass
+    try:
+        r = sys_probe.run(cmd, timeout=10, **kwargs)
+        headers = _parse_header_dump(header_file) if capture_headers else None
+    finally:
+        # tmp-файл обязан уйти на ЛЮБОМ пути выхода (cycle-review PR #324: утечка
+        # srouter-curl-headers-* в $TMPDIR, если run бросит недокументированное исключение).
+        if header_file:
+            try:
+                os.unlink(header_file)
+            except OSError:
+                pass
     if r["timeout"] or not r["out"]:
         result = {"code": "000", "ms": None, "up": False}
     else:
