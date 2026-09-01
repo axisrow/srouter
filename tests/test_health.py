@@ -2047,9 +2047,18 @@ def test_check_all_has_endpoint_override_check(monkeypatch):
 
 
 @_pytest.fixture(autouse=True)
-def _block_real_watchdog_lifecycle(monkeypatch):
+def _block_real_watchdog_lifecycle(monkeypatch, tmp_path):
     if hasattr(health, "_record_watchdog_lifecycle"):
         monkeypatch.setattr(health, "_record_watchdog_lifecycle", lambda: None)
+    # PR #326 review P2: audit-JSONL — ПРОД-файл (сюда же пишет launchd-watchdog): тесты
+    # без собственного setattr не должны дописывать фейковые переходы в живой лог.
+    if hasattr(health, "WATCHDOG_STATUS_LOG"):
+        monkeypatch.setattr(health, "WATCHDOG_STATUS_LOG",
+                            tmp_path / "srouter-watchdog.status.jsonl")
+    # Канон #265 (ambient env травит параметризуемые заглушки): cooldown-env снимаем,
+    # тесты задают его явно через monkeypatch.setenv.
+    monkeypatch.delenv(_COOLDOWN_ENV if hasattr(health, "_DEGRADED_NOTIFY_COOLDOWN_ENV")
+                       else "SROUTER_WATCHDOG_DEGRADED_COOLDOWN", raising=False)
 
 
 def test_watchdog_pushes_on_degraded_to_down(monkeypatch, tmp_path):
@@ -2470,6 +2479,84 @@ def test_watchdog_set_comparison_order_insensitive(monkeypatch, tmp_path):
     health.cmd_watchdog()
     assert len(notified) == 0, "перестановка порядка драйверов — не смена состава"
     assert not status_log.exists(), "audit-JSONL не пишет ложное изменение при перестановке"
+
+
+# ============================ PR #326 review: P2/P3 findings ============================
+
+def test_watchdog_status_log_isolated_from_prod(monkeypatch, tmp_path):
+    """P2 (review): autouse-фикстура уводит WATCHDOG_STATUS_LOG в tmp_path — прогон
+    тестов не дописывает фейковые переходы в живой ~/Library/Logs/srouter-watchdog.status.jsonl,
+    куда параллельно пишет launchd-watchdog."""
+    assert str(health.WATCHDOG_STATUS_LOG).startswith(str(tmp_path)), \
+        "audit-JSONL обязан быть изолирован autouse-фикстурой даже в тестах без явного setattr"
+    assert _COOLDOWN_ENV not in os.environ, \
+        "ambient cooldown-env снят (канон #265 — не травить параметризуемые заглушки)"
+
+
+def test_watchdog_heterogeneous_failed_does_not_crash_loop(monkeypatch, tmp_path):
+    """P3 (review, блокирующий): гетерогенный failed из битого state ([3, 'x']) —
+    sorted([3,'x']) бросает TypeError ДО записи state → crash-loop на каждом тике
+    (/tmp world-writable), нотификации мертвы до ручной чистки. Парсинг обязан
+    «не бросать» (докстринг) и файл — перезаписаться каноничным видом."""
+    state_file = tmp_path / "watchdog.last"
+    state_file.write_text(json.dumps({
+        "status": "degraded", "failed": [3, "x", "claude-proxy"],
+        "notified_failed": [None, "x"], "last_degraded_push": 0.0}, ensure_ascii=False))
+    monkeypatch.setattr(health, "WATCHDOG_STATE", state_file)
+    monkeypatch.setattr(health, "check_all", lambda **kw: {
+        "status": "degraded", "checks": [{"name": "claude-proxy", "ok": False}]})
+    monkeypatch.setattr(health, "_notify", lambda msg, sound="Glass": None)
+    health.cmd_watchdog()  # не должен бросать
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    assert state["failed"] == ["claude-proxy"], \
+        "state перезаписан каноничным видом текущего прогона (битый [3,'x'] не зациклил тик)"
+
+
+def test_watchdog_last_degraded_push_clamped(monkeypatch, tmp_path):
+    """P3 (review): nan/inf/отрицательный last_degraded_push из битого state навсегда
+    глушат degraded-класс (сравнение с nan всегда False) — кламп в [0, now] → 0,
+    уведомление о деградации доставляется."""
+    for bad in (float("nan"), float("inf"), -5.0, "garbage"):
+        state_file = tmp_path / "watchdog.last"
+        state_file.write_text(json.dumps({
+            "status": "ok", "failed": [], "notified_failed": [],
+            "last_degraded_push": bad}, ensure_ascii=False))
+        monkeypatch.setattr(health, "WATCHDOG_STATE", state_file)
+        notified = []
+        monkeypatch.setattr(health, "check_all", lambda **kw: {
+            "status": "degraded", "checks": [{"name": "claude-proxy", "ok": False}]})
+        monkeypatch.setattr(health, "_notify", lambda msg, sound="Glass": notified.append(msg))
+        monkeypatch.setenv(_COOLDOWN_ENV, "0")
+        health.cmd_watchdog()
+        assert len(notified) == 1, f"bad last_degraded_push={bad!r} не должен глушить пуш"
+
+
+def test_watchdog_down_to_degraded_shrinking_set_not_degradation(monkeypatch, tmp_path):
+    """P3 (review): down{туннель,privoxy}→degraded{privoxy} — статус УЛУЧШИЛСЯ, набор
+    сократился: лейбл «состав ... изменился», не «стек деградировал» (ложное ухудшение)."""
+    notified, _, _ = _wd315_watchdog_harness(
+        monkeypatch, tmp_path, "degraded", ["privoxy"],
+        prev_state={"status": "down", "failed": ["privoxy", "туннель"],
+                    "notified_failed": ["privoxy", "туннель"], "last_degraded_push": 0.0},
+        env={_COOLDOWN_ENV: "0"})
+    health.cmd_watchdog()
+    assert len(notified) == 1
+    assert "состав" in notified[0][0], "не-ok→не-ok — всегда «состав изменился»"
+    assert "деградир" not in notified[0][0], "ложное ухудшение в момент улучшения"
+
+
+def test_degraded_cooldown_env_parsing_branches(monkeypatch):
+    """P3 (review): ветки env-парсера — мусор → дефолт 900, clamp 86400, отрицательные → 0."""
+    monkeypatch.delenv(_COOLDOWN_ENV, raising=False)
+    assert health._degraded_notify_cooldown_sec() == 900
+    monkeypatch.setenv(_COOLDOWN_ENV, "garbage")
+    assert health._degraded_notify_cooldown_sec() == 900
+    monkeypatch.setenv(_COOLDOWN_ENV, "999999")
+    assert health._degraded_notify_cooldown_sec() == 86400
+    monkeypatch.setenv(_COOLDOWN_ENV, "-5")
+    assert health._degraded_notify_cooldown_sec() == 0
+    monkeypatch.setenv(_COOLDOWN_ENV, "120")
+    assert health._degraded_notify_cooldown_sec() == 120
 
 
 def test_watchdog_legacy_state_baselines_notified_set(monkeypatch, tmp_path):

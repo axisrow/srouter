@@ -746,20 +746,30 @@ def _read_watchdog_prev_state():
         parsed = None
     if isinstance(parsed, dict):
         status = parsed.get("status")
-        failed = parsed.get("failed")
-        notified = parsed.get("notified_failed")
         try:
             last_push = float(parsed.get("last_degraded_push") or 0.0)
         except (TypeError, ValueError):
             last_push = 0.0
+        # Кламп [0, now] (PR #326 review P3): nan/inf/отрицательный из битого state
+        # навсегда глушат degraded-класс (сравнение с nan всегда False) — сбрасываем в 0.
+        if not (0.0 <= last_push <= time.time()):
+            last_push = 0.0
+
+        def _canon_names(value):
+            # sorted-канонизация набора имён (round 4 P2: перестановка — не смена
+            # состава). Не-строки из битого state отбрасываем, а не роняем парсер:
+            # sorted([3, 'x']) — TypeError ДО записи state = crash-loop каждого тика
+            # (/tmp world-writable), нотификации мертвы до ручной чистки (review P3).
+            if not isinstance(value, list):
+                return None
+            return sorted(x for x in value if isinstance(x, str))
+
         return {
             "status": status if isinstance(status, str) else "",
-            # sorted — канонический вид набора (round 4 P2): перестановка порядка из
-            # state не должна выглядеть сменой состава.
-            "failed": sorted(failed) if isinstance(failed, list) else None,
+            "failed": _canon_names(parsed.get("failed")),
             # notified_failed — последний УВЕДОМЛЁННЫЙ состав (Codex P1-1 round 2): при
             # подавлении cooldown'ом НЕ продвигается, чтобы событие не терялось навсегда.
-            "notified_failed": sorted(notified) if isinstance(notified, list) else None,
+            "notified_failed": _canon_names(parsed.get("notified_failed")),
             "last_degraded_push": last_push,
         }
     # Legacy: голая строка статуса (в т.ч. закавыченная валидным JSON — тоже строка).
@@ -879,13 +889,15 @@ def _cmd_watchdog_locked(result):
         new_degradation = cur == "degraded" and prev_status in ("ok", "")
         # Состав не уведомлён: либо сменился, либо был подавлен cooldown'ом (P1-1).
         unnotified = notified_failed is not None and list(notified_failed) != failed
-        same_status = prev_status == cur
         if (new_degradation or unnotified) and \
                 time.time() - last_push >= _degraded_notify_cooldown_sec():
-            if same_status:
-                label = "состав отказа изменился" if cur == "down" else "состав деградации изменился"
-            else:
+            # Лейбл по prev_status (PR #326 review P3): «деградировал» — только вход из
+            # ok/fresh; не-ok→не-ok (в т.ч. down→degraded с СОКРАТИВШИМСЯ набором) —
+            # «состав изменился», не ложное ухудшение в момент улучшения.
+            if prev_status in ("", "ok"):
                 label = "стек деградировал"
+            else:
+                label = "состав отказа изменился" if cur == "down" else "состав деградации изменился"
             _notify(f"{label} ({', '.join(failed)})", "Ping")
             notified_failed = failed
             last_push = time.time()
