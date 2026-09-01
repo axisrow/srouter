@@ -345,7 +345,13 @@ def _tunnel_target_up(url):
                        "--connect-timeout", "4", "--max-time", "8",
                        "-w", _TIMING_WRITE_FORMAT, url], timeout=10)
     if r.get("timeout"):
-        return False, "timeout", "timeout", None
+        # timing-минимум, не None (#315 round 2 / Codex P2-4): rc/err причины доступны
+        # даже когда процесс убит до вывода -w — timeout-класс не терял бы err в metrics.
+        return False, "timeout", "timeout", {
+            "target": url, "code": "000", "status": "timeout",
+            "connect_ms": None, "tls_ms": None, "ttfb_ms": None, "total_ms": None,
+            "rc": r.get("rc"), "err": r.get("err"),
+        }
     tokens = (r.get("out") or "").strip().split()
     code = tokens[0] if tokens else ""
     # Сначала классифицируем (ok, detail, kind), timing собираем ОДИН раз в конце:
