@@ -19,7 +19,11 @@
 - Формат события (одна строка JSONL, ключи стабильны):
     {"timestamp": iso, "ts": epoch, "target": host|None, "code": str|None,
      "status": ok|timeout|connection-failed|upstream-error|bad-code|no-response|down,
-     "connect_ms": int|None, "tls_ms": int|None, "ttfb_ms": int|None, "total_ms": int|None}
+     "connect_ms": int|None, "tls_ms": int|None, "ttfb_ms": int|None, "total_ms": int|None,
+     "rc": int|None, "err": str|None}
+    rc/err (#315 п.5) — exit-код и stderr той же curl-пробы: сигнатуры отказов #301
+    (exit 56≈8ms — xray мёртв; 35≈2s — узел отказал; 28≈4s — узел висит) видны в JSONL
+    ретроспективно. err — одна строка, ≤200 символов.
 """
 import json
 import logging
@@ -108,6 +112,16 @@ def build_event(timing, now=None):
     target = raw.get("target")
     if not isinstance(target, str) or not target:
         target = None
+    rc = raw.get("rc")
+    if isinstance(rc, bool) or not isinstance(rc, int):
+        rc = None
+    err = raw.get("err")
+    if not isinstance(err, str) or not err.strip():
+        err = None
+    else:
+        # Многострочный stderr curl → одна строка (join), bounded (канон hot_routes: лог
+        # bounded, иначе деградация сама раздувает файл метрик).
+        err = " | ".join(line.strip() for line in err.splitlines() if line.strip())[:200]
     return {
         "timestamp": datetime.fromtimestamp(ts).astimezone().isoformat(),
         "ts": ts,
@@ -118,6 +132,8 @@ def build_event(timing, now=None):
         "tls_ms": _safe_ms(raw.get("tls_ms")),
         "ttfb_ms": _safe_ms(raw.get("ttfb_ms")),
         "total_ms": _safe_ms(raw.get("total_ms")),
+        "rc": rc,
+        "err": err,
     }
 
 
