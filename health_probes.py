@@ -347,8 +347,14 @@ def _tunnel_target_up(url):
     if r.get("timeout"):
         # timing-минимум, не None (#315 round 2 / Codex P2-4): rc/err причины доступны
         # даже когда процесс убит до вывода -w — timeout-класс не терял бы err в metrics.
+        # target — hostname по контракту metrics (urlsplit), не полный URL (Codex F2 r3).
+        try:
+            from urllib.parse import urlsplit
+            host = urlsplit(url).hostname
+        except ValueError:
+            host = None
         return False, "timeout", "timeout", {
-            "target": url, "code": "000", "status": "timeout",
+            "target": host, "code": "000", "status": "timeout",
             "connect_ms": None, "tls_ms": None, "ttfb_ms": None, "total_ms": None,
             "rc": r.get("rc"), "err": r.get("err"),
         }

@@ -2444,6 +2444,41 @@ def test_watchdog_state_write_is_atomic(monkeypatch, tmp_path):
     assert any("watchdog.last" in c for c in calls), "state должен писаться через _write_watchdog_state"
 
 
+# ============================ #315 round 3: Codex findings ============================
+
+def test_watchdog_silent_on_degraded_to_ok_with_notified_set(monkeypatch, tmp_path):
+    """F1 (round 3): degraded с уведомлённым составом → ok — ТИШИНА, не ложный
+    «стек деградировал ()»: unnotified не должен вычисляться при cur=ok."""
+    notified, _, _ = _wd315_watchdog_harness(
+        monkeypatch, tmp_path, "ok", [],
+        prev_state={"status": "degraded", "failed": ["claude-proxy"],
+                    "notified_failed": ["claude-proxy"], "last_degraded_push": 0.0},
+        env={_COOLDOWN_ENV: "0"})
+    health.cmd_watchdog()
+    assert len(notified) == 0, "degraded→ok — молчим (#315 п.1), даже если состав был уведомлён"
+
+
+def test_watchdog_legacy_state_baselines_notified_set(monkeypatch, tmp_path):
+    """F3 (round 3): после legacy-строки первый прогон принимает текущий состав как
+    notified-baseline (тихая миграция, канон lifecycle-baseline) — ПОСЛЕДУЮЩИЕ смены
+    состава детектятся. Регрессия: notified_failed оставался null навсегда."""
+    notified, _, state_file = _wd315_watchdog_harness(
+        monkeypatch, tmp_path, "degraded", ["claude-proxy"],
+        prev_state="degraded", env={_COOLDOWN_ENV: "0"})
+    health.cmd_watchdog()
+    assert len(notified) == 0, "legacy prev — тихий baseline"
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    assert state["notified_failed"] == ["claude-proxy"], \
+        "после миграции notified_failed = текущий состав (baseline), не null"
+    # смена состава теперь видна
+    monkeypatch.setattr(health, "check_all", lambda **kw: {
+        "status": "degraded",
+        "checks": [{"name": name, "ok": False} for name in ("claude-proxy", "туннель")]})
+    health.cmd_watchdog()
+    assert len(notified) == 1
+    assert "состав" in notified[0][0]
+
+
 def test_notify_logs_to_file(monkeypatch, tmp_path):
     """_notify пишет audit trail в лог-файл (timestamp + msg)."""
     log_file = tmp_path / "srouter-watchdog.notify.log"
@@ -3788,6 +3823,8 @@ def test_tunnel_target_up_timing_minimum_on_probe_timeout(monkeypatch):
     assert timing["status"] == "timeout"
     assert timing["rc"] is None
     assert "timeout" in timing["err"]
+    assert timing["target"] == "api.anthropic.com", \
+        "контракт metrics: target — hostname (Codex F2 round 3), не полный URL"
     ev = metrics_store.build_event(timing, now=1700000000.0)
     assert ev["status"] == "timeout"
     assert ev["err"] is not None

@@ -869,7 +869,9 @@ def _cmd_watchdog_locked(result):
     elif cur == "ok" and prev_status == "down":
         _notify("стек восстановлен", "Glass")
         notified_failed = []
-    else:
+    elif cur in ("degraded", "down"):
+        # Гейт cur in (degraded, down) обязателен (Codex F1 round 3): без него ok-прогон с
+        # «не уведомлённым» составом прошлого degraded пушит ложное «стек деградировал ()».
         new_degradation = cur == "degraded" and prev_status in ("ok", "")
         # Состав не уведомлён: либо сменился, либо был подавлен cooldown'ом (P1-1).
         unnotified = notified_failed is not None and list(notified_failed) != failed
@@ -886,11 +888,14 @@ def _cmd_watchdog_locked(result):
 
     try:
         # _write_watchdog_state сам делает json.dumps + atomic-write (tmp+fsync+rename,
-        # канон local_state): передаём dict, не строку.
+        # канон local_state): передаём dict, не строку. notified_failed=None (legacy-строка
+        # или битый JSON) → baseline текущим составом (Codex F3 round 3): тихая миграция
+        # один раз, все ПОСЛЕДУЮЩИЕ смены состава детектятся (не null навсегда).
         _write_watchdog_state(WATCHDOG_STATE, {
             "status": cur,
             "failed": failed,
-            "notified_failed": notified_failed if cur != "ok" else [],
+            "notified_failed": (notified_failed if notified_failed is not None else failed)
+            if cur != "ok" else [],
             "last_degraded_push": last_push,
         })
     except OSError as exc:
