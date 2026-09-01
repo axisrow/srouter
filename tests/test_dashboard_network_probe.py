@@ -169,13 +169,27 @@ def test_curl_through_without_capture_headers_keeps_old_contract(monkeypatch):
     assert r == {"code": "200", "ms": 50, "up": True}
 
 
-def test_curl_through_capture_headers_missing_file_yields_empty(monkeypatch):
-    """curl не создал файл (таймаут/ошибка) — headers = {}, зонд не бросает."""
+def test_curl_through_capture_headers_empty_dump_yields_empty(monkeypatch):
+    """curl не записал заголовки (таймаут до ответа) — mkstemp-файл пуст, headers = {}.
+
+    Точность нейминга (review PR #324): файл здесь существует всегда (mkstemp создаёт
+    его до вызова curl) — «отсутствует» именно дамп заголовков, не файл. Ветку
+    отсутствующего файла покрывает отдельный прямой тест парсера ниже.
+    """
     monkeypatch.setattr(dashboard_network.sys_probe, "run",
                         lambda cmd, timeout=None, env=None: {"rc": 0, "out": "", "err": "", "timeout": True})
     r = dashboard_network._curl_through("http://example.com/", capture_headers=True)
     assert r["code"] == "000"
     assert r["headers"] == {}
+
+
+def test_parse_header_dump_missing_file_returns_empty(tmp_path):
+    """OSError-ветка парсера: несуществующий путь -> {}, не исключение.
+
+    В проде практически недостижимо (файл живёт от mkstemp до unlink в try/finally),
+    но парсер defensive — закрепляем контракт напрямую.
+    """
+    assert dashboard_network._parse_header_dump(tmp_path / "no-such-dump.txt") == {}
 
 
 def test_curl_through_direct_strips_proxy_env(monkeypatch):
