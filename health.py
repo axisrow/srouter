@@ -754,10 +754,12 @@ def _read_watchdog_prev_state():
             last_push = 0.0
         return {
             "status": status if isinstance(status, str) else "",
-            "failed": failed if isinstance(failed, list) else None,
+            # sorted — канонический вид набора (round 4 P2): перестановка порядка из
+            # state не должна выглядеть сменой состава.
+            "failed": sorted(failed) if isinstance(failed, list) else None,
             # notified_failed — последний УВЕДОМЛЁННЫЙ состав (Codex P1-1 round 2): при
             # подавлении cooldown'ом НЕ продвигается, чтобы событие не терялось навсегда.
-            "notified_failed": notified if isinstance(notified, list) else None,
+            "notified_failed": sorted(notified) if isinstance(notified, list) else None,
             "last_degraded_push": last_push,
         }
     # Legacy: голая строка статуса (в т.ч. закавыченная валидным JSON — тоже строка).
@@ -838,7 +840,9 @@ def _cmd_watchdog_locked(result):
     _record_watchdog_lifecycle()
     _record_watchdog_metrics(result)
     cur = result["status"]
-    failed = [c["name"] for c in result["checks"] if not c["ok"] and not c.get("info")]
+    # Канонический вид набора (round 4 P2): sorted — порядок перечисления драйверов не
+    # событие, иначе перестановка [a,b]→[b,a] давала ложный Ping и ложный audit-diff.
+    failed = sorted({c["name"] for c in result["checks"] if not c["ok"] and not c.get("info")})
     prev = _read_watchdog_prev_state()
     prev_status = prev["status"] if prev else ""
     prev_failed = prev["failed"] if prev else None

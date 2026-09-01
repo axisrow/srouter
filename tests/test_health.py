@@ -2458,6 +2458,20 @@ def test_watchdog_silent_on_degraded_to_ok_with_notified_set(monkeypatch, tmp_pa
     assert len(notified) == 0, "degraded→ok — молчим (#315 п.1), даже если состав был уведомлён"
 
 
+def test_watchdog_set_comparison_order_insensitive(monkeypatch, tmp_path):
+    """Round 4 (P2): failed — МНОЖЕСТВО драйверов: смена порядка перечисления
+    ([a,b]→[b,a]) не событие — ни Ping, ни ложная запись в audit-JSONL."""
+    notified, status_log, _ = _wd315_watchdog_harness(
+        monkeypatch, tmp_path, "degraded", ["туннель", "claude-proxy"],
+        prev_state={"status": "degraded", "failed": ["claude-proxy", "туннель"],
+                    "notified_failed": ["claude-proxy", "туннель"],
+                    "last_degraded_push": 0.0},
+        env={_COOLDOWN_ENV: "0"})
+    health.cmd_watchdog()
+    assert len(notified) == 0, "перестановка порядка драйверов — не смена состава"
+    assert not status_log.exists(), "audit-JSONL не пишет ложное изменение при перестановке"
+
+
 def test_watchdog_legacy_state_baselines_notified_set(monkeypatch, tmp_path):
     """F3 (round 3): после legacy-строки первый прогон принимает текущий состав как
     notified-baseline (тихая миграция, канон lifecycle-baseline) — ПОСЛЕДУЮЩИЕ смены
