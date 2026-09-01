@@ -124,6 +124,74 @@ def test_probe_direct_down_on_5xx(monkeypatch):
     assert r["status"] == "down", f"5xx на прямом probe = down, получили {r}"
 
 
+# ===================== issue #323: capture_headers — заголовки ответа для guard'а синтетики =====================
+# Живой захват (canon mock-format-must-come-from-live-capture): изолированный стенд
+# privoxy 4.2.0 (brew), forward-socks5t на мёртвый upstream, 2026-09-01, research #301.
+# Это ровно то, что curl -D кладёт в файл при синтетическом 503 «Forwarding failure».
+PRIVOXY_SYNTHETIC_503_DUMP = (
+    "HTTP/1.1 503 Forwarding failure\r\n"
+    "Content-Length: 6925\r\n"
+    "Content-Type: text/html\r\n"
+    "Cache-Control: no-cache\r\n"
+    "Date: Tue, 01 Sep 2026 03:32:59 GMT\r\n"
+    "Last-Modified: Wed, 08 Jun 1955 12:00:00 GMT\r\n"
+    "Expires: Sat, 17 Jun 2000 12:00:00 GMT\r\n"
+    "Pragma: no-cache\r\n"
+)
+
+
+def _run_writing_header_dump(dump, *, timed_out=False):
+    """fake sys_probe.run, который ведёт себя как реальный curl -D: пишет дамп по пути
+    из аргумента после -D (cmd строится как [curl, ..., -D, path, url])."""
+    def fake_run(cmd, timeout=None, env=None):
+        path = cmd[cmd.index("-D") + 1]
+        with open(path, "w", encoding="utf-8", newline="") as fh:
+            fh.write(dump)
+        return {"rc": 0, "out": "503 0.007139", "err": "", "timeout": timed_out}
+    return fake_run
+
+
+def test_curl_through_capture_headers_parses_live_dump(monkeypatch):
+    """capture_headers=True: дамп парсится в lower-case dict, magic-даты доступны guard'у."""
+    monkeypatch.setattr(dashboard_network.sys_probe, "run",
+                        _run_writing_header_dump(PRIVOXY_SYNTHETIC_503_DUMP))
+    r = dashboard_network._curl_through("http://example.com/", capture_headers=True)
+    assert r["code"] == "503"
+    assert r["headers"]["expires"] == "Sat, 17 Jun 2000 12:00:00 GMT"
+    assert r["headers"]["last-modified"] == "Wed, 08 Jun 1955 12:00:00 GMT"
+    assert "HTTP/1.1" not in str(r["headers"])  # статус-лайн не попадает в заголовки
+
+
+def test_curl_through_without_capture_headers_keeps_old_contract(monkeypatch):
+    """Без capture_headers ключа headers НЕТ: старые потребители и моки не меняются."""
+    monkeypatch.setattr(dashboard_network.sys_probe, "run", _run_returning("200 0.050000"))
+    r = dashboard_network._curl_through("https://api.anthropic.com/")
+    assert r == {"code": "200", "ms": 50, "up": True}
+
+
+def test_curl_through_capture_headers_empty_dump_yields_empty(monkeypatch):
+    """curl не записал заголовки (таймаут до ответа) — mkstemp-файл пуст, headers = {}.
+
+    Точность нейминга (review PR #324): файл здесь существует всегда (mkstemp создаёт
+    его до вызова curl) — «отсутствует» именно дамп заголовков, не файл. Ветку
+    отсутствующего файла покрывает отдельный прямой тест парсера ниже.
+    """
+    monkeypatch.setattr(dashboard_network.sys_probe, "run",
+                        lambda cmd, timeout=None, env=None: {"rc": 0, "out": "", "err": "", "timeout": True})
+    r = dashboard_network._curl_through("http://example.com/", capture_headers=True)
+    assert r["code"] == "000"
+    assert r["headers"] == {}
+
+
+def test_parse_header_dump_missing_file_returns_empty(tmp_path):
+    """OSError-ветка парсера: несуществующий путь -> {}, не исключение.
+
+    В проде практически недостижимо (файл живёт от mkstemp до unlink в try/finally),
+    но парсер defensive — закрепляем контракт напрямую.
+    """
+    assert dashboard_network._parse_header_dump(tmp_path / "no-such-dump.txt") == {}
+
+
 def test_curl_through_direct_strips_proxy_env(monkeypatch):
     """ДЫРА (cycle-review PR #298): proxy=False обязан МИНУТЬ прокси через env -u, иначе
     unвыведенный HTTP_PROXY/ALL_PROXY в окружении процесса тихо перенаправит «прямой» замер
