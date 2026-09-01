@@ -116,7 +116,13 @@ def proxy_effective_probe(*, host=None, channel="socks"):
     """Прямой vs через-прокси замер одного домена. Не бросает.
 
     {status: ok|warn|down|unknown, verdict, works: bool|None, host, channel,
-     direct: {code, ms, up}, proxy: {code, ms, up}, detail}
+     direct: {code, ms, up}, proxy: {code, ms, up, synthetic_5xx}, detail}
+
+    Граница применимости guard'а #323: зонд меряет https://-плечо, где синтетика
+    посредника не доходит до кода (провал CONNECT = code=000) — guard там инертен и не
+    меняет вердикты. Оживает он на http://-целях (сегодня у зонда их нет — запасной
+    фикс #323; via-замер уже собирает заголовки, так что любому будущему http-плечу
+    guard доступен без изменений).
     """
     host = host or DEFAULT_HOST
     proxy_url = _CHANNEL_PROXY.get(channel, _SOCKS_PROXY_URL)
