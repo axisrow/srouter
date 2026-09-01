@@ -17,10 +17,17 @@
     timeout  ok          ok-blocked-direct   True   ok       <- прокси спасает от блокировки
     timeout  timeout     both-down           False  down     <- сеть/DNS/узел
     ok       5xx         vendor-outage       True   warn     <- канал жив, лежит вендор
+    ok       5xx синт.   proxy-broken        False  down     <- 5xx синтезировал сам посредник (#323)
 
 Семантика 5xx взята из health._tunnel_up (#207) и sys_probe.direct_probe: сервер ОТВЕТИЛ
 через прокси, значит канал доказан живым, даже если вендор лежит. Не поднимаем ложную
 тревогу «прокси упал» (issue #82 класс).
+
+Уточнение #323 (research #301): на plain-HTTP-плече посредник (privoxy) сам синтезирует
+5xx о мёртвом upstream — такой код НЕ доказывает канал. Отличаем по magic-датам privoxy
+в заголовках ответа (захват стенда, живые дампы — issue #301). На HTTPS-плече синтетика
+в принципе не доходит до кода (провал CONNECT даёт code=000), поэтому там семантика #207
+не меняется.
 
 Probe-канон: НИКОГДА не бросает; при внутреннем сбое works=None (не False — неизвестность
 не равна поломке).
@@ -50,12 +57,39 @@ DEFAULT_HOST = "github.com"
 
 _SERVER_ERROR = 500
 
+# Magic-даты privoxy-синтетики (issue #323; живой захват изолированного стенда
+# privoxy 4.2.0 brew + мёртвый upstream, research #301). Константы privoxy кладёт во ВСЕ
+# собственные страницы ошибок; у настоящего ответа домена такие даты практически
+# невозможны (1955 — до появления HTTP). Expires есть во всех вариантах синтетики
+# (503/502/500), Last-Modified 1955 — только в шаблонных (503/502; у 500-без-шаблона
+# там текущая дата), поэтому проверяем обе, OR.
+_SYNTHETIC_EXPIRES = "Sat, 17 Jun 2000 12:00:00 GMT"
+_SYNTHETIC_LAST_MODIFIED = "Wed, 08 Jun 1955 12:00:00 GMT"
+
 
 def _code_int(res):
     try:
         return int(str(res.get("code", "")).strip())
     except (TypeError, ValueError):
         return None
+
+
+def _is_synthetic_middleware_5xx(via):
+    """5xx синтезировал сам посредник (privoxy о мёртвом upstream), не вендор.
+
+    Только plain-HTTP-плечо (research #301): на HTTPS синтетика не проходит CONNECT и
+    зонд видит code=000. Заголовков нет (HTTPS-зонд, старые данные) -> False: семантика
+    канона #207 не меняется.
+    """
+    code = _code_int(via)
+    if code is None or code < _SERVER_ERROR:
+        return False
+    headers = via.get("headers")
+    if not isinstance(headers, dict):
+        return False
+    expires = str(headers.get("expires", "")).strip()
+    last_modified = str(headers.get("last-modified", "")).strip()
+    return expires == _SYNTHETIC_EXPIRES or last_modified == _SYNTHETIC_LAST_MODIFIED
 
 
 def _classify(direct, via):
@@ -65,8 +99,9 @@ def _classify(direct, via):
     direct_ok = bool(direct.get("up"))
     via_ok = bool(via.get("up"))
 
-    if via_5xx:
+    if via_5xx and not _is_synthetic_middleware_5xx(via):
         # Ответ сервера через прокси = канал доказан живым, лежит вендор (не прокси).
+        # Синтетика посредника сюда НЕ попадает: она о мёртвом upstream, канал не доказан (#323).
         return "vendor-outage", True, "warn"
     if direct_ok and via_ok:
         return "ok", True, "ok"
@@ -88,8 +123,13 @@ def proxy_effective_probe(*, host=None, channel="socks"):
     url = f"https://{host}/"
     try:
         direct = _curl_through(url, proxy=False)
-        via = _curl_through(url, proxy=True, proxy_url=proxy_url)
+        # via-плечо просит заголовки: единственный способ отличить синтетический 5xx
+        # посредника от настоящего ответа домена (issue #323). direct-плечу они не нужны.
+        via = _curl_through(url, proxy=True, proxy_url=proxy_url, capture_headers=True)
         verdict, works, status = _classify(direct, via)
+        # Наружу — булев флаг, НЕ сырые заголовки: они не должны утекать в метрики/логи.
+        via_public = {k: v for k, v in via.items() if k != "headers"}
+        via_public["synthetic_5xx"] = _is_synthetic_middleware_5xx(via)
         return {
             "status": status,
             "verdict": verdict,
@@ -98,8 +138,8 @@ def proxy_effective_probe(*, host=None, channel="socks"):
             "channel": channel,
             "proxy_url": proxy_url,
             "direct": direct,
-            "proxy": via,
-            "detail": _detail(verdict, host, direct, via),
+            "proxy": via_public,
+            "detail": _detail(verdict, host, direct, via_public),
         }
     except Exception as e:  # noqa: BLE001 — probe-канон: boundary catch-all, честный unknown
         return {
@@ -120,6 +160,10 @@ def _detail(verdict, host, direct, via):
     if verdict == "ok":
         return f"{host}: прокси работает (прямо {d}, через прокси {v})"
     if verdict == "proxy-broken":
+        if via.get("synthetic_5xx"):
+            return (f"{host}: прямой путь работает ({d}), а через прокси пришёл "
+                    f"синтетический {v} от самого прокси (мёртвый upstream) — "
+                    f"туннель не работает")
         return (f"{host}: прямой путь работает ({d}), а через прокси нет ({v}) — "
                 f"узел мёртв или туннель не поднят")
     if verdict == "ok-blocked-direct":

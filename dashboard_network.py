@@ -1,6 +1,7 @@
 """Сетевые probe-хелперы dashboard без импорта Flask/dashboard."""
 
 import os
+import tempfile
 
 import sys_probe
 from dashboard_common import (
@@ -59,7 +60,28 @@ def probe_services():
     }
 
 
-def _curl_through(url, proxy=True, proxy_url=None):
+def _parse_header_dump(path):
+    """Заголовки из curl -D дампа: {lower(name): value}, при дублях — последнее значение.
+
+    Статус-лайны (HTTP/1.1 ...) и obs-fold continuation (строки с пробела/таба)
+    выбрасываются. Потребитель — guard синтетического 5xx privoxy (issue #323): ему
+    нужны точные значения magic-дат, фолдинга в них нет.
+    """
+    headers = {}
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except OSError:
+        return headers
+    for line in text.splitlines():
+        if not line or line.startswith(("HTTP/", " ", "\t")) or ":" not in line:
+            continue
+        name, _, value = line.partition(":")
+        headers[name.strip().lower()] = value.strip()
+    return headers
+
+
+def _curl_through(url, proxy=True, proxy_url=None, capture_headers=False):
     """curl к url напрямую (proxy=False) или через прокси. {code, ms, up}.
 
     proxy_url задаёт КАКОЙ прокси (issue: централизованный статус): потребители ходят
@@ -72,10 +94,21 @@ def _curl_through(url, proxy=True, proxy_url=None):
     замер тихо уйдёт через посторонний прокси — контрольная группа парного замера
     (proxy_effective.py) перестаёт быть контрольной (cycle-review PR #298, canon —
     тот же приём, что и в probe_manager.direct_probe).
+
+    capture_headers=True добавляет в результат поле headers — дамп заголовков ответа
+    (curl -D во временный файл), {lower(name): value}. Нужен via-плечу proxy_effective:
+    отличать синтетический 5xx посредника от настоящего ответа домена по magic-датам
+    privoxy (issue #323, research #301). Без флага контракт прежний: {code, ms, up} —
+    старые потребители и моки не меняются.
     """
     cmd = [CURL, "-sS", "-o", "/dev/null", "--connect-timeout", "4", "--max-time", "8",
            "-w", "%{http_code} %{time_total}"]
     kwargs = {}
+    header_file = None
+    if capture_headers:
+        fd, header_file = tempfile.mkstemp(prefix="srouter-curl-headers-")
+        os.close(fd)
+        cmd += ["-D", header_file]  # до url: url обязан остаться cmd[-1] (тесты/потребители)
     if proxy:
         cmd += ["-x", proxy_url or HTTP_PROXY_URL]
     else:
@@ -86,21 +119,33 @@ def _curl_through(url, proxy=True, proxy_url=None):
         kwargs["env"] = env
     cmd.append(url)
     r = sys_probe.run(cmd, timeout=10, **kwargs)
+    headers = _parse_header_dump(header_file) if capture_headers else None
+    if header_file:
+        try:
+            os.unlink(header_file)
+        except OSError:
+            pass
     if r["timeout"] or not r["out"]:
-        return {"code": "000", "ms": None, "up": False}
-    parts = r["out"].split()
-    if len(parts) < 2:
-        return {"code": "000", "ms": None, "up": False}
-    code, t = parts[0], parts[1]
-    try:
-        code_int = int(code)
-    except (TypeError, ValueError):
-        return {"code": "000", "ms": None, "up": False}
-    try:
-        ms = round(float(t) * 1000)
-    except (TypeError, ValueError):
-        ms = None
-    return {"code": code, "ms": ms, "up": sys_probe.tunnel_code_up(code_int)}
+        result = {"code": "000", "ms": None, "up": False}
+    else:
+        parts = r["out"].split()
+        if len(parts) < 2:
+            result = {"code": "000", "ms": None, "up": False}
+        else:
+            code, t = parts[0], parts[1]
+            try:
+                code_int = int(code)
+            except (TypeError, ValueError):
+                result = {"code": "000", "ms": None, "up": False}
+            else:
+                try:
+                    ms = round(float(t) * 1000)
+                except (TypeError, ValueError):
+                    ms = None
+                result = {"code": code, "ms": ms, "up": sys_probe.tunnel_code_up(code_int)}
+    if capture_headers:
+        result["headers"] = headers or {}
+    return result
 
 
 def probe_tunnel():
