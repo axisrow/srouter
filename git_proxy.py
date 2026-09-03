@@ -521,6 +521,13 @@ def enable(force=False):
     может interleave'иться между read и write этой функции. Если лок физически недоступен
     (flock unsupported/permission) — fail-closed, НЕ мутируем без сериализации (Codex
     cycle-review PR #275 follow-up).
+
+    Issue #307 round 2 (Codex cycle-review PR #328 finding 4, остаточный риск): лок
+    сериализует только процессы, которые его берут (CLI + dashboard). Внешний `git config`
+    МЕЖДУ _get_all() и _write_values() не участвует в локе — чужое значение, записанное
+    ровно в этом окне, будет перезаписано без backup. Полностью закрыть это можно только
+    сериализацией ВСЕХ писателей gitconfig (вне зоны контроля srouter); окно принято как
+    документированный остаточный риск, backup/restore смягчает последствия для наших циклов.
     """
     with _mutation_lock() as lock_acquired:
         if not lock_acquired:

@@ -799,7 +799,11 @@ class TestClaudeProxyExceptions:
             assert result == {}, "Dict должен быть пустым"
 
     def test_load_json_decode_error_fallback(self):
-        """_load возвращает {} при malformed JSON."""
+        """_load возвращает None при malformed JSON.
+
+        Issue #307 round 2 (Codex cycle-review PR #328 finding 3): раньше fallback был {}
+        — битый JSON схлопывался в пустой конфиг, и enable() молча перезаписывал ВЕСЬ чужой
+        settings.json. Теперь malformed = None = «неизвестно», enable/disable отказывают."""
         import claude_proxy
 
         with patch('claude_proxy.SETTINGS', Path("/nonexistent/settings.json")):
@@ -807,7 +811,7 @@ class TestClaudeProxyExceptions:
             with patch.object(Path, 'read_text', return_value="{invalid json}"):
                 with patch.object(Path, 'exists', return_value=True):
                     result = claude_proxy._load()
-                    assert result == {}, "Должен возвращать пустой dict при JSON decode error"
+                    assert result is None, "Malformed JSON = неизвестно (None), не пустой конфиг"
 
     def test_save_os_error_handling(self, tmp_path):
         """_save обрабатывает OS ошибки и возвращает structured error."""

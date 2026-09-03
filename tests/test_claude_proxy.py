@@ -133,13 +133,14 @@ def test_round_trip_enable_disable_status(monkeypatch, tmp_path):
 
 
 def test_enable_handles_broken_json(monkeypatch, tmp_path):
-    """settings.json битый → enable создаёт свежий env (fail-soft)."""
+    """settings.json битый → enable НЕ падает и НЕ затирает файл (issue #307 round 2,
+    Codex finding 3: раньше битый JSON схлопывался в {} и перезаписывался целиком —
+    молчаливая потеря всего чужого settings.json)."""
     settings = _setup(monkeypatch, tmp_path)
     settings.write_text("{ not valid json")
     r = claude_proxy.enable()
-    assert r["ok"] is True  # не падает на битом файле
-    data = json.loads(settings.read_text())  # результат — валидный JSON
-    assert data["env"]["HTTPS_PROXY"] == EXPECTED_CLAUDE_PROXY
+    assert r["ok"] is False  # честный отказ, не «создаём свежий env» поверх чужого файла
+    assert claude_proxy.status()["state"] == "unknown"
 
 
 # ============================ NO_PROXY для z.ai (glm идёт напрямую, мимо privoxy) ============================
@@ -364,3 +365,91 @@ def test_disable_strips_no_proxy_only_when_managed(monkeypatch, tmp_path):
 
     env = json.loads(settings.read_text())["env"]
     assert env["NO_PROXY"] == "api.z.ai,other.internal", "чужой NO_PROXY не тронут"
+
+
+# ============ issue #307 round 2 (Codex cycle-review PR #328): находки 1-3 ============
+
+def test_disable_backup_survives_failed_save(monkeypatch, tmp_path):
+    """Codex finding 2: backup удаляется ТОЛЬКО после подтверждённой записи. Если _save()
+    падает при restore, единственная копия чужого значения обязана остаться в backup."""
+    settings = _setup(monkeypatch, tmp_path)
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text(json.dumps({"env": {"HTTPS_PROXY": "http://corp-proxy:3128"}}))
+    assert claude_proxy.enable(force=True)["ok"] is True
+
+    real_save = claude_proxy._save
+
+    def _failing_save(data):
+        return {"ok": False, "err": "simulated disk full"}
+
+    monkeypatch.setattr(claude_proxy, "_save", _failing_save)
+    r = claude_proxy.disable()
+    monkeypatch.setattr(claude_proxy, "_save", real_save)
+
+    assert r["ok"] is False
+    backup = claude_proxy._backup_path()
+    assert backup.exists(), "backup НЕ удалён при упавшей записи — единственная копия чужого значения"
+    assert json.loads(backup.read_text())["env"]["HTTPS_PROXY"] == "http://corp-proxy:3128"
+    # После "починки" disable доводит restore до конца.
+    assert claude_proxy.disable()["ok"] is True
+    assert json.loads(settings.read_text())["env"]["HTTPS_PROXY"] == "http://corp-proxy:3128"
+    assert not backup.exists()
+
+
+def test_status_and_enable_report_unknown_on_unreadable_settings(monkeypatch, tmp_path):
+    """Codex finding 3: malformed JSON — НЕ «не настроено» и НЕ повод затирать файл.
+    status -> state=unknown, enable/disable -> отказ без мутации (fail-closed)."""
+    settings = _setup(monkeypatch, tmp_path)
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    broken = "{ not valid json"
+    settings.write_text(broken)
+
+    s = claude_proxy.status()
+    assert s["state"] == "unknown", s
+    assert s["enabled"] is False
+
+    r = claude_proxy.enable(force=True)
+    assert r["ok"] is False
+    assert settings.read_text() == broken, "битый файл не перезаписан"
+
+    r = claude_proxy.disable()
+    assert r["ok"] is False
+    assert settings.read_text() == broken
+
+
+def test_enable_refuses_non_dict_json(monkeypatch, tmp_path):
+    """Валидный JSON не-object (список/строка) — чужой документ: не заменяем на наш dict."""
+    settings = _setup(monkeypatch, tmp_path)
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text('["some", "list"]')
+    r = claude_proxy.enable(force=True)
+    assert r["ok"] is False
+    assert json.loads(settings.read_text()) == ["some", "list"], "чужой документ не тронут"
+
+
+def test_enable_rechecks_disk_state_before_save(monkeypatch, tmp_path):
+    """Codex finding 4 (TOCTOU): state может измениться МЕЖДУ gate и записью. enable обязан
+    перечитать файл непосредственно перед _save и отказаться, если решение устарело."""
+    settings = _setup(monkeypatch, tmp_path)
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text("{}")
+
+    real_load = claude_proxy._load
+    calls = {"n": 0}
+
+    def _racing_load():
+        # 1-е чтение (gate): absent; последующие (pre-save re-check): уже чужое.
+        calls["n"] += 1
+        data = real_load()
+        if calls["n"] > 1:
+            return {"env": {"HTTPS_PROXY": "http://corp-proxy:3128"}}
+        return data
+
+    monkeypatch.setattr(claude_proxy, "_load", _racing_load)
+    r = claude_proxy.enable()
+    monkeypatch.setattr(claude_proxy, "_load", real_load)
+
+    assert r["ok"] is False, "устаревшее решение -> отказ, не тихая перезапись"
+    # _load замокан, запись не состоялась: файл на диске остался в исходном виде (наш
+    # managed-прокси НЕ записан поверх чужого значения из гонки).
+    assert json.loads(settings.read_text()) == {}, "запись не должна была состояться"

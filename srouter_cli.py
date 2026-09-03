@@ -194,17 +194,17 @@ def cmd_install(args) -> int:
     if result.get("ok"):
         # Claude Code обязан ходить через прокси (изоляция режет api.anthropic.com напрямую).
         # Best-effort: не критично для install, но удобно «из коробки».
-        # force=True (issue #307): install — уже за-конфирмённое пользователем действие (шаг 5
-        # apply после prompt), чужие значения перезаписываются осознанно (с backup), не молча
-        # из панели. Прецедент: force_endpoint_overwrite выше.
-        cp = claude_proxy.enable(force=True)
+        # Issue #307 round 2 (Codex cycle-review finding 1): -y НЕ разрешает перезапись ЧУЖИХ
+        # значений; force — только явный --force-proxy-overwrite (прецедент force_endpoint_overwrite).
+        _proxy_force = bool(getattr(args, "force_proxy_overwrite", False))
+        cp = claude_proxy.enable(force=_proxy_force)
         cp_note = ("Claude Code: HTTPS_PROXY прописан в ~/.claude/settings.json."
                    if cp.get("ok") else
                    f"Claude Code: не удалось прописать HTTPS_PROXY ({cp.get('err', 'unknown')}).")
         # issue #130: git → SOCKS5 (xray 10808) scoped на github.com, автоматически, без ручных
         # правок ~/.gitconfig. Best-effort (не критично для install, но часть «одна команда, всё
         # правильно» — git умеет нативный SOCKS5, в отличие от Claude Code).
-        gp = git_proxy.enable(force=True)
+        gp = git_proxy.enable(force=_proxy_force)
         gp_note = (f"git: github-proxy прописан в ~/.gitconfig ({gp.get('proxy', '')})."
                    if gp.get("ok") else
                    f"git: не удалось прописать github-proxy ({gp.get('err', 'unknown')}).")
@@ -245,7 +245,7 @@ def cmd_install(args) -> int:
         # Отдельный клиент от ChatGPT.app (расширение в Code/Cursor, не GUI-приложение). Комплементарен
         # codenv: codenv покрывает Rust app-server ChatGPT.app, VSCode http.proxy — расширение. CC
         # (отдельный процесс, свой ~/.claude/settings.json) НЕ затрагивается ни одним из них.
-        vp = vscode_proxy.enable(force=True)
+        vp = vscode_proxy.enable(force=_proxy_force)
         if vp.get("ok"):
             vp_note = ("scoped SOCKS5 в VSCode http.proxy (Code/Cursor) — расширение openai.chatgpt, "
                        "CC не затрагивается (#185)"
@@ -895,6 +895,14 @@ def build_parser() -> argparse.ArgumentParser:
             p.add_argument("--force-endpoint-overwrite", action="store_true",
                            help="Обойти #200 защиту: перезаписать рабочий xray config placeholder'ом "
                                 "(осознанно; обычно запусти `srouter sync` вместо этого).")
+            # Issue #307 (Codex cycle-review PR #328 finding 1): `-y` НЕ означает разрешение
+            # перезаписывать ЧУЖИЕ proxy-настройки (корпоративные/ручные). Перезапись — только
+            # этот явный флаг (или осознанный force через дашборд-панель).
+            p.add_argument("--force-proxy-overwrite", action="store_true",
+                           help="Перезаписать ЧУЖИЕ значения прокси в ~/.gitconfig, "
+                                "~/.claude/settings.json и settings.json редакторов "
+                                "(чужие значения сохраняются в backup; по умолчанию install "
+                                "на чужое значение честно отказывает).")
         p.set_defaults(func=fn)
 
     # sync (#200): импорт endpoint активного узла из РАБОЧЕГО xray config в srouter.local.json,

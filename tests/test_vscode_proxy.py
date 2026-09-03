@@ -267,3 +267,83 @@ def test_disable_after_force_restores_backed_up_foreign_value(monkeypatch, tmp_p
     data = json.loads(paths[0].read_text())
     assert data["http.proxy"] == "http://corp-proxy:3128"
     assert not vscode_proxy._backup_path(paths[0]).exists(), "backup потреблён, не висит сиротой"
+
+
+# ============ issue #307 round 2 (Codex cycle-review PR #328): находки 2-4 ============
+
+def test_disable_backup_survives_failed_save(monkeypatch, tmp_path):
+    """Codex finding 2: backup удаляется ТОЛЬКО после подтверждённой записи settings.json."""
+    paths = _setup(monkeypatch, tmp_path)
+    paths[0].parent.mkdir(parents=True)
+    paths[0].write_text(json.dumps({"http.proxy": "http://corp-proxy:3128"}), encoding="utf-8")
+    assert vscode_proxy.enable(force=True)["ok"] is True
+
+    real_save = vscode_proxy._save
+
+    def _failing_save(path, data):
+        return {"ok": False, "err": "simulated disk full"}
+
+    monkeypatch.setattr(vscode_proxy, "_save", _failing_save)
+    r = vscode_proxy.disable()
+    monkeypatch.setattr(vscode_proxy, "_save", real_save)
+
+    assert r["ok"] is False
+    backup = vscode_proxy._backup_path(paths[0])
+    assert backup.exists(), "backup НЕ удалён при упавшей записи"
+    # После "починки" disable доводит restore до конца.
+    assert vscode_proxy.disable()["ok"] is True
+    assert json.loads(paths[0].read_text())["http.proxy"] == "http://corp-proxy:3128"
+    assert not backup.exists()
+
+
+def test_status_reports_unknown_on_unreadable_settings(monkeypatch, tmp_path):
+    """Codex finding 3: malformed JSON — НЕ absent. state=unknown; enable отказывает без
+    перезаписи файла (раньше битый/не-dict файл заменялся на наш)."""
+    paths = _setup(monkeypatch, tmp_path)
+    paths[0].parent.mkdir(parents=True)
+    broken = "{ not valid json"
+    paths[0].write_text(broken, encoding="utf-8")
+
+    s = vscode_proxy.status()
+    assert s["state"] == "unknown", s
+    assert s["paths"][str(paths[0])]["state"] == "unknown"
+
+    r = vscode_proxy.enable(force=True)
+    assert r["ok"] is False
+    assert paths[0].read_text(encoding="utf-8") == broken, "битый файл не перезаписан"
+
+
+def test_enable_refuses_non_dict_json(monkeypatch, tmp_path):
+    """Валидный JSON не-object — чужой документ: не заменяем на наш dict (finding 3)."""
+    paths = _setup(monkeypatch, tmp_path)
+    paths[0].parent.mkdir(parents=True)
+    paths[0].write_text('["some", "list"]', encoding="utf-8")
+    r = vscode_proxy.enable(force=True)
+    assert r["ok"] is False
+    assert json.loads(paths[0].read_text(encoding="utf-8")) == ["some", "list"]
+
+
+def test_enable_rechecks_disk_state_before_save(monkeypatch, tmp_path):
+    """Codex finding 4 (TOCTOU): foreign между gate-чтением и записью -> отказ, не тихая
+    перезапись без force и backup."""
+    paths = _setup(monkeypatch, tmp_path)
+    paths[0].parent.mkdir(parents=True)
+    paths[0].write_text("{}", encoding="utf-8")
+
+    real_read = vscode_proxy._read_settings
+    calls = {"n": 0}
+
+    def _racing_read(path):
+        calls["n"] += 1
+        if calls["n"] > 1:
+            # Чужое появилось в гонке ПОСЛЕ gate-чтения (kind='ok' — легитимный файл).
+            return {"http.proxy": "http://corp-proxy:3128"}, "ok"
+        return real_read(path)
+
+    monkeypatch.setattr(vscode_proxy, "_read_settings", _racing_read)
+    r = vscode_proxy.enable()
+    monkeypatch.setattr(vscode_proxy, "_read_settings", real_read)
+
+    assert r["ok"] is False, "устаревшее решение -> отказ"
+    # _load замокан, запись не состоялась: файл остался в исходном виде.
+    assert json.loads(paths[0].read_text(encoding="utf-8")) == {}, "запись не должна была состояться"

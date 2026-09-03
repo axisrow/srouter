@@ -7,6 +7,7 @@ cmd_install падал в не-TTY среде (cron/launchd/CI/фоновый п
 Покрываем gate-логику подтверждения (cmd_install:544). Конфликт-блок (cmd_install:530) НЕ трогаем —
 там TTY нужен legitimately (per-компонентный выбор adopt/overwrite/skip неразрешим через -y).
 """
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -24,6 +25,16 @@ def _args(**over):
     base = dict(state=None, prefix=None, launchagents_dir=None, python=None, yes=True)
     base.update(over)
     return SimpleNamespace(**base)
+
+
+_FORCE_SEEN = {}
+
+
+def _force_seen(consumer, force):
+    """Записать force, с которым cmd_install позвал enable (Codex finding 1: -y не означает
+    разрешение перезаписывать чужие proxy-настройки)."""
+    _FORCE_SEEN[consumer] = force
+    return None
 
 
 def _stub_cmd_install_internals(monkeypatch, *, apply_ok=True, tty=True):
@@ -49,9 +60,12 @@ def _stub_cmd_install_internals(monkeypatch, *, apply_ok=True, tty=True):
     monkeypatch.setattr(srouter_cli, "apply_install",
                         lambda **k: {"ok": apply_ok, "blocked": []})
     # best-effort хелперы после успешного apply (мокаем, чтобы не трогать реальную ФС/сеть).
-    monkeypatch.setattr(srouter_cli, "claude_proxy", SimpleNamespace(enable=lambda force=False: {"ok": True}))
+    monkeypatch.setattr(srouter_cli, "claude_proxy", SimpleNamespace(
+        enable=lambda force=False: (_force_seen("claude", force), {"ok": True})[1]))
     # issue #130: git → SOCKS5 (xray 10808) через gitconfig, симметрично claude_proxy/vscode_proxy.
-    monkeypatch.setattr(srouter_cli, "git_proxy", SimpleNamespace(enable=lambda force=False: {"ok": True, "proxy": "socks5h://127.0.0.1:10808"}))
+    monkeypatch.setattr(srouter_cli, "git_proxy", SimpleNamespace(
+        enable=lambda force=False: (_force_seen("git", force),
+                                    {"ok": True, "proxy": "socks5h://127.0.0.1:10808"})[1]))
     monkeypatch.setattr(srouter_cli, "_install_generic_launchagent", lambda *a, **k: (True, ""))
     monkeypatch.setattr(srouter_cli, "_install_ppp_hook", lambda *a, **k: "")
     monkeypatch.setattr(srouter_cli, "_install_codex_wrappers", lambda env: "")
@@ -62,7 +76,8 @@ def _stub_cmd_install_internals(monkeypatch, *, apply_ok=True, tty=True):
     monkeypatch.setattr(srouter_cli, "_ensure_home_bin_in_path", lambda env: "")
     # issue #185: scoped SOCKS5 через VSCode http.proxy (вместо gui-SOCKS5, который ломал CC #130).
     monkeypatch.setattr(srouter_cli, "vscode_proxy",
-                        SimpleNamespace(enable=lambda force=False: {"ok": True, "paths": []}))
+                        SimpleNamespace(enable=lambda force=False: (
+                            _force_seen("vscode", force), {"ok": True, "paths": []})[1]))
     # issue #168: PF codex-изоляция (sub-anchor). Лезет в реальный pfctl/osascript — мокаем.
     if hasattr(srouter_cli, "_install_codex_isolation"):
         monkeypatch.setattr(srouter_cli, "_install_codex_isolation", lambda env, runner: "")
@@ -193,3 +208,30 @@ def test_cmd_install_enables_git_proxy(monkeypatch):
 
     assert rc == 0
     assert calls["git_enable"] == 1, "install обязан настроить git-прокси автоматически (#130)"
+
+
+# ============ issue #307 round 2 (Codex finding 1): install не форсирует чужие значения ============
+
+def test_cmd_install_does_not_force_proxy_overwrite_by_default(monkeypatch):
+    """Codex cycle-review PR #328 finding 1: `install` и даже `-y` НЕ означают разрешение
+    перезаписывать чужие proxy-настройки: enable зовётся без force; конфликт честно
+    репортится в note. Перезапись — только явный --force-proxy-overwrite."""
+    mod = sys.modules[__name__]
+    _stub_cmd_install_internals(monkeypatch, apply_ok=True, tty=False)
+    mod._FORCE_SEEN.clear()
+
+    rc = srouter.cmd_install(_args(yes=True))
+
+    assert rc == 0
+    assert mod._FORCE_SEEN == {"claude": False, "git": False, "vscode": False}, mod._FORCE_SEEN
+
+
+def test_cmd_install_force_proxy_overwrite_flag_forces(monkeypatch):
+    _stub_cmd_install_internals(monkeypatch, apply_ok=True, tty=False)
+    mod = sys.modules[__name__]
+    mod._FORCE_SEEN.clear()
+
+    rc = srouter.cmd_install(_args(yes=True, force_proxy_overwrite=True))
+
+    assert rc == 0
+    assert mod._FORCE_SEEN == {"claude": True, "git": True, "vscode": True}, mod._FORCE_SEEN
