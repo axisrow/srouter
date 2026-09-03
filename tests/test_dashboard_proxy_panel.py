@@ -151,3 +151,96 @@ def test_absent_state_keeps_plain_no_label():
                     "state": "absent", "runtime": "n/a",
                     "proxy": "", "detail": "", "manageable": True})
     assert "proxy_foreign" not in html
+
+
+# ==================== issue #307 (review PR #328): выбор action с учётом state ====================
+
+_TOGGLE_STUBS = r"""
+var LANG = 'ru';
+var _KEYS = {
+  proxy_yes: 'да', proxy_no: 'нет', proxy_unknown: '?',
+  proxy_works: 'работает', proxy_broken: 'не идёт', proxy_na: '—',
+  proxy_state_unknown: 'неизвестно', proxy_mixed: 'частично',
+  proxy_foreign: 'чужое значение', proxy_mixed_state: 'разные значения',
+  proxy_force_confirm: 'ЧУЖОЕ: {0}',
+  proxy_on: 'Включить', proxy_off: 'Выключить',
+  proxy_applied: 'включён', proxy_cleared: 'выключен', proxy_failed: 'ошибка: {0}',
+  proxy_consumer_not_found: 'устарело'
+};
+var I18N = { ru: _KEYS, en: _KEYS };
+function esc(v){ return String(v==null?'':v)
+  .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+var CALLS = { posts: [], confirms: [], toasts: [] };
+var PROXY_DATA = { consumers: [] };
+function tryBeginMutation(){ return true; }
+function finishMutation(){}
+function toast(msg, kind){ CALLS.toasts.push([String(msg), kind]); }
+function loadProxyPanel(){ return Promise.resolve(); }
+window = { confirm: function (msg) { CALLS.confirms.push(String(msg)); return CONFIRM_ANSWER; } };
+var CONFIRM_ANSWER = true;
+var btn = {
+  innerHTML: 'btn', disabled: false,
+  getAttribute: function (name) { return name === 'data-consumer' ? CONSUMER_ID : null; }
+};
+var CONSUMER_ID = 'vscode';
+function fetch(url, opts) {
+  CALLS.posts.push({ url: String(url), body: JSON.parse(opts.body) });
+  var status = (CALLS.posts.length === 1 && FIRST_CONFLICT) ? 409 : 200;
+  var res = (CALLS.posts.length === 1 && FIRST_CONFLICT)
+    ? { ok: false, results: [{ id: CONSUMER_ID, ok: false, conflict: true, state: 'mixed', err: 'x' }] }
+    : { ok: true, results: [] };
+  return Promise.resolve({ json: function () { return Promise.resolve(res); } });
+}
+var FIRST_CONFLICT = true;
+"""
+
+
+def _toggle(state, configured):
+    """Прогнать toggleProxyConsumer через node: вернуть {posts, confirms}."""
+    funcs = extract_functions(HTML, ["t", "toggleProxyConsumer"])
+    PROXY_DATA = {"consumers": [{"id": "vscode", "configured": configured, "state": state,
+                                 "proxy": "http://corp-proxy:3128", "manageable": True}]}
+    body = ("PROXY_DATA.consumers = %s;\n"
+            "toggleProxyConsumer(btn);\n"
+            "setTimeout(function(){ console.log(JSON.stringify({posts: CALLS.posts, "
+            "confirms: CALLS.confirms})); }, 10);" % json.dumps(PROXY_DATA["consumers"]))
+    return _run_node(_TOGGLE_STUBS + "\n" + funcs + "\n" + body)
+
+
+def test_mixed_row_with_configured_true_goes_enable_force_path():
+    """Regression (review PR #328): mixed + configured=true (Code managed, Cursor foreign) —
+    кнопка ОБЯЗАНА вести на enable (с force-confirm), а не disable: иначе confirm
+    недостижим и чужое значение молча остаётся/не подтверждается."""
+    out = _toggle("mixed", True)
+    assert out["posts"][0]["url"] == "/api/proxy/enable", out
+    assert out["confirms"], "перед force обязан быть confirm с чужим значением"
+    assert "corp-proxy:3128" in out["confirms"][0]
+    assert out["posts"][-1]["body"] == {"ids": ["vscode"], "force": True}, out
+
+
+def test_foreign_row_with_configured_true_goes_enable_force_path():
+    out = _toggle("foreign", True)
+    assert out["posts"][0]["url"] == "/api/proxy/enable", out
+    assert out["posts"][-1]["body"] == {"ids": ["vscode"], "force": True}, out
+
+
+def test_managed_on_row_goes_disable_without_confirm():
+    out = _toggle("managed-on", True)
+    assert out["posts"][0]["url"] == "/api/proxy/disable", out
+    assert out["posts"][0]["body"] == {"ids": ["vscode"]}, out
+    assert out["confirms"] == [], "disable нашего значения — без confirm"
+
+
+def test_confirmed_refusal_never_sends_force():
+    """Отказ в confirm — force НЕ отправляется (осознанность действия)."""
+    funcs = extract_functions(HTML, ["t", "toggleProxyConsumer"])
+    consumers = [{"id": "vscode", "configured": True, "state": "mixed",
+                  "proxy": "http://corp:1", "manageable": True}]
+    stubs = _TOGGLE_STUBS.replace("var CONFIRM_ANSWER = true;", "var CONFIRM_ANSWER = false;")
+    body = ("PROXY_DATA.consumers = %s;\n"
+            "toggleProxyConsumer(btn);\n"
+            "setTimeout(function(){ console.log(JSON.stringify({posts: CALLS.posts, "
+            "confirms: CALLS.confirms})); }, 10);" % json.dumps(consumers))
+    out = _run_node(stubs + "\n" + funcs + "\n" + body)
+    assert out["confirms"], "confirm показан"
+    assert len(out["posts"]) == 1, "после отказа force не отправляется"

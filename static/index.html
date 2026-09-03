@@ -1533,7 +1533,10 @@
 
       var btn = '';
       if (c.manageable) {
-        var on = c.configured === true;
+        // issue #307 (review PR #328): foreign/mixed — это путь «включить с подтверждением»,
+        // даже если configured=true (напр. Code managed + Cursor foreign): кнопка «Выключить»
+        // сделала бы conflict-диалог недостижимым, чужое значение осталось бы нетронутым.
+        var on = c.configured === true && c.state !== 'foreign' && c.state !== 'mixed';
         btn = '<button type="button" class="btn btn-sm ' +
               (on ? 'btn-outline-danger' : 'btn-outline-primary') +
               ' act proxy-toggle" data-consumer="' + esc(c.id) + '">' +
@@ -1633,7 +1636,11 @@
         loadProxyPanel(false);
         return;
       }
-      var action = row.configured === true ? 'disable' : 'enable';
+      // issue #307 (review PR #328): действие выбирается с учётом state, не только configured:
+      // foreign/mixed — путь «enable с force-confirm» (иначе при configured=true/mixed ушла бы
+      // disable, чужое значение осталось бы, confirm был бы недостижим).
+      var action = (row.configured === true && row.state !== 'foreign' && row.state !== 'mixed')
+        ? 'disable' : 'enable';
       var orig = btn.innerHTML;
       btn.disabled = true;
       btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span>';
