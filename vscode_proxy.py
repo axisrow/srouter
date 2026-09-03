@@ -21,11 +21,20 @@ codex-процессА (`{...process.env, ...n}`), а не системно. Р�
 JSON read-modify-write (не строками), сохраняя все существующие настройки редактора. Atomic-запись
 через tmp+replace. Не бросает (probe-канон). Provenance через ЗНАЧЕНИЕ-совпадение: disable убирает
 ключ только если val == PROXY (чужой корпоративный/ручной http.proxy не трогаем — fail-closed #112).
+
+Issue #307 (foreign/mixed/force, канон privileged-boundary-fail-closed): чужое значение http.proxy
+— ОТДЕЛЬНОЕ состояние foreign в status() (не «не настроено»); mixed — у разных редакторов разные
+значения (напр. наш в Code, чужой в Cursor). enable() на foreign/mixed отказывает ЯВНО (conflict)
+без мутации; перезапись — только force=True, при этом чужое значение уходит в sidecar-backup
+(прецедент #112), disable() после force восстанавливает его. Классификация состояний — общий
+слой proxy_config_contract (канон third-module-breaks-reexport-cycle).
 """
 import json
 import os
 from pathlib import Path
 from urllib.parse import urlparse
+
+import proxy_config_contract as _contract
 
 # Прокси codex = SOCKS5 xray 10808. Единый источник правды (issue #155) — dashboard_common.
 # except SystemExit (НЕ BaseException): dashboard_common при отсутствии srouter_config.py поднимает
@@ -79,6 +88,21 @@ def _load(path):
         return None
 
 
+def _read_settings(path):
+    """(data, kind): kind ∈ 'missing' | 'ok' | 'invalid'; data None для missing/invalid.
+
+    Issue #307 round 2 (Codex cycle-review PR #328 finding 3): раньше missing и invalid
+    схлопывались в один None — битый/не-object файл классифицировался как «редактор не
+    установлен» и молча заменялся нашим конфигом. Теперь caller видит разницу.
+    """
+    if not path.exists():
+        return None, "missing"
+    try:
+        return json.loads(path.read_text(encoding="utf-8")), "ok"
+    except (OSError, json.JSONDecodeError, ValueError, TypeError):
+        return None, "invalid"
+
+
 def _save(path, data):
     """Atomic-запись settings.json. tmp+replace — не теряем данные при сбое. {ok, err}.
 
@@ -98,47 +122,120 @@ def _save(path, data):
 
 
 def status():
-    """Состояние scoped-прокси: {enabled, proxy, paths}. Не бросает.
+    """Состояние scoped-прокси: {enabled, proxy, state, paths}. Не бросает.
 
-    enabled=True если ХОТЯ БЫ ОДИН существующий settings.json содержит KEY == PROXY. proxy — значение
-    из первого найденного. paths — {str(path): {present, proxy}} для диагностики (health/doctor).
-    Сырой state, НЕ probe — runtime-вердикт делает health._vscode_proxy_check().
+    state (issue #307) — absent/managed-on/foreign/mixed: чужое значение http.proxy — НЕ
+    «не настроено», а foreign; разные значения в разных settings.json — mixed. enabled=True
+    если ХОТЯ БЫ ОДИН существующий settings.json содержит KEY == PROXY. proxy — значение
+    из первого найденного. paths — {str(path): {present, proxy, state}} для диагностики
+    (health/doctor). Сырой state, НЕ probe — runtime-вердикт делает health._vscode_proxy_check().
     """
     found_any = False
     per_path = {}
     proxy = ""
+    states = []
     for path in SETTINGS_PATHS:
-        data = _load(path)
-        if data is None:
-            per_path[str(path)] = {"present": False, "proxy": ""}
+        data, kind = _read_settings(path)
+        if kind != "ok" or not isinstance(data, dict):
+            # missing = редактор не установлен (ABSENT, не участник конфликта);
+            # invalid / не-object = нечитаемый чужой документ — ЧЕСТНЫЙ unknown (finding 3).
+            st = _contract.ABSENT if kind == "missing" else _contract.UNKNOWN
+            per_path[str(path)] = {"present": kind == "ok", "proxy": "", "state": st}
+            states.append(st)
             continue
-        val = data.get(KEY, "") if isinstance(data, dict) else ""
-        per_path[str(path)] = {"present": True, "proxy": val}
+        val = data.get(KEY, "")
+        st = _contract.classify(KEY in data, val, PROXY)
+        per_path[str(path)] = {"present": True, "proxy": val, "state": st}
+        states.append(st)
         if val:
             found_any = True
             if not proxy:
                 proxy = val
-    return {"enabled": found_any and proxy == PROXY, "proxy": proxy, "paths": per_path}
+    return {"enabled": found_any and proxy == PROXY, "proxy": proxy,
+            "state": _contract.aggregate(states), "paths": per_path}
 
 
-def enable():
-    """Прописать KEY = SOCKS5 в каждый СУЩЕСТВУЮЩИЙ settings.json редактора. {ok, err, paths}.
+def _backup_path(path):
+    """Sidecar-backup чужого http.proxy, перезаписанного force-enable (прецедент #112).
+    Живёт рядом с settings.json редактора; disable() восстанавливает из него и удаляет."""
+    return path.parent / (path.name + ".srouter-proxy-backup.json")
+
+
+def _read_backup(path):
+    """Прочитать sidecar-backup редактора. None если нет/битый. Не бросает."""
+    try:
+        p = _backup_path(path)
+        return json.loads(p.read_text(encoding="utf-8")) if p.exists() else None
+    except (OSError, json.JSONDecodeError, ValueError, TypeError):
+        return None
+
+
+def enable(force=False):
+    """Прописать KEY = SOCKS5 в каждый СУЩЕСТВУЮЩИЙ settings.json редактора. {ok, err, paths, state?}.
 
     Несуществующий файл НЕ создаём (VSCode сам создаст при первом запуске — не плодим мусор).
     Не трогает другие настройки (read-modify-write). Контракт: PROXY обязан быть socks5-схемы
     (#120 — privoxy/HTTP рвёт WS; #127-класс регрессии).
+
+    Issue #307: если в любом редакторе чужое значение http.proxy (или mixed) — отказ без
+    мутации {ok: False, conflict: True, state}; перезапись только force=True, при этом
+    чужое значение уходит в sidecar-backup (disable() потом его восстановит).
+
+    Issue #307 round 2 (Codex cycle-review PR #328): битый/не-object settings.json — честный
+    отказ БЕЗ замены файла (finding 3); состояние каждого файла перечитывается непосредственно
+    перед записью — foreign, появившийся между gate и save, не затирается (finding 4).
     """
     scheme = urlparse(PROXY).scheme.lower()
     if scheme not in {"socks", "socks5", "socks5h"}:
         return {"ok": False, "err": f"unsupported proxy scheme for codex (need socks5): {scheme or 'missing'}",
                 "paths": []}
+    gate = {}  # path -> (kind, dict|None) — снапшот, на котором принимается решение
+    states = []
+    for path in SETTINGS_PATHS:
+        data, kind = _read_settings(path)
+        if kind == "invalid" or (kind == "ok" and not isinstance(data, dict)):
+            return {"ok": False, "state": _contract.UNKNOWN,
+                    "err": f"{path}: settings.json нечитаем/битый/не JSON-object — "
+                           "перезапись чужого файла запрещена (issue #307)",
+                    "paths": []}
+        if kind == "missing":
+            continue  # редактор не установлен — ABSENT не участник конфликта
+        gate[path] = (data, _contract.classify(KEY in data, data.get(KEY, ""), PROXY))
+        states.append(gate[path][1])
+    state = _contract.aggregate(states)
+    if _contract.needs_force(state) and not force:
+        r = _contract.conflict_result(state)
+        r["paths"] = []
+        return r
     changed = []
     for path in SETTINGS_PATHS:
-        data = _load(path)
-        if data is None:
+        data, kind = _read_settings(path)
+        if kind == "missing":
             continue  # редактор не установлен — не создаём
-        if not isinstance(data, dict):
-            data = {}
+        if kind == "invalid" or not isinstance(data, dict):
+            return {"ok": False, "err": f"{path}: settings.json стал нечитаем во время операции",
+                    "paths": changed}
+        # TOCTOU re-check (finding 4): если KEY на диске изменился с момента gate-решения —
+        # решение устарело, отказываем. Presence отдельно от значения (AO review round 3):
+        # absent и JSON-null — разные состояния, иначе конкурентная вставка http.proxy: null
+        # после gate сравнялась бы с absent и была бы затёрта.
+        gate_data, _ = gate.get(path, (None, None))
+        gate_snap = (KEY in gate_data, gate_data.get(KEY)) if isinstance(gate_data, dict) else (False, None)
+        if (KEY in data, data.get(KEY)) != gate_snap:
+            return {"ok": False, "conflict": True, "state": state,
+                    "err": f"{path}: settings.json изменился во время операции — повторите",
+                    "paths": changed}
+        if force and KEY in data and data[KEY] != PROXY:
+            # Provenance: чужое значение, которое сейчас затрём, — в sidecar-backup.
+            backup = {"http.proxy": data[KEY]}
+            try:
+                bp = _backup_path(path)
+                tmp = bp.with_suffix(".json.tmp")
+                tmp.write_text(json.dumps(backup, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+                tmp.replace(bp)
+            except (OSError, TypeError, ValueError) as exc:
+                return {"ok": False, "err": f"backup foreign value failed: {str(exc)[:150]}",
+                        "paths": changed}
         data[KEY] = PROXY
         r = _save(path, data)
         if not r["ok"]:
@@ -151,14 +248,30 @@ def disable():
     """Убрать KEY из settings.json, ТОЛЬКО если val == PROXY (чужой не трогаем). {ok, err}. Идемпотентно.
 
     fail-closed provenance (#112): корпоративный/ручной http.proxy ≠ PROXY → оставляем на месте.
+    Issue #307: если force-enable раньше перезаписал чужое значение — восстанавливаем его из
+    sidecar-backup (вместо простого удаления нашего ключа) и backup потребляем.
+    Issue #307 round 2 (Codex finding 2): backup удаляется ТОЛЬКО после подтверждённой записи —
+    при упавшей _save() он остаётся единственной копией чужого значения.
     """
     for path in SETTINGS_PATHS:
         data = _load(path)
         if not isinstance(data, dict):
-            continue
+            continue  # missing/invalid — не наше, не трогаем (no mutation, ok)
         if data.get(KEY) == PROXY:
-            del data[KEY]
+            backup = _read_backup(path)
+            backup_consumed = False
+            if isinstance(backup, dict) and backup.get(KEY) != PROXY:
+                data[KEY] = backup[KEY]  # восстановить ЧУЖОЕ значение, не оставить дырку
+                backup_consumed = True
+            else:
+                del data[KEY]
             r = _save(path, data)
             if not r["ok"]:
                 return r
+            if backup_consumed:
+                try:
+                    _backup_path(path).unlink()
+                except OSError as exc:
+                    # Данные уже восстановлены в settings.json; честно репортим cleanup.
+                    return {"ok": True, "err": f"backup cleanup failed: {str(exc)[:120]}"}
     return {"ok": True}

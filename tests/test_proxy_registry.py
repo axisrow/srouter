@@ -184,3 +184,50 @@ def test_broken_status_fn_forces_unknown_runtime_even_if_health_fn_succeeds(monk
         f"status_fn упал -> мы не знаем, настроен ли потребитель, значит runtime тоже "
         f"честный unknown, а не значение здоровой (но независимой) health-пробы: {git}"
     )
+
+
+# ==================== issue #307: state passthrough + force ====================
+
+def test_row_passes_foreign_state_through_to_panel(monkeypatch):
+    """ДЫРА #307: foreign обязан дойти до панели как отдельное состояние — иначе клик
+    «Включить» выглядит безопасным, хотя уничтожит чужую настройку."""
+    monkeypatch.setattr(proxy_registry.git_proxy, "status",
+                        lambda: {"enabled": False, "proxy": "https://corp:8443", "state": "foreign"})
+    git = _spec(proxy_registry.overview(probe=False), "git")
+    assert git["state"] == "foreign"
+
+
+def test_apply_enable_forwards_force_to_consumer(monkeypatch):
+    """force — явный параметр API-контракта: реестр обязан донести его до enable_fn."""
+    seen = {}
+
+    def _fake_enable(force=False):
+        seen["force"] = force
+        return {"ok": True}
+
+    monkeypatch.setattr(proxy_registry.git_proxy, "enable", _fake_enable)
+    r = proxy_registry.apply(["git"], action="enable", force=True)
+    assert r["ok"] is True
+    assert seen["force"] is True
+
+
+def test_apply_enable_default_force_false(monkeypatch):
+    seen = {}
+
+    def _fake_enable(force=False):
+        seen["force"] = force
+        return {"ok": True}
+
+    monkeypatch.setattr(proxy_registry.git_proxy, "enable", _fake_enable)
+    proxy_registry.apply(["git"], action="enable")
+    assert seen["force"] is False
+
+
+def test_apply_passes_conflict_flag_through(monkeypatch):
+    """conflict — не рядовая ошибка: панель отличает её для confirm-диалога force."""
+    monkeypatch.setattr(proxy_registry.git_proxy, "enable",
+                        lambda force=False: {"ok": False, "conflict": True, "state": "foreign",
+                                             "err": "foreign value"})
+    r = proxy_registry.apply(["git"], action="enable")
+    assert r["ok"] is False
+    assert r["results"][0]["conflict"] is True

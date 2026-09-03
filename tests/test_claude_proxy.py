@@ -60,11 +60,11 @@ def test_enable_rejects_socks_without_mutating_settings(monkeypatch, tmp_path):
 
 def test_enable_overwrites_stale_socks5_from_previous_experiments(monkeypatch, tmp_path):
     """Regression issue #130: settings.json с мусором от экспериментов (SOCKS5 fiasco #127) —
-    HTTPS_PROXY=socks5h://... — enable() ДОЛЖЕН перезаписать на HTTP, не оставлять смесь рядом.
+    HTTPS_PROXY=socks5h://... — install-путь (force=True) ДОЛЖЕН уметь перезаписать на HTTP.
 
-    Сценарий из issue: после экспериментов ~/.claude/settings.json может содержать
-    HTTPS_PROXY=socks5h://127.0.0.1:10808 (SOCKS5, официально не поддерживается Claude Code —
-    UnsupportedProxyProtocol). install должен привести к чистому HTTP-состоянию автоматически.
+    Issue #307: без force такой ключ теперь ЧУЖОЕ значение (state=foreign, enable отказывает);
+    перезапись — осознанный force с backup. Модуль не отличает «наш старый мусор» от
+    корпоративной настройки — решение принимает вызывающий (CLI install зовёт с force).
     """
     settings = _setup(monkeypatch, tmp_path)
     settings.write_text(json.dumps({"env": {
@@ -73,11 +73,15 @@ def test_enable_overwrites_stale_socks5_from_previous_experiments(monkeypatch, t
         "KEEP": "yes",
     }}))
 
-    r = claude_proxy.enable()
+    r = claude_proxy.enable(force=True)
 
     assert r["ok"] is True
     data = json.loads(settings.read_text())
     assert data["env"]["HTTPS_PROXY"] == EXPECTED_CLAUDE_PROXY, "SOCKS5-мусор перезаписан на HTTP"
+    assert data["env"]["KEEP"] == "yes"
+    # Provenance #307: чужое значение забэкаплено, не потеряно.
+    backup = json.loads(claude_proxy._backup_path().read_text())
+    assert backup["env"]["HTTPS_PROXY"] == "socks5h://127.0.0.1:10808"
     assert data["env"]["HTTP_PROXY"] == EXPECTED_CLAUDE_PROXY, "SOCKS5-мусор перезаписан на HTTP"
     assert data["env"]["KEEP"] == "yes"
     s = claude_proxy.status()
@@ -129,13 +133,14 @@ def test_round_trip_enable_disable_status(monkeypatch, tmp_path):
 
 
 def test_enable_handles_broken_json(monkeypatch, tmp_path):
-    """settings.json битый → enable создаёт свежий env (fail-soft)."""
+    """settings.json битый → enable НЕ падает и НЕ затирает файл (issue #307 round 2,
+    Codex finding 3: раньше битый JSON схлопывался в {} и перезаписывался целиком —
+    молчаливая потеря всего чужого settings.json)."""
     settings = _setup(monkeypatch, tmp_path)
     settings.write_text("{ not valid json")
     r = claude_proxy.enable()
-    assert r["ok"] is True  # не падает на битом файле
-    data = json.loads(settings.read_text())  # результат — валидный JSON
-    assert data["env"]["HTTPS_PROXY"] == EXPECTED_CLAUDE_PROXY
+    assert r["ok"] is False  # честный отказ, не «создаём свежий env» поверх чужого файла
+    assert claude_proxy.status()["state"] == "unknown"
 
 
 # ============================ NO_PROXY для z.ai (glm идёт напрямую, мимо privoxy) ============================
@@ -241,3 +246,235 @@ def test_enable_merges_divergent_no_proxy_variants(monkeypatch, tmp_path):
         assert "a.com" in np, f"{k}: a.com (из NO_PROXY) сохранён"
         assert "b.com" in np, f"{k}: b.com (из no_proxy) сохранён"
         assert "api.z.ai" in np, f"{k}: provider-хост добавлен"
+
+
+# ==================== issue #307: foreign state + force-gate + provenance ====================
+
+def test_status_reports_foreign_state_not_configured_false(monkeypatch, tmp_path):
+    """ДЫРА #307 (ложный configured=false): чужое HTTPS_PROXY рапортуется как отдельное
+    состояние foreign, а не неотличимо от «не настроено»."""
+    settings = _setup(monkeypatch, tmp_path)
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text(json.dumps({"env": {"HTTPS_PROXY": "http://corp-proxy:3128"}}))
+    s = claude_proxy.status()
+    assert s["state"] == "foreign"
+    assert s["enabled"] is False
+    assert s["proxy"] == "http://corp-proxy:3128"
+
+
+def test_status_states_absent_and_managed_on(monkeypatch, tmp_path):
+    _setup(monkeypatch, tmp_path)
+    assert claude_proxy.status()["state"] == "absent"
+    claude_proxy.enable()
+    assert claude_proxy.status()["state"] == "managed-on"
+
+
+def test_enable_on_foreign_fails_closed_without_mutation(monkeypatch, tmp_path):
+    """ДЫРА #307 (перезапись чужого): enable() на чужое значение обязан отказать ЯВНО
+    (conflict) и НЕ трогать settings.json (канон privileged-boundary-fail-closed)."""
+    settings = _setup(monkeypatch, tmp_path)
+    original = {"env": {"HTTPS_PROXY": "http://corp-proxy:3128", "KEEP": "x"}}
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text(json.dumps(original))
+
+    r = claude_proxy.enable()
+
+    assert r["ok"] is False
+    assert r["conflict"] is True
+    assert r["state"] == "foreign"
+    assert json.loads(settings.read_text()) == original, "чужое значение не тронуто"
+
+
+def test_enable_force_overwrites_and_backs_up_foreign_value(monkeypatch, tmp_path):
+    """force — осознанная перезапись: чужое значение сохраняется в sidecar-backup
+    (прецедент #112 provenance), не исчезает безвозвратно."""
+    settings = _setup(monkeypatch, tmp_path)
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text(json.dumps({"env": {"HTTPS_PROXY": "http://corp-proxy:3128"}}))
+
+    r = claude_proxy.enable(force=True)
+
+    assert r["ok"] is True
+    data = json.loads(settings.read_text())
+    assert data["env"]["HTTPS_PROXY"] == EXPECTED_CLAUDE_PROXY
+    backup = claude_proxy._backup_path()
+    assert backup.exists()
+    saved = json.loads(backup.read_text())
+    assert saved["env"]["HTTPS_PROXY"] == "http://corp-proxy:3128"
+
+
+def test_enable_without_force_is_idempotent_on_managed_on(monkeypatch, tmp_path):
+    """Повторный enable на своём значении — обычный ok, force не нужен."""
+    _setup(monkeypatch, tmp_path)
+    assert claude_proxy.enable()["ok"] is True
+    assert claude_proxy.enable()["ok"] is True
+    assert claude_proxy.enable(force=True)["ok"] is True
+
+
+def test_disable_on_foreign_value_does_not_delete_it(monkeypatch, tmp_path):
+    """ДЫРА #307 (удаление чужого при disable): сегодня disable() безусловно удаляет
+    env.HTTPS_PROXY/HTTP_PROXY даже когда там чужое значение."""
+    settings = _setup(monkeypatch, tmp_path)
+    original = {"env": {"HTTPS_PROXY": "http://corp-proxy:3128",
+                        "HTTP_PROXY": "http://corp-proxy:3128",
+                        "OTHER": "keep"}}
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text(json.dumps(original))
+
+    r = claude_proxy.disable()
+
+    assert r["ok"] is True
+    assert json.loads(settings.read_text()) == original, "чужой прокси-ключ не должен удаляться"
+
+
+def test_disable_after_force_restores_backed_up_foreign_value(monkeypatch, tmp_path):
+    """Provenance-цикл: force-enable перезаписал чужое -> disable() восстанавливает ЧУЖОЕ
+    значение из backup (а не просто удаляет наш ключ)."""
+    settings = _setup(monkeypatch, tmp_path)
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text(json.dumps({"env": {"HTTPS_PROXY": "http://corp-proxy:3128"}}))
+    assert claude_proxy.enable(force=True)["ok"] is True
+
+    assert claude_proxy.disable()["ok"] is True
+
+    data = json.loads(settings.read_text())
+    assert data["env"]["HTTPS_PROXY"] == "http://corp-proxy:3128"
+    assert not claude_proxy._backup_path().exists(), "backup потреблён, не висит сиротой"
+
+
+def test_disable_without_backup_removes_managed_key(monkeypatch, tmp_path):
+    """Обычный цикл (наше значение с нуля): disable удаляет ключ, как и раньше."""
+    settings = _setup(monkeypatch, tmp_path)
+    claude_proxy.enable()
+    assert claude_proxy.disable()["ok"] is True
+    data = json.loads(settings.read_text())
+    assert "HTTPS_PROXY" not in data["env"] and "HTTP_PROXY" not in data["env"]
+
+
+def test_disable_strips_no_proxy_only_when_managed(monkeypatch, tmp_path):
+    """NO_PROXY связан с НАШИМ прокси: при чужом HTTPS_PROXY его трогать нельзя."""
+    settings = _setup(monkeypatch, tmp_path)
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text(json.dumps({"env": {
+        "ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic",
+        "HTTPS_PROXY": "http://corp-proxy:3128",
+        "NO_PROXY": "api.z.ai,other.internal",
+    }}))
+
+    claude_proxy.disable()
+
+    env = json.loads(settings.read_text())["env"]
+    assert env["NO_PROXY"] == "api.z.ai,other.internal", "чужой NO_PROXY не тронут"
+
+
+# ============ issue #307 round 2 (Codex cycle-review PR #328): находки 1-3 ============
+
+def test_disable_backup_survives_failed_save(monkeypatch, tmp_path):
+    """Codex finding 2: backup удаляется ТОЛЬКО после подтверждённой записи. Если _save()
+    падает при restore, единственная копия чужого значения обязана остаться в backup."""
+    settings = _setup(monkeypatch, tmp_path)
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text(json.dumps({"env": {"HTTPS_PROXY": "http://corp-proxy:3128"}}))
+    assert claude_proxy.enable(force=True)["ok"] is True
+
+    real_save = claude_proxy._save
+
+    def _failing_save(data):
+        return {"ok": False, "err": "simulated disk full"}
+
+    monkeypatch.setattr(claude_proxy, "_save", _failing_save)
+    r = claude_proxy.disable()
+    monkeypatch.setattr(claude_proxy, "_save", real_save)
+
+    assert r["ok"] is False
+    backup = claude_proxy._backup_path()
+    assert backup.exists(), "backup НЕ удалён при упавшей записи — единственная копия чужого значения"
+    assert json.loads(backup.read_text())["env"]["HTTPS_PROXY"] == "http://corp-proxy:3128"
+    # После "починки" disable доводит restore до конца.
+    assert claude_proxy.disable()["ok"] is True
+    assert json.loads(settings.read_text())["env"]["HTTPS_PROXY"] == "http://corp-proxy:3128"
+    assert not backup.exists()
+
+
+def test_status_and_enable_report_unknown_on_unreadable_settings(monkeypatch, tmp_path):
+    """Codex finding 3: malformed JSON — НЕ «не настроено» и НЕ повод затирать файл.
+    status -> state=unknown, enable/disable -> отказ без мутации (fail-closed)."""
+    settings = _setup(monkeypatch, tmp_path)
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    broken = "{ not valid json"
+    settings.write_text(broken)
+
+    s = claude_proxy.status()
+    assert s["state"] == "unknown", s
+    assert s["enabled"] is False
+
+    r = claude_proxy.enable(force=True)
+    assert r["ok"] is False
+    assert settings.read_text() == broken, "битый файл не перезаписан"
+
+    r = claude_proxy.disable()
+    assert r["ok"] is False
+    assert settings.read_text() == broken
+
+
+def test_enable_refuses_non_dict_json(monkeypatch, tmp_path):
+    """Валидный JSON не-object (список/строка) — чужой документ: не заменяем на наш dict."""
+    settings = _setup(monkeypatch, tmp_path)
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text('["some", "list"]')
+    r = claude_proxy.enable(force=True)
+    assert r["ok"] is False
+    assert json.loads(settings.read_text()) == ["some", "list"], "чужой документ не тронут"
+
+
+def test_enable_rechecks_disk_state_before_save(monkeypatch, tmp_path):
+    """Codex finding 4 (TOCTOU): state может измениться МЕЖДУ gate и записью. enable обязан
+    перечитать файл непосредственно перед _save и отказаться, если решение устарело."""
+    settings = _setup(monkeypatch, tmp_path)
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text("{}")
+
+    real_load = claude_proxy._load
+    calls = {"n": 0}
+
+    def _racing_load():
+        # 1-е чтение (gate): absent; последующие (pre-save re-check): уже чужое.
+        calls["n"] += 1
+        data = real_load()
+        if calls["n"] > 1:
+            return {"env": {"HTTPS_PROXY": "http://corp-proxy:3128"}}
+        return data
+
+    monkeypatch.setattr(claude_proxy, "_load", _racing_load)
+    r = claude_proxy.enable()
+    monkeypatch.setattr(claude_proxy, "_load", real_load)
+
+    assert r["ok"] is False, "устаревшее решение -> отказ, не тихая перезапись"
+    # _load замокан, запись не состоялась: файл на диске остался в исходном виде (наш
+    # managed-прокси НЕ записан поверх чужого значения из гонки).
+    assert json.loads(settings.read_text()) == {}, "запись не должна была состояться"
+
+
+def test_enable_recheck_distinguishes_absent_from_json_null(monkeypatch, tmp_path):
+    """AO review round 3: absent и JSON-null — РАЗНЫЕ состояния. Конкурентная вставка
+    HTTPS_PROXY: null после gate не должна сравняться с absent и быть затёрта."""
+    settings = _setup(monkeypatch, tmp_path)
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text("{}")
+
+    real_load = claude_proxy._load
+    calls = {"n": 0}
+
+    def _racing_load():
+        calls["n"] += 1
+        if calls["n"] > 1:
+            # Другой писатель вставил ключ со значением null ПОСЛЕ gate (absent -> present-null).
+            return {"env": {"HTTPS_PROXY": None}}
+        return real_load()
+
+    monkeypatch.setattr(claude_proxy, "_load", _racing_load)
+    r = claude_proxy.enable()
+    monkeypatch.setattr(claude_proxy, "_load", real_load)
+
+    assert r["ok"] is False, "absent -> present-null в гонке: решение устарело, отказ"
+    assert json.loads(settings.read_text()) == {}, "запись не должна была состояться"
