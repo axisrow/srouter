@@ -453,3 +453,28 @@ def test_enable_rechecks_disk_state_before_save(monkeypatch, tmp_path):
     # _load замокан, запись не состоялась: файл на диске остался в исходном виде (наш
     # managed-прокси НЕ записан поверх чужого значения из гонки).
     assert json.loads(settings.read_text()) == {}, "запись не должна была состояться"
+
+
+def test_enable_recheck_distinguishes_absent_from_json_null(monkeypatch, tmp_path):
+    """AO review round 3: absent и JSON-null — РАЗНЫЕ состояния. Конкурентная вставка
+    HTTPS_PROXY: null после gate не должна сравняться с absent и быть затёрта."""
+    settings = _setup(monkeypatch, tmp_path)
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text("{}")
+
+    real_load = claude_proxy._load
+    calls = {"n": 0}
+
+    def _racing_load():
+        calls["n"] += 1
+        if calls["n"] > 1:
+            # Другой писатель вставил ключ со значением null ПОСЛЕ gate (absent -> present-null).
+            return {"env": {"HTTPS_PROXY": None}}
+        return real_load()
+
+    monkeypatch.setattr(claude_proxy, "_load", _racing_load)
+    r = claude_proxy.enable()
+    monkeypatch.setattr(claude_proxy, "_load", real_load)
+
+    assert r["ok"] is False, "absent -> present-null в гонке: решение устарело, отказ"
+    assert json.loads(settings.read_text()) == {}, "запись не должна была состояться"

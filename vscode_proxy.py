@@ -216,9 +216,12 @@ def enable(force=False):
             return {"ok": False, "err": f"{path}: settings.json стал нечитаем во время операции",
                     "paths": changed}
         # TOCTOU re-check (finding 4): если KEY на диске изменился с момента gate-решения —
-        # решение устарело, отказываем.
+        # решение устарело, отказываем. Presence отдельно от значения (AO review round 3):
+        # absent и JSON-null — разные состояния, иначе конкурентная вставка http.proxy: null
+        # после gate сравнялась бы с absent и была бы затёрта.
         gate_data, _ = gate.get(path, (None, None))
-        if (data.get(KEY) if KEY in data else None) != (gate_data.get(KEY) if gate_data is not None and KEY in gate_data else None):
+        gate_snap = (KEY in gate_data, gate_data.get(KEY)) if isinstance(gate_data, dict) else (False, None)
+        if (KEY in data, data.get(KEY)) != gate_snap:
             return {"ok": False, "conflict": True, "state": state,
                     "err": f"{path}: settings.json изменился во время операции — повторите",
                     "paths": changed}

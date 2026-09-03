@@ -345,5 +345,30 @@ def test_enable_rechecks_disk_state_before_save(monkeypatch, tmp_path):
     monkeypatch.setattr(vscode_proxy, "_read_settings", real_read)
 
     assert r["ok"] is False, "устаревшее решение -> отказ"
-    # _load замокан, запись не состоялась: файл остался в исходном виде.
+    # _read_settings замокан, запись не состоялась: файл остался в исходном виде.
+    assert json.loads(paths[0].read_text(encoding="utf-8")) == {}, "запись не должна была состояться"
+
+
+def test_enable_recheck_distinguishes_absent_from_json_null(monkeypatch, tmp_path):
+    """AO review round 3: absent и JSON-null — РАЗНЫЕ состояния. Конкурентная вставка
+    http.proxy: null после gate не должна сравняться с absent и быть затёрта."""
+    paths = _setup(monkeypatch, tmp_path)
+    paths[0].parent.mkdir(parents=True)
+    paths[0].write_text("{}", encoding="utf-8")
+
+    real_read = vscode_proxy._read_settings
+    calls = {"n": 0}
+
+    def _racing_read(path):
+        calls["n"] += 1
+        if calls["n"] > 1:
+            # Другой писатель вставил KEY=null ПОСЛЕ gate (absent -> present-null).
+            return {"http.proxy": None}, "ok"
+        return real_read(path)
+
+    monkeypatch.setattr(vscode_proxy, "_read_settings", _racing_read)
+    r = vscode_proxy.enable()
+    monkeypatch.setattr(vscode_proxy, "_read_settings", real_read)
+
+    assert r["ok"] is False, "absent -> present-null в гонке: решение устарело, отказ"
     assert json.loads(paths[0].read_text(encoding="utf-8")) == {}, "запись не должна была состояться"

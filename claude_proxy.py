@@ -197,7 +197,10 @@ def enable(force=False):
                 return {"ok": False, "err": f"backup foreign value failed: {str(exc)[:150]}"}
 
     # TOCTOU re-check (finding 4): снапшот proxy-ключей, на котором принято решение.
-    decision_snapshot = {k: env.get(k) for k in ENV_KEYS}
+    # Presence отдельно от значения (AO review round 3): absent и JSON-null — РАЗНЫЕ
+    # состояния (classify считает present-любое-значение foreign); иначе конкурентная
+    # вставка HTTPS_PROXY: null после gate сравнялась бы с absent и была бы затёрта.
+    decision_snapshot = {k: (k in env, env.get(k)) for k in ENV_KEYS}
 
     for k in ENV_KEYS:
         env[k] = _PROXY
@@ -216,7 +219,7 @@ def enable(force=False):
     if not isinstance(fresh, dict):
         return {"ok": False, "err": "settings.json стал нечитаем во время операции — отказ (issue #307)"}
     fresh_env = fresh.get("env") if isinstance(fresh.get("env"), dict) else {}
-    if {k: fresh_env.get(k) for k in ENV_KEYS} != decision_snapshot:
+    if {k: (k in fresh_env, fresh_env.get(k)) for k in ENV_KEYS} != decision_snapshot:
         return {"ok": False, "conflict": True, "state": state,
                 "err": "settings.json изменился во время операции — повторите (issue #307)"}
     return _save(data)
