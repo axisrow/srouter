@@ -22,7 +22,8 @@ _log = logging.getLogger("srouter.health")
 __all__ = [
     "_is_codex_app_comm", "_codex_app_process_kind", "_is_codex_binary_comm", "_codex_proxy_probe",
     "_codex_wrapper_path", "_which_all", "_binary_version", "_is_srouter_codex_wrapper",
-    "_codex_provenance", "_claude_provenance", "_scan_codex_binaries", "_scan_claude_code_binaries",
+    "_codex_provenance", "_claude_provenance", "_cask_codex_installed",
+    "_scan_codex_binaries", "_scan_claude_code_binaries",
     "_format_versions_detail", "_privoxy_log_observability_check", "_installed_versions_check",
     "_codex_isolation_check",
 ]
@@ -281,6 +282,16 @@ def _claude_provenance(path):
     return "cli"
 
 
+def _cask_codex_installed(brew_cask_out):
+    """Имя каска 'codex' есть в выводе `brew list --cask` — ТОЧНОЕ совпадение строки-токена.
+    Формат вывода (Homebrew 6.0.20, замер 2026-09-04): по одному каску в строке, без пробелов
+    внутри строки → split() = список целых имён. Вхождение подстроки 'codex' ложно матчит
+    соседние каски (codexbar — реальный кейс этой машины; codex-cli) — канон
+    loose-validator-recurring-leak / marker-whole-line-invariant.
+    """
+    return "codex" in (brew_cask_out or "").split()
+
+
 def _scan_codex_binaries():
     """Найти ВСЕ codex-binary на диске. Источники: which -a, homebrew-paths, ~/bin wrapper,
     npm global root (@openai/codex/bin/codex.js), brew-cask. Дедуп по нормализованному пути.
@@ -309,12 +320,22 @@ def _scan_codex_binaries():
             npm_codex = str(Path(npm_root) / "@openai" / "codex" / "bin" / "codex.js")
             if Path(npm_codex).is_file():
                 candidates.append(npm_codex)
-    # 5. brew-cask codex (отдельный binary, не npm).
+    # 5. brew-cask codex (отдельный binary, не npm). Артефакт каска — bin/codex (Binary):
+    # исполняемый файл живёт в Caskroom/codex/<версия>/bin/codex, brew линкует его в
+    # /opt/homebrew/bin/codex (шаг 2). Линк может отсутствовать (unlink/ручная чистка) —
+    # тогда шаг 5 единственный, кто находит binary. Issue #310: искали КАТАЛОГ Caskroom/codex
+    # (is_dir), а финальный фильтр пропускает только файлы — ветка была тождественно пустой.
     brew_r = sys_probe.run(["/opt/homebrew/bin/brew", "list", "--cask"], timeout=5)
-    if not brew_r.get("timeout") and "codex" in (brew_r.get("out") or ""):
-        for cand in ("/opt/homebrew/Caskroom/codex",):
-            if Path(cand).is_dir():
-                candidates.append(cand)
+    if not brew_r.get("timeout") and _cask_codex_installed(brew_r.get("out")):
+        cask_dir = Path("/opt/homebrew/Caskroom/codex")
+        if cask_dir.is_dir():
+            try:
+                for ver_dir in sorted(cask_dir.iterdir()):
+                    exe = ver_dir / "bin" / "codex"
+                    if exe.is_file():
+                        candidates.append(str(exe))
+            except OSError:
+                pass
 
     # Дедуп по нормализованному пути (один файл через два имени — один).
     seen = set()
