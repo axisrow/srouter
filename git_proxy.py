@@ -59,6 +59,8 @@ from pathlib import Path
 
 import sys_probe
 
+import proxy_config_contract as _contract
+
 GIT = "/usr/bin/git"
 KEY = "http.https://github.com.proxy"
 # Backup списка исходных чужих значений (created/overwrote-канон install_lib.py, но БЕЗ отдельного
@@ -299,12 +301,17 @@ def _write_values(key, values, timeout=5, begin_txn=True):
 
 
 def status():
-    """{enabled, present, proxy, values, multi, key}. НЕ бросает.
+    """{enabled, present, proxy, values, multi, key, state}. НЕ бросает.
 
     present — ключ реально существует в gitconfig (независимо от значения — пустая строка тоже
     present=True). proxy — ПЕРВОЕ значение списка (single-value путь и UI). values — полный список
     (multi-value-aware). enabled — present И единственное значение == наш managed _PROXY (multi-value
     или чужое значение → enabled=False, fail-closed).
+
+    state (issue #307) — absent/managed-on/foreign/unknown: чужое значение (включая multi-value)
+    — ОТДЕЛЬНОЕ состояние foreign, а не «не настроено»; иначе клик «Включить» на панели выглядит
+    безопасным, а уничтожил бы чужую настройку. Managed-off у git не существует отдельно от
+    absent: disable() снимает/восстанавливает ключ целиком, маркеров в чужом конфиге не оставляем.
 
     Contract change (/review PR #223): раньше (`git config --get` без `--all`) поле `proxy` было
     ПОСЛЕДНИМ значением multi-valued ключа (git's `--get` semantics). Теперь, после перехода на
@@ -316,11 +323,18 @@ def status():
     r = _get_all(KEY)
     if r["unknown"]:
         return {"enabled": False, "present": False, "proxy": "", "values": [], "multi": False,
-                "key": KEY, "status": "unknown"}
+                "key": KEY, "state": "unknown", "status": "unknown"}
     proxy = r["values"][0] if r["values"] else ""
     enabled = r["present"] and not r["multi"] and proxy == _PROXY
+    # multi-value при present — foreign независимо от первого значения (наш путь single-value).
+    if r["present"] and (r["multi"] or proxy != _PROXY):
+        state = _contract.FOREIGN
+    elif r["present"]:
+        state = _contract.MANAGED_ON
+    else:
+        state = _contract.ABSENT
     return {"enabled": enabled, "present": r["present"], "proxy": proxy, "values": r["values"],
-            "multi": r["multi"], "key": KEY}
+            "multi": r["multi"], "key": KEY, "state": state}
 
 
 def _backup_state():
@@ -485,8 +499,8 @@ def _check_and_resolve_txn():
     return {"ok": True, "resolved": True}
 
 
-def enable():
-    """Прописать KEY = наш managed _PROXY (scoped github.com). {ok, proxy, err}.
+def enable(force=False):
+    """Прописать KEY = наш managed _PROXY (scoped github.com). {ok, proxy, err, conflict?, state?}.
 
     Если текущее значение(-я) чужие (present и не равны ровно [_PROXY]) — бэкапим ПОЛНЫЙ список
     ПЕРЕД перезаписью, чтобы disable() мог восстановить исходное состояние целиком (multi-value
@@ -494,6 +508,11 @@ def enable():
     текущий foreign-список отличается от уже сохранённого backup, backup переписывается (иначе
     A→install→manual B→uninstall→install→uninstall терял бы B, восстанавливая устаревший A).
     Идемпотентно: если текущее значение уже == наш _PROXY (повторный install), backup не трогаем.
+
+    Issue #307 (force-gate, канон privileged-boundary-fail-closed): на ЧУЖОЕ значение enable
+    БЕЗ force отказывает ЯВНО ({ok: False, conflict: True, state}) БЕЗ мутации и без создания
+    backup. Перезапись чужого — только force=True (осознанное действие; backup при этом
+    создаётся как раньше — provenance #112). absent/managed-on — идемпотентный ok без force.
 
     Issue #224: в начале проверяем и доводим до конец любую незавершённую транзакцию.
 
@@ -506,10 +525,10 @@ def enable():
     with _mutation_lock() as lock_acquired:
         if not lock_acquired:
             return {"ok": False, "err": "cross-process lock unavailable — refusing unsynchronized mutation"}
-        return _enable_locked()
+        return _enable_locked(force=force)
 
 
-def _enable_locked():
+def _enable_locked(force=False):
     """Тело enable() — вызывается ТОЛЬКО под _mutation_lock() (issue #234 finding 2)."""
     # Issue #224: итеративно проверяем и доводим до конца незавершённые транзакции
     # (максимум 1 итерация: после resolved txn проверка снова даст resolved=False)
@@ -525,6 +544,9 @@ def _enable_locked():
         return {"ok": False, "err": "git config --get-all failed (non-absent rc)"}
 
     is_foreign = current["present"] and current["values"] != [_PROXY]
+    if is_foreign and not force:
+        # Issue #307: чужое значение — конфликт; отказ ДО любой мутации (включая backup-ключ).
+        return _contract.conflict_result(_contract.FOREIGN)
     if is_foreign:
         backup = _backup_state()
         if backup["unknown"]:

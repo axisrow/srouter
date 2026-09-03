@@ -124,7 +124,7 @@ def test_backup_updates_on_new_foreign_value_between_generations(real_git_home):
     """
     _raw_set(git_proxy.KEY, "https://corp-A.example:8443", real_git_home)
 
-    assert git_proxy.enable()["ok"] is True
+    assert git_proxy.enable(force=True)["ok"] is True
     assert git_proxy.status()["proxy"] == EXPECTED_GIT_PROXY
 
     # Пользователь вручную меняет прокси на B (между generations нашего managed-состояния).
@@ -134,7 +134,7 @@ def test_backup_updates_on_new_foreign_value_between_generations(real_git_home):
     assert git_proxy.status()["proxy"] == "https://corp-B.example:9443"
 
     # Второй install: B — текущее чужое значение, ДОЛЖНО стать новым backup (не A).
-    assert git_proxy.enable()["ok"] is True
+    assert git_proxy.enable(force=True)["ok"] is True
     assert git_proxy.status()["proxy"] == EXPECTED_GIT_PROXY
 
     assert git_proxy.disable()["ok"] is True
@@ -149,8 +149,8 @@ def test_backup_survives_repeated_idempotent_enable(real_git_home):
     нашим же managed-значением (идемпотентный install)."""
     _raw_set(git_proxy.KEY, "https://corp.example:8443", real_git_home)
 
-    assert git_proxy.enable()["ok"] is True
-    assert git_proxy.enable()["ok"] is True  # повторный install, идемпотентно
+    assert git_proxy.enable(force=True)["ok"] is True
+    assert git_proxy.enable()["ok"] is True  # повторный install, идемпотентно (managed-on, force не нужен)
 
     assert git_proxy.disable()["ok"] is True
     assert git_proxy.status()["proxy"] == "https://corp.example:8443"
@@ -211,7 +211,7 @@ def test_disable_removes_own_value_verified_when_key_was_multivalued_before_inst
     _raw_set_add(git_proxy.KEY, "https://corp1.example:8443", real_git_home)
     _raw_set_add(git_proxy.KEY, "https://corp2.example:9443", real_git_home)
 
-    assert git_proxy.enable()["ok"] is True
+    assert git_proxy.enable(force=True)["ok"] is True
     s = git_proxy.status()
     assert s["multi"] is False
     assert s["proxy"] == EXPECTED_GIT_PROXY
@@ -278,7 +278,7 @@ def test_full_lifecycle_preserves_leading_empty_foreign_value(real_git_home):
     _raw_set_add(git_proxy.KEY, "", real_git_home)
     _raw_set_add(git_proxy.KEY, "A", real_git_home)
 
-    assert git_proxy.enable()["ok"] is True
+    assert git_proxy.enable(force=True)["ok"] is True
     assert git_proxy.status()["proxy"] == EXPECTED_GIT_PROXY
 
     assert git_proxy.disable()["ok"] is True
@@ -303,3 +303,55 @@ def test_get_all_multiline_single_value_not_confused_with_multiple_values(real_g
 
 
 # ========== 5. Orphan backup-ключ при прерванном restore (Codex round 1, наблюдение C) ==========
+
+
+# ==================== issue #307: foreign state + force-gate ====================
+
+def test_status_reports_foreign_state(real_git_home):
+    """ДЫРА #307 (ложный configured=false): чужое значение — отдельное состояние foreign,
+    а не неотличимо от «не настроено» (absent)."""
+    _raw_set(git_proxy.KEY, "https://corp-proxy.example:8443", real_git_home)
+
+    s = git_proxy.status()
+
+    assert s["state"] == "foreign"
+    assert s["enabled"] is False
+
+
+def test_status_states_absent_and_managed_on(real_git_home):
+    assert git_proxy.status()["state"] == "absent"
+    assert git_proxy.enable()["ok"] is True
+    assert git_proxy.status()["state"] == "managed-on"
+
+
+def test_enable_on_foreign_fails_closed_without_mutation(real_git_home):
+    """ДЫРА #307 (перезапись чужого): enable() на чужое значение обязан отказать ЯВНО
+    (conflict) и НЕ трогать ~/.gitconfig без force."""
+    _raw_set(git_proxy.KEY, "https://corp-proxy.example:8443", real_git_home)
+
+    r = git_proxy.enable()
+
+    assert r["ok"] is False
+    assert r["conflict"] is True
+    assert r["state"] == "foreign"
+    s = git_proxy.status()
+    assert s["values"] == ["https://corp-proxy.example:8443"], "чужое значение не тронуто"
+    assert git_proxy._backup_state()["present"] is False, "backup тоже не создавался (мутации нет)"
+
+
+def test_enable_force_overwrites_with_backup(real_git_home):
+    """force — осознанная перезапись: backup чужого сохраняется (существующая provenance-модель)."""
+    _raw_set(git_proxy.KEY, "https://corp-proxy.example:8443", real_git_home)
+
+    r = git_proxy.enable(force=True)
+
+    assert r["ok"] is True
+    assert git_proxy.status()["proxy"] == EXPECTED_GIT_PROXY
+    assert git_proxy._backup_state()["values"] == ["https://corp-proxy.example:8443"]
+
+
+def test_enable_without_force_is_idempotent_on_managed_on(real_git_home):
+    """Повторный enable на своём значении — обычный ok, force не нужен (панель не ломается)."""
+    assert git_proxy.enable()["ok"] is True
+    assert git_proxy.enable()["ok"] is True
+    assert git_proxy.enable(force=True)["ok"] is True

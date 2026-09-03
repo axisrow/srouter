@@ -176,3 +176,94 @@ def test_enable_rejects_non_socks_scheme_without_mutating(monkeypatch, tmp_path)
     assert r["ok"] is False
     assert "socks" in r["err"].lower() or "scheme" in r["err"].lower()
     assert json.loads(paths[0].read_text()) == original  # не мутирован
+
+
+# ==================== issue #307: foreign/mixed state + force-gate + provenance ====================
+
+def test_status_reports_foreign_state(monkeypatch, tmp_path):
+    """ДЫРА #307 (ложный configured=false): чужое http.proxy — отдельное состояние foreign,
+    а не неотличимо от «не настроено»."""
+    paths = _setup(monkeypatch, tmp_path)
+    paths[0].parent.mkdir(parents=True)
+    paths[0].write_text(json.dumps({"http.proxy": "http://corp-proxy:3128"}), encoding="utf-8")
+    s = vscode_proxy.status()
+    assert s["state"] == "foreign"
+    assert s["enabled"] is False
+
+
+def test_status_reports_managed_on_and_absent(monkeypatch, tmp_path):
+    paths = _setup(monkeypatch, tmp_path)
+    assert vscode_proxy.status()["state"] == "absent"
+    paths[0].parent.mkdir(parents=True)
+    paths[0].write_text("{}", encoding="utf-8")
+    vscode_proxy.enable()
+    assert vscode_proxy.status()["state"] == "managed-on"
+
+
+def test_status_reports_mixed_when_editors_disagree(monkeypatch, tmp_path):
+    """mixed: в Code — наше значение, в Cursor — чужое. Один клик «Включить» сейчас
+    молча затирает чужое — обязан отказывать как конфликт."""
+    paths = _setup(monkeypatch, tmp_path)
+    for p, val in ((paths[0], EXPECTED_PROXY), (paths[1], "http://corp-proxy:3128")):
+        p.parent.mkdir(parents=True)
+        p.write_text(json.dumps({"http.proxy": val}), encoding="utf-8")
+    s = vscode_proxy.status()
+    assert s["state"] == "mixed"
+
+
+def test_enable_on_foreign_fails_closed_without_mutation(monkeypatch, tmp_path):
+    """ДЫРА #307 (перезапись чужого): enable() на чужое значение обязан отказать ЯВНО."""
+    paths = _setup(monkeypatch, tmp_path)
+    paths[0].parent.mkdir(parents=True)
+    original = {"http.proxy": "http://corp-proxy:3128", "editor.fontSize": 14}
+    paths[0].write_text(json.dumps(original), encoding="utf-8")
+
+    r = vscode_proxy.enable()
+
+    assert r["ok"] is False
+    assert r["conflict"] is True
+    assert r["state"] == "foreign"
+    assert json.loads(paths[0].read_text()) == original, "чужое значение не тронуто"
+
+
+def test_enable_on_mixed_fails_closed_without_mutation(monkeypatch, tmp_path):
+    paths = _setup(monkeypatch, tmp_path)
+    for p, val in ((paths[0], EXPECTED_PROXY), (paths[1], "http://corp-proxy:3128")):
+        p.parent.mkdir(parents=True)
+        p.write_text(json.dumps({"http.proxy": val}), encoding="utf-8")
+
+    r = vscode_proxy.enable()
+
+    assert r["ok"] is False
+    assert r["conflict"] is True
+    assert r["state"] == "mixed"
+    assert json.loads(paths[1].read_text())["http.proxy"] == "http://corp-proxy:3128"
+
+
+def test_enable_force_overwrites_and_backs_up_foreign_value(monkeypatch, tmp_path):
+    """force — осознанная перезапись: чужое значение уходит в sidecar-backup (#112)."""
+    paths = _setup(monkeypatch, tmp_path)
+    paths[0].parent.mkdir(parents=True)
+    paths[0].write_text(json.dumps({"http.proxy": "http://corp-proxy:3128"}), encoding="utf-8")
+
+    r = vscode_proxy.enable(force=True)
+
+    assert r["ok"] is True
+    assert json.loads(paths[0].read_text())["http.proxy"] == EXPECTED_PROXY
+    backup = vscode_proxy._backup_path(paths[0])
+    assert backup.exists()
+    assert json.loads(backup.read_text())["http.proxy"] == "http://corp-proxy:3128"
+
+
+def test_disable_after_force_restores_backed_up_foreign_value(monkeypatch, tmp_path):
+    """Provenance-цикл: force-enable -> disable() восстанавливает ЧУЖОЕ значение из backup."""
+    paths = _setup(monkeypatch, tmp_path)
+    paths[0].parent.mkdir(parents=True)
+    paths[0].write_text(json.dumps({"http.proxy": "http://corp-proxy:3128"}), encoding="utf-8")
+    assert vscode_proxy.enable(force=True)["ok"] is True
+
+    assert vscode_proxy.disable()["ok"] is True
+
+    data = json.loads(paths[0].read_text())
+    assert data["http.proxy"] == "http://corp-proxy:3128"
+    assert not vscode_proxy._backup_path(paths[0]).exists(), "backup потреблён, не висит сиротой"

@@ -790,6 +790,11 @@ def api_proxy_apply(action):
         return jsonify({"ok": False, "err": "ids must be a list"}), 400
     if isinstance(ids, list) and not all(isinstance(i, str) for i in ids):
         return jsonify({"ok": False, "err": "ids must be strings"}), 400
+    # force (issue #307) — осознанная перезапись чужого значения. Вайтлист типа: только
+    # настоящий JSON bool; строка "yes"/число от клиента не может протащить «истину».
+    force = payload.get("force", False)
+    if not isinstance(force, bool):
+        return jsonify({"ok": False, "err": "force must be a boolean"}), 400
 
     # Зовём через атрибут модуля (proxy_registry.apply), а не через from-import: тесты
     # подменяют именно атрибут — канон moving-caller-inverts-mock-ownership.
@@ -800,7 +805,7 @@ def api_proxy_apply(action):
     # bounded на практике). shutdown(wait=False) отпускает HTTP-ответ немедленно; поток на
     # flock всё равно не прервать (тот же факт, что и раньше), но он больше не держит нас.
     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    future = pool.submit(lambda: proxy_registry.apply(ids, action=action))
+    future = pool.submit(lambda: proxy_registry.apply(ids, action=action, force=force))
     try:
         result = future.result(timeout=_PROXY_APPLY_TIMEOUT_SEC)
     except concurrent.futures.TimeoutError:
@@ -813,7 +818,12 @@ def api_proxy_apply(action):
         }), 504
     pool.shutdown(wait=False)
 
-    return jsonify(result), (200 if result.get("ok") else 500)
+    # conflict (issue #307) — это КОНФЛИКТ состояния (клиент показывает confirm-force),
+    # а не серверная ошибка: 409 отличим панели от 500-рядовой ошибки.
+    status_code = 200
+    if not result.get("ok"):
+        status_code = 409 if any(r.get("conflict") for r in result.get("results", [])) else 500
+    return jsonify(result), status_code
 
 
 # ============================ качество туннеля (/api/metrics/tunnel) ============================

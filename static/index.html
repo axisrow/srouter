@@ -301,6 +301,8 @@
         proxy_yes: "yes", proxy_no: "no", proxy_unknown: "?",
         proxy_works: "working", proxy_broken: "not flowing", proxy_na: "—",
         proxy_state_unknown: "unknown", proxy_mixed: "partial",
+        proxy_foreign: "foreign value", proxy_mixed_state: "mixed settings",
+        proxy_force_confirm: "A foreign proxy value is set here: {0}\nOverwrite it with the srouter-managed value? The foreign value will be backed up.",
         proxy_on: "Enable", proxy_off: "Disable",
         proxy_mismatch: "MISMATCH", proxy_ok_badge: "OK",
         proxy_applied: "Proxy enabled", proxy_cleared: "Proxy disabled",
@@ -421,6 +423,8 @@
         proxy_yes: "да", proxy_no: "нет", proxy_unknown: "?",
         proxy_works: "работает", proxy_broken: "не идёт", proxy_na: "—",
         proxy_state_unknown: "неизвестно", proxy_mixed: "частично",
+        proxy_foreign: "чужое значение", proxy_mixed_state: "разные значения",
+        proxy_force_confirm: "Здесь прописано ЧУЖОЕ значение прокси: {0}\nПерезаписать управляемым srouter-значением? Чужое значение будет сохранено в backup.",
         proxy_on: "Включить", proxy_off: "Выключить",
         proxy_mismatch: "РАСХОЖДЕНИЕ", proxy_ok_badge: "ОК",
         proxy_applied: "Прокси включён", proxy_cleared: "Прокси выключен",
@@ -1499,10 +1503,20 @@
        одна строка таблицы. Всё, что пришло с сервера, экранируется — detail несёт
        вывод health-проб (PID, пути, текст команд). */
     function proxyRowHtml(c) {
-      var confMap = { true: 'proxy_yes', false: 'proxy_no' };
-      var confKey = confMap[String(c.configured)] || 'proxy_unknown';
-      var confCls = c.configured === true ? 'text-success'
-                  : (c.configured === false ? 'text-secondary' : 'text-warning');
+      // issue #307: чужое значение (foreign) и разные значения в разных конфигах (mixed) —
+      // НЕ «не настроено»: обычный клик «Включить» выглядит безобидно, а уничтожил бы чужую
+      // настройку. Показываем отдельное состояние + предупреждение, force — confirm-диалог.
+      var confKey, confCls;
+      if (c.state === 'foreign') {
+        confKey = 'proxy_foreign'; confCls = 'text-warning';
+      } else if (c.state === 'mixed') {
+        confKey = 'proxy_mixed_state'; confCls = 'text-warning';
+      } else {
+        var confMap = { true: 'proxy_yes', false: 'proxy_no' };
+        confKey = confMap[String(c.configured)] || 'proxy_unknown';
+        confCls = c.configured === true ? 'text-success'
+                : (c.configured === false ? 'text-secondary' : 'text-warning');
+      }
 
       var runMap = {
         ok: ['proxy_works', 'text-success'],
@@ -1623,19 +1637,43 @@
       var orig = btn.innerHTML;
       btn.disabled = true;
       btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span>';
-      fetch('/api/proxy/' + action, {
-        method: 'POST',
-        headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ids: [cid] })
-      })
-        .then(function (r) {
+
+      function post(body) {
+        return fetch('/api/proxy/' + action, {
+          method: 'POST',
+          headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        }).then(function (r) {
           return r.json().catch(function () { return { ok: false, err: 'HTTP ' + r.status }; });
-        })
+        });
+      }
+
+      post({ ids: [cid] })
         .then(function (res) {
+          // issue #307: конфликт чужого значения (409 + conflict) — НЕ ошибка в тост, а
+          // осознанный выбор: показываем ЧУЖОЕ значение и подтверждаем перезапись (force).
+          var first = (res && res.results && res.results[0]) || {};
+          if (action === 'enable' && !res.ok && first.conflict) {
+            finishMutation();
+            btn.disabled = false;
+            btn.innerHTML = orig;
+            var msg = t('proxy_force_confirm', String(row.proxy || '')).replace(/\\n/g, '\n');
+            if (!window.confirm(msg)) return loadProxyPanel(false);
+            if (!tryBeginMutation('proxy:' + cid)) return loadProxyPanel(false);
+            btn.disabled = true;
+            btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span>';
+            return post({ ids: [cid], force: true }).then(function (res2) {
+              if (res2 && res2.ok) toast(t('proxy_applied'), 'ok');
+              else {
+                var f2 = (res2 && res2.results && res2.results[0]) || {};
+                toast(t('proxy_failed', String(f2.err || (res2 && res2.err) || '')).slice(0, 220), 'err');
+              }
+              return loadProxyPanel(false);
+            });
+          }
           if (res && res.ok) {
             toast(t(action === 'enable' ? 'proxy_applied' : 'proxy_cleared'), 'ok');
           } else {
-            var first = (res && res.results && res.results[0]) || {};
             toast(t('proxy_failed', String(first.err || (res && res.err) || '')).slice(0, 220), 'err');
           }
           // Правда — только с сервера: перечитываем состояние, не доверяя оптимистичному локальному состоянию.

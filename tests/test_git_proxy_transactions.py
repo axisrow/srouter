@@ -84,7 +84,7 @@ def test_enable_fails_but_backup_already_updated_stays_consistent(monkeypatch, r
 
     monkeypatch.setattr(git_proxy.sys_probe, "run", _fail_key_write)
 
-    r = git_proxy.enable()
+    r = git_proxy.enable(force=True)
 
     assert r["ok"] is False, "запись KEY провалилась -> enable() честно репортит отказ"
 
@@ -100,7 +100,7 @@ def test_enable_fails_but_backup_already_updated_stays_consistent(monkeypatch, r
     )
 
     # Повторный enable() (после "починки" среды) должен суметь довести дело до конца.
-    assert git_proxy.enable()["ok"] is True
+    assert git_proxy.enable(force=True)["ok"] is True
     assert git_proxy.status()["proxy"] == EXPECTED_GIT_PROXY
 
     # И disable() восстанавливает то же самое чужое значение, backup не был испорчен по пути.
@@ -219,7 +219,7 @@ def test_transactional_marker_survives_partial_failure_mid_write(monkeypatch, re
 
     monkeypatch.setattr(git_proxy.sys_probe, "run", _fail_first_add_proxy_then_succeed)
 
-    r = git_proxy.enable()
+    r = git_proxy.enable(force=True)
 
     # Первая попытка упала — но транзакционный маркер зафиксировал target state
     assert r["ok"] is False, "первая попытка честно репортит отказ"
@@ -231,7 +231,7 @@ def test_transactional_marker_survives_partial_failure_mid_write(monkeypatch, re
 
     # Повторный enable() (после "рестарта процесса") должен довести транзакцию до конца
     # НЕ угадывая "а вдруг текущее состояние похоже на что-то знакомое"
-    r2 = git_proxy.enable()
+    r2 = git_proxy.enable(force=True)
     assert r2["ok"] is True, "повторная попытка должна довести транзакцию до конца"
 
     # Проверяем, что состояние консистентно
@@ -310,13 +310,13 @@ def test_partial_txn_marked_checksum_rejected_as_corrupt(monkeypatch, real_git_h
 
     monkeypatch.setattr(git_proxy.sys_probe, "run", _fail_sentinel_write)
 
-    r = git_proxy.enable()
+    r = git_proxy.enable(force=True)
 
     # Первая попытка упала при записи checksum txn-маркера
     assert r["ok"] is False, "enable() должен вернуть ошибку при частичном txn begin"
 
     # Следующий enable() должен ОТКЛОНИТЬ partial txn-маркер как corrupt
-    r2 = git_proxy.enable()
+    r2 = git_proxy.enable(force=True)
     assert r2["ok"] is False, "повторный enable() должен отклонить partial txn-маркер"
 
     # Проверяем, что backup НЕ ПОТЕРЯН — partial recovery не произошло
@@ -343,7 +343,7 @@ def test_disable_restore_backup_unknown_read_fails_closed_not_unset(monkeypatch,
     """
     # Состояние: установлен наш managed-прокси + присутствует backup чужого значения
     _raw_set(git_proxy.KEY, "https://corp.example:8443", real_git_home)
-    assert git_proxy.enable()["ok"] is True
+    assert git_proxy.enable(force=True)["ok"] is True
     assert git_proxy.status()["proxy"] == EXPECTED_GIT_PROXY
     assert git_proxy._backup_state()["present"] is True, "sanity: backup создан enable()"
 

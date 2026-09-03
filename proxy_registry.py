@@ -111,7 +111,7 @@ CONSUMERS = (
         id="git", title="git → github", kind="git-config",
         status_fn=lambda: git_proxy.status(),
         health_fn=lambda: health._github_direct_check(),
-        enable_fn=lambda: git_proxy.enable(),
+        enable_fn=lambda force=False: git_proxy.enable(force=force),
         disable_fn=lambda: git_proxy.disable(),
         note="~/.gitconfig · http.https://github.com.proxy",
     ),
@@ -119,7 +119,7 @@ CONSUMERS = (
         id="claude", title="Claude Code", kind="env-json",
         status_fn=lambda: claude_proxy.status(),
         health_fn=lambda: health._claude_proxy_probe(),
-        enable_fn=lambda: claude_proxy.enable(),
+        enable_fn=lambda force=False: claude_proxy.enable(force=force),
         disable_fn=lambda: claude_proxy.disable(),
         note="~/.claude/settings.json · env.HTTPS_PROXY",
     ),
@@ -127,7 +127,7 @@ CONSUMERS = (
         id="vscode", title="VSCode / codex", kind="json-settings",
         status_fn=lambda: vscode_proxy.status(),
         health_fn=lambda: health._vscode_proxy_check(),
-        enable_fn=lambda: vscode_proxy.enable(),
+        enable_fn=lambda force=False: vscode_proxy.enable(force=force),
         disable_fn=lambda: vscode_proxy.disable(),
         note="settings.json · http.proxy",
     ),
@@ -167,24 +167,30 @@ def _effective():
 
 
 def _configured_from(raw):
-    """{enabled, proxy, status?} -> (configured: bool|None, proxy: str).
+    """{enabled, proxy, state?, status?} -> (configured: bool|None, proxy: str, state: str|None).
 
     status == 'unknown' -> configured=None: конфиг не прочитан, и это НЕ «выключено»
     (канон verify-dont-guess — неизвестность не равна отрицанию).
+    state (issue #307) — absent/managed-on/foreign/mixed/unknown: foreign обязан дойти до
+    панели как ОТДЕЛЬНОЕ состояние, иначе «Включить» выглядит безопасным кликом, а
+    уничтожил бы чужую настройку.
     """
     if not isinstance(raw, dict):
-        return None, ""
+        return None, "", None
     if raw.get("status") == "unknown":
-        return None, str(raw.get("proxy") or "")
-    return bool(raw.get("enabled")), str(raw.get("proxy") or "")
+        return None, str(raw.get("proxy") or ""), _UNKNOWN_STATE
+    return bool(raw.get("enabled")), str(raw.get("proxy") or ""), raw.get("state")
+
+
+_UNKNOWN_STATE = "unknown"
 
 
 def _row(spec, want_runtime):
     """Одна строка панели. Никогда не бросает — упавший потребитель деградирует в unknown."""
-    configured, proxy = None, ""
+    configured, proxy, state = None, "", None
     if spec.status_fn is not None:
         try:
-            configured, proxy = _configured_from(spec.status_fn())
+            configured, proxy, state = _configured_from(spec.status_fn())
         except Exception as e:  # noqa: BLE001 — fail-soft boundary: один потребитель не роняет панель
             _log.warning("proxy_registry: status %s failed: %s", spec.id, e)
 
@@ -222,6 +228,7 @@ def _row(spec, want_runtime):
         "title": spec.title,
         "kind": spec.kind,
         "configured": configured,
+        "state": state,
         "runtime": runtime,
         "proxy": proxy,
         "detail": detail,
@@ -288,11 +295,15 @@ def overview(*, probe=False):
     }
 
 
-def apply(ids=None, *, action):
-    """Включить/выключить потребителей по реестру. {ok, results: [{id, ok, err}]}.
+def apply(ids=None, *, action, force=False):
+    """Включить/выключить потребителей по реестру. {ok, results: [{id, ok, err, conflict?}]}.
 
     Вайтлист id и action ДО любой мутации (канон: мутирующий путь валидирует по вайтлисту).
     Неуправляемый потребитель -> честный отказ, а не молчаливый успех.
+
+    force (issue #307) — осознанная перезапись чужого значения: реестр доносит его до
+    enable_fn каждого потребителя; без force enable на foreign/mixed возвращает per-consumer
+    {ok: False, conflict: True} (панель показывает confirm вместо silent-перезаписи).
     """
     if action not in _ACTIONS:
         return {"ok": False, "err": f"unknown action: {action!r}", "results": []}
@@ -315,8 +326,12 @@ def apply(ids=None, *, action):
             continue
         fn = spec.enable_fn if action == "enable" else spec.disable_fn
         try:
-            r = fn() or {}
-            results.append({"id": spec.id, "ok": bool(r.get("ok")), "err": str(r.get("err") or "")})
+            r = (fn(force=force) if action == "enable" else fn()) or {}
+            entry = {"id": spec.id, "ok": bool(r.get("ok")), "err": str(r.get("err") or "")}
+            if r.get("conflict"):
+                entry["conflict"] = True
+                entry["state"] = r.get("state")
+            results.append(entry)
         except Exception as e:  # noqa: BLE001 — fail-soft: один сбой не прерывает остальные
             _log.warning("proxy_registry: %s %s failed: %s", action, spec.id, e)
             results.append({"id": spec.id, "ok": False, "err": str(e) or e.__class__.__name__})

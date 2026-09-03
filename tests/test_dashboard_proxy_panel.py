@@ -25,6 +25,9 @@ var _KEYS = {
   proxy_yes: 'да', proxy_no: 'нет', proxy_unknown: '?',
   proxy_works: 'работает', proxy_broken: 'не идёт', proxy_na: '—',
   proxy_state_unknown: 'неизвестно', proxy_mixed: 'частично',
+  // issue #307: новые ключи маппятся сами в себя — ассерт «proxy_foreign in html» ловит
+  // именно использование ключа, а не совпадение человеческого текста.
+  proxy_foreign: 'proxy_foreign', proxy_mixed_state: 'proxy_mixed_state',
   proxy_on: 'Включить', proxy_off: 'Выключить'
 };
 var I18N = { ru: _KEYS, en: _KEYS };
@@ -121,3 +124,30 @@ def test_multiline_detail_does_not_break_row_layout():
                     "manageable": True})
     body = html.split("</tr>")[-2] if "</tr>" in html else html
     assert "\n" not in body.replace("\\n", "")
+
+
+# ==================== issue #307: foreign/mixed видны пользователю ====================
+
+def test_foreign_state_is_shown_distinctly_not_as_not_configured():
+    """ДЫРА #307: чужое значение НЕ имеет права выглядеть как «нет» (не настроено) —
+    обычный клик «Включить» выглядит безобидно, а уничтожил бы чужую настройку."""
+    html = _render({"id": "git", "title": "git → github", "configured": False,
+                    "state": "foreign", "runtime": "n/a",
+                    "proxy": "https://corp-proxy:8443", "detail": "", "manageable": True})
+    assert "proxy_foreign" in html, "чужое значение подписано отдельным состоянием"
+    assert "text-warning" in html, "чужое значение подсвечено как требующее внимания"
+
+
+def test_mixed_state_is_shown_distinctly():
+    html = _render({"id": "vscode", "title": "VSCode / codex", "configured": False,
+                    "state": "mixed", "runtime": "n/a",
+                    "proxy": "http://corp-proxy:3128", "detail": "", "manageable": True})
+    assert "proxy_mixed_state" in html
+
+
+def test_absent_state_keeps_plain_no_label():
+    """Обычное «не настроено» (absent) не превращается в warning — сигнал не размывается."""
+    html = _render({"id": "git", "title": "git → github", "configured": False,
+                    "state": "absent", "runtime": "n/a",
+                    "proxy": "", "detail": "", "manageable": True})
+    assert "proxy_foreign" not in html

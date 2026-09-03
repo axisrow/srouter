@@ -49,9 +49,9 @@ def _stub_cmd_install_internals(monkeypatch, *, apply_ok=True, tty=True):
     monkeypatch.setattr(srouter_cli, "apply_install",
                         lambda **k: {"ok": apply_ok, "blocked": []})
     # best-effort хелперы после успешного apply (мокаем, чтобы не трогать реальную ФС/сеть).
-    monkeypatch.setattr(srouter_cli, "claude_proxy", SimpleNamespace(enable=lambda: {"ok": True}))
+    monkeypatch.setattr(srouter_cli, "claude_proxy", SimpleNamespace(enable=lambda force=False: {"ok": True}))
     # issue #130: git → SOCKS5 (xray 10808) через gitconfig, симметрично claude_proxy/vscode_proxy.
-    monkeypatch.setattr(srouter_cli, "git_proxy", SimpleNamespace(enable=lambda: {"ok": True, "proxy": "socks5h://127.0.0.1:10808"}))
+    monkeypatch.setattr(srouter_cli, "git_proxy", SimpleNamespace(enable=lambda force=False: {"ok": True, "proxy": "socks5h://127.0.0.1:10808"}))
     monkeypatch.setattr(srouter_cli, "_install_generic_launchagent", lambda *a, **k: (True, ""))
     monkeypatch.setattr(srouter_cli, "_install_ppp_hook", lambda *a, **k: "")
     monkeypatch.setattr(srouter_cli, "_install_codex_wrappers", lambda env: "")
@@ -62,7 +62,7 @@ def _stub_cmd_install_internals(monkeypatch, *, apply_ok=True, tty=True):
     monkeypatch.setattr(srouter_cli, "_ensure_home_bin_in_path", lambda env: "")
     # issue #185: scoped SOCKS5 через VSCode http.proxy (вместо gui-SOCKS5, который ломал CC #130).
     monkeypatch.setattr(srouter_cli, "vscode_proxy",
-                        SimpleNamespace(enable=lambda: {"ok": True, "paths": []}))
+                        SimpleNamespace(enable=lambda force=False: {"ok": True, "paths": []}))
     # issue #168: PF codex-изоляция (sub-anchor). Лезет в реальный pfctl/osascript — мокаем.
     if hasattr(srouter_cli, "_install_codex_isolation"):
         monkeypatch.setattr(srouter_cli, "_install_codex_isolation", lambda env, runner: "")
@@ -163,7 +163,7 @@ def test_cmd_install_activates_codenv_and_vscode_proxy(monkeypatch):
     _stub_cmd_install_internals(monkeypatch, apply_ok=True, tty=False)
     calls = {"vscode_enable": 0, "launchctl_env": 0}
     monkeypatch.setattr(srouter_cli, "vscode_proxy",
-                        SimpleNamespace(enable=lambda: (calls.__setitem__("vscode_enable", 1), {"ok": True})[1]))
+                        SimpleNamespace(enable=lambda force=False: (calls.__setitem__("vscode_enable", 1), {"ok": True})[1]))
     monkeypatch.setattr(srouter_cli, "_install_launchctl_env",
                         lambda env, runner: (calls.__setitem__("launchctl_env", 1), "")[1])
 
@@ -187,7 +187,7 @@ def test_cmd_install_enables_git_proxy(monkeypatch):
     _stub_cmd_install_internals(monkeypatch, apply_ok=True, tty=False)
     calls = {"git_enable": 0}
     monkeypatch.setattr(srouter_cli, "git_proxy", SimpleNamespace(
-        enable=lambda: (calls.__setitem__("git_enable", 1), {"ok": True, "proxy": "socks5h://127.0.0.1:10808"})[1]))
+        enable=lambda force=False: (calls.__setitem__("git_enable", 1), {"ok": True, "proxy": "socks5h://127.0.0.1:10808"})[1]))
 
     rc = srouter.cmd_install(_args(yes=True))
 

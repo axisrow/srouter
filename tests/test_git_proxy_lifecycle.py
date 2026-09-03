@@ -69,7 +69,7 @@ def test_disable_self_heals_orphan_backup_after_interrupted_restore(real_git_hom
     (= restore уже произошёл раньше, просто cleanup не завершился) — доубрать backup.
     """
     _raw_set(git_proxy.KEY, "https://corp.example:8443", real_git_home)
-    assert git_proxy.enable()["ok"] is True  # backup = ["https://corp.example:8443"]
+    assert git_proxy.enable(force=True)["ok"] is True  # backup = ["https://corp.example:8443"]
 
     # Симулируем restore, прошедший наполовину: KEY уже восстановлен на чужое значение, но
     # backup-ключ не подчищен (как будто disable() упал между restore и cleanup).
@@ -153,7 +153,7 @@ def test_full_lifecycle_preserves_pre_existing_foreign_proxy(real_git_home):
     """install->uninstall lifecycle возвращает ИСХОДНЫЙ чужой прокси (created/overwrote-канон)."""
     _raw_set(git_proxy.KEY, "https://corp.example:8443", real_git_home)
 
-    assert git_proxy.enable()["ok"] is True
+    assert git_proxy.enable(force=True)["ok"] is True
     assert git_proxy.status()["proxy"] == EXPECTED_GIT_PROXY
 
     assert git_proxy.disable()["ok"] is True
@@ -231,7 +231,7 @@ def test_disable_self_heals_when_key_absent_but_backup_matches_history(real_git_
     должны "телепортироваться" в никуда только потому что KEY оказался пуст в момент запроса).
     """
     _raw_set(git_proxy.KEY, "https://corp-B.example:9443", real_git_home)
-    assert git_proxy.enable()["ok"] is True  # backup = ["https://corp-B.example:9443"]
+    assert git_proxy.enable(force=True)["ok"] is True  # backup = ["https://corp-B.example:9443"]
 
     # Симулируем "и новая запись, и rollback упали" -> KEY становится пустым, backup остаётся.
     assert git_proxy._unset_all(git_proxy.KEY)["ok"] is True
@@ -266,7 +266,7 @@ def test_disable_self_heal_partial_restore_does_not_get_stuck_permanently(monkey
     _raw_set_add(git_proxy.KEY, "A", real_git_home)
     _raw_set_add(git_proxy.KEY, "B", real_git_home)
     _raw_set_add(git_proxy.KEY, "C", real_git_home)
-    assert git_proxy.enable()["ok"] is True  # backup = [A, B, C]
+    assert git_proxy.enable(force=True)["ok"] is True  # backup = [A, B, C]
 
     # Симулируем крэш: KEY снят целиком (как будто процесс убит после _unset_all, до восстановления).
     assert git_proxy._unset_all(git_proxy.KEY)["ok"] is True
