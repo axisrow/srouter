@@ -40,6 +40,12 @@ try:
 except BaseException:
     _MANAGED_GUI_HTTP_PROXY_URL = "http://127.0.0.1:8118"
 
+# Ключи residual-детекции gui-домена: ВСЕ 6 scheme-ключей, оба регистра. Локальная копия
+# codex_wrappers.CODEX_LAUNCHCTL_UNSET_KEYS — прямой import создал бы цикл (codex_wrappers
+# импортирует health). Паритет гвардится тестом test_gui_socks_residual_keys_parity (#340 review).
+_LAUNCHCTL_RESIDUAL_SOCKS_KEYS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+                                  "http_proxy", "https_proxy", "all_proxy")
+
 # Абсолютные пути: launchd/GUI PATH их не содержит (канон проекта).
 LSOF = "/usr/sbin/lsof"
 PS = "/bin/ps"
@@ -137,7 +143,12 @@ def _gui_socks_residual_check():
                  своим warn не будем, #189 codenv-aware семантика).
     Scheme-классификация через urlparse (эталон #127, не подстрока). Не бросает.
     """
-    gui = _read_gui_proxy_env()
+    # keys_filter = ВСЕ 6 scheme-ключей (оба регистра, как CODEX_LAUNCHCTL_UNSET_KEYS):
+    # дефолт LAUNCHCTL_PROXY_KEYS видит только верхний регистр — а старая версия codenv-env
+    # ставила И lower-case (all_proxy/https_proxy/http_proxy), residual там тот же pip-ломающий
+    # socks5h; молчать о нём = детектор-константа (канон detector-must-be-function-not-constant).
+    gui = _read_gui_proxy_env(
+        keys_filter=tuple(k for k in _LAUNCHCTL_RESIDUAL_SOCKS_KEYS))
     if not gui.get("verifiable"):
         return {"status": "unknown",
                 "detail": ("launchctl print gui/<uid> не ответил — residual-socks в gui-домене "

@@ -246,6 +246,34 @@ def test_gui_socks_residual_not_ours_when_codenv_not_managed(monkeypatch):
     assert res["status"] == "unknown", f"чужой socks — вне контракта srouter; got {res}"
 
 
+def test_gui_socks_residual_warn_when_lowercase_only(monkeypatch):
+    """#340 (review): residual socks ТОЛЬКО в lower-case ключах (all_proxy/https_proxy) — warn.
+
+    Дефолтный keys_filter _read_gui_proxy_env (LAUNCHCTL_PROXY_KEYS) — только верхний регистр;
+    старая версия srouter-codex-env.sh ставила И lower-case. Детектор обязан видеть весь
+    residual-класс (канон detector-must-be-function-not-constant): warn-ветка достижима на
+    lower-case-only входе."""
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _fake("", _gui_env({"all_proxy": SOCKS5, "https_proxy": SOCKS5})))
+    _fake_codenv_managed(monkeypatch, managed=True)
+    res = health._gui_socks_residual_check()
+    assert res["status"] == "warn", f"lower-case residual socks → warn; got {res}"
+
+
+def test_gui_socks_residual_keys_parity():
+    """#340 (review): residual-набор ключей = CODEX_LAUNCHCTL_UNSET_KEYS (scheme-часть).
+
+    Локальная копия в health_codenv нужна из-за цикла импортов (codex_wrappers → health), но
+    она обязана следовать за контрактом снятия — иначе новый ключ появится в uninstall, а
+    детектор его молча пропустит (drift двух копий)."""
+    import codex_wrappers
+    import health_codenv
+    assert set(health_codenv._LAUNCHCTL_RESIDUAL_SOCKS_KEYS) == \
+        set(codex_wrappers.CODEX_LAUNCHCTL_UNSET_KEYS) - {"NO_PROXY", "no_proxy"}, (
+        f"residual-ключи health_codenv должны совпадать с scheme-частью "
+        f"CODEX_LAUNCHCTL_UNSET_KEYS: {health_codenv._LAUNCHCTL_RESIDUAL_SOCKS_KEYS}")
+
+
 def test_gui_socks_residual_ok_when_privoxy_or_empty(monkeypatch):
     """Наш новый формат (privoxy scheme-ключи, ALL_PROXY пуст/нет) → ok."""
     monkeypatch.setattr(health.sys_probe, "run",
