@@ -406,7 +406,12 @@ def _repair_locked(path, runner):
     if _is_target_endpoint(socks):
         # Наш endpoint уже стоит — просто включаем канал, если выключен.
         if socks["enabled"]:
-            return _promote_repairing(path, leases, service, lease, changed=False)
+            # previous = текущее состояние (AO-review 5110061682): lease без честного снимка
+            # «до» разворачивался restore'ом в endpoint "" 0 + state off — обнуление SOCKS,
+            # настроенного install'ом. С честным снимком restore из идемпотентного repair —
+            # no-op (off -> endpoint target -> on == текущее состояние).
+            return _promote_repairing(path, leases, service, lease, changed=False,
+                                      previous=dict(socks))
         _, err = _mutate([NETWORKSETUP, "-setsocksfirewallproxystate", service, "on"], runner)
         if err is not None:
             return {"ok": False, "conflict": False, "err": err}
@@ -520,9 +525,13 @@ def _restore_locked(path, runner, service):
         results.append({"service": svc,
                         **_restore_one(path, leases, svc, runner)})
     ok = all(r["ok"] for r in results)
+    warnings = [r["warning"] for r in results if r.get("warning")]
     return {"ok": ok,
             "conflict": any(r.get("conflict") for r in results),
             "err": None if ok else "; ".join(r["err"] for r in results if not r["ok"] and r.get("err")),
+            # Per-service warning'и всплывают наверх (AO-review 5110061682; канон
+            # noisy-log-better-than-no-log) — иначе self-heal-расчистка lease невидима.
+            **({"warning": "; ".join(warnings)} if warnings else {}),
             "results": results}
 
 
@@ -545,6 +554,15 @@ def _restore_one(path, leases, service, runner):
         # мутации применились — разворачиваем их по previous; чужой endpoint — мутаций не было
         # (или внешний откат), восстанавливать нечего, stale-lease сбрасывается.
         if _is_target_endpoint(current):
+            # Симметричный preflight repairing → restoring (AO-review 5110061682): без него
+            # сбой после endpoint-шага оставлял lease в repairing, и retry уходил в stale-сброс
+            # «восстанавливать нечего» вместо докрутки. Спасал лишь неявный инвариант
+            # previous.enabled=False (repair пишет repairing только для выключенного чужого
+            # endpoint) — нигде не защищённый от будущих источников enabled-previous.
+            leases[service] = {"phase": _PHASE_RESTORING, "service": service, "previous": previous}
+            if not _save_leases(path, leases):
+                return {"ok": False, "err": "state не записывается — фаза restoring не "
+                                            "сохранена, мутации отменены (fail-closed)"}
             return _restore_apply(path, leases, service, previous, current, runner)
         leases.pop(service, None)
         if _save_leases(path, leases):
@@ -617,6 +635,6 @@ def _restore_apply(path, leases, service, previous, current, runner):
         return {"ok": True}
     # Система уже полностью восстановлена; lease (restoring) дочистится reconcile-веткой
     # «endpoint previous + state как previous» при следующем restore.
-    _log.warning("system_proxy_control: restore %s применён, но lease не расчился", service)
+    _log.warning("system_proxy_control: restore %s применён, но lease не расчистился", service)
     return {"ok": True, "warning": "restore применён, но расчистить lease не удалось — "
                                    "дочистится при следующем restore"}

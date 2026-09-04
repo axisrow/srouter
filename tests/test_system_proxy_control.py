@@ -543,3 +543,78 @@ def test_lock_timeout_invalid_falls_back_to_default(monkeypatch):
     monkeypatch.setenv("SROUTER_SYSTEM_PROXY_LOCK_TIMEOUT_SEC", "7")
     assert spc._lock_timeout_sec(None) == 7.0
 
+
+# --- cycle-review AO (review 5110061682): контракт previous и preflight restoring ---
+
+
+def test_repair_idempotent_then_restore_is_non_destructive(tmp_path):
+    """AO-review (1): repair на уже настроенной машине (наш endpoint ВКЛЮЧЁН, лиза нет) не имеет
+    права создавать lease с previous={} — restore из такого lease выполнял state off ->
+    endpoint "" 0 -> state off, обнуляя и выключая системный SOCKS (регрессия vs main, где
+    repair при enabled+target lease не писал вовсе). Честный previous = текущее состояние."""
+    state_file = tmp_path / "state.json"
+    runner = ProxyRunner(enabled=True)  # install уже настроил: target + enabled
+    res = system_proxy_control.repair(path=state_file, runner=runner)
+    assert res["ok"] is True
+    assert res["changed"] is False
+    res = system_proxy_control.restore(path=state_file, runner=runner)
+    assert res["ok"] is True
+    assert (runner.server, runner.port, runner.enabled) == ("127.0.0.1", 10808, True), (
+        "restore идемпотентного repair обязан быть no-op, а не обнуление SOCKS")
+
+
+def test_restore_from_repairing_preflights_restoring_phase(tmp_path):
+    """AO-review (2): restore из repairing-фазы обязан preflight'ом перевести lease в restoring
+    ДО мутаций (как active-ветка). Иначе сбой после endpoint-шага оставляет repairing, и retry
+    уходит в stale-сброс «восстанавливать нечего» вместо докрутки — спасал только неявный
+    инвариант previous.enabled=False, никак не защищённый."""
+    state_file = tmp_path / "state.json"
+    previous = {"enabled": True, "server": "corp.proxy", "port": 1080, "authenticated": False}
+    _seed_sp(state_file, {"leases": {"Wi-Fi": {
+        "phase": "repairing", "service": "Wi-Fi", "previous": previous}}})
+    runner = ProxyRunner(enabled=True, fail_on="-setsocksfirewallproxy")
+    res = system_proxy_control.restore(path=state_file, runner=runner)
+    assert res["ok"] is False
+    assert _sp_section(state_file)["leases"]["Wi-Fi"]["phase"] == "restoring", (
+        "после сбоя mid-restore lease обязан быть в restoring, а не в repairing")
+    runner.fail_on = None
+    res = system_proxy_control.restore(path=state_file, runner=runner)
+    assert res["ok"] is True
+    assert (runner.server, runner.port, runner.enabled) == ("corp.proxy", 1080, True)
+    assert "Wi-Fi" not in _sp_section(state_file)["leases"]
+
+
+def test_restore_aggregates_per_service_warnings(tmp_path, monkeypatch):
+    """AO-review (3): верхний warning у restore был мёртвым — _restore_locked его не собирал.
+    Per-service warning'и (self-heal расчистки lease) обязаны всплывать наверх (канон
+    noisy-log-better-than-no-log)."""
+    def fake_one(path, leases, service, runner):
+        leases.pop(service, None)
+        return {"ok": True, "warning": "restore применён, но расчистить lease не удалось"}
+
+    monkeypatch.setattr(system_proxy_control, "_restore_one", fake_one)
+    state_file = tmp_path / "state.json"
+    _seed_sp(state_file, {"leases": {"Wi-Fi": {
+        "phase": "active", "service": "Wi-Fi", "previous": dict(CORP_PREVIOUS)}}})
+    res = system_proxy_control.restore(path=state_file, runner=ProxyRunner(enabled=True))
+    assert res["ok"] is True
+    assert res.get("warning") == "restore применён, но расчистить lease не удалось"
+
+
+def test_cli_restore_prints_per_service_warning(tmp_path, monkeypatch, capsys):
+    """AO-review (3): CLI печатал из results только err — warning терялся. Обязан печататься
+    (в stderr, не роняя exit-code), как обещает PR-описание."""
+    import srouter_cli
+
+    warning = "restore применён, но расчистить lease не удалось"
+    monkeypatch.setattr(system_proxy_control, "restore", lambda **kw: {
+        "ok": True, "conflict": False, "warning": warning,
+        "results": [{"service": "Wi-Fi", "ok": True, "warning": warning}]})
+    args = SimpleNamespace(system_proxy_action="restore", state=str(tmp_path / "state.json"),
+                           system_proxy_service=None)
+    rc = srouter_cli.cmd_system_proxy(args)
+    captured = capsys.readouterr()
+    assert rc == 0
+    # per-service формат — top-level warning печатался и до фикса, per-service терялся:
+    assert f"system-proxy: Wi-Fi: warning — {warning}" in captured.err
+

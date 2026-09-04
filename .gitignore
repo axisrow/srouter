@@ -4,6 +4,8 @@ srouter.local.json
 # cycle-review #114 C3/C4: save_state atomic-write temp (local_state.py:596). Комментарий на отдельной
 # строке — inline-коммент ломает паттерн в gitignore/dockerignore (# только в начале строки).
 srouter.local.json.tmp
+# AO-review 5110061682: межпроцессный flock system-proxy (#316) рядом с дефолтным state в корне
+srouter.local.json.system_proxy.lock
 # _backup() timestamped — прежний (чужой) конфиг с секретами (install_lib.py:599)
 *.srouter-backup-*
 

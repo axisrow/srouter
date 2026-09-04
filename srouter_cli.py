@@ -649,6 +649,9 @@ def cmd_system_proxy(args) -> int:
             if res.get("err"):
                 line += f" — {res['err']}"
             print(line, file=sys.stderr if not res["ok"] else sys.stdout)
+            if res.get("warning"):
+                print(f"system-proxy: {res['service']}: warning — {res['warning']}",
+                      file=sys.stderr)
         if r["ok"]:
             print("system-proxy: восстановлен прежний системный SOCKS.")
             if r.get("warning"):
