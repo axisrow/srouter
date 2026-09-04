@@ -480,6 +480,37 @@ def test_enable_recheck_distinguishes_absent_from_json_null(monkeypatch, tmp_pat
     assert json.loads(settings.read_text()) == {}, "запись не должна была состояться"
 
 
+def test_enable_toctou_abort_does_not_leave_stale_backup(monkeypatch, tmp_path):
+    """Review #338 follow-up: sidecar-backup пишется только ПОСЛЕ пройденного TOCTOU re-check.
+    При отказе на гонке sidecar не появляется: записанный до re-check, он хранит снапшот
+    устаревших чужих значений, который следующий disable() восстановил бы поверх более
+    свежих, поставленных конкурентным писателем."""
+    settings = _setup(monkeypatch, tmp_path)
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text(json.dumps({"env": {"HTTPS_PROXY": "http://corp:3128"}}))
+
+    real_load = claude_proxy._load
+    calls = {"n": 0}
+
+    def _racing_load():
+        calls["n"] += 1
+        if calls["n"] > 1:
+            # Другой писатель поменял значение ПОСЛЕ gate.
+            return {"env": {"HTTPS_PROXY": "http://corp-2:3128"}}
+        return real_load()
+
+    monkeypatch.setattr(claude_proxy, "_load", _racing_load)
+    r = claude_proxy.enable(force=True)
+    monkeypatch.setattr(claude_proxy, "_load", real_load)
+
+    assert r["ok"] is False, "устаревшее решение -> отказ"
+    assert not claude_proxy._backup_path().exists(), \
+        "при отказе sidecar с устаревшим снапшотом не должен остаться на диске"
+    # Конкурентный писатель симулирован только возвратом _load (диск он не писал):
+    # инвариант «enable ничего не записал» = файл в исходном виде.
+    assert json.loads(settings.read_text())["env"]["HTTPS_PROXY"] == "http://corp:3128"
+
+
 # ============ issue #331: нейтрализация all_proxy/ALL_PROXY (SOCKS-плечо xray) ============
 #
 # launchctl gui-домен (srouter-codex-env.sh) ставит ALL_PROXY/all_proxy=socks5h://...:10808

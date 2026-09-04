@@ -177,6 +177,9 @@ def enable(force=False):
     Issue #307 round 2 (Codex cycle-review PR #328): нечитаемый/битый/не-object settings.json —
     честный отказ БЕЗ перезаписи файла (finding 3); state перечитывается с диска непосредственно
     перед записью — значение, появившееся в гонке между gate и save, не затирается (finding 4).
+    Review #338 follow-up: sidecar-backup пишется только ПОСЛЕ пройденного TOCTOU re-check —
+    при отказе на гонке на диске не остаётся снапшота устаревших чужих значений, который
+    следующий disable() восстановил бы поверх более свежих.
     """
     scheme = urlparse(_PROXY).scheme.lower()
     if scheme not in {"http", "https"}:
@@ -211,20 +214,14 @@ def enable(force=False):
             result["err"] += f"; также чужое непустое {','.join(sorted(foreign_neutral))} (issue #331)"
         return result
 
+    # Provenance: захватить ЧУЖИЕ значения (только сами proxy-ключи) ДО мутации env.
+    # Сама запись sidecar — ниже, после пройденного TOCTOU re-check (review #338): sidecar,
+    # записанный до re-check, при отказе на гонке остаётся на диске со снапшотом устаревших
+    # значений, и следующий disable() восстановил бы их поверх более свежих.
+    foreign = {}
     if force and (_contract.needs_force(state) or foreign_neutral):
-        # Provenance: сохранить ЧУЖИЕ значения перед перезаписью (только сами proxy-ключи).
         foreign = {k: env[k] for k in ENV_KEYS if k in env and env[k] != _PROXY}
         foreign.update(foreign_neutral)
-        if foreign:
-            # _save() пишет строго SETTINGS; backup — отдельная атомарная запись тем же паттерном.
-            try:
-                _backup_path().parent.mkdir(parents=True, exist_ok=True)
-                tmp = _backup_path().with_suffix(".json.tmp")
-                tmp.write_text(json.dumps({"env": foreign}, indent=2, ensure_ascii=False) + "\n",
-                               encoding="utf-8")
-                tmp.replace(_backup_path())
-            except (OSError, TypeError, ValueError) as exc:
-                return {"ok": False, "err": f"backup foreign value failed: {str(exc)[:150]}"}
 
     # TOCTOU re-check (finding 4): снапшот proxy-ключей, на котором принято решение.
     # Presence отдельно от значения (AO review round 3): absent и JSON-null — РАЗНЫЕ
@@ -254,6 +251,19 @@ def enable(force=False):
     if {k: (k in fresh_env, fresh_env.get(k)) for k in ENV_KEYS + NEUTRAL_PROXY_KEYS} != decision_snapshot:
         return {"ok": False, "conflict": True, "state": state,
                 "err": "settings.json изменился во время операции — повторите (issue #307)"}
+
+    if foreign:
+        # Re-check пройден: решение свежее, чужие значения из `foreign` всё ещё на диске —
+        # теперь можно сохранять их в sidecar. _save() пишет строго SETTINGS; backup —
+        # отдельная атомарная запись тем же паттерном (tmp + replace).
+        try:
+            _backup_path().parent.mkdir(parents=True, exist_ok=True)
+            tmp = _backup_path().with_suffix(".json.tmp")
+            tmp.write_text(json.dumps({"env": foreign}, indent=2, ensure_ascii=False) + "\n",
+                           encoding="utf-8")
+            tmp.replace(_backup_path())
+        except (OSError, TypeError, ValueError) as exc:
+            return {"ok": False, "err": f"backup foreign value failed: {str(exc)[:150]}"}
     return _save(data)
 
 
