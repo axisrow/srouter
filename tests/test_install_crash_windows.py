@@ -236,19 +236,57 @@ def test_crash_between_intent_and_target_write_leaves_clean_system(tmp_path, mon
     )
 
 
-def test_backup_state_write_failure_blocks_before_touching_target(tmp_path, monkeypatch):
+@pytest.mark.parametrize("fail_on", [2, 3])
+def test_backup_state_write_failure_blocks_before_touching_target(tmp_path, monkeypatch, fail_on):
     """Fail-closed: не удалось записать state → apply обязан остановиться ДО мутации target.
 
     Если бы порядок был обратным (сначала target, потом state), отказ save_state потерял бы ссылку
     на уже созданный backup при живой перезаписи оригинала — тот же дефект A, просто без crash.
+    Параметризация по номеру падающей записи покрывает ОБА pre-target гейта (issue #293 структурно):
+      fail_on=2 — intent-гейт (_record_backup_intent): channels уже записаны, backup-файл УЖЕ лежит
+                  на диске (орфанный, легитимно: discover_backups его переоткроет), target ещё нет;
+      fail_on=3 — effect-гейт (_record_component_applied): backup + intent-entry на диске, target
+                  ещё нет. Оба возврата обязаны случиться раньше записи srouter-конфига в target.
     """
     env, config_path = _foreign_privoxy(tmp_path)
-    monkeypatch.setattr(install_config.local_state, "save_state", lambda *a, **k: None)
+    original_save = install_config.local_state.save_state
+    calls = {"n": 0}
+
+    def failing_nth_save(state, **kwargs):
+        calls["n"] += 1
+        if calls["n"] >= fail_on:  # 1 — channels, 2 — backup-intent, 3 — эффект privoxy
+            return None
+        return original_save(state, **kwargs)
+
+    monkeypatch.setattr(install_config.local_state, "save_state", failing_nth_save)
 
     result = _apply_overwrite_privoxy(env)
 
     assert result["ok"] is False
-    assert "privoxy_backup_state_write_failed" in result["blocked"]
+    assert "state_write_failed" in result["blocked"][-1]
+    backups = list(config_path.parent.glob("config.srouter-backup-*"))
+    assert backups, "backup создан на диске до отказавшей state-записи (fail_on=%d)" % fail_on
+    if fail_on == 2:
+        # intent-гейт (дефект A): backup на диске, state-ссылки нет → apply обязан остановиться
+        # ДО мутации target — иначе перезапись оригинала с потерянной ссылкой.
+        assert config_path.read_text(encoding="utf-8") == "foreign config\n", (
+            "target не должен мутироваться, если state не смог зафиксировать ссылку на backup"
+        )
+        assert install_lib.MARKER not in config_path.read_text(encoding="utf-8")
+    else:
+        # effect-гейт: intent-запись уже в state (ссылка зафиксирована), target уже перезаписан —
+        # это честное состояние (orphaned_backup, rollback возможен), обрыв именно на effect-записи.
+        assert _entry(env).get("backup") == str(backups[0]), (
+            "intent-запись (ссылка на backup) обязана быть в state до effect-записи"
+        )
+        assert install_lib.MARKER in config_path.read_text(encoding="utf-8")
+
+    # Оба отказа оставляют систему в классифицируемом component_facts состоянии — rollback корректен
+    # (fail-closed save_state активен только для install-фазы).
+    monkeypatch.undo()
+    result_un = install_lib.apply_uninstall(env=env, confirmations={"configs": True}, runner=FakeRunner())
+    assert result_un["ok"] is True
+    assert result_un["leftover"] == []
     assert config_path.read_text(encoding="utf-8") == "foreign config\n", (
         "target не должен мутироваться, если state не смог зафиксировать ссылку на backup"
     )
@@ -952,7 +990,13 @@ def test_uninstall_stops_service_and_resets_dns_for_orphaned_backup(tmp_path, mo
     # ЧТО именно лежит в state к моменту обрыва, не смысл проверки managed/restorable гейта ниже.
     entry_at_crash = _entry(env)
     assert entry_at_crash.get("backup"), "state-first (часть 2/2) уже знает про backup к этой точке"
-    assert "management" not in entry_at_crash, "голый intent-entry не несёт management (часть 2/2)"
+    # issue #293: effect-запись mode/provenance стоит ПОСЛЕ restart'а, так что обрыв ровно в его
+    # call-site оставляет голый intent-entry (без management) — rollback всё равно корректен через
+    # orphaned_backup (гейт managed or restorable проходит в обоих случаях). Полный эффект (включая
+    # запись) покрывает test_crash_after_restart_persists_managed_entry_at_effect_time.
+    assert "management" not in entry_at_crash, (
+        "голый intent-entry не несёт management — effect-запись следует за restart'ом"
+    )
 
     uninstall_runner = FakeRunner()
     result = install_lib.apply_uninstall(
@@ -1021,9 +1065,11 @@ def test_uninstall_resets_dns_for_orphaned_backup_dnsmasq(tmp_path, monkeypatch)
                                  if install_config.NETWORKSETUP in c and "127.0.0.1" in c]
     assert dns_calls_during_install, "install реально применил DNS=127.0.0.1 до обрыва"
     stale_entry = _entry(env, "dnsmasq")
-    assert stale_entry.get("management", {}).get("mode") == "skipped", (
-        "state-entry несёт mode ИЗ BOOTSTRAP'а (skipped) — второй apply оборвался ДО финальной "
-        "записи, значит его managed='overwrote' entry не попал в state вовсе"
+    # issue #293 структурно: раньше entry нёс mode из BOOTSTRAP'а (skipped — второй apply оборвался
+    # до финальной записи). Теперь полный эффект компонента (config+restart) фиксирует managed
+    # сразу — ДО _apply_dns, который идёт следом в той же итерации.
+    assert stale_entry.get("management", {}).get("mode") == "managed", (
+        "эффект-запись (issue #293): mode/provenance dnsmasq фиксируются сразу после restart'а"
     )
 
     uninstall_runner = _WifiAwareRunner()
@@ -1053,10 +1099,9 @@ def test_uninstall_resets_dns_for_orphaned_backup_dnsmasq(tmp_path, monkeypatch)
 #
 # issue #293: (а) закрыт композицией части 2/2 (state-first, PR #294) + not_before симметрично на
 # stated backup — _record_backup_intent пишет ссылку сразу после создания backup, entry больше не
-# замерзает на устаревшем pointer. (б) закрыт точечно: _restore_dns переоткрывает wifi_service вживую
-# через runner (_discover_network), когда state['network']['channels'] пуст, а компонент managed/
-# restorable — симметрично тому, как discover_backups уже переоткрывает backup'ы вместо доверия одной
-# state-записи.
+# замерзает на устаревшем pointer. (б) закрыт точечно (#295: live-discovery в _restore_dns), затем
+# СТРУКТУРНО: effect-time записи (секция ниже) — каждый side-effect фиксирует свой результат в state
+# сразу, финальная запись стала сверкой; точечные фиксы остаются defense-in-depth.
 
 
 def test_stale_restored_backup_pointer_loses_user_edits_after_manual_edit(tmp_path, monkeypatch):
@@ -1133,11 +1178,11 @@ def test_cold_start_crash_after_apply_dns_leaves_dns_broken_reported_ok(tmp_path
     state.network уже заполнен от предыдущего успешного apply), здесь state_path вообще не существует
     до этого apply — типичный первый запуск install на чистой машине.
 
-    Примечание (issue #293): с state-first (часть 2/2, PR #294) state-файл к моменту обрыва уже может
-    существовать — _record_backup_intent пишет голый backup-pointer entry ДО _apply_dns, когда у
-    dnsmasq есть что бэкапить (foreign config, choice=overwrite). Это не регрессия холодного старта:
-    важное для этого сценария свойство — что state['network']['channels'] так и остался пустым,
-    именно это и проверяем.
+    Примечание (issue #293): с effect-time записями (структурный фикс) channels пишутся сразу после
+    preflight — на холодном старте они к моменту обрыва УЖЕ в state, поэтому _restore_dns читает
+    канал из state, а не через live-discovery. Сценарий «канал утрачен из state» (деградация) +
+    сбой discovery отдельно покрывает следующий тест; сам live-discovery fallback в _restore_dns
+    остаётся defense-in-depth.
     """
     env = _env(tmp_path)
     assert not env.state_path.exists(), "precondition: ни одного успешного apply раньше не было"
@@ -1159,10 +1204,10 @@ def test_cold_start_crash_after_apply_dns_leaves_dns_broken_reported_ok(tmp_path
                                  if install_config.NETWORKSETUP in c and "127.0.0.1" in c]
     assert dns_calls_during_install, "install реально применил DNS=127.0.0.1 до обрыва"
     state_after_crash = local_state.load_state(path=env.state_path) or {}
-    assert not state_after_crash.get("network", {}).get("channels"), (
-        "холодный старт: network.channels никогда не был записан (пишется только финальной "
-        "_write_state_after_apply) — это и есть предпосылка, которую _restore_dns обязан пережить"
-    )
+    # issue #293 структурно: channels пишутся сразу после preflight, так что к точке обрыва они
+    # УЖЕ в state — rollback читает канал из памяти, live-discovery не нужен. _restore_dns обязан
+    # пережить и деградацию (пустой channels, см. следующий тест), но штатный путь теперь state-first.
+    assert state_after_crash.get("network", {}).get("channels", {}).get("wifi_service") == "Wi-Fi"
 
     uninstall_runner = _WifiAwareRunner()
     result = install_lib.apply_uninstall(
@@ -1177,6 +1222,143 @@ def test_cold_start_crash_after_apply_dns_leaves_dns_broken_reported_ok(tmp_path
     assert dns_reset_calls, (
         "DNS обязан быть сброшен даже когда state['network']['channels'] пуст (холодный старт) — "
         "иначе dnsmasq остановлен, а DNS всё ещё указывает на 127.0.0.1, при report ok=True"
+    )
+
+
+# ==================================================================================================
+# issue #293, структурный фикс (write-близко-к-side-effect). Три раунда cycle-review PR #290 нашлись
+# ПО ОДНОМУ полю за раунд (backup discovery → mode → managed-гейт → backup-pointer → network.channels)
+# в одной и той же модели: _write_state_after_apply пишет весь detected_environment/network ОДНИМ махом
+# в КОНЦЕ apply_install, а поля трактуются как proof of recency для side-effect'ов, случившихся
+# РАНЬШЕ этой записи. Список полей открытый — точечные фиксы (#294 state-first для backup, #295
+# live-discovery DNS) закрыли экземпляры, не класс. Структурный шаг: каждый side-effect фиксирует
+# свой результат в state СРАЗУ после свершения (discovery-каналы — сразу после preflight; entry
+# компонента — сразу после config-write+restart; launchagent — сразу после установки), а финальная
+# запись становится СВЕРКОЙ (idempotent reconciliation), не единственным источником.
+
+
+def test_crash_after_restart_persists_managed_entry_at_effect_time(tmp_path, monkeypatch):
+    """Обрыв ПОСЛЕ полного эффекта компонента (config-write + restart) → entry уже managed.
+
+    Раньше entry оставался голым {config_path, backup} (_record_backup_intent) до самой финальной
+    записи: mode/provenance/created_at существовали только в локальных переменных apply_install и
+    испарялись при обрыве — следующее поле того же класса (любое будущее в detected_environment)
+    требовало бы очередного раунда. Теперь сам эффект дописывает свою форму владения сразу.
+    """
+    env, config_path = _foreign_privoxy(tmp_path)
+    # crash-точка — сама effect-запись (не _restart_component: обрыв в его call-site минует и запись,
+    # и всё, что за ней). Запись успевает отработать, финальная сверка — нет.
+    _crash_after(monkeypatch, "_record_component_applied")
+    runner = FakeRunner()
+    with pytest.raises(_Crash):
+        _apply_overwrite_privoxy(env)
+
+    entry = _entry(env)
+    assert entry.get("management", {}).get("mode") == "managed", (
+        "эффект 'компонент переведён на srouter-конфиг' обязан быть записан в state сразу после "
+        "restart'а, а не батчиться в финальную запись (issue #293, структурный фикс)"
+    )
+    assert entry.get("management", {}).get("provenance") == "overwrote"
+    assert entry.get("backup"), "эффект-запись несёт тот же backup, что и intent-запись"
+
+    # И end-to-end: rollback по такой записи корректен без участия финальной записи.
+    result = install_lib.apply_uninstall(env=env, confirmations={"configs": True}, runner=FakeRunner())
+    assert result["ok"] is True
+    assert config_path.read_text(encoding="utf-8") == "foreign config\n"
+
+
+def test_cold_start_crash_persists_network_channels_at_effect_time(tmp_path, monkeypatch):
+    """P1b структурно: discovery-каналы пишутся в state ДО любых мутаций, на холодном старте тоже.
+
+    channels — факт discovery (build_plan), а не финального apply: писать их в state нужно там же,
+    где они открыты. Тогда ЛЮБОЙ обрыв после preflight оставляет rollback-уровню (DNS) знание о
+    канале — независимо от того, дошёл ли _apply_dns до финальной записи.
+    """
+    env = _env(tmp_path)
+    assert not env.state_path.exists(), "precondition: холодный старт"
+
+    _write_config_without_marker(env, "privoxy")
+    dnsmasq_config = env.component_paths("dnsmasq")["config"]
+    dnsmasq_config.parent.mkdir(parents=True, exist_ok=True)
+    dnsmasq_config.write_text("foreign dnsmasq config\n", encoding="utf-8")
+
+    _crash_after(monkeypatch, "_apply_dns")
+    runner = _WifiAwareRunner()
+    with pytest.raises(_Crash):
+        install_lib.apply_install(
+            env=env, confirm=True,
+            choices={"privoxy": "skip", "xray": "skip", "dnsmasq": "overwrite"},
+            runner=runner, port_checker=_port_checker_managed_up(runner.calls))
+
+    state_after_crash = local_state.load_state(path=env.state_path) or {}
+    assert state_after_crash.get("network", {}).get("channels", {}).get("wifi_service") == "Wi-Fi", (
+        "discovery-факт (wifi_service) обязан быть в state сразу после preflight apply — ДО любых "
+        "side-effect'ов, иначе холодный старт при обрыве оставляет rollback без знания канала"
+    )
+
+
+def test_crash_after_launchagent_install_persists_launchagent_entry(tmp_path, monkeypatch):
+    """launchagent — такой же side-effect, как компонент: фиксируется сразу после установки."""
+    env, _config_path = _foreign_privoxy(tmp_path)
+    _crash_after(monkeypatch, "_record_launchagent_applied")
+    with pytest.raises(_Crash):
+        _apply_overwrite_privoxy(env)
+
+    entry = _entry(env, "launchagent")
+    assert entry.get("management", {}).get("mode") == "managed", (
+        "установленный LaunchAgent обязан быть зафиксирован в state сразу после установки — "
+        "обрыв до финальной записи не должен терять факт его существования"
+    )
+    assert entry.get("last_loaded_at") == env.now
+
+
+def test_component_effect_state_write_failure_blocks_apply(tmp_path, monkeypatch):
+    """Fail-closed: отказ записи эффекта компонента прерывает apply (симметрично _record_backup_intent)."""
+    env, _config_path = _foreign_privoxy(tmp_path)
+    original_save = install_config.local_state.save_state
+    calls = {"n": 0}
+
+    def failing_third_save(state, **kwargs):
+        calls["n"] += 1
+        if calls["n"] >= 3:  # 1 — channels, 2 — backup-intent, 3 — эффект privoxy
+            return None
+        return original_save(state, **kwargs)
+
+    monkeypatch.setattr(install_config.local_state, "save_state", failing_third_save)
+
+    result = _apply_overwrite_privoxy(env)
+
+    assert result["ok"] is False
+    assert "privoxy_state_write_failed" in result["blocked"], result
+
+
+def test_final_state_write_is_reconciliation_not_new_facts(tmp_path):
+    """Финальная _write_state_after_apply — сверка: повтор поверх уже записанного ничего не меняет.
+
+    После структурного фикса все содержательные факты (компоненты, network, launchagent) уже в state
+    от effect-time записей; финальный проход обязан быть idempotent-пересчётом тех же значений, а не
+    источником новых. Байт-в-байт равенство JSON — сильнейшая форма этого инварианта.
+    """
+    env, config_path = _foreign_privoxy(tmp_path)
+    runner = FakeRunner()
+    result = install_lib.apply_install(
+        env=env, confirm=True,
+        choices={"privoxy": "overwrite", "xray": "skip", "dnsmasq": "skip"},
+        runner=runner, port_checker=_port_checker_managed_up(runner.calls))
+    assert result["ok"] is True
+    before = env.state_path.read_text(encoding="utf-8")
+
+    entry = json.loads(before)["detected_environment"]["privoxy"]
+    rerun = install_config._write_state_after_apply(
+        env, result["plan"],
+        modes={"privoxy": "managed", "xray": "skipped", "dnsmasq": "skipped"},
+        backups={"privoxy": entry["backup"]},
+        launchagent_action={"component": "launchagent", "mode": "managed", "changed": True})
+    assert rerun == ""
+
+    assert env.state_path.read_text(encoding="utf-8") == before, (
+        "повторная финальная запись обязана быть идемпотентной сверкой (reconciliation), а не "
+        "вторым источником фактов — иначе расхождение effect-time и финальной записей = новый класс"
     )
 
 
@@ -1220,10 +1402,15 @@ def test_cold_start_dns_discovery_failure_is_not_silently_reported_ok(tmp_path, 
             runner=runner, port_checker=_port_checker_managed_up(runner.calls))
 
     state_after_crash = local_state.load_state(path=env.state_path) or {}
-    assert not state_after_crash.get("network", {}).get("channels"), (
-        "precondition: холодный старт — network.channels пуст, _restore_dns обязан переоткрыть "
-        "wifi_service вживую через _discover_network"
+    # issue #293 структурно: холодный старт больше не оставляет channels пустым (effect-time запись).
+    # Но guard #295 остаётся defense-in-depth для ДЕГРАДАЦИИ state — здесь моделируем именно её:
+    # channels утрачены из state (отказ записи/ручная порча), discovery при uninstall тоже деградировал.
+    assert state_after_crash.get("network", {}).get("channels", {}).get("wifi_service") == "Wi-Fi", (
+        "precondition: effect-time запись каналов уже сработала — деградацию моделируем явно ниже"
     )
+    degraded = json.loads(env.state_path.read_text(encoding="utf-8"))
+    degraded["network"] = {"channels": {}}
+    env.state_path.write_text(json.dumps(degraded), encoding="utf-8")
 
     uninstall_runner = _DiscoveryFailingRunner()
     result = install_lib.apply_uninstall(

@@ -340,13 +340,14 @@ def _restore_dns(plan, runner):
     channels = plan.get("network", {}).get("channels") if isinstance(plan.get("network"), dict) else {}
     service = channels.get("wifi_service") if isinstance(channels, dict) else ""
     if not service:
-        # issue #293 (P1b, cycle-review round 3 PR #290): холодный старт — на первом-ever apply
-        # state-файл ещё не существует, поэтому state['network']['channels'] никогда не был записан
-        # (пишется только финальной _write_state_after_apply в конце apply_install), хотя _apply_dns
-        # реально мог успеть выполниться до обрыва. Симметрично тому, как discover_backups уже
-        # переоткрывает backup'ы вживую вместо доверия одной state-записи: здесь для restorable/managed
-        # компонента переоткрываем wifi_service вживую через runner, а не молча no-op'имся на пустой
-        # кэш — иначе dnsmasq останавливается, а DNS так и указывает на 127.0.0.1 под видом успеха.
+        # issue #293 (P1b, cycle-review round 3 PR #290; структурный фикс — effect-time записи):
+        # штатно channels пишутся effect-time сразу после preflight apply, так что холодный старт
+        # больше не оставляет их пустыми. Но state может деградировать (отказ записи канала, ручная
+        # порча, state старее фикса) — тогда _apply_dns реально мог успеть выполниться до обрыва,
+        # а канал нигде не записан. Симметрично тому, как discover_backups уже переоткрывает
+        # backup'ы вживую вместо доверия одной state-записи: здесь для restorable/managed компонента
+        # переоткрываем wifi_service вживую через runner, а не молча no-op'имся на пустой кэш —
+        # иначе dnsmasq останавливается, а DNS так и указывает на 127.0.0.1 под видом успеха.
         discovered = _discover_network(runner)
         service = discovered.get("channels", {}).get("wifi_service", "")
         if not service and not discovered.get("services_probe", {}).get("ok", True):

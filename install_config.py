@@ -532,6 +532,29 @@ def _backup(path, env):
         return ""
 
 
+def _record_state_effect(env, mutate):
+    """Единый примитив effect-time записи state (issue #293, структурный фикс).
+
+    Канон two-phase (AGENTS.md) в форме write-близко-к-side-effect: каждый side-effect apply_install
+    фиксирует свой УЖЕ СВЕРШИВШИЙСЯ результат в state сразу (load → mutate → save), а не батчит его
+    в финальную _write_state_after_apply. Три раунда cycle-review PR #290 находили по одному полю за
+    раунд в одной модели («финальная запись как proof of recency для фактов, случившихся раньше») —
+    список полей открытый, поэтому закрыт СЛОЙ, а не поле.
+
+    FAIL-CLOSED: не удалось прочитать/записать state → вызывающий обязан прервать apply; продолжать
+    side-effect'ы, чья rollback-история не фиксируется, нельзя (та же граница, что _record_backup_intent).
+
+    Возвращает "" при успехе, иначе код ошибки ("state_unreadable" | "state_write_failed").
+    """
+    state, readable = local_state.load_state_checked(path=env.state_path)
+    if not readable:
+        return "state_unreadable"
+    mutate(state)
+    if local_state.save_state(state, path=env.state_path) is None:
+        return "state_write_failed"
+    return ""
+
+
 def _record_backup_intent(env, name, config_path, backup):
     """State-first (issue #124, часть 2/2): зафиксировать ссылку на backup ДО мутации target.
 
@@ -559,25 +582,24 @@ def _record_backup_intent(env, name, config_path, backup):
     а promote заводит собственное окно, требующее своего патча (так в PR #119 родился F1). Здесь же
     фиксируется факт, который УЖЕ случился и подтверждён на диске (shutil.copy2 отработал) — факт не
     нуждается в промоушене, только в том, чтобы быть записанным раньше, чем станет незаменимым.
+    С issue #293 это не отдельный приём, а первый экземпляр общего слоя _record_state_effect:
+    каждый side-effect пишет свой результат сам, финальная запись — сверка.
 
     FAIL-CLOSED: не удалось прочитать/записать state → вызывающий обязан прервать apply ДО мутации
     target — иначе конфиг пользователя был бы перезаписан, а ссылку на его копию восстановить неоткуда.
 
     Возвращает "" при успехе, иначе код ошибки ("state_unreadable" | "state_write_failed").
     """
-    state, readable = local_state.load_state_checked(path=env.state_path)
-    if not readable:
-        return "state_unreadable"
-    detected = state.get("detected_environment") if isinstance(state.get("detected_environment"), dict) else {}
-    prev = detected.get(name) if isinstance(detected.get(name), dict) else {}
-    entry = dict(prev)  # merge: если prev уже нёс management (idempotent/reclaimable) — не сносим его
-    entry["config_path"] = str(config_path)
-    entry["backup"] = str(backup)
-    detected[name] = entry
-    state["detected_environment"] = detected
-    if local_state.save_state(state, path=env.state_path) is None:
-        return "state_write_failed"
-    return ""
+    def mutate(state):
+        detected = state.get("detected_environment") if isinstance(state.get("detected_environment"), dict) else {}
+        prev = detected.get(name) if isinstance(detected.get(name), dict) else {}
+        entry = dict(prev)  # merge: если prev уже нёс management (idempotent/reclaimable) — не сносим его
+        entry["config_path"] = str(config_path)
+        entry["backup"] = str(backup)
+        detected[name] = entry
+        state["detected_environment"] = detected
+
+    return _record_state_effect(env, mutate)
 
 
 def _parse_backup_stamp(name):
@@ -770,7 +792,137 @@ def _management_for(mode, item, *, provenance=None):
     }
 
 
+def _applied_component_entry(prev, item, mode, backup, *, now):
+    """Единственный редьюсер entry компонента в detected_environment после его apply-эффекта.
+
+    ОБЩИЙ СЛОЙ (issue #293, структурный фикс): эту форму раньше вычисляла ТОЛЬКО финальная
+    _write_state_after_apply — теперь её же вычисляет effect-time _record_component_applied сразу
+    после config-write+restart. Одна реализация для обоих писателей — иначе расхождение двух
+    реализаций одной истины (корневой класс #110/#124) воспроизвелось бы на новом уровне.
+
+    provenance (issue #112 Часть 1): только для managed. backup truthy ⟺ config существовал до
+    install (needs_backup): created = свежий с нуля, overwrote = перезаписан чужой.
+    """
+    provenance = None
+    if mode == "managed":
+        provenance = "overwrote" if backup else "created"
+    # cycle-review cloud (@bbc356a) P1: idempotent reinstall НЕ должен терять существующий backup/provenance.
+    # Если этот apply не создавал/не перезаписывал файл (backup пуст — target уже marker-managed,
+    # не конфликт) НО prev уже managed с backup — preserve prev.backup/provenance. Иначе _management_for
+    # перезаписывал entry → provenance='created' + backup утерян → следующий uninstall УДАЛЯЛ srouter-config
+    # вместо restore пользовательского оригинала (потеря в цикле install→reinstall→uninstall).
+    # cycle-review cloud round 2 (@307bb34) P1: path-ownership guard. Preserve ТОЛЬКО когда prev.config_path
+    # совпадает с текущим item.config_path. Смена --prefix (A→B): prev под путём A, текущий B → backup A НЕ
+    # переносится на B (иначе uninstall restore'ит A's foreign-конфиг в B, обход path-ownership, cycle-review
+    # #111 finding 1). Привязка ownership к пути — тот же канон, что _inspect_component state_owns_path.
+    prev_same_path = (str(Path(prev.get("config_path") or "")) == str(item.get("config_path"))
+                      if prev.get("config_path") else False)
+    # issue #124 (F3/P1-2), часть 2/2: backup — свойство ПРОШЛОГО (файл .srouter-backup-* лежит
+    # на диске и не исчезает от смены режима), provenance — свойство ТЕКУЩЕГО apply (создали/
+    # перезаписали именно сейчас). Поэтому carried_backup вычисляется по одному-единственному
+    # ограничителю (prev_same_path — path-ownership guard, cycle-review #111 finding 1) и НЕ
+    # гейтится mode=='managed': раньше обе ветки preserve гейтились managed, и повторный apply со
+    # skip/adopt после оборванного overwrite перезаписывал entry БЕЗ backup — оригинал пользователя
+    # осиротевал, хотя его копия лежала рядом с target (_record_backup_intent пишет голый entry
+    # без management, поэтому _is_managed_entry(prev) на нём ложен — гейтить backup-ветку им нельзя).
+    # provenance-ветка гейт managed СОХРАНЯЕТ: при skip/adopt действия «создали/перезаписали» не
+    # было, поле неприменимо (test_install_skipped_has_no_provenance) и не влияет на классификацию
+    # component_facts для не-managed entry — писать его значило бы плодить противоречивый мусор.
+    carried_backup = prev.get("backup") if prev_same_path else None
+    if mode == "managed" and not backup and _is_managed_entry(prev) and carried_backup:
+        provenance = _provenance_of(prev) or "overwrote"
+    entry = _management_for(mode, item, provenance=provenance)
+    backup_ref = backup or carried_backup
+    if backup_ref:
+        entry["backup"] = backup_ref
+    # cycle-review PR #290 (Codex + /review, независимо): created_at — нижняя граница возраста
+    # backup'а, который discover_backups вправе засчитать за «доказательство overwrite ЭТОГО
+    # install». Без неё retained backup (сохраняется НАМЕРЕННО, user_data_retained) от давно
+    # завершённого install→uninstall цикла неотличим от backup'а текущего цикла: пользователь
+    # вручную удаляет восстановленный файл, следующий install создаёт конфиг с нуля
+    # (provenance='created', backup не пишется), а uninstall всё ещё находит СТАРЫЙ backup рядом
+    # и восстанавливает устаревший чужой контент вместо удаления свежесозданного конфига.
+    # Пишем только при 'created' — тем самым фиксируя момент, раньше которого валидных backup'ов
+    # для ЭТОГО конфига быть не может; 'overwrote' в этой границе не нуждается (backup уже
+    # известен по имени). Idempotent reinstall (той же строкой provenance) обязан СОХРАНИТЬ
+    # исходный created_at, а не обновлять его на новый now — иначе повторный install молча
+    # расширял бы окно доверия и снова впускал тот же старый backup.
+    if provenance == "created":
+        entry["created_at"] = (
+            prev.get("created_at")
+            if mode == "managed" and _is_managed_entry(prev) and prev_same_path and prev.get("created_at")
+            else now
+        )
+    return entry
+
+
+def _launchagent_entry(launchagent, now):
+    """Форма detected_environment.launchagent (общий слой effect-time записи и финальной сверки)."""
+    return {
+        "label": launchagent.get("label"),
+        "plist_path": launchagent.get("plist_path"),
+        "dashboard_path": launchagent.get("dashboard_path"),
+        "python_bin": launchagent.get("python_bin"),
+        "management": {"mode": "managed", "managed": True},
+        "last_loaded_at": now,
+    }
+
+
+def _record_network_channels(env, network):
+    """Effect-time запись discovery-факта (network.channels) — ДО любых side-effect'ов apply.
+
+    Каналы открываются в build_plan (discovery), и это факт о мире независимо от того, докатится ли
+    apply до финальной записи. Раньше channels писались ТОЛЬКО в конце: холодный старт (state-файла
+    ещё нет) + обрыв после _apply_dns = DNS реально указан на 127.0.0.1, а state не знает канала —
+    rollback молча no-op'ился (issue #293 P1b, точечно закрыт #295 live-discovery; здесь закрыт
+    СЛОЙ: знание пишется там же, где открыто). Fail-closed: отказ записи прерывает apply.
+    """
+    def mutate(state):
+        merged = state.get("network") if isinstance(state.get("network"), dict) else {}
+        merged.update(network or {})
+        state["network"] = merged
+
+    return _record_state_effect(env, mutate)
+
+
+def _record_component_applied(env, name, item, mode, backup):
+    """Effect-time запись формы владения компонента сразу после config-write+restart.
+
+    mode/provenance/created_at существовали только в локальных переменных apply_install до финальной
+    записи — обрыв испарял их, и каждое новое поле того же класса требовало очередного раунда
+    cycle-review (issue #293 диагноз). Теперь эффект дописывает свою форму сам через ОБЩИЙ редьюсер
+    _applied_component_entry — та же форма, которую сверит финальная запись.
+    """
+    def mutate(state):
+        detected = state.get("detected_environment") if isinstance(state.get("detected_environment"), dict) else {}
+        prev = detected.get(name) if isinstance(detected.get(name), dict) else {}
+        detected[name] = _applied_component_entry(prev, item, mode, backup, now=env.now)
+        state["detected_environment"] = detected
+
+    return _record_state_effect(env, mutate)
+
+
+def _record_launchagent_applied(env, plan):
+    """Effect-time запись факта установки LaunchAgent (симметрично _record_component_applied)."""
+    launchagent = plan.get("launchagent") or {}
+
+    def mutate(state):
+        detected = state.get("detected_environment") if isinstance(state.get("detected_environment"), dict) else {}
+        detected["launchagent"] = _launchagent_entry(launchagent, env.now)
+        state["detected_environment"] = detected
+
+    return _record_state_effect(env, mutate)
+
+
 def _write_state_after_apply(env, plan, modes, backups, launchagent_action=None):
+    """Финальная СВЕРКА state (reconciliation), не единственный источник фактов (issue #293).
+
+    После структурного фикса каждый side-effect уже записал свой результат (_record_backup_intent,
+    _record_network_channels, _record_component_applied, _record_launchagent_applied); здесь те же
+    значения пересчитываются теми же редьюсерами (_applied_component_entry/_launchagent_entry) —
+    запись идемпотентна и не изобретает новых фактов. Единственное содержательно новое здесь —
+    bookkeeping без side-effect-семантики: brew/last_checked_at/runtime.last_apply.
+    """
     state, readable = local_state.load_state_checked(path=env.state_path)
     if not readable:
         return "state_unreadable"
@@ -784,69 +936,9 @@ def _write_state_after_apply(env, plan, modes, backups, launchagent_action=None)
             detected[name] = dict(prev)
             detected[name]["service"] = "protected-system"
             continue
-        # provenance (issue #112 Часть 1): только для managed. backups[name] truthy ⟺ config существовал
-        # до install (apply_install needs_backup требует config_path.exists() → _backup вызван).
-        # created = нет backup (fresh install с нуля), overwrote = есть backup (перезаписан чужой).
-        provenance = None
-        if mode == "managed":
-            provenance = "overwrote" if backups.get(name) else "created"
-        # cycle-review cloud (@bbc356a) P1: idempotent reinstall НЕ должен терять существующий backup/provenance.
-        # Если этот apply не создавал/не перезаписывал файл (backups[name] пуст — target уже marker-managed,
-        # не конфликт) НО prev уже managed с backup — preserve prev.backup/provenance. Иначе _management_for
-        # перезаписывал entry → provenance='created' + backup утерян → следующий uninstall УДАЛЯЛ srouter-config
-        # вместо restore пользовательского оригинала (потеря в цикле install→reinstall→uninstall).
-        # cycle-review cloud round 2 (@307bb34) P1: path-ownership guard. Preserve ТОЛЬКО когда prev.config_path
-        # совпадает с текущим item.config_path. Смена --prefix (A→B): prev под путём A, текущий B → backup A НЕ
-        # переносится на B (иначе uninstall restore'ит A's foreign-конфиг в B, обход path-ownership, cycle-review
-        # #111 finding 1). Привязка ownership к пути — тот же канон, что _inspect_component state_owns_path.
-        prev_same_path = (str(Path(prev.get("config_path") or "")) == str(item.get("config_path"))
-                          if prev.get("config_path") else False)
-        # issue #124 (F3/P1-2), часть 2/2: backup — свойство ПРОШЛОГО (файл .srouter-backup-* лежит
-        # на диске и не исчезает от смены режима), provenance — свойство ТЕКУЩЕГО apply (создали/
-        # перезаписали именно сейчас). Поэтому carried_backup вычисляется по одному-единственному
-        # ограничителю (prev_same_path — path-ownership guard, cycle-review #111 finding 1) и НЕ
-        # гейтится mode=='managed': раньше обе ветки preserve гейтились managed, и повторный apply со
-        # skip/adopt после оборванного overwrite перезаписывал entry БЕЗ backup — оригинал пользователя
-        # осиротевал, хотя его копия лежала рядом с target (_record_backup_intent пишет голый entry
-        # без management, поэтому _is_managed_entry(prev) на нём ложен — гейтить backup-ветку им нельзя).
-        # provenance-ветка гейт managed СОХРАНЯЕТ: при skip/adopt действия «создали/перезаписали» не
-        # было, поле неприменимо (test_install_skipped_has_no_provenance) и не влияет на классификацию
-        # component_facts для не-managed entry — писать его значило бы плодить противоречивый мусор.
-        carried_backup = prev.get("backup") if prev_same_path else None
-        if mode == "managed" and not backups.get(name) and _is_managed_entry(prev) and carried_backup:
-            provenance = _provenance_of(prev) or "overwrote"
-        detected[name] = _management_for(mode, item, provenance=provenance)
-        backup_ref = backups.get(name) or carried_backup
-        if backup_ref:
-            detected[name]["backup"] = backup_ref
-        # cycle-review PR #290 (Codex + /review, независимо): created_at — нижняя граница возраста
-        # backup'а, который discover_backups вправе засчитать за «доказательство overwrite ЭТОГО
-        # install». Без неё retained backup (сохраняется НАМЕРЕННО, user_data_retained) от давно
-        # завершённого install→uninstall цикла неотличим от backup'а текущего цикла: пользователь
-        # вручную удаляет восстановленный файл, следующий install создаёт конфиг с нуля
-        # (provenance='created', backup не пишется), а uninstall всё ещё находит СТАРЫЙ backup рядом
-        # и восстанавливает устаревший чужой контент вместо удаления свежесозданного конфига.
-        # Пишем только при 'created' — тем самым фиксируя момент, раньше которого валидных backup'ов
-        # для ЭТОГО конфига быть не может; 'overwrote' в этой границе не нуждается (backup уже
-        # известен по имени). Idempotent reinstall (той же строкой provenance) обязан СОХРАНИТЬ
-        # исходный created_at, а не обновлять его на новый env.now — иначе повторный install молча
-        # расширял бы окно доверия и снова впускал тот же старый backup.
-        if provenance == "created":
-            detected[name]["created_at"] = (
-                prev.get("created_at")
-                if mode == "managed" and _is_managed_entry(prev) and prev_same_path and prev.get("created_at")
-                else env.now
-            )
+        detected[name] = _applied_component_entry(prev, item, mode, backups.get(name), now=env.now)
     if launchagent_action:
-        launchagent = plan.get("launchagent") or {}
-        detected["launchagent"] = {
-            "label": launchagent.get("label"),
-            "plist_path": launchagent.get("plist_path"),
-            "dashboard_path": launchagent.get("dashboard_path"),
-            "python_bin": launchagent.get("python_bin"),
-            "management": {"mode": "managed", "managed": True},
-            "last_loaded_at": env.now,
-        }
+        detected["launchagent"] = _launchagent_entry(plan.get("launchagent") or {}, env.now)
     detected["brew"] = plan.get("homebrew")
     detected["last_checked_at"] = env.now
     state["detected_environment"] = detected
@@ -907,6 +999,13 @@ def apply_install(env=None, *, confirm=False, choices=None, runner=run, port_che
     needs_brew = any(mode == "managed" for mode in modes.values())
     if needs_brew and not plan.get("homebrew", {}).get("available"):
         return {"ok": False, "blocked": ["homebrew_missing"], "actions": [], "plan": plan}
+
+    # issue #293 (структурный фикс): discovery-факт (network.channels) фиксируется ПЕРВЫМ — до любых
+    # мутаций. Все preflight-гейты выше уже прошли: дальше apply собирается мутировать мир, и знание,
+    # нужное rollback'у (канал DNS), обязано быть в state раньше первого side-effect'а.
+    channels_error = _record_network_channels(env, plan.get("network"))
+    if channels_error:
+        return {"ok": False, "blocked": [channels_error], "actions": [], "plan": plan}
 
     actions = []
     backups = {}
@@ -979,6 +1078,15 @@ def apply_install(env=None, *, confirm=False, choices=None, runner=run, port_che
         restart = _restart_component(name, runner, port_checker=port_checker)
         if restart.get("timeout") or restart.get("rc") != 0:
             return {"ok": False, "blocked": [f"{name}_restart_failed"], "actions": actions, "plan": plan}
+        # issue #293 (структурный фикс): полный эффект компонента (config+restart) фиксирует форму
+        # владения (mode/provenance/created_at/backup) СРАЗУ — до _apply_dns и до следующих
+        # компонентов, не дожидаясь финальной сверки. Записано ровно то, что уже произошло:
+        # маркер на диске подтверждает владение, значит claim managed честен (#110 Дефект 1 не
+        # воспроизводится). Fail-closed: не зафиксировано — не продолжаем.
+        effect_error = _record_component_applied(env, name, item, mode, backups.get(name))
+        if effect_error:
+            return {"ok": False, "blocked": [f"{name}_state_write_failed"], "error": effect_error,
+                    "actions": actions, "plan": plan}
         if name == "dnsmasq":
             _apply_dns(env, plan, runner)
         actions.append({"component": name, "mode": mode, "changed": True})
@@ -988,6 +1096,12 @@ def apply_install(env=None, *, confirm=False, choices=None, runner=run, port_che
         launchagent_ok, launchagent_error = _install_launchagent(env, runner)
         if not launchagent_ok:
             return {"ok": False, "blocked": [launchagent_error], "actions": actions, "plan": plan}
+        # Префикс стадии — симметрично {name}_state_write_failed у компонентов: blocked-код обязан
+        # быть самодостаточным (отказ effect-записи launchagent ≠ отказ финальной сверки в логе).
+        la_state_error = _record_launchagent_applied(env, plan)
+        if la_state_error:
+            return {"ok": False, "blocked": [f"launchagent_{la_state_error}"],
+                    "error": la_state_error, "actions": actions, "plan": plan}
         launchagent_action = {"component": "launchagent", "mode": "managed", "changed": True}
         actions.append(launchagent_action)
 
@@ -1063,8 +1177,9 @@ def _resolve_backup(entry, discovered, *, not_before=None, config_path=None):
     (provenance='created', backup не пишется — нечего было бэкапить) → uninstall снова находит СТАРЫЙ
     backup как единственного кандидата → component_facts классифицирует как restore вместо remove →
     восстанавливается устаревший чужой контент поверх только что созданного конфига. not_before —
-    момент создания ТЕКУЩЕГО конфига (entry['created_at'], пишет _write_state_after_apply только для
-    provenance='created'); кандидаты со stamp строго раньше этого момента доказанно принадлежат
+    момент создания ТЕКУЩЕГО конфига (entry['created_at'], пишут _record_component_applied /
+    _write_state_after_apply через общий редьюсер — только для provenance='created'); кандидаты со
+    stamp строго раньше этого момента доказанно принадлежат
     ПРЕДЫДУЩЕМУ install-циклу и отбрасываются ДО подсчёта len(discovered) — иначе retained-relic мог бы
     выдать себя за «единственного» и обойти даже политику ambiguous.
     """
