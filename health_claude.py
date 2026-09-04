@@ -144,23 +144,33 @@ def _claude_proxy_probe():
             # (класс #143: живой CC запущен раньше со стандартным endpoint). Атрибутируем
             # per-PID: readable env БЕЗ override-хоста → down; override/нечитаемый → unknown.
             # Cost-гейт (hot path watchdog ~90с + /health): доп. ps eww ТОЛЬКО при external
-            # PID (паттерн _pids_env_readable #335).
+            # PID (паттерн _pids_env_readable #335); readable берётся из ТОГО ЖЕ eww-вывода
+            # (env_readable_pids, #337 review perf — не второй перекрывающийся батч).
             rt = _health_facade._read_runtime_endpoint_config()
-            readable = _health_facade._pids_env_readable(sorted(external_pids))
             leak_pids = _health_facade._override_runtime_leak_pids(
-                sorted(external_pids), rt, readable, ov["host"])
+                sorted(external_pids), rt, rt.get("env_readable_pids", set()), ov["host"])
             if leak_pids:
                 leaks = []
                 for pid in sorted(leak_pids):
                     base = rt.get("per_pid", {}).get(pid, {}).get("ANTHROPIC_BASE_URL", "")
-                    leaks.append(f"{pid} (runtime endpoint: {base or 'не задан — стандартный'})")
+                    # #337 review семантика: «без override» (стандартный endpoint) и «чужой
+                    # override» (другой нестандартный хост) — разные дивергенции; у второй
+                    # прямой ход намеренный В ЕЁ конфигурации, совет «подобрать override»
+                    # вводил бы в заблуждение.
+                    host = urlparse(base).hostname.lower().rstrip(".") if base else ""
+                    if not base or host == urlparse(CLAUDE_API_BASE_URL).hostname:
+                        leaks.append(f"{pid} (без override — runtime endpoint стандартный)")
+                    else:
+                        leaks.append(f"{pid} (runtime endpoint {base} ≠ файловский "
+                                     f"{ov['base_url']})")
                 return {"status": "down", "source": "runtime",
                         "detail": (f"runtime: endpoint override {ov['base_url']} в NO_PROXY "
-                                   f"(direct-first), но PID {', '.join(leaks)} запущен БЕЗ "
-                                   f"override и идёт напрямую (external ESTABLISHED) — "
-                                   f"доказуемая утечка мимо прокси (дивергенция файлы-vs-runtime, "
-                                   f"#337), нарушение fail-closed. Перезапусти CC, чтобы он "
-                                   f"подобрал override из settings.json."
+                                   f"(direct-first), но PID {', '.join(leaks)} идёт напрямую "
+                                   f"(external ESTABLISHED) — доказуемая утечка мимо прокси "
+                                   f"(дивергенция файлы-vs-runtime, #337), нарушение "
+                                   f"fail-closed. Приведи runtime-конфигурацию CC в "
+                                   f"соответствие с файлами (перезапусти CC / синхронизируй "
+                                   f"settings.json)."
                                    + (f". Остальные external на override / с нечитаемым env: "
                                       f"PID {','.join(sorted(external_pids - leak_pids))}"
                                       if external_pids - leak_pids else ""))}

@@ -487,17 +487,18 @@ def test_check_all_no_false_verdict_when_endpoint_override(monkeypatch):
 
 
 def _override_runtime_mocks(monkeypatch, *, per_pid, readable):
-    """Моки runtime-чтения #337: _read_runtime_endpoint_config + _pids_env_readable.
+    """Мок runtime-чтения #337: _read_runtime_endpoint_config с env_readable_pids.
 
-    Оба вызова идут через health-фасад — мокаем на health (как _read_endpoint_config выше).
-    Ambient ANTHROPIC_* вычищаем: тесты про env-семантику не должны зависеть от shell'а
-    (канон ambient-env-poisons-env-parameterized-stubs).
+    Вызов идёт через health-фасад — мокаем на health (как _read_endpoint_config выше).
+    readable теперь поле того же rt (#337 review perf: один проход ps eww, второй батч
+    _pids_env_readable из probe убран). Ambient ANTHROPIC_* вычищаем: тесты про
+    env-семантику не должны зависеть от shell'а (канон ambient-env-poisons).
     """
     monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
     monkeypatch.setattr(health, "_read_runtime_endpoint_config",
                         lambda: {"per_pid": per_pid, "pids": sorted(per_pid),
-                                 "readable": bool(per_pid)})
-    monkeypatch.setattr(health, "_pids_env_readable", lambda pids: set(readable) & set(pids))
+                                 "readable": bool(per_pid),
+                                 "env_readable_pids": set(readable)})
 
 
 def test_probe_down_when_override_files_but_live_pid_standard(monkeypatch):
@@ -519,7 +520,8 @@ def test_probe_down_when_override_files_but_live_pid_standard(monkeypatch):
     assert res["status"] == "down", \
         "external PID с runtime env без override — доказуемая утечка, не «неприменима»"
     assert "12345" in res["detail"], "утёкший PID должен быть в detail (per-PID атрибуция)"
-    assert "api.anthropic.com" in res["detail"], "runtime endpoint PID виден в detail"
+    assert "без override" in res["detail"] and "стандартный" in res["detail"], \
+        "стандартный runtime endpoint PID помечен как «без override»"
     assert "sk-secret" not in res["detail"], "секреты env не попадают в detail"
 
 
@@ -581,6 +583,45 @@ def test_probe_override_mixed_leak_and_by_design(monkeypatch):
     assert res["status"] == "down"
     assert "111" in res["detail"], "утёкший PID атрибутирован"
     assert "222" in res["detail"], "by-design PID упомянут (не утечка)"
+
+
+def test_probe_override_foreign_host_pid_labeled_distinctly(monkeypatch):
+    """#337 review: PID на ДРУГОМ нестандартном хосте — «≠ файловский», не «без override».
+
+    У такого PID свой override: прямой ход намеренный в его конфигурации, а вердикт down
+    корректен по семантике файлов (его хост не в файловском NO_PROXY). Формулировка detail
+    не должна советовать ему «подобрать override».
+    """
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _ps_lsof_fake(f"12345 {CLI_COMM}\n", _EXTERNAL_LEAK_LINE))
+    monkeypatch.setattr(health, "_read_endpoint_config", lambda: _ZAI_OVERRIDE_CFG)
+    _override_runtime_mocks(
+        monkeypatch,
+        per_pid={"12345": {"ANTHROPIC_BASE_URL": "https://other.example.com/v1"}},
+        readable={"12345"})
+    res = health._claude_proxy_probe()
+    assert res["status"] == "down"
+    assert "≠ файловский" in res["detail"], "чужой override помечен как дивергенция, не «без override»"
+    assert "other.example.com" in res["detail"]
+    assert "без override" not in res["detail"]
+
+
+def test_runtime_config_env_readable_pids_independent_of_anthropic(monkeypatch):
+    """#337 review perf: readable-критерий считается из ТОГО ЖЕ eww-вывода, без ANTHROPIC_*.
+
+    PID 100 с env без ANTHROPIC_* всё равно читается; PID 200 без env-токенов — нет. Один
+    проход секционирования даёт и per_pid, и env_readable_pids (второй ps eww не нужен).
+    """
+    eww = ("100 ttys000 0:01.00 /bin/zsh HTTPS_PROXY=http://127.0.0.1:8118\n"
+           "200 ttys000 0:01.00 /bin/sandboxed\n")
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _runtime_fake_run([("100", CLI_COMM), ("200", CLI_COMM)],
+                                          {"100": eww.splitlines()[0], "200": eww.splitlines()[1]}))
+    res = health._read_runtime_endpoint_config()
+    assert res["readable"] is False, "ANTHROPIC_* нигде нет — rt.readable остаётся False"
+    assert res["env_readable_pids"] == {"100"}, \
+        "но читаемость env PID 100 видна из того же вывода"
+    assert res["pids"] == ["100", "200"]
 
 
 def test_probe_override_gate_skips_runtime_read_without_external(monkeypatch):
