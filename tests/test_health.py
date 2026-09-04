@@ -1036,6 +1036,105 @@ def test_boot_persistence_rechecks_before_warn_on_not_loaded(monkeypatch, tmp_pa
     assert result["status"] == "ok", "mid-start not_loaded на re-check loaded → НЕ warn"
 
 
+def test_boot_persistence_not_warn_after_clean_stop_with_plist_intact(monkeypatch, tmp_path):
+    """#330 P2 (cycle-review): plist на диске + job не загружен + порт закрыт — это осознанный
+    stop (protected: control_as_root stop = bootout, plist ОСТАЁТСЯ; brew: brew services stop
+    удаляет plist, но brew-stop здесь не сценарий). Bootout — runtime-операция: после ребута
+    launchd поднимет сервис (RunAtLoad+KeepAlive, man launchd.plist) → НЕ warn, ok-статус."""
+    monkeypatch.setattr(health, "_port_up", lambda port: False)
+    monkeypatch.setattr(health, "_zombie_recheck_delay", lambda: None)
+    monkeypatch.setattr(health.privoxy_system, "protection_present", lambda: False)
+    agents = tmp_path / "LaunchAgents"
+    agents.mkdir()
+    for label in (health.PRIVOXY_BREW_LABEL, "homebrew.mxcl.xray"):
+        (agents / f"{label}.plist").write_text("<plist/>", encoding="utf-8")
+    monkeypatch.setattr(health, "_user_launchagent_plist", lambda label: agents / f"{label}.plist")
+
+    def fake_run(cmd, timeout):
+        if "print-disabled" in cmd:
+            return {"rc": 0, "out": "\tdisabled services = {\n\t}\n", "err": "", "timeout": False}
+        return {"rc": 3, "out": "", "err": "not loaded", "timeout": False}
+
+    monkeypatch.setattr(health.sys_probe, "run", fake_run)
+    result = health._local_proxy_boot_persistence()
+    assert result["status"] == "ok", "stop при целом plist → НЕ warn (после ребута поднимется)"
+    assert "остановлен" in result["detail"].lower(), "факт остановки остаётся в detail (noisy-log)"
+    assert "не поднимется" not in result["detail"].lower(), \
+        "прогноз «не поднимется» при целом plist — ложь (P2)"
+
+
+def test_boot_persistence_not_loaded_port_open_warns_orphan_conflict(monkeypatch, tmp_path):
+    """#330 P2: plist на диске + job не загружен + ПОРТ ЖИВ → warn (порт держит посторонний
+    процесс — orphan-конфликт, инцидент #330), НО прогноз честный: launchd поднимет сервис
+    при ребуте (RunAtLoad), «не поднимется» — только про disabled/отсутствие plist."""
+    monkeypatch.setattr(health, "_port_up", lambda port: True)
+    monkeypatch.setattr(health, "_zombie_recheck_delay", lambda: None)
+    monkeypatch.setattr(health.privoxy_system, "protection_present", lambda: False)
+    agents = tmp_path / "LaunchAgents"
+    agents.mkdir()
+    for label in (health.PRIVOXY_BREW_LABEL, "homebrew.mxcl.xray"):
+        (agents / f"{label}.plist").write_text("<plist/>", encoding="utf-8")
+    monkeypatch.setattr(health, "_user_launchagent_plist", lambda label: agents / f"{label}.plist")
+
+    def fake_run(cmd, timeout):
+        if "print-disabled" in cmd:
+            return {"rc": 0, "out": "\tdisabled services = {\n\t}\n", "err": "", "timeout": False}
+        return {"rc": 3, "out": "", "err": "not loaded", "timeout": False}
+
+    monkeypatch.setattr(health.sys_probe, "run", fake_run)
+    result = health._local_proxy_boot_persistence()
+    assert result["status"] == "warn", "порт жив без launchd-job → warn (orphan-конфликт)"
+    assert "посторонн" in result["detail"].lower(), "detail называет постороннего держателя порта"
+    assert "не поднимется" not in result["detail"].lower(), \
+        "прогноз «не поднимется» при целом plist — ложь (P2: bootout не персистентен)"
+
+
+def test_boot_persistence_disabled_means_wont_boot(monkeypatch, tmp_path):
+    """#330 P2: персистентный «не поднимется» — только launchctl disabled (bootout — runtime).
+    plist на диске + job не загружен + print-disabled: disabled → warn с корректным прогнозом."""
+    monkeypatch.setattr(health, "_port_up", lambda port: False)
+    monkeypatch.setattr(health, "_zombie_recheck_delay", lambda: None)
+    monkeypatch.setattr(health.privoxy_system, "protection_present", lambda: False)
+    agents = tmp_path / "LaunchAgents"
+    agents.mkdir()
+    for label in (health.PRIVOXY_BREW_LABEL, "homebrew.mxcl.xray"):
+        (agents / f"{label}.plist").write_text("<plist/>", encoding="utf-8")
+    monkeypatch.setattr(health, "_user_launchagent_plist", lambda label: agents / f"{label}.plist")
+
+    def fake_run(cmd, timeout):
+        if "print-disabled" in cmd:
+            out = "\tdisabled services = {\n"
+            for label in (health.PRIVOXY_BREW_LABEL, "homebrew.mxcl.xray"):
+                out += f'\t\t"{label}" => disabled\n'
+            out += "\t}\n"
+            return {"rc": 0, "out": out, "err": "", "timeout": False}
+        return {"rc": 3, "out": "", "err": "not loaded", "timeout": False}
+
+    monkeypatch.setattr(health.sys_probe, "run", fake_run)
+    result = health._local_proxy_boot_persistence()
+    assert result["status"] == "warn", "disabled + not loaded → warn"
+    assert "disabled" in result["detail"].lower(), "detail называет disabled-причину"
+    assert "не поднимется" in result["detail"].lower(), "disabled → честный прогноз «не поднимется»"
+
+
+def test_boot_persistence_plist_path_resolved_through_facade():
+    """Гвард P1-регрессии (#330 cycle-review): _local_proxy_boot_persistence резолвит
+    _user_launchagent_plist ТОЛЬКО через _health_facade (канон #158) — прямой вызов резолвится
+    из health_probes.__dict__, моки тестов (health.__dict__) мимо, проба читает реальный $HOME
+    (машинно-зависимые тесты + лишний real-sleep на warn-ветке)."""
+    import ast
+
+    import health_probes  # функция определена здесь; health.py — star-import фасад (#158)
+
+    source = Path(health_probes.__file__).read_text(encoding="utf-8")
+    fn = next(node for node in ast.walk(ast.parse(source))
+              if isinstance(node, ast.FunctionDef) and node.name == "_local_proxy_boot_persistence")
+    direct = [ast.unparse(call.func) for call in ast.walk(fn)
+              if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+              and call.func.id == "_user_launchagent_plist"]
+    assert not direct, f"прямые вызовы _user_launchagent_plist мимо facade (моки мертвы): {direct}"
+
+
 def test_check_all_boot_persistence_is_info_only_warn(monkeypatch):
     """Wiring в check_all: warn → ok=False + info=True (⚠, не роняет вердикт — паттерн
     codex-isolation «по выбору»), НОВЫЙ чек не драйвит агрегацию."""

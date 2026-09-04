@@ -139,6 +139,28 @@ def _user_launchagent_plist(label):
     return Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
 
 
+def _launchd_disabled_status(label, domain):
+    """Персистентно ли выключен сервис (launchctl print-disabled) — tri-state (#330 P2).
+
+    bootout — RUNTIME-операция: после ребута launchd заново сканирует LaunchDaemons/
+    LaunchAgents и поднимет job (RunAtLoad — man launchd.plist). Персистентный «не поднимется»
+    даёт только disabled-статус (launchctl disable / Disabled=true). Формат вывода print-disabled
+    (эмпирика launchctl, macOS 25): 'disabled services = {' и строки '"<label>" => enabled|disabled'.
+      "disabled" — launchctl ответил, label помечен disabled;
+      "enabled"  — label в списке enabled ИЛИ отсутствует в выводе (не выключен);
+      "unknown"  — timeout/rc!=0: fail-closed, НЕ утверждаем disabled (канон #204).
+    """
+    import re
+    r = sys_probe.run([LAUNCHCTL, "print-disabled", domain], timeout=3)
+    if r.get("timeout") or r.get("rc") != 0:
+        return "unknown"
+    match = re.search(rf'^\s*"{re.escape(label)}"\s*=>\s*(disabled|enabled)\s*$',
+                      r.get("out") or "", re.MULTILINE)
+    if not match:
+        return "enabled"  # label нет в выводе — не выключен
+    return match.group(1)
+
+
 def _service_running(label, domain=None):
     """Состояние launchd-сервена по `launchctl print <domain>/<label>` — tri-state (#204 cycle-review P1).
 
@@ -242,31 +264,34 @@ def _local_proxy_up():
 def _local_proxy_boot_persistence():
     """Переживёт ли локальный прокси перезагрузку? (#330 — грань persists-across-boot)
 
-    На компонент: регистрация = plist присутствует (protected privoxy — по managed-маркеру,
-    brew/xray — по факту файла) И job загружен в launchd. Не зарегистрирован → warn «порт жив,
-    но после перезагрузки не поднимется» (orphan — инцидент #330) либо «не запущен и не
-    зарегистрирован» (restart регистрацию не вернёт — нужен start/protect). Info-only ВСЕГДА:
-    warn не роняет вердикт (канал в моменте работает).
+    На компонент (канон probe-semantics-from-primary-source — man launchd.plist):
+      - plist ОТСУТСТВУЕТ (protected privoxy — по managed-маркеру; brew/xray — по факту файла)
+        → job при буте не загрузится НИКАК → warn «после перезагрузки не поднимется» (это класс
+        инцидента #330: orphan с живым портом, doctor зелёный до ребута);
+      - plist на диске + job не загружен (после anti-mid-start re-check) → bootout — RUNTIME-
+        операция, при буте launchd поднимет сервис (RunAtLoad; KeepAlive=true implicitly implies
+        RunAtLoad) → «не поднимется» говорить НЕЛЬЗЯ (P2 cycle-review). Warn только когда это
+        anomaly ЗДЕСЬ И СЕЙЧАС: персистентный disabled (print-disabled) → честное «не поднимется»;
+        порт жив без launchd-job → orphan-конфликт (посторонний процесс держит порт); порт
+        закрыт + plist цел → осознанный stop → НЕ warn (факт — в detail, noisy-log).
+      - launchctl timeout → fail-closed (unknown ≠ not_loaded), пометка в detail, не warn.
 
-    Fail-closed #204-канон: launchctl timeout → НЕ утверждаем «не зарегистрирован» (unknown
-    ≠ not_loaded); отсутствие plist — факт ФС, детерминативен без launchctl. Anti-mid-start
-    (та же гонка старта, что у зомби-вердикта): plist есть + «не загружен» → re-check с backoff
-    перед warn. Каноны: verify-dont-guess, probe-semantics-from-primary-source (RunAtLoad —
-    man launchd.plist), noisy-log-better-than-no-log.
-
-    Возвращает {status, detail}: "ok" | "warn". Не бросает.
+    Info-only ВСЕГДА: warn не роняет вердикт (канал в моменте работает). Все machine-dependent
+    вызовы — через _health_facade (канон #158, гвард test_boot_persistence_plist_path_resolved_
+    through_facade). Возвращает {status, detail}: "ok" | "warn". Не бросает.
     """
     privoxy_label, privoxy_domain = _privoxy_service_target()
     protected = privoxy_system.protection_present()
     components = [
         ("privoxy", PRIVOXY_PORT, privoxy_label, privoxy_domain,
          privoxy_system.DEFAULT_LAYOUT.launchdaemon_path if protected
-         else _user_launchagent_plist(PRIVOXY_BREW_LABEL),
+         else _health_facade._user_launchagent_plist(PRIVOXY_BREW_LABEL),
          privoxy_system.PROTECTED_MARKER if protected else None),
         ("xray", XRAY_PORT, XRAY_BREW_LABEL, f"gui/{os.getuid()}",
-         _user_launchagent_plist(XRAY_BREW_LABEL), None),
+         _health_facade._user_launchagent_plist(XRAY_BREW_LABEL), None),
     ]
     problems = []
+    notes = []
     unverified = []
     for name, port, label, domain, plist_path, managed_marker in components:
         port_open = _health_facade._port_up(port)
@@ -274,33 +299,54 @@ def _local_proxy_boot_persistence():
             plist_ok = privoxy_system._managed_file(plist_path, managed_marker)
         else:
             plist_ok = plist_path.is_file()
-        if plist_ok:
-            loaded = _health_facade._launchd_loaded_status(label, domain)
-            if loaded == "unknown":
-                # fail-closed: не утверждаем «не зарегистрирован» без ответа launchctl.
-                unverified.append(name)
-                continue
-            if loaded == "loaded":
-                continue
-            # anti-mid-start: bootstrap в полёте даёт not_loaded на первом срезе.
-            _health_facade._zombie_recheck_delay()
-            if _health_facade._launchd_loaded_status(label, domain) == "loaded":
-                continue
-            why = "plist на диске, но job не загружен в launchd"
-        else:
+        if not plist_ok:
+            # Плоскость инцидента #330: без plist'а launchd при буте ничего не загрузит.
             why = f"plist отсутствует ({plist_path})"
-        remedy = ("srouter privoxy protect --strict (пересоздаёт managed-plist)"
-                  if name == "privoxy" and protected
-                  else f"brew services start {name} (создаёт plist)")
+            remedy = ("srouter privoxy protect --strict (пересоздаёт managed-plist)"
+                      if name == "privoxy" and protected
+                      else f"brew services start {name} (создаёт plist)")
+            if port_open:
+                problems.append(f"{name}: порт {port} жив, но launchd-регистрации нет ({why}) — "
+                                f"после перезагрузки не поднимется; регистрация: {remedy}")
+            else:
+                problems.append(f"{name}: не запущен и не зарегистрирован ({why}) — после "
+                                f"перезагрузки сам не поднимется; регистрация: {remedy}")
+            continue
+        loaded = _health_facade._launchd_loaded_status(label, domain)
+        if loaded == "unknown":
+            # fail-closed: не утверждаем «не зарегистрирован» без ответа launchctl.
+            unverified.append(name)
+            continue
+        if loaded == "loaded":
+            continue
+        # anti-mid-start: bootstrap в полёте даёт not_loaded на первом срезе.
+        _health_facade._zombie_recheck_delay()
+        if _health_facade._launchd_loaded_status(label, domain) == "loaded":
+            continue
+        # plist на диске + job не загружен: bootout не персистентен — при буте launchd поднимет
+        # сервис (RunAtLoad). «Не поднимется» персистентен только disabled (print-disabled).
+        if _launchd_disabled_status(label, domain) == "disabled":
+            problems.append(f"{name}: {'порт ' + str(port) + ' жив, но ' if port_open else ''}"
+                            f"сервис выключен в launchd (print-disabled: disabled, job не загружен) — "
+                            f"после перезагрузки не поднимется")
+            continue
         if port_open:
-            problems.append(f"{name}: порт {port} жив, но launchd-регистрации нет ({why}) — "
-                            f"после перезагрузки не поднимется; регистрация: {remedy}")
-        else:
-            problems.append(f"{name}: не запущен и не зарегистрирован ({why}) — после перезагрузки "
-                            f"сам не поднимется; регистрация: {remedy}")
+            problems.append(f"{name}: порт {port} жив, но launchd-job не запущен (plist на диске, "
+                            f"disabled нет) — порт держит посторонний процесс; после перезагрузки "
+                            f"launchd поднимет сервис, но он не займёт порт, пока orphan держит его")
+            continue
+        # порт закрыт + plist цел = осознанный stop (protected: control_as_root stop = bootout,
+        # plist остаётся): после ребута поднимется — персистентность ок, факт остаём в detail.
+        notes.append(f"{name}: остановлен (job не загружен), plist на диске — "
+                     f"после перезагрузки launchd поднимет")
     if problems:
-        return {"status": "warn", "detail": "; ".join(problems)}
+        detail = "; ".join(problems)
+        if notes:
+            detail += f" (прочее: {'; '.join(notes)})"
+        return {"status": "warn", "detail": detail}
     detail = "регистрация launchd подтверждена: privoxy + xray (plist на месте + job загружен)"
+    if notes:
+        detail += f" ({'; '.join(notes)})"
     if unverified:
         detail += f" (⚠ launchctl не верифицирован для {', '.join(unverified)} — timeout)"
     return {"status": "ok", "detail": detail}

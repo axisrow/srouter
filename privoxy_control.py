@@ -560,21 +560,27 @@ def protect(*, state_path, prefix="/opt/homebrew", runner=None, require_tty=True
 def _boot_persistence(runner, layout=None):
     """Launchd-регистрация protected-privoxy переживает перезагрузку? (#330)
 
-    Детектор трёх условий boot-persistence (канон probe-semantics-from-primary-source:
-    RunAtLoad — man launchd.plist):
+    Детектор условий boot-persistence (канон probe-semantics-from-primary-source —
+    man launchd.plist):
       (1) managed-plist на диске с маркером (PROTECTED_MARKER) — файл, который launchd
           загрузит при старте системы;
-      (2) RunAtLoad=true в plist — launchd запустит job при загрузке (вырезанный/сброшенный
-          ключ = plist «есть», но сервис после ребута не поднимется);
-      (3) job загружен в system-domain — bootstrap после restart/stop→start реально прошёл.
+      (2) ключ(и) boot-start: RunAtLoad=true («job is launched at load time») ИЛИ KeepAlive=true
+          («The use of this key implicitly implies RunAtLoad, causing launchd to speculatively
+          launch the job»). Вырезаны ОБА (drift) → после ребута не поднимется; вырезан только
+          RunAtLoad при живом KeepAlive=true → клеймить «не переживёт» НЕЛЬЗЯ (man: implied
+          RunAtLoad). KeepAlive-dict (условия) гарантии старта при буте не даёт — не считается.
+      (3) job загружен в system-domain — bootstrap после restart/stop→start реально прошёл;
+          launchctl timeout ≠ not_loaded (канон #204): persistent=None, «не верифицировано».
 
-    Возвращает {persistent: bool, reason: str}, reason ∈ "ok" | "plist_missing_or_unmanaged" |
-    "plist_invalid" | "runatload_missing" | "not_loaded". Обе ветки достижимы (канон
-    detector-is-function): drift маркера, вырезанный RunAtLoad, снесённый plist, неотвечающий
-    bootstrap — каждый даёт свою причину, а не постоянную зелёную/красную.
+    Возвращает {persistent: True/False/None, reason: str}, reason ∈ "ok" |
+    "plist_missing_or_unmanaged" | "plist_invalid" | "boot_start_key_missing" | "not_loaded" |
+    "loaded_unverified". Обе ветки достижимы (канон detector-is-function): drift маркера,
+    вырезанные ключи, снесённый plist, неотвечающий bootstrap — каждая даёт свою причину.
 
     plistlib/ExpatError — stdlib основного процесса (модуль НЕ копируется под sudo, см.
-    docstring модуля); битый XML бросает ExpatError, а не ValueError — ловим оба.
+    docstring модуля); битый XML бросает ExpatError, а не ValueError — ловим оба; валидный
+    plist с топ-уровнем не-dict (array/string, маркер-подстрока цел) → plist_invalid, а не
+    AttributeError-traceback ПОСЛЕ успешного подъёма сервиса (P3 cycle-review).
     """
     if layout is None:
         layout = privoxy_system.DEFAULT_LAYOUT
@@ -585,10 +591,18 @@ def _boot_persistence(runner, layout=None):
         payload = plistlib.loads(Path(plist_path).read_bytes())
     except (OSError, ValueError, ExpatError):
         return {"persistent": False, "reason": "plist_invalid"}
-    if payload.get("RunAtLoad") is not True:
-        return {"persistent": False, "reason": "runatload_missing"}
-    if not privoxy_system._launchd_loaded(privoxy_system.SYSTEM_DOMAIN,
-                                          privoxy_system.SYSTEM_LABEL, runner):
+    if not isinstance(payload, dict):
+        return {"persistent": False, "reason": "plist_invalid"}
+    if payload.get("RunAtLoad") is not True and payload.get("KeepAlive") is not True:
+        return {"persistent": False, "reason": "boot_start_key_missing"}
+    result = runner([privoxy_system.LAUNCHCTL, "print",
+                     privoxy_system._launchd_target(privoxy_system.SYSTEM_DOMAIN,
+                                                    privoxy_system.SYSTEM_LABEL)], 5)
+    if result.get("timeout"):
+        # unknown ≠ not_loaded (канон #204): timeout не даёт утверждать «job не загружен» —
+        # регистрация не верифицирована (persistent=None), а не ложное «транзиентно».
+        return {"persistent": None, "reason": "loaded_unverified"}
+    if result.get("rc") != 0:
         return {"persistent": False, "reason": "not_loaded"}
     return {"persistent": True, "reason": "ok"}
 

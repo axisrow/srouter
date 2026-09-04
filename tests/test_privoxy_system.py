@@ -2011,11 +2011,14 @@ def test_install_helper_fail_closed_when_staged_tree_module_substituted_after_st
 
 
 def _control_runner(loaded=True):
-    """Fake-runner для control(): sudo -k ок, helper restart ok, launchctl print по `loaded`."""
+    """Fake-runner для control(): sudo -k ок, helper restart ok, launchctl print по `loaded`
+    (True/False/"timeout" — последний имитирует launchctl timeout, rc=None + timeout=True)."""
     def runner(cmd, timeout):
         if cmd[:2] == [privoxy_system.SUDO, "-k"]:
             return {"rc": 0, "out": "", "err": "", "timeout": False}
         if cmd[:1] == [privoxy_system.LAUNCHCTL] or privoxy_system.LAUNCHCTL in cmd[:2]:
+            if loaded == "timeout":
+                return {"rc": None, "out": "", "err": "timeout", "timeout": True}
             if loaded:
                 return {"rc": 0, "out": "\tpid = 4242;\n\tstate = running;\n", "err": "", "timeout": False}
             return {"rc": 3, "out": "", "err": "Load failed: 5: Input/output error", "timeout": False}
@@ -2045,22 +2048,64 @@ def test_control_restart_reports_persistent_when_registration_intact(tmp_path, m
     assert outcome.get("persistent") is True, "регистрация на месте → persistent"
 
 
-def test_control_restart_flags_transient_when_runatload_stripped(tmp_path, monkeypatch):
-    """ДЫРА #330: маркер на месте, но RunAtLoad вырезан (drift) → persistent=False: после ребута
-    job не поднимется. Молчаливый ok здесь = следующий инцидент."""
+def test_control_restart_flags_transient_when_boot_start_keys_stripped(tmp_path, monkeypatch):
+    """ДЫРА #330: маркер на месте, но RunAtLoad И KeepAlive вырезаны (drift) → persistent=False:
+    job не поднимется после ребута. Молчаливый ok здесь = следующий инцидент."""
     layout = _layout(tmp_path)
     payload = plistlib.loads(privoxy_system.launchdaemon_bytes("/opt/homebrew", layout))
     payload["RunAtLoad"] = False
+    payload["KeepAlive"] = False
     # plistlib-комментарий (наш маркер) парсером не сохраняется — ре-сериализация вставляет его
-    # обратно тем же приёмом, что launchdaemon_bytes: иначе тест проверял бы не «RunAtLoad
-    # вырезан», а «маркер вырезан» (plist_missing_or_unmanaged).
+    # обратно тем же приёмом, что launchdaemon_bytes: иначе тест проверял бы не «ключи вырезаны»,
+    # а «маркер вырезан» (plist_missing_or_unmanaged).
     stripped = plistlib.dumps(payload, fmt=plistlib.FMT_XML, sort_keys=False)
     marker = f"<!-- {privoxy_system.PROTECTED_MARKER} -->\n".encode()
     stripped = stripped.replace(b"?>\n", b"?>\n" + marker, 1)
     outcome, _ = _restart_with(tmp_path, monkeypatch, plist_bytes=stripped)
     assert outcome["ok"] is True, "restart сам прошёл (сервис поднят)"
-    assert outcome.get("persistent") is False, "RunAtLoad вырезан → не переживёт ребут"
-    assert "runatload" in outcome.get("persistence_reason", "").lower()
+    assert outcome.get("persistent") is False, "нет ни RunAtLoad, ни KeepAlive → не переживёт ребут"
+    assert outcome.get("persistence_reason") == "boot_start_key_missing"
+
+
+def test_control_restart_persistent_when_runatload_stripped_but_keepalive_true(tmp_path, monkeypatch):
+    """P3 (cycle-review): RunAtLoad вырезан, но KeepAlive=true жив → клеймить «не переживёт
+    ребут» НЕЛЬЗЯ: man launchd.plist — «The use of this key [KeepAlive] implicitly implies
+    RunAtLoad, causing launchd to speculatively launch the job». Поднимется → persistent=True."""
+    layout = _layout(tmp_path)
+    payload = plistlib.loads(privoxy_system.launchdaemon_bytes("/opt/homebrew", layout))
+    payload["RunAtLoad"] = False
+    stripped = plistlib.dumps(payload, fmt=plistlib.FMT_XML, sort_keys=False)
+    marker = f"<!-- {privoxy_system.PROTECTED_MARKER} -->\n".encode()
+    stripped = stripped.replace(b"?>\n", b"?>\n" + marker, 1)
+    outcome, _ = _restart_with(tmp_path, monkeypatch, plist_bytes=stripped)
+    assert outcome.get("persistent") is True, \
+        "KeepAlive=true implies RunAtLoad (man launchd.plist) → поднимется, не клеймим"
+
+
+def test_boot_persistence_plist_invalid_when_top_level_array(tmp_path):
+    """P3 (cycle-review): валидный plist с топ-уровнем array (маркер-подстрока цел) — payload
+    не dict → plist_invalid, а НЕ AttributeError-traceback после успешного подъёма сервиса."""
+    layout = _layout(tmp_path)
+    layout.launchdaemon_path.parent.mkdir(parents=True, exist_ok=True)
+    marker = f"<!-- {privoxy_system.PROTECTED_MARKER} -->".encode()
+    (layout.launchdaemon_path.write_bytes(
+        b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" + marker + b"\n"
+        b"<plist version=\"1.0\"><array><string>drift</string></array></plist>"))
+    outcome = privoxy_system._boot_persistence(_control_runner(), layout)
+    assert outcome["persistent"] is False
+    assert outcome["reason"] == "plist_invalid"
+
+
+def test_boot_persistence_unverified_when_launchctl_times_out(tmp_path):
+    """P3 (cycle-review): launchctl timeout ≠ not_loaded (канон #204, unknown fail-closed) —
+    persistent=None («не верифицировано»), а не ложное «транзиентно» на здоровой регистрации."""
+    layout = _layout(tmp_path)
+    layout.launchdaemon_path.parent.mkdir(parents=True, exist_ok=True)
+    layout.launchdaemon_path.write_bytes(
+        privoxy_system.launchdaemon_bytes("/opt/homebrew", layout))
+    outcome = privoxy_system._boot_persistence(_control_runner(loaded="timeout"), layout)
+    assert outcome["persistent"] is None, "timeout → регистрация не верифицирована, не not_loaded"
+    assert outcome["reason"] == "loaded_unverified"
 
 
 def test_control_restart_flags_transient_when_plist_missing(tmp_path, monkeypatch):
@@ -2108,6 +2153,25 @@ def test_privoxy_cli_restart_warns_transient_loudly(monkeypatch, capsys, tmp_pat
         "CLI явно предупреждает про транзиентный подъём"
     assert "перезагрузк" in captured.err.lower() or "перезагрузк" in captured.out.lower(), \
         "warning называет ребут"
+
+
+def test_privoxy_cli_restart_unverified_warning_not_transient(monkeypatch, capsys, tmp_path):
+    """P3: persistent=None (launchctl timeout) — CLI говорит «не удалось верифицировать»,
+    а НЕ «транзиентно»: unknown ≠ not_loaded (канон #204), ложная тревога на живой регистрации
+    недопустима."""
+    import srouter_cli
+    monkeypatch.setattr(privoxy_system, "control", lambda action, runner=None, layout=None: {
+        "ok": True, "changed": True, "persistent": None,
+        "persistence_reason": "loaded_unverified"})
+    args = srouter_cli.build_parser().parse_args(
+        ["privoxy", "restart", "--state", str(tmp_path / "state.json")])
+    rc = srouter_cli.cmd_privoxy(args)
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "верифициров" in captured.err.lower() or "верифициров" in captured.out.lower(), \
+        "unverified → warning про невозможность верификации"
+    assert "транзиентно" not in captured.err.lower()
+    assert "транзиентно" not in captured.out.lower()
 
 
 def test_privoxy_cli_restart_silent_when_persistent(monkeypatch, capsys, tmp_path):

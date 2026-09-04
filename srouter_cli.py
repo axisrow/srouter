@@ -780,6 +780,15 @@ def cmd_privoxy(args) -> int:
             "Верните регистрацию: srouter privoxy protect --strict (пересоздаёт managed-plist).",
             file=sys.stderr,
         )
+    elif result.get("persistent") is None:
+        # #330 P3: launchctl timeout — регистрация не верифицирована (unknown ≠ not_loaded,
+        # канон #204): НЕ клеймим «транзиентно», но и не молчим — подтверждения нет.
+        print(
+            f"ВНИМАНИЕ: launchd-регистрацию не удалось верифицировать "
+            f"({result.get('persistence_reason', 'unknown')}): подтверждения boot-персистентности нет "
+            "(#330). Проверьте: srouter privoxy status.",
+            file=sys.stderr,
+        )
     return 0
 
 
