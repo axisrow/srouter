@@ -140,6 +140,30 @@ def _claude_proxy_probe():
                   f"намеренно (direct-first); claude-proxy проба при override неприменима "
                   f"(lsof не различает endpoint и утечку)")
         if external_pids:
+            # #337: гейт схлопывал доказуемую утечку в unknown, когда ФАЙЛЫ на override
+            # (класс #143: живой CC запущен раньше со стандартным endpoint). Атрибутируем
+            # per-PID: readable env БЕЗ override-хоста → down; override/нечитаемый → unknown.
+            # Cost-гейт (hot path watchdog ~90с + /health): доп. ps eww ТОЛЬКО при external
+            # PID (паттерн _pids_env_readable #335).
+            rt = _health_facade._read_runtime_endpoint_config()
+            readable = _health_facade._pids_env_readable(sorted(external_pids))
+            leak_pids = _health_facade._override_runtime_leak_pids(
+                sorted(external_pids), rt, readable, ov["host"])
+            if leak_pids:
+                leaks = []
+                for pid in sorted(leak_pids):
+                    base = rt.get("per_pid", {}).get(pid, {}).get("ANTHROPIC_BASE_URL", "")
+                    leaks.append(f"{pid} (runtime endpoint: {base or 'не задан — стандартный'})")
+                return {"status": "down", "source": "runtime",
+                        "detail": (f"runtime: endpoint override {ov['base_url']} в NO_PROXY "
+                                   f"(direct-first), но PID {', '.join(leaks)} запущен БЕЗ "
+                                   f"override и идёт напрямую (external ESTABLISHED) — "
+                                   f"доказуемая утечка мимо прокси (дивергенция файлы-vs-runtime, "
+                                   f"#337), нарушение fail-closed. Перезапусти CC, чтобы он "
+                                   f"подобрал override из settings.json."
+                                   + (f". Остальные external на override / с нечитаемым env: "
+                                      f"PID {','.join(sorted(external_pids - leak_pids))}"
+                                      if external_pids - leak_pids else ""))}
             detail += f". Наблюдение: external ESTABLISHED PID {','.join(sorted(external_pids))}"
         return {"status": "unknown", "source": "runtime", "detail": detail}
 
