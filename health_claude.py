@@ -169,7 +169,8 @@ def _claude_proxy_probe():
         routes = f"; HTTP 8118 PID {','.join(sorted(proxy_pids))}" if proxy_pids else ""
         return {"status": "unknown", "source": "runtime",
                 "detail": (f"runtime: TCP к SOCKS5 10808 (PID {','.join(sorted(socks_pids))}){routes} "
-                           f"не доказывает API transport; нужен активный real-CLI probe")}
+                           f"не доказывает API transport; нужен активный real-CLI probe"
+                           f"{unverified_note}")}
     if leak_pids:
         return {"status": "down", "source": "runtime",
                 "detail": (f"runtime: Claude Code идёт НАПРЯМУЮ (мимо прокси) — нарушение fail-closed. "

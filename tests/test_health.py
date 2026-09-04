@@ -428,6 +428,27 @@ def test_probe_mixed_down_with_unverified_forensics(monkeypatch):
     assert "не читается" in res["detail"]
 
 
+def test_probe_socks_keeps_unverified_external_forensics(monkeypatch):
+    """#329 review: socks + external только с нечитаемым env → форензика PID не теряется.
+
+    mixed-ветка пропущена (leak пуст), ok — external непуст: до фикса socks-ветка молчала
+    про external PID целиком, хотя до PR он был виден (в mixed-down). Канон
+    noisy-log-better-than-no-log: непроверяемое наблюдение остаётся в detail.
+    """
+    lsof_out = (
+        f"claude 200 axisrow 7u IPv4 ... TCP 127.0.0.1:51233->127.0.0.1:{health.XRAY_PORT} (ESTABLISHED)\n"
+        "claude 12345 axisrow 7u IPv4 ... TCP 192.168.1.5:51234->160.79.104.10:443 (ESTABLISHED)\n"
+    )
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _ps_lsof_fake(f"200 {CLI_COMM}\n12345 {CLI_COMM}\n", lsof_out, eww_out=""))
+    _std_endpoint(monkeypatch)
+    res = health._claude_proxy_probe()
+    assert res["status"] == "unknown", "socks + нечитаемый external → unknown (не down)"
+    assert "не доказывает" in res["detail"], "socks-семантика ветки сохранена"
+    assert "12345" in res["detail"], "external PID остаётся форензикой в socks-ветке"
+    assert "не читается" in res["detail"]
+
+
 def test_check_all_no_false_verdict_when_endpoint_override(monkeypatch):
     """#329 интеграция: z.ai override + runtime external → вердикт ok, check не driver.
 
