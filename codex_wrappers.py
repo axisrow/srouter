@@ -35,8 +35,10 @@ from install_lib import (
 # srouter_config.py, а SystemExit не ловится Exception — fallback должен сработать и для него.
 try:
     from dashboard_common import SOCKS_PROXY_URL as _CODEX_PROXY_URL
+    from dashboard_common import HTTP_PROXY_URL as _GUI_HTTP_PROXY_URL
 except BaseException:
     _CODEX_PROXY_URL = "socks5h://127.0.0.1:10808"
+    _GUI_HTTP_PROXY_URL = "http://127.0.0.1:8118"
 # NO_PROXY для launchctl-gui env: loopback (Codex→moonbridge на loopback и локальные сервисы)
 # + z.ai,.z.ai (moonbridge→api.z.ai — внешний хост, доступен напрямую мимо SOCKS5/xray/VPS).
 # z.ai НЕ за GFW: при мёртвом VPS (#194) moonbridge-клиент обязан достучаться к api.z.ai напрямую,
@@ -48,12 +50,26 @@ CODEX_NO_PROXY = "localhost,127.0.0.1,::1,z.ai,.z.ai"
 # (#96 core), НЕ provider-direct. z.ai-прямой-доступ релевантен moonbridge (GUI launchctl-gui выше),
 # а не CLI-codex. Две разные границы = две константы (канон route-scope-not-shared-validator).
 CODEX_NO_PROXY_LOOPBACK = "localhost,127.0.0.1,::1"
-# (env-key, value) — единый список для install/setenv и uninstall/unsetenv (синхронны всегда).
-# Значение нужно только для setenv (launchctl-gui); unsetenv итерирует по ключам.
-CODEX_LAUNCHCTL_ENV = tuple((k, _CODEX_PROXY_URL) for k in
-                            ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
-                             "http_proxy", "https_proxy", "all_proxy")) \
+# (env-key, value) — единый список для install/setenv-контракта gui-домена (issue #340).
+# scheme-ключи НЕСУТ privoxy (терминальное плечо #331): socks5h в HTTPS_PROXY/https_proxy делал
+# pip/requests достижимым для SOCKSProxyManager (requests.utils.select_proxy: scheme-ключ раньше
+# 'all') → TypeError PoolKey (#340); privoxy-http — рабочее прокси-плечо, fail-closed сохранён
+# (privoxy→xray, прямого egress нет). ALL_PROXY/all_proxy ИСКЛЮЧЕНЫ: reqwest (Codex Rust
+# app-server) тоже берёт scheme-ключ раньше 'all' (src/proxy.rs «Overwritten by the more
+# specific HTTP_PROXY») → 'all'-ключ в gui-домене избыточен для потребителя и ломает Python.
+# CLI-wrapper'ы (~/bin/codex-srouter) продолжают ставить себе socks5h:10808 ТОЧЕЧНО — privoxy
+# рвёт их WS (#120); gui-домен к ним не относится.
+# Значение нужно только для setenv; uninstall итерирует CODEX_LAUNCHCTL_UNSET_KEYS.
+CODEX_LAUNCHCTL_ENV = tuple((k, _GUI_HTTP_PROXY_URL) for k in
+                            ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")) \
                       + (("NO_PROXY", CODEX_NO_PROXY), ("no_proxy", CODEX_NO_PROXY))
+# Список ключей ДЛЯ СНЯТИЯ (uninstall + residual-чистка): надмножество SET — включает
+# ALL_PROXY/all_proxy, которые старые версии codenv ставили в gui-домен (#331/#340). setenv не
+# ретроактивен и не снимает то, чего не ставит → «не ставить» ≠ «убрать»: без unsetenv residual
+# socks5h из старой установки жил бы в gui-домене вечно и продолжал ломать pip.
+CODEX_LAUNCHCTL_UNSET_KEYS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+                              "http_proxy", "https_proxy", "all_proxy",
+                              "NO_PROXY", "no_proxy")
 # Wrappers: (name, template, marker). Цикл в install/remove — не два явных вызова.
 # Issue #169: CLI-wrapper переименован codex → codex-srouter — убрать коллизию неймспейса (wrapper и
 # real binary оба звались codex → natural-рекурсия #150/#144, foreign-wrapper резолвит codex=wrapper).
@@ -392,7 +408,7 @@ def _remove_launchctl_env(runner) -> dict:
         # `launchctl print gui/<uid>` блок `environment = {...}` (единственный домен-осознанный
         # источник чтения, тот же паттерн, что health._read_gui_proxy_env для doctor-чеков #189).
         uid = os.getuid()
-        all_keys = tuple(key for key, _ in CODEX_LAUNCHCTL_ENV)
+        all_keys = CODEX_LAUNCHCTL_UNSET_KEYS
         for key in all_keys:
             runner([LAUNCHCTL, "asuser", str(uid), LAUNCHCTL, "unsetenv", key], 5)
         gui = health._read_gui_proxy_env(runner, keys_filter=all_keys)

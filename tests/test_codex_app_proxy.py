@@ -188,13 +188,79 @@ def test_app_proxy_ok_when_socks_in_all_proxy_only(monkeypatch):
     assert res["status"] == "ok", f"ALL_PROXY SOCKS5 + lsof 10808 → ok; got {res}"
 
 
-def test_app_proxy_warn_when_app_running_and_gui_http_only(monkeypatch):
-    """App-codex активен + gui-env только HTTP (privoxy) → warn: privoxy рвёт long-lived WS (#120)."""
+def test_app_proxy_unknown_when_managed_privoxy_gui_env(monkeypatch):
+    """#340: gui-env = наш managed privoxy-формат (HTTP_PROXY_URL) → НЕ warn, а unknown (info).
+
+    С #340 codenv ставит scheme-ключи = privoxy (терминальное плечо): это НОРМАЛЬНОЕ состояние
+    установки, а не «App через privoxy рвёт WS» — иначе нормальная установка вечно degraded
+    (канон PR #135). Rust app-server сегодня спавнится с санитизованным env без прокси
+    (ps eww, #340) — gui-env до него не доходит; реальный маршрут App-PID по-прежнему ловит
+    runtime-ветка (lsof privoxy → warn #120). Fail-closed: ok без runtime-доказательства не
+    заявляем → unknown (info-only, не driver)."""
     ps = f"60826 {APP_CODEX_COMM}\n"
     monkeypatch.setattr(health.sys_probe, "run",
                         _fake(ps, _gui_env({"HTTPS_PROXY": PRIVOXY, "HTTP_PROXY": PRIVOXY})))
     res = health._codex_app_proxy_check()
-    assert res["status"] == "warn", f"App на privoxy → warn (WS порвётся #120); got {res}"
+    assert res["status"] == "unknown", f"managed privoxy gui-env — норма #340 → unknown; got {res}"
+
+
+def test_app_proxy_warn_when_gui_http_proxy_is_foreign(monkeypatch):
+    """Чужой http-прокси в gui-env (не наш privoxy-формат #340) → warn как раньше (#120 класс)."""
+    ps = f"60826 {APP_CODEX_COMM}\n"
+    foreign = "http://10.0.0.5:3128"
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _fake(ps, _gui_env({"HTTPS_PROXY": foreign, "HTTP_PROXY": foreign})))
+    res = health._codex_app_proxy_check()
+    assert res["status"] == "warn", f"чужой http-прокси в gui → warn; got {res}"
+
+
+# ============ #340: residual-SOCKS в gui-домене (launchctl-источник, не убран старой версией) ============
+def _fake_codenv_managed(monkeypatch, *, managed):
+    """Мок _codenv_managed → managed (plist+loaded) / False — без обращения к реальному дому."""
+    import health_codenv
+    monkeypatch.setattr(health_codenv, "_codenv_managed", lambda runner=None: managed)
+
+
+def test_gui_socks_residual_warn_when_managed_codenv_still_socks(monkeypatch):
+    """#340: socks5h в gui-домене при managed codenv → warn (старая версия скрипта / residual).
+
+    Канон-issue #340: предупреждать о launchctl-источнике. После перехода codenv на privoxy-
+    плечо socks в gui = residual от старой установки → сигнал «перепримени install / дождись
+    прогона агента (≤5 мин)», а не молчание."""
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _fake("", _gui_env({"ALL_PROXY": SOCKS5, "HTTPS_PROXY": SOCKS5})))
+    _fake_codenv_managed(monkeypatch, managed=True)
+    res = health._gui_socks_residual_check()
+    assert res["status"] == "warn", f"residual socks при managed codenv → warn; got {res}"
+    assert "unsetenv" in res["detail"] or "install" in res["detail"].lower(), \
+        f"detail предлагает remediation; got {res}"
+
+
+def test_gui_socks_residual_not_ours_when_codenv_not_managed(monkeypatch):
+    """socks в gui-домене БЕЗ managed codenv — чужой (не наша зона; desktop-check уже down-ит) →
+    unknown/info: не дублируем чужой вердикт своим warn (#189 codenv-aware семантика)."""
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _fake("", _gui_env({"ALL_PROXY": "socks5://10.0.0.9:1080"})))
+    _fake_codenv_managed(monkeypatch, managed=False)
+    res = health._gui_socks_residual_check()
+    assert res["status"] == "unknown", f"чужой socks — вне контракта srouter; got {res}"
+
+
+def test_gui_socks_residual_ok_when_privoxy_or_empty(monkeypatch):
+    """Наш новый формат (privoxy scheme-ключи, ALL_PROXY пуст/нет) → ok."""
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _fake("", _gui_env({"HTTPS_PROXY": PRIVOXY, "HTTP_PROXY": PRIVOXY})))
+    _fake_codenv_managed(monkeypatch, managed=True)
+    res = health._gui_socks_residual_check()
+    assert res["status"] == "ok", f"privoxy gui-домен (#340) → ok; got {res}"
+
+
+def test_gui_socks_residual_unknown_when_gui_unverifiable(monkeypatch):
+    """launchctl print не ответил → unknown (fail-closed, info-only): «не смогли спросить» ≠ «чисто»."""
+    monkeypatch.setattr(health.sys_probe, "run", _fake("", "", gui_verifiable=False))
+    _fake_codenv_managed(monkeypatch, managed=True)
+    res = health._gui_socks_residual_check()
+    assert res["status"] == "unknown", f"gui не верифицируем → unknown; got {res}"
 
 
 def test_app_proxy_unknown_when_app_not_running(monkeypatch):

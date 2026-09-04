@@ -82,6 +82,10 @@ def _all_up_monkey(monkeypatch, *, probe_status="ok", probe_detail="runtime: к�
     # Тесты test_health_proxy_env.py переопределяют мок ПОСЛЕ этого вызова (late-binding).
     monkeypatch.setattr(health, "_proxy_env_consistency",
                         lambda: {"status": "ok", "detail": "mock: env консистентен"})
+    # #340: _gui_socks_residual_check дёргает launchctl print gui + _codenv_managed (реальный
+    # plist/launchd dev-машины) — мокаем ok, иначе живой gui-домен драйвит вердикт.
+    monkeypatch.setattr(health, "_gui_socks_residual_check",
+                        lambda: {"status": "ok", "detail": "mock: gui-домен чист"})
     monkeypatch.setattr(health, "_codex_proxy_probe",
                         lambda: {"status": codex_status, "source": "runtime" if codex_status != "unknown" else "n/a",
                                  "detail": codex_detail})

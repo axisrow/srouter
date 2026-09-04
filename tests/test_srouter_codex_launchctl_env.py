@@ -635,6 +635,98 @@ def test_codenv_plist_comment_mentions_zai():
     assert "z.ai" in text, f"plist комментарий описывает z.ai в NO_PROXY: {plist.name}"
 
 
+# ============ issue #340: gui-домен раздаёт ТЕРМИНАЛЬНОЕ плечо (privoxy), не SOCKS ==========
+# Механизм #340 (подтверждён первоисточниками + живой машиной):
+# 1. requests (vendored pip) и reqwest (Codex Rust app-server) выбирают scheme-ключ
+#    (HTTPS_PROXY) ПРЕДПОЧТИТЕЛЬНЕЕ ALL_PROXY (reqwest src/proxy.rs get_from_environment:
+#    «Overwritten by the more specific HTTP_PROXY»; requests.utils.select_proxy: scheme → all).
+#    Следствия: (а) удаление одного только ALL_PROXY из gui-домена pip НЕ чинит —
+#    HTTPS_PROXY=socks5h сам по себе даёт тот же TypeError PoolKey; (б) ALL_PROXY в gui-домене
+#    избыточен для reqwest-потребителя.
+# 2. Живая эмпирика (2026-09-05, ps eww app-server PID): текущий Rust app-server ChatGPT.app
+#    (`codex app-server`) спавнится ChatGPT.app с САНИТИЗОВАННЫМ env БЕЗ прокси-переменных —
+#    launchctl gui-домен до него не доходит; июльская зависимость #189 (App читает gui-env)
+#    устарела. CLI-codex wrapper'ы ставят socks5h:10808 себе точечно (privoxy рвёт WS #120) —
+#    не тронуты.
+# Решение: gui-домен = ТЕРМИНАЛЬНОЕ плечо: scheme-ключи = privoxy (HTTP_PROXY_URL) — рабочий
+# прокси для pip/терминалов (fail-closed сохранён: privoxy→xray, прямого egress нет),
+# ALL_PROXY/all_proxy не ставятся и ЯВНО unsetenv (residual-чистка: setenv не ретроактивен,
+# старые socks-значения из предыдущей версии скрипта иначе живут в gui-домене вечно).
+def test_codenv_env_script_sets_terminal_http_shoulder_not_socks():
+    """#340: scheme-ключи в gui-домен = privoxy (http://127.0.0.1:8118), socks в скрипте нет.
+
+    Критерий готовности #340: pip в свежем терминале работает без env -u. С socks5h в
+    HTTPS_PROXY/https_proxy requests уходит в SOCKSProxyManager (select_proxy: scheme-ключ
+    раньше 'all') → TypeError PoolKey при любом сетевом запросе. Privoxy-http — рабочее плечо
+    (терминальное, #331/#340), при этом proxy-инвариант сохранён (прямой egress по-прежнему
+    отсутствует)."""
+    import dashboard_common
+    script = Path(__file__).resolve().parent.parent / "launchagents" / "srouter-codex-env.sh"
+    text = script.read_text(encoding="utf-8")
+    code_lines = [ln for ln in text.splitlines() if not ln.lstrip().startswith("#")]
+    code = "\n".join(code_lines)
+    assert dashboard_common.HTTP_PROXY_URL in code, \
+        f"скрипт ставит scheme-ключи в privoxy ({dashboard_common.HTTP_PROXY_URL}); код: {code}"
+    assert "socks5h" not in code, \
+        f"socks5h не должен ставиться в gui-домен (pip-ломающее плечо #340); код: {code}"
+
+
+def test_codenv_env_script_unsets_all_proxy_residual():
+    """#340: скрипт ЯВНО unsetenv ALL_PROXY/all_proxy каждый прогон (residual-чистка).
+
+    launchctl setenv не ретроактивен и не снимает то, чего не ставит: после апгрейда со
+    старой версии (ставившей socks5h) в gui-домене навсегда остались бы ALL_PROXY=socks5h —
+    единственное плечо, которое читают Python-инструменты с 'all'-fallback. Без unsetenv
+    «не ставить» ≠ «убрать», критерий #340 не достигается до ручной чистки."""
+    script = Path(__file__).resolve().parent.parent / "launchagents" / "srouter-codex-env.sh"
+    code = "\n".join(ln for ln in script.read_text(encoding="utf-8").splitlines()
+                     if not ln.lstrip().startswith("#"))
+    assert 'launchctl unsetenv ALL_PROXY' in code, f"unsetenv ALL_PROXY отсутствует; код: {code}"
+    assert 'launchctl unsetenv all_proxy' in code, f"unsetenv all_proxy отсутствует; код: {code}"
+
+
+def test_codex_launchctl_env_scheme_keys_use_privoxy_http_shoulder():
+    """#340: CODEX_LAUNCHCTL_ENV — scheme-ключи несут privoxy (HTTP_PROXY_URL), ALL_PROXY исключён.
+
+    Единый источник (key, value)-пар для install/setenv-контракта: верхний и нижний регистр
+    scheme-ключей = терминальное privoxy-плечо; ALL_PROXY/all_proxy в SET-списке быть не должно
+    (pip-ломающее плечо #340). CLI-wrapper'ы (socks5h:10808 точечно) не через этот список."""
+    import dashboard_common
+    scheme_keys = {"HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"}
+    env = dict(srouter.CODEX_LAUNCHCTL_ENV)
+    for key in scheme_keys:
+        assert env.get(key) == dashboard_common.HTTP_PROXY_URL, \
+            f"{key} должен нести privoxy-плечо ({dashboard_common.HTTP_PROXY_URL}): {env}"
+    for key in ("ALL_PROXY", "all_proxy"):
+        assert key not in env, f"{key} исключён из SET-списка (pip-ломающее плечо #340): {env}"
+    assert env.get("NO_PROXY") == srouter.CODEX_NO_PROXY
+    assert env.get("no_proxy") == srouter.CODEX_NO_PROXY
+
+
+def test_codex_launchctl_unset_keys_include_all_proxy():
+    """#340: UNSET-список — надмножество SET: ALL_PROXY/all_proxy снимаются при uninstall и в
+    residual-чистке, хотя больше не ставятся (симметричная нейтрализация старых установок)."""
+    unset_keys = set(srouter.CODEX_LAUNCHCTL_UNSET_KEYS)
+    set_keys = {key for key, _ in srouter.CODEX_LAUNCHCTL_ENV}
+    assert set_keys <= unset_keys, f"UNSET покрывает весь SET: не хватает {set_keys - unset_keys}"
+    assert {"ALL_PROXY", "all_proxy"} <= unset_keys, \
+        f"ALL_PROXY/all_proxy обязаны сниматься (residual старых установок #340): {unset_keys}"
+
+
+def test_remove_launchctl_env_unset_keys_follow_unset_list(monkeypatch, tmp_path):
+    """uninstall итерирует CODEX_LAUNCHCTL_UNSET_KEYS (включая ALL_PROXY/all_proxy)."""
+    home = _mock_home(monkeypatch, tmp_path)
+    srouter._install_launchctl_env(_env(tmp_path), _fake_runner())
+    runner = _real_launchctl_runner({})
+
+    srouter._remove_launchctl_env(runner)
+
+    keys = {c[5] for c in runner.calls
+            if len(c) > 5 and c[1] == "asuser" and c[4] == "unsetenv"}
+    assert set(srouter.CODEX_LAUNCHCTL_UNSET_KEYS) <= keys, \
+        f"uninstall снимает все ключи UNSET-списка (включая ALL_PROXY/all_proxy): {keys}"
+
+
 # ============ issue #250: guard — LaunchAgent НЕ ставится с путём в эфемерный AO-worktree =========
 #
 # Инцидент 2026-07-30: `com.srouter.codenv` указывал на

@@ -29,7 +29,16 @@ __all__ = [
     "_codenv_plist_is_managed", "_codenv_job_state", "_CODENV_RELOAD_SETTLE_WAIT",
     "_codenv_unloaded_is_persistent", "_codenv_job_check",
     "_codex_app_proxy_check", "_app_pids_route", "_codex_app_chromium_proxy_check",
+    "_gui_socks_residual_check",
 ]
+
+# Наш managed privoxy-формат gui-домена (#340): scheme-ключи = HTTP_PROXY_URL. try-import —
+# тот же fail-soft паттерн, что codex_wrappers (dashboard_common raise SystemExit без
+# srouter_config.py; SystemExit не ловится Exception — канон systemexit-breaks-except-exception).
+try:
+    from dashboard_common import HTTP_PROXY_URL as _MANAGED_GUI_HTTP_PROXY_URL
+except BaseException:
+    _MANAGED_GUI_HTTP_PROXY_URL = "http://127.0.0.1:8118"
 
 # Абсолютные пути: launchd/GUI PATH их не содержит (канон проекта).
 LSOF = "/usr/sbin/lsof"
@@ -111,6 +120,44 @@ def _codenv_managed(runner=None):
     run = runner if runner is not None else sys_probe.run
     loaded = _launchd_is_loaded(_CODENV_LABEL, domain=_launchd_domain(), runner=run)
     return loaded is True
+
+
+def _gui_socks_residual_check():
+    """Residual-SOCKS в gui-домене при managed codenv → warn (issue #340, launchctl-источник).
+
+    #340: источник pip-ломающего SOCKS-плеча — launchctl gui-домен. С #340 codenv ставит
+    scheme-ключи = privoxy (терминальное плечо) и снимает ALL_PROXY/all_proxy при каждом прогоне
+    агента; socks5h в gui-домене = residual от старой версии скрипта (setenv не ретроактивен —
+    новый скрипт снимает его только при СЛЕДУЮЩЕМ прогоне) → оператору нужен сигнал
+    «перепримени install / подожди ≤5 мин», а не молчание. Семантика:
+      ok       — socks-схем в gui-домене нет (наш новый privoxy-формат или пусто);
+      warn     — socks есть И codenv managed (наш источник, residual/устаревший скрипт);
+      unknown  — gui не верифицируем (fail-closed) ИЛИ codenv не managed (чужой socks — НЕ наша
+                 зона: desktop-check уже down-ит чужой SOCKS #127; дублировать чужой вердикт
+                 своим warn не будем, #189 codenv-aware семантика).
+    Scheme-классификация через urlparse (эталон #127, не подстрока). Не бросает.
+    """
+    gui = _read_gui_proxy_env()
+    if not gui.get("verifiable"):
+        return {"status": "unknown",
+                "detail": ("launchctl print gui/<uid> не ответил — residual-socks в gui-домене "
+                           "не верифицируем (issue #340). Ручная проверка: launchctl print gui/$(id -u)")}
+    keys = gui.get("keys") or {}
+    socks_keys = {k: v for k, v in keys.items()
+                  if urlparse(v).scheme.lower() in {"socks", "socks5", "socks5h"}}
+    if not socks_keys:
+        return {"status": "ok",
+                "detail": "gui-домен без socks-scheme — терминальное privoxy-плечо (#340), pip не затронут"}
+    if not _codenv_managed():
+        return {"status": "unknown",
+                "detail": (f"socks в gui-домене ({', '.join(sorted(socks_keys))}), но codenv не "
+                           f"managed — чужой прокси, не источник srouter (см. desktop proxy check, #127)")}
+    found = ", ".join(f"{k}={v}" for k, v in sorted(socks_keys.items()))
+    return {"status": "warn",
+            "detail": (f"residual SOCKS в gui-домене от старой версии codenv ({found}) — наследуется "
+                       f"всеми GUI-терминалами, ломает pip/requests (issue #340). Фикс: 'srouter "
+                       f"install' (новый скрипт снимает ALL_PROXY при первом же прогоне, ≤5 мин) "
+                       f"или разово: launchctl unsetenv ALL_PROXY all_proxy")}
 
 
 def _desktop_proxy_check():
@@ -750,8 +797,22 @@ def _codex_app_proxy_check():
         return {"status": "ok", "source": "runtime",
                 "detail": (f"ChatGPT.app Rust app-server через SOCKS5 (lsof PID {','.join(sorted(route['socks']))} "
                            f"-> 10808, codenv gui-env: {found})")}
-    # gui-env задан, но без SOCKS5 (только HTTP/privoxy) → warn (long-lived WS порвётся #120).
+    # gui-env задан, но без SOCKS5. #340: наш managed privoxy-формат — НОРМАЛЬНОЕ состояние
+    # установки (терминальное плечо), не «App на privoxy» — иначе нормальная установка вечно
+    # degraded (канон PR #135). App сегодня спавнится с санитизованным env без прокси (ps eww,
+    # #340) — gui-env до него не доходит; реальный маршрут App-PID ловит runtime-ветка выше
+    # (lsof privoxy → warn #120). ok без runtime-доказательства не заявляем (fail-closed,
+    # cycle-review #190) → unknown (info-only). ЧУЖОЙ http-прокси (не наш URL) → warn как раньше
+    # (#120 класс риска: если App его унаследует, long-lived WS порвётся).
     found = ", ".join(f"{k}={v}" for k, v in keys.items())
+    proxy_vals = {v for k, v in keys.items()
+                  if urlparse(v).scheme.lower() in {"http", "https", "socks", "socks5", "socks5h"}}
+    if proxy_vals and proxy_vals <= {_MANAGED_GUI_HTTP_PROXY_URL}:
+        return {"status": "unknown", "source": "gui-env",
+                "detail": (f"gui-env = managed privoxy-плечо #340 ({found}, {pid_hint}) — норма "
+                           f"установки, не «App на privoxy»: Rust app-server не наследует gui-env "
+                           f"(санитизованный spawn, #340). Реальный маршрут App-PID см. runtime/lsof; "
+                           f"SOCKS для CLI-codex — ~/bin/codex-srouter wrapper'ы точечно")}
     return {"status": "warn", "source": "gui-env",
             "detail": (f"ChatGPT.app Rust app-server через HTTP прокси без SOCKS5 ({found}, {pid_hint}) — "
                        f"privoxy рвёт long-lived WS (#120). codenv должен ставить SOCKS5")}

@@ -431,12 +431,14 @@ def _assert_shell_proxy_endpoints_follow_canonical(script_rel, expected_port_map
             )
 
 
-def test_launchagent_codex_env_follows_canonical_socks_port():
-    """srouter-codex-env.sh выставляет GUI env PROXY=socks5h://127.0.0.1:XRAY_SOCKS_PORT.
-    Shell не импортирует Python — parity-гвард против dashboard_common.XRAY_SOCKS_PORT."""
+def test_launchagent_codex_env_follows_canonical_privoxy_port():
+    """srouter-codex-env.sh выставляет GUI env PROXY=privoxy (issue #340): scheme-ключи =
+    http://127.0.0.1:PRIVOXY_PORT — терминальное плечо (pip/requests), не socks5h (#331/#340:
+    socks в scheme-ключах gui-домена ломает pip — select_proxy берёт scheme-ключ раньше 'all').
+    Shell не импортирует Python — parity-гвард против dashboard_common.PRIVOXY_PORT."""
     _assert_shell_proxy_endpoints_follow_canonical(
         "launchagents/srouter-codex-env.sh",
-        {"PROXY": dashboard_common.XRAY_SOCKS_PORT},
+        {"PROXY": dashboard_common.PRIVOXY_PORT},
     )
 
 
