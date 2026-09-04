@@ -53,12 +53,16 @@ LAUNCHCTL = "/bin/launchctl"
 
 # ============================ #134: Desktop App proxy (launchctl getenv) ============================
 
-# launchctl держит ТРИ прокси-ключа; Desktop App наследует все. Инцидент #127: SOCKS5 сидел в
-# HTTP_PROXY (не HTTPS_PROXY) → doctor (читая только HTTPS_PROXY) сказал ✅. Обходим все три,
-# НЕ угадывая selector приложения (он у Claude/Node/Electron разный) — показываем «как есть».
-# NOTE: не то же что CODEX_LAUNCHCTL_ENV в srouter.py — там (key, SOCKS5-value)-пары для Codex
-# install; здесь — диагностика Claude Desktop, другая семантика.
-LAUNCHCTL_PROXY_KEYS = ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY")
+# launchctl держит ШЕСТЬ прокси-ключей (оба регистра); GUI-процессы наследуют все. Инцидент #127:
+# SOCKS5 сидел в HTTP_PROXY (не HTTPS_PROXY) → doctor (читая только HTTPS_PROXY) сказал ✅.
+# Обходим все шесть, НЕ угадывая selector приложения (он у Claude/Node/Electron разный) —
+# показываем «как есть». #340 (Codex cycle-review): lower-case обязателен — старый codenv-env
+# ставил socks5h и в http_proxy/https_proxy/all_proxy; без них чужой lower-case SOCKS проходил
+# мимо desktop-check'а И residual-чека одновременно (двойной пропуск, GUI наследуют SOCKS).
+# NOTE: не то же что CODEX_LAUNCHCTL_UNSET_KEYS в codex_wrappers — там контракт снятия install,
+# здесь — диагностика Claude Desktop, другая семантика.
+LAUNCHCTL_PROXY_KEYS = ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY",
+                        "https_proxy", "http_proxy", "all_proxy")
 
 
 def _read_proxy_sources():
@@ -819,10 +823,35 @@ def _codex_app_proxy_check():
     proxy_vals = {v for k, v in keys.items()
                   if urlparse(v).scheme.lower() in {"http", "https", "socks", "socks5", "socks5h"}}
     if proxy_vals and proxy_vals <= {_MANAGED_GUI_HTTP_PROXY_URL}:
+        # Managed privoxy gui-env — норма установки (#340), НО не short-circuit: runtime-маршрут
+        # App-PID классифицируем независимо от gui-env (Codex cycle-review P1) — иначе STALE App
+        # с прямым external-сокетом растворяется в info-only unknown, и doctor показывает общий
+        # ok при прямом egress (fail-closed нарушение). socks → ok (positive evidence), privoxy →
+        # warn (#120 WS), external → down (STALE App / прямой egress), без доказательств → unknown.
+        route = _app_pids_route(app_pids, app_kinds=app_kinds)
+        if route.get("verifiable"):
+            if route.get("socks"):
+                return {"status": "ok", "source": "runtime",
+                        "detail": (f"ChatGPT.app Rust app-server через SOCKS5 (lsof PID "
+                                   f"{','.join(sorted(route['socks']))} -> {XRAY_PORT}; managed "
+                                   f"privoxy gui-env #340, {pid_hint})")}
+            if route.get("privoxy"):
+                pv = ",".join(sorted(route["privoxy"]))
+                return {"status": "warn", "source": "runtime",
+                        "detail": (f"ChatGPT.app Rust app-server через privoxy {PRIVOXY_PORT} "
+                                   f"(PID {pv}) — long-lived WS порвётся (#120). Перезапусти "
+                                   f"ChatGPT.app (Cmd+Q) / проверь wrapper")}
+            if route.get("external"):
+                ext = ",".join(sorted(route["external"]))
+                return {"status": "down", "source": "runtime",
+                        "detail": (f"ChatGPT.app App-процесс(ы) НАПРЯМУЮ (PID {ext} держат "
+                                   f"external-сокеты; managed privoxy gui-env #340, {pid_hint}) — "
+                                   f"STALE App: перезапусти ChatGPT.app (Cmd+Q из Dock)")}
         return {"status": "unknown", "source": "gui-env",
                 "detail": (f"gui-env = managed privoxy-плечо #340 ({found}, {pid_hint}) — норма "
                            f"установки, не «App на privoxy»: Rust app-server не наследует gui-env "
-                           f"(санитизованный spawn, #340). Реальный маршрут App-PID см. runtime/lsof; "
+                           f"(санитизованный spawn, #340). Маршрут App-PID не доказан (idle/сбой "
+                           f"lsof) — ручная проверка: lsof -nP -p {','.join(app_pids)}. "
                            f"SOCKS для CLI-codex — ~/bin/codex-srouter wrapper'ы точечно")}
     return {"status": "warn", "source": "gui-env",
             "detail": (f"ChatGPT.app Rust app-server через HTTP прокси без SOCKS5 ({found}, {pid_hint}) — "

@@ -727,6 +727,25 @@ def test_remove_launchctl_env_unset_keys_follow_unset_list(monkeypatch, tmp_path
         f"uninstall снимает все ключи UNSET-списка (включая ALL_PROXY/all_proxy): {keys}"
 
 
+def test_codenv_env_script_propagates_launchctl_failures():
+    """#340 (Codex cycle-review): сбой setenv/unsetenv → ненулевой exit скрипта, не маскировка.
+
+    LaunchAgent job-check читает last exit code: скрипт, «проглотивший» сбой launchctl (rc=0
+    при провале unsetenv residual / setenv proxy), выглядит здоровым, пока gui-домен остаётся
+    с pip-ломающим плечом или без прокси вовсе. Канон: fail-closed + noisy-log-better-than-no-log
+    (детерминированный сигнал в exit code лучше молчаливого rc=0)."""
+    script = Path(__file__).resolve().parent.parent / "launchagents" / "srouter-codex-env.sh"
+    code = "\n".join(ln for ln in script.read_text(encoding="utf-8").splitlines()
+                     if not ln.lstrip().startswith("#"))
+    assert "FAIL=0" in code and "FAIL=1" in code, "скрипт накапливает статус сбоев launchctl"
+    assert "exit" in code, "скрипт отдаёт накопленный статус в exit code"
+    # Каждый launchctl вызов в коде гейтится `|| FAIL=1` — ни одного «голого» вызова.
+    bare = [ln for ln in code.splitlines()
+            if ln.strip().startswith("launchctl ") and "FAIL=1" not in ln
+            and not ln.strip().startswith("launchctl unsetenv \"$key\"")]
+    assert not bare, f"launchctl-вызовы без `|| FAIL=1`: {bare}"
+
+
 # ============ issue #250: guard — LaunchAgent НЕ ставится с путём в эфемерный AO-worktree =========
 #
 # Инцидент 2026-07-30: `com.srouter.codenv` указывал на

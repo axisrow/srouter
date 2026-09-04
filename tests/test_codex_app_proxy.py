@@ -214,6 +214,57 @@ def test_app_proxy_warn_when_gui_http_proxy_is_foreign(monkeypatch):
     assert res["status"] == "warn", f"чужой http-прокси в gui → warn; got {res}"
 
 
+def test_app_proxy_classifies_route_under_managed_privoxy_gui_env(monkeypatch):
+    """#340 (Codex cycle-review P1): managed privoxy gui-env НЕ short-circuit'ит runtime-маршрут.
+
+    gui-env=privoxy — норма установки, но App-PID с прямым external-сокетом обязан остаться
+    down (STALE App), а не раствориться в info-only unknown: doctor не имеет права показать
+    общий ok при прямом egress (fail-closed, канон detector-must-be-function-not-constant).
+    """
+    ps = f"60826 {APP_CODEX_COMM}\n"
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _fake(ps, _gui_env({"HTTPS_PROXY": PRIVOXY, "HTTP_PROXY": PRIVOXY}),
+                              lsof_out=_lsof_external("60826")))
+    res = health._codex_app_proxy_check()
+    assert res["status"] == "down", f"external-сокет App при managed privoxy gui → down; got {res}"
+
+
+def test_app_proxy_socks_route_ok_under_managed_privoxy_gui_env(monkeypatch):
+    """App-PID с доказанным SOCKS-сокетом при managed privoxy gui-env → ok (positive evidence)."""
+    ps = f"60826 {APP_CODEX_COMM}\n"
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _fake(ps, _gui_env({"HTTPS_PROXY": PRIVOXY, "HTTP_PROXY": PRIVOXY}),
+                              lsof_out=_lsof_socks("60826")))
+    res = health._codex_app_proxy_check()
+    assert res["status"] == "ok", f"доказанный SOCKS-маршрут → ok; got {res}"
+
+
+def test_app_proxy_privoxy_route_warn_under_managed_privoxy_gui_env(monkeypatch):
+    """App-PID через privoxy 8118 при managed privoxy gui-env → warn (#120 WS), не unknown."""
+    ps = f"60826 {APP_CODEX_COMM}\n"
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _fake(ps, _gui_env({"HTTPS_PROXY": PRIVOXY, "HTTP_PROXY": PRIVOXY}),
+                              lsof_out=_lsof_privoxy("60826")))
+    res = health._codex_app_proxy_check()
+    assert res["status"] == "warn", f"App через privoxy 8118 → warn (#120); got {res}"
+
+
+def test_desktop_check_sees_lowercase_foreign_socks(monkeypatch):
+    """#340 (Codex cycle-review P2): desktop-check видит foreign socks и в lower-case ключах.
+
+    LAUNCHCTL_PROXY_KEYS без lower-case — чужой all_proxy=socks5:// невидим desktop-check'у
+    (unknown вместо down), а residual-чек в этот момент честно уходит в unknown («не наша
+    зона») → SOCKS наследуется всеми GUI-процессами, а doctor молчит (двойной пропуск).
+    """
+    gui_text = _gui_env({"all_proxy": "socks5://10.0.0.9:1080", "https_proxy": "http://10.0.0.9:3128"})
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _fake("", gui_text, lsof_out=""))
+    src = health._read_proxy_sources()
+    assert "all_proxy" in src["desktop_keys"], f"desktop_keys должны включать lower-case: {src}"
+    res = health._desktop_proxy_check()
+    assert res["status"] == "down", f"чужой lower-case socks → down (#127); got {res}"
+
+
 # ============ #340: residual-SOCKS в gui-домене (launchctl-источник, не убран старой версией) ============
 def _fake_codenv_managed(monkeypatch, *, managed):
     """Мок _codenv_managed → managed (plist+loaded) / False — без обращения к реальному дому."""

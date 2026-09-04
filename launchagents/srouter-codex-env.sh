@@ -44,21 +44,26 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 PYTHON_BIN="${SROUTER_PYTHON:-/usr/bin/python3}"
 PROXY="http://127.0.0.1:8118"
 FALLBACK_NO_PROXY="localhost,127.0.0.1,::1,z.ai,.z.ai"
+# Статус сбоев launchctl (#340 cycle-review): job-check читает last exit code — «проглотивший»
+# сбой скрипт (rc=0 при провале setenv/unsetenv) выглядит здоровым в launchd, пока gui-домен
+# остаётся с pip-ломающим плечом или вообще без прокси. Накапливаем и отдаём ненулевой exit.
+FAIL=0
 # 1) PROXY-переменные + conservative NO_PROXY — НЕМЕДЛЕННО (без сетевого ожидания), fail-closed.
 for key in HTTP_PROXY HTTPS_PROXY http_proxy https_proxy; do
-  launchctl setenv "$key" "$PROXY"
+  launchctl setenv "$key" "$PROXY" || FAIL=1
 done
-launchctl setenv NO_PROXY "$FALLBACK_NO_PROXY"
-launchctl setenv no_proxy "$FALLBACK_NO_PROXY"
+launchctl setenv NO_PROXY "$FALLBACK_NO_PROXY" || FAIL=1
+launchctl setenv no_proxy "$FALLBACK_NO_PROXY" || FAIL=1
 # 1b) residual-чистка #331/#340: старые версии этого скрипта ставили ALL_PROXY/all_proxy=socks5h
 #     в gui-домен; launchctl setenv не ретроактивен и не снимает то, чего не ставит → без явного
 #     unsetenv residual socks5h жил бы в gui-домене вечно и продолжал ломать pip/requests.
-launchctl unsetenv ALL_PROXY
-launchctl unsetenv all_proxy
+launchctl unsetenv ALL_PROXY || FAIL=1
+launchctl unsetenv all_proxy || FAIL=1
 # 2) Динамический NO_PROXY — ПОСЛЕ (блокирующий probe). Обновляет ТОЛЬКО NO_PROXY; PROXY уже стоит.
 #    Пустой результат (Python/detect сбой) → оставляем conservative fallback, уже выставленный выше.
 NO_PROXY="$("$PYTHON_BIN" -c "import sys; sys.path.insert(0, '$ROOT_DIR'); import direct_first; print(direct_first.no_proxy_string())" 2>/dev/null)"
 if [ -n "$NO_PROXY" ]; then
-  launchctl setenv NO_PROXY "$NO_PROXY"
-  launchctl setenv no_proxy "$NO_PROXY"
+  launchctl setenv NO_PROXY "$NO_PROXY" || FAIL=1
+  launchctl setenv no_proxy "$NO_PROXY" || FAIL=1
 fi
+exit "$FAIL"
