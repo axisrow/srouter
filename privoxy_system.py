@@ -855,7 +855,7 @@ _USER_SIDE_NAMES = frozenset({
     "status", "state_protected", "_write_pending", "_write_unprotect_pending", "_mark_failed",
     "_promote_state", "_restore_state_after_unprotect", "_parse_helper_output", "_sudo_reset",
     "_install_helper", "_remove_via_runner", "_rollback_protection", "protect", "control",
-    "unprotect",
+    "unprotect", "_boot_persistence",  # #330: boot-persistence детектор рестарт-пути
 })
 
 

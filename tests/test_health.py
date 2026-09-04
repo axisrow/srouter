@@ -12,6 +12,7 @@ _claude_proxy_probe() возвращает {status, source, detail}:
 """
 import json
 import os
+from pathlib import Path
 
 import pytest as _pytest
 import pytest  # noqa: ICN003 — pytest.fail/raises в тестах ниже (#194)
@@ -126,6 +127,10 @@ def _all_up_monkey(monkeypatch, *, probe_status="ok", probe_detail="runtime: к�
                         lambda: {"status": "info", "detail": "mock: PF kill-switch не установлен"})
     monkeypatch.setattr(health, "_claude_transport_probe",
                         lambda *a, **kw: {"status": "unknown", "detail": "mock: CC не запущен (real CLI)"})
+    # #330: persists-across-boot дёргает launchctl print + ФС plist'ов — мокаем ok (не драйвит
+    # вердикт; это info-only чек). Тесты самой грани мокают отдельно (см. #330-секцию).
+    monkeypatch.setattr(health, "_local_proxy_boot_persistence",
+                        lambda: {"status": "ok", "detail": "mock: регистрация launchd на месте"})
 
 
 # ============================ _claude_proxy_probe (детект lsof) ============================
@@ -745,8 +750,11 @@ def test_local_proxy_down_when_port_closed(monkeypatch):
 def test_local_proxy_zombie_when_port_open_but_service_not_running(monkeypatch):
     """ДЫРА #204: port open + service NOT running → ЗОМБИ. Порт слушается (кем-то), но launchd-сервис
     не Running → privoxy-процесс отвалился от launchd (orphan) либо порт занят чужим. Раньше
-    port-open давал ложный ok. Теперь service-status ловит несоответствие."""
+    port-open давал ложный ok. Теперь service-status ловит несоответствие. #330: заглушка
+    статична → re-check подтверждает not_running; backoff гасим (unit-тест, не sleep-тест)."""
     monkeypatch.setattr(health, "_port_up", lambda port: True)
+    monkeypatch.setattr(health, "_zombie_recheck_delay", lambda: None)
+
     def fake_running(label, domain=None):
         return "not_running" if label == health.PRIVOXY_SYSTEM_LABEL or label == "homebrew.mxcl.privoxy" else "running"
     monkeypatch.setattr(health, "_service_running", fake_running)
@@ -783,8 +791,10 @@ def test_local_proxy_not_zombie_when_launchctl_times_out(monkeypatch):
 
 def test_local_proxy_zombie_requires_confirmed_not_running(monkeypatch):
     """Зомби требует ПОДТВЕРЖДЁННОГО not-running (state!=running, rc=0), не timeout/unknown.
-    Регресс-гвард P1: только not_running (launchctl ответил, state waiting/exited) -> зомби."""
+    Регресс-гвард P1: только not_running (launchctl ответил, state waiting/exited) -> зомби.
+    #330: подтверждение теперь двусрезное (re-check); backoff гасим (unit-тест)."""
     monkeypatch.setattr(health, "_port_up", lambda port: True)
+    monkeypatch.setattr(health, "_zombie_recheck_delay", lambda: None)
     monkeypatch.setattr(health, "_service_running", lambda label, domain=None: "not_running"
                         if (label == health.PRIVOXY_SYSTEM_LABEL or label == "homebrew.mxcl.privoxy")
                         else "running")
@@ -845,6 +855,199 @@ def test_service_running_uses_system_domain_for_protected_privoxy(monkeypatch):
     # проверяем что launchctl print system/<label>:
     assert any("print" in c and "system/" in " ".join(c) for c in calls), \
         "protected → launchctl print system/<label>"
+
+# ============================ #330: зомби-вердикт устойчив к mid-start (re-check с backoff) =====
+# Стенограмма инцидента #330: второй прогон doctor после `brew services start` показал ⚠ «зомби
+# (port 8118 слушается, но сервис не Running)» на RUNNING-сервисе — первый срез launchctl print
+# поймал mid-start состояние (bootstrap в полёте, state ещё не running / job ещё не загружен).
+# Канон verify-dont-guess: «подтверждённый not_running» обязан быть подтверждён ДВАЖДЫ — re-check
+# с коротким backoff перед вердиктом.
+
+def test_local_proxy_zombie_needs_recheck_midstart_becomes_running(monkeypatch):
+    """ДЫРА #330: port open + первый срез not_running, НО на re-check сервис уже running
+    (mid-start) → НЕ зомби (ok). Раньше одиночный срез давал ложный зомби на живом сервисе."""
+    monkeypatch.setattr(health, "_port_up", lambda port: True)
+    monkeypatch.setattr(health, "_zombie_recheck_delay", lambda: None)  # без реального sleep
+    states = iter(["not_running", "running", "running", "running"])
+
+    def fake_running(label, domain=None):
+        # privoxy первый в списке компонентов: 1-й вызов mid-start, дальше running.
+        return next(states, "running")
+
+    monkeypatch.setattr(health, "_service_running", fake_running)
+    result = health._local_proxy_up()
+    assert result["status"] == "ok", "mid-start (re-check running) → НЕ зомби"
+    assert "зомби" not in result["detail"].lower(), "mid-start не клеймится зомби"
+
+
+def test_local_proxy_zombie_confirmed_when_recheck_still_not_running(monkeypatch):
+    """Зомби подтверждённый: оба среза not_running → verdict остаётся down (re-check не маскирует
+    реальный orphan — детектор не превращается в всегда-зелёный, канон detector-is-function)."""
+    monkeypatch.setattr(health, "_port_up", lambda port: True)
+    monkeypatch.setattr(health, "_zombie_recheck_delay", lambda: None)
+    monkeypatch.setattr(health, "_service_running", lambda label, domain=None:
+                        "not_running" if label in (health.PRIVOXY_SYSTEM_LABEL, health.PRIVOXY_BREW_LABEL)
+                        else "running")
+    result = health._local_proxy_up()
+    assert result["status"] == "down", "подтверждённый зомби (оба среза) → down"
+    assert "зомби" in result["detail"].lower()
+
+
+def test_local_proxy_zombie_recheck_port_closed_reports_crash(monkeypatch):
+    """Порт закрылся МЕЖДУ срезами, сервис not_running → это крах (не «порт слушается, но...»):
+    зомби-формулировка со «слушается» была бы ложью о повторной пробе."""
+    monkeypatch.setattr(health, "_zombie_recheck_delay", lambda: None)
+    ports = iter([True, False])  # первый срез порт жив, re-check порт закрылся
+    monkeypatch.setattr(health, "_port_up", lambda port: next(ports, False))
+    monkeypatch.setattr(health, "_service_running", lambda label, domain=None:
+                        "not_running" if label in (health.PRIVOXY_SYSTEM_LABEL, health.PRIVOXY_BREW_LABEL)
+                        else "running")
+    result = health._local_proxy_up()
+    assert result["status"] == "down", "порт закрылся при повторной пробе → down"
+    assert "зомби" not in result["detail"].lower(), "порт закрылся → это крах, не зомби"
+
+
+def test_local_proxy_zombie_recheck_unknown_is_not_zombie(monkeypatch):
+    """Re-check launchctl timeout → fail-closed: НЕ зомби (тот же канон, что первый срез unknown)."""
+    monkeypatch.setattr(health, "_port_up", lambda port: True)
+    monkeypatch.setattr(health, "_zombie_recheck_delay", lambda: None)
+    states = iter(["not_running", "unknown", "running", "running"])
+
+    def fake_running(label, domain=None):
+        return next(states, "running")
+
+    monkeypatch.setattr(health, "_service_running", fake_running)
+    result = health._local_proxy_up()
+    assert result["status"] == "ok", "re-check timeout → НЕ зомби (fail-closed)"
+    assert "зомби" not in result["detail"].lower()
+
+
+# ============================ #330: persists-across-boot (launchd-регистрация) ==================
+# Дыра #330: probe локального прокси видел только «порт слушается + сервис Running» в момент
+# пробы — orphan (порт жив, launchd-регистрации нет) выглядел healthy до ближайшего ребута.
+# Новая грань: plist присутствует + job загружен → перезагрузку переживёт; иначе warn «порт жив,
+# но после перезагрузки не поднимется» — info-only (не error), опорный паттерн семантики —
+# codex-isolation probe «PF kill-switch не установлен (lease отсутствует) — по выбору».
+
+def _mock_no_registrations(monkeypatch):
+    """Ни одного brew-plist на диске + launchctl «не загружен» (детерминированный orphan)."""
+    monkeypatch.setattr(health.sys_probe, "run", lambda cmd, timeout:
+                        {"rc": 3, "out": "", "err": "not loaded", "timeout": False})
+    monkeypatch.setattr(health.privoxy_system, "protection_present", lambda: False)
+    monkeypatch.setattr(health, "_user_launchagent_plist",
+                        lambda label: Path("/nonexistent-srouter-mock") / f"{label}.plist")
+
+
+def test_boot_persistence_warns_when_port_alive_without_registration(monkeypatch):
+    """ДЫРА #330 (инцидент 2026-09-03): порт 8118 жив, а launchd-регистрации нет (orphan —
+    поднят вручную/транзиентно) → warn «после перезагрузки не поднимется»: НЕ error, НЕ ok."""
+    monkeypatch.setattr(health, "_port_up", lambda port: True)
+    _mock_no_registrations(monkeypatch)
+    result = health._local_proxy_boot_persistence()
+    assert result["status"] == "warn", "порт жив без регистрации → warn (orphan), не ok"
+    assert "перезагрузк" in result["detail"].lower(), "warn называет ребут явно"
+    assert "8118" in result["detail"], "detail указывает живой порт orphan'а"
+
+
+def test_boot_persistence_ok_when_plist_present_and_loaded(monkeypatch, tmp_path):
+    """Обе регистрации на месте (plist на диске + job загружен) → ok (перезагрузку переживёт)."""
+    monkeypatch.setattr(health, "_port_up", lambda port: True)
+    monkeypatch.setattr(health.sys_probe, "run", lambda cmd, timeout:
+                        {"rc": 0, "out": "\tstate = running;\n\tpid = 1;\n", "err": "", "timeout": False})
+    monkeypatch.setattr(health.privoxy_system, "protection_present", lambda: False)
+    agents = tmp_path / "LaunchAgents"
+    agents.mkdir()
+    for label in (health.PRIVOXY_BREW_LABEL, "homebrew.mxcl.xray"):
+        (agents / f"{label}.plist").write_text("<plist/>", encoding="utf-8")
+    monkeypatch.setattr(health, "_user_launchagent_plist", lambda label: agents / f"{label}.plist")
+    result = health._local_proxy_boot_persistence()
+    assert result["status"] == "ok", "plist + loaded → ok"
+
+
+def test_boot_persistence_warns_when_port_dead_and_unregistered(monkeypatch):
+    """Не запущен И не зарегистрирован → тоже warn (это состояние после ребута из инцидента
+    #330): restart-совет lp_check регистрацию не вернёт — регистрирует только start/protect."""
+    monkeypatch.setattr(health, "_port_up", lambda port: False)
+    _mock_no_registrations(monkeypatch)
+    result = health._local_proxy_boot_persistence()
+    assert result["status"] == "warn", "не запущен + не зарегистрирован → warn"
+    assert "перезагрузк" in result["detail"].lower()
+
+
+def test_boot_persistence_not_warn_when_launchctl_unverified_with_plist(monkeypatch, tmp_path):
+    """Fail-closed #204-канон: plist на диске, но launchctl timeout → НЕ утверждаем «не
+    зарегистрирован» (unknown ≠ not_loaded) → ok с пометкой, не ложный warn."""
+    monkeypatch.setattr(health, "_port_up", lambda port: True)
+    monkeypatch.setattr(health.sys_probe, "run", lambda cmd, timeout:
+                        {"rc": None, "out": "", "err": "", "timeout": True})
+    monkeypatch.setattr(health.privoxy_system, "protection_present", lambda: False)
+    agents = tmp_path / "LaunchAgents"
+    agents.mkdir()
+    for label in (health.PRIVOXY_BREW_LABEL, "homebrew.mxcl.xray"):
+        (agents / f"{label}.plist").write_text("<plist/>", encoding="utf-8")
+    monkeypatch.setattr(health, "_user_launchagent_plist", lambda label: agents / f"{label}.plist")
+    result = health._local_proxy_boot_persistence()
+    assert result["status"] == "ok", "launchctl timeout + plist → НЕ warn (fail-closed)"
+    assert "не верифицирован" in result["detail"].lower(), "пометка в detail (noisy-log)"
+
+
+def test_boot_persistence_uses_managed_marker_for_protected_privoxy(monkeypatch, tmp_path):
+    """protected-mode: plist проверяется по маркеру managed-файла (не голый exists), путь —
+    system LaunchDaemon из ProtectedLayout; xray остаётся brew-контролем."""
+    calls = []
+    monkeypatch.setattr(health, "_port_up", lambda port: True)
+    monkeypatch.setattr(health.sys_probe, "run", lambda cmd, timeout:
+                        {"rc": 0, "out": "\tstate = running;\n", "err": "", "timeout": False})
+    monkeypatch.setattr(health.privoxy_system, "protection_present", lambda: True)
+
+    def fake_managed(path, marker):
+        calls.append((Path(path), marker))
+        return True
+
+    monkeypatch.setattr(health.privoxy_system, "_managed_file", fake_managed)
+    agents = tmp_path / "LaunchAgents"
+    agents.mkdir()
+    (agents / "homebrew.mxcl.xray.plist").write_text("<plist/>", encoding="utf-8")
+    monkeypatch.setattr(health, "_user_launchagent_plist", lambda label: agents / f"{label}.plist")
+    result = health._local_proxy_boot_persistence()
+    assert result["status"] == "ok", "managed-marker ок + xray plist ок → ok"
+    assert any(privoxy_system.PROTECTED_MARKER in (m or "") for _, m in calls), \
+        "protected privoxy проверяется по маркеру managed-plist"
+
+
+def test_boot_persistence_rechecks_before_warn_on_not_loaded(monkeypatch, tmp_path):
+    """plist есть, но первый срез launchctl «не загружен» → re-check с backoff перед warn
+    (та же анти-гонка старта, что у зомби-вердикта #330): второй срез loaded → НЕ warn."""
+    monkeypatch.setattr(health, "_port_up", lambda port: True)
+    monkeypatch.setattr(health, "_zombie_recheck_delay", lambda: None)
+    monkeypatch.setattr(health.privoxy_system, "protection_present", lambda: False)
+    agents = tmp_path / "LaunchAgents"
+    agents.mkdir()
+    for label in (health.PRIVOXY_BREW_LABEL, "homebrew.mxcl.xray"):
+        (agents / f"{label}.plist").write_text("<plist/>", encoding="utf-8")
+    monkeypatch.setattr(health, "_user_launchagent_plist", lambda label: agents / f"{label}.plist")
+    rcs = iter([3, 0, 0, 0])  # privoxy: первый срез not loaded, re-check loaded; xray loaded
+
+    def fake_run(cmd, timeout):
+        return {"rc": next(rcs, 0), "out": "\tstate = running;\n", "err": "", "timeout": False}
+
+    monkeypatch.setattr(health.sys_probe, "run", fake_run)
+    result = health._local_proxy_boot_persistence()
+    assert result["status"] == "ok", "mid-start not_loaded на re-check loaded → НЕ warn"
+
+
+def test_check_all_boot_persistence_is_info_only_warn(monkeypatch):
+    """Wiring в check_all: warn → ok=False + info=True (⚠, не роняет вердикт — паттерн
+    codex-isolation «по выбору»), НОВЫЙ чек не драйвит агрегацию."""
+    _all_up_monkey(monkeypatch)
+    monkeypatch.setattr(health, "_local_proxy_boot_persistence",
+                        lambda: {"status": "warn", "detail": "privoxy: порт жив, но после перезагрузки не поднимется"})
+    result = health.check_all()
+    bp = [c for c in result["checks"] if "persists-across-boot" in c["name"]]
+    assert bp, "чек persists-across-boot присутствует в doctor"
+    assert bp[0]["ok"] is False and bp[0].get("info") is True, "warn → info-only (⚠, не error)"
+    assert result["status"] == "ok", "info-only warn не роняет вердикт"
+
 
 # ============================ #205: DNS-резолв (DNS сломан vs VPS мёртв) ============================
 # Корень: _upstream_vps_reachable (#196) зовёт sys_probe.port_open → socket.create_connection,

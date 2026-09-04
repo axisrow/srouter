@@ -1999,3 +1999,126 @@ def test_install_helper_fail_closed_when_staged_tree_module_substituted_after_st
     # даже если entrypoint и остальные модули были install'ены честно до этого шага.
     assert not layout.helper_path.exists()
     assert not layout.helper_modules_dir.exists()
+
+
+# ============================ #330: boot-persistence рестарт-пути protected-mode ===================
+# Дыра #330 (инцидент 2026-09-03): privoxy жил как orphan без launchd-регистрации — doctor был
+# зелёный до ближайшего ребута, после ребута туннель лежал. Рекомендованный doctor'ом путь
+# восстановления `srouter privoxy restart` обязан после подъёма проверять launchd-регистрацию
+# (managed-plist с маркером + RunAtLoad + job загружен) и ЯВНО предупреждать «поднят транзиентно»,
+# если она не подтверждена (канон fail-closed + noisy-log: молчаливый транзиентный подъём =
+# следующий инцидент). Канон probe-semantics-from-primary-source: RunAtLoad — man launchd.plist.
+
+
+def _control_runner(loaded=True):
+    """Fake-runner для control(): sudo -k ок, helper restart ok, launchctl print по `loaded`."""
+    def runner(cmd, timeout):
+        if cmd[:2] == [privoxy_system.SUDO, "-k"]:
+            return {"rc": 0, "out": "", "err": "", "timeout": False}
+        if cmd[:1] == [privoxy_system.LAUNCHCTL] or privoxy_system.LAUNCHCTL in cmd[:2]:
+            if loaded:
+                return {"rc": 0, "out": "\tpid = 4242;\n\tstate = running;\n", "err": "", "timeout": False}
+            return {"rc": 3, "out": "", "err": "Load failed: 5: Input/output error", "timeout": False}
+        return {"rc": 0, "out": json.dumps({"ok": True, "changed": True}), "err": "", "timeout": False}
+    return runner
+
+
+def _restart_with(tmp_path, monkeypatch, *, plist_bytes=None, loaded=True):
+    """Прогнать control('restart') на tmp-layout с реальным plist-файлом и fake-runner'ом."""
+    layout = _layout(tmp_path)
+    monkeypatch.setattr(privoxy_system, "protection_present", lambda layout=None: True)
+    monkeypatch.setattr(privoxy_system, "status", lambda runner=None, layout=None: {"protected": True})
+    if plist_bytes is not None:
+        layout.launchdaemon_path.parent.mkdir(parents=True, exist_ok=True)
+        layout.launchdaemon_path.write_bytes(plist_bytes)
+    outcome = privoxy_system.control("restart", runner=_control_runner(loaded=loaded),
+                                     require_tty=False, layout=layout)
+    return outcome, layout
+
+
+def test_control_restart_reports_persistent_when_registration_intact(tmp_path, monkeypatch):
+    """managed-plist с маркером + RunAtLoad + job загружен → persistent=True (зелёный путь)."""
+    layout = _layout(tmp_path)
+    plist_bytes = privoxy_system.launchdaemon_bytes("/opt/homebrew", layout)
+    outcome, _ = _restart_with(tmp_path, monkeypatch, plist_bytes=plist_bytes)
+    assert outcome["ok"] is True, "restart прошёл"
+    assert outcome.get("persistent") is True, "регистрация на месте → persistent"
+
+
+def test_control_restart_flags_transient_when_runatload_stripped(tmp_path, monkeypatch):
+    """ДЫРА #330: маркер на месте, но RunAtLoad вырезан (drift) → persistent=False: после ребута
+    job не поднимется. Молчаливый ok здесь = следующий инцидент."""
+    layout = _layout(tmp_path)
+    payload = plistlib.loads(privoxy_system.launchdaemon_bytes("/opt/homebrew", layout))
+    payload["RunAtLoad"] = False
+    # plistlib-комментарий (наш маркер) парсером не сохраняется — ре-сериализация вставляет его
+    # обратно тем же приёмом, что launchdaemon_bytes: иначе тест проверял бы не «RunAtLoad
+    # вырезан», а «маркер вырезан» (plist_missing_or_unmanaged).
+    stripped = plistlib.dumps(payload, fmt=plistlib.FMT_XML, sort_keys=False)
+    marker = f"<!-- {privoxy_system.PROTECTED_MARKER} -->\n".encode()
+    stripped = stripped.replace(b"?>\n", b"?>\n" + marker, 1)
+    outcome, _ = _restart_with(tmp_path, monkeypatch, plist_bytes=stripped)
+    assert outcome["ok"] is True, "restart сам прошёл (сервис поднят)"
+    assert outcome.get("persistent") is False, "RunAtLoad вырезан → не переживёт ребут"
+    assert "runatload" in outcome.get("persistence_reason", "").lower()
+
+
+def test_control_restart_flags_transient_when_plist_missing(tmp_path, monkeypatch):
+    """Plist отсутствует/без маркера на момент пост-проверки → persistent=False
+    (plist_missing_or_unmanaged): поднятый процесс — транзиентный orphan."""
+    outcome, _ = _restart_with(tmp_path, monkeypatch, plist_bytes=None)
+    assert outcome["ok"] is True
+    assert outcome.get("persistent") is False
+    assert outcome.get("persistence_reason") == "plist_missing_or_unmanaged"
+
+
+def test_control_restart_flags_transient_when_job_not_loaded(tmp_path, monkeypatch):
+    """Plist на диске, но launchd job не загружен → persistent=False (not_loaded)."""
+    layout = _layout(tmp_path)
+    plist_bytes = privoxy_system.launchdaemon_bytes("/opt/homebrew", layout)
+    outcome, _ = _restart_with(tmp_path, monkeypatch, plist_bytes=plist_bytes, loaded=False)
+    assert outcome["ok"] is True
+    assert outcome.get("persistent") is False
+    assert outcome.get("persistence_reason") == "not_loaded"
+
+
+def test_control_stop_does_not_report_persistence(tmp_path, monkeypatch):
+    """stop не поднимает сервис — грань persistence относится только к start/restart."""
+    layout = _layout(tmp_path)
+    monkeypatch.setattr(privoxy_system, "protection_present", lambda layout=None: True)
+    monkeypatch.setattr(privoxy_system, "status", lambda runner=None, layout=None: {})
+    outcome = privoxy_system.control("stop", runner=_control_runner(), require_tty=False, layout=layout)
+    assert outcome["ok"] is True
+    assert "persistent" not in outcome, "stop не клеймится persistence-гранью"
+
+
+def test_privoxy_cli_restart_warns_transient_loudly(monkeypatch, capsys, tmp_path):
+    """CLI ЯВНО предупреждает «поднят транзиентно, ребут не переживёт» при persistent=False
+    (канон noisy-log-better-than-no-log: молчаливый транзиентный подъём = следующий инцидент)."""
+    import srouter_cli
+    monkeypatch.setattr(privoxy_system, "control", lambda action, runner=None, layout=None: {
+        "ok": True, "changed": True, "persistent": False,
+        "persistence_reason": "plist_missing_or_unmanaged"})
+    args = srouter_cli.build_parser().parse_args(
+        ["privoxy", "restart", "--state", str(tmp_path / "state.json")])
+    rc = srouter_cli.cmd_privoxy(args)
+    captured = capsys.readouterr()
+    assert rc == 0, "сервис поднят → rc 0 (это warning, не failure)"
+    assert "транзиентно" in captured.err.lower() or "транзиентно" in captured.out.lower(), \
+        "CLI явно предупреждает про транзиентный подъём"
+    assert "перезагрузк" in captured.err.lower() or "перезагрузк" in captured.out.lower(), \
+        "warning называет ребут"
+
+
+def test_privoxy_cli_restart_silent_when_persistent(monkeypatch, capsys, tmp_path):
+    """persistent=True → никакого warning'а про транзиентность (без ложной тревоги)."""
+    import srouter_cli
+    monkeypatch.setattr(privoxy_system, "control", lambda action, runner=None, layout=None: {
+        "ok": True, "changed": True, "persistent": True, "persistence_reason": "ok"})
+    args = srouter_cli.build_parser().parse_args(
+        ["privoxy", "restart", "--state", str(tmp_path / "state.json")])
+    rc = srouter_cli.cmd_privoxy(args)
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "транзиентно" not in captured.err.lower()
+    assert "транзиентно" not in captured.out.lower()

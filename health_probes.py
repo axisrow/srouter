@@ -10,8 +10,10 @@ health.py остаётся тонким фасадом: `from health_probes impo
 """
 import logging
 import os
+from pathlib import Path
 import socket
 import subprocess
+import time
 
 import local_state
 import privoxy_system
@@ -29,6 +31,8 @@ _log = logging.getLogger("srouter.health")
 __all__ = [
     "_launchd_field", "_port_up", "PRIVOXY_SYSTEM_LABEL", "PRIVOXY_BREW_LABEL", "XRAY_BREW_LABEL",
     "_privoxy_service_target", "_service_running", "_local_proxy_up",
+    "_zombie_recheck_delay", "_ZOMBIE_RECHECK_DELAY_SEC", "_launchd_loaded_status",
+    "_user_launchagent_plist", "_local_proxy_boot_persistence",
     "GFW_PROBE_DOMAINS", "GFW_CONTROL_DOMAIN", "_direct_domain_probe", "_gfw_domain_check",
     "_direct_first_check", "TUNNEL_TARGETS", "VENDOR_OUTAGE_MARKER",
     "_tunnel_target_up", "_tunnel_up",
@@ -101,6 +105,40 @@ def _privoxy_service_target():
     return PRIVOXY_BREW_LABEL, f"gui/{os.getuid()}"
 
 
+# #330: короткий backoff перед re-check'ом вердиктов, чувствительных к mid-start (зомби,
+# «plist не загружен»): первый срез launchctl print ловил bootstrap в полёте и клеймил зомби
+# на running-сервисе (стенограмма инцидента #330: второй прогон после `brew services start`
+# показал ⚠ зомби на running-сервисе).
+_ZOMBIE_RECHECK_DELAY_SEC = 1.5
+
+
+def _zombie_recheck_delay():
+    """Backoff перед повторным срезом launchctl (anti-mid-start, #330). Отдельная функция —
+    тесты гасят sleep (monkeypatch health._zombie_recheck_delay), не теряя логики re-check'а."""
+    time.sleep(max(0.0, _ZOMBIE_RECHECK_DELAY_SEC))
+
+
+def _launchd_loaded_status(label, domain=None):
+    """Загружен ли job в launchd — tri-state #204-канон (#330 persists-across-boot).
+      "loaded"     — launchctl print ответил rc=0 (job в launchd);
+      "not_loaded" — launchctl ОТВЕТИЛ ошибкой (job не загружен) — подтверждённый сигнал;
+      "unknown"    — timeout: fail-closed, НЕ утверждаем «не загружен» (как _service_running).
+    Отличие от _service_running: это ЗАГРУЖЕННОСТЬ (регистрация), не Running-состояние —
+    job бывает загружен и waiting/exiting, регистрация при этом валидна (свойство персистентности).
+    """
+    domain = domain or f"gui/{os.getuid()}"
+    r = sys_probe.run([LAUNCHCTL, "print", f"{domain}/{label}"], timeout=3)
+    if r.get("timeout"):
+        return "unknown"
+    return "loaded" if r.get("rc") == 0 else "not_loaded"
+
+
+def _user_launchagent_plist(label):
+    """Путь brew-plist'а в пользовательских LaunchAgents (тот же конвеншн, что
+    _launchd_job_snapshot в health.py: plist_path=None → ~/Library/LaunchAgents/<label>.plist)."""
+    return Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
+
+
 def _service_running(label, domain=None):
     """Состояние launchd-сервена по `launchctl print <domain>/<label>` — tri-state (#204 cycle-review P1).
 
@@ -159,8 +197,26 @@ def _local_proxy_up():
                 hint = "сервис не Running" if svc == "not_running" else "service-status unknown"
                 problems.append(f"{name} крах (port {port} closed, {hint} — restart)")
         elif svc == "not_running":
-            # port open + ПОДТВЕРЖДЁННО не Running → зомби (orphan/launchd рассинхрон).
-            problems.append(f"{name} зомби (port {port} слушается, но сервис не Running — orphan/launchd)")
+            # #330: re-check с коротким backoff перед вердиктом — одиночный срез ловил mid-start
+            # (bootstrap в полёте: job ещё не загружен / state ещё не running) и клеймил зомби
+            # на running-сервисе (стенограмма инцидента #330). Зомби = подтверждённый ДВАЖДЫ:
+            # порт жив на обоих срезах + not_running на обоих; любой другой исход re-check'а
+            # читается по его собственному значению (крах / mid-start ok / timeout fail-closed).
+            _health_facade._zombie_recheck_delay()
+            svc_recheck = _health_facade._service_running(label, domain)
+            port_open_recheck = _health_facade._port_up(port)
+            if not port_open_recheck:
+                # Порт закрылся между срезами: зомби-формулировка «порт слушается» была бы ложью
+                # о повторной пробе — это крах.
+                problems.append(f"{name} крах (port {port} закрылся при повторной пробе)")
+            elif svc_recheck == "running":
+                # mid-start рассосался: сервис уже Running — НЕ зомби (verify-dont-guess).
+                continue
+            elif svc_recheck == "unknown":
+                # timeout даже на re-check'е — fail-closed, НЕ зомби (тот же канон, что первый срез).
+                unverified.append(name)
+            else:
+                problems.append(f"{name} зомби (port {port} слушается, но сервис не Running — orphan/launchd)")
         elif svc == "unknown":
             # port open, но launchctl не ответил → НЕ зомби (fail-closed), помечаем для observability.
             unverified.append(name)
@@ -172,6 +228,81 @@ def _local_proxy_up():
     detail = "локальный прокси жив: privoxy 8118 + xray 10808 port-up + service-running"
     if unverified:
         detail += f" (⚠ service-status не верифицирован для {', '.join(unverified)} — launchctl timeout)"
+    return {"status": "ok", "detail": detail}
+
+
+# ============================ #330: persists-across-boot (launchd-регистрация) ==================
+# Дыра #330 (инцидент 2026-09-03): probe локального прокси видел только «порт слушается + сервис
+# Running» в момент пробы — orphan (порт жив, launchd-регистрации нет: plist отсутствует, job не
+# загружен) выглядел healthy до ближайшего ребута. После ребута privoxy не поднялся, туннель лёг
+# (fail-closed), а doctor перед ребутом был зелёный. Опорный паттерн семантики — codex-isolation
+# probe («PF kill-switch не установлен (lease отсутствует) — по выбору»): грань персистентности —
+# это warn (⚠, info-only), не error.
+
+def _local_proxy_boot_persistence():
+    """Переживёт ли локальный прокси перезагрузку? (#330 — грань persists-across-boot)
+
+    На компонент: регистрация = plist присутствует (protected privoxy — по managed-маркеру,
+    brew/xray — по факту файла) И job загружен в launchd. Не зарегистрирован → warn «порт жив,
+    но после перезагрузки не поднимется» (orphan — инцидент #330) либо «не запущен и не
+    зарегистрирован» (restart регистрацию не вернёт — нужен start/protect). Info-only ВСЕГДА:
+    warn не роняет вердикт (канал в моменте работает).
+
+    Fail-closed #204-канон: launchctl timeout → НЕ утверждаем «не зарегистрирован» (unknown
+    ≠ not_loaded); отсутствие plist — факт ФС, детерминативен без launchctl. Anti-mid-start
+    (та же гонка старта, что у зомби-вердикта): plist есть + «не загружен» → re-check с backoff
+    перед warn. Каноны: verify-dont-guess, probe-semantics-from-primary-source (RunAtLoad —
+    man launchd.plist), noisy-log-better-than-no-log.
+
+    Возвращает {status, detail}: "ok" | "warn". Не бросает.
+    """
+    privoxy_label, privoxy_domain = _privoxy_service_target()
+    protected = privoxy_system.protection_present()
+    components = [
+        ("privoxy", PRIVOXY_PORT, privoxy_label, privoxy_domain,
+         privoxy_system.DEFAULT_LAYOUT.launchdaemon_path if protected
+         else _user_launchagent_plist(PRIVOXY_BREW_LABEL),
+         privoxy_system.PROTECTED_MARKER if protected else None),
+        ("xray", XRAY_PORT, XRAY_BREW_LABEL, f"gui/{os.getuid()}",
+         _user_launchagent_plist(XRAY_BREW_LABEL), None),
+    ]
+    problems = []
+    unverified = []
+    for name, port, label, domain, plist_path, managed_marker in components:
+        port_open = _health_facade._port_up(port)
+        if managed_marker is not None:
+            plist_ok = privoxy_system._managed_file(plist_path, managed_marker)
+        else:
+            plist_ok = plist_path.is_file()
+        if plist_ok:
+            loaded = _health_facade._launchd_loaded_status(label, domain)
+            if loaded == "unknown":
+                # fail-closed: не утверждаем «не зарегистрирован» без ответа launchctl.
+                unverified.append(name)
+                continue
+            if loaded == "loaded":
+                continue
+            # anti-mid-start: bootstrap в полёте даёт not_loaded на первом срезе.
+            _health_facade._zombie_recheck_delay()
+            if _health_facade._launchd_loaded_status(label, domain) == "loaded":
+                continue
+            why = "plist на диске, но job не загружен в launchd"
+        else:
+            why = f"plist отсутствует ({plist_path})"
+        remedy = ("srouter privoxy protect --strict (пересоздаёт managed-plist)"
+                  if name == "privoxy" and protected
+                  else f"brew services start {name} (создаёт plist)")
+        if port_open:
+            problems.append(f"{name}: порт {port} жив, но launchd-регистрации нет ({why}) — "
+                            f"после перезагрузки не поднимется; регистрация: {remedy}")
+        else:
+            problems.append(f"{name}: не запущен и не зарегистрирован ({why}) — после перезагрузки "
+                            f"сам не поднимется; регистрация: {remedy}")
+    if problems:
+        return {"status": "warn", "detail": "; ".join(problems)}
+    detail = "регистрация launchd подтверждена: privoxy + xray (plist на месте + job загружен)"
+    if unverified:
+        detail += f" (⚠ launchctl не верифицирован для {', '.join(unverified)} — timeout)"
     return {"status": "ok", "detail": detail}
 
 

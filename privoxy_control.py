@@ -29,6 +29,7 @@ privoxy_system` только регистрирует модуль, атрибу
 """
 import json
 import os
+import plistlib
 import pwd
 import shutil
 import sys
@@ -36,6 +37,7 @@ import tempfile
 from pathlib import Path
 
 import privoxy_system
+from xml.parsers.expat import ExpatError  # noqa: F401 — см. _boot_persistence (битый XML ≠ ValueError)
 
 
 def status(*, runner=None, layout=None):
@@ -555,6 +557,42 @@ def protect(*, state_path, prefix="/opt/homebrew", runner=None, require_tty=True
         shutil.rmtree(staged_dir, ignore_errors=True)
 
 
+def _boot_persistence(runner, layout=None):
+    """Launchd-регистрация protected-privoxy переживает перезагрузку? (#330)
+
+    Детектор трёх условий boot-persistence (канон probe-semantics-from-primary-source:
+    RunAtLoad — man launchd.plist):
+      (1) managed-plist на диске с маркером (PROTECTED_MARKER) — файл, который launchd
+          загрузит при старте системы;
+      (2) RunAtLoad=true в plist — launchd запустит job при загрузке (вырезанный/сброшенный
+          ключ = plist «есть», но сервис после ребута не поднимется);
+      (3) job загружен в system-domain — bootstrap после restart/stop→start реально прошёл.
+
+    Возвращает {persistent: bool, reason: str}, reason ∈ "ok" | "plist_missing_or_unmanaged" |
+    "plist_invalid" | "runatload_missing" | "not_loaded". Обе ветки достижимы (канон
+    detector-is-function): drift маркера, вырезанный RunAtLoad, снесённый plist, неотвечающий
+    bootstrap — каждый даёт свою причину, а не постоянную зелёную/красную.
+
+    plistlib/ExpatError — stdlib основного процесса (модуль НЕ копируется под sudo, см.
+    docstring модуля); битый XML бросает ExpatError, а не ValueError — ловим оба.
+    """
+    if layout is None:
+        layout = privoxy_system.DEFAULT_LAYOUT
+    plist_path = layout.launchdaemon_path
+    if not privoxy_system._managed_file(plist_path, privoxy_system.PROTECTED_MARKER):
+        return {"persistent": False, "reason": "plist_missing_or_unmanaged"}
+    try:
+        payload = plistlib.loads(Path(plist_path).read_bytes())
+    except (OSError, ValueError, ExpatError):
+        return {"persistent": False, "reason": "plist_invalid"}
+    if payload.get("RunAtLoad") is not True:
+        return {"persistent": False, "reason": "runatload_missing"}
+    if not privoxy_system._launchd_loaded(privoxy_system.SYSTEM_DOMAIN,
+                                          privoxy_system.SYSTEM_LABEL, runner):
+        return {"persistent": False, "reason": "not_loaded"}
+    return {"persistent": True, "reason": "ok"}
+
+
 def control(action, *, runner=None, require_tty=True, layout=None):
     if layout is None:
         layout = privoxy_system.DEFAULT_LAYOUT
@@ -571,6 +609,14 @@ def control(action, *, runner=None, require_tty=True, layout=None):
     privoxy_system._sudo_reset(runner)
     outcome = privoxy_system._parse_helper_output(invoked)
     outcome["status"] = privoxy_system.status(runner=runner, layout=layout)
+    if action in ("start", "restart") and outcome.get("ok"):
+        # #330: путь восстановления обязан после подъёма проверять launchd-регистрацию —
+        # молчаливый транзиентный подъём (порт жив, регистрации нет) = следующий инцидент
+        # после ребута (канон fail-closed + noisy-log-better-than-no-log). Не клеймим success
+        # persistent'ом: результат несёт persistent/persistence_reason, CLI предупреждает явно.
+        persistence = privoxy_system._boot_persistence(runner, layout)
+        outcome["persistent"] = persistence["persistent"]
+        outcome["persistence_reason"] = persistence["reason"]
     return outcome
 
 

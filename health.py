@@ -177,6 +177,15 @@ def check_all(*, active_claude=False):
         # всё равно driver (туннель fail уже driver выше; этот чек объясняет причину локально).
         lp_check["ok"] = False
     checks.append(lp_check)
+    # #330: persists-across-boot — грань launchd-регистрации локального прокси. Орфан с живым
+    # портом, но без регистрации (plist отсутствует / job не загружен), выглядел healthy до
+    # ближайшего ребута (инцидент 2026-09-03: после ребута privoxy не поднялся, туннель лёг).
+    # Info-only ВСЕГДА (паттерн codex-isolation probe «PF kill-switch не установлен — по
+    # выбору»): warn «порт жив, но после перезагрузки не поднимется» требует внимания, но
+    # не роняет вердикт — канал в моменте работает.
+    bp = _local_proxy_boot_persistence()
+    checks.append({"name": "локальный прокси (persists-across-boot)",
+                   "ok": bp["status"] == "ok", "info": True, "detail": bp["detail"]})
     # Claude Code РЕАЛЬНО использует прокси? runtime (lsof), не файл. unknown (CC не запущен) →
     # info-only, не driver: проверять «CC юзает прокси» бессмысленно, если CC не работает.
     cp = _claude_proxy_probe()
