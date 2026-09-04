@@ -64,6 +64,7 @@ from codex_wrappers import (  # noqa: F401 — намеренный re-export п
     CODEX_ENV_LABEL,
     CODEX_ENV_MARKER,
     CODEX_LAUNCHCTL_ENV,
+    CODEX_LAUNCHCTL_UNSET_KEYS,
     CODEX_NO_PROXY,
     CODEX_NO_PROXY_LOOPBACK,
     CODEX_WRAPPERS,

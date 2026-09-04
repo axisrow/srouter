@@ -269,6 +269,10 @@ def _machine_state_monkey(monkeypatch):
     # (гвард test_machine_state_mock_guard.py требует canon ⊆ versions).
     monkeypatch.setattr(health, "_proxy_env_consistency",
                         lambda: {"status": "ok", "detail": "mock: env консистентен"})
+    # #340: _gui_socks_residual_check читает реальный launchctl gui + _codenv_managed — мокаем ok
+    # (гвард test_machine_state_mock_guard.py требует canon ⊆ versions).
+    monkeypatch.setattr(health, "_gui_socks_residual_check",
+                        lambda: {"status": "ok", "detail": "mock: gui-домен чист"})
     monkeypatch.setattr(health, "_codex_isolation_check",
                         lambda: {"status": "info", "detail": "mock: PF kill-switch не установлен"})
     monkeypatch.setattr(health, "_claude_transport_probe",

@@ -204,6 +204,15 @@ def check_all(*, active_claude=False):
     if pe["status"] == "unknown":
         pe_check["info"] = True
     checks.append(pe_check)
+    # Issue #340: residual-SOCKS в launchctl gui-домене (источник #331, не закрытый нейтрализацией
+    # settings.json). warn = driver degraded (реально ломает pip во всех GUI-терминалах); unknown
+    # (gui не верифицируем / чужой socks) — info-only, как claude-proxy.
+    gsr = _gui_socks_residual_check()
+    gsr_check = {"name": "proxy-env (launchctl gui-источник)",
+                 "ok": gsr["status"] == "ok", "detail": gsr["detail"]}
+    if gsr["status"] == "unknown":
+        gsr_check["info"] = True
+    checks.append(gsr_check)
     if active_claude:
         active = _claude_transport_probe()
         active_check = {"name": "Claude Code transport (real CLI)",
