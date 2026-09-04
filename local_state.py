@@ -92,12 +92,12 @@ _DEFAULT_STATE = {
     "runtime": {"last_apply": None, "last_error": None, "active_throttle": None,
                  "active_isolate": None, "active_codex_isolate": None,
                  # system_proxy — runtime-lease системного macOS SOCKS-repair (srouter system-proxy
-                 # repair/restore). active пишется ПОСЛЕ подтверждённого успеха (previous endpoint
-                 # для честного restore) — НЕ двухфазный pending/active контракт active_throttle/
-                 # active_isolate: networksetup-мутация атомарна за один вызов, восстанавливать
-                 # промежуточное состояние между командами не нужно. Отдельный ключ, т.к. это
-                 # независимая привилегированная операция (repair CLI, не Traffic Guard/PF).
-                 "system_proxy": {"active": None}},
+                 # repair/restore). leases — per-service слоты с фазами
+                 # repairing/active/restoring (write-preflight + reconcile, issue #316); миграция
+                 # legacy {"active": {...}} — на чтении в system_proxy_control._normalize_leases.
+                 # Отдельный ключ, т.к. это независимая привилегированная операция
+                 # (repair CLI, не Traffic Guard/PF).
+                 "system_proxy": {"leases": {}}},
     # auto_route_sync — opt-in split-route до VPS через en0 (мимо VPN). Top-level ключ (читается
     # node_selector._auto_route_sync_enabled строго is True). По умолчанию ON — «пофигу VPN»:
     # watchdog (ensure_split_route) держит route через физический шлюз при любом состоянии VPN.
@@ -116,6 +116,13 @@ def load_state(path=None):
     """
     state, _readable = _load_state_checked(path)
     return state
+
+
+def state_path(path=None):
+    """Резолв пути state-файла (public с #316): рядом-лежащие артефакты (lock-файлы system-proxy,
+    будущие аудиты) обязаны резолвить «рядом с state» этим же правилом, а не своей копией
+    _DEFAULT_PATH — иначе path= в функциях и path= в локах разъезжаются."""
+    return Path(path) if path else _DEFAULT_PATH
 
 
 def load_state_checked(path=None):
