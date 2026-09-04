@@ -441,3 +441,103 @@ def test_versions_check_runs_in_doctor_path(monkeypatch):
     assert any("версии" in n.lower() and "диск" in n.lower() for n in names), \
         f"versions-check должен быть в doctor-отчёте, got {names}"
 
+
+# ============================ (4) brew-cask ветка (#310): мёртвая is_dir-вход/is_file-выход + loose-подстрока ============================
+#
+# Формат мока `brew list --cask` — живой захват этой машины (канон mock-format-must-come-from-live-
+# capture): /opt/homebrew/bin/brew list --cask, Homebrew 6.0.20, 2026-09-04 — по одному каску в
+# строке, без пробелов внутри строки; на машине стоит codexbar (НЕ codex). Парный живой тест —
+# tests/test_health_versions_live.py (skip-if-no-brew).
+
+_BREW_CASK_LIVE = (
+    "android-cli\n"
+    "android-commandlinetools\n"
+    "bitwarden\n"
+    "codexbar\n"
+    "gcloud-cli\n"
+    "kitty\n"
+    "ngrok\n"
+    "obsidian\n"
+    "stats\n"
+    "visual-studio-code"
+)
+
+
+def _cask_fs(*, cask_bin="0.151.0"):
+    """Файлы каска codex в Caskroom: Caskroom/codex/<ver>/bin/codex — артефакт cask 'codex'
+    есть 'bin/codex (Binary)' (brew info --cask codex, 2026-09-04); brew линкует его в
+    /opt/homebrew/bin/codex, но линк может отсутствовать (unlink/ручная чистка) — ровно
+    тогда шаг 5 единственный, кто находит binary."""
+    return {
+        "/opt/homebrew/Caskroom/codex": None,                       # каталог версии-агрегатор
+        f"/opt/homebrew/Caskroom/codex/{cask_bin}": None,           # каталог версии
+        f"/opt/homebrew/Caskroom/codex/{cask_bin}/bin": None,
+        f"/opt/homebrew/Caskroom/codex/{cask_bin}/bin/codex": "#!/usr/bin/env node\n",
+    }
+
+
+def test_cask_codex_installed_without_brew_link_is_found(_versions_monkey):
+    """КРАСНЫЙ #310 (дефект 1, мёртвая ветка): каск codex установлен, binary НЕ слинкован в
+    /opt/homebrew/bin/codex (шаги 1-2 молчат) — шаг 5 единственный источник → должен вернуть
+    ИСПОЛНЯЕМЫЙ файл внутри Caskroom, а не каталог (каталог отсеивается финальным is_file-
+    фильтром health_codex.py — ветка была тождественно пустой при любом состоянии)."""
+    exe = "/opt/homebrew/Caskroom/codex/0.151.0/bin/codex"
+    _versions_monkey(_cask_fs(),
+                     which_codex=[],
+                     brew_cask=_BREW_CASK_LIVE.split("\n") + ["codex"],
+                     codex_versions={exe: "codex-cli 0.151.0"})
+
+    res = health._installed_versions_check()
+    by_path = {b["path"]: b for b in res["codex"]}
+    assert exe in by_path, \
+        f"cask-codex без линка должен находиться шагом 5 (исполняемый файл, не каталог), got {set(by_path)}"
+    assert by_path[exe]["provenance"] == "homebrew", "путь под /opt/homebrew/ → provenance homebrew"
+    assert by_path[exe]["version"] == "codex-cli 0.151.0", "версия читается с файла — файл, не каталог"
+
+
+def test_cask_codex_gate_exact_line_match():
+    """КРАСНЫЙ #310 (дефект 2, loose-подстрока): имя каска матчится ТОЧНО — целая строка
+    вывода `brew list --cask` (канон marker-whole-line-invariant: все границы строки).
+    'codexbar'/'codex-cli' — соседние каски, вхождение подстроки 'codex' в них — ложный
+    триггер шага 5 (канон loose-validator-recurring-leak)."""
+    gate = health._cask_codex_installed
+    assert gate("android-cli\nbitwarden\ncodexbar\nkitty") is False, "codexbar ≠ codex (суффикс)"
+    assert gate("codex-cli") is False, "codex-cli ≠ codex (суффикс-каск)"
+    assert gate("codexbar.app") is False, "префикс-вхождение не матчится"
+    assert gate("codex") is True, "точная строка 'codex' матчится"
+    assert gate("bitwarden\ncodex\nkitty") is True, "точная строка среди соседей матчится"
+    assert gate("") is False and gate(None) is False, "пустой/отсутствующий вывод → False"
+
+
+def test_cask_codexbar_only_no_false_positive(_versions_monkey):
+    """Приёмка #310 (2): установлен только codexbar → codex НЕ находится. На диске — stale
+    Caskroom/codex (остался после неудачного uninstall): до фикса loose-подстрока 'codex'
+    в 'codexbar' открывала бы гейт и (после починки дефекта 1) выдала бы чужой бинарь;
+    точный гейт в Caskroom не заглядывает вовсе."""
+    _versions_monkey(_cask_fs(),
+                     which_codex=[],
+                     brew_cask=_BREW_CASK_LIVE.split("\n"),
+                     codex_versions={"/opt/homebrew/Caskroom/codex/0.151.0/bin/codex":
+                                     "codex-cli 0.151.0"})
+
+    res = health._installed_versions_check()
+    cask_paths = [b["path"] for b in res["codex"] if "/Caskroom/" in b["path"]]
+    assert cask_paths == [], \
+        f"каска codex нет в brew list — Caskroom не должен попадать в результаты, got {cask_paths}"
+    assert res["codex"] == [], "codexbar — другой пакет: ни одного codex-binary найдено"
+
+
+def test_cask_neighbor_names_no_false_positive(_versions_monkey):
+    """Границы гейта на result-уровне: соседние имена касков (codexbar, codex-cli) в списке
+    при stale-Caskroom → ничего не находится. Убивает prefix/suffix-мутантов гейта
+    (startswith/endswith/'in' по строке и по строкам)."""
+    _versions_monkey(_cask_fs(),
+                     which_codex=[],
+                     brew_cask=["bitwarden", "codexbar", "codex-cli", "kitty"],
+                     codex_versions={"/opt/homebrew/Caskroom/codex/0.151.0/bin/codex":
+                                     "codex-cli 0.151.0"})
+
+    res = health._installed_versions_check()
+    assert res["codex"] == [], \
+        f"ни одного точного 'codex' в списке касков → пусто, got {res['codex']}"
+
