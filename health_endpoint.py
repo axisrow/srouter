@@ -19,7 +19,8 @@ _log = logging.getLogger("srouter.health")
 
 # star-import re-export (канон star-import-reexport-contract) — см. health_probes.py докстринг __all__.
 __all__ = [
-    "_read_endpoint_config", "_endpoint_override_check",
+    "_read_endpoint_config", "_endpoint_override_check", "_host_in_no_proxy",
+    "_endpoint_direct_override", "_pids_env_readable",
     "_endpoint_xray_sync_check", "_read_runtime_endpoint_config", "_runtime_model_override_check",
     "_ENDPOINT_SYNC_STATE_PATH", "_ENDPOINT_SYNC_XRAY_PATH",
 ]
@@ -61,6 +62,39 @@ def _read_endpoint_config():
     return {"base_url": base, "no_proxy": no_proxy, "source": source}
 
 
+def _host_in_no_proxy(host, no_proxy):
+    """hostname входит в NO_PROXY (exact или subdomain, НЕ substring)? Семантика #129.
+
+    Не substring — lookalike-атака (evil-z.ai при NO_PROXY=z.ai) не проходит (канон #131 C2).
+    Чистая функция: вынесена, чтобы _endpoint_override_check и _endpoint_direct_override (#329)
+    разделили ОДНО определение членства (не два расходящихся парсера).
+    """
+    return any(
+        h.strip() and (host == h.strip() or host.endswith("." + h.strip()))
+        for h in no_proxy.split(",")
+    )
+
+
+def _endpoint_direct_override():
+    """«CC ходит к endpoint напрямую BY DESIGN»? (#329, канон zai-direct-no-proxy).
+
+    overridden=True только когда ANTHROPIC_BASE_URL задан, hostname != api.anthropic.com
+    (exact, урок #131 lookalike) И hostname входит в NO_PROXY (direct-first) — тогда прямые
+    соединения CC к endpoint намеренны и lsof-классификация «external = утечка» ложна.
+    Владелец семантики NO_PROXY — этот модуль (канон route-scope-not-shared-validator):
+    _claude_proxy_probe переиспользует через health-фасад, не дублирует парсинг.
+    Возвращает {overridden: bool, base_url: str, host: str}; не бросает (_read_endpoint_config
+    сам fail-soft).
+    """
+    cfg = _health_facade._read_endpoint_config()
+    base = cfg["base_url"]
+    host = (urlparse(base).hostname or "").lower().rstrip(".") if base else ""
+    if not host or host == _DEFAULT_ANTHROPIC_HOST:
+        return {"overridden": False, "base_url": base, "host": host}
+    return {"overridden": _host_in_no_proxy(host, cfg["no_proxy"]),
+            "base_url": base, "host": host}
+
+
 def _endpoint_override_check():
     """Детектит ANTHROPIC_BASE_URL override + NO_PROXY masking (#129).
 
@@ -76,12 +110,7 @@ def _endpoint_override_check():
     host = (urlparse(base).hostname or "").lower().rstrip(".")
     if host == _DEFAULT_ANTHROPIC_HOST:
         return {"status": "ok", "detail": f"стандартный endpoint ({_DEFAULT_ANTHROPIC_HOST})"}
-    no_proxy = cfg["no_proxy"]
-    in_no_proxy = any(
-        h.strip() and (host == h.strip() or host.endswith("." + h.strip()))
-        for h in no_proxy.split(",")
-    )
-    if in_no_proxy:
+    if _host_in_no_proxy(host, cfg["no_proxy"]):
         return {"status": "info",
                 "detail": f"endpoint override: {base} (в NO_PROXY → CC ходит напрямую, "
                           f"прокси/туннель-проверки нерелевантны)"}
@@ -174,6 +203,10 @@ _RUNTIME_ENV_RE = re.compile(r"(ANTHROPIC_[A-Z_]+)=([^ ]*)")
 # Каждая строка процесса в `ps eww` начинается с PID-цифр (`^[0-9]+ `); заголовок отбрасывается.
 # Per-PID секционирование (см. _read_runtime_endpoint_config) — не слить env разных процессов.
 _PID_LINE_RE = re.compile(r"^\s*(\d+)\s")
+# Токен env в выводе `ps eww`: ALL_CAPS_NAME=значение (граница — пробел/начало строки). Отличает
+# «ps напечатал env» от строки команды без окружения (чужой UID/sandbox): CLI-аргументы вида
+# --flag=value или пути в нижнем регистре не матчатся (#329).
+_GENERIC_ENV_TOKEN_RE = re.compile(r"(?:^|\s)([A-Z][A-Z0-9_]{1,})=")
 
 
 def _read_runtime_endpoint_config():
@@ -215,6 +248,32 @@ def _read_runtime_endpoint_config():
     if not any(per_pid.values()):
         return {"per_pid": {}, "pids": pids, "readable": False}
     return {"per_pid": per_pid, "pids": pids, "readable": True}
+
+
+def _pids_env_readable(pids):
+    """Какие из PID отдают env через `ps eww` (same-UID)? (#329 «Дополнительно»).
+
+    Возвращает set PID-строк — подмножество pids, чьи секции в выводе `ps eww` содержат хотя бы
+    один ALL_CAPS= токен (см. _GENERIC_ENV_TOKEN_RE). Чужой UID/sandbox → строки без env или
+    процесса нет в выводе → НЕ читается; пустой вывод/timeout/пустой список → пустое set.
+    Критерий «читается», не «имеет HTTPS_PROXY»: отсутствие переменной в читаемом env — само
+    по себе диагноз (процесс без прокси-конфига); нечитаемость же делает проверку неприменимой.
+    Секционирование — тот же канон _PID_LINE_RE, что в _read_runtime_endpoint_config.
+    """
+    if not pids:
+        return set()
+    r = sys_probe.run([PS, "eww", "-p", ",".join(pids)], timeout=3)
+    if r.get("timeout"):
+        return set()
+    readable = set()
+    cur_pid = ""
+    for line in (r.get("out") or "").splitlines():
+        m = _PID_LINE_RE.match(line)
+        if m:
+            cur_pid = m.group(1)
+        if cur_pid and _GENERIC_ENV_TOKEN_RE.search(line):
+            readable.add(cur_pid)
+    return readable
 
 
 def _runtime_model_override_check():

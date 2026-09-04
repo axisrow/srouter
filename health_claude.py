@@ -91,7 +91,10 @@ def _claude_proxy_probe():
 
     Важно (#127): ESTABLISHED к 10808 доказывает только TCP до SOCKS listener, но не SOCKS
     handshake и не доставку запроса к API. Поэтому 10808 без active real-CLI probe никогда не
-    получает ok. External socket остаётся доказательством direct leak.
+    получает ok. External socket остаётся доказательством direct leak — КРОМЕ двух случаев #329:
+    endpoint-override в NO_PROXY (прямой ход к endpoint намеренно, lsof endpoint-слеп) и external
+    у PID с нечитаемым env (sandbox/чужой UID — HTTPS_PROXY неприменим/непроверяем, атрибуция
+    невозможна). Оба деградируют в unknown, не down (parity с endpoint-пробой).
     """
     r = sys_probe.run([PS, "-axo", "pid=,comm="], timeout=3)
     if r.get("timeout"):
@@ -122,29 +125,69 @@ def _claude_proxy_probe():
         elif f"->127.0.0.1:{XRAY_PORT}" in line:
             socks_pids.add(pid)
         elif "->127.0.0.1:" not in line:
-            # external ESTABLISHED (не localhost) — CC идёт напрямую, мимо прокси.
+            # external ESTABLISHED (не localhost) — похоже на «CC идёт напрямую, мимо прокси»;
+            # финальное решение — после #329-гейта и env-атрибуции ниже.
             external_pids.add(pid)
+
+    # #329: endpoint-override в NO_PROXY — CC ходит к endpoint напрямую BY DESIGN
+    # (канон zai-direct-no-proxy). lsof отдаёт numeric IP без hostname: прямое соединение к
+    # endpoint она не отличает от утечки → проба неприменима, деградирует в unknown (parity с
+    # endpoint-пробой), не «нарушение fail-closed». Членство в NO_PROXY решает владелец семантики
+    # (канон route-scope-not-shared-validator): health_endpoint._endpoint_direct_override.
+    ov = _health_facade._endpoint_direct_override()
+    if ov["overridden"]:
+        detail = (f"endpoint override {ov['base_url']} в NO_PROXY — прямое соединение CC "
+                  f"намеренно (direct-first); claude-proxy проба при override неприменима "
+                  f"(lsof не различает endpoint и утечку)")
+        if external_pids:
+            detail += f". Наблюдение: external ESTABLISHED PID {','.join(sorted(external_pids))}"
+        return {"status": "unknown", "source": "runtime", "detail": detail}
+
+    # #329 «Дополнительно»: атрибуция external по читаемости env. `ps eww` читает env только
+    # same-UID (см. _read_runtime_endpoint_config): нечитаемый PID (sandbox/чужой UID) — процесс,
+    # к которому HTTPS_PROXY неприменим/непроверяем; нарушение атрибутируется ТОЛЬКО по PID с
+    # читаемым env, нечитаемые остаются форензикой в detail. Без этого фильтра любой чужой
+    # CC-процесс красился бы как утечка нашей конфигурации.
+    readable_pids = (_health_facade._pids_env_readable(sorted(external_pids))
+                     if external_pids else set())
+    leak_pids = {p for p in external_pids if p in readable_pids}
+    unverified_pids = external_pids - readable_pids
+    unverified_note = (f" (PID {','.join(sorted(unverified_pids))}: env не читается — "
+                       f"sandbox/чужой UID, HTTPS_PROXY неприменим/непроверяем)"
+                       if unverified_pids else "")
+
     local_pids = proxy_pids | socks_pids
-    if local_pids and external_pids:
+    if local_pids and leak_pids:
         return {"status": "down", "source": "runtime",
                 "detail": (f"runtime: Claude Code MIXED — local proxy (PID {','.join(sorted(local_pids))}) "
-                           f"+ direct-leak (PID {','.join(sorted(external_pids))}). "
+                           f"+ direct-leak (PID {','.join(sorted(leak_pids))}). "
                            f"Один из PID идёт напрямую — нарушение fail-closed. "
-                           f"Проверь HTTPS_PROXY в ~/.claude/settings.json env.")}
-    if proxy_pids and not socks_pids:
+                           f"Проверь HTTPS_PROXY в ~/.claude/settings.json env."
+                           f"{unverified_note}")}
+    if proxy_pids and not socks_pids and not external_pids:
         return {"status": "ok", "source": "runtime",
                 "detail": f"runtime: Claude Code через HTTP bridge 8118 (PID {','.join(sorted(proxy_pids))})"}
     if socks_pids:
         routes = f"; HTTP 8118 PID {','.join(sorted(proxy_pids))}" if proxy_pids else ""
         return {"status": "unknown", "source": "runtime",
                 "detail": (f"runtime: TCP к SOCKS5 10808 (PID {','.join(sorted(socks_pids))}){routes} "
-                           f"не доказывает API transport; нужен активный real-CLI probe")}
-    if external_pids:
+                           f"не доказывает API transport; нужен активный real-CLI probe"
+                           f"{unverified_note}")}
+    if leak_pids:
         return {"status": "down", "source": "runtime",
                 "detail": (f"runtime: Claude Code идёт НАПРЯМУЮ (мимо прокси) — нарушение fail-closed. "
-                           f"PID {','.join(sorted(external_pids))}. "
+                           f"PID {','.join(sorted(leak_pids))}. "
                            f"Проверь HTTPS_PROXY в ~/.claude/settings.json env "
-                           f"(ожидается http://127.0.0.1:8118)")}
+                           f"(ожидается http://127.0.0.1:8118)"
+                           f"{unverified_note}")}
+    if external_pids:
+        # все external нечитаемы: утечка ВОЗМОЖНА, но не доказуема этой пробой (verify-dont-guess).
+        local_note = (f"; local proxy подтверждён PID {','.join(sorted(local_pids))}"
+                      if local_pids else "")
+        return {"status": "unknown", "source": "runtime",
+                "detail": (f"runtime: external ESTABLISHED (PID {','.join(sorted(external_pids))}), "
+                           f"но env не читается (sandbox/чужой UID) — атрибуция невозможна, "
+                           f"HTTPS_PROXY к этим процессам неприменим/непроверяем{local_note}")}
     return {"status": "unknown", "source": "runtime",
             "detail": "runtime: Claude Code запущен, но нет активных сокетов (idle)"}
 
