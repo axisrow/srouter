@@ -741,8 +741,7 @@ def test_codenv_env_script_propagates_launchctl_failures():
     assert "exit" in code, "скрипт отдаёт накопленный статус в exit code"
     # Каждый launchctl вызов в коде гейтится `|| FAIL=1` — ни одного «голого» вызова.
     bare = [ln for ln in code.splitlines()
-            if ln.strip().startswith("launchctl ") and "FAIL=1" not in ln
-            and not ln.strip().startswith("launchctl unsetenv \"$key\"")]
+            if ln.strip().startswith("launchctl ") and "FAIL=1" not in ln]
     assert not bare, f"launchctl-вызовы без `|| FAIL=1`: {bare}"
 
 
