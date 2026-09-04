@@ -634,14 +634,25 @@ def cmd_system_proxy(args) -> int:
         if r["ok"]:
             print("system-proxy: repair выполнен — системный SOCKS настроен и включён "
                   f"({'изменения применены' if r.get('changed') else 'уже был настроен'}).")
+            if r.get("warning"):
+                print(f"system-proxy: warning — {r['warning']}", file=sys.stderr)
             return 0
         print(f"system-proxy: repair не выполнен — {r.get('err', 'unknown error')}", file=sys.stderr)
         return 1
 
     if action == "restore":
-        r = system_proxy_control.restore(path=state_path, runner=runner)
+        r = system_proxy_control.restore(path=state_path, runner=runner,
+                                         service=getattr(args, "system_proxy_service", None))
+        for res in r.get("results", []):
+            word = "восстановлен" if res["ok"] else "НЕ восстановлен"
+            line = f"system-proxy: {res['service']}: {word}"
+            if res.get("err"):
+                line += f" — {res['err']}"
+            print(line, file=sys.stderr if not res["ok"] else sys.stdout)
         if r["ok"]:
             print("system-proxy: восстановлен прежний системный SOCKS.")
+            if r.get("warning"):
+                print(f"system-proxy: warning — {r['warning']}", file=sys.stderr)
             return 0
         print(f"system-proxy: restore не выполнен — {r.get('err', 'unknown error')}", file=sys.stderr)
         return 1
@@ -926,10 +937,14 @@ def build_parser() -> argparse.ArgumentParser:
     for sub_name, sub_help in (
         ("status", "Показать текущее состояние системного SOCKS активного network service."),
         ("repair", "Настроить и включить наш SOCKS endpoint (бэкапит чужой, если он выключен)."),
-        ("restore", "Вернуть endpoint, сохранённый последним repair (если состояние не менялось извне)."),
+        ("restore", "Вернуть endpoint'ы, сохранённые repair'ами (все сервисы или --service)."),
     ):
         sp = p_sysproxy_sub.add_parser(sub_name, help=sub_help)
         sp.add_argument("--state", default=None, help="Путь к srouter.local.json.")
+        if sub_name == "restore":
+            sp.add_argument("--service", dest="system_proxy_service", default=None,
+                            help="Восстановить только указанный network service "
+                                 "(по умолчанию — все известные leases).")
         sp.set_defaults(func=cmd_system_proxy)
 
     # routing (#136): управление routing-доменами production xray-config. Отдельная подкоманда —
