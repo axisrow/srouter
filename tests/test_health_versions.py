@@ -273,6 +273,9 @@ def _machine_state_monkey(monkeypatch):
                         lambda: {"status": "info", "detail": "mock: PF kill-switch не установлен"})
     monkeypatch.setattr(health, "_claude_transport_probe",
                         lambda *a, **kw: {"status": "unknown", "detail": "mock: CC не запущен (real CLI)"})
+    # #330: persists-across-boot (launchctl print + ФС plist'ов) — тот же мок, что в каноне.
+    monkeypatch.setattr(health, "_local_proxy_boot_persistence",
+                        lambda: {"status": "ok", "detail": "mock: регистрация launchd на месте"})
 
 
 def test_check_all_status_ok_when_nothing_installed(monkeypatch, tmp_path):

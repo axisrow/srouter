@@ -784,6 +784,25 @@ def cmd_privoxy(args) -> int:
         return 2
     changed = "изменён" if result.get("changed", True) else "уже в нужном состоянии"
     print(f"Privoxy {action}: {changed}.")
+    if result.get("persistent") is False:
+        # #330: сервис поднят, но launchd-регистрация не подтверждена — молчаливый транзиентный
+        # подъём = следующий инцидент после ребута (канон noisy-log-better-than-no-log). rc 0:
+        # трафик идёт, это warning, а не failure; doctor-грань persists-across-boot подхватит.
+        print(
+            f"ВНИМАНИЕ: launchd-регистрация НЕ подтверждена ({result.get('persistence_reason', 'unknown')}): "
+            "privoxy поднят ТРАНЗИЕНТНО — после перезагрузки НЕ поднимется (#330). "
+            "Верните регистрацию: srouter privoxy protect --strict (пересоздаёт managed-plist).",
+            file=sys.stderr,
+        )
+    elif result.get("persistent") is None:
+        # #330 P3: launchctl timeout — регистрация не верифицирована (unknown ≠ not_loaded,
+        # канон #204): НЕ клеймим «транзиентно», но и не молчим — подтверждения нет.
+        print(
+            f"ВНИМАНИЕ: launchd-регистрацию не удалось верифицировать "
+            f"({result.get('persistence_reason', 'unknown')}): подтверждения boot-персистентности нет "
+            "(#330). Проверьте: srouter privoxy status.",
+            file=sys.stderr,
+        )
     return 0
 
 
