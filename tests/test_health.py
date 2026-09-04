@@ -477,6 +477,175 @@ def test_check_all_no_false_verdict_when_endpoint_override(monkeypatch):
     assert "неприменима" in cp["detail"]
 
 
+# ============================ #337: per-PID атрибуция при override-гейте ============================
+# Дивергенция файлы-vs-runtime (класс #143): ФАЙЛЫ уже на z.ai-override (гейт #329 активен →
+# probe отвечает unknown «проба неприменима»), а живой CC запущен РАНЬШЕ со стандартным
+# endpoint и реально идёт мимо прокси — доказуемая утечка, которую гейт схлопывал в unknown.
+# Ожидание: readable external PID с runtime env БЕЗ override → down (PID в detail); все
+# external с override или нечитаемым env → прежний unknown без изменений. Cost-гейт: доп.
+# ps eww ТОЛЬКО когда есть external PID (г hot path watchdog ~90с + /health).
+
+
+def _override_runtime_mocks(monkeypatch, *, per_pid, readable):
+    """Мок runtime-чтения #337: _read_runtime_endpoint_config с env_readable_pids.
+
+    Вызов идёт через health-фасад — мокаем на health (как _read_endpoint_config выше).
+    readable теперь поле того же rt (#337 review perf: один проход ps eww, второй батч
+    _pids_env_readable из probe убран). Ambient ANTHROPIC_* вычищаем: тесты про
+    env-семантику не должны зависеть от shell'а (канон ambient-env-poisons).
+    """
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    monkeypatch.setattr(health, "_read_runtime_endpoint_config",
+                        lambda: {"per_pid": per_pid, "pids": sorted(per_pid),
+                                 "readable": bool(per_pid),
+                                 "env_readable_pids": set(readable)})
+
+
+def test_probe_down_when_override_files_but_live_pid_standard(monkeypatch):
+    """#337 RED: файловый z.ai override + живой external PID на СТАНДАРТНОМ endpoint → down.
+
+    Гейт #329 раньше схлопывал эту доказуемую утечку в unknown: файлы говорят «direct by
+    design», а runtime env PID 12345 — стандартный api.anthropic.com, значит его external
+    ESTABLISHED — утечка мимо прокси (дивергенция файлы-vs-runtime). Per-PID: PID в detail.
+    """
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _ps_lsof_fake(f"12345 {CLI_COMM}\n", _EXTERNAL_LEAK_LINE))
+    monkeypatch.setattr(health, "_read_endpoint_config", lambda: _ZAI_OVERRIDE_CFG)
+    _override_runtime_mocks(
+        monkeypatch,
+        per_pid={"12345": {"ANTHROPIC_BASE_URL": "https://api.anthropic.com",
+                           "ANTHROPIC_AUTH_TOKEN": "sk-secret"}},
+        readable={"12345"})
+    res = health._claude_proxy_probe()
+    assert res["status"] == "down", \
+        "external PID с runtime env без override — доказуемая утечка, не «неприменима»"
+    assert "12345" in res["detail"], "утёкший PID должен быть в detail (per-PID атрибуция)"
+    assert "без override" in res["detail"] and "стандартный" in res["detail"], \
+        "стандартный runtime endpoint PID помечен как «без override»"
+    assert "sk-secret" not in res["detail"], "секреты env не попадают в detail"
+
+
+def test_probe_down_when_override_files_but_live_pid_no_base_url(monkeypatch):
+    """#337: readable env БЕЗ ANTHROPIC_BASE_URL → CC по умолчанию стандартный → утечка."""
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _ps_lsof_fake(f"12345 {CLI_COMM}\n", _EXTERNAL_LEAK_LINE))
+    monkeypatch.setattr(health, "_read_endpoint_config", lambda: _ZAI_OVERRIDE_CFG)
+    _override_runtime_mocks(monkeypatch,
+                            per_pid={"12345": {"HTTPS_PROXY": ""}}, readable={"12345"})
+    res = health._claude_proxy_probe()
+    assert res["status"] == "down", \
+        "читаемый env без base_url = стандартный endpoint → external = утечка"
+    assert "12345" in res["detail"]
+
+
+def test_probe_unknown_when_override_pid_also_on_override(monkeypatch):
+    """#337: external PID сам на z.ai-override → прямой ход BY DESIGN → прежний unknown."""
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _ps_lsof_fake(f"12345 {CLI_COMM}\n", _EXTERNAL_LEAK_LINE))
+    monkeypatch.setattr(health, "_read_endpoint_config", lambda: _ZAI_OVERRIDE_CFG)
+    _override_runtime_mocks(
+        monkeypatch,
+        per_pid={"12345": {"ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic"}},
+        readable={"12345"})
+    res = health._claude_proxy_probe()
+    assert res["status"] == "unknown", "PID на том же override → direct намеренно, не down"
+    assert "неприменима" in res["detail"]
+    assert "12345" in res["detail"], "external-наблюдение остаётся форензикой"
+
+
+def test_probe_unknown_when_override_pid_env_unreadable(monkeypatch):
+    """#337: external PID с нечитаемым env → атрибуция невозможна → прежний unknown."""
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _ps_lsof_fake(f"12345 {CLI_COMM}\n", _EXTERNAL_LEAK_LINE))
+    monkeypatch.setattr(health, "_read_endpoint_config", lambda: _ZAI_OVERRIDE_CFG)
+    _override_runtime_mocks(monkeypatch, per_pid={}, readable=set())
+    res = health._claude_proxy_probe()
+    assert res["status"] == "unknown"
+    assert "неприменима" in res["detail"]
+    assert "12345" in res["detail"], "нечитаемый PID остаётся форензикой"
+
+
+def test_probe_override_mixed_leak_and_by_design(monkeypatch):
+    """#337: mixed external — leak-PID 111 драйвит down, override-PID 222 не маскирует."""
+    lsof_out = (
+        "claude 111 axisrow 7u IPv4 ... TCP 192.168.1.5:51235->160.79.104.10:443 (ESTABLISHED)\n"
+        "claude 222 axisrow 7u IPv4 ... TCP 192.168.1.5:51236->104.18.7.113:443 (ESTABLISHED)\n"
+    )
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _ps_lsof_fake(f"111 {CLI_COMM}\n222 {CLI_COMM}\n", lsof_out))
+    monkeypatch.setattr(health, "_read_endpoint_config", lambda: _ZAI_OVERRIDE_CFG)
+    _override_runtime_mocks(
+        monkeypatch,
+        per_pid={"111": {"ANTHROPIC_BASE_URL": "https://api.anthropic.com"},
+                 "222": {"ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic"}},
+        readable={"111", "222"})
+    res = health._claude_proxy_probe()
+    assert res["status"] == "down"
+    assert "111" in res["detail"], "утёкший PID атрибутирован"
+    assert "222" in res["detail"], "by-design PID упомянут (не утечка)"
+
+
+def test_probe_override_foreign_host_pid_labeled_distinctly(monkeypatch):
+    """#337 review: PID на ДРУГОМ нестандартном хосте — «≠ файловский», не «без override».
+
+    У такого PID свой override: прямой ход намеренный в его конфигурации, а вердикт down
+    корректен по семантике файлов (его хост не в файловском NO_PROXY). Формулировка detail
+    не должна советовать ему «подобрать override».
+    """
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _ps_lsof_fake(f"12345 {CLI_COMM}\n", _EXTERNAL_LEAK_LINE))
+    monkeypatch.setattr(health, "_read_endpoint_config", lambda: _ZAI_OVERRIDE_CFG)
+    _override_runtime_mocks(
+        monkeypatch,
+        per_pid={"12345": {"ANTHROPIC_BASE_URL": "https://other.example.com/v1"}},
+        readable={"12345"})
+    res = health._claude_proxy_probe()
+    assert res["status"] == "down"
+    assert "≠ файловский" in res["detail"], "чужой override помечен как дивергенция, не «без override»"
+    assert "other.example.com" in res["detail"]
+    assert "без override" not in res["detail"]
+
+
+def test_runtime_config_env_readable_pids_independent_of_anthropic(monkeypatch):
+    """#337 review perf: readable-критерий считается из ТОГО ЖЕ eww-вывода, без ANTHROPIC_*.
+
+    PID 100 с env без ANTHROPIC_* всё равно читается; PID 200 без env-токенов — нет. Один
+    проход секционирования даёт и per_pid, и env_readable_pids (второй ps eww не нужен).
+    """
+    eww = ("100 ttys000 0:01.00 /bin/zsh HTTPS_PROXY=http://127.0.0.1:8118\n"
+           "200 ttys000 0:01.00 /bin/sandboxed\n")
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _runtime_fake_run([("100", CLI_COMM), ("200", CLI_COMM)],
+                                          {"100": eww.splitlines()[0], "200": eww.splitlines()[1]}))
+    res = health._read_runtime_endpoint_config()
+    assert res["readable"] is False, "ANTHROPIC_* нигде нет — rt.readable остаётся False"
+    assert res["env_readable_pids"] == {"100"}, \
+        "но читаемость env PID 100 видна из того же вывода"
+    assert res["pids"] == ["100", "200"]
+
+
+def test_probe_override_gate_skips_runtime_read_without_external(monkeypatch):
+    """#337 cost-гейт: без external ESTABLISHED доп. ps eww НЕ вызывается (hot path ~90с)."""
+    calls = []
+
+    def fake_run(cmd, timeout):
+        calls.append(cmd)
+        if cmd and cmd[0] == "/bin/ps" and cmd[1] == "-axo":
+            return {"rc": 0, "out": f"12345 {CLI_COMM}\n", "err": "", "timeout": False}
+        if cmd and cmd[0] == "/usr/sbin/lsof":
+            return {"rc": 0, "out": f"claude 12345 axisrow 7u IPv4 ... TCP 127.0.0.1:51234->127.0.0.1:{health.PRIVOXY_PORT} (ESTABLISHED)\n",
+                    "err": "", "timeout": False}
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+
+    monkeypatch.setattr(health.sys_probe, "run", fake_run)
+    monkeypatch.setattr(health, "_read_endpoint_config", lambda: _ZAI_OVERRIDE_CFG)
+    res = health._claude_proxy_probe()
+    assert res["status"] == "unknown", "гейт остаётся unknown (проба неприменима при override)"
+    assert "неприменима" in res["detail"]
+    assert not any("eww" in c for c in calls), \
+        "ps eww не нужен без external PID — hot path не платит за гейт"
+
+
 # ============================ check_all (агрегация с info-only unknown) ============================
 def test_check_all_degraded_when_cc_running_without_proxy(monkeypatch):
     """ДЫРА инцидента: порты+туннель живы, CC реально без прокси (runtime down) → degraded.
