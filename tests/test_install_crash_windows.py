@@ -1142,11 +1142,11 @@ def test_cold_start_crash_after_apply_dns_leaves_dns_broken_reported_ok(tmp_path
     state.network уже заполнен от предыдущего успешного apply), здесь state_path вообще не существует
     до этого apply — типичный первый запуск install на чистой машине.
 
-    Примечание (issue #293): с state-first (часть 2/2, PR #294) state-файл к моменту обрыва уже может
-    существовать — _record_backup_intent пишет голый backup-pointer entry ДО _apply_dns, когда у
-    dnsmasq есть что бэкапить (foreign config, choice=overwrite). Это не регрессия холодного старта:
-    важное для этого сценария свойство — что state['network']['channels'] так и остался пустым,
-    именно это и проверяем.
+    Примечание (issue #293): с effect-time записями (структурный фикс) channels пишутся сразу после
+    preflight — на холодном старте они к моменту обрыва УЖЕ в state, поэтому _restore_dns читает
+    канал из state, а не через live-discovery. Сценарий «канал утрачен из state» (деградация) +
+    сбой discovery отдельно покрывает следующий тест; сам live-discovery fallback в _restore_dns
+    остаётся defense-in-depth.
     """
     env = _env(tmp_path)
     assert not env.state_path.exists(), "precondition: ни одного успешного apply раньше не было"
