@@ -498,3 +498,48 @@ def test_restore_busy_lock_refuses_without_mutation(tmp_path):
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
+
+
+# --- cycle-review PR #334: раздельная диагностика busy vs недоступный лок ---
+
+
+def test_lock_unavailable_is_not_reported_as_busy(tmp_path):
+    """cycle-review #334 (1): lock-файл физически недоступен (родительский каталог занят
+    регулярным файлом) — это НЕ 'чужая операция держит лок'. Диагностика обязана называть
+    I/O-причину; busy остаётся только для реально удерживаемого flock."""
+    blocker = tmp_path / "blocker"
+    blocker.write_text("regular file, mkdir под ним невозможен")
+    state_file = blocker / "state.json"
+    runner = ProxyRunner(enabled=False, server="old.proxy", port=1080)
+    res = system_proxy_control.repair(path=state_file, runner=runner, lock_timeout=0.3)
+    assert res["ok"] is False
+    assert res.get("busy") is not True, "I/O-сбой лока не имеет права маскироваться под busy"
+    assert "недоступен" in res["err"] and "сериализация" in res["err"]
+    assert not runner.mutations()
+
+    runner2 = ProxyRunner(enabled=True)
+    res = system_proxy_control.restore(path=state_file, runner=runner2, lock_timeout=0.3)
+    assert res["ok"] is False
+    assert res.get("busy") is not True
+    assert not runner2.mutations()
+
+
+# --- cycle-review PR #334 (2): мусорный/отрицательный lock-таймаут -> безопасный дефолт ---
+
+
+def test_lock_timeout_invalid_falls_back_to_default(monkeypatch):
+    """cycle-review #334 (2): отрицательный таймаут делал дедлайн 'уже просроченным' — мгновенный
+    busy с нулевым ожиданием вместо честной работы. Канон more-options-better (эталон
+    lock_hierarchy._default_timeout_sec): мусор -> безопасный дефолт; 0 = вечно — сохраняется."""
+    spc = system_proxy_control
+    assert spc._lock_timeout_sec(-1) == spc._LOCK_TIMEOUT_DEFAULT_SEC
+    assert spc._lock_timeout_sec(-0.001) == spc._LOCK_TIMEOUT_DEFAULT_SEC
+    assert spc._lock_timeout_sec(0) == 0
+    assert spc._lock_timeout_sec(2.5) == 2.5
+    monkeypatch.setenv("SROUTER_SYSTEM_PROXY_LOCK_TIMEOUT_SEC", "-5")
+    assert spc._lock_timeout_sec(None) == spc._LOCK_TIMEOUT_DEFAULT_SEC
+    monkeypatch.setenv("SROUTER_SYSTEM_PROXY_LOCK_TIMEOUT_SEC", "мусор")
+    assert spc._lock_timeout_sec(None) == spc._LOCK_TIMEOUT_DEFAULT_SEC
+    monkeypatch.setenv("SROUTER_SYSTEM_PROXY_LOCK_TIMEOUT_SEC", "7")
+    assert spc._lock_timeout_sec(None) == 7.0
+

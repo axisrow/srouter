@@ -105,6 +105,12 @@ _PHASE_RESTORING = "restoring"
 _LOCK_SUFFIX = ".system_proxy.lock"
 _LOCK_POLL_SEC = 0.05
 _LOCK_TIMEOUT_DEFAULT_SEC = 120.0
+# Статусы захвата транзакционного лока (cycle-review PR #334: busy = чужой flock удерживает;
+# unavailable = сам lock-файл недоступен — РАЗНЫЕ диагностики, маскировать I/O-сбой под busy
+# нельзя: пользователь пошёл бы искать «параллельный repair», которого нет).
+_LOCK_ACQUIRED = "acquired"
+_LOCK_BUSY = "busy"
+_LOCK_UNAVAILABLE = "unavailable"
 
 
 def _run(cmd, timeout, runner):
@@ -275,16 +281,22 @@ def _same_endpoint(socks, server, port):
 
 def _lock_timeout_sec(lock_timeout):
     """Bounded-ожидание flock. lock_timeout (сек) > env SROUTER_SYSTEM_PROXY_LOCK_TIMEOUT_SEC >
-    дефолт 120. 0 = ждать вечно (семантика blocking-flock git_proxy). Мусор в env → дефолт."""
+    дефолт 120. 0 = ждать вечно (семантика blocking-flock git_proxy). Отрицательное/мусор →
+    дефолт (cycle-review PR #334: отрицательный дедлайн = мгновенный busy с нулевым ожиданием;
+    эталон нормализации — lock_hierarchy._default_timeout_sec)."""
+    def _coerce(value):
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            return _LOCK_TIMEOUT_DEFAULT_SEC
+        return v if v >= 0 else _LOCK_TIMEOUT_DEFAULT_SEC
+
     if lock_timeout is not None:
-        return lock_timeout
+        return _coerce(lock_timeout)
     raw = os.environ.get("SROUTER_SYSTEM_PROXY_LOCK_TIMEOUT_SEC")
     if raw is None:
         return _LOCK_TIMEOUT_DEFAULT_SEC
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        return _LOCK_TIMEOUT_DEFAULT_SEC
+    return _coerce(raw)
 
 
 @contextlib.contextmanager
@@ -296,8 +308,10 @@ def _transaction_lock(path, lock_timeout):
     tmp+rename, fd остался бы на пере-созданный inode), файл-пустышка только под flock.
     Отличие от эталонов: bounded-ожидание (watchdog-паттерн #326 LOCK_NB) — CLI не должен висеть
     вечно, пока конкурент завис на интерактивном admin-диалоге networksetup. Занято дольше
-    таймаута → yield False (caller даёт явный busy-отказ); lock-файл недоступен физически →
-    тоже False (fail-closed: мутация без сериализации — и есть баг находки 4).
+    таймаута → yield (_LOCK_BUSY, None); lock-файл недоступен физически → (_LOCK_UNAVAILABLE,
+    str(exc)) — РАЗНЫЕ статусы: I/O-сбой не маскируется под «чужую операцию» (cycle-review
+    PR #334). Оба варианта — fail-closed отказ caller'а: мутация без сериализации — и есть баг
+    находки 4.
 
     flock конфликтует между file descriptions даже в одном процессе — гонки тестируемы без
     subprocess (поток/второй open в тесте).
@@ -309,7 +323,7 @@ def _transaction_lock(path, lock_timeout):
         fd = os.open(lock_p, os.O_CREAT | os.O_RDWR, 0o600)
     except OSError as exc:
         _log.warning("system_proxy_control: lock-файл недоступен (%s) — отказ без мутации", exc)
-        yield False
+        yield _LOCK_UNAVAILABLE, str(exc)
         return
     deadline = time.monotonic() + lock_timeout if lock_timeout and lock_timeout > 0 else None
     acquired = False
@@ -324,10 +338,10 @@ def _transaction_lock(path, lock_timeout):
             time.sleep(_LOCK_POLL_SEC)
     if not acquired:
         os.close(fd)
-        yield False
+        yield _LOCK_BUSY, None
         return
     try:
-        yield True
+        yield _LOCK_ACQUIRED, None
     finally:
         try:
             fcntl.flock(fd, fcntl.LOCK_UN)
@@ -336,11 +350,18 @@ def _transaction_lock(path, lock_timeout):
         os.close(fd)
 
 
-def _busy_result(path, lock_timeout):
-    return {"ok": False, "conflict": False, "busy": True,
-            "err": f"другая операция system-proxy держит {local_state.state_path(path).name}"
-                   f"{_LOCK_SUFFIX} дольше {lock_timeout:g} с (параллельный repair/restore? "
-                   f"зависший admin-диалог?) — повторите команду позже"}
+def _lock_refusal(path, lock_timeout, status, detail):
+    """Явный отказ при не захваченном локе: busy (чужой flock) и unavailable (I/O) — разные
+    диагностики при одном и том же fail-closed исходе (ноль мутаций)."""
+    lock_name = f"{local_state.state_path(path).name}{_LOCK_SUFFIX}"
+    if status == _LOCK_BUSY:
+        return {"ok": False, "conflict": False, "busy": True,
+                "err": f"другая операция system-proxy держит {lock_name} дольше "
+                       f"{lock_timeout:g} с (параллельный repair/restore? зависший "
+                       f"admin-диалог?) — повторите команду позже"}
+    return {"ok": False, "conflict": False, "busy": False,
+            "err": f"lock-файл {lock_name} недоступен ({detail}) — сериализация невозможна, "
+                   f"отказываюсь без мутаций (fail-closed)"}
 
 
 # ============================== repair ==============================
@@ -359,9 +380,9 @@ def repair(*, path=None, runner=sys_probe.run, lock_timeout=None):
     сначала дочинить restore.
     """
     timeout = _lock_timeout_sec(lock_timeout)
-    with _transaction_lock(path, timeout) as acquired:
-        if not acquired:
-            return _busy_result(path, timeout)
+    with _transaction_lock(path, timeout) as (lock_status, detail):
+        if lock_status != _LOCK_ACQUIRED:
+            return _lock_refusal(path, timeout, lock_status, detail)
         return _repair_locked(path, runner)
 
 
@@ -475,9 +496,9 @@ def restore(*, path=None, runner=sys_probe.run, service=None, lock_timeout=None)
     restoring пишется ДО мутаций (#316-1) — crash на любом шаге дочитывается следующим вызовом.
     """
     timeout = _lock_timeout_sec(lock_timeout)
-    with _transaction_lock(path, timeout) as acquired:
-        if not acquired:
-            return _busy_result(path, timeout)
+    with _transaction_lock(path, timeout) as (lock_status, detail):
+        if lock_status != _LOCK_ACQUIRED:
+            return _lock_refusal(path, timeout, lock_status, detail)
         return _restore_locked(path, runner, service)
 
 
