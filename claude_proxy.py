@@ -36,6 +36,15 @@ except SystemExit:
 SETTINGS = Path.home() / ".claude" / "settings.json"
 # Claude Code/node уважают HTTPS_PROXY; HTTP_PROXY добавляем для полноты (HTTP-эндпоинты).
 ENV_KEYS = ("HTTPS_PROXY", "HTTP_PROXY")
+# Issue #331: launchctl gui-домен (srouter-codex-env.sh) ставит ALL_PROXY/all_proxy =
+# socks5h://127.0.0.1:10808 во ВСЕ GUI-процессы — в сессиях Claude Code это протекает в
+# pip/requests: urllib.request.getproxies_environment() подхватывает all_proxy, requests
+# select_proxy маппит 'all' на ВСЕ схемы → путь SOCKSProxyManager → TypeError
+# PoolKey key_proxy_ssl_context (при shadowing urllib3 поверх vendored). Для CC единственное
+# плечо = privoxy 8118, поэтому enable() НЕЙТРАЛИЗУЕТ all_proxy пустой строкой (не ставит
+# SOCKS!) — канон #199 «снять env-прокси ОБА регистра»: нейтрализация там, где задумана.
+# Чужое НЕпустое значение — FOREIGN (канон #307), перезапись только force с backup.
+NEUTRAL_PROXY_KEYS = ("ALL_PROXY", "all_proxy")
 # NO_PROXY (оба регистра) — хосты из ANTHROPIC_BASE_URL идут напрямую, мимо privoxy.
 # Сторонний провайдер (z.ai/glm/любой) на внешнем хостинге — прокси-туннель ему не нужен (лишний хоп).
 # NO_PROXY следует за HTTPS_PROXY (ставится в enable, убирается в disable) — в установке srouter они
@@ -121,7 +130,7 @@ def status():
         unknown = data is None or not isinstance(data, dict)
         return {"enabled": False, "proxy": "",
                 "state": _contract.UNKNOWN if unknown else _contract.ABSENT,
-                "provider_direct": False, "no_proxy": ""}
+                "provider_direct": False, "no_proxy": "", "socks_neutralized": False}
     val = env.get("HTTPS_PROXY", "")
     no_proxy = env.get("NO_PROXY", "") or env.get("no_proxy", "")
     hosts = _base_url_hosts(data)
@@ -131,8 +140,13 @@ def status():
     provider_direct = bool(host_set & np_set)
     state = _contract.aggregate(
         _contract.classify(k in env, env.get(k, ""), _PROXY) for k in ENV_KEYS)
+    # Issue #331: SOCKS-плечо нейтрализовано = оба neutral-ключа присутствуют с пустой строкой
+    # (строгая форма: частичная нейтрализация — не нейтрализация, all_proxy без ALL_PROXY
+    # всё ещё протекает в lower-first-стеки).
+    socks_neutralized = all(k in env and env[k] == "" for k in NEUTRAL_PROXY_KEYS)
     return {"enabled": val == _PROXY, "proxy": val, "state": state,
-            "provider_direct": provider_direct, "no_proxy": no_proxy}
+            "provider_direct": provider_direct, "no_proxy": no_proxy,
+            "socks_neutralized": socks_neutralized}
 
 
 def _backup_path():
@@ -182,9 +196,20 @@ def enable(force=False):
     if _contract.needs_force(state) and not force:
         return _contract.conflict_result(state)
 
-    if force and _contract.needs_force(state):
+    # Issue #331: чужое НЕпустое all_proxy/ALL_PROXY — FOREIGN (канон #307), тот же контракт,
+    # что у ENV_KEYS: отказ без мутации, перезапись только force с backup. Пустая строка —
+    # НАША нейтрализация (managed value = ""), не foreign (classify тут не применим: он считает
+    # present-пустую строку FOREIGN — presence != truthy #222, а для neutral-ключей пустота
+    # ровно то значение, которое мы сами и ставим).
+    foreign_neutral = {k: env[k] for k in NEUTRAL_PROXY_KEYS if k in env and env[k] != ""}
+    if foreign_neutral and not force:
+        return {"ok": False, "conflict": True, "state": state,
+                "err": f"чужое непустое {','.join(sorted(foreign_neutral))} — перезапись только force (issue #307/#331)"}
+
+    if force and (_contract.needs_force(state) or foreign_neutral):
         # Provenance: сохранить ЧУЖИЕ значения перед перезаписью (только сами proxy-ключи).
         foreign = {k: env[k] for k in ENV_KEYS if k in env and env[k] != _PROXY}
+        foreign.update(foreign_neutral)
         if foreign:
             # _save() пишет строго SETTINGS; backup — отдельная атомарная запись тем же паттерном.
             try:
@@ -200,10 +225,12 @@ def enable(force=False):
     # Presence отдельно от значения (AO review round 3): absent и JSON-null — РАЗНЫЕ
     # состояния (classify считает present-любое-значение foreign); иначе конкурентная
     # вставка HTTPS_PROXY: null после gate сравнялась бы с absent и была бы затёрта.
-    decision_snapshot = {k: (k in env, env.get(k)) for k in ENV_KEYS}
+    decision_snapshot = {k: (k in env, env.get(k)) for k in ENV_KEYS + NEUTRAL_PROXY_KEYS}
 
     for k in ENV_KEYS:
         env[k] = _PROXY
+    for k in NEUTRAL_PROXY_KEYS:
+        env[k] = ""
     hosts = _base_url_hosts(data)
     if hosts:
         # Merge обе variant (NO_PROXY + no_proxy) + provider-хосты. Если брать только одну variant
@@ -219,7 +246,7 @@ def enable(force=False):
     if not isinstance(fresh, dict):
         return {"ok": False, "err": "settings.json стал нечитаем во время операции — отказ (issue #307)"}
     fresh_env = fresh.get("env") if isinstance(fresh.get("env"), dict) else {}
-    if {k: (k in fresh_env, fresh_env.get(k)) for k in ENV_KEYS} != decision_snapshot:
+    if {k: (k in fresh_env, fresh_env.get(k)) for k in ENV_KEYS + NEUTRAL_PROXY_KEYS} != decision_snapshot:
         return {"ok": False, "conflict": True, "state": state,
                 "err": "settings.json изменился во время операции — повторите (issue #307)"}
     return _save(data)
@@ -251,6 +278,14 @@ def disable():
                 del env[k]
                 changed = True
                 managed_removed = True
+        # Issue #331: нейтрализация — наше пустое значение, снимаем как managed (value-match:
+        # ТОЛЬКО пустую строку; чужое непустое all_proxy не трогаем — provenance #112/#307).
+        # managed_removed НЕ поднимаем: NO_PROXY-strip/backup-restore связаны с proxy-ключами,
+        # а не с нейтрализацией all_proxy.
+        for k in NEUTRAL_PROXY_KEYS:
+            if k in env and env[k] == "":
+                del env[k]
+                changed = True
         backup_consumed = False
         if managed_removed:
             backup = _read_backup()

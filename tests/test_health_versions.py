@@ -265,6 +265,10 @@ def _machine_state_monkey(monkeypatch):
                         lambda: {"status": "unknown", "detail": "mock: не установлено", "codex": [], "claude_code": []})
     monkeypatch.setattr(health, "_privoxy_log_observability_check",
                         lambda *a, **kw: {"status": "ok", "detail": "mock: privoxy-log ок"})
+    # #331: _proxy_env_consistency читает реальный settings.json + os.environ — мокаем ok
+    # (гвард test_machine_state_mock_guard.py требует canon ⊆ versions).
+    monkeypatch.setattr(health, "_proxy_env_consistency",
+                        lambda: {"status": "ok", "detail": "mock: env консистентен"})
     monkeypatch.setattr(health, "_codex_isolation_check",
                         lambda: {"status": "info", "detail": "mock: PF kill-switch не установлен"})
     monkeypatch.setattr(health, "_claude_transport_probe",

@@ -58,6 +58,11 @@ def _all_up_monkey(monkeypatch, *, probe_status="ok", probe_detail="runtime: к�
     monkeypatch.setattr(health, "_claude_proxy_probe",
                         lambda: {"status": probe_status, "source": "runtime" if probe_status != "unknown" else "n/a",
                                  "detail": probe_detail})
+    # #331: _proxy_env_consistency дёргает claude_proxy.status (реальный settings.json dev-машины)
+    # + os.environ — мокаем ok, иначе живой settings.json/env драйвит вердикт недетерминированно.
+    # Тесты test_health_proxy_env.py переопределяют мок ПОСЛЕ этого вызова (late-binding).
+    monkeypatch.setattr(health, "_proxy_env_consistency",
+                        lambda: {"status": "ok", "detail": "mock: env консистентен"})
     monkeypatch.setattr(health, "_codex_proxy_probe",
                         lambda: {"status": codex_status, "source": "runtime" if codex_status != "unknown" else "n/a",
                                  "detail": codex_detail})

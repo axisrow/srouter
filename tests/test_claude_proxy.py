@@ -478,3 +478,70 @@ def test_enable_recheck_distinguishes_absent_from_json_null(monkeypatch, tmp_pat
 
     assert r["ok"] is False, "absent -> present-null в гонке: решение устарело, отказ"
     assert json.loads(settings.read_text()) == {}, "запись не должна была состояться"
+
+
+# ============ issue #331: нейтрализация all_proxy/ALL_PROXY (SOCKS-плечо xray) ============
+#
+# launchctl gui-домен (srouter-codex-env.sh) ставит ALL_PROXY/all_proxy=socks5h://...:10808
+# во ВСЕ GUI-процессы; в сессиях Claude Code это протекает в pip/requests → select_proxy
+# маппит 'all' на все схемы → SOCKSProxyManager → TypeError PoolKey key_proxy_ssl_context.
+# Для CC единственное плечо = privoxy 8118 → enable() нейтрализует all_proxy пустой строкой
+# (канон #199 «снять env-прокси ОБА регистра» — нейтрализация там, где задумана, не прокси).
+
+def test_enable_neutralizes_all_proxy(monkeypatch, tmp_path):
+    settings = _setup(monkeypatch, tmp_path)
+    r = claude_proxy.enable()
+    assert r["ok"] is True
+    data = json.loads(settings.read_text())
+    assert data["env"]["ALL_PROXY"] == ""
+    assert data["env"]["all_proxy"] == ""
+
+
+def test_disable_removes_empty_neutral_keys(monkeypatch, tmp_path):
+    """disable() снимает нейтрализацию (наши пустые значения), как и managed proxy-ключи."""
+    settings = _setup(monkeypatch, tmp_path)
+    claude_proxy.enable()
+    r = claude_proxy.disable()
+    assert r["ok"] is True
+    data = json.loads(settings.read_text())
+    assert "ALL_PROXY" not in data["env"]
+    assert "all_proxy" not in data["env"]
+
+
+def test_enable_conflict_on_foreign_all_proxy(monkeypatch, tmp_path):
+    """Чужое НЕпустое all_proxy (ручная SOCKS-настройка) — отказ без мутации (#307 канон),
+    перезапись только force."""
+    settings = _setup(monkeypatch, tmp_path)
+    original = {"env": {"all_proxy": "socks5h://10.0.0.1:1080"}}
+    settings.write_text(json.dumps(original))
+    r = claude_proxy.enable()
+    assert r["ok"] is False
+    assert r.get("conflict") is True
+    assert json.loads(settings.read_text()) == original, "мутации быть не должно"
+
+
+def test_enable_force_overwrites_foreign_all_proxy(monkeypatch, tmp_path):
+    settings = _setup(monkeypatch, tmp_path)
+    settings.write_text(json.dumps({"env": {"all_proxy": "socks5h://10.0.0.1:1080"}}))
+    r = claude_proxy.enable(force=True)
+    assert r["ok"] is True
+    data = json.loads(settings.read_text())
+    assert data["env"]["all_proxy"] == ""
+
+
+def test_disable_keeps_foreign_all_proxy(monkeypatch, tmp_path):
+    """value-match provenance (#112/#307): чужое непустое all_proxy disable() не трогает."""
+    settings = _setup(monkeypatch, tmp_path)
+    settings.write_text(json.dumps({"env": {"all_proxy": "socks5h://10.0.0.1:1080"}}))
+    r = claude_proxy.disable()
+    assert r["ok"] is True
+    assert json.loads(settings.read_text())["env"]["all_proxy"] == "socks5h://10.0.0.1:1080"
+
+
+def test_status_reports_socks_neutralized(monkeypatch, tmp_path):
+    settings = _setup(monkeypatch, tmp_path)
+    assert claude_proxy.status()["socks_neutralized"] is False
+    claude_proxy.enable()
+    assert claude_proxy.status()["socks_neutralized"] is True
+    claude_proxy.disable()
+    assert claude_proxy.status()["socks_neutralized"] is False
