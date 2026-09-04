@@ -1096,9 +1096,12 @@ def apply_install(env=None, *, confirm=False, choices=None, runner=run, port_che
         launchagent_ok, launchagent_error = _install_launchagent(env, runner)
         if not launchagent_ok:
             return {"ok": False, "blocked": [launchagent_error], "actions": actions, "plan": plan}
-        launchagent_error = _record_launchagent_applied(env, plan)
-        if launchagent_error:
-            return {"ok": False, "blocked": [launchagent_error], "actions": actions, "plan": plan}
+        # Префикс стадии — симметрично {name}_state_write_failed у компонентов: blocked-код обязан
+        # быть самодостаточным (отказ effect-записи launchagent ≠ отказ финальной сверки в логе).
+        la_state_error = _record_launchagent_applied(env, plan)
+        if la_state_error:
+            return {"ok": False, "blocked": [f"launchagent_{la_state_error}"],
+                    "error": la_state_error, "actions": actions, "plan": plan}
         launchagent_action = {"component": "launchagent", "mode": "managed", "changed": True}
         actions.append(launchagent_action)
 
@@ -1174,8 +1177,9 @@ def _resolve_backup(entry, discovered, *, not_before=None, config_path=None):
     (provenance='created', backup не пишется — нечего было бэкапить) → uninstall снова находит СТАРЫЙ
     backup как единственного кандидата → component_facts классифицирует как restore вместо remove →
     восстанавливается устаревший чужой контент поверх только что созданного конфига. not_before —
-    момент создания ТЕКУЩЕГО конфига (entry['created_at'], пишет _write_state_after_apply только для
-    provenance='created'); кандидаты со stamp строго раньше этого момента доказанно принадлежат
+    момент создания ТЕКУЩЕГО конфига (entry['created_at'], пишут _record_component_applied /
+    _write_state_after_apply через общий редьюсер — только для provenance='created'); кандидаты со
+    stamp строго раньше этого момента доказанно принадлежат
     ПРЕДЫДУЩЕМУ install-циклу и отбрасываются ДО подсчёта len(discovered) — иначе retained-relic мог бы
     выдать себя за «единственного» и обойти даже политику ambiguous.
     """

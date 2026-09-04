@@ -236,21 +236,57 @@ def test_crash_between_intent_and_target_write_leaves_clean_system(tmp_path, mon
     )
 
 
-def test_backup_state_write_failure_blocks_before_touching_target(tmp_path, monkeypatch):
+@pytest.mark.parametrize("fail_on", [2, 3])
+def test_backup_state_write_failure_blocks_before_touching_target(tmp_path, monkeypatch, fail_on):
     """Fail-closed: не удалось записать state → apply обязан остановиться ДО мутации target.
 
     Если бы порядок был обратным (сначала target, потом state), отказ save_state потерял бы ссылку
     на уже созданный backup при живой перезаписи оригинала — тот же дефект A, просто без crash.
-    issue #293 структурно: первый effect-time отказ теперь ловится ещё РАНЬШЕ — на записи
-    discovery-каналов (до любых side-effect'ов); инвариант «target не тронут» тот же.
+    Параметризация по номеру падающей записи покрывает ОБА pre-target гейта (issue #293 структурно):
+      fail_on=2 — intent-гейт (_record_backup_intent): channels уже записаны, backup-файл УЖЕ лежит
+                  на диске (орфанный, легитимно: discover_backups его переоткроет), target ещё нет;
+      fail_on=3 — effect-гейт (_record_component_applied): backup + intent-entry на диске, target
+                  ещё нет. Оба возврата обязаны случиться раньше записи srouter-конфига в target.
     """
     env, config_path = _foreign_privoxy(tmp_path)
-    monkeypatch.setattr(install_config.local_state, "save_state", lambda *a, **k: None)
+    original_save = install_config.local_state.save_state
+    calls = {"n": 0}
+
+    def failing_nth_save(state, **kwargs):
+        calls["n"] += 1
+        if calls["n"] >= fail_on:  # 1 — channels, 2 — backup-intent, 3 — эффект privoxy
+            return None
+        return original_save(state, **kwargs)
+
+    monkeypatch.setattr(install_config.local_state, "save_state", failing_nth_save)
 
     result = _apply_overwrite_privoxy(env)
 
     assert result["ok"] is False
-    assert "state_write_failed" in result["blocked"]
+    assert "state_write_failed" in result["blocked"][-1]
+    backups = list(config_path.parent.glob("config.srouter-backup-*"))
+    assert backups, "backup создан на диске до отказавшей state-записи (fail_on=%d)" % fail_on
+    if fail_on == 2:
+        # intent-гейт (дефект A): backup на диске, state-ссылки нет → apply обязан остановиться
+        # ДО мутации target — иначе перезапись оригинала с потерянной ссылкой.
+        assert config_path.read_text(encoding="utf-8") == "foreign config\n", (
+            "target не должен мутироваться, если state не смог зафиксировать ссылку на backup"
+        )
+        assert install_lib.MARKER not in config_path.read_text(encoding="utf-8")
+    else:
+        # effect-гейт: intent-запись уже в state (ссылка зафиксирована), target уже перезаписан —
+        # это честное состояние (orphaned_backup, rollback возможен), обрыв именно на effect-записи.
+        assert _entry(env).get("backup") == str(backups[0]), (
+            "intent-запись (ссылка на backup) обязана быть в state до effect-записи"
+        )
+        assert install_lib.MARKER in config_path.read_text(encoding="utf-8")
+
+    # Оба отказа оставляют систему в классифицируемом component_facts состоянии — rollback корректен
+    # (fail-closed save_state активен только для install-фазы).
+    monkeypatch.undo()
+    result_un = install_lib.apply_uninstall(env=env, confirmations={"configs": True}, runner=FakeRunner())
+    assert result_un["ok"] is True
+    assert result_un["leftover"] == []
     assert config_path.read_text(encoding="utf-8") == "foreign config\n", (
         "target не должен мутироваться, если state не смог зафиксировать ссылку на backup"
     )
