@@ -537,7 +537,7 @@ def test_enable_revalidates_under_lock_before_backup_and_save(monkeypatch, tmp_p
     def _racing_lock():
         # Другой srouter-писатель успел закоммитить до нашего lock.
         settings.write_text(json.dumps({"env": {"HTTPS_PROXY": "http://corp-new:3128"}}))
-        yield
+        yield {}  # успешный захват (контракт: dict с err при неудаче)
 
     monkeypatch.setattr(claude_proxy, "_settings_lock", _racing_lock)
     r = claude_proxy.enable(force=True)
@@ -563,7 +563,7 @@ def test_disable_reads_and_consumes_backup_under_lock(monkeypatch, tmp_path):
     def _racing_lock():
         # Другой писатель успел до нашего lock: затёр managed-значение своим.
         settings.write_text(json.dumps({"env": {"HTTPS_PROXY": "http://corp-new:3128"}}))
-        yield
+        yield {}  # успешный захват (контракт: dict с err при неудаче)
 
     monkeypatch.setattr(claude_proxy, "_settings_lock", _racing_lock)
     r = claude_proxy.disable()
@@ -586,6 +586,57 @@ def test_settings_lock_is_real_exclusive_flock(monkeypatch, tmp_path):
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         finally:
             os.close(fd)
+
+
+# --- AO review 5111140277: захват lock вне error-границы — OSError пробрасывался из
+# enable/disable вопреки контракту «Не бросает»/structured {ok, err} ---
+
+def _lock_unavailable_env(monkeypatch, tmp_path):
+    """settings.json читаем, но lockfile некреативен (родитель — обычный файл):
+    mkdir/os.open в _settings_lock гарантированно падают с OSError."""
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory")
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}")
+    monkeypatch.setattr(claude_proxy, "SETTINGS", settings)
+    monkeypatch.setattr(claude_proxy, "_lock_path", lambda: blocker / "settings.json.srouter-proxy-lock")
+    return settings
+
+
+def test_enable_returns_structured_error_when_lock_unavailable(monkeypatch, tmp_path):
+    """OSError при захвате lock (read-only ~/.claude, EMFILE, ...) — structured {ok, err},
+    не исключение. Отказ fail-closed: без lock операция не выполняется (запись без
+    координации воспроизводила бы гонку, которую lock закрывает)."""
+    _lock_unavailable_env(monkeypatch, tmp_path)
+    r = claude_proxy.enable()
+    assert r["ok"] is False
+    assert "settings lock unavailable" in r["err"]
+    assert json.loads((tmp_path / "settings.json").read_text()) == {}, "settings не тронут"
+
+
+def test_disable_returns_structured_error_when_lock_unavailable(monkeypatch, tmp_path):
+    """Тот же контракт для disable(): захват lock — structured {ok, err}, не OSError."""
+    _lock_unavailable_env(monkeypatch, tmp_path)
+    r = claude_proxy.disable()
+    assert r["ok"] is False
+    assert "settings lock unavailable" in r["err"]
+
+
+def test_lock_release_failure_is_wrapped_as_warning(monkeypatch, tmp_path):
+    """Неудача LOCK_UN не валит закоммиченную операцию: ok не меняется, предупреждение
+    честно в err (прецедент backup-cleanup path в _disable_locked)."""
+    _setup(monkeypatch, tmp_path)
+    real_flock = fcntl.flock
+
+    def _fail_unlock(fd, op):
+        if op == fcntl.LOCK_UN:
+            raise OSError("boom unlock")
+        return real_flock(fd, op)
+
+    monkeypatch.setattr(fcntl, "flock", _fail_unlock)
+    r = claude_proxy.enable()
+    assert r["ok"] is True, "операция закоммичена — release не меняет ok"
+    assert "lock release failed" in r.get("err", "")
 
 
 # ============ issue #331: нейтрализация all_proxy/ALL_PROXY (SOCKS-плечо xray) ============

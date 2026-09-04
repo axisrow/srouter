@@ -176,6 +176,30 @@ def _lock_path():
     return SETTINGS.parent / (SETTINGS.name + ".srouter-proxy-lock")
 
 
+def _acquire_settings_lock_fd(state):
+    """Захватить lockfile: mkdir+os.open+flock. fd или None (причина в state["err"]). Не бросает.
+
+    Любой OSError (read-only ~/.claude, EMFILE, гонка за mkdir, flock) — structured err,
+    не исключение (AO review 5111140277). При неудаче flock уже открытый fd закрывается.
+    """
+    try:
+        _lock_path().parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(_lock_path(), os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError as exc:
+        state["err"] = f"settings lock unavailable: {str(exc)[:150]}"
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except OSError as exc:
+        state["err"] = f"settings lock unavailable: {str(exc)[:150]}"
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        return None
+    return fd
+
+
 @contextlib.contextmanager
 def _settings_lock():
     """Эксклюзивный межпроцессный flock на время валидация+backup+save (AO review #338).
@@ -187,15 +211,41 @@ def _settings_lock():
     (редактор, сам Claude Code) в микросекундном окне между under-lock валидацией и rename
     физически не координируем — честная граница решения, не баг. Lockfile остаётся на диске
     (пустой) — стандарт для flock: удаление гонно.
+
+    Контракт «Не бросает» (AO review 5111140277): OSError при захвате не пробрасывается —
+    yielded-dict получает err "settings lock unavailable: ...", вызывающий возвращает
+    structured {ok, err} и ОТКАЗЫВАЕТСЯ от операции: запись без lock воспроизводила бы
+    гонку, которую lock закрывает (fail-closed). Неудача release операцию не валит — она
+    уже закоммичена; предупреждение попадает в err результата через release_err
+    (прецедент: backup-cleanup path в _disable_locked).
     """
-    _lock_path().parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(_lock_path(), os.O_CREAT | os.O_RDWR, 0o600)
+    state = {}
+    fd = _acquire_settings_lock_fd(state)
+    if fd is None:
+        yield state
+        return
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
+        yield state
     finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError as exc:
+            state["release_err"] = str(exc)[:150]
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _lock_release_note(r, lock):
+    """Предупреждение о неудачном release в результат операции. ok НЕ меняется: операция
+    закоммичена (прецедент: backup-cleanup возвращает ok:True + err)."""
+    if not lock.get("release_err"):
+        return r
+    note = f"lock release failed: {lock['release_err']}"
+    r = dict(r)
+    r["err"] = f"{r['err']}; {note}" if r.get("err") else note
+    return r
 
 
 def enable(force=False):
@@ -281,7 +331,9 @@ def enable(force=False):
     # sidecar и _save — одна охраняемая операция. Re-check сам по себе не атомарен с записью:
     # без lock кооперативный писатель мог бы вклиниться между ними, и его значение затёрлось
     # бы _save'ом, а disable() восстановил бы устаревший sidecar поверх него.
-    with _settings_lock():
+    with _settings_lock() as lock:
+        if lock.get("err"):
+            return {"ok": False, "err": lock["err"]}
         fresh = _load()
         if not isinstance(fresh, dict):
             return {"ok": False, "err": "settings.json стал нечитаем во время операции — отказ (issue #307)"}
@@ -302,7 +354,8 @@ def enable(force=False):
                 tmp.replace(_backup_path())
             except (OSError, TypeError, ValueError) as exc:
                 return {"ok": False, "err": f"backup foreign value failed: {str(exc)[:150]}"}
-        return _save(data)
+        r = _save(data)
+    return _lock_release_note(r, lock)
 
 
 def disable():
@@ -320,8 +373,11 @@ def disable():
     AO review #338: тело — read-modify-write + потребление sidecar, выполняется под тем же
     _settings_lock(), что и enable-commit (иначе enable/disable гоняются за sidecar+settings).
     """
-    with _settings_lock():
-        return _disable_locked()
+    with _settings_lock() as lock:
+        if lock.get("err"):
+            return {"ok": False, "err": lock["err"]}
+        r = _disable_locked()
+    return _lock_release_note(r, lock)
 
 
 def _disable_locked():
