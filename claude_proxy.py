@@ -18,7 +18,10 @@ proxy-ключи ТОЛЬКО когда их значение == наш managed
 и восстанавливает backup после force-перезаписи. Классификация состояний — общий слой
 proxy_config_contract (канон third-module-breaks-reexport-cycle).
 """
+import contextlib
+import fcntl
 import json
+import os
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -164,6 +167,37 @@ def _read_backup():
         return None
 
 
+def _lock_path():
+    """Sidecar-lockfile сериализации commit-секций enable/disable (AO review #338).
+
+    Отдельный файл, НЕ settings.json: _save() подменяет inode (tmp+replace) — flock на
+    самом settings.json пережил бы rename и разъехался бы с актуальным файлом.
+    """
+    return SETTINGS.parent / (SETTINGS.name + ".srouter-proxy-lock")
+
+
+@contextlib.contextmanager
+def _settings_lock():
+    """Эксклюзивный межпроцессный flock на время валидация+backup+save (AO review #338).
+
+    CAS-семантика: под lock перечитывается диск и валидируется decision-snapshot, затем
+    атомарно пишутся sidecar и settings — backup и подмена конфига становятся одной
+    охраняемой операцией, пост-recheck гонка кооперативных писателей закрыта. Сериализует
+    только кооперативных писателей (сами srouter-операции); не-кооперативный писатель
+    (редактор, сам Claude Code) в микросекундном окне между under-lock валидацией и rename
+    физически не координируем — честная граница решения, не баг. Lockfile остаётся на диске
+    (пустой) — стандарт для flock: удаление гонно.
+    """
+    _lock_path().parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(_lock_path(), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
 def enable(force=False):
     """Прописать env.HTTPS_PROXY/HTTP_PROXY = прокси + NO_PROXY (provider-direct). {ok, err}.
 
@@ -177,9 +211,10 @@ def enable(force=False):
     Issue #307 round 2 (Codex cycle-review PR #328): нечитаемый/битый/не-object settings.json —
     честный отказ БЕЗ перезаписи файла (finding 3); state перечитывается с диска непосредственно
     перед записью — значение, появившееся в гонке между gate и save, не затирается (finding 4).
-    Review #338 follow-up: sidecar-backup пишется только ПОСЛЕ пройденного TOCTOU re-check —
-    при отказе на гонке на диске не остаётся снапшота устаревших чужих значений, который
-    следующий disable() восстановил бы поверх более свежих.
+    Review #338 follow-up (AO 5110553545): re-check, запись sidecar и _save — одна охраняемая
+    операция под эксклюзивным _settings_lock() (CAS: под lock перечитываем диск и валидируем
+    decision-snapshot, затем атомарный commit) — пост-recheck гонка кооперативных писателей
+    закрыта, при отказе на гонке sidecar на диске не появляется.
     """
     scheme = urlparse(_PROXY).scheme.lower()
     if scheme not in {"http", "https"}:
@@ -242,29 +277,32 @@ def enable(force=False):
         for k in NO_PROXY_KEYS:
             env[k] = _merge_no_proxy(existing, hosts)
 
-    # Re-read непосредственно перед записью: если proxy-ключи на диске изменились с момента
-    # решения — решение устарело, отказываем (чужое значение, появившееся в гонке, не тронуто).
-    fresh = _load()
-    if not isinstance(fresh, dict):
-        return {"ok": False, "err": "settings.json стал нечитаем во время операции — отказ (issue #307)"}
-    fresh_env = fresh.get("env") if isinstance(fresh.get("env"), dict) else {}
-    if {k: (k in fresh_env, fresh_env.get(k)) for k in ENV_KEYS + NEUTRAL_PROXY_KEYS} != decision_snapshot:
-        return {"ok": False, "conflict": True, "state": state,
-                "err": "settings.json изменился во время операции — повторите (issue #307)"}
+    # Commit-секция под _settings_lock (AO review #338): re-read+валидация snapshot'а, запись
+    # sidecar и _save — одна охраняемая операция. Re-check сам по себе не атомарен с записью:
+    # без lock кооперативный писатель мог бы вклиниться между ними, и его значение затёрлось
+    # бы _save'ом, а disable() восстановил бы устаревший sidecar поверх него.
+    with _settings_lock():
+        fresh = _load()
+        if not isinstance(fresh, dict):
+            return {"ok": False, "err": "settings.json стал нечитаем во время операции — отказ (issue #307)"}
+        fresh_env = fresh.get("env") if isinstance(fresh.get("env"), dict) else {}
+        if {k: (k in fresh_env, fresh_env.get(k)) for k in ENV_KEYS + NEUTRAL_PROXY_KEYS} != decision_snapshot:
+            return {"ok": False, "conflict": True, "state": state,
+                    "err": "settings.json изменился во время операции — повторите (issue #307)"}
 
-    if foreign:
-        # Re-check пройден: решение свежее, чужие значения из `foreign` всё ещё на диске —
-        # теперь можно сохранять их в sidecar. _save() пишет строго SETTINGS; backup —
-        # отдельная атомарная запись тем же паттерном (tmp + replace).
-        try:
-            _backup_path().parent.mkdir(parents=True, exist_ok=True)
-            tmp = _backup_path().with_suffix(".json.tmp")
-            tmp.write_text(json.dumps({"env": foreign}, indent=2, ensure_ascii=False) + "\n",
-                           encoding="utf-8")
-            tmp.replace(_backup_path())
-        except (OSError, TypeError, ValueError) as exc:
-            return {"ok": False, "err": f"backup foreign value failed: {str(exc)[:150]}"}
-    return _save(data)
+        if foreign:
+            # Re-check пройден под lock: чужие значения из `foreign` всё ещё на диске —
+            # сохраняем их в sidecar. _save() пишет строго SETTINGS; backup — отдельная
+            # атомарная запись тем же паттерном (tmp + replace).
+            try:
+                _backup_path().parent.mkdir(parents=True, exist_ok=True)
+                tmp = _backup_path().with_suffix(".json.tmp")
+                tmp.write_text(json.dumps({"env": foreign}, indent=2, ensure_ascii=False) + "\n",
+                               encoding="utf-8")
+                tmp.replace(_backup_path())
+            except (OSError, TypeError, ValueError) as exc:
+                return {"ok": False, "err": f"backup foreign value failed: {str(exc)[:150]}"}
+        return _save(data)
 
 
 def disable():
@@ -278,7 +316,16 @@ def disable():
     Issue #307 round 2 (Codex finding 2/3): нечитаемый/битый settings.json — отказ без мутации
     (не «успех»); sidecar-backup удаляется ТОЛЬКО после подтверждённой записи восстановленного
     значения — при упавшей _save() backup остаётся единственной копией чужого значения.
+
+    AO review #338: тело — read-modify-write + потребление sidecar, выполняется под тем же
+    _settings_lock(), что и enable-commit (иначе enable/disable гоняются за sidecar+settings).
     """
+    with _settings_lock():
+        return _disable_locked()
+
+
+def _disable_locked():
+    """Тело disable() под _settings_lock (см. disable())."""
     data = _load()
     if data is None:
         return {"ok": False, "err": "settings.json нечитаем/битый — отказ без мутации (issue #307)"}

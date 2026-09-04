@@ -2,7 +2,12 @@
 
 Проверяет контракт: enable/disable не теряют другие env-ключи, идемпотентны, fail-soft.
 """
+import contextlib
+import fcntl
 import json
+import os
+
+import pytest
 
 import claude_proxy
 from dashboard_common import HTTP_PROXY_URL
@@ -509,6 +514,78 @@ def test_enable_toctou_abort_does_not_leave_stale_backup(monkeypatch, tmp_path):
     # Конкурентный писатель симулирован только возвратом _load (диск он не писал):
     # инвариант «enable ничего не записал» = файл в исходном виде.
     assert json.loads(settings.read_text())["env"]["HTTPS_PROXY"] == "http://corp:3128"
+
+
+# --- AO review 5110553545: пост-recheck гонка — валидация+backup+save под одним lock ---
+#
+# Re-check перед записью сам по себе не атомарен с записью: кооперативный писатель может
+# вклиниться между re-check и _save — его значение затирается, а disable() потом
+# восстанавливает устаревший sidecar поверх него. enable/disable сериализуются эксклюзивным
+# flock на выделенном lockfile (CAS: под lock валидируется decision-snapshot, затем атомарно
+# backup+save). Lockfile — не settings.json: _save подменяет inode (tmp+replace), flock на
+# settings.json пережил бы rename и разъехался бы с актуальным файлом.
+
+def test_enable_revalidates_under_lock_before_backup_and_save(monkeypatch, tmp_path):
+    """AO review 5110553545: писатель, закоммитивший ДО нашего lock, обязан быть виден
+    under-lock валидации — иначе его затирает _save, а следующий disable() восстанавливает
+    устаревший sidecar поверх его значения."""
+    settings = _setup(monkeypatch, tmp_path)
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text(json.dumps({"env": {"HTTPS_PROXY": "http://corp:3128"}}))
+
+    @contextlib.contextmanager
+    def _racing_lock():
+        # Другой srouter-писатель успел закоммитить до нашего lock.
+        settings.write_text(json.dumps({"env": {"HTTPS_PROXY": "http://corp-new:3128"}}))
+        yield
+
+    monkeypatch.setattr(claude_proxy, "_settings_lock", _racing_lock)
+    r = claude_proxy.enable(force=True)
+
+    assert r["ok"] is False, "писатель до lock -> snapshot устарел -> отказ"
+    assert not claude_proxy._backup_path().exists(), "backup не пишется при отказе"
+    assert json.loads(settings.read_text())["env"]["HTTPS_PROXY"] == "http://corp-new:3128", \
+        "чужое новое значение не затёрто"
+
+
+def test_disable_reads_and_consumes_backup_under_lock(monkeypatch, tmp_path):
+    """AO review 5110553545: disable() — второй read-modify-write коммитер (и потребитель
+    sidecar), его чтение/value-match/запись тоже под lock. Писатель, затёрший managed-значение
+    своим до нашего lock, не снимается по устаревшему снапшоту, и sidecar при этом не
+    потребляется."""
+    settings = _setup(monkeypatch, tmp_path)
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text(json.dumps({"env": {"HTTPS_PROXY": claude_proxy._PROXY}}))
+    claude_proxy._backup_path().write_text(json.dumps(
+        {"env": {"all_proxy": "socks5h://old:1080"}}))
+
+    @contextlib.contextmanager
+    def _racing_lock():
+        # Другой писатель успел до нашего lock: затёр managed-значение своим.
+        settings.write_text(json.dumps({"env": {"HTTPS_PROXY": "http://corp-new:3128"}}))
+        yield
+
+    monkeypatch.setattr(claude_proxy, "_settings_lock", _racing_lock)
+    r = claude_proxy.disable()
+
+    assert r["ok"] is True
+    data = json.loads(settings.read_text())
+    assert data["env"]["HTTPS_PROXY"] == "http://corp-new:3128", "чужое новое значение не тронуто"
+    assert "all_proxy" not in data["env"], "restore нет: managed-ключей под lock не видно"
+    assert claude_proxy._backup_path().exists(), "backup не потребляется без подтверждённого restore"
+
+
+def test_settings_lock_is_real_exclusive_flock(monkeypatch, tmp_path):
+    """Lock — настоящий межпроцессный flock, а не no-op: пока он удерживается, второй
+    эксклюзивный захват (LOCK_NB, отдельный fd) обязан блокироваться."""
+    _setup(monkeypatch, tmp_path)
+    with claude_proxy._settings_lock():
+        fd = os.open(claude_proxy._lock_path(), os.O_RDWR)
+        try:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(fd)
 
 
 # ============ issue #331: нейтрализация all_proxy/ALL_PROXY (SOCKS-плечо xray) ============
