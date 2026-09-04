@@ -34,7 +34,9 @@ def test_brew_cask_live_format_one_token_per_line():
     тест падает и требует перезахвата (канон mock-format-must-come-from-live-capture)."""
     out = _brew_list_cask()
     lines = [l for l in out.splitlines() if l.strip()]
-    assert lines, "brew list --cask пуст — касков нет, формат не проверить"
+    if not lines:
+        pytest.skip("brew list --cask пуст — касков нет, формат не проверить "
+                    "(красный цвет зарезервирован за дрейфом формата)")
     bad = [l for l in lines if " " in l or "\t" in l]
     assert not bad, \
         f"формат дрейфнул (пробелы внутри строки): {bad[:3]!r} — перезахвати _BREW_CASK_LIVE"

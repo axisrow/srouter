@@ -491,7 +491,7 @@ def test_cask_codex_installed_without_brew_link_is_found(_versions_monkey):
     assert by_path[exe]["version"] == "codex-cli 0.151.0", "версия читается с файла — файл, не каталог"
 
 
-def test_cask_codex_gate_exact_line_match(_versions_monkey):
+def test_cask_codex_gate_exact_line_match():
     """КРАСНЫЙ #310 (дефект 2, loose-подстрока): имя каска матчится ТОЧНО — целая строка
     вывода `brew list --cask` (канон marker-whole-line-invariant: все границы строки).
     'codexbar'/'codex-cli' — соседние каски, вхождение подстроки 'codex' в них — ложный
