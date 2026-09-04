@@ -88,6 +88,22 @@ def test_unknown_when_foreign_proxy(monkeypatch):
     assert health._proxy_env_consistency()["status"] == "unknown"
 
 
+def test_mixed_state_evaluates_neutral_invariant(monkeypatch):
+    """mixed (напр. наш HTTPS_PROXY + чужой HTTP_PROXY) — НЕ вне контракта: часть нашего
+    прокси активна → neutral-инвариант применим, warn честный (review #338: симметрия
+    out-of-contract семантики — foreign → unknown, mixed → оценивается)."""
+    _scrub_proxy_env(monkeypatch)
+    monkeypatch.setenv("ALL_PROXY", "socks5h://127.0.0.1:10808")
+    _mock_status(monkeypatch, _managed_status(state="mixed"))
+    assert health._proxy_env_consistency()["status"] == "warn"
+
+
+def test_mixed_state_ok_when_neutralized(monkeypatch):
+    _scrub_proxy_env(monkeypatch)
+    _mock_status(monkeypatch, _managed_status(state="mixed", neutralized=True))
+    assert health._proxy_env_consistency()["status"] == "ok"
+
+
 def test_fail_soft_when_claude_proxy_import_broken(monkeypatch):
     """claude_proxy недоступен (InstallEnv-путь) — fail-soft unknown, не исключение."""
     _scrub_proxy_env(monkeypatch)

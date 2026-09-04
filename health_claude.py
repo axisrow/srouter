@@ -291,8 +291,11 @@ def _proxy_env_consistency():
     settings-инвариант, живой env лишь иллюстрирует detail (канон verify-dont-guess).
 
     state unknown (битый settings.json, #307) / foreign (чужой HTTPS_PROXY) — outside
-    контракта → unknown, не угадываем. claude_proxy.status() не бросает (контракт); local
-    import — fail-soft граница health (как _configured_claude_proxy). Без сети, не бросает.
+    контракта → unknown, не угадываем. mixed (наш ключ + чужой ключ) — оценивается: часть
+    нашего прокси активна → neutral-инвариант применим, warn честный (review #338: симметрия
+    out-of-contract семантики — foreign → unknown, mixed → evaluate). claude_proxy.status()
+    не бросает (контракт); local import — fail-soft граница health (как
+    _configured_claude_proxy). Без сети, не бросает.
     """
     try:
         import claude_proxy
@@ -304,9 +307,10 @@ def _proxy_env_consistency():
     if state == _contract.UNKNOWN:
         return {"status": "unknown",
                 "detail": "settings.json нечитаем — консистентность прокси-env не определить (issue #307)"}
-    if state == "foreign":
+    if state == _contract.FOREIGN:
         return {"status": "unknown",
                 "detail": "чужой HTTPS_PROXY (#307) — env вне контракта srouter, не оценивается"}
+    # mixed: falling through осознанно — см. docstring (часть нашего прокси активна).
     if not st.get("enabled"):
         return {"status": "ok", "detail": "CC-прокси выключен — нейтрализация all_proxy не требуется"}
     if st.get("socks_neutralized"):

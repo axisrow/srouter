@@ -193,18 +193,23 @@ def enable(force=False):
 
     state = _contract.aggregate(
         _contract.classify(k in env, env.get(k, ""), _PROXY) for k in ENV_KEYS)
-    if _contract.needs_force(state) and not force:
-        return _contract.conflict_result(state)
-
     # Issue #331: чужое НЕпустое all_proxy/ALL_PROXY — FOREIGN (канон #307), тот же контракт,
     # что у ENV_KEYS: отказ без мутации, перезапись только force с backup. Пустая строка —
     # НАША нейтрализация (managed value = ""), не foreign (classify тут не применим: он считает
     # present-пустую строку FOREIGN — presence != truthy #222, а для neutral-ключей пустота
     # ровно то значение, которое мы сами и ставим).
     foreign_neutral = {k: env[k] for k in NEUTRAL_PROXY_KEYS if k in env and env[k] != ""}
-    if foreign_neutral and not force:
-        return {"ok": False, "conflict": True, "state": state,
-                "err": f"чужое непустое {','.join(sorted(foreign_neutral))} — перезапись только force (issue #307/#331)"}
+    # Review #338 (UX): чужие ENV_KEYS и чужой all_proxy одновременно — ОДИН конфликт-ответ
+    # с обоими поводами, а не два захода (иначе needs_force gate отрабатывал раньше и молчал
+    # про neutral: пользователь чинил один конфликт, чтобы упереться во второй).
+    if not force and (_contract.needs_force(state) or foreign_neutral):
+        if not _contract.needs_force(state):
+            return {"ok": False, "conflict": True, "state": state,
+                    "err": f"чужое непустое {','.join(sorted(foreign_neutral))} — перезапись только force (issue #307/#331)"}
+        result = _contract.conflict_result(state)
+        if foreign_neutral:
+            result["err"] += f"; также чужое непустое {','.join(sorted(foreign_neutral))} (issue #331)"
+        return result
 
     if force and (_contract.needs_force(state) or foreign_neutral):
         # Provenance: сохранить ЧУЖИЕ значения перед перезаписью (только сами proxy-ключи).
@@ -295,10 +300,11 @@ def disable():
             if isinstance(backup, dict) and isinstance(backup.get("env"), dict):
                 for k, v in backup["env"].items():
                     # Codex cycle-review #338 finding 1: restore симметричен capture — backup
-                    # хранит и proxy-ключи (managed value = _PROXY), и neutral (managed "" +
-                    # непустое чужое). Восстанавливаем всё, что != нашему managed значению
-                    # для своего класса ключей, иначе force-перезапись чужого all_proxy
-                    # теряла бы его навсегда (backup-сирота).
+                    # хранит ТОЛЬКО чужие непустые значения (для proxy-ключей — != _PROXY,
+                    # для neutral — непустые): managed-значения при capture туда не пишутся.
+                    # Восстанавливаем всё с фильтром «!= managed-значению своего класса» —
+                    # для neutral-класса фильтр defensive (нашcapture пустоту не пишет), но
+                    # страхует от будущих писателей backup'а.
                     managed_value = _PROXY if k in ENV_KEYS else ""
                     if v != managed_value:
                         env[k] = v

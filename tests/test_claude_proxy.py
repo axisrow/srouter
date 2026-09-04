@@ -520,6 +520,22 @@ def test_enable_conflict_on_foreign_all_proxy(monkeypatch, tmp_path):
     assert json.loads(settings.read_text()) == original, "мутации быть не должно"
 
 
+def test_enable_conflict_aggregates_proxy_and_neutral_causes(monkeypatch, tmp_path):
+    """Review #338 (UX): чужие ENV_KEYS и чужой all_proxy одновременно — ОДИН конфликт-ответ
+    с обоими поводами, а не два захода (needs_force gate отрабатывает раньше и молчал про
+    neutral; пользователь чинил один конфликт, чтобы упереться во второй)."""
+    settings = _setup(monkeypatch, tmp_path)
+    original = {"env": {"HTTPS_PROXY": "http://corp-proxy:3128",
+                        "all_proxy": "socks5h://10.0.0.1:1080"}}
+    settings.write_text(json.dumps(original))
+    r = claude_proxy.enable()
+    assert r["ok"] is False
+    assert r["conflict"] is True
+    assert r["state"] == "foreign"
+    assert "all_proxy" in r["err"], "нейтральный конфликт назван в ТОМ ЖЕ ответе"
+    assert json.loads(settings.read_text()) == original, "мутации быть не должно"
+
+
 def test_enable_force_overwrites_foreign_all_proxy(monkeypatch, tmp_path):
     settings = _setup(monkeypatch, tmp_path)
     settings.write_text(json.dumps({"env": {"all_proxy": "socks5h://10.0.0.1:1080"}}))
