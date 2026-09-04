@@ -7,8 +7,10 @@ handshake или ответ API (#127). Поддержку доказывает 
 
 _claude_proxy_probe() возвращает {status, source, detail}:
   status="ok"      — CC держит коннект к ожидаемому HTTP bridge 8118;
-  status="down"    — CC имеет внешний direct socket;
-  status="unknown" — только SOCKS TCP socket, idle, timeout или CC не запущен.
+  status="down"    — CC имеет внешний direct socket с читаемым env (атрибутируемая утечка);
+  status="unknown" — только SOCKS TCP socket, idle, timeout, CC не запущен, endpoint-override
+                     в NO_PROXY (прямой ход намеренно, #329) или external у PID с нечитаемым
+                     env (sandbox/чужой UID — атрибуция невозможна, #329).
 """
 import json
 import os
@@ -37,6 +39,22 @@ _REAL_NETWORK_INTERFACE_UP = health._network_interface_up
 # isolate_firewall.probe_codex_isolation/probe_codex_user + ps через _codex_iso_probes ДО вызова
 # _all_up_monkey; им нужна РЕАЛЬНАЯ _codex_isolation_check, не глобальная заглушка.
 _REAL_CODEX_ISOLATION_CHECK = health._codex_isolation_check
+
+# #329: аналогично — check_all-интеграционный тест override-гейта хочет РЕАЛЬНУЮ _claude_proxy_probe
+# (ps/lsof через мок sys_probe.run), а не заглушку из _all_up_monkey.
+_REAL_CLAUDE_PROXY_PROBE = health._claude_proxy_probe
+
+
+def _std_endpoint(monkeypatch):
+    """#329: мок endpoint-конфига «стандартный, без override» для probe-тестов.
+
+    _claude_proxy_probe консультируется с _read_endpoint_config (через health-фасад) — без мока
+    она читала бы РЕАЛЬНЫЙ ~/.claude/settings.json/launchctl/shell dev-машины (там z.ai-override)
+    → тесты становились machine-dependent (канон unmocked-probe-is-both-slow-and-machine-dependent).
+    base_url="" → overridden=False → probe работает в обычном режиме.
+    """
+    monkeypatch.setattr(health, "_read_endpoint_config",
+                        lambda: {"base_url": "", "no_proxy": "", "source": "default"})
 
 
 def _all_up_monkey(monkeypatch, *, probe_status="ok", probe_detail="runtime: коннект",
@@ -149,6 +167,7 @@ def test_probe_ok_when_cc_connected_to_proxy(monkeypatch):
         return {"rc": 0, "out": "", "err": "", "timeout": False}
 
     monkeypatch.setattr(health.sys_probe, "run", fake_run)
+    _std_endpoint(monkeypatch)
     res = health._claude_proxy_probe()
     assert res["status"] == "ok"
     assert res["source"] == "runtime"
@@ -169,6 +188,7 @@ def test_probe_detects_version_runner_cc(monkeypatch):
         return {"rc": 0, "out": "", "err": "", "timeout": False}
 
     monkeypatch.setattr(health.sys_probe, "run", fake_run)
+    _std_endpoint(monkeypatch)
     res = health._claude_proxy_probe()
     assert res["status"] == "ok", "version-runner CC должен детектиться (он держит коннект к privoxy)"
 
@@ -183,6 +203,7 @@ def test_probe_unknown_when_cc_has_only_socks_tcp_connection(monkeypatch):
         return {"rc": 0, "out": "", "err": "", "timeout": False}
 
     monkeypatch.setattr(health.sys_probe, "run", fake_run)
+    _std_endpoint(monkeypatch)
     res = health._claude_proxy_probe()
     assert res["status"] == "unknown"
     assert "актив" in res["detail"].lower()
@@ -194,16 +215,21 @@ def test_probe_down_when_cc_direct_leak(monkeypatch):
 
     CC идёт НАПРЯМУЮ к api.anthropic.com мимо прокси — нарушение fail-closed-proxy-down.
     Doctor обязан детектить и сообщить (главная находка этой сессии).
+    #329: external PID с ЧИТАЕМЫМ env (`ps eww` same-UID, ALL_CAPS= в выводе) — полноправный
+    субъект проверки: атрибуция нарушения возможна → red-ветка остаётся достижимой.
     """
     def fake_run(cmd, timeout):
-        if cmd and cmd[0] == "/bin/ps":
+        if cmd and cmd[0] == "/bin/ps" and cmd[1] == "-axo":
             return {"rc": 0, "out": f"12345 {GUI_COMM}\n", "err": "", "timeout": False}
+        if cmd and cmd[0] == "/bin/ps" and cmd[1] == "eww":
+            return {"rc": 0, "out": f"12345 ttys000 0:01.00 {GUI_COMM} HTTPS_PROXY=http://127.0.0.1:8118 HOME=/Users/me\n", "err": "", "timeout": False}
         if cmd and cmd[0] == "/usr/sbin/lsof":
             # external ESTABLISHED — CC напрямую к Anthropic (не localhost)
             return {"rc": 0, "out": "claude 12345 axisrow 7u IPv4 ... TCP 192.168.1.5:51234->160.79.104.10:443 (ESTABLISHED)\n", "err": "", "timeout": False}
         return {"rc": 0, "out": "", "err": "", "timeout": False}
 
     monkeypatch.setattr(health.sys_probe, "run", fake_run)
+    _std_endpoint(monkeypatch)
     res = health._claude_proxy_probe()
     assert res["status"] == "down", "CC идёт напрямую (external) → down (DIRECT-LEAK, fail-closed violation)"
 
@@ -218,6 +244,7 @@ def test_probe_unknown_when_cc_idle_no_sockets(monkeypatch):
         return {"rc": 0, "out": "", "err": "", "timeout": False}
 
     monkeypatch.setattr(health.sys_probe, "run", fake_run)
+    _std_endpoint(monkeypatch)
     res = health._claude_proxy_probe()
     assert res["status"] == "unknown", "CC без активных сокетов → unknown (idle, не down)"
 
@@ -227,10 +254,15 @@ def test_probe_down_when_cc_mixed_proxy_and_direct_leak(monkeypatch):
 
     Баг: has_proxy=True возвращал ok ДО проверки has_external → один PID через proxy,
     другой напрямую → doctor говорил ok. per-PID классификация: proxy+external = down (mixed).
+    #329: external PID 102 с читаемым env → атрибуция возможна → down остаётся.
     """
     def fake_run(cmd, timeout):
-        if cmd and cmd[0] == "/bin/ps":
+        if cmd and cmd[0] == "/bin/ps" and cmd[1] == "-axo":
             return {"rc": 0, "out": f"101 {CLI_COMM}\n102 {CLI_COMM}\n", "err": "", "timeout": False}
+        if cmd and cmd[0] == "/bin/ps" and cmd[1] == "eww":
+            return {"rc": 0, "out": (
+                f"102 ttys000 0:01.00 {CLI_COMM} HTTPS_PROXY=http://127.0.0.1:8118 HOME=/Users/me\n"
+            ), "err": "", "timeout": False}
         if cmd and cmd[0] == "/usr/sbin/lsof":
             # PID 101 через privoxy, PID 102 напрямую (external)
             return {"rc": 0, "out": (
@@ -240,6 +272,7 @@ def test_probe_down_when_cc_mixed_proxy_and_direct_leak(monkeypatch):
         return {"rc": 0, "out": "", "err": "", "timeout": False}
 
     monkeypatch.setattr(health.sys_probe, "run", fake_run)
+    _std_endpoint(monkeypatch)
     res = health._claude_proxy_probe()
     assert res["status"] == "down", "proxy + direct-leak = mixed → down (не ok, direct-leak не маскирован)"
 
@@ -290,6 +323,127 @@ def test_probe_ignores_non_cc_processes(monkeypatch):
     monkeypatch.setattr(health.sys_probe, "run", fake_run)
     res = health._claude_proxy_probe()
     assert res["status"] == "unknown", "desktop Claude.app / codex / wrapper — НЕ Claude Code"
+
+
+# ============================ #329: endpoint-override gate + env-атрибуция external PID ============================
+# Ложный ❌ инцидента: при легитимном z.ai endpoint-override (ANTHROPIC_BASE_URL в NO_PROXY —
+# канон zai-direct-no-proxy, CC ходит напрямую BY DESIGN) probe красила прямой ход как
+# «нарушение fail-closed», противореча endpoint-пробе, которая тот же факт признаёт намеренным.
+# lsof-классификация endpoint-слепа (numeric IP без hostname) → при override в NO_PROXY проба
+# неприменима (unknown, parity с endpoint-пробой), а не down. «Дополнительно» из issue: external
+# PID с нечитаемым env (sandbox/чужой UID, ps eww same-UID only) — HTTPS_PROXY к нему
+# неприменим/непроверяем → атрибуция нарушения только по PID с читаемым env.
+
+# Живой позитив-кейс этой машины (мокается, не читается): z.ai override в NO_PROXY.
+_ZAI_OVERRIDE_CFG = {"base_url": "https://api.z.ai/api/anthropic",
+                     "no_proxy": "localhost,127.0.0.1,::1,z.ai,.z.ai,storage.googleapis.com",
+                     "source": "shell"}
+# external ESTABLISHED, похожий на утечку (не localhost) — ровно то, что probe видит при z.ai.
+_EXTERNAL_LEAK_LINE = ("claude 12345 axisrow 7u IPv4 ... TCP "
+                       "192.168.1.5:51234->160.79.104.10:443 (ESTABLISHED)\n")
+
+
+def _ps_lsof_fake(ps_out, lsof_out, eww_out=""):
+    """fake_run для связки ps -axo / ps eww / lsof — все прочие команды → пустой вывод."""
+    def fake_run(cmd, timeout):
+        if cmd and cmd[0] == "/bin/ps" and cmd[1] == "-axo":
+            return {"rc": 0, "out": ps_out, "err": "", "timeout": False}
+        if cmd and cmd[0] == "/bin/ps" and cmd[1] == "eww":
+            return {"rc": 0, "out": eww_out, "err": "", "timeout": False}
+        if cmd and cmd[0] == "/usr/sbin/lsof":
+            return {"rc": 0, "out": lsof_out, "err": "", "timeout": False}
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+    return fake_run
+
+
+def test_probe_unknown_when_endpoint_in_no_proxy_override(monkeypatch):
+    """#329 RED: z.ai override в NO_PROXY + CC external → unknown «проба неприменима», НЕ down.
+
+    Раньше probe возвращала down «нарушение fail-closed» на легитимной конфигурации — ложный ❌
+    на здоровой системе (и driver-дебаунс watchdog'а). Прямое соединение к endpoint намеренно;
+    красная ветка детектора при этом остаётся достижимой (см. следующий тест).
+    """
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _ps_lsof_fake(f"12345 {CLI_COMM}\n", _EXTERNAL_LEAK_LINE))
+    monkeypatch.setattr(health, "_read_endpoint_config", lambda: _ZAI_OVERRIDE_CFG)
+    res = health._claude_proxy_probe()
+    assert res["status"] == "unknown", \
+        "endpoint в NO_PROXY → прямой ход намеренно, НЕ «нарушение fail-closed»"
+    assert "неприменима" in res["detail"]
+    assert "намеренно" in res["detail"]
+    assert "160.79.104.10" in res["detail"] or "12345" in res["detail"], \
+        "external-наблюдение остаётся в detail как форензика"
+
+
+def test_probe_down_when_override_not_in_no_proxy(monkeypatch):
+    """#329: override НЕ в NO_PROXY (прокси для endpoint обязателен) → проба применяется.
+
+    Обе ветки гейта достижимы (канон detector-must-be-function-not-constant): внешний ход
+    при endpoint-вне-NO_PROXY — по-прежнему доказанная утечка → down.
+    """
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _ps_lsof_fake(f"12345 {CLI_COMM}\n", _EXTERNAL_LEAK_LINE,
+                                      eww_out=f"12345 ttys000 0:01.00 {CLI_COMM} HTTPS_PROXY=http://127.0.0.1:8118\n"))
+    monkeypatch.setattr(health, "_read_endpoint_config",
+                        lambda: {"base_url": "https://api.z.ai/api/anthropic",
+                                 "no_proxy": "localhost,127.0.0.1", "source": "shell"})
+    res = health._claude_proxy_probe()
+    assert res["status"] == "down", "override вне NO_PROXY → fail-closed применим, external = утечка"
+
+
+def test_probe_unknown_when_external_pid_env_unreadable(monkeypatch):
+    """#329 «Дополнительно»: external у PID с нечитаемым env (sandbox/чужой UID) → НЕ down.
+
+    ps eww читает env только same-UID: HTTPS_PROXY к такому процессу неприменим/непроверяем,
+    атрибуция нарушения невозможна → unknown с форензикой, не «нарушение fail-closed».
+    """
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _ps_lsof_fake(f"12345 {CLI_COMM}\n", _EXTERNAL_LEAK_LINE, eww_out=""))
+    _std_endpoint(monkeypatch)
+    res = health._claude_proxy_probe()
+    assert res["status"] == "unknown", "env PID не читается → атрибуция невозможна, не down"
+    assert "12345" in res["detail"], "PID остаётся в detail как форензика"
+    assert "не читается" in res["detail"]
+
+
+def test_probe_mixed_down_with_unverified_forensics(monkeypatch):
+    """#329: mixed — читаемый leak драйвит down, нечитаемый external остаётся форензикой.
+
+    Читаемый PID 102 (leak) не маскируется нечитаемым 103, и наоборот: 103 не участвует
+    в атрибуции, но виден в detail.
+    """
+    lsof_out = (
+        f"claude 101 axisrow 7u IPv4 ... TCP 127.0.0.1:51234->127.0.0.1:{health.PRIVOXY_PORT} (ESTABLISHED)\n"
+        "claude 102 axisrow 7u IPv4 ... TCP 192.168.1.5:51235->160.79.104.10:443 (ESTABLISHED)\n"
+        "claude 103 axisrow 7u IPv4 ... TCP 192.168.1.5:51236->160.79.104.11:443 (ESTABLISHED)\n"
+    )
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _ps_lsof_fake(f"101 {CLI_COMM}\n102 {CLI_COMM}\n103 {CLI_COMM}\n", lsof_out,
+                                      eww_out=f"102 ttys000 0:01.00 {CLI_COMM} HTTPS_PROXY=http://127.0.0.1:8118\n"))
+    _std_endpoint(monkeypatch)
+    res = health._claude_proxy_probe()
+    assert res["status"] == "down", "читаемый external (102) → mixed down"
+    assert "102" in res["detail"]
+    assert "103" in res["detail"], "нечитаемый PID остаётся форензикой в detail"
+    assert "не читается" in res["detail"]
+
+
+def test_check_all_no_false_verdict_when_endpoint_override(monkeypatch):
+    """#329 интеграция: z.ai override + runtime external → вердикт ok, check не driver.
+
+    Сквозной регресс на инцидент: до фикса check_all падал в degraded из-за ложного
+    «нарушение fail-closed» (watchdog пушил ложные алерты #315-класса).
+    """
+    _all_up_monkey(monkeypatch)
+    monkeypatch.setattr(health, "_claude_proxy_probe", _REAL_CLAUDE_PROXY_PROBE)
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _ps_lsof_fake(f"12345 {CLI_COMM}\n", _EXTERNAL_LEAK_LINE))
+    monkeypatch.setattr(health, "_read_endpoint_config", lambda: _ZAI_OVERRIDE_CFG)
+    result = health.check_all()
+    assert result["status"] == "ok", "endpoint в NO_PROXY → claude-proxy не driver → вердикт ok"
+    cp = [c for c in result["checks"] if "claude" in c["name"].lower()][0]
+    assert cp.get("info") is True, "unknown-check помечен info (не driver)"
+    assert "неприменима" in cp["detail"]
 
 
 # ============================ check_all (агрегация с info-only unknown) ============================
@@ -2040,6 +2194,80 @@ def test_check_all_has_endpoint_override_check(monkeypatch):
     names = [c["name"] for c in result["checks"]]
     assert any("endpoint" in n.lower() and "anthropic" in n.lower() for n in names), \
         f"должен быть endpoint-override check, got: {names}"
+
+
+# ============================ #329: _endpoint_direct_override / _host_in_no_proxy / _pids_env_readable ============================
+
+def test_endpoint_direct_override_true_for_zai_in_no_proxy(monkeypatch):
+    """#329: z.ai override + z.ai в NO_PROXY → overridden=True (CC ходит напрямую by design)."""
+    monkeypatch.setattr(health, "_read_endpoint_config", lambda: _ZAI_OVERRIDE_CFG)
+    res = health._endpoint_direct_override()
+    assert res["overridden"] is True
+    assert res["host"] == "api.z.ai"
+    assert res["base_url"] == "https://api.z.ai/api/anthropic"
+
+
+def test_endpoint_direct_override_false_when_not_in_no_proxy(monkeypatch):
+    """#329: override вне NO_PROXY → overridden=False (прокси для endpoint обязателен)."""
+    monkeypatch.setattr(health, "_read_endpoint_config",
+                        lambda: {"base_url": "https://api.z.ai/api/anthropic",
+                                 "no_proxy": "localhost,127.0.0.1", "source": "shell"})
+    assert health._endpoint_direct_override()["overridden"] is False
+
+
+def test_endpoint_direct_override_false_for_standard_and_empty(monkeypatch):
+    """#329: стандартный endpoint (exact api.anthropic.com) и пустой base → overridden=False."""
+    monkeypatch.setattr(health, "_read_endpoint_config",
+                        lambda: {"base_url": "https://api.anthropic.com",
+                                 "no_proxy": "api.anthropic.com", "source": "shell"})
+    assert health._endpoint_direct_override()["overridden"] is False, \
+        "стандартный хост не override, даже если кто-то внес его в NO_PROXY"
+    monkeypatch.setattr(health, "_read_endpoint_config",
+                        lambda: {"base_url": "", "no_proxy": "z.ai", "source": "default"})
+    assert health._endpoint_direct_override()["overridden"] is False
+
+
+def test_endpoint_direct_override_false_for_lookalike_outside_no_proxy(monkeypatch):
+    """#329 C2-канон: lookalike api.anthropic.com.attacker.example вне NO_PROXY → False (проба применяется)."""
+    monkeypatch.setattr(health, "_read_endpoint_config",
+                        lambda: {"base_url": "https://api.anthropic.com.attacker.example/",
+                                 "no_proxy": "localhost", "source": "shell"})
+    assert health._endpoint_direct_override()["overridden"] is False
+
+
+def test_host_in_no_proxy_exact_and_subdomain_only():
+    """#129 семантика членства: exact match или subdomain, НЕ substring (lookalike-атака)."""
+    no_proxy = "localhost,127.0.0.1,::1,z.ai,.z.ai,storage.googleapis.com"
+    assert health._host_in_no_proxy("z.ai", no_proxy) is True
+    assert health._host_in_no_proxy("api.z.ai", no_proxy) is True, "subdomain через .z.ai"
+    assert health._host_in_no_proxy("storage.googleapis.com", no_proxy) is True
+    assert health._host_in_no_proxy("notz.ai", no_proxy) is False, "substring НЕ считается"
+    assert health._host_in_no_proxy("evil-z.ai", no_proxy) is False
+    assert health._host_in_no_proxy("z.ai", "") is False
+
+
+def test_pids_env_readable_sections_by_pid(monkeypatch):
+    """#329: readable = PID-секции с хотя бы одним ALL_CAPS= токеном; секция без env не читается."""
+    out = (
+        f"  PID TTY           TIME CMD\n"
+        f"100 ttys000 0:01.00 {CLI_COMM} HTTPS_PROXY=http://127.0.0.1:8118 HOME=/Users/me\n"
+        f"200 ttys001 0:01.00 {CLI_COMM}\n"
+    )
+    monkeypatch.setattr(health.sys_probe, "run",
+                        lambda cmd, timeout: {"rc": 0, "out": out, "err": "", "timeout": False})
+    assert health._pids_env_readable(["100", "200", "300"]) == {"100"}, \
+        "200 без env и отсутствующий 300 не читаются"
+
+
+def test_pids_env_readable_fail_soft(monkeypatch):
+    """#329: timeout / пустой вывод / пустой список → пустое set (никто не читается)."""
+    monkeypatch.setattr(health.sys_probe, "run",
+                        lambda cmd, timeout: {"rc": None, "out": "", "err": "timeout", "timeout": True})
+    assert health._pids_env_readable(["100"]) == set()
+    monkeypatch.setattr(health.sys_probe, "run",
+                        lambda cmd, timeout: {"rc": 0, "out": "", "err": "", "timeout": False})
+    assert health._pids_env_readable(["100"]) == set()
+    assert health._pids_env_readable([]) == set()
 
 
 # ============================ #109: watchdog state-машина + _notify логирование ============================
