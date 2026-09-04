@@ -278,20 +278,29 @@ def disable():
                 del env[k]
                 changed = True
                 managed_removed = True
-        # Issue #331: нейтрализация — наше пустое значение, снимаем как managed (value-match:
-        # ТОЛЬКО пустую строку; чужое непустое all_proxy не трогаем — provenance #112/#307).
-        # managed_removed НЕ поднимаем: NO_PROXY-strip/backup-restore связаны с proxy-ключами,
-        # а не с нейтрализацией all_proxy.
-        for k in NEUTRAL_PROXY_KEYS:
-            if k in env and env[k] == "":
-                del env[k]
-                changed = True
+        # Issue #331 (Codex cycle-review #338 finding 2): нейтрализация снимается ТОЛЬКО когда
+        # srouter управлял этим конфигом (были managed proxy-ключи — их пишет той же рукой
+        # enable()). Пре-существующие пустые all_proxy/ALL_PROXY без наших ключей — чужая
+        # настройка: provenance-маркеров у нас нет (канон #307), значит единственный честный
+        # сигнал «нашего» — сам факт managed ENV_KEYS. Value-match: пустую строку снимаем,
+        # чужое непустое значение не трогаем никогда (#112).
+        if managed_removed:
+            for k in NEUTRAL_PROXY_KEYS:
+                if k in env and env[k] == "":
+                    del env[k]
+                    changed = True
         backup_consumed = False
         if managed_removed:
             backup = _read_backup()
             if isinstance(backup, dict) and isinstance(backup.get("env"), dict):
                 for k, v in backup["env"].items():
-                    if k in ENV_KEYS and v != _PROXY:
+                    # Codex cycle-review #338 finding 1: restore симметричен capture — backup
+                    # хранит и proxy-ключи (managed value = _PROXY), и neutral (managed "" +
+                    # непустое чужое). Восстанавливаем всё, что != нашему managed значению
+                    # для своего класса ключей, иначе force-перезапись чужого all_proxy
+                    # теряла бы его навсегда (backup-сирота).
+                    managed_value = _PROXY if k in ENV_KEYS else ""
+                    if v != managed_value:
                         env[k] = v
                 # Finding 2: backup удаляем ТОЛЬКО после подтверждённой записи (ниже) —
                 # при упавшей _save() он остаётся единственной копией чужого значения.

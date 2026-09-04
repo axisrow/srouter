@@ -538,6 +538,38 @@ def test_disable_keeps_foreign_all_proxy(monkeypatch, tmp_path):
     assert json.loads(settings.read_text())["env"]["all_proxy"] == "socks5h://10.0.0.1:1080"
 
 
+def test_disable_after_force_restores_backed_up_foreign_all_proxy(monkeypatch, tmp_path):
+    """Codex cycle-review #338 finding 1: force-перезапись чужого all_proxy бэкапит его в
+    sidecar — disable() обязан восстановить SYMMETRICНО (как ENV_KEYS), иначе чужая SOCKS-
+    настройка теряется, а backup становится сиротой."""
+    settings = _setup(monkeypatch, tmp_path)
+    settings.write_text(json.dumps({"env": {"all_proxy": "socks5h://10.0.0.1:1080"}}))
+    assert claude_proxy.enable(force=True)["ok"] is True
+    assert json.loads(settings.read_text())["env"]["all_proxy"] == ""
+
+    r = claude_proxy.disable()
+
+    assert r["ok"] is True
+    data = json.loads(settings.read_text())
+    assert data["env"]["all_proxy"] == "socks5h://10.0.0.1:1080", "чужое значение восстановлено"
+    assert not claude_proxy._backup_path().exists(), "backup потреблён, не сирота"
+
+
+def test_disable_keeps_preexisting_empty_neutral_without_managed_keys(monkeypatch, tmp_path):
+    """Codex cycle-review #338 finding 2 (сужение): disable() удаляет нейтрализацию ТОЛЬКО
+    когда srouter управлял этим конфигом (были managed proxy-ключи). Пре-существующие
+    пустые all_proxy/ALL_PROXY без наших ключей — чужая настройка, не трогаем: у нас нет
+    provenance-маркеров (канон #307 «не оставляем маркеров»), значит единственный честный
+    сигнал «нашего» — собственно managed ENV_KEYS, написанные той же рукой enable()'а."""
+    settings = _setup(monkeypatch, tmp_path)
+    settings.write_text(json.dumps({"env": {"ALL_PROXY": "", "all_proxy": ""}}))
+    r = claude_proxy.disable()
+    assert r["ok"] is True
+    data = json.loads(settings.read_text())
+    assert data["env"]["ALL_PROXY"] == ""
+    assert data["env"]["all_proxy"] == ""
+
+
 def test_status_reports_socks_neutralized(monkeypatch, tmp_path):
     settings = _setup(monkeypatch, tmp_path)
     assert claude_proxy.status()["socks_neutralized"] is False
