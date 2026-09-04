@@ -18,7 +18,10 @@ proxy-ключи ТОЛЬКО когда их значение == наш managed
 и восстанавливает backup после force-перезаписи. Классификация состояний — общий слой
 proxy_config_contract (канон third-module-breaks-reexport-cycle).
 """
+import contextlib
+import fcntl
 import json
+import os
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -36,6 +39,15 @@ except SystemExit:
 SETTINGS = Path.home() / ".claude" / "settings.json"
 # Claude Code/node уважают HTTPS_PROXY; HTTP_PROXY добавляем для полноты (HTTP-эндпоинты).
 ENV_KEYS = ("HTTPS_PROXY", "HTTP_PROXY")
+# Issue #331: launchctl gui-домен (srouter-codex-env.sh) ставит ALL_PROXY/all_proxy =
+# socks5h://127.0.0.1:10808 во ВСЕ GUI-процессы — в сессиях Claude Code это протекает в
+# pip/requests: urllib.request.getproxies_environment() подхватывает all_proxy, requests
+# select_proxy маппит 'all' на ВСЕ схемы → путь SOCKSProxyManager → TypeError
+# PoolKey key_proxy_ssl_context (при shadowing urllib3 поверх vendored). Для CC единственное
+# плечо = privoxy 8118, поэтому enable() НЕЙТРАЛИЗУЕТ all_proxy пустой строкой (не ставит
+# SOCKS!) — канон #199 «снять env-прокси ОБА регистра»: нейтрализация там, где задумана.
+# Чужое НЕпустое значение — FOREIGN (канон #307), перезапись только force с backup.
+NEUTRAL_PROXY_KEYS = ("ALL_PROXY", "all_proxy")
 # NO_PROXY (оба регистра) — хосты из ANTHROPIC_BASE_URL идут напрямую, мимо privoxy.
 # Сторонний провайдер (z.ai/glm/любой) на внешнем хостинге — прокси-туннель ему не нужен (лишний хоп).
 # NO_PROXY следует за HTTPS_PROXY (ставится в enable, убирается в disable) — в установке srouter они
@@ -121,7 +133,7 @@ def status():
         unknown = data is None or not isinstance(data, dict)
         return {"enabled": False, "proxy": "",
                 "state": _contract.UNKNOWN if unknown else _contract.ABSENT,
-                "provider_direct": False, "no_proxy": ""}
+                "provider_direct": False, "no_proxy": "", "socks_neutralized": False}
     val = env.get("HTTPS_PROXY", "")
     no_proxy = env.get("NO_PROXY", "") or env.get("no_proxy", "")
     hosts = _base_url_hosts(data)
@@ -131,8 +143,13 @@ def status():
     provider_direct = bool(host_set & np_set)
     state = _contract.aggregate(
         _contract.classify(k in env, env.get(k, ""), _PROXY) for k in ENV_KEYS)
+    # Issue #331: SOCKS-плечо нейтрализовано = оба neutral-ключа присутствуют с пустой строкой
+    # (строгая форма: частичная нейтрализация — не нейтрализация, all_proxy без ALL_PROXY
+    # всё ещё протекает в lower-first-стеки).
+    socks_neutralized = all(k in env and env[k] == "" for k in NEUTRAL_PROXY_KEYS)
     return {"enabled": val == _PROXY, "proxy": val, "state": state,
-            "provider_direct": provider_direct, "no_proxy": no_proxy}
+            "provider_direct": provider_direct, "no_proxy": no_proxy,
+            "socks_neutralized": socks_neutralized}
 
 
 def _backup_path():
@@ -150,6 +167,87 @@ def _read_backup():
         return None
 
 
+def _lock_path():
+    """Sidecar-lockfile сериализации commit-секций enable/disable (AO review #338).
+
+    Отдельный файл, НЕ settings.json: _save() подменяет inode (tmp+replace) — flock на
+    самом settings.json пережил бы rename и разъехался бы с актуальным файлом.
+    """
+    return SETTINGS.parent / (SETTINGS.name + ".srouter-proxy-lock")
+
+
+def _acquire_settings_lock_fd(state):
+    """Захватить lockfile: mkdir+os.open+flock. fd или None (причина в state["err"]). Не бросает.
+
+    Любой OSError (read-only ~/.claude, EMFILE, гонка за mkdir, flock) — structured err,
+    не исключение (AO review 5111140277). При неудаче flock уже открытый fd закрывается.
+    """
+    try:
+        _lock_path().parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(_lock_path(), os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError as exc:
+        state["err"] = f"settings lock unavailable: {str(exc)[:150]}"
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except OSError as exc:
+        state["err"] = f"settings lock unavailable: {str(exc)[:150]}"
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        return None
+    return fd
+
+
+@contextlib.contextmanager
+def _settings_lock():
+    """Эксклюзивный межпроцессный flock на время валидация+backup+save (AO review #338).
+
+    CAS-семантика: под lock перечитывается диск и валидируется decision-snapshot, затем
+    атомарно пишутся sidecar и settings — backup и подмена конфига становятся одной
+    охраняемой операцией, пост-recheck гонка кооперативных писателей закрыта. Сериализует
+    только кооперативных писателей (сами srouter-операции); не-кооперативный писатель
+    (редактор, сам Claude Code) в микросекундном окне между under-lock валидацией и rename
+    физически не координируем — честная граница решения, не баг. Lockfile остаётся на диске
+    (пустой) — стандарт для flock: удаление гонно.
+
+    Контракт «Не бросает» (AO review 5111140277): OSError при захвате не пробрасывается —
+    yielded-dict получает err "settings lock unavailable: ...", вызывающий возвращает
+    structured {ok, err} и ОТКАЗЫВАЕТСЯ от операции: запись без lock воспроизводила бы
+    гонку, которую lock закрывает (fail-closed). Неудача release операцию не валит — она
+    уже закоммичена; предупреждение попадает в err результата через release_err
+    (прецедент: backup-cleanup path в _disable_locked).
+    """
+    state = {}
+    fd = _acquire_settings_lock_fd(state)
+    if fd is None:
+        yield state
+        return
+    try:
+        yield state
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError as exc:
+            state["release_err"] = str(exc)[:150]
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _lock_release_note(r, lock):
+    """Предупреждение о неудачном release в результат операции. ok НЕ меняется: операция
+    закоммичена (прецедент: backup-cleanup возвращает ok:True + err)."""
+    if not lock.get("release_err"):
+        return r
+    note = f"lock release failed: {lock['release_err']}"
+    r = dict(r)
+    r["err"] = f"{r['err']}; {note}" if r.get("err") else note
+    return r
+
+
 def enable(force=False):
     """Прописать env.HTTPS_PROXY/HTTP_PROXY = прокси + NO_PROXY (provider-direct). {ok, err}.
 
@@ -163,6 +261,10 @@ def enable(force=False):
     Issue #307 round 2 (Codex cycle-review PR #328): нечитаемый/битый/не-object settings.json —
     честный отказ БЕЗ перезаписи файла (finding 3); state перечитывается с диска непосредственно
     перед записью — значение, появившееся в гонке между gate и save, не затирается (finding 4).
+    Review #338 follow-up (AO 5110553545): re-check, запись sidecar и _save — одна охраняемая
+    операция под эксклюзивным _settings_lock() (CAS: под lock перечитываем диск и валидируем
+    decision-snapshot, затем атомарный commit) — пост-recheck гонка кооперативных писателей
+    закрыта, при отказе на гонке sidecar на диске не появляется.
     """
     scheme = urlparse(_PROXY).scheme.lower()
     if scheme not in {"http", "https"}:
@@ -179,31 +281,43 @@ def enable(force=False):
 
     state = _contract.aggregate(
         _contract.classify(k in env, env.get(k, ""), _PROXY) for k in ENV_KEYS)
-    if _contract.needs_force(state) and not force:
-        return _contract.conflict_result(state)
+    # Issue #331: чужое НЕпустое all_proxy/ALL_PROXY — FOREIGN (канон #307), тот же контракт,
+    # что у ENV_KEYS: отказ без мутации, перезапись только force с backup. Пустая строка —
+    # НАША нейтрализация (managed value = ""), не foreign (classify тут не применим: он считает
+    # present-пустую строку FOREIGN — presence != truthy #222, а для neutral-ключей пустота
+    # ровно то значение, которое мы сами и ставим).
+    foreign_neutral = {k: env[k] for k in NEUTRAL_PROXY_KEYS if k in env and env[k] != ""}
+    # Review #338 (UX): чужие ENV_KEYS и чужой all_proxy одновременно — ОДИН конфликт-ответ
+    # с обоими поводами, а не два захода (иначе needs_force gate отрабатывал раньше и молчал
+    # про neutral: пользователь чинил один конфликт, чтобы упереться во второй).
+    if not force and (_contract.needs_force(state) or foreign_neutral):
+        if not _contract.needs_force(state):
+            return {"ok": False, "conflict": True, "state": state,
+                    "err": f"чужое непустое {','.join(sorted(foreign_neutral))} — перезапись только force (issue #307/#331)"}
+        result = _contract.conflict_result(state)
+        if foreign_neutral:
+            result["err"] += f"; также чужое непустое {','.join(sorted(foreign_neutral))} (issue #331)"
+        return result
 
-    if force and _contract.needs_force(state):
-        # Provenance: сохранить ЧУЖИЕ значения перед перезаписью (только сами proxy-ключи).
+    # Provenance: захватить ЧУЖИЕ значения (только сами proxy-ключи) ДО мутации env.
+    # Сама запись sidecar — ниже, после пройденного TOCTOU re-check (review #338): sidecar,
+    # записанный до re-check, при отказе на гонке остаётся на диске со снапшотом устаревших
+    # значений, и следующий disable() восстановил бы их поверх более свежих.
+    foreign = {}
+    if force and (_contract.needs_force(state) or foreign_neutral):
         foreign = {k: env[k] for k in ENV_KEYS if k in env and env[k] != _PROXY}
-        if foreign:
-            # _save() пишет строго SETTINGS; backup — отдельная атомарная запись тем же паттерном.
-            try:
-                _backup_path().parent.mkdir(parents=True, exist_ok=True)
-                tmp = _backup_path().with_suffix(".json.tmp")
-                tmp.write_text(json.dumps({"env": foreign}, indent=2, ensure_ascii=False) + "\n",
-                               encoding="utf-8")
-                tmp.replace(_backup_path())
-            except (OSError, TypeError, ValueError) as exc:
-                return {"ok": False, "err": f"backup foreign value failed: {str(exc)[:150]}"}
+        foreign.update(foreign_neutral)
 
     # TOCTOU re-check (finding 4): снапшот proxy-ключей, на котором принято решение.
     # Presence отдельно от значения (AO review round 3): absent и JSON-null — РАЗНЫЕ
     # состояния (classify считает present-любое-значение foreign); иначе конкурентная
     # вставка HTTPS_PROXY: null после gate сравнялась бы с absent и была бы затёрта.
-    decision_snapshot = {k: (k in env, env.get(k)) for k in ENV_KEYS}
+    decision_snapshot = {k: (k in env, env.get(k)) for k in ENV_KEYS + NEUTRAL_PROXY_KEYS}
 
     for k in ENV_KEYS:
         env[k] = _PROXY
+    for k in NEUTRAL_PROXY_KEYS:
+        env[k] = ""
     hosts = _base_url_hosts(data)
     if hosts:
         # Merge обе variant (NO_PROXY + no_proxy) + provider-хосты. Если брать только одну variant
@@ -213,16 +327,35 @@ def enable(force=False):
         for k in NO_PROXY_KEYS:
             env[k] = _merge_no_proxy(existing, hosts)
 
-    # Re-read непосредственно перед записью: если proxy-ключи на диске изменились с момента
-    # решения — решение устарело, отказываем (чужое значение, появившееся в гонке, не тронуто).
-    fresh = _load()
-    if not isinstance(fresh, dict):
-        return {"ok": False, "err": "settings.json стал нечитаем во время операции — отказ (issue #307)"}
-    fresh_env = fresh.get("env") if isinstance(fresh.get("env"), dict) else {}
-    if {k: (k in fresh_env, fresh_env.get(k)) for k in ENV_KEYS} != decision_snapshot:
-        return {"ok": False, "conflict": True, "state": state,
-                "err": "settings.json изменился во время операции — повторите (issue #307)"}
-    return _save(data)
+    # Commit-секция под _settings_lock (AO review #338): re-read+валидация snapshot'а, запись
+    # sidecar и _save — одна охраняемая операция. Re-check сам по себе не атомарен с записью:
+    # без lock кооперативный писатель мог бы вклиниться между ними, и его значение затёрлось
+    # бы _save'ом, а disable() восстановил бы устаревший sidecar поверх него.
+    with _settings_lock() as lock:
+        if lock.get("err"):
+            return {"ok": False, "err": lock["err"]}
+        fresh = _load()
+        if not isinstance(fresh, dict):
+            return {"ok": False, "err": "settings.json стал нечитаем во время операции — отказ (issue #307)"}
+        fresh_env = fresh.get("env") if isinstance(fresh.get("env"), dict) else {}
+        if {k: (k in fresh_env, fresh_env.get(k)) for k in ENV_KEYS + NEUTRAL_PROXY_KEYS} != decision_snapshot:
+            return {"ok": False, "conflict": True, "state": state,
+                    "err": "settings.json изменился во время операции — повторите (issue #307)"}
+
+        if foreign:
+            # Re-check пройден под lock: чужие значения из `foreign` всё ещё на диске —
+            # сохраняем их в sidecar. _save() пишет строго SETTINGS; backup — отдельная
+            # атомарная запись тем же паттерном (tmp + replace).
+            try:
+                _backup_path().parent.mkdir(parents=True, exist_ok=True)
+                tmp = _backup_path().with_suffix(".json.tmp")
+                tmp.write_text(json.dumps({"env": foreign}, indent=2, ensure_ascii=False) + "\n",
+                               encoding="utf-8")
+                tmp.replace(_backup_path())
+            except (OSError, TypeError, ValueError) as exc:
+                return {"ok": False, "err": f"backup foreign value failed: {str(exc)[:150]}"}
+        r = _save(data)
+    return _lock_release_note(r, lock)
 
 
 def disable():
@@ -236,7 +369,19 @@ def disable():
     Issue #307 round 2 (Codex finding 2/3): нечитаемый/битый settings.json — отказ без мутации
     (не «успех»); sidecar-backup удаляется ТОЛЬКО после подтверждённой записи восстановленного
     значения — при упавшей _save() backup остаётся единственной копией чужого значения.
+
+    AO review #338: тело — read-modify-write + потребление sidecar, выполняется под тем же
+    _settings_lock(), что и enable-commit (иначе enable/disable гоняются за sidecar+settings).
     """
+    with _settings_lock() as lock:
+        if lock.get("err"):
+            return {"ok": False, "err": lock["err"]}
+        r = _disable_locked()
+    return _lock_release_note(r, lock)
+
+
+def _disable_locked():
+    """Тело disable() под _settings_lock (см. disable())."""
     data = _load()
     if data is None:
         return {"ok": False, "err": "settings.json нечитаем/битый — отказ без мутации (issue #307)"}
@@ -251,12 +396,30 @@ def disable():
                 del env[k]
                 changed = True
                 managed_removed = True
+        # Issue #331 (Codex cycle-review #338 finding 2): нейтрализация снимается ТОЛЬКО когда
+        # srouter управлял этим конфигом (были managed proxy-ключи — их пишет той же рукой
+        # enable()). Пре-существующие пустые all_proxy/ALL_PROXY без наших ключей — чужая
+        # настройка: provenance-маркеров у нас нет (канон #307), значит единственный честный
+        # сигнал «нашего» — сам факт managed ENV_KEYS. Value-match: пустую строку снимаем,
+        # чужое непустое значение не трогаем никогда (#112).
+        if managed_removed:
+            for k in NEUTRAL_PROXY_KEYS:
+                if k in env and env[k] == "":
+                    del env[k]
+                    changed = True
         backup_consumed = False
         if managed_removed:
             backup = _read_backup()
             if isinstance(backup, dict) and isinstance(backup.get("env"), dict):
                 for k, v in backup["env"].items():
-                    if k in ENV_KEYS and v != _PROXY:
+                    # Codex cycle-review #338 finding 1: restore симметричен capture — backup
+                    # хранит ТОЛЬКО чужие непустые значения (для proxy-ключей — != _PROXY,
+                    # для neutral — непустые): managed-значения при capture туда не пишутся.
+                    # Восстанавливаем всё с фильтром «!= managed-значению своего класса» —
+                    # для neutral-класса фильтр defensive (нашcapture пустоту не пишет), но
+                    # страхует от будущих писателей backup'а.
+                    managed_value = _PROXY if k in ENV_KEYS else ""
+                    if v != managed_value:
                         env[k] = v
                 # Finding 2: backup удаляем ТОЛЬКО после подтверждённой записи (ниже) —
                 # при упавшей _save() он остаётся единственной копией чужого значения.

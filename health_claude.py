@@ -14,6 +14,7 @@ import tempfile
 from urllib.parse import urlparse
 
 import sys_probe
+import proxy_config_contract as _contract
 from health_constants import _PROXY, PRIVOXY_PORT, XRAY_PORT
 
 import health as _health_facade  # noqa: E402 — резолвит intra-module вызовы через health для monkeypatch (канон #158)
@@ -25,6 +26,7 @@ __all__ = [
     "_is_claude_code_comm", "_claude_code_pids", "_claude_proxy_probe",
     "_find_claude_binary", "_has_expected_api_401", "_has_api_retry",
     "_claude_transport_once", "_configured_claude_proxy", "_claude_transport_probe",
+    "_proxy_env_consistency",
     "CLAUDE_TRANSPORT_TIMEOUT", "CLAUDE_API_BASE_URL", "CLAUDE_DUMMY_API_KEY",
     "CONTROL_PROBE_TIMEOUT",
 ]
@@ -275,6 +277,55 @@ def _configured_claude_proxy():
     except ImportError as exc:
         _log.debug("claude_proxy недоступен: %s — proxy считается не настроенным", exc)
         return ""
+
+
+def _proxy_env_consistency():
+    """Консистентность прокси-env Claude Code (issue #331). {status: ok|warn|unknown, detail}.
+
+    Инвариант: managed CC-прокси ВКЛ (claude_proxy.enable) ⇒ SOCKS-плечо нейтрализовано
+    (ALL_PROXY/all_proxy="" в settings.json). Нарушение = протечка: launchctl gui-домен
+    (srouter-codex-env.sh) ставит ALL_PROXY/all_proxy=socks5h://...:10808 во все GUI-процессы,
+    сессия CC наследует ОБА плеча → pip/requests через select_proxy маппят 'all' на ВСЕ схемы →
+    SOCKSProxyManager → TypeError PoolKey key_proxy_ssl_context. Чистый живой env текущего
+    процесса НЕ опровергает протечку (зависит от того, откуда запущен doctor) — решает
+    settings-инвариант, живой env лишь иллюстрирует detail (канон verify-dont-guess).
+
+    state unknown (битый settings.json, #307) / foreign (чужой HTTPS_PROXY) — outside
+    контракта → unknown, не угадываем. mixed (наш ключ + чужой ключ) — оценивается: часть
+    нашего прокси активна → neutral-инвариант применим, warn честный (review #338: симметрия
+    out-of-contract семантики — foreign → unknown, mixed → evaluate). claude_proxy.status()
+    не бросает (контракт); local import — fail-soft граница health (как
+    _configured_claude_proxy). Без сети, не бросает.
+    """
+    try:
+        import claude_proxy
+        st = claude_proxy.status()
+    except ImportError as exc:
+        _log.debug("claude_proxy недоступен: %s — консистентность env не определить", exc)
+        return {"status": "unknown", "detail": f"claude_proxy недоступен: {exc}"}
+    state = st.get("state")
+    if state == _contract.UNKNOWN:
+        return {"status": "unknown",
+                "detail": "settings.json нечитаем — консистентность прокси-env не определить (issue #307)"}
+    if state == _contract.FOREIGN:
+        return {"status": "unknown",
+                "detail": "чужой HTTPS_PROXY (#307) — env вне контракта srouter, не оценивается"}
+    # mixed: falling through осознанно — см. docstring (часть нашего прокси активна).
+    if not st.get("enabled"):
+        return {"status": "ok", "detail": "CC-прокси выключен — нейтрализация all_proxy не требуется"}
+    if st.get("socks_neutralized"):
+        return {"status": "ok",
+                "detail": "SOCKS-плечо (all_proxy) нейтрализовано — privoxy единственное плечо CC"}
+    live = [f"{key}={os.environ[key]}" for key in ("ALL_PROXY", "all_proxy") if os.environ.get(key)]
+    leaked = f"; в env сейчас: {', '.join(live)}" if live else \
+             "; в env этого процесса не видно (зависит от источника запуска doctor)"
+    return {
+        "status": "warn",
+        "detail": ("SOCKS-плечо xray (ALL_PROXY/all_proxy из launchctl) не нейтрализовано в "
+                   f"settings.json{leaked} — pip/requests падают (TypeError PoolKey, issue #331). "
+                   "Фикс: 'srouter install' (enable ставит ALL_PROXY=\"\"), разово: "
+                   "export ALL_PROXY= all_proxy="),
+    }
 
 
 # Control-проба (HTTP bridge) запускается только когда сконфигурированный SOCKS уже упал —

@@ -185,6 +185,16 @@ def check_all(*, active_claude=False):
     if cp["status"] == "unknown":
         cp_check["info"] = True  # не участвует в агрегации (drivers ниже фильтруют info)
     checks.append(cp_check)
+    # Issue #331: консистентность прокси-env — SOCKS-плечо (ALL_PROXY/all_proxy из launchctl
+    # gui-домена) не нейтрализовано при managed CC-прокси → warn DRIVER degraded: pip/requests
+    # в сессиях CC падают (TypeError PoolKey). unknown (битый settings.json / чужой прокси /
+    # claude_proxy недоступен) — info-only, как claude-proxy (fail-closed, не роняет вердикт).
+    pe = _proxy_env_consistency()
+    pe_check = {"name": "proxy-env (консистентность ALL_PROXY)",
+                "ok": pe["status"] == "ok", "detail": pe["detail"]}
+    if pe["status"] == "unknown":
+        pe_check["info"] = True
+    checks.append(pe_check)
     if active_claude:
         active = _claude_transport_probe()
         active_check = {"name": "Claude Code transport (real CLI)",

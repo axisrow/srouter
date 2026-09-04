@@ -20,6 +20,10 @@ srouter-critical-infra-24-7 (dev-workflow не должен зависеть о�
 import git_proxy
 import health
 
+# Реальный тестируемый чек — канонический _all_up_monkey его мокает, тесты check_all ниже
+# восстанавливают поверх (паттерн _REAL_NETWORK_INTERFACE_UP из test_health.py, #271).
+_REAL_GITHUB_DIRECT_CHECK = health._github_direct_check
+
 
 # ============================ _github_direct_check: предикаты по git_proxy.status ============================
 
@@ -130,7 +134,9 @@ def test_never_raises(monkeypatch):
 
 def test_check_all_has_github_direct_check(monkeypatch):
     """check_all содержит gh/git-direct чек (виден в doctor)."""
+    from test_health import _all_up_monkey  # rootdir-insertion pytest: tests/ в sys.path
     _all_up_monkey(monkeypatch)
+    monkeypatch.setattr(health, "_github_direct_check", _REAL_GITHUB_DIRECT_CHECK)
     monkeypatch.setattr(git_proxy, "status",
                         lambda: {"enabled": True, "proxy": "socks5h://127.0.0.1:10808",
                                  "key": "http.https://github.com.proxy"})
@@ -145,7 +151,9 @@ def test_check_all_github_direct_is_info_only_never_driver(monkeypatch):
     Даже когда github-direct чек warn (git-config прокси включён), при живом стеке вердикт
     остаётся ok: это образовательная подсказка dev-workflow, не сбой инфраструктуры.
     """
+    from test_health import _all_up_monkey  # rootdir-insertion pytest: tests/ в sys.path
     _all_up_monkey(monkeypatch)
+    monkeypatch.setattr(health, "_github_direct_check", _REAL_GITHUB_DIRECT_CHECK)
     monkeypatch.setattr(git_proxy, "status",
                         lambda: {"enabled": True, "proxy": "socks5h://127.0.0.1:10808",
                                  "key": "http.https://github.com.proxy"})
@@ -158,7 +166,9 @@ def test_check_all_github_direct_is_info_only_never_driver(monkeypatch):
 
 def test_check_all_github_direct_info_only_when_disabled(monkeypatch):
     """ok git-proxy-disabled тоже info-only (картина, не driver) — симметрия с warn."""
+    from test_health import _all_up_monkey  # rootdir-insertion pytest: tests/ в sys.path
     _all_up_monkey(monkeypatch)
+    monkeypatch.setattr(health, "_github_direct_check", _REAL_GITHUB_DIRECT_CHECK)
     monkeypatch.setattr(git_proxy, "status",
                         lambda: {"enabled": False, "proxy": "", "key": "http.https://github.com.proxy"})
     result = health.check_all()
@@ -168,24 +178,8 @@ def test_check_all_github_direct_info_only_when_disabled(monkeypatch):
     assert all(c.get("info") for c in gh_checks)
 
 
-# ============================ helper (копия из test_health.py — все чеки up) ============================
-
-def _all_up_monkey(monkeypatch, *, probe_status="ok", probe_detail="runtime: коннект"):
-    """Мокирует ВСЕ driver-чеки в up + active_node пустой — изолирует github-direct чек.
-
-    Не мокает github-direct (тестируемый чек) — его мокает каждый тест через git_proxy.status.
-    """
-    import local_state
-    monkeypatch.setattr(health, "_port_up", lambda port: True)
-    monkeypatch.setattr(health, "_tunnel_up", lambda: (True, "HTTP 200", False, None))
-    monkeypatch.setattr(health, "_upstream_vps_reachable",
-                        lambda node=None: {"status": "ok", "detail": "VPS reachable"})
-    monkeypatch.setattr(health, "_claude_proxy_probe",
-                        lambda: {"status": probe_status, "detail": probe_detail})
-    monkeypatch.setattr(health, "_codex_proxy_probe",
-                        lambda: {"status": probe_status, "detail": probe_detail})
-    monkeypatch.setattr(health, "_codex_app_proxy_check",
-                        lambda: {"status": probe_status, "detail": probe_detail})
-    monkeypatch.setattr(health, "_desktop_proxy_check",
-                        lambda: {"status": "unknown", "detail": "launchctl пустой"})
-    monkeypatch.setattr(local_state, "active_node", lambda path=None: {})
+# Локальная копия _all_up_monkey удалена (issue #331): параллельная копия канона перестала
+# синхронизироваться — не мокала новые machine-dependent probes check_all, из-за чего эти
+# check_all-тесты зависели от живой машины (немоканный probe = недетерминированный вердикт,
+# канон unmocked-probe / гвард test_machine_state_mock_guard.py). Тесты используют канонический
+# helper из test_health.py + восстанавливают РЕАЛЬНЫЙ _github_direct_check поверх его мока.

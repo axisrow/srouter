@@ -2,7 +2,12 @@
 
 Проверяет контракт: enable/disable не теряют другие env-ключи, идемпотентны, fail-soft.
 """
+import contextlib
+import fcntl
 import json
+import os
+
+import pytest
 
 import claude_proxy
 from dashboard_common import HTTP_PROXY_URL
@@ -478,3 +483,272 @@ def test_enable_recheck_distinguishes_absent_from_json_null(monkeypatch, tmp_pat
 
     assert r["ok"] is False, "absent -> present-null в гонке: решение устарело, отказ"
     assert json.loads(settings.read_text()) == {}, "запись не должна была состояться"
+
+
+def test_enable_toctou_abort_does_not_leave_stale_backup(monkeypatch, tmp_path):
+    """Review #338 follow-up: sidecar-backup пишется только ПОСЛЕ пройденного TOCTOU re-check.
+    При отказе на гонке sidecar не появляется: записанный до re-check, он хранит снапшот
+    устаревших чужих значений, который следующий disable() восстановил бы поверх более
+    свежих, поставленных конкурентным писателем."""
+    settings = _setup(monkeypatch, tmp_path)
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text(json.dumps({"env": {"HTTPS_PROXY": "http://corp:3128"}}))
+
+    real_load = claude_proxy._load
+    calls = {"n": 0}
+
+    def _racing_load():
+        calls["n"] += 1
+        if calls["n"] > 1:
+            # Другой писатель поменял значение ПОСЛЕ gate.
+            return {"env": {"HTTPS_PROXY": "http://corp-2:3128"}}
+        return real_load()
+
+    monkeypatch.setattr(claude_proxy, "_load", _racing_load)
+    r = claude_proxy.enable(force=True)
+    monkeypatch.setattr(claude_proxy, "_load", real_load)
+
+    assert r["ok"] is False, "устаревшее решение -> отказ"
+    assert not claude_proxy._backup_path().exists(), \
+        "при отказе sidecar с устаревшим снапшотом не должен остаться на диске"
+    # Конкурентный писатель симулирован только возвратом _load (диск он не писал):
+    # инвариант «enable ничего не записал» = файл в исходном виде.
+    assert json.loads(settings.read_text())["env"]["HTTPS_PROXY"] == "http://corp:3128"
+
+
+# --- AO review 5110553545: пост-recheck гонка — валидация+backup+save под одним lock ---
+#
+# Re-check перед записью сам по себе не атомарен с записью: кооперативный писатель может
+# вклиниться между re-check и _save — его значение затирается, а disable() потом
+# восстанавливает устаревший sidecar поверх него. enable/disable сериализуются эксклюзивным
+# flock на выделенном lockfile (CAS: под lock валидируется decision-snapshot, затем атомарно
+# backup+save). Lockfile — не settings.json: _save подменяет inode (tmp+replace), flock на
+# settings.json пережил бы rename и разъехался бы с актуальным файлом.
+
+def test_enable_revalidates_under_lock_before_backup_and_save(monkeypatch, tmp_path):
+    """AO review 5110553545: писатель, закоммитивший ДО нашего lock, обязан быть виден
+    under-lock валидации — иначе его затирает _save, а следующий disable() восстанавливает
+    устаревший sidecar поверх его значения."""
+    settings = _setup(monkeypatch, tmp_path)
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text(json.dumps({"env": {"HTTPS_PROXY": "http://corp:3128"}}))
+
+    @contextlib.contextmanager
+    def _racing_lock():
+        # Другой srouter-писатель успел закоммитить до нашего lock.
+        settings.write_text(json.dumps({"env": {"HTTPS_PROXY": "http://corp-new:3128"}}))
+        yield {}  # успешный захват (контракт: dict с err при неудаче)
+
+    monkeypatch.setattr(claude_proxy, "_settings_lock", _racing_lock)
+    r = claude_proxy.enable(force=True)
+
+    assert r["ok"] is False, "писатель до lock -> snapshot устарел -> отказ"
+    assert not claude_proxy._backup_path().exists(), "backup не пишется при отказе"
+    assert json.loads(settings.read_text())["env"]["HTTPS_PROXY"] == "http://corp-new:3128", \
+        "чужое новое значение не затёрто"
+
+
+def test_disable_reads_and_consumes_backup_under_lock(monkeypatch, tmp_path):
+    """AO review 5110553545: disable() — второй read-modify-write коммитер (и потребитель
+    sidecar), его чтение/value-match/запись тоже под lock. Писатель, затёрший managed-значение
+    своим до нашего lock, не снимается по устаревшему снапшоту, и sidecar при этом не
+    потребляется."""
+    settings = _setup(monkeypatch, tmp_path)
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text(json.dumps({"env": {"HTTPS_PROXY": claude_proxy._PROXY}}))
+    claude_proxy._backup_path().write_text(json.dumps(
+        {"env": {"all_proxy": "socks5h://old:1080"}}))
+
+    @contextlib.contextmanager
+    def _racing_lock():
+        # Другой писатель успел до нашего lock: затёр managed-значение своим.
+        settings.write_text(json.dumps({"env": {"HTTPS_PROXY": "http://corp-new:3128"}}))
+        yield {}  # успешный захват (контракт: dict с err при неудаче)
+
+    monkeypatch.setattr(claude_proxy, "_settings_lock", _racing_lock)
+    r = claude_proxy.disable()
+
+    assert r["ok"] is True
+    data = json.loads(settings.read_text())
+    assert data["env"]["HTTPS_PROXY"] == "http://corp-new:3128", "чужое новое значение не тронуто"
+    assert "all_proxy" not in data["env"], "restore нет: managed-ключей под lock не видно"
+    assert claude_proxy._backup_path().exists(), "backup не потребляется без подтверждённого restore"
+
+
+def test_settings_lock_is_real_exclusive_flock(monkeypatch, tmp_path):
+    """Lock — настоящий межпроцессный flock, а не no-op: пока он удерживается, второй
+    эксклюзивный захват (LOCK_NB, отдельный fd) обязан блокироваться."""
+    _setup(monkeypatch, tmp_path)
+    with claude_proxy._settings_lock():
+        fd = os.open(claude_proxy._lock_path(), os.O_RDWR)
+        try:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(fd)
+
+
+# --- AO review 5111140277: захват lock вне error-границы — OSError пробрасывался из
+# enable/disable вопреки контракту «Не бросает»/structured {ok, err} ---
+
+def _lock_unavailable_env(monkeypatch, tmp_path):
+    """settings.json читаем, но lockfile некреативен (родитель — обычный файл):
+    mkdir/os.open в _settings_lock гарантированно падают с OSError."""
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory")
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}")
+    monkeypatch.setattr(claude_proxy, "SETTINGS", settings)
+    monkeypatch.setattr(claude_proxy, "_lock_path", lambda: blocker / "settings.json.srouter-proxy-lock")
+    return settings
+
+
+def test_enable_returns_structured_error_when_lock_unavailable(monkeypatch, tmp_path):
+    """OSError при захвате lock (read-only ~/.claude, EMFILE, ...) — structured {ok, err},
+    не исключение. Отказ fail-closed: без lock операция не выполняется (запись без
+    координации воспроизводила бы гонку, которую lock закрывает)."""
+    _lock_unavailable_env(monkeypatch, tmp_path)
+    r = claude_proxy.enable()
+    assert r["ok"] is False
+    assert "settings lock unavailable" in r["err"]
+    assert json.loads((tmp_path / "settings.json").read_text()) == {}, "settings не тронут"
+
+
+def test_disable_returns_structured_error_when_lock_unavailable(monkeypatch, tmp_path):
+    """Тот же контракт для disable(): захват lock — structured {ok, err}, не OSError."""
+    _lock_unavailable_env(monkeypatch, tmp_path)
+    r = claude_proxy.disable()
+    assert r["ok"] is False
+    assert "settings lock unavailable" in r["err"]
+
+
+def test_lock_release_failure_is_wrapped_as_warning(monkeypatch, tmp_path):
+    """Неудача LOCK_UN не валит закоммиченную операцию: ok не меняется, предупреждение
+    честно в err (прецедент backup-cleanup path в _disable_locked)."""
+    _setup(monkeypatch, tmp_path)
+    real_flock = fcntl.flock
+
+    def _fail_unlock(fd, op):
+        if op == fcntl.LOCK_UN:
+            raise OSError("boom unlock")
+        return real_flock(fd, op)
+
+    monkeypatch.setattr(fcntl, "flock", _fail_unlock)
+    r = claude_proxy.enable()
+    assert r["ok"] is True, "операция закоммичена — release не меняет ok"
+    assert "lock release failed" in r.get("err", "")
+
+
+# ============ issue #331: нейтрализация all_proxy/ALL_PROXY (SOCKS-плечо xray) ============
+#
+# launchctl gui-домен (srouter-codex-env.sh) ставит ALL_PROXY/all_proxy=socks5h://...:10808
+# во ВСЕ GUI-процессы; в сессиях Claude Code это протекает в pip/requests → select_proxy
+# маппит 'all' на все схемы → SOCKSProxyManager → TypeError PoolKey key_proxy_ssl_context.
+# Для CC единственное плечо = privoxy 8118 → enable() нейтрализует all_proxy пустой строкой
+# (канон #199 «снять env-прокси ОБА регистра» — нейтрализация там, где задумана, не прокси).
+
+def test_enable_neutralizes_all_proxy(monkeypatch, tmp_path):
+    settings = _setup(monkeypatch, tmp_path)
+    r = claude_proxy.enable()
+    assert r["ok"] is True
+    data = json.loads(settings.read_text())
+    assert data["env"]["ALL_PROXY"] == ""
+    assert data["env"]["all_proxy"] == ""
+
+
+def test_disable_removes_empty_neutral_keys(monkeypatch, tmp_path):
+    """disable() снимает нейтрализацию (наши пустые значения), как и managed proxy-ключи."""
+    settings = _setup(monkeypatch, tmp_path)
+    claude_proxy.enable()
+    r = claude_proxy.disable()
+    assert r["ok"] is True
+    data = json.loads(settings.read_text())
+    assert "ALL_PROXY" not in data["env"]
+    assert "all_proxy" not in data["env"]
+
+
+def test_enable_conflict_on_foreign_all_proxy(monkeypatch, tmp_path):
+    """Чужое НЕпустое all_proxy (ручная SOCKS-настройка) — отказ без мутации (#307 канон),
+    перезапись только force."""
+    settings = _setup(monkeypatch, tmp_path)
+    original = {"env": {"all_proxy": "socks5h://10.0.0.1:1080"}}
+    settings.write_text(json.dumps(original))
+    r = claude_proxy.enable()
+    assert r["ok"] is False
+    assert r.get("conflict") is True
+    assert json.loads(settings.read_text()) == original, "мутации быть не должно"
+
+
+def test_enable_conflict_aggregates_proxy_and_neutral_causes(monkeypatch, tmp_path):
+    """Review #338 (UX): чужие ENV_KEYS и чужой all_proxy одновременно — ОДИН конфликт-ответ
+    с обоими поводами, а не два захода (needs_force gate отрабатывает раньше и молчал про
+    neutral; пользователь чинил один конфликт, чтобы упереться во второй)."""
+    settings = _setup(monkeypatch, tmp_path)
+    original = {"env": {"HTTPS_PROXY": "http://corp-proxy:3128",
+                        "all_proxy": "socks5h://10.0.0.1:1080"}}
+    settings.write_text(json.dumps(original))
+    r = claude_proxy.enable()
+    assert r["ok"] is False
+    assert r["conflict"] is True
+    assert r["state"] == "foreign"
+    assert "all_proxy" in r["err"], "нейтральный конфликт назван в ТОМ ЖЕ ответе"
+    assert json.loads(settings.read_text()) == original, "мутации быть не должно"
+
+
+def test_enable_force_overwrites_foreign_all_proxy(monkeypatch, tmp_path):
+    settings = _setup(monkeypatch, tmp_path)
+    settings.write_text(json.dumps({"env": {"all_proxy": "socks5h://10.0.0.1:1080"}}))
+    r = claude_proxy.enable(force=True)
+    assert r["ok"] is True
+    data = json.loads(settings.read_text())
+    assert data["env"]["all_proxy"] == ""
+
+
+def test_disable_keeps_foreign_all_proxy(monkeypatch, tmp_path):
+    """value-match provenance (#112/#307): чужое непустое all_proxy disable() не трогает."""
+    settings = _setup(monkeypatch, tmp_path)
+    settings.write_text(json.dumps({"env": {"all_proxy": "socks5h://10.0.0.1:1080"}}))
+    r = claude_proxy.disable()
+    assert r["ok"] is True
+    assert json.loads(settings.read_text())["env"]["all_proxy"] == "socks5h://10.0.0.1:1080"
+
+
+def test_disable_after_force_restores_backed_up_foreign_all_proxy(monkeypatch, tmp_path):
+    """Codex cycle-review #338 finding 1: force-перезапись чужого all_proxy бэкапит его в
+    sidecar — disable() обязан восстановить SYMMETRICНО (как ENV_KEYS), иначе чужая SOCKS-
+    настройка теряется, а backup становится сиротой."""
+    settings = _setup(monkeypatch, tmp_path)
+    settings.write_text(json.dumps({"env": {"all_proxy": "socks5h://10.0.0.1:1080"}}))
+    assert claude_proxy.enable(force=True)["ok"] is True
+    assert json.loads(settings.read_text())["env"]["all_proxy"] == ""
+
+    r = claude_proxy.disable()
+
+    assert r["ok"] is True
+    data = json.loads(settings.read_text())
+    assert data["env"]["all_proxy"] == "socks5h://10.0.0.1:1080", "чужое значение восстановлено"
+    assert not claude_proxy._backup_path().exists(), "backup потреблён, не сирота"
+
+
+def test_disable_keeps_preexisting_empty_neutral_without_managed_keys(monkeypatch, tmp_path):
+    """Codex cycle-review #338 finding 2 (сужение): disable() удаляет нейтрализацию ТОЛЬКО
+    когда srouter управлял этим конфигом (были managed proxy-ключи). Пре-существующие
+    пустые all_proxy/ALL_PROXY без наших ключей — чужая настройка, не трогаем: у нас нет
+    provenance-маркеров (канон #307 «не оставляем маркеров»), значит единственный честный
+    сигнал «нашего» — собственно managed ENV_KEYS, написанные той же рукой enable()'а."""
+    settings = _setup(monkeypatch, tmp_path)
+    settings.write_text(json.dumps({"env": {"ALL_PROXY": "", "all_proxy": ""}}))
+    r = claude_proxy.disable()
+    assert r["ok"] is True
+    data = json.loads(settings.read_text())
+    assert data["env"]["ALL_PROXY"] == ""
+    assert data["env"]["all_proxy"] == ""
+
+
+def test_status_reports_socks_neutralized(monkeypatch, tmp_path):
+    settings = _setup(monkeypatch, tmp_path)
+    assert claude_proxy.status()["socks_neutralized"] is False
+    claude_proxy.enable()
+    assert claude_proxy.status()["socks_neutralized"] is True
+    claude_proxy.disable()
+    assert claude_proxy.status()["socks_neutralized"] is False
