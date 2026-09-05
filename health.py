@@ -521,11 +521,11 @@ def _record_watchdog_lifecycle():
             _log.warning("watchdog lifecycle-log write failed: %s — событие не записано", exc)
 
     try:
-        WATCHDOG_LIFECYCLE_STATE.parent.mkdir(parents=True, exist_ok=True)
-        WATCHDOG_LIFECYCLE_STATE.write_text(
-            json.dumps(current, ensure_ascii=False, sort_keys=True),
-            encoding="utf-8",
-        )
+        # PR-1 #339 (инвентарь D4): через канон _write_watchdog_state
+        # (local_state._atomic_write_text: tmp+fsync+rename) — прежний write_text оставлял
+        # битый baseline-файл при обрыве, и следующий прогон молча считал его fresh.
+        if not _write_watchdog_state(WATCHDOG_LIFECYCLE_STATE, current):
+            raise OSError("atomic write failed")
     except OSError as exc:
         _log.warning("watchdog lifecycle-state write failed: %s — следующий прогон может ложно "
                      "считать это baseline", exc)

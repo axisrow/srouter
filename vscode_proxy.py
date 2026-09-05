@@ -36,6 +36,8 @@ from urllib.parse import urlparse
 
 import proxy_config_contract as _contract
 
+import backup_lib  # sidecar_path: единый источник суффикса lease-бэкапа (PR-1 #339)
+
 # Прокси codex = SOCKS5 xray 10808. Единый источник правды (issue #155) — dashboard_common.
 # except SystemExit (НЕ BaseException): dashboard_common при отсутствии srouter_config.py поднимает
 # SystemExit (BaseException) → except Exception его пропустит, fallback не сработает в install-пути.
@@ -157,8 +159,9 @@ def status():
 
 def _backup_path(path):
     """Sidecar-backup чужого http.proxy, перезаписанного force-enable (прецедент #112).
-    Живёт рядом с settings.json редактора; disable() восстанавливает из него и удаляет."""
-    return path.parent / (path.name + ".srouter-proxy-backup.json")
+    Живёт рядом с settings.json редактора; disable() восстанавливает из него и удаляет.
+    Суффикс — единый источник backup_lib.SIDECAR_SUFFIX (PR-1 #339, контракт v2)."""
+    return backup_lib.sidecar_path(path)
 
 
 def _read_backup(path):

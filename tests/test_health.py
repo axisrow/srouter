@@ -4647,3 +4647,35 @@ def test_cmd_watchdog_records_metrics(monkeypatch, tmp_path):
     import metrics_store
     events = metrics_store.read_timing_events(log_path=tmp_path / "metrics.jsonl")
     assert len(events) == 1
+
+
+def test_record_watchdog_lifecycle_state_write_is_atomic(monkeypatch, tmp_path):
+    """PR-1 #339: lifecycle-state пишется через _write_watchdog_state (канон
+    local_state._atomic_write_text: tmp+fsync+rename), не write_text — инвентарь #339 D4.
+    Оборванная запись не оставляет битый baseline-файл, который следующий прогон молча
+    считает fresh и глотает реальное событие (зеркало P1-2 для WATCHDOG_STATE,
+    test_watchdog_state_write_is_atomic)."""
+    state_file = tmp_path / "launchd-state.json"
+    monkeypatch.setattr(health, "WATCHDOG_LIFECYCLE_STATE", state_file)
+    monkeypatch.setattr(health, "WATCHDOG_LIFECYCLE_LOG", tmp_path / "events.jsonl")
+    monkeypatch.setattr(health, "_collect_launchd_lifecycle", lambda: {
+        "privoxy": {"loaded": True, "pid": 100, "runs": 1,
+                    "plist": {"exists": True, "mtime_ns": 10, "inode": 20}},
+    })
+    spy_calls = []
+    real = health._write_watchdog_state
+
+    def spy(path, state):
+        spy_calls.append(Path(path))
+        return real(path, state)
+
+    monkeypatch.setattr(health, "_write_watchdog_state", spy)
+
+    # autouse-фикстура нейтрализует health._record_watchdog_lifecycle (launchd-изоляция);
+    # настоящий callable — как test_record_watchdog_lifecycle_logs_only_changes.
+    assert _REAL_RECORD_WATCHDOG_LIFECYCLE is not None
+    _REAL_RECORD_WATCHDOG_LIFECYCLE()
+
+    assert spy_calls and spy_calls[0] == state_file, (
+        "lifecycle-state обязан писаться через _write_watchdog_state (канон atomic), "
+        "не write_text напрямую")
