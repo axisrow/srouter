@@ -421,7 +421,7 @@ def _remove_launchctl_env(runner) -> dict:
 
 
 def _ensure_home_bin_in_path(env) -> str:
-    """Добавить ~/bin в PATH через ~/.zshrc (marker-gate + backup через install_lib._backup + atomic write).
+    """Добавить ~/bin в PATH через ~/.zshrc (marker-gate + backup через backup_lib.create_backup + atomic write).
 
     CLI wrapper требует ~/bin раньше системного codex в PATH.
     """
@@ -505,7 +505,7 @@ def _install_codex_zsh_function(env) -> str:
     Сама функция по-прежнему зовётся codex() в интерактивном шелле — пользовательский habit `codex …`
     сохранён, только внутри ведёт на codex-srouter (имя codex освобождено под real binary).
 
-    Marker-gate (парные begin/end) + backup через install_lib._backup + atomic write — тот же
+    Marker-gate (парные begin/end) + backup через backup_lib.create_backup + atomic write — тот же
     канон, что _ensure_home_bin_in_path. Fail-closed: чужой alias codex/function codex без нашего
     маркера → НЕ добавляем блок (не перекрываем молча).
 

@@ -514,7 +514,6 @@ def format_plan(plan):
 
 
 _BACKUP_INFIX = backup_lib.BACKUP_INFIX
-_backup_suffix = backup_lib.backup_stamp
 
 
 def _backup(path, env):
