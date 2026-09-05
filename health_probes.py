@@ -30,8 +30,8 @@ _log = logging.getLogger("srouter.health")
 # consumer этого __all__; внешний код импортирует health, не health_probes напрямую).
 __all__ = [
     "_launchd_field", "_port_up", "PRIVOXY_SYSTEM_LABEL", "PRIVOXY_BREW_LABEL", "XRAY_BREW_LABEL",
-    "_privoxy_service_target", "_privoxy_alternate_registration", "_service_running",
-    "_local_proxy_up",
+    "_privoxy_service_target", "_privoxy_registrations", "_launchd_pid", "_listener_pid",
+    "_service_running", "_local_proxy_up",
     "_zombie_recheck_delay", "_ZOMBIE_RECHECK_DELAY_SEC", "_launchd_loaded_status",
     "_user_launchagent_plist", "_local_proxy_boot_persistence",
     "GFW_PROBE_DOMAINS", "GFW_CONTROL_DOMAIN", "_direct_domain_probe", "_gfw_domain_check",
@@ -106,17 +106,43 @@ def _privoxy_service_target():
     return PRIVOXY_BREW_LABEL, f"gui/{os.getuid()}"
 
 
-def _privoxy_alternate_registration(label, domain):
-    """Вторая легитимная регистрация privoxy (#341): protected system-daemon ИЛИ brew
-    user-LaunchAgent — обе каноничны (канон #329: детектор обязан знать легитимные
-    альтернативные конфигурации). Возвращает (label, domain), не совпадающий с выбранным
-    по protection_present таргетом. Используется ТОЛЬКО когда выбранный таргет не Running,
-    а порт жив: прежде чем клеймить «зомби», спросить launchd про альтернативу —
-    port может держать легитимная вторая регистрация, и protected-restart поверх неё
-    создал бы конфликт двух сервисов за 8118."""
-    if (label, domain) == (PRIVOXY_SYSTEM_LABEL, "system"):
-        return PRIVOXY_BREW_LABEL, f"gui/{os.getuid()}"
-    return PRIVOXY_SYSTEM_LABEL, "system"
+def _privoxy_registrations():
+    """(selected, alternate) — ОБЕ легитимные регистрации privoxy (#341): protected
+    system-daemon И brew user-LaunchAgent каноничны (канон #329: детектор обязан знать
+    легитимные альтернативные конфигурации). selected — по protection_present (как раньше),
+    alternate — вторая. ЕДИНЫЙ источник пар (label, domain) для этого выбора: не размножать
+    захардкоженные (label, domain)-литералы по пробам (канон REUSE — иначе правка в одном
+    месте тихо десинхронизирует альтернативный probe и #341 регрессирует)."""
+    selected = _privoxy_service_target()
+    if selected == (PRIVOXY_SYSTEM_LABEL, "system"):
+        return selected, (PRIVOXY_BREW_LABEL, f"gui/{os.getuid()}")
+    return selected, (PRIVOXY_SYSTEM_LABEL, "system")
+
+
+def _launchd_pid(label, domain=None):
+    """PID job'а из `launchctl print` (поле pid) — #341 ownership-доказательство.
+      "N"       — pid из вывода (job загружен и имеет живой процесс);
+      None      — launchctl ответил, pid-поля нет (job не загружен / waiting без процесса);
+      "unknown" — timeout: fail-closed, владение не доказано и не опровергнуто.
+    state=running сам по себе НЕ доказывает, что именно этот процесс держит listener:
+    crash-loop с потерянным bind тоже бывает state=running до следующего спавна."""
+    r = sys_probe.run([LAUNCHCTL, "print", f"{domain}/{label}"], timeout=3)
+    if r.get("timeout"):
+        return "unknown"
+    if r.get("rc") != 0:
+        return None
+    return _launchd_field(r.get("out") or "", "pid")
+
+
+def _listener_pid(port):
+    """PID слушателя TCP-порта (lsof -t) — "N" | None | "unknown" (timeout).
+    None НЕ доказывает отсутствие владельца: fd system-daemon (nobody) скрыт от user-lsof
+    (#122) — как в _port_up."""
+    r = sys_probe.run([LSOF, "-t", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"], timeout=3)
+    if r.get("timeout"):
+        return "unknown"
+    pids = (r.get("out") or "").split()
+    return pids[0] if pids else None
 
 
 # #330: короткий backoff перед re-check'ом вердиктов, чувствительных к mid-start (зомби,
@@ -261,17 +287,40 @@ def _local_proxy_up():
                 # Эмпирика #341: protected job loaded, но crash-loop (state=spawn scheduled,
                 # EX_CONFIG), порт 8118 держит живой brew homebrew.mxcl.privoxy — зомби был
                 # false positive, а совет protected-restart создал бы вторую регистрацию за порт.
-                alt_label, alt_domain = (None, None)
+                alt_label, alt_domain = None, None
                 if name == "privoxy":
-                    alt_label, alt_domain = _privoxy_alternate_registration(label, domain)
-                if alt_label is not None and \
-                        _health_facade._service_running(alt_label, alt_domain) == "running":
-                    facets.append(
-                        f"{name} жив через альтернативную регистрацию {alt_label} "
-                        f"(домен {alt_domain}), а выбранная по режиму {label} — не Running. "
-                        f"Порт {port} обслуживается; рестарт выбранного режима поверх живой "
-                        f"альтернативы создал бы конфликт за порт")
-                    continue
+                    _, (alt_label, alt_domain) = _privoxy_registrations()
+                if alt_label is not None:
+                    alt_state = _health_facade._service_running(alt_label, alt_domain)
+                    if alt_state == "unknown":
+                        # fail-closed (#204-канон): timeout на альтернативе НЕ доказывает
+                        # not_running — НЕ зомби, помечаем не верифицированное.
+                        unverified.append(name)
+                        continue
+                    if alt_state == "running":
+                        # state=running ≠ владение портом: crash-loop с потерянным bind тоже
+                        # бывает running (verify-dont-guess). Доказательство — pid-матч:
+                        alt_pid = _health_facade._launchd_pid(alt_label, alt_domain)
+                        lst_pid = _health_facade._listener_pid(port)
+                        if alt_pid not in (None, "unknown") and alt_pid == lst_pid:
+                            facets.append(
+                                f"{name} жив через альтернативную регистрацию {alt_label} "
+                                f"(домен {alt_domain}, pid {alt_pid}); порт {port} обслуживается "
+                                f"ею, выбранная по режиму {label} — не Running. Рестарт выбранного "
+                                f"режима поверх живой альтернативы создал бы конфликт за порт")
+                            continue
+                        if alt_pid in (None, "unknown") or lst_pid in (None, "unknown"):
+                            # pid-доказательство недоступно (hidden-fd system-daemon #122 /
+                            # timeout): зомби — destructive вердикт, требует доказательства →
+                            # НЕ зомби, фасет честно говорит о недоказанности.
+                            facets.append(
+                                f"{name}: порт {port} открыт, выбранная {label} не Running, "
+                                f"альтернативная {alt_label} Running, но владение портом не "
+                                f"доказано pid-матчем (lsof/launchctl скрыты или не ответили) — "
+                                f"НЕ зомби (fail-closed), владельца смотреть lsof вручную")
+                            continue
+                        # оба pid известны и РАЗЛИЧАЮТСЯ: порт держит посторонний процесс,
+                        # альтернатива Running, но bind не взяла → настоящий зомби/orphan.
                 problems.append(f"{name} зомби (port {port} слушается, но сервис не Running — orphan/launchd)")
         elif svc == "unknown":
             # port open, но launchctl не ответил → НЕ зомби (fail-closed), помечаем для observability.
@@ -279,14 +328,26 @@ def _local_proxy_up():
     if problems:
         restart_hint = "brew services restart privoxy xray" if not privoxy_system.protection_present() \
             else "srouter privoxy restart (protected-mode)"
-        return {"status": "down",
-                "detail": f"локальный прокси упал: {'; '.join(problems)}. Restart: {restart_hint}"}
+        if facets:
+            # #341 (cycle-review): mixed-failure (например xray крах при живой brew-privoxy) —
+            # facets вычислены, но не должны теряться, а restart-подсказка не должна вести к
+            # рестарту privoxy поверх живой альтернативной регистрации.
+            restart_hint += f"; privoxy НЕ рестартить — {'; '.join(facets)}"
+        result = {"status": "down",
+                  "detail": f"локальный прокси упал: {'; '.join(problems)}. Restart: {restart_hint}"}
+        if facets:
+            result["facets"] = facets
+        return result
     detail = "локальный прокси жив: privoxy 8118 + xray 10808 port-up + service-running"
+    if facets:
+        # #341 (cycle-review): «service-running» выбранной регистрации в facet-пути ложь —
+        # жива альтернативная. Честная формулировка, детали в грани режима.
+        detail = ("локальный прокси жив: port-up; service-running через альтернативную "
+                  "регистрацию (выбранный по режиму сервис не Running — см. грань режима)")
     if unverified:
         detail += f" (⚠ service-status не верифицирован для {', '.join(unverified)} — launchctl timeout)"
     # #341: facets — отдельные грани (режим регистрации), НЕ зомби; check_all показывает их
-    # отдельным info-only чеком. "facets" в down-ветке не нужен: down означает, что ни одна
-    # легитимная регистрация не Running (фасету там взяться неоткуда).
+    # отдельным warn-чеком (info-only, не driver).
     return {"status": "ok", "detail": detail, "facets": facets}
 
 
