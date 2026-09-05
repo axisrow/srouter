@@ -1078,6 +1078,27 @@ def test_local_proxy_pid_mismatch_is_zombie(monkeypatch):
     assert "зомби" in result["detail"].lower()
 
 
+def test_local_proxy_multiple_listeners_not_zombie(monkeypatch):
+    """PR #346 review: несколько слушателей порта (унаследованный fd / SO_REUSEPORT) —
+    _listener_pid = "unknown" (не первый попавшийся pid) → ownership недоказан → НЕ зомби,
+    fail-closed фасет (ложный pid-мисматч давал бы ложный зомби)."""
+    monkeypatch.setattr(health, "_port_up", lambda port: True)
+    monkeypatch.setattr(health, "_zombie_recheck_delay", lambda: None)
+    monkeypatch.setattr(privoxy_system, "protection_present",
+                        lambda layout=privoxy_system.DEFAULT_LAYOUT: True)
+
+    def fake_running(label, domain=None):
+        return "not_running" if (label == health.PRIVOXY_SYSTEM_LABEL and domain == "system") \
+            else "running"
+    monkeypatch.setattr(health, "_service_running", fake_running)
+    monkeypatch.setattr(health, "_launchd_pid", lambda label, domain=None: "62891")
+    monkeypatch.setattr(health, "_listener_pid", lambda port: "unknown")  # несколько pids
+    result = health._local_proxy_up()
+    assert result["status"] == "ok", "неоднозначный слушатель → НЕ зомби (fail-closed)"
+    assert "зомби" not in result["detail"].lower()
+    assert "не доказано pid-матчем" in result["facets"][0]
+
+
 def test_local_proxy_facets_survive_down_and_hint_alternate_aware(monkeypatch):
     """#341 (cycle-review): mixed-failure (xray крах при живой brew-privoxy) — facets НЕ
     теряются в down-ветке, restart-подсказка не ведёт к рестарту privoxy поверх живой

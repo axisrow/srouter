@@ -135,14 +135,21 @@ def _launchd_pid(label, domain=None):
 
 
 def _listener_pid(port):
-    """PID слушателя TCP-порта (lsof -t) — "N" | None | "unknown" (timeout).
-    None НЕ доказывает отсутствие владельца: fd system-daemon (nobody) скрыт от user-lsof
-    (#122) — как в _port_up."""
+    """PID слушателя TCP-порта (lsof -t) — "N" | None | "unknown".
+      ровно один pid — однозначный владелец;
+      None — lsof никого не видит; НЕ доказывает отсутствие владельца: fd system-daemon
+            (nobody) скрыт от user-lsof (#122) — как в _port_up;
+      "unknown" — timeout ИЛИ несколько слушателей (унаследованный fd при spawn-передаче,
+            SO_REUSEPORT): выбор первого дал бы не-владельческий pid → ложный pid-мисматч
+            → ложный зомби (cycle-review PR #346) — неоднозначность = недоказанность.
+    """
     r = sys_probe.run([LSOF, "-t", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"], timeout=3)
     if r.get("timeout"):
         return "unknown"
     pids = (r.get("out") or "").split()
-    return pids[0] if pids else None
+    if not pids:
+        return None
+    return pids[0] if len(pids) == 1 else "unknown"
 
 
 # #330: короткий backoff перед re-check'ом вердиктов, чувствительных к mid-start (зомби,
