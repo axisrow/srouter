@@ -27,6 +27,8 @@ from urllib.parse import urlparse
 
 import proxy_config_contract as _contract
 
+import backup_lib  # sidecar_path: единый источник суффикса lease-бэкапа (PR-1 #339)
+
 # Прокси Claude Code = HTTP bridge privoxy 8118. Не заменять на SOCKS по одному lsof/exit-code:
 # black-box proof — реальный Claude Code должен получить ожидаемый API 401 (#127).
 try:
@@ -154,8 +156,9 @@ def status():
 
 def _backup_path():
     """Sidecar-backup чужих значений, перезаписанных force-enable (прецедент #112 provenance).
-    Живёт рядом с settings.json; disable() восстанавливает из него и удаляет."""
-    return SETTINGS.parent / (SETTINGS.name + ".srouter-proxy-backup.json")
+    Живёт рядом с settings.json; disable() восстанавливает из него и удаляет.
+    Суффикс — единый источник backup_lib.SIDECAR_SUFFIX (PR-1 #339, контракт v2)."""
+    return backup_lib.sidecar_path(SETTINGS)
 
 
 def _read_backup():

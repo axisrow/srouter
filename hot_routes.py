@@ -33,6 +33,8 @@ import re
 from pathlib import Path
 from urllib.parse import urlsplit
 
+import local_state  # _atomic_write_text: канон atomic-save (tmp+fsync+rename), PR-1 #339
+
 # Пути по умолчанию — рядом с модулем (не cwd), чтобы работало под launchd.
 # Кэш — ignored-файл (см. .gitignore), никогда не коммитится и не аплоадится.
 _DEFAULT_CACHE_PATH = Path(__file__).resolve().parent / "srouter.hot_routes.json"
@@ -641,16 +643,17 @@ def load_cursor(path=None):
 
 
 def _atomic_write(path, cache, meta):
-    """Атомарно записать кэш (temp + os.replace), как local_state.save_state.
+    """Атомарно записать кэш через канон-примитив local_state._atomic_write_text
+    (tmp+fsync+rename+fsync-каталога, PR-1 #339 — прежде собственная копия tmp+replace
+    без fsync, инвентарь #339 C4).
 
     cache = dict {domain: entry}. Возвращает True при успехе, False при сбое.
-    При сбое сериализации/записи tmp подчищается, а существующий файл не тронут.
+    При сбое сериализации существующий файл не тронут; tmp-подчистка — в примитиве.
     """
     p = Path(path)
-    tmp = p.with_suffix(p.suffix + ".tmp")
-    # Сериализуем в память ДО открытия tmp: TypeError на несериализуемом count
-    # не оставит пустой/битый tmp и не тронет существующий кэш. Сортировка тоже
-    # внутри try — несериализуемый count роняет unary-minus в key ещё до json.dumps.
+    # Сериализуем в память ДО записи: TypeError на несериализуемом count
+    # не тронет существующий кэш. Сортировка тоже внутри try — несериализуемый
+    # count роняет unary-minus в key ещё до json.dumps.
     try:
         ranked = sorted(cache.values(), key=lambda e: (-e["count"], e["domain"]))
         domains = [
@@ -688,18 +691,7 @@ def _atomic_write(path, cache, meta):
         )
     except (TypeError, ValueError):
         return False
-    try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(text)
-        tmp.replace(p)  # atomic rename
-    except OSError:
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
-        return False
-    return True
+    return local_state._atomic_write_text(p, text)
 
 
 def _evict(cache, ttl, now, top_n):

@@ -11,12 +11,12 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+import backup_lib  # канон-примитивы бэкапов (PR-1 #339): create_backup/discover/stamp
 import gen_xray_config
 import local_state
 import privoxy_system
@@ -513,23 +513,16 @@ def format_plan(plan):
     return "\n".join(lines)
 
 
-_BACKUP_INFIX = ".srouter-backup-"
-
-
-def _backup_suffix(now):
-    """Timestamp-суффикс имени backup: env.now с вырезанными недопустимыми в имени файла символами."""
-    return now.replace(":", "").replace("/", "-")
+_BACKUP_INFIX = backup_lib.BACKUP_INFIX
 
 
 def _backup(path, env):
-    if not path.exists():
-        return ""
-    backup = path.with_name(path.name + _BACKUP_INFIX + _backup_suffix(env.now))
-    try:
-        shutil.copy2(path, backup)
-        return str(backup)
-    except OSError:
-        return ""
+    """Делегирует канон-примитив backup_lib.create_backup (PR-1 #339, контракт v2).
+
+    Изменение против прежней локальной copy2: копия АТОМАРНА (tmp + os.replace + fsync) —
+    обрыв посреди копии не оставляет частичный файл под валидным backup-именем, который
+    discover_backups засчитала бы как поколение. Сигнатура/возврат прежние (API-гвард #229)."""
+    return backup_lib.create_backup(path, env)
 
 
 def _record_state_effect(env, mutate):
@@ -603,83 +596,27 @@ def _record_backup_intent(env, name, config_path, backup):
 
 
 def _parse_backup_stamp(name):
-    """'2026-06-29T000000Z' → datetime, иначе None. Единственный источник правды о формате имени.
-
-    Формат задаёт _backup: _backup_suffix(env.now), где env.now — ISO-8601 UTC-Z из _now() с
-    вырезанными ':' и '/'. Разбор ОБРАТНОЙ операцией (а не «почти-regex» вроде \\d+) — канон
-    probe-semantics-from-primary-source / loose-validator-recurring-leak: не парсится этим форматом —
-    значит файл создан не нами.
-    """
-    try:
-        return datetime.strptime(name, "%Y-%m-%dT%H%M%SZ").replace(tzinfo=timezone.utc)
-    except (ValueError, TypeError):
-        return None
+    """'2026-06-29T000000Z' → datetime, иначе None. Делегирует backup_lib.parse_stamp (PR-1 #339):
+    разбор обратной операцией к формату имени — не парсится, значит файл создан не нами."""
+    return backup_lib.parse_stamp(name)
 
 
 def _parse_backup_stamp_or_none(value):
-    """entry['created_at'] (ISO-8601 из env.now, формат _now()) → datetime, иначе None.
-
-    Отдельно от _parse_backup_stamp: created_at хранится в НЕОБРЕЗАННОМ ISO-8601 (с ':'), потому что
-    он пишется в state как обычная временная метка (симметрично restored_at/removed_at), а не как
-    часть имени файла — обрезка нужна только там, где ':' недопустим в имени. Разбор обратной
-    операцией к _now(); не парсится — значит поле повреждено/чужеродно, границу не применяем
-    (fail-closed в сторону «не сужать» — отсутствие валидной границы не должно ложно отбрасывать
-    настоящие кандидаты).
-    """
-    if not isinstance(value, str):
-        return None
-    try:
-        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-    except ValueError:
-        return None
+    """entry['created_at'] (необрезанный ISO-8601) → datetime, иначе None. Делегирует
+    backup_lib.parse_iso_utc (PR-1 #339): state-поля хранят полный ISO, обрезка — только
+    в имени файла; не парсится — границу не применяем (fail-closed в сторону «не сужать»)."""
+    return backup_lib.parse_iso_utc(value)
 
 
 def discover_backups(config_path):
-    """Валидные srouter-backup'ы, лежащие рядом с config_path, от старых к новым (issue #124).
+    """Валидные srouter-backup'ы рядом с config_path, от старых к новым (issue #124).
 
-    ЗАЧЕМ. Ссылка на backup хранится в state, но между созданием backup-файла и записью state лежат
-    минуты (brew install/restart всех компонентов). Обрыв в этом окне терял ссылку, и uninstall
-    оставлял пользовательский оригинал orphaned навсегда (P1-3, самый дорогой из 6 P1 issue #124).
-    Backup-файл самоописывающийся и лежит ВПЛОТНУЮ к target, поэтому он обнаружим из одного лишь
-    config_path — как srouter-маркер в самом конфиге, который проект уже канонизировал как «живой
-    арбитр» (_has_marker). Разница между «state помнит backup» и «backup сам себя предъявляет» — это
-    разница между памятью и доказательством; канон verify-dont-guess требует второго.
-
-    ГРАНИЦА СЛОЯ. Функция отвечает на вопрос о МИРЕ («какие backup'ы этого конфига существуют»), а не
-    о механике install'а («был ли crash / в какой фазе / был ли pending»). Поэтому её вправе звать и
-    uninstall — он не узнаёт ничего о том, как install пишет. Утечка WAL-механики в uninstall и была
-    провалом PR #119 (см. tests/test_install_layering.py).
-
-    FAIL-CLOSED. Похожее имя ещё не делает файл нашим:
-      - fullmatch с якорем, а не glob: glob('config.srouter-backup-*') поймал бы хвостовой
-        'config.srouter-backup-x.tmp' от атомарной записи и вложенный двойной суффикс;
-      - суффикс обязан парситься форматом _backup (_parse_backup_stamp);
-      - только regular file: симлинк с валидным именем — вектор подмены (restore записал бы
-        содержимое по чужому пути), directory — не backup.
-    Возврат отсортирован по метке времени ДЕТЕРМИНИРОВАННО — для воспроизводимых сообщений оператору,
-    но НЕ для автовыбора «самого свежего»: при обрыве второго install свежий backup — копия
-    srouter-конфига, а оригинал пользователя в самом старом (см. _resolve_backup).
-    """
-    path = Path(config_path)
-    try:
-        candidates = list(path.parent.iterdir())
-    except OSError:
-        return []
-    prefix = path.name + _BACKUP_INFIX
-    found = []
-    for candidate in candidates:
-        if not candidate.name.startswith(prefix):
-            continue
-        stamp = _parse_backup_stamp(candidate.name[len(prefix):])
-        if stamp is None:
-            continue
-        try:
-            if candidate.is_symlink() or not candidate.is_file():
-                continue
-        except OSError:
-            continue
-        found.append((stamp, candidate))
-    return [candidate for _stamp, candidate in sorted(found, key=lambda pair: (pair[0], pair[1].name))]
+    Делегирует backup_lib.discover (PR-1 #339, контракт v2) — семантика перенесена без
+    изменений: disk-доказательство («какие бэкапы существуют»), а не память install'а;
+    fullmatch-парс stamp, только regular file (симлинк — вектор подмены), сортировка
+    old→new для сообщений оператору, НЕ для автовыбора «самого свежего» (при обрыве
+    второго install свежий бэкап — копия srouter-конфига; канон _resolve_backup)."""
+    return backup_lib.discover(config_path)
 
 
 def _write_component_config(name, env):

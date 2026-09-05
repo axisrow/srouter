@@ -14,6 +14,7 @@ import string
 from pathlib import Path
 
 import hot_routes
+import local_state  # _atomic_write_text: канон atomic-save, делегирование — PR-1 #339
 
 
 # ============================ helpers ============================
@@ -1092,3 +1093,25 @@ def test_default_constants_present():
     assert hot_routes.DEFAULT_BUCKET_SECONDS > 0
     assert isinstance(hot_routes._DEFAULT_CACHE_PATH, Path)
     assert isinstance(hot_routes._DEFAULT_LOG_PATH, Path)
+
+
+# ============================ PR-1 #339: канон atomic-write ============================
+def test_atomic_write_delegates_to_canonical_primitive(tmp_path, monkeypatch):
+    """PR-1 #339: запись кэша идёт через канон local_state._atomic_write_text
+    (tmp+fsync+rename), а не собственной копией open(tmp,'w')+replace без fsync —
+    инвентарь #339 C4. Канон уже несёт fsync файла и каталога; дубль без fsync мог
+    «успешно» заменить кэш содержимым, не дошедшим до диска."""
+    calls = []
+
+    def spy(path, text):
+        calls.append((Path(path), text))
+        return True
+
+    monkeypatch.setattr(local_state, "_atomic_write_text", spy)
+    cache = {"example.com": {
+        "domain": "example.com", "count": 2, "last_seen": 1.0, "buckets": {"1": 2}}}
+    p = tmp_path / "cache.json"
+
+    assert hot_routes._atomic_write(p, cache, {}) is True
+    assert calls and calls[0][0] == p, "запись обязана идти через канон-примитив"
+    assert not p.exists(), "сам модуль не пишет файл напрямую — только через примитив"
