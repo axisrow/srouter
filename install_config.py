@@ -515,8 +515,6 @@ def format_plan(plan):
 
 _BACKUP_INFIX = backup_lib.BACKUP_INFIX
 _backup_suffix = backup_lib.backup_stamp
-_parse_backup_stamp = backup_lib.parse_stamp
-_parse_backup_stamp_or_none = backup_lib.parse_iso_utc
 
 
 def _backup(path, env):
