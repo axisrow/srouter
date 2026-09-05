@@ -30,7 +30,8 @@ _log = logging.getLogger("srouter.health")
 # consumer этого __all__; внешний код импортирует health, не health_probes напрямую).
 __all__ = [
     "_launchd_field", "_port_up", "PRIVOXY_SYSTEM_LABEL", "PRIVOXY_BREW_LABEL", "XRAY_BREW_LABEL",
-    "_privoxy_service_target", "_service_running", "_local_proxy_up",
+    "_privoxy_service_target", "_privoxy_alternate_registration", "_service_running",
+    "_local_proxy_up",
     "_zombie_recheck_delay", "_ZOMBIE_RECHECK_DELAY_SEC", "_launchd_loaded_status",
     "_user_launchagent_plist", "_local_proxy_boot_persistence",
     "GFW_PROBE_DOMAINS", "GFW_CONTROL_DOMAIN", "_direct_domain_probe", "_gfw_domain_check",
@@ -103,6 +104,19 @@ def _privoxy_service_target():
     if privoxy_system.protection_present():
         return PRIVOXY_SYSTEM_LABEL, "system"
     return PRIVOXY_BREW_LABEL, f"gui/{os.getuid()}"
+
+
+def _privoxy_alternate_registration(label, domain):
+    """Вторая легитимная регистрация privoxy (#341): protected system-daemon ИЛИ brew
+    user-LaunchAgent — обе каноничны (канон #329: детектор обязан знать легитимные
+    альтернативные конфигурации). Возвращает (label, domain), не совпадающий с выбранным
+    по protection_present таргетом. Используется ТОЛЬКО когда выбранный таргет не Running,
+    а порт жив: прежде чем клеймить «зомби», спросить launchd про альтернативу —
+    port может держать легитимная вторая регистрация, и protected-restart поверх неё
+    создал бы конфликт двух сервисов за 8118."""
+    if (label, domain) == (PRIVOXY_SYSTEM_LABEL, "system"):
+        return PRIVOXY_BREW_LABEL, f"gui/{os.getuid()}"
+    return PRIVOXY_SYSTEM_LABEL, "system"
 
 
 # #330: короткий backoff перед re-check'ом вердиктов, чувствительных к mid-start (зомби,
@@ -196,7 +210,10 @@ def _local_proxy_up():
       - port open + service unknown → НЕ зомби (fail-closed: launchctl не ответил — вердикт по port-open,
         с пометкой «service-status не верифицирован»). cycle-review P1: иначе timeout давал ложный зомби;
       - оба компонента port-up + running → ok.
-    Возвращает {status, detail}: ok / down (с причиной крах vs зомби + какой компонент). Не бросает.
+    #341: для privoxy «зомби» требует не-Running ОБЕИХ легитимных регистраций (protected system
+    И brew user-agent): порт может держать вторая легитимная регистрация — это НЕ зомби, а грань
+    режима (facets, info-only). Возвращает {status, detail, facets}: ok / down (с причиной
+    крах vs зомби + какой компонент). Не бросает.
     unknown по service-status НЕ роняет ok (port-open = прокси принимает соединения), но помечается
     в detail (observability — noisy-log-better-than-no-log).
     """
@@ -206,6 +223,7 @@ def _local_proxy_up():
         ("xray", XRAY_PORT, XRAY_BREW_LABEL, f"gui/{os.getuid()}"),
     ]
     problems = []
+    facets = []  # #341: грани режима (info/warn), НЕ роняющие вердикт — отдельная от «зомби»
     unverified = []
     for name, port, label, domain in components:
         port_open = _health_facade._port_up(port)
@@ -238,6 +256,22 @@ def _local_proxy_up():
                 # timeout даже на re-check'е — fail-closed, НЕ зомби (тот же канон, что первый срез).
                 unverified.append(name)
             else:
+                # #341: прежде чем клеймить «зомби», спросить launchd про ВТОРУЮ легитимную
+                # регистрацию privoxy (канон #329 — детектор знает легитимные альтернативы).
+                # Эмпирика #341: protected job loaded, но crash-loop (state=spawn scheduled,
+                # EX_CONFIG), порт 8118 держит живой brew homebrew.mxcl.privoxy — зомби был
+                # false positive, а совет protected-restart создал бы вторую регистрацию за порт.
+                alt_label, alt_domain = (None, None)
+                if name == "privoxy":
+                    alt_label, alt_domain = _privoxy_alternate_registration(label, domain)
+                if alt_label is not None and \
+                        _health_facade._service_running(alt_label, alt_domain) == "running":
+                    facets.append(
+                        f"{name} жив через альтернативную регистрацию {alt_label} "
+                        f"(домен {alt_domain}), а выбранная по режиму {label} — не Running. "
+                        f"Порт {port} обслуживается; рестарт выбранного режима поверх живой "
+                        f"альтернативы создал бы конфликт за порт")
+                    continue
                 problems.append(f"{name} зомби (port {port} слушается, но сервис не Running — orphan/launchd)")
         elif svc == "unknown":
             # port open, но launchctl не ответил → НЕ зомби (fail-closed), помечаем для observability.
@@ -250,7 +284,10 @@ def _local_proxy_up():
     detail = "локальный прокси жив: privoxy 8118 + xray 10808 port-up + service-running"
     if unverified:
         detail += f" (⚠ service-status не верифицирован для {', '.join(unverified)} — launchctl timeout)"
-    return {"status": "ok", "detail": detail}
+    # #341: facets — отдельные грани (режим регистрации), НЕ зомби; check_all показывает их
+    # отдельным info-only чеком. "facets" в down-ветке не нужен: down означает, что ни одна
+    # легитимная регистрация не Running (фасету там взяться неоткуда).
+    return {"status": "ok", "detail": detail, "facets": facets}
 
 
 # ============================ #330: persists-across-boot (launchd-регистрация) ==================

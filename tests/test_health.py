@@ -988,6 +988,67 @@ def test_local_proxy_zombie_requires_confirmed_not_running(monkeypatch):
 
 
 
+def test_local_proxy_not_zombie_when_brew_registration_running(monkeypatch):
+    """ДЫРА #341: выбранная по protection_present регистрация (protected com.srouter.privoxy)
+    не Running, но ПОРТ ЖИВ через вторую легитимную регистрацию — brew homebrew.mxcl.privoxy
+    (эмпирика 2026-09-05: protected job loaded, но crash-loop state=spawn scheduled EX_CONFIG,
+    порт 8118 держит живой brew PID 62891). Проба клеймила «зомби» с советом protected-restart —
+    ложная тревога на живом 24/7-прокси + риск ВТОРОЙ регистрации за порт.
+    Ожидание: НЕ down/зомби; расхождение режима — отдельная грань (facets), не «зомби»."""
+    monkeypatch.setattr(health, "_port_up", lambda port: True)
+    monkeypatch.setattr(health, "_zombie_recheck_delay", lambda: None)
+    monkeypatch.setattr(privoxy_system, "protection_present",
+                        lambda layout=privoxy_system.DEFAULT_LAYOUT: True)
+
+    def fake_running(label, domain=None):
+        if label == health.PRIVOXY_SYSTEM_LABEL:
+            return "not_running"  # protected job loaded, но crash-loop (не running)
+        return "running"          # brew homebrew.mxcl.privoxy — живой PID, держит 8118
+    monkeypatch.setattr(health, "_service_running", fake_running)
+    result = health._local_proxy_up()
+    assert result["status"] == "ok", "порт жив через легитимную brew-регистрацию → НЕ зомби"
+    assert "зомби" not in result["detail"].lower(), "зомби-вердикта быть не должно"
+    assert result.get("facets"), "расхождение режима — отдельная грань (facets)"
+    assert "homebrew.mxcl.privoxy" in result["facets"][0], "грань называет живую регистрацию"
+
+
+def test_local_proxy_not_zombie_when_protected_registration_running(monkeypatch):
+    """#341, обратное направление: политика brew (protection_present=False), brew-регистрация не
+    Running, но порт держит protected com.srouter.privoxy → НЕ зомби, грань о режиме."""
+    monkeypatch.setattr(health, "_port_up", lambda port: True)
+    monkeypatch.setattr(health, "_zombie_recheck_delay", lambda: None)
+    monkeypatch.setattr(privoxy_system, "protection_present",
+                        lambda layout=privoxy_system.DEFAULT_LAYOUT: False)
+
+    def fake_running(label, domain=None):
+        if label == health.PRIVOXY_BREW_LABEL:
+            return "not_running"
+        return "running"  # protected system-daemon жив
+    monkeypatch.setattr(health, "_service_running", fake_running)
+    result = health._local_proxy_up()
+    assert result["status"] == "ok", "порт жив через protected-регистрацию → НЕ зомби"
+    assert "зомби" not in result["detail"].lower()
+    assert result.get("facets"), "расхождение режима — отдельная грань"
+    assert health.PRIVOXY_SYSTEM_LABEL in result["facets"][0]
+
+
+def test_check_all_surfaces_registration_mode_facet_as_info(monkeypatch):
+    """#341: грань режима регистрации попадает в check_all как ОТДЕЛЬНЫЙ info-only чек —
+    не «зомби», не driver (канал в моменте работает, warn только о несоответствии режиму)."""
+    _all_up_monkey(monkeypatch, probe_status="ok")
+    monkeypatch.setattr(privoxy_system, "protection_present",
+                        lambda layout=privoxy_system.DEFAULT_LAYOUT: True)
+    monkeypatch.setattr(health, "_zombie_recheck_delay", lambda: None)
+
+    def fake_running(label, domain=None):
+        return "not_running" if label == health.PRIVOXY_SYSTEM_LABEL else "running"
+    monkeypatch.setattr(health, "_service_running", fake_running)
+    result = health.check_all()
+    facet = [c for c in result["checks"] if "режим" in c["name"].lower()]
+    assert facet, "грань режима регистрации — отдельный чек в check_all"
+    assert facet[0].get("info") is True and facet[0]["ok"] is True, "info-only, не driver"
+
+
 # Интеграция в check_all: DRIVER когда туннель fail (проблема в локальном прокси, VPS жив/н/д).
 # Туннель ok → info (картина, не driver — порты уже driver через _port_up чеки выше).
 
