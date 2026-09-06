@@ -555,6 +555,26 @@ def test_apply_unmanageable_in_ids_validated_before_mutation(monkeypatch):
     assert "system" in ids_failed
 
 
+def test_apply_force_over_foreign_enabled_prestate_honest_skip_reason(monkeypatch):
+    """Code-review 2-й pass: force-enable поверх ВКЛЮЧЁННОГО foreign pre-state перезаписал
+    чужое значение; откат не может value-восстановить (enable_fn не принимает значение),
+    и «уже был включён» — вводящий в заблуждение reason. Честный skip называет перезапись
+    и прежнее значение для ручного восстановления (noisy-log-better-than-no-log)."""
+    monkeypatch.setattr(proxy_registry.git_proxy, "status",
+                        lambda: {"enabled": True, "proxy": "https://corp:8443", "state": "foreign"})
+    monkeypatch.setattr(proxy_registry.git_proxy, "enable", lambda force=False: {"ok": True})
+    monkeypatch.setattr(proxy_registry.claude_proxy, "enable",
+                        lambda force=False: (_ for _ in ()).throw(RuntimeError("boom")))
+    git_disable = _spy(result={"ok": True})
+    monkeypatch.setattr(proxy_registry.git_proxy, "disable", git_disable)
+    r = proxy_registry.apply(action="enable", force=True)
+    assert git_disable.calls == [], "выключать нельзя: до apply прокси был включён (чужим значением)"
+    assert r["rolled_back"] == []
+    reason = r["rollback_skipped"][0]["reason"]
+    assert "corp:8443" in reason, reason
+    assert "перезаписан" in reason, reason
+
+
 def test_apply_conflict_aborts_and_rolls_back(monkeypatch):
     """conflict = неудавшаяся мутация: apply останавливается, ранее применённое откатывается."""
     monkeypatch.setattr(proxy_registry.git_proxy, "enable", lambda force=False: {"ok": True})

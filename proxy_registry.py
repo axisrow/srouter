@@ -499,7 +499,7 @@ def apply(ids=None, *, action, force=False):
     rolled_back, rollback_errors, rollback_skipped = [], [], []
     if failed is not None:
         for spec, pre in reversed(applied):
-            skip = _rollback_skip_reason(action, pre)
+            skip = _rollback_skip_reason(action, pre, force)
             if skip:
                 _log.warning("proxy_registry: rollback %s skipped: %s", spec.id, skip)
                 rollback_skipped.append({"id": spec.id, "reason": skip})
@@ -533,7 +533,7 @@ def apply(ids=None, *, action, force=False):
     }
 
 
-def _rollback_skip_reason(action, pre):
+def _rollback_skip_reason(action, pre, force=False):
     """Review #347: причина, по которой consumer НЕ откатывается (None = откатывать можно).
 
     Слепая инверсия опасна в обе стороны: disable уже-включённого = новое разрушение
@@ -544,6 +544,13 @@ def _rollback_skip_reason(action, pre):
         return "pre-state неизвестен — слепой откат опасен (review #347)"
     enabled_pre = bool(pre.get("enabled"))
     if action == "enable" and enabled_pre:
+        # Code-review 2-й pass: force перезаписал ЧУЖОЕ включённое значение — restore
+        # значением невозможен (enable_fn не принимает значение); выключать тоже нельзя
+        # (до apply прокси работал). Честно называем перезапись и прежнее значение.
+        if force and pre.get("state") in ("foreign", "mixed"):
+            return (f"pre-state {pre.get('state')} ({pre.get('proxy') or 'значение не читается'}) "
+                    f"перезаписан force-включением — auto-restore значением невозможен, "
+                    f"требуется ручной шаг (#307)")
         return "уже был включён до apply — откат выключил бы рабочее состояние"
     if action == "disable":
         if not enabled_pre:
