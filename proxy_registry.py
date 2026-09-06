@@ -19,6 +19,19 @@
 «настроен, но узел мёртв» (порт открыт, curl таймаутит) и «дашборд думает, что выключено»
 (мутация не доехала, а badge держался в JS-переменной).
 
+ТРЁХУРОВНЕВАЯ ОСЬ (issue #302, design-анализ подтверждён axisrow): поле runtime честно
+только там, где существует физический сигнал. Класс evidence задаётся декларативно:
+  physical     — runtime-замер есть (claude/codex: lsof ESTABLISHED по PID);
+  active-probe — физика только активной пробой, секунды, probe=True и только при
+                 configured=True (git: процесс живёт <2с, пассивный lsof промахивается —
+                 эмпирика design-анализа #302; замер = git ls-remote стеком самого git);
+  config-only  — физического сигнала нет (vscode/desktop: health_fn читает settings.json/
+                 launchctl — тот же класс артефакта, что configured). Их конфиг-проба НЕ
+                 попадает в runtime: там честное 'n/a', иначе панель показывает ложный ok
+                 именно там, ради которого её строили (noisy-log-better-than-no-log).
+Плюс отдельная ось running (process-alive): живой процесс потребителя по ps, гейтится
+наличием процесса по образцу #337; измеряется только при probe=True (~десятки ms).
+
 Почему отдельный модуль, а не расширение health.py: health уже 2895 строк и 13 issue-секций;
 это плоский список процедур с семантикой doctor-вердикта (driver/info), а не lifecycle
 потребителей. Реестр живёт ВЫШЕ health и переиспользует его пробы как есть. Бонус: health
@@ -67,19 +80,23 @@ class ConsumerSpec:
     """Декларативное описание одного потребителя прокси.
 
     status_fn  — сырое состояние конфига (свой формат у каждого модуля);
-    health_fn  — runtime-проба из health.py ({status, detail}); None -> runtime "n/a";
+    health_fn  — проба из health.py ({status, detail}); её СМЫСЛ задаёт evidence (#302):
+                 physical -> runtime, config-only -> не runtime (см. докстринг модуля);
+    evidence   — класс физического сигнала: physical | active-probe | config-only;
     enable_fn/disable_fn — write-путь; None -> manageable=False (только наблюдаем).
     """
 
-    __slots__ = ("id", "title", "kind", "status_fn", "health_fn", "enable_fn", "disable_fn", "note")
+    __slots__ = ("id", "title", "kind", "status_fn", "health_fn", "evidence",
+                 "enable_fn", "disable_fn", "note")
 
     def __init__(self, id, title, kind, status_fn, health_fn=None,
-                 enable_fn=None, disable_fn=None, note=""):
+                 enable_fn=None, disable_fn=None, note="", evidence="config-only"):
         self.id = id
         self.title = title
         self.kind = kind
         self.status_fn = status_fn
         self.health_fn = health_fn
+        self.evidence = evidence
         self.enable_fn = enable_fn
         self.disable_fn = disable_fn
         self.note = note
@@ -110,7 +127,10 @@ CONSUMERS = (
     ConsumerSpec(
         id="git", title="git → github", kind="git-config",
         status_fn=lambda: git_proxy.status(),
-        health_fn=lambda: health._github_direct_check(),
+        # #302: физика git — ТОЛЬКО активная проба (_git_verified), не _github_direct_check:
+        # та читает git-config (класс configured) и вдобавок зовёт ok «идёт напрямую».
+        health_fn=lambda: _git_verified(),
+        evidence="active-probe",
         enable_fn=lambda force=False: git_proxy.enable(force=force),
         disable_fn=lambda: git_proxy.disable(),
         note="~/.gitconfig · http.https://github.com.proxy",
@@ -119,6 +139,7 @@ CONSUMERS = (
         id="claude", title="Claude Code", kind="env-json",
         status_fn=lambda: claude_proxy.status(),
         health_fn=lambda: health._claude_proxy_probe(),
+        evidence="physical",
         enable_fn=lambda force=False: claude_proxy.enable(force=force),
         disable_fn=lambda: claude_proxy.disable(),
         note="~/.claude/settings.json · env.HTTPS_PROXY",
@@ -126,7 +147,10 @@ CONSUMERS = (
     ConsumerSpec(
         id="vscode", title="VSCode / codex", kind="json-settings",
         status_fn=lambda: vscode_proxy.status(),
+        # #302: _vscode_proxy_check читает settings.json — класс configured; в runtime
+        # не попадает (был ложный ok «физически» из того же файла, что и ось «настроен»).
         health_fn=lambda: health._vscode_proxy_check(),
+        evidence="config-only",
         enable_fn=lambda force=False: vscode_proxy.enable(force=force),
         disable_fn=lambda: vscode_proxy.disable(),
         note="settings.json · http.proxy",
@@ -137,18 +161,22 @@ CONSUMERS = (
         id="codex", title="Codex CLI", kind="wrapper",
         status_fn=None,
         health_fn=lambda: health._codex_proxy_probe(),
+        evidence="physical",
         note="~/bin/codex-srouter · zsh-функция (управляется через srouter install)",
     ),
     ConsumerSpec(
         id="desktop", title="Desktop / ChatGPT.app", kind="launchctl",
         status_fn=None,
+        # #302: _desktop_proxy_check читает launchctl getenv — класс configured, не физика.
         health_fn=lambda: health._desktop_proxy_check(),
+        evidence="config-only",
         note="launchctl setenv (gui-домен)",
     ),
     ConsumerSpec(
         id="system", title="Система (macOS)", kind="system",
         status_fn=_system_status,
         health_fn=None,
+        evidence="config-only",
         note="Network settings · только чтение",
     ),
 )
@@ -164,6 +192,56 @@ def _health_call(fn):
 def _effective():
     """Физический замер. Отдельная функция — чтобы тесты могли его отключить/подменить."""
     return proxy_effective.proxy_effective_probe()
+
+
+# ==================== #302: process-alive ось + активный git-замер ====================
+
+PS = "/bin/ps"
+# Замер идёт СТЕКОМ САМОГО git (ls-remote через его scoped-прокси из git-config) — это и
+# есть per-потребительский физический сигнал, в отличие от proxy_effective_probe (curl).
+GITHUB_PROBE_URL = "https://github.com/axisrow/srouter.git"
+# Process-alive гейт (#302, по образцу #337): ps один раз, substring по comm. git не имеет
+# долгоживущего процесса (эмпирика: операция <2с, lsof-сэмплирование промахивается) — None.
+_PROCESS_PATTERNS = {
+    "claude": ("claude",),
+    "vscode": ("Code Helper", "Cursor Helper"),
+    "desktop": ("ChatGPT",),
+}
+
+
+def _process_running(consumer_id):
+    """Живой процесс потребителя: True/False, None = нет процесса либо ps не ответил.
+
+    Дешёво (один ps), но зовётся только при probe=True (см. _row) — открытие страницы
+    лёгкое, watchdog не получает лишнего машинно-зависимого скана (канон #251/#263).
+    """
+    patterns = _PROCESS_PATTERNS.get(consumer_id)
+    if not patterns:
+        return None
+    r = sys_probe.run([PS, "-axo", "pid=,comm="], timeout=3)
+    if r.get("timeout") or not r.get("out"):
+        return None
+    return any(p in line for line in r["out"].splitlines() for p in patterns)
+
+
+def _git_verified():
+    """Активный физический замер git (#302): ls-remote через СОБСТВЕННЫЙ стек git —
+    его scoped git-config proxy, его LibreSSL-стек. Секунды через GFW, поэтому зовётся
+    только при probe=True и только при configured=True (не настроен — путь не задействован).
+
+    ok   — rc=0: стек git доставил ответ github (с его прокси или без — как настроено);
+    down — иной rc: транспорт не доставил ответ (мёртвый прокси/сеть);
+    unknown — таймаут замера (не гадаем, что именно не ответило).
+    """
+    r = sys_probe.run(["git", "ls-remote", "--exit-code", GITHUB_PROBE_URL, "HEAD"], timeout=15)
+    if r.get("timeout"):
+        return {"status": "unknown",
+                "detail": f"git ls-remote timeout — физический замер {GITHUB_PROBE_URL} не ответил"}
+    if r.get("rc") == 0:
+        return {"status": "ok",
+                "detail": "git ls-remote ok — стек git (со своим scoped-прокси) доставляет ответ github"}
+    return {"status": "down",
+            "detail": f"git ls-remote не удался (rc={r.get('rc')}): {(r.get('err') or '')[:200]}"}
 
 
 def _configured_from(raw):
@@ -195,7 +273,44 @@ def _row(spec, want_runtime):
             _log.warning("proxy_registry: status %s failed: %s", spec.id, e)
 
     runtime, detail = "n/a", spec.note
-    if spec.health_fn is not None:
+    running = None
+    if want_runtime:
+        # running (process-alive) — дешёвая ось (~десятки ms ps), но только по явному
+        # запросу (#302, гейт по образцу #337): открытие страницы остаётся лёгким.
+        try:
+            running = _process_running(spec.id)
+        except Exception as e:  # noqa: BLE001 — fail-soft boundary: ось не роняет панель
+            _log.warning("proxy_registry: process %s failed: %s", spec.id, e)
+            running = None
+
+    if spec.evidence == "config-only":
+        # #302: физического сигнала нет — конфиг-проба (settings.json/launchctl) НЕ может
+        # стать runtime (ложный ok из того же класса артефакта, что ось configured).
+        # Честное n/a; результат конфиг-пробы живёт в detail, не в вердикте.
+        if spec.health_fn is not None and want_runtime:
+            try:
+                h = _health_call(spec.health_fn) or {}
+                if h.get("detail"):
+                    detail = f"config-only ({spec.note}); конфиг-проба: {h['detail']}"
+            except Exception as e:  # noqa: BLE001 — fail-soft boundary
+                _log.warning("proxy_registry: health %s failed: %s", spec.id, e)
+    elif spec.evidence == "active-probe":
+        # #302: активная проба (секунды через GFW) — только по probe=True и только при
+        # configured=True: не настроен/неизвестно — прокси-путь git не задействован.
+        if not want_runtime:
+            runtime = "n/a"
+        elif configured is not True:
+            runtime = "n/a" if configured is False else "unknown"
+        else:
+            try:
+                h = _health_call(spec.health_fn) or {}
+                runtime = h.get("status") or "unknown"
+                detail = h.get("detail") or spec.note
+            except Exception as e:  # noqa: BLE001 — fail-soft boundary
+                _log.warning("proxy_registry: health %s failed: %s", spec.id, e)
+                runtime = "unknown"
+    elif spec.health_fn is not None:
+        # physical: настоящий runtime-замер (lsof ESTABLISHED по PID).
         if want_runtime:
             try:
                 h = _health_call(spec.health_fn) or {}
@@ -230,6 +345,8 @@ def _row(spec, want_runtime):
         "configured": configured,
         "state": state,
         "runtime": runtime,
+        "running": running,
+        "evidence": spec.evidence,
         "proxy": proxy,
         "detail": detail,
         "manageable": spec.manageable,
@@ -296,17 +413,29 @@ def overview(*, probe=False):
 
 
 def apply(ids=None, *, action, force=False):
-    """Включить/выключить потребителей по реестру. {ok, results: [{id, ok, err, conflict?}]}.
+    """Включить/выключить потребителей по реестру. {ok, partial, results, applied,
+    rolled_back, rollback_errors, failed, unattempted}.
 
     Вайтлист id и action ДО любой мутации (канон: мутирующий путь валидирует по вайтлисту).
     Неуправляемый потребитель -> честный отказ, а не молчаливый успех.
+
+    АТОМАРНОСТЬ (issue #303): stop-on-first-error + компенсирующий rollback. Первая
+    неудавшаяся мутация (включая conflict) останавливает применение — не расширяем частично
+    изменённое состояние (fail-closed); всё УЖЕ применённое откатывается обратным действием
+    (enable -> disable, disable -> enable(force=True): восстанавливаем собственное только что
+    снятое значение, conflict-гейт не имеет права блокировать восстановление). Отчитываемся
+    явно: applied / rolled_back / rollback_errors / failed / unattempted — partial-состояние
+    не может быть тихим (noisy-log-better-than-no-log). Ошибки rollback НЕ глотаются:
+    rollback_errors непустой -> ok=False.
 
     force (issue #307) — осознанная перезапись чужого значения: реестр доносит его до
     enable_fn каждого потребителя; без force enable на foreign/mixed возвращает per-consumer
     {ok: False, conflict: True} (панель показывает confirm вместо silent-перезаписи).
     """
     if action not in _ACTIONS:
-        return {"ok": False, "err": f"unknown action: {action!r}", "results": []}
+        return {"ok": False, "err": f"unknown action: {action!r}", "results": [],
+                "partial": False, "applied": [], "rolled_back": [], "rollback_errors": [],
+                "failed": None, "unattempted": []}
 
     if ids is None:
         targets = [c for c in CONSUMERS if c.manageable]
@@ -315,12 +444,18 @@ def apply(ids=None, *, action, force=False):
         for cid in ids:
             spec = _BY_ID.get(cid)
             if spec is None:
-                return {"ok": False, "err": f"unknown consumer: {cid!r}", "results": []}
+                return {"ok": False, "err": f"unknown consumer: {cid!r}", "results": [],
+                        "partial": False, "applied": [], "rolled_back": [],
+                        "rollback_errors": [], "failed": None, "unattempted": []}
             targets.append(spec)
 
     results = []
+    applied_specs = []
+    failed = None
+    refused = False
     for spec in targets:
         if not spec.manageable:
+            refused = True
             results.append({"id": spec.id, "ok": False,
                             "err": f"{spec.title}: управление отсюда не поддерживается ({spec.note})"})
             continue
@@ -332,8 +467,42 @@ def apply(ids=None, *, action, force=False):
                 entry["conflict"] = True
                 entry["state"] = r.get("state")
             results.append(entry)
-        except Exception as e:  # noqa: BLE001 — fail-soft: один сбой не прерывает остальные
+        except Exception as e:  # noqa: BLE001 — сбой мутации = стоп + rollback (см. докстринг)
             _log.warning("proxy_registry: %s %s failed: %s", action, spec.id, e)
-            results.append({"id": spec.id, "ok": False, "err": str(e) or e.__class__.__name__})
+            entry = {"id": spec.id, "ok": False, "err": str(e) or e.__class__.__name__}
+            results.append(entry)
+        if not entry["ok"]:
+            failed = {"id": spec.id, "err": entry["err"]}
+            break
+        applied_specs.append(spec)
 
-    return {"ok": bool(results) and all(r["ok"] for r in results), "results": results}
+    # #303: компенсирующий rollback применённого — в обратном порядке.
+    rolled_back, rollback_errors = [], []
+    if failed is not None:
+        for spec in reversed(applied_specs):
+            try:
+                if action == "enable":
+                    ir = spec.disable_fn() or {}
+                else:
+                    ir = spec.enable_fn(force=True) or {}
+                if ir.get("ok") is False:
+                    rollback_errors.append({"id": spec.id, "err": str(ir.get("err") or "rollback refused")})
+                else:
+                    rolled_back.append(spec.id)
+            except Exception as e:  # noqa: BLE001 — ошибка отката не может быть тихой
+                _log.warning("proxy_registry: rollback %s failed: %s", spec.id, e)
+                rollback_errors.append({"id": spec.id, "err": str(e) or e.__class__.__name__})
+
+    failed_index = next((i for i, s in enumerate(targets) if s.id == (failed or {}).get("id")), len(targets))
+    unattempted = [s.id for s in targets[failed_index + 1:]]
+
+    return {
+        "ok": failed is None and not rollback_errors and not refused,
+        "partial": failed is not None and bool(applied_specs),
+        "results": results,
+        "applied": [s.id for s in applied_specs],
+        "rolled_back": rolled_back,
+        "rollback_errors": rollback_errors,
+        "failed": failed,
+        "unattempted": unattempted,
+    }

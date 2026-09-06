@@ -302,6 +302,7 @@
         proxy_works: "working", proxy_broken: "not flowing", proxy_na: "—",
         proxy_state_unknown: "unknown", proxy_mixed: "partial",
         proxy_foreign: "foreign value", proxy_mixed_state: "mixed settings",
+        proxy_running_yes: "process alive", proxy_running_no: "process not found",
         proxy_force_confirm: "A foreign proxy value is set here: {0}\nOverwrite it with the srouter-managed value? The foreign value will be backed up.",
         proxy_on: "Enable", proxy_off: "Disable",
         proxy_mismatch: "MISMATCH", proxy_ok_badge: "OK",
@@ -424,6 +425,7 @@
         proxy_works: "работает", proxy_broken: "не идёт", proxy_na: "—",
         proxy_state_unknown: "неизвестно", proxy_mixed: "частично",
         proxy_foreign: "чужое значение", proxy_mixed_state: "разные значения",
+        proxy_running_yes: "процесс жив", proxy_running_no: "процесс не найден",
         proxy_force_confirm: "Здесь прописано ЧУЖОЕ значение прокси: {0}\nПерезаписать управляемым srouter-значением? Чужое значение будет сохранено в backup.",
         proxy_on: "Включить", proxy_off: "Выключить",
         proxy_mismatch: "РАСХОЖДЕНИЕ", proxy_ok_badge: "ОК",
@@ -545,6 +547,7 @@
         proxy_yes: "是", proxy_no: "否", proxy_unknown: "?",
         proxy_works: "正常", proxy_broken: "不通", proxy_na: "—",
         proxy_state_unknown: "未知", proxy_mixed: "部分",
+        proxy_running_yes: "进程存活", proxy_running_no: "进程未找到",
         proxy_on: "启用", proxy_off: "停用",
         proxy_mismatch: "不一致", proxy_ok_badge: "正常",
         proxy_applied: "代理已启用", proxy_cleared: "代理已停用",
@@ -1546,12 +1549,16 @@
       // detail приходит из health-проб и бывает многострочной инструкцией в сотни символов
       // (например _github_direct_check). В ячейку таблицы такое полотно не помещается —
       // показываем первую строку-выжимку, полный текст кладём в title (tooltip).
+      // issue #302: ось running (process-alive) показывается маркером в начале detail —
+      // только когда она ИЗМЕРЕНА (boolean); null = не проверяли, маркера нет.
+      var flat0 = c.detail ? String(c.detail).replace(/\s+/g, ' ').trim() : '';
+      if (c.running === true) flat0 = t('proxy_running_yes') + (flat0 ? ' · ' + flat0 : '');
+      else if (c.running === false) flat0 = t('proxy_running_no') + (flat0 ? ' · ' + flat0 : '');
       var detailRow = '';
-      if (c.detail) {
-        var flat = String(c.detail).replace(/\s+/g, ' ').trim();
-        var short = flat.length > 160 ? flat.slice(0, 160) + '…' : flat;
+      if (flat0) {
+        var short0 = flat0.length > 160 ? flat0.slice(0, 160) + '…' : flat0;
         detailRow = '<tr' + rowCls + '><td colspan="5" class="sub text-secondary pt-0 border-0" title="' +
-                    esc(flat) + '">' + esc(short) + '</td></tr>';
+                    esc(flat0) + '">' + esc(short0) + '</td></tr>';
       }
 
       return '<tr' + rowCls + '>' +
