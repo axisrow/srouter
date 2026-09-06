@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shutil
@@ -50,6 +51,8 @@ CODEX_NO_PROXY = "localhost,127.0.0.1,::1,z.ai,.z.ai"
 # (#96 core), НЕ provider-direct. z.ai-прямой-доступ релевантен moonbridge (GUI launchctl-gui выше),
 # а не CLI-codex. Две разные границы = две константы (канон route-scope-not-shared-validator).
 CODEX_NO_PROXY_LOOPBACK = "localhost,127.0.0.1,::1"
+
+_log = logging.getLogger("srouter.codex_wrappers")
 # (env-key, value) — единый список для install/setenv-контракта gui-домена (issue #340).
 # scheme-ключи НЕСУТ privoxy (терминальное плечо #331): socks5h в HTTPS_PROXY/https_proxy делал
 # pip/requests достижимым для SOCKSProxyManager (requests.utils.select_proxy: scheme-ключ раньше
@@ -436,13 +439,28 @@ def _remove_launchctl_env(runner) -> dict:
         return {"ok": False, "note": f"Codex env: не снят ({str(exc)[:80]})."}
 
 
+def _backup_and_rotate(zshrc, env):
+    """Generation-бэкап ~/.zshrc + ротация поколений сверх окна (PR-2 #339, контракт §3:
+    A4/A6 — install-конфиги и zshrc ротируются одним примитивом; fail-closed внутри
+    backup_lib.rotate_backups; best-effort — сбой чистки правку zshrc не срывает).
+    Сбой ротации логируется (noisy-log-better-than-no-log, review #350): молчаливые
+    неочищенные реликты оператор иначе увидел бы только в doctor-грани «накопление»."""
+    from backup_lib import create_backup, rotate_backups
+
+    backup = create_backup(zshrc, env)  # timestamped generation, канон-примитив (PR-1 #339)
+    rotation = rotate_backups(zshrc)
+    if rotation["failed"]:
+        _log.warning("zshrc: ротация бэкапов не удалила %d поколение(й): %s",
+                     len(rotation["failed"]), ", ".join(str(p) for p in rotation["failed"]))
+    return backup
+
+
 def _ensure_home_bin_in_path(env) -> str:
     """Добавить ~/bin в PATH через ~/.zshrc (marker-gate + backup через backup_lib.create_backup + atomic write).
 
     CLI wrapper требует ~/bin раньше системного codex в PATH.
     """
     try:
-        from backup_lib import create_backup
         zshrc = _zshrc_path()
         block = f'\n{ZSHRC_PATH_MARKER}\nexport PATH="$HOME/bin:$PATH"\n'
         if not zshrc.exists():
@@ -454,7 +472,7 @@ def _ensure_home_bin_in_path(env) -> str:
         content = zshrc.read_text(encoding="utf-8")
         if ZSHRC_PATH_MARKER in content or '$HOME/bin' in content or "${HOME}/bin" in content:
             return "PATH: ~/bin уже в ~/.zshrc (idempotent)."
-        create_backup(zshrc, env)  # timestamped generation через канон-примитив (PR-1 #339)
+        _backup_and_rotate(zshrc, env)
         _write_text_atomic(zshrc, content + block)
         return "PATH: ~/bin добавлен в ~/.zshrc (backup: .zshrc.srouter-backup-*)."
     except (OSError, ValueError, TypeError) as exc:
@@ -530,7 +548,6 @@ def _install_codex_zsh_function(env) -> str:
     Никакого count/find/ordered_pair вне marker_block: здесь только find → block, inspect span, replace.
     """
     try:
-        from backup_lib import create_backup
         zshrc = _zshrc_path()
         content = zshrc.read_text(encoding="utf-8") if zshrc.exists() else ""
         # Idempotent ИЛИ migration stale-блока (cycle-review FIX B). Managed-блок уже на месте —
@@ -569,7 +586,7 @@ def _install_codex_zsh_function(env) -> str:
                     return ("Codex функция: новый codex-srouter не установлен/не валиден — "
                             "stale zsh-блок НЕ мигрирую (оставляя ~/bin/codex, рабочий). "
                             "Запусти srouter install после установки codex binary.")
-                create_backup(zshrc, env)  # timestamped generation перед правкой managed-блока (PR-1 #339)
+                _backup_and_rotate(zshrc, env)  # generation + ротация (PR-2 #339)
                 updated_block = span.replace('"$HOME/bin/codex" "$@"',
                                              '"$HOME/bin/codex-srouter" "$@"')
                 new_content = marker_block.replace_managed_block(content, block, updated_block)
@@ -604,7 +621,7 @@ def _install_codex_zsh_function(env) -> str:
             return ("Codex функция: создан ~/.zshrc с codex() → ~/bin/codex-srouter (новый терминал подхватит). "
                     "ВНИМАНИЕ: существующие терминалы/codex-процессы не получат новое окружение — "
                     "перезапусти их (exec zsh -l в каждом, затем закрыть/открыть TUI).")
-        create_backup(zshrc, env)  # timestamped generation, канон-примитив (PR-1 #339)
+        _backup_and_rotate(zshrc, env)  # generation + ротация (PR-2 #339)
         _write_text_atomic(zshrc, content.rstrip() + "\n\n" + _CODEX_FUNC_BLOCK + "\n")
         return ("Codex функция: добавлена в ~/.zshrc (codex → ~/bin/codex-srouter по абс. пути, "
                 "бьёт brew в PATH). Backup: .zshrc.srouter-backup-*. "

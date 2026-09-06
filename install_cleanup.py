@@ -14,6 +14,8 @@ from pathlib import Path
 
 from sys_probe import run
 
+import backup_lib  # purge_user_backups: чистка USER_BACKUPS_DIR при uninstall (PR-2 #339)
+
 from install_config import (
     BREW,
     CHOICES,
@@ -452,6 +454,14 @@ def apply_uninstall(env=None, *, confirmations=None, runner=run):
             return {"ok": False, "blocked": [unloaded["blocked"]], "actions": actions, "plan": plan}
         if unloaded.get("changed"):
             actions.append({"category": "launchagent", "component": LAUNCHAGENT_LABEL, "changed": True})
+
+    # Каталог бэкапов СОБСТВЕННЫХ артефактов srouter (контракт v2 §1, PR-2 #339): чистится
+    # БЕЗ подтверждения категории — это наши данные, а не пользовательские (чужие конфиги
+    # restore-only выше). Бэкапы содержат секреты (nodes/route_ip) и не должны переживать
+    # uninstall. 'failed' не роняет откат (best-effort), но попадает в actions — оператор видит.
+    purge_status = backup_lib.purge_user_backups()
+    actions.append({"category": "backups", "component": "srouter-user-backups-dir",
+                    "changed": purge_status == "purged", "status": purge_status})
 
     return {"ok": True, "blocked": [], "actions": actions, "components": components,
             "leftover": leftover, "plan": plan}
