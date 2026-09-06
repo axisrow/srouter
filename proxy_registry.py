@@ -296,12 +296,10 @@ def _row(spec, want_runtime):
                 _log.warning("proxy_registry: health %s failed: %s", spec.id, e)
     elif spec.evidence == "active-probe":
         # #302: активная проба (секунды через GFW) — только по probe=True и только при
-        # configured=True: не настроен/неизвестно — прокси-путь git не задействован.
-        if not want_runtime:
-            runtime = "n/a"
-        elif configured is not True:
-            runtime = "n/a" if configured is False else "unknown"
-        else:
+        # configured=True: не настроен/неизвестно — прокси-путь git не задействован
+        # (runtime остаётся исходным "n/a"; configured=None дозаглушается guard'ом ниже —
+        # канон cycle-review PR #299 claim C: не знаем, задействован ли путь, -> unknown).
+        if want_runtime and configured is True:
             try:
                 h = _health_call(spec.health_fn) or {}
                 runtime = h.get("status") or "unknown"
@@ -309,6 +307,8 @@ def _row(spec, want_runtime):
             except Exception as e:  # noqa: BLE001 — fail-soft boundary
                 _log.warning("proxy_registry: health %s failed: %s", spec.id, e)
                 runtime = "unknown"
+                # honest unknown: без объяснения «unknown из ниоткуда» нечитаем
+                detail = f"активная проба не удалась: {e.__class__.__name__}: {e}"
     elif spec.health_fn is not None:
         # physical: настоящий runtime-замер (lsof ESTABLISHED по PID).
         if want_runtime:

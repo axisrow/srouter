@@ -298,6 +298,22 @@ def test_git_active_probe_only_when_configured(monkeypatch):
     assert git["runtime"] == "n/a"
 
 
+def test_git_verified_probe_failure_explains_unknown(monkeypatch):
+    """Code-review #347: unknown от упавшей активной пробы обязан нести причину в detail —
+    «unknown из ниоткуда» нечитаем (noisy-log-better-than-no-log)."""
+    monkeypatch.setattr(proxy_registry.git_proxy, "status",
+                        lambda: {"enabled": True, "present": True, "proxy": "http://127.0.0.1:8118",
+                                 "values": [], "multi": False, "key": "k"})
+
+    def boom():
+        raise RuntimeError("git сломан")
+    monkeypatch.setattr(proxy_registry, "_git_verified", boom)
+    monkeypatch.setattr(proxy_registry, "_effective", lambda: {"status": "ok"})
+    git = _spec(proxy_registry.overview(probe=True), "git")
+    assert git["runtime"] == "unknown"
+    assert "не удалась" in git["detail"], git
+
+
 def test_git_verified_probe_result_becomes_runtime(monkeypatch):
     """configured=True + probe=True: активный ls-remote стеком самого git — настоящий
     per-потребительский физический замер; его вердикт и есть runtime."""
