@@ -280,6 +280,10 @@ def _machine_state_monkey(monkeypatch):
     # #330: persists-across-boot (launchctl print + ФС plist'ов) — тот же мок, что в каноне.
     monkeypatch.setattr(health, "_local_proxy_boot_persistence",
                         lambda: {"status": "ok", "detail": "mock: регистрация launchd на месте"})
+    # #339 PR-3: бэкап-слоты (state + settings ФС) — тот же мок, что в каноне.
+    monkeypatch.setattr(health, "_backup_slots_probe",
+                        lambda: {"status": "ok", "detail": "mock: бэкап-слоты консистентны",
+                                 "findings": []})
 
 
 def test_check_all_status_ok_when_nothing_installed(monkeypatch, tmp_path):

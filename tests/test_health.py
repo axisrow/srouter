@@ -158,6 +158,11 @@ def _all_up_monkey(monkeypatch, *, probe_status="ok", probe_detail="runtime: к�
     # вердикт; это info-only чек). Тесты самой грани мокают отдельно (см. #330-секцию).
     monkeypatch.setattr(health, "_local_proxy_boot_persistence",
                         lambda: {"status": "ok", "detail": "mock: регистрация launchd на месте"})
+    # #339 PR-3: бэкап-слоты читают state + settings ФС — мокаем ok (info-only чек).
+    # Тесты самой грани — tests/test_health_backups.py.
+    monkeypatch.setattr(health, "_backup_slots_probe",
+                        lambda: {"status": "ok", "detail": "mock: бэкап-слоты консистентны",
+                                 "findings": []})
 
 
 # ============================ _claude_proxy_probe (детект lsof) ============================

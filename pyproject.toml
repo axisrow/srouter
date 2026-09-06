@@ -74,6 +74,7 @@ py-modules = [
     "health_codenv",
     "health_devworkflow",
     "health_endpoint",
+    "health_backups",
     "health_constants",
     "privoxy_system",
     "privoxy_control",
