@@ -212,3 +212,110 @@ def test_probe_result_exposes_flag_not_raw_headers(monkeypatch):
     r = proxy_effective.proxy_effective_probe(host="example.com")
     assert "headers" not in r["proxy"]
     assert r["proxy"].get("synthetic_5xx") is True
+
+
+# ===================== issue #325: http://-цель в пробной матрице =====================
+# Третье плечо — plain-HTTP-замер через privoxy (единственный plain-HTTP-посредник стека,
+# research #301: xray HTTP-5xx синтезировать не может). Пара https-замеров остаётся
+# ЕДИНСТВЕННЫМ вердиктным источником (канон #207 нетронут); http-плечо — дополнительный
+# сигнал с асимметричной силой: подписанная синтетика (magic-даты) эскалирует, любой
+# неподписанный сбой plain-HTTP вердикт не меняет (шум GFW-класса сетей не красит канал,
+# #82). Моки — те же живые захваты стенда #301, что и выше.
+
+
+def _patch_arms(monkeypatch, *, direct, via_https, via_http):
+    """Три плеча по URL/флагу: direct (без прокси), https-via, http-via (обе через прокси)."""
+    def fake(url, proxy=True, proxy_url=None, **kwargs):
+        if not proxy:
+            return direct
+        return via_http if url.startswith("http://") else via_https
+    monkeypatch.setattr(proxy_effective, "_curl_through", fake)
+
+
+def test_http_arm_targets_plain_http_url(monkeypatch):
+    """В пробной матрице есть http://-цель: guard синтетики #323 операционно достижим."""
+    urls = []
+
+    def fake(url, proxy=True, proxy_url=None, **kwargs):
+        urls.append(url)
+        return _curl(200)
+
+    monkeypatch.setattr(proxy_effective, "_curl_through", fake)
+    proxy_effective.proxy_effective_probe(host="github.com")
+    assert any(u.startswith("http://") for u in urls)
+
+
+def test_http_arm_runs_on_socks_channel_too(monkeypatch):
+    """Прод-вызов панели — channel="socks" (proxy_registry._effective): guard обязан быть
+    достижим именно там. Плечо бьёт в privoxy-запись реестра независимо от канала замера."""
+    calls = []
+
+    def fake(url, proxy=True, proxy_url=None, **kwargs):
+        calls.append((url, proxy_url))
+        return _curl(200)
+
+    monkeypatch.setattr(proxy_effective, "_curl_through", fake)
+    proxy_effective.proxy_effective_probe(host="github.com", channel="socks")
+    http_calls = [(u, p) for u, p in calls if u.startswith("http://")]
+    assert http_calls, "http-плечо не замерялось на socks-канале"
+    assert all(p == proxy_effective._CHANNEL_PROXY["http"] for _, p in http_calls)
+
+
+def test_synthetic_on_http_arm_escalates_to_proxy_broken_not_vendor_outage(monkeypatch):
+    """КЛЮЧЕВОЙ (#325): синтетика privoxy на http-плече при works=True-вердикте https-пары
+    (здесь vendor-outage) эскалирует в proxy-broken — посредник доказанно не смог
+    форвардить, канал НЕ доказан, «лежит вендор» — ложный вердикт."""
+    _patch_arms(monkeypatch, direct=_curl(200),
+                via_https=_curl(503),  # настоящий 5xx без magic-дат -> vendor-outage
+                via_http={**_curl(503), "headers": PRIVOXY_SYNTHETIC_503_HEADERS})
+    r = proxy_effective.proxy_effective_probe(host="github.com", channel="http")
+    assert r["verdict"] == "proxy-broken"
+    assert r["verdict"] != "vendor-outage"
+    assert r["works"] is False
+    assert r["status"] == "down"
+    assert r["http_arm"]["synthetic_5xx"] is True
+
+
+def test_unsigned_http_arm_failure_never_changes_verdict(monkeypatch):
+    """#82-граница: неподписанный сбой plain-HTTP (000 — шум GFW/redirect/что угодно) НЕ
+    красит канал: вердиктным источником остаётся TLS-пара. Эскалирует только подпись."""
+    _patch_arms(monkeypatch, direct=_curl(200), via_https=_curl(200), via_http=_curl("000"))
+    r = proxy_effective.proxy_effective_probe(host="github.com", channel="http")
+    assert r["verdict"] == "ok"
+    assert r["works"] is True
+    assert r["http_arm"]["synthetic_5xx"] is False
+    assert r["http_arm"]["up"] is False  # сам факт сбоя плеча зафиксирован
+
+
+def test_real_5xx_on_http_arm_is_informational_not_escalation(monkeypatch):
+    """Настоящий 5xx домена на http-плече (заголовки вендора, без magic-дат) — не подпись
+    посредника: канал доказан TLS-парой, эскалации нет."""
+    _patch_arms(monkeypatch, direct=_curl(200), via_https=_curl(200),
+                via_http={**_curl(503), "headers": REAL_ORIGIN_503_HEADERS})
+    r = proxy_effective.proxy_effective_probe(host="github.com", channel="http")
+    assert r["verdict"] == "ok"
+    assert r["http_arm"]["synthetic_5xx"] is False
+
+
+def test_synthetic_on_http_arm_attributes_already_broken_verdict(monkeypatch):
+    """https-пара уже proxy-broken (000) + подпись на http-плече: вердикт тот же (уже down),
+    но detail называет виновника (мёртвый upstream), а не безликое «узел мёртв»."""
+    _patch_arms(monkeypatch, direct=_curl(200), via_https=_curl("000"),
+                via_http={**_curl(503), "headers": PRIVOXY_SYNTHETIC_503_HEADERS})
+    r = proxy_effective.proxy_effective_probe(host="github.com", channel="http")
+    assert r["verdict"] == "proxy-broken"
+    assert "синтетический" in r["detail"]
+
+
+def test_http_arm_can_be_disabled(monkeypatch):
+    """Опция http_arm=False: плечо не замеряется, контракт прежних потребителей цел."""
+    calls = []
+
+    def fake(url, proxy=True, proxy_url=None, **kwargs):
+        calls.append(url)
+        return _curl(200)
+
+    monkeypatch.setattr(proxy_effective, "_curl_through", fake)
+    r = proxy_effective.proxy_effective_probe(host="github.com", http_arm=False)
+    assert not any(u.startswith("http://") for u in calls)
+    assert r["http_arm"] is None

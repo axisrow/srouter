@@ -84,3 +84,21 @@ def test_live_privoxy_synthetic_5xx_carries_guard_signature(dead_upstream_privox
         f"живой privoxy изменил magic-Last-Modified: {r['headers']}"
     )
     assert proxy_effective._is_synthetic_middleware_5xx(r) is True
+
+
+def test_live_full_probe_catches_synthetic_on_http_arm(dead_upstream_privoxy, monkeypatch):
+    """Живой прогон ПОЛНОЙ матрицы зонда (#325) против стенда: синтетика privoxy ловится
+    на http-плече, verdict не «вендор лежит».
+
+    Обе via-плечи (https + http) перенаправлены в изолированный privoxy стенда — прод-порты
+    8118/10808 не задействуются. direct-плечо бьёт в реальную сеть: его исход (200/000)
+    машинно-зависим, поэтому ассерты не зависят от него — оба допустимых итога покрыты.
+    """
+    monkeypatch.setitem(proxy_effective._CHANNEL_PROXY, "http", dead_upstream_privoxy)
+    r = proxy_effective.proxy_effective_probe(host="github.com", channel="http")
+    assert r["http_arm"]["synthetic_5xx"] is True, (
+        f"живая синтетика не распознана в полном прогоне: {r['http_arm']}"
+    )
+    assert r["verdict"] != "vendor-outage", f"синтетика посредника выдана за вендора: {r}"
+    assert r["works"] is False
+    assert r["verdict"] in ("proxy-broken", "both-down"), f"неожиданный вердикт: {r}"

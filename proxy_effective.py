@@ -29,6 +29,19 @@
 в принципе не доходит до кода (провал CONNECT даёт code=000), поэтому там семантика #207
 не меняется.
 
+Третье плечо #325 (вердикт автора: ДА): plain-HTTP-замер http://{host}/ — дополнительный
+СИГНАЛ, не замена пары. Цель — читать собственную подпись посредника о его upstream
+(синтетика видна только на plain-HTTP), а не менять измеряемую семантику потребительского
+плеча. Плечо всегда бьёт в privoxy-запись реестра (_CHANNEL_PROXY["http"]) независимо от
+channel замера: xray HTTP-5xx синтезировать не может (research #301), а прод-вызов панели
+— channel="socks" — иначе не достигал бы guard'а #323 вовсе. Асимметричная сила сигнала:
+  - подписанная синтетика (magic-даты — их ambient-шум не подделывает) при works=True
+    эскалирует вердикт в proxy-broken: посредник доказанно не смог форвардить — туннель
+    умер между плечами (гонка/флап #315); fail-closed без ложной тревоги (#82);
+  - неподписанный сбой plain-HTTP (000/таймаут/настоящий 5xx домена) вердикт НЕ меняет:
+    plain-HTTP сам по себе шумнее (GFW-класс сетей), http-флап не красит канал сильнее,
+    чем TLS-пара.
+
 Probe-канон: НИКОГДА не бросает; при внутреннем сбое works=None (не False — неизвестность
 не равна поломке).
 """
@@ -112,17 +125,34 @@ def _classify(direct, via):
     return "both-down", False, "down"
 
 
-def proxy_effective_probe(*, host=None, channel="socks"):
-    """Прямой vs через-прокси замер одного домена. Не бросает.
+def _escalate(verdict, works, status, arm):
+    """Эскалация вердикта подписью посредника с plain-HTTP-плеча (#325). Чистая.
+
+    works=True-вердикт («канал доказан» ответом https-плеча) опровергается подписанной
+    синтетикой privoxy: в тот же момент посредник не смог форвардить plain-GET — туннель
+    умер между плечами (гонка/флап #315). fail-closed: magic-даты подписи ambient-шум
+    не подделывает, поэтому обычный http-шум (#82) эскалации не порождает.
+    works=False не меняется (вердикт уже down); works=None сюда не доходит (unknown
+    выходит раньше), проверка на всякий случай та же.
+    """
+    if works and arm is not None and _is_synthetic_middleware_5xx(arm):
+        return "proxy-broken", False, "down"
+    return verdict, works, status
+
+
+def proxy_effective_probe(*, host=None, channel="socks", http_arm=True):
+    """Прямой vs через-прокси замер одного домена (+ plain-HTTP-плечо, #325). Не бросает.
 
     {status: ok|warn|down|unknown, verdict, works: bool|None, host, channel,
-     direct: {code, ms, up}, proxy: {code, ms, up, synthetic_5xx}, detail}
+     direct: {code, ms, up}, proxy: {code, ms, up, synthetic_5xx},
+     http_arm: {code, ms, up, synthetic_5xx}|None, detail}
 
-    Граница применимости guard'а #323: зонд меряет https://-плечо, где синтетика
-    посредника не доходит до кода (провал CONNECT = code=000) — guard там инертен и не
-    меняет вердикты. Оживает он на http://-целях (сегодня у зонда их нет — запасной
-    фикс #323; via-замер уже собирает заголовки, так что любому будущему http-плечу
-    guard доступен без изменений).
+    Вердиктным источником остаётся ПАРА https-замеров (канон #207 нетронут — контрольный
+    тест vendor-outage зелёный без правок). http_arm — диагностическое плечо #325:
+    plain-HTTP-замер через privoxy, где синтетика посредника доходит до кода и guard #323
+    операционно достижим (на https-плече она застревает в CONNECT = code=000). Его
+    подпись эскалирует works=True-вердикт в proxy-broken (_escalate), неподписанный сбой
+    не меняет ничего. http_arm=False отключает плечо (контракт прежних потребителей).
     """
     host = host or DEFAULT_HOST
     proxy_url = _CHANNEL_PROXY.get(channel, _SOCKS_PROXY_URL)
@@ -136,6 +166,26 @@ def proxy_effective_probe(*, host=None, channel="socks"):
         # Наружу — булев флаг, НЕ сырые заголовки: они не должны утекать в метрики/логи.
         via_public = {k: v for k, v in via.items() if k != "headers"}
         via_public["synthetic_5xx"] = _is_synthetic_middleware_5xx(via)
+        arm_public, arm_synthetic = None, False
+        if http_arm:
+            # Диагностическое плечо #325 — всегда через privoxy-запись реестра: только она
+            # plain-HTTP-посредник (research #301), а прод-вызов панели channel="socks"
+            # иначе guard'а не достигает. Это НЕ путь потребителя — не путать с via-плечем.
+            arm = _curl_through(f"http://{host}/", proxy=True,
+                                proxy_url=_CHANNEL_PROXY["http"], capture_headers=True)
+            arm_public = {k: v for k, v in arm.items() if k != "headers"}
+            arm_synthetic = _is_synthetic_middleware_5xx(arm)
+            arm_public["synthetic_5xx"] = arm_synthetic
+            verdict, works, status = _escalate(verdict, works, status, arm)
+        if arm_synthetic and arm_public is not None:
+            # Подпись посредника объясняет ЛЮБОИЙ итоговый down-вердикт — и эскалированный
+            # (works=True -> proxy-broken), и уже-broken пару: виновник назван по факту.
+            # (arm_public здесь всегда dict — синтетика без словаря плеча невозможна.)
+            detail = (f"{host}: через прокси пришёл синтетический "
+                      f"{arm_public.get('code', '?')} от самого прокси (мёртвый upstream, "
+                      f"plain-HTTP-замер) — туннель не работает")
+        else:
+            detail = _detail(verdict, host, direct, via_public)
         return {
             "status": status,
             "verdict": verdict,
@@ -145,7 +195,8 @@ def proxy_effective_probe(*, host=None, channel="socks"):
             "proxy_url": proxy_url,
             "direct": direct,
             "proxy": via_public,
-            "detail": _detail(verdict, host, direct, via_public),
+            "http_arm": arm_public,
+            "detail": detail,
         }
     except Exception as e:  # noqa: BLE001 — probe-канон: boundary catch-all, честный unknown
         return {
