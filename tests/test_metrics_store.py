@@ -236,3 +236,18 @@ def test_summarize_no_baseline_means_insufficient_trend():
     out = metrics_store.summarize(window, now=now)
     assert out["trend"] == "insufficient"
     assert out["latest"]["total_ms"] == 500.0
+
+
+def test_summarize_ignores_events_from_the_future():
+    """Регресс: без нижней границы окна события «из будущего» относительно now
+    (ретроспективный анализ) разбавляли failure_rate всей последующей историей —
+    живой инцидент 30 минут сплошных connection-failed рисовался как fail=0.077."""
+    incident = 1_000_000.0
+    events = [_event(incident - 60.0 * i, status="connection-failed", total_ms=None)
+              for i in range(1, 13)]                      # 12 сплошных фейлов до now
+    events += [_event(incident + 3600.0 * 24 * i, total_ms=200)
+               for i in range(1, 60)]                     # «будущее»: сутки, двое, ...
+    out = metrics_store.summarize(events, now=incident)
+    assert out["latest"]["samples"] == 12
+    assert out["latest"]["failure_rate"] == 1.0
+    assert out["trend"] == "degraded"
