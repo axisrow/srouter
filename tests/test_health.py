@@ -4082,6 +4082,37 @@ def test_privoxy_log_check_debug_1_url_level_flagged_as_sensitive(tmp_path):
     assert "debug 1" in res["detail"]
 
 
+def test_privoxy_log_check_unparseable_config_is_not_ok(tmp_path, monkeypatch):
+    """#309 (1.3) красный: конфиг не парсится (ValueError) → НЕ ok.
+
+    Двойной fail-open: ValueError парсера → directives={} → debug=0 → ok «молчаливый» — нечитаемый
+    конфиг неотличим от осознанно тихого (канон detector-must-be-function-not-constant, форма B).
+    """
+    layout = _privoxy_tmp_layout(tmp_path, debug=0)
+
+    def boom(text):
+        raise ValueError("bad or duplicate directive")
+
+    monkeypatch.setattr(health.privoxy_system, "_config_directives", boom)
+    res = health._privoxy_log_observability_check(layout=layout)
+    assert res["status"] == "warn", f"нечитаемый конфиг прочитан как «молчаливый»: {res}"
+    assert "нечитаем" in res["detail"].lower() or "не парсится" in res["detail"].lower(), res["detail"]
+
+
+def test_privoxy_log_check_non_numeric_debug_is_not_ok(tmp_path):
+    """#309 (1.3) красный: debug нечисловой (int ValueError) → НЕ ok, warn «конфиг нечитаем»."""
+    config_path = tmp_path / "config"
+    config_path.write_text("debug bananas\nlogfile logfile\n", encoding="utf-8")
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / "logfile").write_bytes(b"")
+    layout = privoxy_system.ProtectedLayout(config_path=config_path, log_dir=log_dir)
+
+    res = health._privoxy_log_observability_check(layout=layout)
+    assert res["status"] == "warn", f"мусорный debug прочитан как «молчаливый»: {res}"
+    assert "debug" in res["detail"].lower(), res["detail"]
+
+
 def test_check_all_has_privoxy_log_check_info_only(monkeypatch):
     """privoxy-log observability чек присутствует в doctor (active_claude), info-only, не роняет вердикт."""
     _all_up_monkey(monkeypatch, probe_status="ok")
