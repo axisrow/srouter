@@ -73,15 +73,18 @@ def _launchd_field(output, key):
 
 
 def _port_up(port):
-    """Слушает ли кто-то TCP порт (быстро, без сети). True/False."""
-    if port == PRIVOXY_PORT and privoxy_system.protection_present():
-        # macOS скрывает fd system-daemon пользователя `nobody` от обычного `lsof`, поэтому после
-        # #122 lsof даёт ложный down. Loopback connect проверяет именно доступность 8118 без sudo.
-        return sys_probe.port_open("127.0.0.1", port, timeout=0.5)
+    """Слушает ли кто-то TCP порт (быстро, без сети). True/False.
+
+    #309 (1.4): единый путь для ВСЕХ портов — раньше connect-обход lsof-слепоты был
+    спец-случаем только для 8118 при protection_present. macOS скрывает fd system-daemon
+    (nobody/root) от обычного `lsof` (#122), поэтому lsof-пусто (и timeout) НЕ доказывает
+    «не слушает»: арбитр — loopback connect, проверяющий доступность порта без sudo
+    (канон detector-must-be-function-not-constant: lsof-слепота ≠ down). lsof-попадание —
+    up без connect (лишний сокет в пробы демонов не нужен)."""
     r = sys_probe.run([LSOF, "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"], timeout=3)
-    if r.get("timeout"):
-        return False
-    return bool((r.get("out") or "").strip())
+    if not r.get("timeout") and (r.get("out") or "").strip():
+        return True
+    return sys_probe.port_open("127.0.0.1", port, timeout=0.5)
 
 
 # ============================ #204: локальный прокси service-status ============================

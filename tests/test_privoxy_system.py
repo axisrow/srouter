@@ -1042,18 +1042,21 @@ def test_health_lifecycle_switches_privoxy_to_system_domain(monkeypatch):
 
 
 def test_health_checks_protected_privoxy_with_loopback_connect_not_lsof(monkeypatch):
+    """#309 (1.4): вердикт protected-privoxy НЕ зависит от lsof-видимости.
+
+    Старый контракт («lsof не зовётся вовсе» — спец-случай только для 8118) заменён единым
+    путём: lsof-слепота (root-fd скрыт, #122) НЕ читается как down — арбитр loopback connect
+    для ЛЮБОГО порта. Инвариант прежний: слепой lsof не решает вердикт."""
     monkeypatch.setattr(privoxy_system, "protection_present", lambda: True)
     calls = []
     monkeypatch.setattr(
         health.sys_probe,
         "port_open",
-        lambda host, port, timeout: calls.append((host, port, timeout)) or True,
+        lambda host, port, timeout=0.5: calls.append((host, port, timeout)) or True,
     )
-    monkeypatch.setattr(
-        health.sys_probe,
-        "run",
-        lambda *args, **kwargs: pytest.fail("protected Privoxy must not depend on lsof visibility"),
-    )
+    # lsof слеп к root-fd: пусто, rc=1 (#122) — это НЕ «не слушает».
+    monkeypatch.setattr(health.sys_probe, "run",
+                        lambda *args, **kwargs: {"rc": 1, "out": "", "err": ""})
 
     assert health._port_up(health.PRIVOXY_PORT) is True
     assert calls == [("127.0.0.1", health.PRIVOXY_PORT, 0.5)]

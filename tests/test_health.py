@@ -5039,3 +5039,49 @@ def test_record_watchdog_lifecycle_state_write_is_atomic(monkeypatch, tmp_path):
     assert spy_calls and spy_calls[0] == state_file, (
         "lifecycle-state обязан писаться через _write_watchdog_state (канон atomic), "
         "не write_text напрямую")
+
+
+# ============================ #309 (1.4): _port_up — lsof-слепота, единый путь ============================
+
+def test_port_up_connect_fallback_when_lsof_blind(monkeypatch):
+    """#309 (1.4) красный: lsof пуст (root-fd скрыт, #122) + connect отвечает → port UP.
+
+    Раньше connect-обход был спец-случаем только для 8118 при protection_present: любой ДРУГОЙ
+    порт, уехавший под root, давал бы молчаливый ложный down. lsof-пусто НЕ доказывает «не
+    слушает» — арбитр для всех портов один: loopback connect (канон
+    detector-must-be-function-not-constant)."""
+    import health_probes
+
+    monkeypatch.setattr(health_probes.sys_probe, "run",
+                        lambda cmd, timeout=None: {"rc": 1, "out": ""})  # lsof слеп
+    monkeypatch.setattr(health_probes.sys_probe, "port_open",
+                        lambda host, port, timeout=0.5: True)  # порт реально отвечает
+    assert health_probes._port_up(9999) is True, "lsof-слепота прочитана как down"
+
+
+def test_port_up_still_down_when_lsof_blind_and_connect_refused(monkeypatch):
+    """Симметрия: lsof пуст И connect отказан → down (ничего не слушает — прежняя семантика)."""
+    import health_probes
+
+    monkeypatch.setattr(health_probes.sys_probe, "run",
+                        lambda cmd, timeout=None: {"rc": 1, "out": ""})
+    monkeypatch.setattr(health_probes.sys_probe, "port_open",
+                        lambda host, port, timeout=0.5: False)
+    assert health_probes._port_up(9999) is False
+
+
+def test_port_up_lsof_hit_short_circuits_without_connect(monkeypatch):
+    """lsof видит слушателя → up без connect (не долбить лишним сокетом в пробы демонов)."""
+    import health_probes
+
+    monkeypatch.setattr(health_probes.sys_probe, "run",
+                        lambda cmd, timeout=None: {"rc": 0, "out": "xray 1234 user 4u IPv4 ... LISTEN"})
+    called = []
+
+    def _no_connect(host, port, timeout=0.5):
+        called.append(port)
+        return False
+
+    monkeypatch.setattr(health_probes.sys_probe, "port_open", _no_connect)
+    assert health_probes._port_up(10808) is True
+    assert not called, "lsof-попадание не должно долбить connect'ом"
