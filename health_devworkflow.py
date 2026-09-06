@@ -106,6 +106,8 @@ def _github_direct_check():
     Возвращает {status, detail}:
       ok      — git-config github-proxy выключен (github уже идёт напрямую);
       warn    — git-config ВКЛЮЧЁН (scoped github → privoxy) → git зависит от VPS, подсказка env -u;
+                ИЛИ state=foreign — указан ПОСТОРОННИЙ прокси (#309: enabled=False не различает
+                «выключено» и «чужое»; канон detector-must-be-function-not-constant);
       unknown — git_proxy.status unknown/ошибка (git config timeout/недоступен).
     Не бросает (probe-канон).
     """
@@ -123,6 +125,16 @@ def _github_direct_check():
         return {"status": "unknown",
                 "detail": "git config недоступен (timeout) — github-direct check пропущен"}
     enabled = bool(st.get("enabled"))
+    # #309 (1.1): enabled=False склеивает absent и foreign — чужой прокси печатался как «выключен,
+    # идёт напрямую». Корень починен в #307/PR #328 (state: absent/managed-on/foreign) — читаем его.
+    # Старые моки/потребители без ключа state (старый контракт) трактуем по enabled как раньше.
+    state = st.get("state")
+    if state == "foreign":
+        return {"status": "warn",
+                "detail": f"git github-proxy указывает на ЧУЖОЙ прокси ({st.get('proxy') or '?'}) — "
+                          f"git ходит через посторонний посредник, НЕ srouter-стек. Если это не "
+                          f"осознанная настройка — снять: git config --global --unset {st.get('key') or 'http.https://github.com.proxy'}. "
+                          + GH_DIRECT_HINT}
     if not enabled:
         return {"status": "ok",
                 "detail": "git github-proxy выключен — github идёт напрямую (VPS-независимо). "

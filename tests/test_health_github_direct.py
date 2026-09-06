@@ -104,7 +104,39 @@ def test_hint_does_not_promise_gh_repo_clone_is_proxy_free(monkeypatch):
         assert "git -c" in detail, "clone через gh делегирует git → нужен git -c для scoped proxy"
 
 
-def test_unknown_when_git_proxy_status_unknown(monkeypatch):
+def test_foreign_proxy_is_not_ok_not_off(monkeypatch):
+    """#309 (1.1) красный: state=foreign — git ходит через ПОСТОРОННИЙ прокси, чек обязан НЕ
+    говорить «выключен — идёт напрямую» и НЕ давать ok.
+
+    Живой эксперимент (2026-09-05, issue-комментарий): прописали чужой прокси на github →
+    git_proxy.status() честно вернул state="foreign", а чек ответил ok «git github-proxy выключен —
+    github идёт напрямую». enabled=False склеивает absent/foreign — ложная уверенность
+    (канон detector-must-be-function-not-constant, форма B). Корень (state) починен в #328/PR #328,
+    консьюмер обязан им пользоваться.
+    """
+    monkeypatch.setattr(git_proxy, "status",
+                        lambda: {"enabled": False, "present": True, "multi": False,
+                                 "proxy": "http://corp-proxy.example.com:8080",
+                                 "values": ["http://corp-proxy.example.com:8080"],
+                                 "key": "http.https://github.com.proxy", "state": "foreign"})
+    res = health._github_direct_check()
+    assert res["status"] != "ok", f"foreign прокси прочитан как «выключен»: {res}"
+    assert res["status"] in ("warn", "down")
+    detail = res["detail"].lower()
+    assert "чужой" in detail or "foreign" in detail or "посторонн" in detail, res["detail"]
+    assert "corp-proxy.example.com" in res["detail"], "detail обязан назвать фактический прокси"
+
+
+def test_managed_on_state_keeps_warn(monkeypatch):
+    """Симметрия: state=managed-on (свой managed-прокси) → warn «зависит от VPS», как раньше."""
+    monkeypatch.setattr(git_proxy, "status",
+                        lambda: {"enabled": True, "present": True, "multi": False,
+                                 "proxy": "socks5h://127.0.0.1:10808",
+                                 "values": ["socks5h://127.0.0.1:10808"],
+                                 "key": "http.https://github.com.proxy", "state": "managed-on"})
+    res = health._github_direct_check()
+    assert res["status"] == "warn"
+    assert "env -u" in res["detail"].lower()
     """git_proxy.status unknown (git config timeout) → unknown (info-only, не роняет)."""
     monkeypatch.setattr(git_proxy, "status",
                         lambda: {"enabled": False, "proxy": "", "key": "http.https://github.com.proxy",
