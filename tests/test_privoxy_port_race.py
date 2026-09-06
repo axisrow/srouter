@@ -20,6 +20,10 @@
 состояние порта (через port_checker), не фиксированный sleep.
 """
 from pathlib import Path
+import os
+import subprocess
+import tempfile
+import unittest
 
 import install_config
 import install_lib
@@ -51,6 +55,55 @@ def test_privoxy_whitelist_excludes_feature_gated_https_inspection_directives():
                      "ca-password", "certificate-directory", "cipher-list", "trusted-cas-file"}
     leaked = sorted(feature_gated & install_lib.PRIVOXY_KNOWN_DIRECTIVES)
     assert not leaked, f"feature-gated HTTPS-Inspection директивы не должны быть в whitelist: {leaked}"
+
+
+def test_privoxy_whitelist_excludes_phantom_directives():
+    """#309 (1.6) красный: 4 директивы whitelist НЕ существуют в privoxy 4.2.0.
+
+    Эмпирика (verify 2026-09-05, `privoxy --config-test`, read-only): каждая из них даёт
+    "Ignoring unrecognized directive", идентично bogus-контролю; эталонная listen-backlog
+    распознаётся. Метод: privoxy сверяет hash-коды, `strings` по бинарю неинформативен.
+    Это ровно симптом, ради которого whitelist заведён (#115) — дыра в гварде.
+    """
+    phantom = {"temporary-directory", "enable-accept-filter", "enable-compression",
+               "compression-level"}
+    leaked = sorted(phantom & install_lib.PRIVOXY_KNOWN_DIRECTIVES)
+    assert not leaked, f"несуществующие в privoxy 4.2.0 директивы в whitelist: {leaked}"
+
+
+@unittest.skipUnless(os.path.isfile("/opt/homebrew/sbin/privoxy"),
+                     "privoxy недоступен (CI/sandbox) — skip live config-test sync")
+def test_privoxy_whitelist_matches_live_config_test():
+    """#309 (1.6): живой гвард синхронизации — КАЖДАЯ whitelist-директива проходит
+    `privoxy --config-test` (read-only, демон не стартует) БЕЗ "unrecognized directive".
+
+    По одной директиве за прогон: общий конфиг невалиден (разнородные типы значений —
+    client-specific-tag требует описание и падает fatal ДО разбора остальных, что даёт
+    вакуумный зелёный). Значение «0» может быть семантически невалидным для части
+    директив (файлы/спеки) — это НЕ unrecognized, гвард ловит только факт распознавания.
+    Первоисточник семантики — сам privoxy этой версии (канон probe-semantics-from-primary-
+    source): список ведётся по --config-test, не по документации/strings (privoxy сверяет
+    hash-коды — strings по бинарю неинформативен).
+    """
+    unrecognized = []
+    for directive in sorted(install_lib.PRIVOXY_KNOWN_DIRECTIVES):
+        with tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False) as fh:
+            fh.write(f"{directive} 0\n")
+            path = fh.name
+        try:
+            proc = subprocess.run(
+                ["/opt/homebrew/sbin/privoxy", "--no-daemon", "--config-test", path],
+                capture_output=True, text=True, timeout=30,
+            )
+        finally:
+            os.unlink(path)
+        combined = proc.stdout + proc.stderr
+        if "unrecognized directive" in combined:
+            unrecognized.append(directive)
+    assert not unrecognized, (
+        "whitelist содержит директивы, которые privoxy 4.2.0 не распознаёт:\n  "
+        + "\n  ".join(unrecognized)
+    )
 
 
 def test_privoxy_whitelist_includes_directives_used_by_template():

@@ -52,7 +52,8 @@ PRIVOXY_KNOWN_DIRECTIVES = frozenset({
     # 7.1 Local Set-up Documentation
     "user-manual", "trust-info-url", "admin-address", "proxy-info-url",
     # 7.2 Configuration and Log File Locations
-    "confdir", "templdir", "temporary-directory", "logdir", "actionsfile",
+    # (#309 1.6: temporary-directory НЕ существует в privoxy 4.2.0 — убран по --config-test)
+    "confdir", "templdir", "logdir", "actionsfile",
     "filterfile", "logfile", "trustfile",
     # 7.3 Debugging
     "debug", "single-threaded", "hostname",
@@ -65,10 +66,14 @@ PRIVOXY_KNOWN_DIRECTIVES = frozenset({
     "forward", "forward-socks4", "forward-socks4a", "forward-socks5", "forward-socks5t",
     "forwarded-connect-retries",
     # 7.6 Miscellaneous
+    # (#309 1.6: enable-accept-filter / enable-compression / compression-level НЕ существуют
+    #  в privoxy 4.2.0 (brew) — --config-test даёт "unrecognized directive"; убраны.
+    #  Синхронизация whitelist ↔ реальный privoxy гвардится живым тестом
+    #  test_privoxy_whitelist_matches_live_config_test.)
     "accept-intercepted-requests", "allow-cgi-request-crunching", "split-large-forms",
     "keep-alive-timeout", "tolerate-pipelining", "default-server-timeout", "connection-sharing",
-    "socket-timeout", "max-client-connections", "listen-backlog", "enable-accept-filter",
-    "handle-as-empty-doc-returns-ok", "enable-compression", "compression-level",
+    "socket-timeout", "max-client-connections", "listen-backlog",
+    "handle-as-empty-doc-returns-ok",
     "client-header-order", "client-specific-tag", "client-tag-lifetime", "trust-x-forwarded-for",
     "receive-buffer-size",
 })
