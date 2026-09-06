@@ -599,6 +599,55 @@ def test_rotate_event_log_trims_oldest_fresh_lines_on_size_cap(tmp_path):
     assert kept_seqs == list(range(60 - len(kept), 60)), "срезан СТАРЫЙ хвост, новый цел"
 
 
+def test_rotate_event_log_window_ge_one_never_empties_journal(tmp_path):
+    """Window ≥ 1 (канон PR-2 «единственное поколение неприкосновенно»): degenerate
+    max_bytes меньше одной записи НЕ опустошает журнал — держится новейшая запись.
+    Повторная ротация не переписывает файл тем же содержанием (no-op, не hourly-burn)."""
+    layout = _layout(tmp_path)
+    layout.event_log_path.parent.mkdir(parents=True)
+    lines = [json.dumps({"captured_at": f"2026-09-06T00:0{i}:00+00:00", "seq": i})
+             for i in range(3)]
+    layout.event_log_path.write_text("".join(l + "\n" for l in lines), encoding="utf-8")
+
+    first = privoxy_audit.rotate_event_log(
+        layout, retention_days=30, max_bytes=10,
+        now=datetime(2026, 9, 6, 12, tzinfo=timezone.utc).timestamp(),
+        chown=lambda path, uid, gid: None)
+    after_first = layout.event_log_path.read_text(encoding="utf-8").splitlines()
+    mtime_first = layout.event_log_path.stat().st_mtime_ns
+
+    second = privoxy_audit.rotate_event_log(
+        layout, retention_days=30, max_bytes=10,
+        now=datetime(2026, 9, 6, 12, tzinfo=timezone.utc).timestamp(),
+        chown=lambda path, uid, gid: None)
+
+    assert first is True and second is True
+    assert len(after_first) == 1, "минимум одна новейшая запись переживает бюджет"
+    assert json.loads(after_first[0])["seq"] == 2
+    assert layout.event_log_path.stat().st_mtime_ns == mtime_first, \
+        "неуменьшаемый файл не переписывается тем же содержанием каждый час"
+
+
+def test_rotate_event_log_size_trim_may_drop_corrupt_line(tmp_path):
+    """Прецеденс контрактов (review finding 3): возрастная чистка сохраняет битые
+    строки-улики, но байтовый бюджет — ЖЁСТКАЯ граница и срезает старейшее без
+    разбора валидности (иначе corrupt-потолк мог бы выселять валидные записи)."""
+    layout = _layout(tmp_path)
+    layout.event_log_path.parent.mkdir(parents=True)
+    corrupt = "x" * 400 + "-not-json"
+    fresh = json.dumps({"captured_at": "2026-09-06T00:00:00+00:00", "seq": 1})
+    layout.event_log_path.write_text(corrupt + "\n" + fresh + "\n", encoding="utf-8")
+
+    ok = privoxy_audit.rotate_event_log(
+        layout, retention_days=30, max_bytes=300,
+        now=datetime(2026, 9, 6, 12, tzinfo=timezone.utc).timestamp(),
+        chown=lambda path, uid, gid: None)
+
+    assert ok is True
+    kept = layout.event_log_path.read_text(encoding="utf-8").splitlines()
+    assert kept == [fresh], "бюджет срезал старейшую corrupt-строку, валидная цела"
+
+
 def test_rotate_event_log_failure_keeps_file_intact(tmp_path, monkeypatch):
     layout = _layout(tmp_path)
     layout.event_log_path.parent.mkdir(parents=True)

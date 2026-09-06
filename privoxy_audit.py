@@ -413,10 +413,13 @@ def rotate_event_log(layout=DEFAULT_LAYOUT, *, retention_days=None, max_bytes=No
     открывается заново на каждое событие (_append_event), поэтому replace НЕ осиротивает
     записи. Вызывается ТОЛЬКО между событиями.
 
-    ОТЛИЧИЕ от metrics-канона: битые строки СОХРАНЯЮТСЯ — audit-журнал не теряет улики
-    (вырезается только доказанно протухшее по валидному captured_at). Сбой → False и
-    существующий файл нетронут. Fresh-голова + размер в лимите → early-exit без rewrite.
-    Не бросает."""
+    ОТЛИЧИЕ от metrics-канона: битые строки СОХРАНЯЮТСЯ возрастной чисткой — audit-журнал
+    не теряет улики (вырезается только доказанно протухшее по валидному captured_at).
+    ПРЕЦЕДЕНС: байтовый бюджет — ЖЁСТКАЯ граница поверх этого: при перевесе срезаются
+    старейшие строки без разбора валидности (иначе corrupt-потолк выселял бы валидные
+    записи из бюджета); новейшая запись неприкосновенна и при degenerate max_bytes
+    (window ≥ 1, канон PR-2). Сбой → False и существующий файл нетронут. Fresh-голова +
+    размер в лимите → early-exit без rewrite. Не бросает."""
     path = layout.event_log_path
     try:
         retention_days = (max(1, int(retention_days)) if retention_days is not None
@@ -453,17 +456,23 @@ def rotate_event_log(layout=DEFAULT_LAYOUT, *, retention_days=None, max_bytes=No
         # Байтовый бюджет: перевес при полностью свежих строках срезает СТАРЕЙШИЕ
         # (журнал append-only, монотонен) — rewrite обязан уменьшить файл, а не
         # переписывать то же содержание каждый час (канон размера из метрик).
+        # Прецеденс контрактов: возрастная чистка сохраняет битые строки-улики,
+        # байтовый бюджет — ЖЁСТКАЯ граница, срезающая старейшее без разбора
+        # валидности (иначе corrupt-потолк выселял бы валидные записи).
+        # Window ≥ 1 (канон PR-2): новейшая запись неприкосновенна даже при
+        # degenerate max_bytes меньше одной записи — журнал не опустошается.
         kept_bytes = sum(len(l.encode("utf-8")) + 1 for l in kept)
-        if kept_bytes > max_bytes:
+        if kept_bytes > max_bytes and len(kept) > 1:
             tail_bytes, tail_start = 0, len(kept)
             while tail_start > 0:
                 tail_bytes += len(kept[tail_start - 1].encode("utf-8")) + 1
                 if tail_bytes > max_bytes:
                     break
                 tail_start -= 1
+            tail_start = min(tail_start, len(kept) - 1)  # window ≥ 1: новейшая неприкосновенна
             dropped += tail_start
             kept = kept[tail_start:]
-        if dropped == 0 and size <= max_bytes:
+        if dropped == 0 and (size <= max_bytes or len(kept) <= 1):
             return True
         return _atomic_write(path, "".join(l + "\n" for l in kept).encode("utf-8"),
                              mode=0o600, uid=0, gid=0, chown=chown)
