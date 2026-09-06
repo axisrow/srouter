@@ -56,6 +56,7 @@ from health_codex import *  # noqa: F401,F403 re-export — Codex detection/bina
 from health_codenv import *  # noqa: F401,F403 re-export — codenv/desktop/app-proxy (канон #158)
 from health_devworkflow import *  # noqa: F401,F403 re-export — VSCode/gh/git dev-workflow (канон #158)
 from health_endpoint import *  # noqa: F401,F403 re-export — ANTHROPIC_BASE_URL endpoint (канон #158)
+from health_backups import *  # noqa: F401,F403 re-export — бэкап-слоты консистентность (#339 PR-3)
 
 _log = logging.getLogger("srouter.health")
 
@@ -196,6 +197,13 @@ def check_all(*, active_claude=False):
     bp = _local_proxy_boot_persistence()
     checks.append({"name": "локальный прокси (persists-across-boot)",
                    "ok": bp["status"] == "ok", "info": True, "detail": bp["detail"]})
+    # #339 PR-3: бэкап-слоты консистентны (сирота-sidecar / stale-pointer / orphaned /
+    # накопление / смешение слотов). Info-only ВСЕГДА (как persists-across-boot выше):
+    # бэкап-слоты не влияют на канал в моменте, но warn требует внимания оператора —
+    # «нашёл/ожидал» в detail, ничего не удаляем и не чиним сами.
+    bs = _backup_slots_probe()
+    checks.append({"name": "бэкап-слоты (консистентность)",
+                   "ok": bs["status"] != "warn", "info": True, "detail": bs["detail"]})
     # Claude Code РЕАЛЬНО использует прокси? runtime (lsof), не файл. unknown (CC не запущен) →
     # info-only, не driver: проверять «CC юзает прокси» бессмысленно, если CC не работает.
     cp = _claude_proxy_probe()
