@@ -137,6 +137,9 @@ def test_managed_on_state_keeps_warn(monkeypatch):
     res = health._github_direct_check()
     assert res["status"] == "warn"
     assert "env -u" in res["detail"].lower()
+
+
+def test_unknown_when_git_proxy_status_unknown(monkeypatch):
     """git_proxy.status unknown (git config timeout) → unknown (info-only, не роняет)."""
     monkeypatch.setattr(git_proxy, "status",
                         lambda: {"enabled": False, "proxy": "", "key": "http.https://github.com.proxy",
