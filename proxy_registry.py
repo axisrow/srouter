@@ -419,14 +419,17 @@ def apply(ids=None, *, action, force=False):
     Вайтлист id и action ДО любой мутации (канон: мутирующий путь валидирует по вайтлисту).
     Неуправляемый потребитель -> честный отказ, а не молчаливый успех.
 
-    АТОМАРНОСТЬ (issue #303): stop-on-first-error + компенсирующий rollback. Первая
-    неудавшаяся мутация (включая conflict) останавливает применение — не расширяем частично
-    изменённое состояние (fail-closed); всё УЖЕ применённое откатывается обратным действием
-    (enable -> disable, disable -> enable(force=True): восстанавливаем собственное только что
-    снятое значение, conflict-гейт не имеет права блокировать восстановление). Отчитываемся
-    явно: applied / rolled_back / rollback_errors / failed / unattempted — partial-состояние
-    не может быть тихим (noisy-log-better-than-no-log). Ошибки rollback НЕ глотаются:
-    rollback_errors непустой -> ok=False.
+    АТОМАРНОСТЬ (issue #303): валидация ДО мутаций (action, id, manageability), затем
+    stop-on-first-error + компенсирующий rollback. Первая неудавшаяся мутация (включая
+    conflict) останавливает применение — не расширяем частично изменённое состояние
+    (fail-closed). Откат восстанавливает ИСХОДНОЕ состояние (review #347): pre-state
+    снимается через status_fn до мутации; откатывается только реально изменённое
+    (enable -> disable_fn для был-выключен; disable -> enable(force=True) для был-включён-НАШ);
+    уже-включённый потребитель не выключается откатом, foreign/mixed pre-state не
+    перезаписывается force-восстановлением (#307), нечитаемый pre-state — честный skip.
+    Отчитываемся явно: applied / rolled_back / rollback_errors / rollback_skipped / failed /
+    unattempted / partial — partial-состояние не может быть тихим. Ошибки и skips rollback
+    НЕ глотаются: они видны в ответе и в warning-логе; rollback_errors -> ok=False.
 
     force (issue #307) — осознанная перезапись чужого значения: реестр доносит его до
     enable_fn каждого потребителя; без force enable на foreign/mixed возвращает per-consumer
@@ -435,7 +438,7 @@ def apply(ids=None, *, action, force=False):
     if action not in _ACTIONS:
         return {"ok": False, "err": f"unknown action: {action!r}", "results": [],
                 "partial": False, "applied": [], "rolled_back": [], "rollback_errors": [],
-                "failed": None, "unattempted": []}
+                "rollback_skipped": [], "failed": None, "unattempted": []}
 
     if ids is None:
         targets = [c for c in CONSUMERS if c.manageable]
@@ -446,19 +449,32 @@ def apply(ids=None, *, action, force=False):
             if spec is None:
                 return {"ok": False, "err": f"unknown consumer: {cid!r}", "results": [],
                         "partial": False, "applied": [], "rolled_back": [],
-                        "rollback_errors": [], "failed": None, "unattempted": []}
+                        "rollback_errors": [], "rollback_skipped": [], "failed": None,
+                        "unattempted": []}
             targets.append(spec)
 
     results = []
-    applied_specs = []
+    applied = []          # [(spec, pre_state_dict)] — pre-state снимается ДО мутации
     failed = None
-    refused = False
+
+    # Review #347: manageability-проверка — В фазе валидации, до любых мутаций (канон
+    # «мутирующий путь валидирует по вайтлисту»). Иначе отказ unmanageable посреди цикла
+    # оставляет применённую половину без rollback при ok=False — тихий partial в обход #303.
     for spec in targets:
         if not spec.manageable:
-            refused = True
-            results.append({"id": spec.id, "ok": False,
-                            "err": f"{spec.title}: управление отсюда не поддерживается ({spec.note})"})
-            continue
+            return {"ok": False, "err": f"{spec.title}: управление отсюда не поддерживается ({spec.note})",
+                    "results": [{"id": spec.id, "ok": False,
+                                 "err": f"{spec.title}: управление отсюда не поддерживается ({spec.note})"}],
+                    "partial": False, "applied": [], "rolled_back": [], "rollback_errors": [],
+                    "rollback_skipped": [], "failed": None, "unattempted": []}
+
+    for spec in targets:
+        # Review #347: pre-state снимается ДО мутации — rollback обязан восстанавливать
+        # исходное состояние, а не слепо применять противоположное действие.
+        try:
+            pre = spec.status_fn() if spec.status_fn is not None else None
+        except Exception:  # noqa: BLE001 — нечитаемый pre-state честно попадёт в skip
+            pre = None
         fn = spec.enable_fn if action == "enable" else spec.disable_fn
         try:
             r = (fn(force=force) if action == "enable" else fn()) or {}
@@ -474,12 +490,20 @@ def apply(ids=None, *, action, force=False):
         if not entry["ok"]:
             failed = {"id": spec.id, "err": entry["err"]}
             break
-        applied_specs.append(spec)
+        applied.append((spec, pre))
 
-    # #303: компенсирующий rollback применённого — в обратном порядке.
-    rolled_back, rollback_errors = [], []
+    # #303: компенсирующий rollback применённого — в обратном порядке. Review #347:
+    # откатывается только РЕАЛЬНО изменённое (pre-state выключен при enable / включён и
+    # наш при disable); уже-включённый потребитель не выключается откатом, чужой pre-state
+    # (foreign/mixed) не перезаписывается force-восстановлением (#307).
+    rolled_back, rollback_errors, rollback_skipped = [], [], []
     if failed is not None:
-        for spec in reversed(applied_specs):
+        for spec, pre in reversed(applied):
+            skip = _rollback_skip_reason(action, pre)
+            if skip:
+                _log.warning("proxy_registry: rollback %s skipped: %s", spec.id, skip)
+                rollback_skipped.append({"id": spec.id, "reason": skip})
+                continue
             try:
                 if action == "enable":
                     ir = spec.disable_fn() or {}
@@ -497,12 +521,33 @@ def apply(ids=None, *, action, force=False):
     unattempted = [s.id for s in targets[failed_index + 1:]]
 
     return {
-        "ok": failed is None and not rollback_errors and not refused,
-        "partial": failed is not None and bool(applied_specs),
+        "ok": failed is None and not rollback_errors,
+        "partial": failed is not None and bool(applied),
         "results": results,
-        "applied": [s.id for s in applied_specs],
+        "applied": [s.id for s, _ in applied],
         "rolled_back": rolled_back,
         "rollback_errors": rollback_errors,
+        "rollback_skipped": rollback_skipped,
         "failed": failed,
         "unattempted": unattempted,
     }
+
+
+def _rollback_skip_reason(action, pre):
+    """Review #347: причина, по которой consumer НЕ откатывается (None = откатывать можно).
+
+    Слепая инверсия опасна в обе стороны: disable уже-включённого = новое разрушение
+    рабочего состояния; enable(force=True) поверх foreign = перезапись без consent (#307).
+    Нечитаемый pre-state — тоже skip: неизвестность не равна «изменилось» (verify-dont-guess).
+    """
+    if not isinstance(pre, dict) or pre.get("status") == "unknown" or "enabled" not in pre:
+        return "pre-state неизвестен — слепой откат опасен (review #347)"
+    enabled_pre = bool(pre.get("enabled"))
+    if action == "enable" and enabled_pre:
+        return "уже был включён до apply — откат выключил бы рабочее состояние"
+    if action == "disable":
+        if not enabled_pre:
+            return "уже был выключен до apply — восстанавливать нечего"
+        if pre.get("state") in ("foreign", "mixed"):
+            return f"pre-state {pre.get('state')} — force-перезапись чужого значения без consent (#307)"
+    return None
