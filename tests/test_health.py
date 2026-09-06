@@ -2953,6 +2953,10 @@ def _block_real_watchdog_lifecycle(monkeypatch, tmp_path):
     # тесты задают его явно через monkeypatch.setenv.
     monkeypatch.delenv(_COOLDOWN_ENV if hasattr(health, "_DEGRADED_NOTIFY_COOLDOWN_ENV")
                        else "SROUTER_WATCHDOG_DEGRADED_COOLDOWN", raising=False)
+    # #353 review P3: env формата разницы состава тоже — иначе ambient-шаблон без
+    # {added} или малый PUSH_MAX краснит тесты пуша независимо от кода.
+    monkeypatch.delenv("SROUTER_WATCHDOG_DEGRADED_DIFF_TEMPLATE", raising=False)
+    monkeypatch.delenv("SROUTER_WATCHDOG_DEGRADED_PUSH_MAX", raising=False)
 
 
 def test_watchdog_pushes_on_degraded_to_down(monkeypatch, tmp_path):
@@ -3505,7 +3509,10 @@ def test_watchdog_set_change_push_contains_diff_removed(monkeypatch, tmp_path):
         env={_COOLDOWN_ENV: "0"})
     health.cmd_watchdog()
     assert len(notified) == 1
-    assert "−туннель" in notified[0][0], "ушедший драйвер виден с маркером «−»"
+    # точное равенство (review P2): substring-assert пропускал ведущий «; » при
+    # пустой added-стороне («изменился (; −туннель)»)
+    assert notified[0][0] == "состав деградации изменился (−туннель)", \
+        "ушедший драйвер с маркером «−», без артефактов пустой added-стороны"
     assert "+" not in notified[0][0], "ничего не добавилось — плюс-части быть не должно"
 
 
@@ -3565,7 +3572,7 @@ def test_watchdog_status_jsonl_event_carries_explicit_diff(monkeypatch, tmp_path
 
 def test_degradation_diff_template_env(monkeypatch):
     """#353 п.4 (more-options-better): формат разницы параметризуется env; мусор → дефолт."""
-    monkeypatch.delenv(_DIFF_TEMPLATE_ENV, raising=False)
+    # env-скраб — в autouse-фикстуре _block_real_watchdog_lifecycle (канон #265)
     assert health._format_degradation_diff(["a", "b"], ["c"]) == "+a, +b; −c"
     monkeypatch.setenv(_DIFF_TEMPLATE_ENV, "добавлено: {added} / ушло: {removed}")
     assert health._format_degradation_diff(["a"], ["c"]) == "добавлено: +a / ушло: −c"
@@ -3581,7 +3588,7 @@ def test_degradation_diff_template_env(monkeypatch):
 
 def test_degradation_diff_push_len_limit(monkeypatch):
     """#353: пуш читается на телефоне — лимит длины с приоритетом added (ушлые кратко)."""
-    monkeypatch.delenv(_DIFF_TEMPLATE_ENV, raising=False)
+    # env-скраб — в autouse-фикстуре _block_real_watchdog_lifecycle (канон #265)
     monkeypatch.setenv(_DIFF_MAX_LEN_ENV, "40")
     added = ["driver-очень-длинный-00", "driver-очень-длинный-01", "driver-очень-длинный-02"]
     out = health._format_degradation_diff(added, ["gone-тоже-длинный-хвост"])
@@ -3590,9 +3597,23 @@ def test_degradation_diff_push_len_limit(monkeypatch):
     assert "др." in out or "ушед" in out, "не влезающее схлопнуто в счётчик"
 
 
+def test_watchdog_status_jsonl_legacy_prev_has_no_diff(monkeypatch, tmp_path):
+    """#353 review P3: legacy-строка в prev (failed=None) — событие status.jsonl
+    пишется БЕЗ ключа diff (разница неизвестна). Регрессия: снятие isinstance-гварда
+    тихо меняет схему audit-JSONL, которую читают форензика и ротация."""
+    _, status_log, _ = _wd315_watchdog_harness(
+        monkeypatch, tmp_path, "down", ["privoxy"],
+        prev_state="degraded", env={_COOLDOWN_ENV: "0"})
+    health.cmd_watchdog()
+    lines = [json.loads(line) for line in status_log.read_text(encoding="utf-8").splitlines()
+             if line.strip()]
+    assert len(lines) == 1, "degraded(legacy)→down — событие пишется"
+    assert "diff" not in lines[0], "legacy prev (набор неизвестен) — без diff-ключа"
+
+
 def test_degradation_diff_empty_set(monkeypatch):
     """#353: пустая разница — пустая строка (noop-путь не строит текст)."""
-    monkeypatch.delenv(_DIFF_TEMPLATE_ENV, raising=False)
+    # env-скраб — в autouse-фикстуре _block_real_watchdog_lifecycle (канон #265)
     assert health._format_degradation_diff([], []) == ""
 
 

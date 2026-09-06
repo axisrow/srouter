@@ -830,8 +830,10 @@ def _format_degradation_diff(added, removed):
         # в дефолт: битый env-шаблон не должен валить watchdog-тик (прод 24/7).
         except (AttributeError, KeyError, IndexError, ValueError):
             out = _DEGRADED_DIFF_TEMPLATE_DEFAULT.format(added=added_part, removed=removed_part)
-        # дефолтный «; » разделитель при пустой стороне не оставляет хвостов «; »
-        return out.strip().rstrip(";").strip()
+        # «; »-разделитель не оставляет хвостов при пустой стороне — ни хвостового,
+        # ни ВЕДУЩЕГО (review P2: "{added}; {removed}" с пустым added → "; −x");
+        # имена драйверов «;» не содержат, шаблоны без «;»-краёв не затронуты.
+        return out.strip().strip(";").strip()
 
     try:
         limit = max(40, min(1000, int(os.environ.get(_DEGRADED_DIFF_PUSH_MAX_LEN_ENV, ""))))
