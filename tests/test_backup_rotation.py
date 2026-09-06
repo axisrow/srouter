@@ -197,6 +197,43 @@ def test_apply_install_rotates_stale_generations_beyond_window(tmp_path):
     assert state["detected_environment"]["privoxy"]["backup"] == str(fresh)
 
 
+def test_apply_install_rotation_failure_surfaces_in_actions(tmp_path, monkeypatch):
+    """review #350 (noisy-log-better-than-no-log): сбой best-effort-ротации виден СРАЗУ —
+    в actions компонента (rotation.status=rotation_failed + пути), не только спустя циклы
+    в doctor-грани «накопление» PR-3."""
+    env = _env(tmp_path)
+    config_path = env.component_paths("privoxy")["config"]
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text("foreign config\n", encoding="utf-8")
+    stale = _seed_generations(config_path, [
+        "2026-01-01T000000Z", "2026-02-01T000000Z",
+        "2026-03-01T000000Z", "2026-04-01T000000Z",
+    ])
+    real_unlink = Path.unlink
+
+    def flaky_unlink(self, *args, **kwargs):
+        if self == stale[0]:
+            raise OSError("EPERM")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", flaky_unlink)
+
+    runner = FakeRunner()
+    result = install_lib.apply_install(
+        env=env,
+        confirm=True,
+        choices={"privoxy": "overwrite", "xray": "skip", "dnsmasq": "skip"},
+        runner=runner,
+        port_checker=_port_checker_managed_up(runner.calls),
+    )
+
+    assert result["ok"] is True, "best-effort: сбой чистки не роняет install"
+    privoxy_action = next(a for a in result["actions"] if a.get("component") == "privoxy")
+    assert privoxy_action["rotation"]["status"] == "rotation_failed"
+    assert privoxy_action["rotation"]["failed"] == [str(stale[0])]
+    assert stale[0].exists(), "сбойное поколение не удалено, но и не потеряно из report"
+
+
 def test_apply_install_rotation_env_keep_zero_disables(tmp_path, monkeypatch):
     """SROUTER_BACKUP_KEEP=0 действует и через install-путь: поколения не трогаются
     (осознанное «хранить всё» — контракт §3, канон more-options-better)."""

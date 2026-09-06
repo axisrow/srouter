@@ -10,6 +10,7 @@ InstallEnv (env-переменные → runtime paths), маркер-детек
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from dataclasses import dataclass
@@ -37,6 +38,8 @@ from install_plist import (
 MARKER = "srouter-managed"
 TEXT_MARKER = "srouter-managed-config-v1"
 ROOT = Path(__file__).resolve().parent
+
+_log = logging.getLogger("srouter.install_config")
 
 # Whitelist директив privoxy 4.2.0, гарантированно распознаваемых базовой сборкой. Строгий
 # первоисточник — privoxy 4.2.0 user-manual (https://www.privoxy.org/user-manual/config.html),
@@ -1069,10 +1072,24 @@ def apply_install(env=None, *, confirm=False, choices=None, runner=run, port_che
         # Ротация поколений (PR-2 #339, контракт §3): effect уже зафиксирован, свежее
         # поколение названо в state — старые сверх окна можно чистить. Поинтеры
         # неприкосновенны (fail-closed), сбой чистки install не роняет (best-effort).
-        _rotate_component_backups(env, config_path)
+        rotation = _rotate_component_backups(env, config_path)
         if name == "dnsmasq":
             _apply_dns(env, plan, runner)
-        actions.append({"component": name, "mode": mode, "changed": True})
+        action = {"component": name, "mode": mode, "changed": True}
+        # noisy-log-better-than-no-log (review #350): best-effort-ротация не роняет install,
+        # но её сбой/пропуск обязан быть виден СРАЗУ — в actions и логе, а не только спустя
+        # циклы в doctor-грани «накопление» (PR-3) без причины.
+        if rotation.get("failed"):
+            _log.warning("%s: ротация бэкапов не удалила %d поколение(й): %s",
+                         name, len(rotation["failed"]),
+                         ", ".join(str(p) for p in rotation["failed"]))
+            action["rotation"] = {"status": "rotation_failed",
+                                  "failed": [str(p) for p in rotation["failed"]]}
+        elif rotation.get("skipped"):
+            _log.warning("%s: ротация бэкапов пропущена (%s) — поколения не тронуты",
+                         name, rotation["skipped"])
+            action["rotation"] = {"status": "rotation_skipped", "reason": rotation["skipped"]}
+        actions.append(action)
 
     launchagent_action = None
     if install_launchagent:

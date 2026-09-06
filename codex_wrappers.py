@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shutil
@@ -50,6 +51,8 @@ CODEX_NO_PROXY = "localhost,127.0.0.1,::1,z.ai,.z.ai"
 # (#96 core), НЕ provider-direct. z.ai-прямой-доступ релевантен moonbridge (GUI launchctl-gui выше),
 # а не CLI-codex. Две разные границы = две константы (канон route-scope-not-shared-validator).
 CODEX_NO_PROXY_LOOPBACK = "localhost,127.0.0.1,::1"
+
+_log = logging.getLogger("srouter.codex_wrappers")
 # (env-key, value) — единый список для install/setenv-контракта gui-домена (issue #340).
 # scheme-ключи НЕСУТ privoxy (терминальное плечо #331): socks5h в HTTPS_PROXY/https_proxy делал
 # pip/requests достижимым для SOCKSProxyManager (requests.utils.select_proxy: scheme-ключ раньше
@@ -439,11 +442,16 @@ def _remove_launchctl_env(runner) -> dict:
 def _backup_and_rotate(zshrc, env):
     """Generation-бэкап ~/.zshrc + ротация поколений сверх окна (PR-2 #339, контракт §3:
     A4/A6 — install-конфиги и zshrc ротируются одним примитивом; fail-closed внутри
-    backup_lib.rotate_backups; best-effort — сбой чистки правку zshrc не срывает)."""
+    backup_lib.rotate_backups; best-effort — сбой чистки правку zshrc не срывает).
+    Сбой ротации логируется (noisy-log-better-than-no-log, review #350): молчаливые
+    неочищенные реликты оператор иначе увидел бы только в doctor-грани «накопление»."""
     from backup_lib import create_backup, rotate_backups
 
     backup = create_backup(zshrc, env)  # timestamped generation, канон-примитив (PR-1 #339)
-    rotate_backups(zshrc)
+    rotation = rotate_backups(zshrc)
+    if rotation["failed"]:
+        _log.warning("zshrc: ротация бэкапов не удалила %d поколение(й): %s",
+                     len(rotation["failed"]), ", ".join(str(p) for p in rotation["failed"]))
     return backup
 
 
