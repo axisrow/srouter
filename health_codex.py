@@ -444,15 +444,23 @@ def _privoxy_log_observability_check(layout=privoxy_system.DEFAULT_LAYOUT):
         return {"status": "info",
                 "detail": "privoxy config не читается без sudo (protected-mode) — observability недоступна"}
     # debug-уровень из live-конфига. _config_directives из privoxy_system: ключ→значение, skip comments.
+    # #309 (1.3): снят двойной fail-open. Раньше ValueError парсера → {} и ValueError int() → 0 —
+    # нечитаемый конфиг был неотличим от осознанно тихого (ok «молчаливый»). Нечитаемое состояние
+    # обязано быть видимым: warn, не ok (канон detector-must-be-function-not-constant).
     try:
         directives = privoxy_system._config_directives(text)
-    except ValueError:
-        directives = {}
+    except ValueError as exc:
+        return {"status": "warn",
+                "detail": f"privoxy config не парсится ({exc}) — debug-уровень неизвестен, "
+                          f"observability под вопросом (осознанно тихий дефолт #141 неотличим от "
+                          f"битого конфига). Проверить: privoxy --config-test"}
     debug_raw = directives.get("debug", "0").strip()
     try:
         debug = int(debug_raw)
     except ValueError:
-        debug = 0
+        return {"status": "warn",
+                "detail": f"privoxy: директива debug нечисловая ({debug_raw!r}) — конфиг нечитаем/бит, "
+                          f"фактический уровень логирования неизвестен"}
 
     # logfile = logdir + "logfile logfile" (ProtectedLayout.log_dir / "logfile").
     logfile = layout.log_dir / "logfile"

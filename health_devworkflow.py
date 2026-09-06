@@ -26,9 +26,12 @@ def _vscode_proxy_check():
     Чек читает user-settings.json (Code+Cursor) и сверяет http.proxy.
 
     Возвращает {status, detail}:
-      ok      — хотя бы один существующий settings.json содержит http.proxy == socks5h://10808;
+      ok      — ВСЕ настроенные (present+proxy) settings.json содержат socks5h://10808 (#309: чек
+                проверяет все редакторы, не возвращается на первом совпавшем);
       unknown — ни одного settings.json нет (редактор не установлен) — info-only (как desktop-proxy);
-      down    — http.proxy есть, но НЕ socks5 (privoxy/HTTP рвёт WS #120, или чужой корпоративный) — driver.
+      down    — http.proxy есть, но НЕ socks5 хотя бы у одного редактора — даже при верном втором
+                (#309: ранний ok перекрывал сломанного; privoxy/HTTP рвёт WS #120, или чужой
+                корпоративный) — driver.
     Чек ВСЕГДА info-only (как endpoint-override): VSCode может быть не установлен, srouter-stack от этого
     не падает. ok/down — картина scoped-маршрута codex для диагностики, не driver агрегированного вердикта.
     """
@@ -43,17 +46,25 @@ def _vscode_proxy_check():
     if not present:
         return {"status": "unknown",
                 "detail": "VSCode/Cursor user-settings не найдены — редактор не установлен (scoped http.proxy неприменим)"}
-    # Хотя бы один с правильным SOCKS5 → ok (пользователь может пользоваться любым редактором).
+    # #309 (1.2): проверяем ВСЕ present-редакторы, не возвращаемся на первом совпавшем —
+    # ранний ok перекрывал сломанного редактора (сценарий #120: Code=socks5 + Cursor=privoxy-http
+    # давал ok, сломанный даже не попадал в detail; down-ветка была недостижима при хоть одном
+    # верном — канон detector-must-be-function-not-constant).
     socks_ok = [p for p, info in present.items()
                 if urlparse(info.get("proxy", "")).scheme.lower() in {"socks", "socks5", "socks5h"}]
+    # http.proxy задан, но НЕ socks5 хотя бы у одного → down (privoxy/HTTP рвёт WS, или чужой прокси
+    # мимо xray). Сломанный редактор не «перекрывается» верным — все перечисляются.
+    bad = [(p, info["proxy"]) for p, info in present.items()
+           if info.get("proxy") and p not in socks_ok]
+    if bad:
+        bad_str = ", ".join(f"{Path(p).parent.parent.name}={proxy}" for p, proxy in bad)
+        ok_names = ", ".join(Path(p).parent.parent.name for p in socks_ok)  # 'Code' / 'Cursor'
+        ok_note = f"; верные: {ok_names}" if socks_ok else ""
+        return {"status": "down",
+                "detail": f"VSCode http.proxy НЕ SOCKS5 ({bad_str}){ok_note} — codex рвёт WS через privoxy/чужой (#120)"}
     if socks_ok:
         names = ", ".join(Path(p).parent.parent.name for p in socks_ok)  # 'Code' / 'Cursor'
         return {"status": "ok", "detail": f"VSCode http.proxy=SOCKS5 10808 ({names}) — codex расширения гонит через xray (#185)"}
-    # http.proxy задан, но НЕ socks5 → down (privoxy/HTTP рвёт WS, или чужой прокси мимо xray).
-    bad = ", ".join(f"{Path(p).parent.parent.name}={info['proxy']}" for p, info in present.items() if info.get("proxy"))
-    if bad:
-        return {"status": "down",
-                "detail": f"VSCode http.proxy НЕ SOCKS5 ({bad}) — codex рвёт WS через privoxy/чужой (#120)"}
     # Файлы есть, http.proxy не задан совсем → unknown (scoped не настроен, но не сломан — info-only).
     return {"status": "unknown",
             "detail": "VSCode http.proxy не задан — codex расширения наследует privoxy из env (рвёт WS #120), scoped не активирован"}
@@ -106,6 +117,8 @@ def _github_direct_check():
     Возвращает {status, detail}:
       ok      — git-config github-proxy выключен (github уже идёт напрямую);
       warn    — git-config ВКЛЮЧЁН (scoped github → privoxy) → git зависит от VPS, подсказка env -u;
+                ИЛИ state=foreign — указан ПОСТОРОННИЙ прокси (#309: enabled=False не различает
+                «выключено» и «чужое»; канон detector-must-be-function-not-constant);
       unknown — git_proxy.status unknown/ошибка (git config timeout/недоступен).
     Не бросает (probe-канон).
     """
@@ -123,6 +136,16 @@ def _github_direct_check():
         return {"status": "unknown",
                 "detail": "git config недоступен (timeout) — github-direct check пропущен"}
     enabled = bool(st.get("enabled"))
+    # #309 (1.1): enabled=False склеивает absent и foreign — чужой прокси печатался как «выключен,
+    # идёт напрямую». Корень починен в #307/PR #328 (state: absent/managed-on/foreign) — читаем его.
+    # Старые моки/потребители без ключа state (старый контракт) трактуем по enabled как раньше.
+    state = st.get("state")
+    if state == "foreign":
+        return {"status": "warn",
+                "detail": f"git github-proxy указывает на ЧУЖОЙ прокси ({st.get('proxy') or '?'}) — "
+                          f"git ходит через посторонний посредник, НЕ srouter-стек. Если это не "
+                          f"осознанная настройка — снять: git config --global --unset {st.get('key') or 'http.https://github.com.proxy'}. "
+                          + GH_DIRECT_HINT}
     if not enabled:
         return {"status": "ok",
                 "detail": "git github-proxy выключен — github идёт напрямую (VPS-независимо). "

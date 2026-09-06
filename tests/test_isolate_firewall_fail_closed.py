@@ -71,7 +71,7 @@ def boom(monkeypatch):
 def _no_real_resolve(monkeypatch):
     """resolve_domain_ips не должен ходить в сеть: детерминированный резолв."""
     monkeypatch.setattr(isolate_firewall, "resolve_domain_ips",
-                        lambda domains, dns_servers=None: {d: ["1.2.3.4"] for d in (domains or [])})
+                        lambda domains, dns_servers=None, errors=None: {d: ["1.2.3.4"] for d in (domains or [])})
 
 
 # Публичные функции, чей docstring обещает dict с ok=False (не бросает).
@@ -227,7 +227,7 @@ def test_enable_isolation_ok(monkeypatch):
     """Успешный путь enable_isolation: домены зарезолвлены, token захвачен."""
     monkeypatch.setattr(isolate_firewall.sys_probe, "run", _ok_run("7"))
     monkeypatch.setattr(isolate_firewall, "resolve_domain_ips",
-                        lambda domains, dns_servers=None: {"api.anthropic.com": ["1.2.3.4", "5.6.7.8"]})
+                        lambda domains, dns_servers=None, errors=None: {"api.anthropic.com": ["1.2.3.4", "5.6.7.8"]})
     result = isolate_firewall.enable_isolation(["api.anthropic.com"], ports=[80, 443])
     assert result["ok"] is True, f"ожидали успех: {result}"
     assert result["token"] == "7", f"ожидали token=7: {result}"
@@ -349,7 +349,7 @@ def test_isolate_enable_route_reports_structured_error(monkeypatch):
         raise RuntimeError("pfctl взорвался")
     monkeypatch.setattr(dashboard.isolate_firewall.sys_probe, "run", _raise)
     monkeypatch.setattr(dashboard.isolate_firewall, "resolve_domain_ips",
-                        lambda domains, dns_servers=None: {d: ["1.2.3.4"] for d in (domains or [])})
+                        lambda domains, dns_servers=None, errors=None: {d: ["1.2.3.4"] for d in (domains or [])})
 
     response = dashboard.app.test_client().post(
         "/api/isolate/enable", json={"domains": ["api.anthropic.com"], "ports": [80, 443]})

@@ -55,6 +55,26 @@ def test_vscode_check_down_when_foreign_proxy(monkeypatch, tmp_path):
     assert res["status"] == "down"
 
 
+def test_vscode_check_down_even_when_one_editor_ok(monkeypatch, tmp_path):
+    """#309 (1.2) красный: Code=socks5h + Cursor=privoxy-http → down, Cursor в detail.
+
+    Живой сценарий #120 (privoxy рвёт WebSocket): первый совпавший socks-ok перекрывал сломанного —
+    ранний return ok до проверки остальных редакторов, down-ветка недостижима при хоть одном верном
+    (канон detector-must-be-function-not-constant, форма B).
+    """
+    ok = tmp_path / "Code" / "User" / "settings.json"
+    ok.parent.mkdir(parents=True)
+    ok.write_text('{"http.proxy": "socks5h://127.0.0.1:10808"}', encoding="utf-8")
+    broken = tmp_path / "Cursor" / "User" / "settings.json"
+    broken.parent.mkdir(parents=True)
+    broken.write_text('{"http.proxy": "http://127.0.0.1:8118"}', encoding="utf-8")
+    _patch_paths(monkeypatch, [ok, broken])
+    res = health._vscode_proxy_check()
+    assert res["status"] == "down", f"сломанный редактор перекрыт верным: {res}"
+    assert "Cursor" in res["detail"], f"сломанный редактор обязан быть в detail: {res['detail']}"
+    assert "8118" in res["detail"], f"фактический прокси сломанного обязан быть в detail: {res['detail']}"
+
+
 def test_vscode_check_registered_info_only(monkeypatch):
     """Чек регистрируется в check_all как info-only (не driver — VSCode может отсутствовать)."""
     _patch_paths(monkeypatch, [])  # unknown → info

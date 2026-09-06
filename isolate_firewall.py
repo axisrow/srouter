@@ -234,7 +234,7 @@ def _ifaces_spec():
 
 
 # ============================ резолв доменов → IPs ============================
-def resolve_domain_ips(domains, dns_servers=PUBLIC_DNS):
+def resolve_domain_ips(domains, dns_servers=PUBLIC_DNS, errors=None):
     """domains → {domain: [canonical ip,...]}. fail-soft per domain (пустой список при сбое).
 
     Резолвит ОБА семейства: A (IPv4, dig без типа) и AAAA (IPv6). Без v6 изоляция
@@ -244,6 +244,13 @@ def resolve_domain_ips(domains, dns_servers=PUBLIC_DNS):
     dig вызывается через sys_probe.run как список аргументов (НЕ shell) — домен не
     интерполируется в shell-текст. Вывод валидируется _ip_literal (отбрасываем CNAME
     и неканонические формы) перед любым использованием.
+
+    errors (#309 1.5): опциональный dict {domain: [причина,...]} — канал видимых отказов
+    резолверов (rc!=0 / timeout). Раньше rc НЕ проверялся: недостижимый резолвер отвечал
+    rc=9 с пустым stdout БЕЗ timeout, и это молча съедалось как «домен не резолвится» →
+    домен выпадал из PF-таблицы (fail-open в границе). rc — первоисточник, вывод — нет
+    (канон probe-semantics-from-primary-source). rc=0 с пустым stdout — авторитетно
+    пустой ответ (NXDOMAIN), ошибкой НЕ считается.
     """
     result = {}
     for domain in domains or []:
@@ -252,11 +259,17 @@ def resolve_domain_ips(domains, dns_servers=PUBLIC_DNS):
             continue
         ips = []
         seen = set()
+        domain_errors = []
         for dns in dns_servers:
             # "" = default query (A/IPv4), "AAAA" = IPv6. Оба семейства обязательны для fail-closed.
             for qtype in ("", "AAAA"):
                 r = sys_probe.run([DIG, f"@{dns}", domain, qtype, "+short", "+time=3", "+tries=1"], timeout=6)
                 if r.get("timeout"):
+                    domain_errors.append(f"{dns}:timeout")
+                    continue
+                if r.get("rc") != 0:
+                    # #309: rc!=0 (недостижим/SERVFAIL) ≠ «домен не резолвится» — резолвер не ответил.
+                    domain_errors.append(f"{dns}:rc={r.get('rc')}")
                     continue
                 for line in (r.get("out") or "").splitlines():
                     line = line.strip()
@@ -264,6 +277,8 @@ def resolve_domain_ips(domains, dns_servers=PUBLIC_DNS):
                         seen.add(line)
                         ips.append(line)
         result[domain] = ips
+        if errors is not None and domain_errors:
+            errors[domain] = domain_errors
     return result
 
 
@@ -379,7 +394,8 @@ def enable_isolation(domains, ports=DEFAULT_PORTS, token=None):
             return {**_reject("список доменов пуст"), "token": None,
                     "domains": {}, "unresolved": [], "ports": list(ports or DEFAULT_PORTS)}
 
-        resolved = resolve_domain_ips(domains)
+        resolution_errors = {}
+        resolved = resolve_domain_ips(domains, errors=resolution_errors)
         all_ips = []
         unresolved = []
         for domain, ips in resolved.items():
@@ -410,6 +426,8 @@ def enable_isolation(domains, ports=DEFAULT_PORTS, token=None):
         res["token"] = new_token
         res["domains"] = resolved
         res["unresolved"] = unresolved
+        # #309: ошибки резолверов (rc!=0/timeout) видны в ответе — домен не выпадает молча.
+        res["resolution_errors"] = resolution_errors
         res["ports"] = list(ports or DEFAULT_PORTS)
         if res["ok"] and not new_token:
             res["ok"] = False
@@ -430,7 +448,8 @@ def refresh_isolation_ips(domains, ports=DEFAULT_PORTS, token=None):
     Возвращает dict + domains→ips + unresolved + ports. Не бросает.
     """
     try:
-        resolved = resolve_domain_ips(domains)
+        resolution_errors = {}
+        resolved = resolve_domain_ips(domains, errors=resolution_errors)
         all_ips, unresolved = [], []
         for domain, ips in resolved.items():
             if ips:
@@ -445,6 +464,8 @@ def refresh_isolation_ips(domains, ports=DEFAULT_PORTS, token=None):
         res = _admin_run(fill)
         res["domains"] = resolved
         res["unresolved"] = unresolved
+        # #309: ошибки резолверов видны и в refresh-ответе (канон fail-closed границы).
+        res["resolution_errors"] = resolution_errors
         res["ports"] = list(ports or DEFAULT_PORTS)
         return res
     except Exception as exc:  # noqa: BLE001 — fail-closed контракт, см. модульный docstring

@@ -191,7 +191,7 @@ def test_enable_isolation_does_not_touch_codex_subanchor(monkeypatch):
     calls = []
     monkeypatch.setattr(isolate_firewall.sys_probe, "run", _apply_ok_run(calls))
     monkeypatch.setattr(isolate_firewall, "resolve_domain_ips",
-                        lambda domains, dns_servers=None: {"api.anthropic.com": ["203.0.113.10"]})
+                        lambda domains, dns_servers=None, errors=None: {"api.anthropic.com": ["203.0.113.10"]})
     r = isolate_firewall.enable_isolation(["api.anthropic.com"])
     assert r["ok"], r
     shell_text = _shell_text(calls)
@@ -458,3 +458,62 @@ def test_provision_codex_user_real_roundtrip():
         d = isolate_firewall.deprovision_codex_user()
         assert d["ok"], f"deprovision failed: {d}"
     assert isolate_firewall.probe_codex_user()["provisioned"] is False, "cleanup: пользователь удалён"
+
+
+# ============================ #309 (1.5): dig rc — первоисточник, fail-closed ============================
+
+def _stub_dig(monkeypatch, results):
+    """Подменяет sys_probe.run для dig-вызовов: results — список ответов по порядку вызовов.
+    Ответ: dict {rc, out, timeout?}. Возвращает список полученных argv (для инспекции)."""
+    calls = []
+
+    def fake_run(cmd, timeout=None):
+        calls.append(cmd)
+        return results[min(len(calls) - 1, len(results) - 1)]
+
+    monkeypatch.setattr(isolate_firewall.sys_probe, "run", fake_run)
+    return calls
+
+
+def test_resolve_domain_ips_rc_error_is_not_silent_empty(monkeypatch):
+    """#309 (1.5) красный: резолвер ответил rc=9 с пустым stdout (недостижим, БЕЗ timeout) →
+    это НЕ «домен не резолвится»: ошибки обязаны быть видимы в errors-канале, а не съедены."""
+    _stub_dig(monkeypatch, [{"rc": 9, "out": "", "err": "connection timed out"}])
+    errors = {}
+    resolved = isolate_firewall.resolve_domain_ips(["example.com"], dns_servers=["192.0.2.1"],
+                                                   errors=errors)
+    assert resolved == {"example.com": []}
+    assert errors, "rc!=0 без timeout съеден молча — fail-open остался"
+    assert "example.com" in errors
+    assert any("rc" in str(e) for e in errors["example.com"]), errors
+
+
+def test_resolve_domain_ips_authoritative_empty_is_not_an_error(monkeypatch):
+    """Симметрия: rc=0 с пустым stdout (NXDOMAIN/нет записей) — НЕ ошибка, errors пуст."""
+    _stub_dig(monkeypatch, [{"rc": 0, "out": ""}])
+    errors = {}
+    resolved = isolate_firewall.resolve_domain_ips(["example.com"], dns_servers=["8.8.8.8"],
+                                                   errors=errors)
+    assert resolved == {"example.com": []}
+    assert not errors, f"авторитетно пустой ответ помечен ошибкой: {errors}"
+
+
+def test_resolve_domain_ips_timeout_counts_as_error(monkeypatch):
+    """timeout резолвера (уже шел в continue) тоже попадает в errors-канал — единая грань."""
+    _stub_dig(monkeypatch, [{"rc": 0, "out": "", "timeout": True}])
+    errors = {}
+    isolate_firewall.resolve_domain_ips(["example.com"], dns_servers=["192.0.2.1"], errors=errors)
+    assert errors and "example.com" in errors
+
+
+def test_enable_isolation_surfaces_resolution_errors(monkeypatch, tmp_path):
+    """Вызывающий (enable_isolation) НЕ проглатывает ошибки резолва: они в ответе ответа
+    (resolution_errors) — домен не выпадает молча (канон fail-closed границы)."""
+    monkeypatch.setattr(isolate_firewall.sys_probe, "run",
+                        lambda cmd, timeout=None: {"rc": 9, "out": "", "err": "timed out"})
+    monkeypatch.setattr(isolate_firewall, "_admin_run",
+                        lambda cmd: {"ok": True, "out": "token 42", "err": ""})
+    r = isolate_firewall.enable_isolation(["api.anthropic.com"])
+    assert r["unresolved"] == ["api.anthropic.com"], r
+    assert r.get("resolution_errors", {}).get("api.anthropic.com"), \
+        f"ошибки резолва проглочены вызывающим: {r}"

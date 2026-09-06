@@ -261,7 +261,11 @@ class TestHealthExceptions:
         assert results == []
 
     def test_privoxy_log_check_config_directives_value_error(self, monkeypatch, tmp_path):
-        """_config_directives бросает ValueError (malformed config) → directives={}, debug=0, status ok."""
+        """_config_directives бросает ValueError (malformed config) → warn «не читается» (#309).
+
+        Бывший fail-open (ValueError → {} → debug=0 → ok) снят: нечитаемый конфиг ≠ осознанно
+        тихий (канон detector-must-be-function-not-constant, форма B). Чек при этом не бросает.
+        """
         import health
 
         config_path = tmp_path / "config"
@@ -276,10 +280,11 @@ class TestHealthExceptions:
 
         monkeypatch.setattr(health.privoxy_system, "_config_directives", boom)
         result = health._privoxy_log_observability_check(layout=layout)
-        assert result["status"] == "ok", "directives={} → debug=0 → молчаливый privoxy, status ok"
+        assert result["status"] == "warn", "нечитаемый конфиг обязан быть видимым (warn), не ok"
+        assert "не парсится" in result["detail"] or "нечитаем" in result["detail"]
 
     def test_privoxy_log_check_debug_int_parse_value_error(self, monkeypatch, tmp_path):
-        """int(debug_raw) бросает ValueError (нечисловой debug) → debug=0, status ok."""
+        """int(debug_raw) бросает ValueError (нечисловой debug) → warn «конфиг нечитаем» (#309)."""
         import health
 
         config_path = tmp_path / "config"
@@ -289,7 +294,8 @@ class TestHealthExceptions:
 
         layout = health.privoxy_system.ProtectedLayout(config_path=config_path, log_dir=log_dir)
         result = health._privoxy_log_observability_check(layout=layout)
-        assert result["status"] == "ok", "debug не парсится → 0 → молчаливый privoxy, status ok"
+        assert result["status"] == "warn", "нечисловой debug обязан быть видимым (warn), не ok"
+        assert "debug" in result["detail"]
 
     def test_installed_versions_check_scan_codex_os_error(self, monkeypatch):
         """_scan_codex_binaries бросает OSError → codex_bins=[], не крашится."""
