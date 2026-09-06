@@ -825,7 +825,10 @@ def _format_degradation_diff(added, removed):
     def _join(added_part, removed_part):
         try:
             out = template.format(added=added_part, removed=removed_part)
-        except (KeyError, IndexError, ValueError):
+        # AttributeError — тоже (cycle-review #355): str.format разрешает доступ к
+        # атрибутам ({added.real}) — вместе с KeyError/IndexError/ValueError уводим
+        # в дефолт: битый env-шаблон не должен валить watchdog-тик (прод 24/7).
+        except (AttributeError, KeyError, IndexError, ValueError):
             out = _DEGRADED_DIFF_TEMPLATE_DEFAULT.format(added=added_part, removed=removed_part)
         # дефолтный «; » разделитель при пустой стороне не оставляет хвостов «; »
         return out.strip().rstrip(";").strip()

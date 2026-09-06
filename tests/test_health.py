@@ -3572,6 +3572,11 @@ def test_degradation_diff_template_env(monkeypatch):
     monkeypatch.setenv(_DIFF_TEMPLATE_ENV, "{added} {broken")
     assert health._format_degradation_diff(["a"], ["c"]) == "+a; −c", \
         "битый шаблон → дефолт (форма пуша не должна ронять watchdog)"
+    # cycle-review PR #355 (major): str.format разрешает доступ к атрибутам —
+    # {added.real} даёт AttributeError, который не ловился → crash-loop тика.
+    monkeypatch.setenv(_DIFF_TEMPLATE_ENV, "{added.real}")
+    assert health._format_degradation_diff(["a"], ["c"]) == "+a; −c", \
+        "шаблон с атрибутным доступом → дефолт, НЕ AttributeError (прод 24/7)"
 
 
 def test_degradation_diff_push_len_limit(monkeypatch):
