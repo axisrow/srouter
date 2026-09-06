@@ -3474,6 +3474,123 @@ def test_watchdog_legacy_state_baselines_notified_set(monkeypatch, tmp_path):
     assert "состав" in notified[0][0]
 
 
+# ============================ #353: разница состава в пуше и audit-JSONL ============================
+# Пуш «состав деградации изменился» сообщал ФАКТ смены, но не саму разницу — сигнал без
+# содержания. Теперь: текст пуша = «+новые; −ушедшие» (новые первыми), первый ok→degraded
+# тоже перечисляет состав, status.jsonl несёт diff явно. Формат env-параметризуем.
+
+_DIFF_TEMPLATE_ENV = "SROUTER_WATCHDOG_DEGRADED_DIFF_TEMPLATE"
+_DIFF_MAX_LEN_ENV = "SROUTER_WATCHDOG_DEGRADED_PUSH_MAX"
+
+
+def test_watchdog_set_change_push_contains_diff_added(monkeypatch, tmp_path):
+    """#353 п.1: degraded{a}→degraded{a,туннель} — пуш несёт «+туннель», а не только факт."""
+    notified, _, _ = _wd315_watchdog_harness(
+        monkeypatch, tmp_path, "degraded", ["claude-proxy", "туннель"],
+        prev_state={"status": "degraded", "failed": ["claude-proxy"],
+                    "notified_failed": ["claude-proxy"], "last_degraded_push": 0.0},
+        env={_COOLDOWN_ENV: "0"})
+    health.cmd_watchdog()
+    assert len(notified) == 1
+    assert "+туннель" in notified[0][0], "добавившийся драйвер виден с маркером «+»"
+    assert "−" not in notified[0][0], "ничего не ушло — минус-части быть не должно"
+
+
+def test_watchdog_set_change_push_contains_diff_removed(monkeypatch, tmp_path):
+    """#353 п.1: degraded{a,туннель}→degraded{a} — пуш несёт «−туннель»."""
+    notified, _, _ = _wd315_watchdog_harness(
+        monkeypatch, tmp_path, "degraded", ["claude-proxy"],
+        prev_state={"status": "degraded", "failed": ["claude-proxy", "туннель"],
+                    "notified_failed": ["claude-proxy", "туннель"], "last_degraded_push": 0.0},
+        env={_COOLDOWN_ENV: "0"})
+    health.cmd_watchdog()
+    assert len(notified) == 1
+    assert "−туннель" in notified[0][0], "ушедший драйвер виден с маркером «−»"
+    assert "+" not in notified[0][0], "ничего не добавилось — плюс-части быть не должно"
+
+
+def test_watchdog_set_change_push_contains_diff_both(monkeypatch, tmp_path):
+    """#353: одновременное добавление и удаление — обе части разницы в пуше, новые первыми."""
+    notified, _, _ = _wd315_watchdog_harness(
+        monkeypatch, tmp_path, "degraded", ["claude-proxy", "codex-proxy"],
+        prev_state={"status": "degraded", "failed": ["claude-proxy", "туннель"],
+                    "notified_failed": ["claude-proxy", "туннель"], "last_degraded_push": 0.0},
+        env={_COOLDOWN_ENV: "0"})
+    health.cmd_watchdog()
+    assert len(notified) == 1
+    assert "+codex-proxy" in notified[0][0] and "−туннель" in notified[0][0]
+    assert notified[0][0].index("+codex-proxy") < notified[0][0].index("−туннель"), \
+        "добавившиеся — первыми (приоритет новых)"
+
+
+def test_watchdog_first_degradation_push_lists_full_set(monkeypatch, tmp_path):
+    """#353 п.2: первый ok→degraded — пуш перечисляет состав («+a, +b»), не только факт."""
+    notified, _, _ = _wd315_watchdog_harness(
+        monkeypatch, tmp_path, "degraded", ["claude-proxy", "туннель"],
+        prev_state={"status": "ok", "failed": [], "notified_failed": [],
+                    "last_degraded_push": 0.0},
+        env={_COOLDOWN_ENV: "0"})
+    health.cmd_watchdog()
+    assert len(notified) == 1
+    assert "+claude-proxy" in notified[0][0] and "+туннель" in notified[0][0], \
+        "вход в degraded перечисляет весь упавший состав с маркером «+»"
+
+
+def test_watchdog_set_change_noop_stays_silent(monkeypatch, tmp_path):
+    """#353: noop-переход (состав не изменился) — молчание сохраняется (регрессия #315 п.3)."""
+    notified, _, _ = _wd315_watchdog_harness(
+        monkeypatch, tmp_path, "degraded", ["claude-proxy"],
+        prev_state={"status": "degraded", "failed": ["claude-proxy"],
+                    "notified_failed": ["claude-proxy"], "last_degraded_push": 0.0},
+        env={_COOLDOWN_ENV: "0"})
+    health.cmd_watchdog()
+    assert len(notified) == 0, "состав и статус не изменились — тишина"
+
+
+def test_watchdog_status_jsonl_event_carries_explicit_diff(monkeypatch, tmp_path):
+    """#353 п.3: событие смены состава в status.jsonl несёт added/removed явно —
+    разница восстановима без ретроспективы записей."""
+    _, status_log, _ = _wd315_watchdog_harness(
+        monkeypatch, tmp_path, "degraded", ["claude-proxy", "codex-proxy"],
+        prev_state={"status": "degraded", "failed": ["claude-proxy", "туннель"],
+                    "notified_failed": ["claude-proxy", "туннель"], "last_degraded_push": 0.0},
+        env={_COOLDOWN_ENV: "0"})
+    health.cmd_watchdog()
+    lines = [json.loads(line) for line in status_log.read_text(encoding="utf-8").splitlines()
+             if line.strip()]
+    assert len(lines) == 1
+    assert lines[0]["diff"]["added"] == ["codex-proxy"]
+    assert lines[0]["diff"]["removed"] == ["туннель"]
+
+
+def test_degradation_diff_template_env(monkeypatch):
+    """#353 п.4 (more-options-better): формат разницы параметризуется env; мусор → дефолт."""
+    monkeypatch.delenv(_DIFF_TEMPLATE_ENV, raising=False)
+    assert health._format_degradation_diff(["a", "b"], ["c"]) == "+a, +b; −c"
+    monkeypatch.setenv(_DIFF_TEMPLATE_ENV, "добавлено: {added} / ушло: {removed}")
+    assert health._format_degradation_diff(["a"], ["c"]) == "добавлено: +a / ушло: −c"
+    monkeypatch.setenv(_DIFF_TEMPLATE_ENV, "{added} {broken")
+    assert health._format_degradation_diff(["a"], ["c"]) == "+a; −c", \
+        "битый шаблон → дефолт (форма пуша не должна ронять watchdog)"
+
+
+def test_degradation_diff_push_len_limit(monkeypatch):
+    """#353: пуш читается на телефоне — лимит длины с приоритетом added (ушлые кратко)."""
+    monkeypatch.delenv(_DIFF_TEMPLATE_ENV, raising=False)
+    monkeypatch.setenv(_DIFF_MAX_LEN_ENV, "40")
+    added = ["driver-очень-длинный-00", "driver-очень-длинный-01", "driver-очень-длинный-02"]
+    out = health._format_degradation_diff(added, ["gone-тоже-длинный-хвост"])
+    assert len(out) <= 40, f"лимит 40 соблюдён, получено {len(out)}: {out!r}"
+    assert out.startswith("+"), "добавившиеся — первыми даже при обрезке"
+    assert "др." in out or "ушед" in out, "не влезающее схлопнуто в счётчик"
+
+
+def test_degradation_diff_empty_set(monkeypatch):
+    """#353: пустая разница — пустая строка (noop-путь не строит текст)."""
+    monkeypatch.delenv(_DIFF_TEMPLATE_ENV, raising=False)
+    assert health._format_degradation_diff([], []) == ""
+
+
 def test_notify_logs_to_file(monkeypatch, tmp_path):
     """_notify пишет audit trail в лог-файл (timestamp + msg)."""
     log_file = tmp_path / "srouter-watchdog.notify.log"

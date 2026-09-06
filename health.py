@@ -83,6 +83,14 @@ WATCHDOG_STATUS_LOG = Path.home() / "Library" / "Logs" / "srouter-watchdog.statu
 _DEGRADED_NOTIFY_COOLDOWN_DEFAULT_SEC = 900
 _DEGRADED_NOTIFY_COOLDOWN_ENV = "SROUTER_WATCHDOG_DEGRADED_COOLDOWN"
 
+# #353: разница состава в пуше «состав деградации изменился» — что добавилось/что ушло.
+# Формат env-параметризуем (канон more-options-better), лимит длины — пуш читается
+# на телефоне; приоритет added (новые первыми), ушедшие при обрезке — счётчиком.
+_DEGRADED_DIFF_TEMPLATE_ENV = "SROUTER_WATCHDOG_DEGRADED_DIFF_TEMPLATE"
+_DEGRADED_DIFF_TEMPLATE_DEFAULT = "{added}; {removed}"
+_DEGRADED_DIFF_PUSH_MAX_LEN_ENV = "SROUTER_WATCHDOG_DEGRADED_PUSH_MAX"
+_DEGRADED_DIFF_PUSH_MAX_LEN_DEFAULT = 160
+
 # Ротация watchdog-журналов D2 (PR-4 #339, контракт §3 — дефолты «статус-jsonl: 14d/2MB»).
 # Выключена по умолчанию — включение SROUTER_WATCHDOG_LOG_ROTATE=1 (граница согласия).
 WATCHDOG_JOURNAL_RETENTION_DAYS = 14
@@ -800,6 +808,58 @@ def _degraded_notify_cooldown_sec():
         return _DEGRADED_NOTIFY_COOLDOWN_DEFAULT_SEC
 
 
+def _format_degradation_diff(added, removed):
+    """Текст разницы состава деградации (#353): «+новые; −ушедшие», новые первыми.
+
+    Лимит длины (SROUTER_WATCHDOG_DEGRADED_PUSH_MAX, дефолт 160) с приоритетом added:
+    при обрезке добавившиеся перечисляются максимально полно (+N др.), ушедшие
+    схлопываются в счётчик (−N ушедших). Пустая разница → "". Не бросает
+    (битый шаблон → дефолт): текст пуша не должен ронять watchdog-тик.
+    """
+    added = sorted(added)
+    removed = sorted(removed)
+    if not added and not removed:
+        return ""
+    template = os.environ.get(_DEGRADED_DIFF_TEMPLATE_ENV) or _DEGRADED_DIFF_TEMPLATE_DEFAULT
+
+    def _join(added_part, removed_part):
+        try:
+            out = template.format(added=added_part, removed=removed_part)
+        except (KeyError, IndexError, ValueError):
+            out = _DEGRADED_DIFF_TEMPLATE_DEFAULT.format(added=added_part, removed=removed_part)
+        # дефолтный «; » разделитель при пустой стороне не оставляет хвостов «; »
+        return out.strip().rstrip(";").strip()
+
+    try:
+        limit = max(40, min(1000, int(os.environ.get(_DEGRADED_DIFF_PUSH_MAX_LEN_ENV, ""))))
+    except ValueError:
+        limit = _DEGRADED_DIFF_PUSH_MAX_LEN_DEFAULT
+
+    added_full = ", ".join("+" + name for name in added)
+    removed_full = ", ".join("−" + name for name in removed)
+    full = _join(added_full, removed_full)
+    if len(full) <= limit:
+        return full
+    # Не влезло: ушедшие — кратко (счётчиком), added — максимально полно.
+    removed_short = f"−{len(removed)} ушедших" if removed else ""
+    candidate = _join(added_full, removed_short)
+    if len(candidate) <= limit:
+        return candidate
+    for keep in range(len(added), 0, -1):
+        head = ", ".join("+" + name for name in added[:keep])
+        rest = len(added) - keep
+        if rest:
+            head += f", +{rest} др."
+        # Приоритет added: сначала жертвуем полнотой added-перечня (счётчик), затем
+        # removed-частью вовсе — новые драйверы важнее перечня ушедших (#353 п.1).
+        for removed_part in (removed_short, ""):
+            candidate = _join(head, removed_part)
+            if len(candidate) <= limit:
+                return candidate
+    # Экзотика (одно имя длиннее лимита): сигнал важнее длины — отдаём последний вариант.
+    return candidate
+
+
 def _read_watchdog_prev_state():
     """Prev-state watchdog'а: JSON-dict | legacy-строка | None. Не бросает.
 
@@ -865,12 +925,24 @@ def _append_watchdog_status_event(previous, current):
     try:
         from datetime import datetime
 
+        # #353 п.3: событие смены состава несёт разницу явно (added/removed) —
+        # не восстановимую ретроспективой. None-сторона (legacy/битый state) → без diff.
+        prev_failed = previous.get("failed") if isinstance(previous, dict) else None
+        cur_failed = current.get("failed") if isinstance(current, dict) else None
+        diff = None
+        if isinstance(prev_failed, list) and isinstance(cur_failed, list):
+            diff = {
+                "added": sorted(set(cur_failed) - set(prev_failed)),
+                "removed": sorted(set(prev_failed) - set(cur_failed)),
+            }
         WATCHDOG_STATUS_LOG.parent.mkdir(parents=True, exist_ok=True)
         event = {
             "timestamp": datetime.now().astimezone().isoformat(),
             "previous": previous,
             "current": current,
         }
+        if diff is not None:
+            event["diff"] = diff
         with open(WATCHDOG_STATUS_LOG, "a", encoding="utf-8") as log_file:
             log_file.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
     except OSError as exc:
@@ -974,7 +1046,18 @@ def _cmd_watchdog_locked(result):
                 label = "стек деградировал"
             else:
                 label = "состав отказа изменился" if cur == "down" else "состав деградации изменился"
-            _notify(f"{label} ({', '.join(failed)})", "Ping")
+            # #353: текст пуша — сама разница с последнего УВЕДОМЛЁННОГО состава
+            # («+новые; −ушедшие», новые первыми). Первый ok→degraded: notified=[]
+            # → весь состав виден как added (п.2). Legacy notified=None → старый
+            # перечень (разница неизвестна). Тяжесть проб не растёт: множества уже
+            # вычислены в state.
+            if notified_failed is not None:
+                diff_added = sorted(set(failed) - set(notified_failed))
+                diff_removed = sorted(set(notified_failed) - set(failed))
+                detail = _format_degradation_diff(diff_added, diff_removed) or ", ".join(failed)
+            else:
+                detail = ", ".join(failed)
+            _notify(f"{label} ({detail})", "Ping")
             notified_failed = failed
             last_push = time.time()
 
