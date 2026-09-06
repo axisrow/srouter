@@ -313,7 +313,8 @@ def _same_hour(ts, sod_now):
 
 
 def summarize(events, now=None, window_sec=WINDOW_SEC, ratio_threshold=DEGRADE_RATIO,
-              min_window_samples=MIN_WINDOW_SAMPLES):
+              min_window_samples=MIN_WINDOW_SAMPLES,
+              failure_rate_threshold=DEGRADE_FAILURE_RATE):
     """Свести тренд деградации по событиям (чистая функция, не бросает).
 
     Окно = последние window_sec; baseline = ok-замеры total_ms «того же часа ±30 мин»
@@ -327,7 +328,10 @@ def summarize(events, now=None, window_sec=WINDOW_SEC, ratio_threshold=DEGRADE_R
       ratio     — latest.total_ms / baseline.total_ms (None без baseline);
       trend     — stable | degraded | insufficient.
     degraded: ratio ≥ threshold (при ok-замерах окна ≥ min_window_samples) ИЛИ
-    failure_rate ≥ DEGRADE_FAILURE_RATE (туннель флапает — медиана выживших не видит этого).
+    failure_rate ≥ failure_rate_threshold — flap-гейт по ВСЕМ замерам окна
+    (len(window) ≥ min_window_samples, не по ok: сплошной провал окна не должен
+    выпадать в insufficient), ratio-гейт по ok-замерам (медиана по 2 точкам шумная).
+    Туннель флапает — медиана выживших этого не видит.
     """
     now_ts = _now(now)
     try:
@@ -342,6 +346,14 @@ def summarize(events, now=None, window_sec=WINDOW_SEC, ratio_threshold=DEGRADE_R
         min_window_samples = max(1, int(min_window_samples))
     except (TypeError, ValueError):
         min_window_samples = MIN_WINDOW_SAMPLES
+    # is not None, а не truthiness (как у ratio_threshold): 0.0 = «degraded при любом
+    # провале» — легитимный порог, truthiness молча подменил бы его дефолтным 0.5.
+    try:
+        failure_rate_threshold = (float(failure_rate_threshold)
+                                  if failure_rate_threshold is not None
+                                  else DEGRADE_FAILURE_RATE)
+    except (TypeError, ValueError):
+        failure_rate_threshold = DEGRADE_FAILURE_RATE
 
     # Один проход по событиям: окно, ok-окно и оба baseline-накопителя. Retention-хвост
     # ~10k событий — отдельные проходы на каждую выборку здесь не бесплатны.
@@ -356,7 +368,11 @@ def summarize(events, now=None, window_sec=WINDOW_SEC, ratio_threshold=DEGRADE_R
         except (TypeError, ValueError):
             continue
         is_ok = e.get("status") == "ok"
-        if age <= window_sec:
+        # Окно строго [0, window_sec]: без нижней границы события «из будущего»
+        # относительно now (ретроспективный анализ, скачок часов) проваливаются в
+        # окно и разбавляют failure_rate всей последующей историей — реальный
+        # инцидент «30 минут сплошных connection-failed» рисовался как fail=0.077.
+        if 0.0 <= age <= window_sec:
             window.append(e)
             if is_ok:
                 ok_window.append(e)
@@ -398,13 +414,22 @@ def summarize(events, now=None, window_sec=WINDOW_SEC, ratio_threshold=DEGRADE_R
         except (TypeError, ValueError, ZeroDivisionError):
             ratio = None
 
-    # Тренд утверждаем только при достатке ok-замеров окна И наличии baseline; иначе
-    # insufficient (в т.ч. первые сутки наблюдения — окно есть, baseline ещё нет).
+    # Тренд: degraded — по ЛЮБОЙ из двух причин при достатке замеров окна:
+    #   флап (failure_rate ≥ порога; гейт по ВСЕМ замерам окна, не только ok —
+    #   сплошной провал не должен выпадать в insufficient, инцидент 30 мин чистых
+    #   connection-failed именно так терялся);
+    #   замедление ratio ≥ threshold (гейт по ok-замерам: медиана по 2 точкам шумная).
+    # stable — есть baseline и достаточно ok-замеров; иначе insufficient (в т.ч.
+    # первые сутки наблюдения и пустые окна).
     trend = "insufficient"
-    if latest is not None and len(ok_window) >= min_window_samples and baseline["total_ms"] is not None:
-        slow = ratio is not None and ratio >= ratio_threshold
-        flapping = latest.get("failure_rate", 0.0) >= DEGRADE_FAILURE_RATE
-        trend = "degraded" if (slow or flapping) else "stable"
+    if latest is not None and len(window) >= min_window_samples:
+        flapping = latest.get("failure_rate", 0.0) >= failure_rate_threshold
+        slow = (ratio is not None and ratio >= ratio_threshold
+                and len(ok_window) >= min_window_samples)
+        if flapping or slow:
+            trend = "degraded"
+        elif baseline["total_ms"] is not None and len(ok_window) >= min_window_samples:
+            trend = "stable"
 
     return {"latest": latest, "baseline": baseline, "ratio": ratio, "trend": trend}
 

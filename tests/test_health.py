@@ -727,6 +727,10 @@ def test_check_all_down_when_everything_dead(monkeypatch):
     # нейтрализовано) даёт ok → any_ok=True → degraded вместо down. Мокаем по той же причине.
     monkeypatch.setattr(health, "_proxy_env_consistency",
                         lambda: {"status": "down", "detail": "down"})
+    # #340: _gui_socks_residual_check — новый driver (residual-SOCKS в launchctl gui-домене),
+    # читает РЕАЛЬНЫЙ launchctl: на машине без residual даёт ok → degraded вместо down.
+    monkeypatch.setattr(health, "_gui_socks_residual_check",
+                        lambda: {"status": "down", "detail": "down"})
     # #205: _dns_up дёргает реальный getaddrinfo — мокаем (детерминизм; «всё мёртво» → DNS-down ok).
     _mock_dns(monkeypatch, resolves=False)
 

@@ -236,3 +236,47 @@ def test_summarize_no_baseline_means_insufficient_trend():
     out = metrics_store.summarize(window, now=now)
     assert out["trend"] == "insufficient"
     assert out["latest"]["total_ms"] == 500.0
+
+
+def test_summarize_ignores_events_from_the_future():
+    """Регресс: без нижней границы окна события «из будущего» относительно now
+    (ретроспективный анализ) разбавляли failure_rate всей последующей историей —
+    живой инцидент 30 минут сплошных connection-failed рисовался как fail=0.077."""
+    incident = 1_000_000.0
+    events = [_event(incident - 60.0 * i, status="connection-failed", total_ms=None)
+              for i in range(1, 13)]                      # 12 сплошных фейлов до now
+    events += [_event(incident + 3600.0 * 24 * i, total_ms=200)
+               for i in range(1, 60)]                     # «будущее»: сутки, двое, ...
+    out = metrics_store.summarize(events, now=incident)
+    assert out["latest"]["samples"] == 12
+    assert out["latest"]["failure_rate"] == 1.0
+    assert out["trend"] == "degraded"
+
+
+def test_summarize_degraded_by_pure_failure_window_without_baseline():
+    """Цикл-review #356 (N2): сплошной провал окна — degraded ИЗОЛИРОВАННО от
+    future-фикса: без «будущих» событий и без baseline. До фикса тренд-гейта такое
+    окно падало в insufficient: гейт требовал min ok-замеров, которых при сплошном
+    провале нет по построению."""
+    now = 1_000_000.0
+    events = [_event(now - 60.0 * i, status="connection-failed", total_ms=None)
+              for i in range(1, 13)]
+    out = metrics_store.summarize(events, now=now)
+    assert out["latest"]["samples"] == 12
+    assert out["latest"]["failure_rate"] == 1.0
+    assert out["trend"] == "degraded"
+
+
+def test_summarize_flap_threshold_parameterized():
+    """Цикл-review #356 (N3, more-options-better): flap-порог параметром. rate=0.4
+    при дефолтном пороге 0.5 — stable (против baseline); пониженный порог 0.3
+    переводит то же окно в degraded."""
+    now = 1_000_000.0
+    events = [_event(now - 3600.0 * 10, total_ms=200) for _ in range(40)]   # trailing-baseline
+    events += [_event(now - 60.0 * i) for i in range(1, 7)]                 # 6 ok
+    events += [_event(now - 60.0 * i, status="timeout", total_ms=None)
+               for i in range(7, 11)]                                       # 4 fail → rate 0.4
+    assert metrics_store.summarize(events, now=now)["trend"] == "stable"
+    out = metrics_store.summarize(events, now=now, failure_rate_threshold=0.3)
+    assert out["trend"] == "degraded"
+    assert out["latest"]["failure_rate"] == 0.4
