@@ -3,6 +3,7 @@ import json
 import os
 import plistlib
 import pwd
+from datetime import datetime, timezone
 
 import privoxy_audit
 import srouter
@@ -526,3 +527,300 @@ def test_cli_parser_exposes_nested_audit_commands():
     assert install.privoxy_audit_action == "install"
     assert report.limit == 12 and report.json is True
     assert uninstall.purge_log is True
+
+
+# ===========================================================================
+# PR-4 #339, остаток (D3): ротация command-audit.jsonl. Writer сам ротирует свой
+# журнал: daemon — единственный append-процесс, ротация происходит МЕЖДУ событиями,
+# fd под append открывается заново на каждое событие (_append_event) — os.replace
+# не осиротивает записи. Opt-in SROUTER_AUDIT_LOG_ROTATE=1 — та же граница согласия,
+# что и D2 (#354): удаление содержимого логов — только явное решение оператора
+# (для launchd-даемона — `sudo launchctl setenv`). Дефолты 30d/16MB (контракт §3).
+# Битые строки СОХРАНЯЮТСЯ — audit-журнал не теряет улики (осознанное отличие от
+# metrics-канона «битая строка вырезается»). stdout/stderr.log НЕ ротируются: их
+# держит launchd (StandardOutPath/StandardErrorPath), rename осиротил бы вывод.
+# ===========================================================================
+
+def test_rotate_event_log_drops_stale_keeps_malformed(tmp_path):
+    layout = _layout(tmp_path)
+    layout.event_log_path.parent.mkdir(parents=True)
+    stale = json.dumps({"captured_at": "2026-08-01T00:00:00+00:00"})
+    fresh = json.dumps({"captured_at": "2026-09-06T00:00:00+00:00"})
+    layout.event_log_path.write_text(
+        stale + "\ngarbage-not-json\n" + fresh + "\n", encoding="utf-8")
+
+    ok = privoxy_audit.rotate_event_log(
+        layout, retention_days=30, max_bytes=16 * 1024 * 1024,
+        now=datetime(2026, 9, 6, 12, tzinfo=timezone.utc).timestamp(),
+        chown=lambda path, uid, gid: None)
+
+    assert ok is True
+    kept = layout.event_log_path.read_text(encoding="utf-8").splitlines()
+    assert kept == ["garbage-not-json", fresh], "протухшее вырезано, битая улика сохранена"
+
+
+def test_rotate_event_log_early_exit_fresh_head(tmp_path):
+    layout = _layout(tmp_path)
+    layout.event_log_path.parent.mkdir(parents=True)
+    content = json.dumps({"captured_at": "2026-09-06T00:00:00+00:00"}) + "\n"
+    layout.event_log_path.write_text(content, encoding="utf-8")
+    before = layout.event_log_path.stat().st_mtime_ns
+
+    ok = privoxy_audit.rotate_event_log(
+        layout, retention_days=30, max_bytes=16 * 1024 * 1024,
+        now=datetime(2026, 9, 6, 12, tzinfo=timezone.utc).timestamp(),
+        chown=lambda path, uid, gid: None)
+
+    assert ok is True
+    assert layout.event_log_path.read_text(encoding="utf-8") == content
+    assert layout.event_log_path.stat().st_mtime_ns == before, "fresh-голова — rewrite не нужен"
+
+
+def test_rotate_event_log_trims_oldest_fresh_lines_on_size_cap(tmp_path):
+    """Перевес по max_bytes при полностью свежих строках: хвост обязан влезть в бюджет —
+    срезаются СТАРЕЙШИЕ строки (журнал append-only, монотонен), не «ничего не делать».
+    Канон размера из метрик (rewrite обязан уменьшить файл), без line-count костыля."""
+    layout = _layout(tmp_path)
+    layout.event_log_path.parent.mkdir(parents=True)
+    lines = [json.dumps({"captured_at": f"2026-09-0{1 + i // 10}T0{i % 10}:00:00+00:00",
+                         "seq": i}) for i in range(60)]
+    layout.event_log_path.write_text("".join(l + "\n" for l in lines), encoding="utf-8")
+
+    ok = privoxy_audit.rotate_event_log(
+        layout, retention_days=30, max_bytes=1400,
+        now=datetime(2026, 9, 6, 12, tzinfo=timezone.utc).timestamp(),
+        chown=lambda path, uid, gid: None)
+
+    assert ok is True
+    kept = layout.event_log_path.read_text(encoding="utf-8").splitlines()
+    assert len(kept) < 60, "перевес по размеру обязан ужаться"
+    assert len("".join(l + "\n" for l in kept).encode("utf-8")) <= 1400
+    kept_seqs = [json.loads(l)["seq"] for l in kept]
+    assert kept_seqs == list(range(60 - len(kept), 60)), "срезан СТАРЫЙ хвост, новый цел"
+
+
+def test_rotate_event_log_window_ge_one_never_empties_journal(tmp_path):
+    """Window ≥ 1 (канон PR-2 «единственное поколение неприкосновенно»): degenerate
+    max_bytes меньше одной записи НЕ опустошает журнал — держится новейшая запись.
+    Повторная ротация не переписывает файл тем же содержанием (no-op, не hourly-burn)."""
+    layout = _layout(tmp_path)
+    layout.event_log_path.parent.mkdir(parents=True)
+    lines = [json.dumps({"captured_at": f"2026-09-06T00:0{i}:00+00:00", "seq": i})
+             for i in range(3)]
+    layout.event_log_path.write_text("".join(l + "\n" for l in lines), encoding="utf-8")
+
+    first = privoxy_audit.rotate_event_log(
+        layout, retention_days=30, max_bytes=10,
+        now=datetime(2026, 9, 6, 12, tzinfo=timezone.utc).timestamp(),
+        chown=lambda path, uid, gid: None)
+    after_first = layout.event_log_path.read_text(encoding="utf-8").splitlines()
+    mtime_first = layout.event_log_path.stat().st_mtime_ns
+
+    second = privoxy_audit.rotate_event_log(
+        layout, retention_days=30, max_bytes=10,
+        now=datetime(2026, 9, 6, 12, tzinfo=timezone.utc).timestamp(),
+        chown=lambda path, uid, gid: None)
+
+    assert first is True and second is True
+    assert len(after_first) == 1, "минимум одна новейшая запись переживает бюджет"
+    assert json.loads(after_first[0])["seq"] == 2
+    assert layout.event_log_path.stat().st_mtime_ns == mtime_first, \
+        "неуменьшаемый файл не переписывается тем же содержанием каждый час"
+
+
+def test_rotate_event_log_size_trim_may_drop_corrupt_line(tmp_path):
+    """Прецеденс контрактов (review finding 3): возрастная чистка сохраняет битые
+    строки-улики, но байтовый бюджет — ЖЁСТКАЯ граница и срезает старейшее без
+    разбора валидности (иначе corrupt-потолк мог бы выселять валидные записи)."""
+    layout = _layout(tmp_path)
+    layout.event_log_path.parent.mkdir(parents=True)
+    corrupt = "x" * 400 + "-not-json"
+    fresh = json.dumps({"captured_at": "2026-09-06T00:00:00+00:00", "seq": 1})
+    layout.event_log_path.write_text(corrupt + "\n" + fresh + "\n", encoding="utf-8")
+
+    ok = privoxy_audit.rotate_event_log(
+        layout, retention_days=30, max_bytes=300,
+        now=datetime(2026, 9, 6, 12, tzinfo=timezone.utc).timestamp(),
+        chown=lambda path, uid, gid: None)
+
+    assert ok is True
+    kept = layout.event_log_path.read_text(encoding="utf-8").splitlines()
+    assert kept == [fresh], "бюджет срезал старейшую corrupt-строку, валидная цела"
+
+
+def test_rotate_event_log_failure_keeps_file_intact(tmp_path, monkeypatch):
+    layout = _layout(tmp_path)
+    layout.event_log_path.parent.mkdir(parents=True)
+    stale = json.dumps({"captured_at": "2026-08-01T00:00:00+00:00"})
+    fresh = json.dumps({"captured_at": "2026-09-06T00:00:00+00:00"})
+    content = stale + "\n" + fresh + "\n"
+    layout.event_log_path.write_text(content, encoding="utf-8")
+
+    def failing_replace(src, dst, **kwargs):
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(privoxy_audit.os, "replace", failing_replace)
+
+    ok = privoxy_audit.rotate_event_log(
+        layout, retention_days=30, max_bytes=16 * 1024 * 1024,
+        now=datetime(2026, 9, 6, 12, tzinfo=timezone.utc).timestamp(),
+        chown=lambda path, uid, gid: None)
+
+    assert ok is False
+    assert layout.event_log_path.read_text(encoding="utf-8") == content, "сбой — файл нетронут"
+
+
+def test_event_log_rotation_config_defaults_off_and_env_overrides(monkeypatch):
+    for name in ("SROUTER_AUDIT_LOG_ROTATE", "SROUTER_AUDIT_LOG_RETENTION_DAYS",
+                 "SROUTER_AUDIT_LOG_MAX_BYTES"):
+        monkeypatch.delenv(name, raising=False)
+    assert privoxy_audit.event_log_rotation_config() == {
+        "enabled": False, "retention_days": 30, "max_bytes": 16 * 1024 * 1024}
+
+    monkeypatch.setenv("SROUTER_AUDIT_LOG_ROTATE", "1")
+    monkeypatch.setenv("SROUTER_AUDIT_LOG_RETENTION_DAYS", "7")
+    monkeypatch.setenv("SROUTER_AUDIT_LOG_MAX_BYTES", "1024")
+    assert privoxy_audit.event_log_rotation_config() == {
+        "enabled": True, "retention_days": 7, "max_bytes": 1024}
+
+    # more-options-better: мусор → дефолт (кривое значение не опаснее отсутствия ручки)
+    monkeypatch.setenv("SROUTER_AUDIT_LOG_RETENTION_DAYS", "banana")
+    monkeypatch.setenv("SROUTER_AUDIT_LOG_MAX_BYTES", "-5")
+    assert privoxy_audit.event_log_rotation_config() == {
+        "enabled": True, "retention_days": 30, "max_bytes": 16 * 1024 * 1024}
+
+
+def test_daemon_rotates_event_log_between_events(tmp_path, monkeypatch):
+    """Интеграция: enabled + stale-хвост → daemon ротирует МЕЖДУ событиями, и новое
+    событие при этом не теряется (fail-closed: ротация не съедает append)."""
+    layout = _layout(tmp_path)
+    identity = pwd.getpwuid(os.getuid())
+    layout.status_path.parent.mkdir(parents=True)
+    layout.status_path.write_text(json.dumps({
+        "marker": privoxy_audit.AUDIT_MARKER, "gid": identity.pw_gid,
+        "events_written": 0, "parse_errors": 0,
+    }), encoding="utf-8")
+    layout.event_log_path.parent.mkdir(parents=True)
+    layout.event_log_path.write_text(
+        json.dumps({"captured_at": "2026-08-01T00:00:00+00:00"}) + "\n", encoding="utf-8")
+
+    class Child:
+        pid = 9101
+        stdout = io.StringIO(json.dumps(_event(
+            "/opt/homebrew/bin/brew", ["brew", "services", "stop", "privoxy"])) + "\n")
+        stderr = io.StringIO("")
+        _exited = False
+
+        def poll(self):
+            return None if not self._exited else 0
+
+        def wait(self, timeout=None):
+            self._exited = True
+            return 1
+
+        def terminate(self):
+            return None
+
+    monkeypatch.setattr(privoxy_audit.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(privoxy_audit.signal, "signal", lambda signum, handler: None)
+    monkeypatch.setenv("SROUTER_AUDIT_LOG_ROTATE", "1")
+
+    rc = privoxy_audit.daemon(layout=layout, popen=lambda *args, **kwargs: Child(),
+                              chown=lambda path, uid, gid: None, grace=0)
+
+    kept = layout.event_log_path.read_text(encoding="utf-8").splitlines()
+    assert rc == 2
+    assert len(kept) == 1, "stale-строка вырезана, событие daemon'а записано"
+    record = json.loads(kept[0])
+    assert record["target"]["args"][-2:] == ["stop", "privoxy"]
+
+
+def test_daemon_rotation_failure_does_not_stop_writer(tmp_path, monkeypatch):
+    """Сбой ротации — best-effort: writer продолжает писать события; сбой гигиены не
+    превращается в сбой аудита (последний error в статусе — от harness-child, не ротации)."""
+    layout = _layout(tmp_path)
+    identity = pwd.getpwuid(os.getuid())
+    layout.status_path.parent.mkdir(parents=True)
+    layout.status_path.write_text(json.dumps({
+        "marker": privoxy_audit.AUDIT_MARKER, "gid": identity.pw_gid,
+        "events_written": 0, "parse_errors": 0,
+    }), encoding="utf-8")
+
+    class Child:
+        pid = 9102
+        stdout = io.StringIO(json.dumps(_event(
+            "/opt/homebrew/bin/brew", ["brew", "services", "stop", "privoxy"])) + "\n")
+        stderr = io.StringIO("")
+        _exited = False
+
+        def poll(self):
+            return None if not self._exited else 0
+
+        def wait(self, timeout=None):
+            self._exited = True
+            return 1
+
+        def terminate(self):
+            return None
+
+    monkeypatch.setattr(privoxy_audit.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(privoxy_audit.signal, "signal", lambda signum, handler: None)
+    monkeypatch.setenv("SROUTER_AUDIT_LOG_ROTATE", "1")
+    monkeypatch.setattr(privoxy_audit, "rotate_event_log", lambda *args, **kwargs: False)
+
+    rc = privoxy_audit.daemon(layout=layout, popen=lambda *args, **kwargs: Child(),
+                              chown=lambda path, uid, gid: None, grace=0)
+
+    result = privoxy_audit.report(limit=10, layout=layout)
+    assert rc == 2
+    assert result["ok"] is True and len(result["records"]) == 1
+    saved = json.loads(layout.status_path.read_text(encoding="utf-8"))
+    assert saved["events_written"] == 1
+    assert "eslogger_exited" in saved["last_error"], saved
+
+
+def test_daemon_rotation_throttled_to_hourly_gate(tmp_path, monkeypatch):
+    """eslogger стримит ВСЕ exec-события машины — проверка ротации обязана висеть на
+    throttle'е (canon hourly-гейт метрик), а не гонять stat/read на каждой строке."""
+    layout = _layout(tmp_path)
+    identity = pwd.getpwuid(os.getuid())
+    layout.status_path.parent.mkdir(parents=True)
+    layout.status_path.write_text(json.dumps({
+        "marker": privoxy_audit.AUDIT_MARKER, "gid": identity.pw_gid,
+        "events_written": 0, "parse_errors": 0,
+    }), encoding="utf-8")
+
+    calls = []
+    real_rotate = privoxy_audit.rotate_event_log
+
+    def counting_rotate(*args, **kwargs):
+        calls.append(1)
+        return real_rotate(*args, **kwargs)
+
+    monkeypatch.setattr(privoxy_audit, "rotate_event_log", counting_rotate)
+    monkeypatch.setattr(privoxy_audit.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(privoxy_audit.signal, "signal", lambda signum, handler: None)
+    monkeypatch.setenv("SROUTER_AUDIT_LOG_ROTATE", "1")
+
+    events = [_event("/usr/bin/curl", ["curl", f"https://x{i}.example.com"]) for i in range(40)]
+
+    class Child:
+        pid = 9103
+        stdout = io.StringIO("".join(json.dumps(value) + "\n" for value in events))
+        stderr = io.StringIO("")
+        _exited = False
+
+        def poll(self):
+            return None if not self._exited else 0
+
+        def wait(self, timeout=None):
+            self._exited = True
+            return 1
+
+        def terminate(self):
+            return None
+
+    privoxy_audit.daemon(layout=layout, popen=lambda *args, **kwargs: Child(),
+                         chown=lambda path, uid, gid: None, grace=0)
+
+    assert len(calls) == 1, "throttle: одна проверка за прогон, не по одной на строку"

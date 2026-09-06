@@ -1,5 +1,6 @@
 import json
 import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import plistlib
 import pwd
@@ -2189,3 +2190,152 @@ def test_privoxy_cli_restart_silent_when_persistent(monkeypatch, capsys, tmp_pat
     assert rc == 0
     assert "транзиентно" not in captured.err.lower()
     assert "транзиентно" not in captured.out.lower()
+
+
+# ===========================================================================
+# PR-4 #339 остаток (A5): opt-in чистка root-snapshots при protect. Rotation —
+# ТОЛЬКО после успешной транзакции защиты (гигиена не может ей навредить), best-effort
+# (сбой ротации не роняет protect), manifest-поинтеры protected (unit'ы в
+# test_journal_rotation.py). Opt-in идёт из user-env явным флагом — env не переходит
+# границу sudo.
+# ===========================================================================
+
+def _protect_success_harness(tmp_path, monkeypatch):
+    """Харнесс успешного protect_as_root (по образцу
+    test_protect_as_root_runs_config_test_as_nobody_not_root): fake-prefix, lifecycle
+    launchctl-мок, chown no-op. Возвращает (layout, kwargs) для вызова."""
+    layout = _layout(tmp_path)
+    prefix = _fake_prefix(tmp_path)
+    identity = pwd.getpwuid(os.getuid())
+    home = tmp_path / "home"
+    user_plist = home / "Library" / "LaunchAgents" / f"{privoxy_system.USER_LABEL}.plist"
+    user_plist.parent.mkdir(parents=True)
+    user_plist.write_bytes(b"<plist/>")
+    staged = tmp_path / "staged"
+    staged.write_text(privoxy_system.protected_config_text(layout), encoding="utf-8")
+    staged.chmod(0o600)
+    monkeypatch.setattr(privoxy_system, "_allowed_prefix", lambda value: str(value))
+
+    lifecycle = {"user": False, "system": False, "port": False}
+
+    def root_runner(cmd, timeout):
+        if cmd[:2] == [privoxy_system.LAUNCHCTL, "print"]:
+            target = cmd[2]
+            loaded = lifecycle["system"] if target.startswith("system/") else lifecycle["user"]
+            return {"rc": 0 if loaded else 113,
+                    "out": f"{target} = state = running\npid = 4242" if loaded else "",
+                    "err": "" if loaded else "not found", "timeout": False}
+        if cmd[:2] == [privoxy_system.LAUNCHCTL, "bootstrap"]:
+            lifecycle["system"] = True
+            lifecycle["port"] = True
+            return {"rc": 0, "out": "", "err": "", "timeout": False}
+        if cmd[0] == privoxy_system.PS:
+            return {"rc": 0, "out": "nobody", "err": "", "timeout": False}
+        return {"rc": 0, "out": "ok", "err": "", "timeout": False}
+
+    kwargs = dict(
+        username=identity.pw_name,
+        uid=identity.pw_uid,
+        prefix=str(prefix),
+        staged_config=staged,
+        layout=layout,
+        runner=root_runner,
+        checker=lambda: lifecycle["port"],
+        chown=lambda path, uid, gid: None,
+        enforce_root=False,
+        user_home=home,
+        config_test_runner=lambda cmd, timeout: {"rc": 0, "out": "", "err": "", "timeout": False},
+    )
+    return layout, kwargs
+
+
+def test_protect_as_root_rotates_old_snapshots_after_success(tmp_path, monkeypatch):
+    """Opt-in rotate_snapshots=True: после УСПЕШНОЙ защиты старый каталог без
+    manifest-ссылки удалён; свежий backup_dir текущей защиты (и referenced-хвост
+    предыдущей) переживают ротацию."""
+    layout, kwargs = _protect_success_harness(tmp_path, monkeypatch)
+    stale = layout.backup_root / "2026-07-01T000000Z-old"
+    stale.mkdir(parents=True)
+    old_stamp = datetime.now(timezone.utc) - timedelta(days=60)
+    os.utime(stale, (old_stamp.timestamp(), old_stamp.timestamp()))
+
+    result = privoxy_system.protect_as_root(**kwargs, rotate_snapshots=True)
+
+    assert result["ok"] is True
+    assert result["snapshot_rotation"]["deleted"] == [str(stale)], result.get("snapshot_rotation")
+    assert not stale.exists()
+    manifest = json.loads(layout.manifest_path.read_text(encoding="utf-8"))
+    assert Path(manifest["backup_dir"]).exists(), "manifest-поинтер новой защиты protected"
+
+
+def test_protect_as_root_rotation_failure_does_not_fail_protect(tmp_path, monkeypatch):
+    """Fail-closed наоборот: защита уже установлена и верифицирована — сбой гигиены
+    не должен её ронять и не должен менять вердикт транзакции."""
+    layout, kwargs = _protect_success_harness(tmp_path, monkeypatch)
+
+    def broken_rotate(*args, **kwargs):
+        raise RuntimeError("rotation exploded")
+
+    monkeypatch.setattr(privoxy_system, "rotate_old_snapshots", broken_rotate)
+
+    result = privoxy_system.protect_as_root(**kwargs, rotate_snapshots=True)
+
+    assert result["ok"] is True
+    assert result["snapshot_rotation"]["ok"] is False, "сбой гигиены виден в отчёте"
+
+
+def test_protect_passes_snapshot_rotation_flags_from_env(tmp_path, monkeypatch):
+    """User-side protect читает SROUTER_SNAPSHOT_ROTATE / SROUTER_SNAPSHOT_OLDER_THAN_DAYS
+    и передаёт их ЯВНЫМИ флагами в helper; без env — флагов нет (opt-in)."""
+    layout = _layout(tmp_path)
+    state_path = tmp_path / "state.json"
+    _write_state(state_path, {"service": "homebrew-user"})
+    monkeypatch.setattr(
+        privoxy_system, "_install_helper",
+        lambda runner, selected_layout: {"ok": True, "error": ""},
+    )
+    monkeypatch.setenv("SROUTER_SNAPSHOT_ROTATE", "1")
+    monkeypatch.setenv("SROUTER_SNAPSHOT_OLDER_THAN_DAYS", "14")
+    captured = {}
+
+    def runner(cmd, timeout):
+        if "protect" in cmd:
+            captured["rotate"] = "--rotate-snapshots" in cmd
+            captured["days"] = (cmd[cmd.index("--snapshot-older-than-days") + 1]
+                                if "--snapshot-older-than-days" in cmd else None)
+            return {"rc": 0, "out": '{"ok":true,"error":"","backup_dir":"/backup"}',
+                    "err": "", "timeout": False}
+        if "unprotect" in cmd:
+            return {"rc": 0, "out": '{"ok":true,"error":"","restored":true}',
+                    "err": "", "timeout": False}
+        if "-n" in cmd:
+            return {"rc": 1, "out": "", "err": "password required", "timeout": False}
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+
+    statuses = iter([
+        {"protected": False, "loaded": False, "port_up": True, "owner": "",
+         "config_writable": None, "binary_writable": None, "assets_writable": False},
+        {"protected": True, "loaded": True, "port_up": True, "owner": "nobody",
+         "config_writable": False, "binary_writable": False, "assets_writable": False,
+         "user_shadow_loaded": False},
+    ])
+    monkeypatch.setattr(privoxy_system, "status", lambda **kwargs: next(statuses))
+
+    privoxy_system.protect(state_path=state_path, runner=runner, require_tty=False, layout=layout)
+    assert captured["rotate"] is True
+    assert captured["days"] == "14"
+
+    # Без env — opt-in выключен: флаги в helper-команде отсутствуют.
+    monkeypatch.delenv("SROUTER_SNAPSHOT_ROTATE", raising=False)
+    monkeypatch.delenv("SROUTER_SNAPSHOT_OLDER_THAN_DAYS", raising=False)
+    captured.clear()
+    statuses = iter([
+        {"protected": False, "loaded": False, "port_up": True, "owner": "",
+         "config_writable": None, "binary_writable": None, "assets_writable": False},
+        {"protected": True, "loaded": True, "port_up": True, "owner": "nobody",
+         "config_writable": False, "binary_writable": False, "assets_writable": False,
+         "user_shadow_loaded": False},
+    ])
+    privoxy_system.protect(state_path=state_path, runner=runner, require_tty=False, layout=layout)
+    assert captured["rotate"] is False
+    assert captured["days"] is None

@@ -345,11 +345,14 @@ def _rollback_live(snapshot, *, layout, runner, checker, chown):
 
 def protect_as_root(*, username, uid, prefix, staged_config, layout=DEFAULT_LAYOUT,
                     runner=_run, checker=_port_open, chown=os.chown, enforce_root=True,
-                    user_home=None, config_test_runner=_run_as_nobody, debug=0):
+                    user_home=None, config_test_runner=_run_as_nobody, debug=0,
+                    rotate_snapshots=False, snapshot_older_than_days=None):
     """Одна root-транзакция: backup → bootout user job → install → bootstrap system → verify.
 
     debug — ожидаемый уровень логирования (#152); staged_config валидируется exact-match с тем же
     уровнем, что и был при user-side генерации (пробрасывается через privileged-helper как --debug).
+    rotate_snapshots (PR-4 #339, A5) — opt-in чистка старых root-snapshot'ов ПОСЛЕ успешной
+    защиты (гигиена не может навредить транзакции; сбой — best-effort, вердикт не меняет).
     """
     if enforce_root and os.geteuid() != 0:
         return _result(False, error="root_required")
@@ -526,7 +529,19 @@ def protect_as_root(*, username, uid, prefix, staged_config, layout=DEFAULT_LAYO
                              (json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode(),
                              mode=0o644, uid=0, gid=0, chown=chown):
             raise RuntimeError("manifest_write_failed")
-        return _result(True, label=SYSTEM_LABEL, backup_dir=str(backup_dir), user_loaded=user_loaded)
+        snapshot_rotation = None
+        if rotate_snapshots:
+            # Гигиена ПОСЛЕ подтверждённого успеха транзакции: защита уже установлена и
+            # верифицирована — сбой чистки не роняет её и не меняет вердикт (best-effort).
+            try:
+                snapshot_rotation = rotate_old_snapshots(
+                    layout=layout, older_than_days=snapshot_older_than_days,
+                    enforce_root=enforce_root)
+            except (OSError, RuntimeError, ValueError) as exc:
+                snapshot_rotation = _result(False, error=f"snapshot_rotation_failed:{exc}",
+                                            deleted=[], failed=[])
+        return _result(True, label=SYSTEM_LABEL, backup_dir=str(backup_dir),
+                       user_loaded=user_loaded, snapshot_rotation=snapshot_rotation)
     except (OSError, RuntimeError) as exc:
         error = str(exc)
         try:
@@ -581,6 +596,37 @@ def snapshot_accumulation_report(layout=None, older_than_days=None, now=None):
         str(path) for path, mtime in entries
         if str(path) not in set(result["referenced"]) and mtime < cutoff)
     return result
+
+
+def rotate_old_snapshots(layout=None, older_than_days=None, now=None, *,
+                         rmtree=None, enforce_root=True):
+    """Удалить root-snapshot'ы БЕЗ manifest-ссылки старше N (контракт #339 §3, PR-4 —
+    вторая итерация после count-only #354; удаление — только явный opt-in оператора).
+
+    Fail-closed (канон PR-2): manifest-поинтеры backup_dir/previous_protection_backup_dir
+    — protected, не удаляются никогда; manifest отсутствует/битый → НИЧЕГО не удаляется
+    (без manifest неизвестно, что уже не нужно). Best-effort: сбой удаления одного
+    каталога не останавливает остальные — failed-список в отчёте. Сбой чтения root →
+    ошибка, не исключение. stdlib-only (helper-tree)."""
+    layout = layout or DEFAULT_LAYOUT
+    if enforce_root and os.geteuid() != 0:
+        return _result(False, error="root_required", deleted=[], failed=[])
+    report = snapshot_accumulation_report(layout=layout, older_than_days=older_than_days,
+                                          now=now)
+    if report["error"]:
+        return _result(False, error=f"snapshot_root_unreadable:{report['error']}",
+                       deleted=[], failed=[])
+    if report["manifest_missing"]:
+        return _result(True, reason="manifest_missing", deleted=[], failed=[])
+    rmtree = rmtree or shutil.rmtree
+    deleted, failed = [], []
+    for path in report["old_unreferenced"]:
+        try:
+            rmtree(path)
+            deleted.append(path)
+        except OSError as exc:
+            failed.append({"path": path, "error": str(exc)})
+    return _result(True, deleted=deleted, failed=failed)
 
 
 def unprotect_as_root(*, restore=True, layout=DEFAULT_LAYOUT, runner=_run,
@@ -929,6 +975,10 @@ def helper_main(argv=None):
     protect_parser.add_argument("--prefix", required=True)
     protect_parser.add_argument("--config", required=True)
     protect_parser.add_argument("--debug", type=int, default=0)
+    # PR-4 #339 (A5): opt-in чистка старых root-snapshots — ЯВНЫЕ флаги (env не переходит
+    # границу sudo, канон привилегированной границы).
+    protect_parser.add_argument("--rotate-snapshots", action="store_true")
+    protect_parser.add_argument("--snapshot-older-than-days", type=int, default=None)
     unprotect_parser = sub.add_parser("unprotect")
     unprotect_parser.add_argument("--restore", action="store_true")
     for name in ("start", "stop", "restart", "status"):
@@ -937,7 +987,9 @@ def helper_main(argv=None):
 
     if args.command == "protect":
         outcome = protect_as_root(username=args.username, uid=args.uid, prefix=args.prefix,
-                                  staged_config=args.config, debug=args.debug)
+                                  staged_config=args.config, debug=args.debug,
+                                  rotate_snapshots=args.rotate_snapshots,
+                                  snapshot_older_than_days=args.snapshot_older_than_days)
     elif args.command == "unprotect":
         outcome = unprotect_as_root(restore=args.restore)
     else:

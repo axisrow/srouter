@@ -260,3 +260,118 @@ def test_doctor_edge_warns_on_root_snapshot_accumulation(tmp_path, monkeypatch):
     result = health_backups.check_backup_slots(state_path=state)
 
     assert any("root-snapshots" in f for f in result["findings"]), result["findings"]
+
+
+# ============================ A5: opt-in удаление stale root-snapshots ============================
+# Вторая итерация контракта §3/v2 §5: count-only итерация состоялась (#354) — теперь
+# удаление, но по-прежнему только явное решение оператора (opt-in), с fail-closed
+# инвариантами PR-2: manifest-поинтеры protected, окно хранит свежих, сбой — best-effort.
+
+def test_rotate_old_snapshots_deletes_only_old_unreferenced(tmp_path):
+    """Удаляются ТОЛЬКО каталоги без manifest-ссылки старше N. Manifest-поинтеры
+    (backup_dir/previous_protection_backup_dir) — protected, как state-поинтеры в
+    PR-2; не-referenced моложе окна переживают ротацию."""
+    import privoxy_system
+
+    layout, backup_root = _layout(tmp_path)
+    referenced = _make_snapshot(backup_root, "2026-08-01T000000Z-aaa", age_days=40)
+    previous = _make_snapshot(backup_root, "2026-08-05T000000Z-bbb", age_days=35)
+    stale = _make_snapshot(backup_root, "2026-08-10T000000Z-ccc", age_days=30)
+    fresh_unref = _make_snapshot(backup_root, "2026-09-05T000000Z-ddd", age_days=1)
+    layout.manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    layout.manifest_path.write_text(json.dumps({
+        "backup_dir": str(referenced),
+        "previous_protection_backup_dir": str(previous),
+    }), encoding="utf-8")
+
+    result = privoxy_system.rotate_old_snapshots(layout=layout, older_than_days=28,
+                                                 enforce_root=False)
+
+    assert result["ok"] is True
+    assert result["deleted"] == [str(stale)]
+    assert result["failed"] == []
+    assert referenced.exists() and previous.exists() and fresh_unref.exists()
+
+
+def test_rotate_old_snapshots_manifest_missing_deletes_nothing(tmp_path):
+    """Fail-closed: manifest отсутствует/бит → неизвестно, что уже не нужно → НИЧЕГО
+    не удаляется (тот же инвариант, что у count-only отчёта, только для удаления)."""
+    import privoxy_system
+
+    layout, backup_root = _layout(tmp_path)
+    old = _make_snapshot(backup_root, "2026-08-01T000000Z-aaa", age_days=40)
+
+    result = privoxy_system.rotate_old_snapshots(layout=layout, older_than_days=28,
+                                                 enforce_root=False)
+
+    assert result["ok"] is True
+    assert result["deleted"] == []
+    assert result["reason"] == "manifest_missing"
+    assert old.exists()
+
+
+def test_rotate_old_snapshots_best_effort_on_failure(tmp_path):
+    """Сбой удаления одного каталога не останавливает остальные — best-effort report
+    (канон PR-2: «сбой unlink — best-effort report»)."""
+    import privoxy_system
+
+    layout, backup_root = _layout(tmp_path)
+    first = _make_snapshot(backup_root, "2026-08-01T000000Z-aaa", age_days=40)
+    second = _make_snapshot(backup_root, "2026-08-02T000000Z-bbb", age_days=39)
+    layout.manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    layout.manifest_path.write_text(json.dumps({"backup_dir": ""}), encoding="utf-8")
+
+    real_rmtree = privoxy_system.shutil.rmtree
+
+    def flaky_rmtree(path, *args, **kwargs):
+        if str(path) == str(first):
+            raise OSError("EBUSY: snapshot busy")
+        return real_rmtree(path, *args, **kwargs)
+
+    result = privoxy_system.rotate_old_snapshots(layout=layout, older_than_days=28,
+                                                 enforce_root=False, rmtree=flaky_rmtree)
+
+    assert result["deleted"] == [str(second)]
+    assert result["failed"] == [{"path": str(first), "error": "EBUSY: snapshot busy"}]
+    assert first.exists() and not second.exists()
+
+
+def test_rotate_old_snapshots_requires_root(tmp_path, monkeypatch):
+    """0700 root-каталог чистит только root: не-root → root_required, ничего не удалено."""
+    import privoxy_system
+
+    layout, backup_root = _layout(tmp_path)
+    old = _make_snapshot(backup_root, "2026-08-01T000000Z-aaa", age_days=40)
+    layout.manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    layout.manifest_path.write_text(json.dumps({"backup_dir": ""}), encoding="utf-8")
+    monkeypatch.setattr(privoxy_system.os, "geteuid", lambda: 501)
+
+    result = privoxy_system.rotate_old_snapshots(layout=layout, older_than_days=28)
+
+    assert result["ok"] is False
+    assert result["error"] == "root_required"
+    assert old.exists()
+
+
+def test_helper_main_maps_snapshot_rotation_flags(monkeypatch):
+    """A5 opt-in доходит до protect_as_root явным флагом: env НЕ переходит границу
+    sudo (канон привилегированной границы — явные args, не ambient-env)."""
+    import privoxy_system
+
+    captured = []
+
+    def fake_protect(**kwargs):
+        captured.append(kwargs)
+        return {"ok": True}
+
+    monkeypatch.setattr(privoxy_system, "protect_as_root", fake_protect)
+    base = ["protect", "--username", "axisrow", "--uid", "501",
+            "--prefix", "/opt/homebrew", "--config", "/tmp/staged-config"]
+
+    privoxy_system.helper_main(base + ["--rotate-snapshots", "--snapshot-older-than-days", "14"])
+    privoxy_system.helper_main(list(base))
+
+    assert captured[0]["rotate_snapshots"] is True
+    assert captured[0]["snapshot_older_than_days"] == 14
+    assert captured[1]["rotate_snapshots"] is False
+    assert captured[1]["snapshot_older_than_days"] is None
