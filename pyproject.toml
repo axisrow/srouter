@@ -121,6 +121,9 @@ ignore = []
 # BaseException ловится намеренно: dashboard_common raise SystemExit при отсутствии
 # srouter_config.py, а SystemExit не перехватывается except Exception — см. комментарий в файле.
 "codex_wrappers.py" = ["BLE001"]
+# BaseException ловится намеренно (тот же паттерн, что codex_wrappers): dashboard_common raise
+# SystemExit при отсутствии srouter_config.py — см. комментарий в файле (#340).
+"health_codenv.py" = ["BLE001"]
 # except Exception намеренно широкий: гвард используется как best-effort детектор
 # osascript-вызовов в тестовой обвязке — см. комментарий в файле.
 "tests/conftest.py" = ["BLE001"]
