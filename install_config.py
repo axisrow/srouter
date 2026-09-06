@@ -624,6 +624,43 @@ def discover_backups(config_path):
     return backup_lib.discover(config_path)
 
 
+def _state_backup_pointers(env):
+    """Все backup-поинтеры state → protected для ротации (контракт #339 §3, PR-2).
+
+    Поинтер — единственный адрес несмёрженного пользовательского оригинала (цикл
+    install→…без restore). Ротация не имеет права его удалить: включаем ВСЕ записи
+    detected_environment (backup + restored_from_backup) — фильтр по target ротация
+    делает сама (discover видит только поколения своего target, чужие поинтеры
+    просто не совпадут). State unreadable → protected пуст НЕ бывает: возвращаем
+    маркер «не ротировать» (None), чтобы не удалять вслепую без знания о поинтерах."""
+    state, readable = local_state.load_state_checked(path=env.state_path)
+    if not readable:
+        return None
+    detected = state.get("detected_environment") if isinstance(state.get("detected_environment"), dict) else {}
+    pointers = []
+    for entry in detected.values():
+        if not isinstance(entry, dict):
+            continue
+        for key in ("backup", "restored_from_backup"):
+            value = entry.get(key)
+            if value:
+                pointers.append(value)
+    return pointers
+
+
+def _rotate_component_backups(env, config_path):
+    """Ротация поколений компонента после успешной фиксации его effect-записи (PR-2 #339).
+
+    Best-effort: сбой ротации не блокирует install (install-critical-24/7 — скорость
+    восстановления важнее чистки). FAIL-CLOSED внутри backup_lib.rotate_backups:
+    окно ⩾1, state-поинтеры неприкосновенны. State unreadable → НЕ ротируем (лучше
+    лишнее поколение, чем удалённый вслепую поинтер — тот же fail-closed §3)."""
+    pointers = _state_backup_pointers(env)
+    if pointers is None:
+        return {"deleted": [], "failed": [], "skipped": "state_unreadable"}
+    return backup_lib.rotate_backups(config_path, protected=pointers)
+
+
 def _write_component_config(name, env):
     path = env.component_paths(name)["config"]
     if name == "xray":
@@ -1029,6 +1066,10 @@ def apply_install(env=None, *, confirm=False, choices=None, runner=run, port_che
         if effect_error:
             return {"ok": False, "blocked": [f"{name}_state_write_failed"], "error": effect_error,
                     "actions": actions, "plan": plan}
+        # Ротация поколений (PR-2 #339, контракт §3): effect уже зафиксирован, свежее
+        # поколение названо в state — старые сверх окна можно чистить. Поинтеры
+        # неприкосновенны (fail-closed), сбой чистки install не роняет (best-effort).
+        _rotate_component_backups(env, config_path)
         if name == "dnsmasq":
             _apply_dns(env, plan, runner)
         actions.append({"component": name, "mode": mode, "changed": True})

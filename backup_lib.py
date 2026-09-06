@@ -1,9 +1,10 @@
 """Единый примитивный слой бэкапов — контракт #339 v2, PR-1 (примитивы).
 
 Что здесь: naming-контракт (единый источник суффиксов), атомарный create_backup,
-discover (disk-доказательство существования поколений), каталог бэкапов собственных
-артефактов srouter. Что здесь НЕТ: политика (когда бэкапить/восстанавливать/ротировать —
-в потребителях; ротация — PR-2). root-helper этот модуль НЕ импортирует
+discover (disk-доказательство существования поколений), rotate_backups (окно поколений,
+fail-closed §3), каталог бэкапов собственных артефактов srouter + его purge при uninstall.
+Что здесь НЕТ: политика КОГДА бэкапить/восстанавливать — в потребителях.
+root-helper этот модуль НЕ импортирует
 (stdlib-only parity-гвард, канон root-helper-stdlib-only).
 
 Типология (контракт v2, issue #339):
@@ -23,6 +24,8 @@ import os
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
+
+DEFAULT_BACKUP_KEEP = 3  # окно ротации поколений (контракт v2 §3); env-ручка SROUTER_BACKUP_KEEP
 
 import local_state  # _fsync_parent_dir: канон fsync каталога после rename
 
@@ -151,3 +154,61 @@ def discover(target):
             continue
         found.append((stamp, candidate))
     return [candidate for _stamp, candidate in sorted(found, key=lambda pair: (pair[0], pair[1].name))]
+
+
+def _resolve_keep(keep):
+    """Окно ротации: явный keep > env SROUTER_BACKUP_KEEP > дефолт 3 (канон more-options-better).
+
+    0/negative — ротация выключена. Мусор в env — дефолт (fail-closed: «ротация всё»
+    при кривом значении опаснее отсутствия ротации)."""
+    if keep is None:
+        raw = os.environ.get("SROUTER_BACKUP_KEEP", "")
+        try:
+            keep = int(raw) if raw.strip() else DEFAULT_BACKUP_KEEP
+        except ValueError:
+            keep = DEFAULT_BACKUP_KEEP
+    return keep
+
+
+def rotate_backups(target, *, keep=None, protected=()):
+    """Ротация поколений target (контракт v2 §3, PR-2 #339): оставить `keep` новейших,
+    старые сверх окна удалить. Возвращает {"deleted": [...], "failed": [...]}.
+
+    FAIL-CLOSED (контракт, дословно): rotation не имеет права удалить единственную копию
+    несмёрженных пользовательских правок. Конкретно:
+      - keep ⩽ 1 — окно никогда не пусто (минимум одно, САМОЕ НОВОЕ, поколение остаётся;
+        0/negative — ротация выключена вовсе);
+      - поколение из `protected` (state-поинтеры: единственный адрес несмёрженного
+        прошлым циклом оригинала) не удаляется НИКОГДА, даже за окном;
+      - сбой удаления — best-effort: попадает в "failed", не роняет вызывающий install.
+    Кандидаты — только discover (fullmatch-парс, regular file): импосторы не трогаются
+    и в окно не считаются."""
+    keep = _resolve_keep(keep)
+    if keep < 1:
+        return {"deleted": [], "failed": []}
+    generations = discover(target)
+    protected_resolved = {Path(p) for p in protected}
+    deletable = [g for g in generations[:-keep] if g not in protected_resolved]
+    deleted, failed = [], []
+    for candidate in deletable:
+        try:
+            candidate.unlink()
+            deleted.append(candidate)
+        except OSError:
+            failed.append(candidate)  # best-effort: не срывать install из-за чистки
+    return {"deleted": deleted, "failed": failed}
+
+
+def purge_user_backups():
+    """Удалить USER_BACKUPS_DIR при uninstall (контракт v2 §1: бэкапы собственных
+    артефактов srouter содержат секреты и НЕ переживают uninstall — в отличие от
+    чужих конфигов, которые restore-only). 'purged' | 'absent' | 'failed'."""
+    try:
+        shutil.rmtree(USER_BACKUPS_DIR)
+        return "purged"
+    except FileNotFoundError:
+        return "absent"
+    except OSError:
+        # unreadable-гейт не нужен: это НАШИ артефакты; но молча «ok» тоже нельзя —
+        # статус уходит в actions uninstall'а, оператор видит.
+        return "failed"
