@@ -33,6 +33,19 @@ INSTALL = "/usr/bin/install"
 MKDIR = "/bin/mkdir"
 ESLOGGER = "/usr/bin/eslogger"
 
+# Ротация command-audit.jsonl (PR-4 #339, D3): ВЫКЛЮЧЕНА по умолчанию — та же граница
+# согласия, что и D2 (#354): удаление содержимого логов только с явного opt-in оператора
+# (для launchd-даемона — `sudo launchctl setenv SROUTER_AUDIT_LOG_ROTATE 1`).
+# Дефолты 30d/16MB — контракт #339 §3 («command-audit: 30d/16MB»).
+AUDIT_LOG_ROTATE_ENV = "SROUTER_AUDIT_LOG_ROTATE"
+AUDIT_LOG_RETENTION_DAYS_ENV = "SROUTER_AUDIT_LOG_RETENTION_DAYS"
+AUDIT_LOG_MAX_BYTES_ENV = "SROUTER_AUDIT_LOG_MAX_BYTES"
+AUDIT_LOG_RETENTION_DAYS = 30
+AUDIT_LOG_MAX_BYTES = 16 * 1024 * 1024
+# Канон hourly-гейта метрик: проверка не чаще раза в час (eslogger стримит exec-события
+# всей машины — stat/read на каждой строке недопустим).
+AUDIT_LOG_ROTATE_INTERVAL_SEC = 3600.0
+
 _SECRET_KEY = re.compile(
     r"(?i)(password|passwd|token|secret|api[_-]?key|authorization|credential)"
 )
@@ -349,6 +362,115 @@ def _append_event(layout, record, *, gid, chown=os.chown):
         os.close(fd)
 
 
+def _captured_at_ts(line):
+    """epoch из 'captured_at' audit-записи (ISO-8601 с offset). Не JSON/нет поля/битый
+    ISO → None. Не бросает."""
+    try:
+        value = json.loads(line)
+    except ValueError:
+        return None
+    if not isinstance(value, dict):
+        return None
+    raw = value.get("captured_at")
+    if not isinstance(raw, str):
+        return None
+    try:
+        return datetime.fromisoformat(raw).timestamp()
+    except ValueError:
+        return None
+
+
+def event_log_rotation_config(env=None):
+    """Конфиг ротации из env (more-options-better): enabled только при явном
+    SROUTER_AUDIT_LOG_ROTATE=1; дни/байты — целые, мусор → дефолт (кривое значение
+    не опаснее отсутствия ручки). Чистая функция, не бросает."""
+    env = os.environ if env is None else env
+    try:
+        retention_days = int(env.get(AUDIT_LOG_RETENTION_DAYS_ENV, ""))
+        if retention_days <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        retention_days = AUDIT_LOG_RETENTION_DAYS
+    try:
+        max_bytes = int(env.get(AUDIT_LOG_MAX_BYTES_ENV, ""))
+        if max_bytes <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        max_bytes = AUDIT_LOG_MAX_BYTES
+    return {
+        "enabled": env.get(AUDIT_LOG_ROTATE_ENV, "") == "1",
+        "retention_days": retention_days,
+        "max_bytes": max_bytes,
+    }
+
+
+def rotate_event_log(layout=DEFAULT_LAYOUT, *, retention_days=None, max_bytes=None,
+                     now=None, chown=os.chown):
+    """Ротация command-audit.jsonl (PR-4 #339, D3): вырезать записи старше retention /
+    сверх max_bytes, atomic rewrite (tmp+fsync+replace, root-only 0o600).
+
+    Writer сам ротирует свой журнал: daemon — единственный append-процесс, fd под append
+    открывается заново на каждое событие (_append_event), поэтому replace НЕ осиротивает
+    записи. Вызывается ТОЛЬКО между событиями.
+
+    ОТЛИЧИЕ от metrics-канона: битые строки СОХРАНЯЮТСЯ — audit-журнал не теряет улики
+    (вырезается только доказанно протухшее по валидному captured_at). Сбой → False и
+    существующий файл нетронут. Fresh-голова + размер в лимите → early-exit без rewrite.
+    Не бросает."""
+    path = layout.event_log_path
+    try:
+        retention_days = (max(1, int(retention_days)) if retention_days is not None
+                          else AUDIT_LOG_RETENTION_DAYS)
+    except (TypeError, ValueError):
+        retention_days = AUDIT_LOG_RETENTION_DAYS
+    try:
+        max_bytes = int(max_bytes) if max_bytes is not None else AUDIT_LOG_MAX_BYTES
+    except (TypeError, ValueError):
+        max_bytes = AUDIT_LOG_MAX_BYTES
+    try:
+        try:
+            info = path.lstat()
+        except OSError:
+            return True  # журнала нет — чисто
+        if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+            return False  # audit_log_not_regular — не трогаем
+        size = info.st_size
+        if size == 0:
+            return True
+        cutoff = (float(now) if now is not None else time.time()) - retention_days * 86400.0
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            lines = handle.read().splitlines()
+        kept, dropped = [], 0
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            ts = _captured_at_ts(stripped)
+            if ts is None or ts >= cutoff:
+                kept.append(stripped)  # битая строка-улика сохраняется (ts is None)
+            else:
+                dropped += 1
+        # Байтовый бюджет: перевес при полностью свежих строках срезает СТАРЕЙШИЕ
+        # (журнал append-only, монотонен) — rewrite обязан уменьшить файл, а не
+        # переписывать то же содержание каждый час (канон размера из метрик).
+        kept_bytes = sum(len(l.encode("utf-8")) + 1 for l in kept)
+        if kept_bytes > max_bytes:
+            tail_bytes, tail_start = 0, len(kept)
+            while tail_start > 0:
+                tail_bytes += len(kept[tail_start - 1].encode("utf-8")) + 1
+                if tail_bytes > max_bytes:
+                    break
+                tail_start -= 1
+            dropped += tail_start
+            kept = kept[tail_start:]
+        if dropped == 0 and size <= max_bytes:
+            return True
+        return _atomic_write(path, "".join(l + "\n" for l in kept).encode("utf-8"),
+                             mode=0o600, uid=0, gid=0, chown=chown)
+    except OSError:
+        return False
+
+
 def _valid_identity(username, uid, gid):
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", username or ""):
         return None
@@ -648,6 +770,10 @@ def daemon(*, layout=DEFAULT_LAYOUT, popen=subprocess.Popen, chown=os.chown,
     stopped = False
     child = None
     stderr_lines = deque(maxlen=20)
+    # Ротация event-журнала (PR-4 #339, D3): читается ОДИН раз на старте демона —
+    # ручка оператора, а не поток управления; между событиями, за hourly-гейтом.
+    rotate_cfg = event_log_rotation_config()
+    last_rotate_check = 0.0
 
     def request_stop(signum, frame):
         nonlocal stopped
@@ -709,6 +835,15 @@ def daemon(*, layout=DEFAULT_LAYOUT, popen=subprocess.Popen, chown=os.chown,
     for line in child.stdout:
         if stopped:
             break
+        # Ротация МЕЖДУ событиями (fd append'а от прошлого события уже закрыт — replace
+        # ничего не осиротит). Гейт проверяется на КАЖДОЙ строке стрима (не только на
+        # записанных): тихая машина без privoxy-команд тоже обязана ротировать хвост.
+        # При выключенной ручке — один bool-check; при включённой — один float-compare
+        # на строку (monotonic), сама ротация — не чаще раза в час (канон метрик).
+        if rotate_cfg["enabled"] and clock() - last_rotate_check >= AUDIT_LOG_ROTATE_INTERVAL_SEC:
+            last_rotate_check = clock()
+            rotate_event_log(layout, retention_days=rotate_cfg["retention_days"],
+                             max_bytes=rotate_cfg["max_bytes"], chown=chown)
         try:
             event = json.loads(line)
         except ValueError:

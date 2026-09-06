@@ -467,6 +467,12 @@ def protect(*, state_path, prefix="/opt/homebrew", runner=None, require_tty=True
     # 0 если env не задан). Явный аргумент переопределяет env (для тестов/programmatic-call).
     if debug is None:
         debug = privoxy_system._privoxy_debug_from_env()
+    # PR-4 #339 (A5): opt-in чистка старых root-snapshots (граница согласия: удаление —
+    # только явное решение оператора). Читается из env USER-процесса и передаётся в helper
+    # ЯВНЫМИ флагами — env не переходит границу sudo. Мусор в days → дефолт helper'а.
+    rotate_snapshots = os.environ.get("SROUTER_SNAPSHOT_ROTATE", "") == "1"
+    older_days = os.environ.get("SROUTER_SNAPSHOT_OLDER_THAN_DAYS", "").strip()
+    older_days = older_days if older_days.isdigit() else ""
     current = privoxy_system.status(runner=runner, layout=layout)
     secure = (
         current["protected"]
@@ -506,15 +512,17 @@ def protect(*, state_path, prefix="/opt/homebrew", runner=None, require_tty=True
         if not installed["ok"]:
             privoxy_system._mark_failed(state_path, installed["error"])
             return installed
-        invoked = runner(
-            [privoxy_system.SUDO, str(layout.helper_path), "protect",
-             "--username", pwd.getpwuid(os.getuid()).pw_name,
-             "--uid", str(os.getuid()),
-             "--prefix", str(prefix),
-             "--config", str(staged_config),
-             "--debug", str(debug)],
-            120,
-        )
+        protect_cmd = [privoxy_system.SUDO, str(layout.helper_path), "protect",
+                       "--username", pwd.getpwuid(os.getuid()).pw_name,
+                       "--uid", str(os.getuid()),
+                       "--prefix", str(prefix),
+                       "--config", str(staged_config),
+                       "--debug", str(debug)]
+        if rotate_snapshots:
+            protect_cmd.append("--rotate-snapshots")
+            if older_days:
+                protect_cmd += ["--snapshot-older-than-days", older_days]
+        invoked = runner(protect_cmd, 120)
         outcome = privoxy_system._parse_helper_output(invoked)
         privoxy_system._sudo_reset(runner)
         if not outcome["ok"]:
