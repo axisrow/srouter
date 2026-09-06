@@ -20,7 +20,7 @@ _log = logging.getLogger("srouter.health")
 # star-import re-export (канон star-import-reexport-contract) — см. health_probes.py докстринг __all__.
 __all__ = [
     "_read_endpoint_config", "_endpoint_override_check", "_host_in_no_proxy",
-    "_endpoint_direct_override", "_pids_env_readable",
+    "_endpoint_direct_override", "_pids_env_readable", "_override_runtime_leak_pids",
     "_endpoint_xray_sync_check", "_read_runtime_endpoint_config", "_runtime_model_override_check",
     "_ENDPOINT_SYNC_STATE_PATH", "_ENDPOINT_SYNC_XRAY_PATH",
 ]
@@ -93,6 +93,30 @@ def _endpoint_direct_override():
         return {"overridden": False, "base_url": base, "host": host}
     return {"overridden": _host_in_no_proxy(host, cfg["no_proxy"]),
             "base_url": base, "host": host}
+
+
+def _override_runtime_leak_pids(external_pids, rt, readable, override_host):
+    """#337: какие external-PID доказуемо утекают ПРИ активном override-гейте?
+
+    Гейт #329 схлопывал ВСЕ external в unknown «проба неприменима», но прямое соединение
+    намеренно только у PID, чей runtime env СОДЕРЖИТ override. Чистая функция (обе ветки
+    тестируемы, канон detector-must-be-function-not-constant): PID утекает, когда
+      - env читается (pid в `readable`, критерий _pids_env_readable из #335), И
+      - его ANTHROPIC_BASE_URL НЕ на override-хосте (пустой/нестандартный = CC идёт на
+        стандартный или чужой endpoint напрямую — это утечка, класс дивергенции #143).
+    PID с env на override-хосте — by design; нечитаемый — атрибуция невозможна. Оба не утечка.
+    rt — результат _read_runtime_endpoint_config (per_pid с ANTHROPIC_*); override_host —
+    hostname файлового override. Никогда не бросает; возвращает подмножество external_pids.
+    """
+    leaks = set()
+    for pid in external_pids:
+        if pid not in readable:
+            continue
+        base = rt.get("per_pid", {}).get(pid, {}).get("ANTHROPIC_BASE_URL", "")
+        host = (urlparse(base).hostname or "").lower().rstrip(".") if base else ""
+        if host != (override_host or ""):
+            leaks.add(pid)
+    return leaks
 
 
 def _endpoint_override_check():
@@ -212,7 +236,11 @@ _GENERIC_ENV_TOKEN_RE = re.compile(r"(?:^|\s)([A-Z][A-Z0-9_]{1,})=")
 def _read_runtime_endpoint_config():
     """Читает env ЖИВОГО CC-процесса через `ps eww` (#143), per-PID.
 
-    Возвращает {per_pid, pids, readable}:
+    Возвращает {per_pid, pids, readable, env_readable_pids}:
+      - env_readable_pids — подмножество pids, чьи секции содержат хотя бы один ALL_CAPS=
+        токен (тот же критерий _GENERIC_ENV_TOKEN_RE, что _pids_env_readable): читаемость
+        env НЕЗАВИСИМО от наличия ANTHROPIC_* (#337 review perf: один проход ps eww для
+        readable-критерия и ANTHROPIC-парсинга, не два перекрывающихся батча).
       - readable=False, pids=[]   — CC не запущен (ps -axo пуст) ИЛИ ps-timeout;
       - readable=False, pids=[..] — CC запущен, но ps eww пуст/timeout/нет ANTHROPIC_* (чужой
         UID/sandbox — PID сохранены для forensics в detail чека);
@@ -225,13 +253,14 @@ def _read_runtime_endpoint_config():
     """
     pids = _health_facade._claude_code_pids()
     if not pids:
-        return {"per_pid": {}, "pids": [], "readable": False}
+        return {"per_pid": {}, "pids": [], "readable": False, "env_readable_pids": set()}
     # Один ps eww на ВСЕ PID батчем (запятая, как lsof в _claude_proxy_probe). ps eww отдаёт
     # каждую строку процесса с PID в начале — секционируем per-PID, не одним dict().
     r = sys_probe.run([PS, "eww", "-p", ",".join(pids)], timeout=3)
     if r.get("timeout") or not (r.get("out") or "").strip():
-        return {"per_pid": {}, "pids": pids, "readable": False}
+        return {"per_pid": {}, "pids": pids, "readable": False, "env_readable_pids": set()}
     per_pid = {}
+    env_readable_pids = set()
     cur_pid, cur_lines = "", []
     for line in (r["out"] or "").splitlines():
         m = _PID_LINE_RE.match(line)
@@ -241,13 +270,17 @@ def _read_runtime_endpoint_config():
             cur_pid, cur_lines = m.group(1), [line]
         elif cur_pid:
             cur_lines.append(line)  # продолжение env того же PID (маловероятно, но устойчиво)
+        if cur_pid and _GENERIC_ENV_TOKEN_RE.search(line):
+            env_readable_pids.add(cur_pid)
     if cur_pid:
         per_pid[cur_pid] = dict(_RUNTIME_ENV_RE.findall("\n".join(cur_lines)))
     # НИ у одного PID нет ANTHROPIC_* (мусор/неполный env/чужой контекст) — evidence нет → НЕ
     # readable. Иначе чек дал бы ложный ok «стандартный endpoint» без proof (verify-dont-guess).
     if not any(per_pid.values()):
-        return {"per_pid": {}, "pids": pids, "readable": False}
-    return {"per_pid": per_pid, "pids": pids, "readable": True}
+        return {"per_pid": {}, "pids": pids, "readable": False,
+                "env_readable_pids": env_readable_pids}
+    return {"per_pid": per_pid, "pids": pids, "readable": True,
+            "env_readable_pids": env_readable_pids}
 
 
 def _pids_env_readable(pids):
