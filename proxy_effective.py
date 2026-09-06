@@ -132,8 +132,15 @@ def _escalate(verdict, works, status, arm):
     синтетикой privoxy: в тот же момент посредник не смог форвардить plain-GET — туннель
     умер между плечами (гонка/флап #315). fail-closed: magic-даты подписи ambient-шум
     не подделывает, поэтому обычный http-шум (#82) эскалации не порождает.
-    works=False не меняется (вердикт уже down); works=None сюда не доходит (unknown
-    выходит раньше), проверка на всякий случай та же.
+    works=False не меняется (вердикт уже down); works=None не эскалируется (канон probe:
+    неизвестность не равна поломке — unknown обязан остаться unknown).
+
+    Граница атрибуции (#325, review): плечо красит ВЕСЬ стек, а не канал замера —
+    arm всегда смотрит в privoxy, тогда как channel может мерить socks/xray. При живом
+    xray и локально мёртвом upstream privoxy socks-вердикт ok эскалируется в
+    proxy-broken: осознанный fail-closed по стеку в целом, симметрии «канал-в-канал»
+    здесь нет. Плечи замеряются в разные моменты: подпись в T+δ опровергает вердикт,
+    доказанный в T, — окно ложной тревоги в секунды, самозаживляющее следующей пробой.
     """
     if works and arm is not None and _is_synthetic_middleware_5xx(arm):
         return "proxy-broken", False, "down"
@@ -177,10 +184,12 @@ def proxy_effective_probe(*, host=None, channel="socks", http_arm=True):
             arm_synthetic = _is_synthetic_middleware_5xx(arm)
             arm_public["synthetic_5xx"] = arm_synthetic
             verdict, works, status = _escalate(verdict, works, status, arm)
-        if arm_synthetic and arm_public is not None:
-            # Подпись посредника объясняет ЛЮБОИЙ итоговый down-вердикт — и эскалированный
-            # (works=True -> proxy-broken), и уже-broken пару: виновник назван по факту.
-            # (arm_public здесь всегда dict — синтетика без словаря плеча невозможна.)
+        if arm_synthetic and arm_public is not None and verdict == "proxy-broken":
+            # Синтетический detail — только когда proxy-broken (эскалированный или от пары):
+            # виновник назван по факту. both-down НЕ объясняем подписью плеча: там мёртв и
+            # direct, полная недоступность сети объясняет итог не хуже — однозначная
+            # атрибуция была бы без основания (review #349); факт синтетики остаётся
+            # в данных http_arm. (arm_public здесь всегда dict.)
             detail = (f"{host}: через прокси пришёл синтетический "
                       f"{arm_public.get('code', '?')} от самого прокси (мёртвый upstream, "
                       f"plain-HTTP-замер) — туннель не работает")
@@ -206,7 +215,7 @@ def proxy_effective_probe(*, host=None, channel="socks", http_arm=True):
             "host": host,
             "channel": channel,
             "proxy_url": proxy_url,
-            "direct": {}, "proxy": {},
+            "direct": {}, "proxy": {}, "http_arm": None,
             "detail": f"замер не выполнен: {e or e.__class__.__name__}",
         }
 

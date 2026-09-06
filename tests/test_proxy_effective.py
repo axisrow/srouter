@@ -274,6 +274,21 @@ def test_synthetic_on_http_arm_escalates_to_proxy_broken_not_vendor_outage(monke
     assert r["works"] is False
     assert r["status"] == "down"
     assert r["http_arm"]["synthetic_5xx"] is True
+    # Эскалированный вердикт обязан нести синтетический detail: регрессия, снова
+    # возвращающая _detail («лежит вендор»-стиль), должна краснеть здесь.
+    assert "синтетический" in r["detail"]
+
+
+def test_escalate_never_touches_unknown_or_down_verdicts():
+    """Гвард works в _escalate: unknown (works=None) НЕ эскалируется — канон probe
+    «неизвестность не равна поломке»; down-вердикты не меняются эскалацией."""
+    synthetic = {**_curl(503), "headers": PRIVOXY_SYNTHETIC_503_HEADERS}
+    assert proxy_effective._escalate("unknown", None, "unknown", synthetic) == \
+        ("unknown", None, "unknown")
+    assert proxy_effective._escalate("proxy-broken", False, "down", synthetic) == \
+        ("proxy-broken", False, "down")
+    assert proxy_effective._escalate("both-down", False, "down", synthetic) == \
+        ("both-down", False, "down")
 
 
 def test_unsigned_http_arm_failure_never_changes_verdict(monkeypatch):
@@ -319,3 +334,26 @@ def test_http_arm_can_be_disabled(monkeypatch):
     r = proxy_effective.proxy_effective_probe(host="github.com", http_arm=False)
     assert not any(u.startswith("http://") for u in calls)
     assert r["http_arm"] is None
+
+
+def test_unknown_result_still_carries_http_arm_key(monkeypatch):
+    """Review #349: unknown-путь держит форму контракта — http_arm присутствует (None),
+    иначе потребитель ловит KeyError ровно на пути, где диагностика нужнее всего."""
+    def boom(url, proxy=True, proxy_url=None, **kwargs):
+        raise RuntimeError("сломалось")
+    monkeypatch.setattr(proxy_effective, "_curl_through", boom)
+    r = proxy_effective.proxy_effective_probe(host="github.com")
+    assert r["status"] == "unknown"
+    assert r["http_arm"] is None
+
+
+def test_synthetic_on_http_arm_does_not_explain_both_down(monkeypatch):
+    """Review #349: при both-down прямое плечо тоже мёртв — «туннель не работает» была бы
+    однозначной атрибуцией без основания (полная недоступность сети объясняет итог не
+    хуже). Detail остаётся на _detail; факт синтетики живёт в данных http_arm."""
+    _patch_arms(monkeypatch, direct=_curl("000"), via_https=_curl("000"),
+                via_http={**_curl(503), "headers": PRIVOXY_SYNTHETIC_503_HEADERS})
+    r = proxy_effective.proxy_effective_probe(host="github.com", channel="http")
+    assert r["verdict"] == "both-down"
+    assert r["http_arm"]["synthetic_5xx"] is True
+    assert "синтетический" not in r["detail"]
