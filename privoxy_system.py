@@ -536,6 +536,53 @@ def protect_as_root(*, username, uid, prefix, staged_config, layout=DEFAULT_LAYO
         return _result(False, error=error, backup_dir=str(backup_dir))
 
 
+SNAPSHOT_ACCUMULATION_DEFAULT_DAYS = 28  # A5-ротация: «старше N» для кандидатов на чистку
+
+
+def snapshot_accumulation_report(layout=None, older_than_days=None, now=None):
+    """Count-only отчёт накопления root-snapshot'ов A5 (PR-4 #339, контракт §3/v2 §5).
+
+    Какие каталоги в backup_root НЕ ссылаются manifest'ом (backup_dir /
+    previous_protection_backup_dir) и старше older_than_days — кандидаты на чистку.
+    НИЧЕГО НЕ УДАЛЯЕТ: v2 §5 — первая итерация «только считаем»; удаление — отдельное
+    явное решение оператора (граница согласия автора). Возраст — по mtime каталога
+    (mkdtemp-имя `<stamp>-<rand>` несёт тот же момент, mtime переживает копирование).
+    Manifest отсутствует/битый → все старые каталоги кандидаты (fail-closed: без
+    manifest мы не знаем, что уже не нужно), флаг manifest_missing. Сбой чтения
+    (0700 root-каталог из user-процесса) → error-поле, не исключение. stdlib-only
+    (helper-tree, канон root-helper-stdlib-only)."""
+    layout = layout or DEFAULT_LAYOUT
+    try:
+        older = max(1, int(older_than_days)) if older_than_days is not None \
+            else SNAPSHOT_ACCUMULATION_DEFAULT_DAYS
+    except (TypeError, ValueError):
+        older = SNAPSHOT_ACCUMULATION_DEFAULT_DAYS
+
+    result = {"backup_root": str(layout.backup_root), "total": 0, "referenced": [],
+              "old_unreferenced": [], "manifest_missing": False,
+              "older_than_days": older, "error": ""}
+    manifest = _load_manifest(layout)
+    if not manifest:
+        result["manifest_missing"] = True
+    else:
+        result["referenced"] = sorted(
+            {str(manifest[key]) for key in ("backup_dir", "previous_protection_backup_dir")
+             if manifest.get(key)})
+    try:
+        cutoff = (float(now) if now is not None
+                  else datetime.now(timezone.utc).timestamp()) - older * 24 * 3600.0
+        entries = [(path, path.stat().st_mtime) for path in layout.backup_root.iterdir()
+                   if path.is_dir()]
+    except OSError as exc:
+        result["error"] = str(exc)
+        return result
+    result["total"] = len(entries)
+    result["old_unreferenced"] = sorted(
+        str(path) for path, mtime in entries
+        if str(path) not in set(result["referenced"]) and mtime < cutoff)
+    return result
+
+
 def unprotect_as_root(*, restore=True, layout=DEFAULT_LAYOUT, runner=_run,
                       checker=_port_open, chown=os.chown, enforce_root=True):
     if enforce_root and os.geteuid() != 0:

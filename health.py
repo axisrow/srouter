@@ -83,6 +83,12 @@ WATCHDOG_STATUS_LOG = Path.home() / "Library" / "Logs" / "srouter-watchdog.statu
 _DEGRADED_NOTIFY_COOLDOWN_DEFAULT_SEC = 900
 _DEGRADED_NOTIFY_COOLDOWN_ENV = "SROUTER_WATCHDOG_DEGRADED_COOLDOWN"
 
+# Ротация watchdog-журналов D2 (PR-4 #339, контракт §3 — дефолты «статус-jsonl: 14d/2MB»).
+# Выключена по умолчанию — включение SROUTER_WATCHDOG_LOG_ROTATE=1 (граница согласия).
+WATCHDOG_JOURNAL_RETENTION_DAYS = 14
+WATCHDOG_JOURNAL_MAX_BYTES = 2 * 1024 * 1024
+WATCHDOG_JOURNAL_ROTATE_ENV = "SROUTER_WATCHDOG_LOG_ROTATE"
+
 
 def check_all(*, active_claude=False):
     """Все проверки стека. {status: ok|degraded|down, checks: [{name, ok, detail?, info?}]}.
@@ -666,12 +672,36 @@ def _record_watchdog_metrics(result):
 
         if now - _state_float(state, "last_rotate") >= metrics_store.RETENTION_CHECK_INTERVAL_SEC:
             metrics_store.rotate_metrics_log(retention_days=opts["retention_days"])
+            # PR-4 #339 (D2): тот же hourly-гейт крутит и watchdog-журналы (при
+            # выключенной ручке — no-op; отдельный таймер не заводим).
+            _rotate_watchdog_journals()
             state["last_rotate"] = now
 
         state["last_write"] = now
         _write_watchdog_state(WATCHDOG_METRICS_STATE, state)
     except (OSError, ValueError, TypeError, KeyError) as exc:
         _log.debug("watchdog metrics recording failed: %s — метрики пропущены", exc)
+
+
+def _rotate_watchdog_journals():
+    """Ротация watchdog-журналов D2 (PR-4 #339, контракт §3): status/lifecycle JSONL
+    (ISO 'timestamp') и notify.log (ISO-префикс) — обобщённым примитивом
+    metrics_store.rotate_journal, дефолты 14d/2MB.
+
+    ВЫКЛЮЧЕНА ПО УМОЛЧАНИЮ (граница согласия автора): удаление содержимого логов —
+    только с явного opt-in оператора, env SROUTER_WATCHDOG_LOG_ROTATE=1. Повешена на
+    тот же hourly-гейт, что и metrics-ротация (RETENTION_CHECK_INTERVAL_SEC); при
+    выключенной ручке — дешёвый no-op. Best-effort: сбой не роняет watchdog."""
+    if os.environ.get(WATCHDOG_JOURNAL_ROTATE_ENV, "") != "1":
+        return
+    for log_path, ts_of_line in (
+        (WATCHDOG_STATUS_LOG, metrics_store.iso_timestamp_ts),
+        (WATCHDOG_LIFECYCLE_LOG, metrics_store.iso_timestamp_ts),
+        (WATCHDOG_NOTIFY_LOG, metrics_store.iso_prefix_ts),
+    ):
+        metrics_store.rotate_journal(log_path, retention_days=WATCHDOG_JOURNAL_RETENTION_DAYS,
+                                     max_bytes=WATCHDOG_JOURNAL_MAX_BYTES,
+                                     ts_of_line=ts_of_line, log_name=log_path.name)
 
 
 def _print_report(result):

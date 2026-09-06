@@ -70,8 +70,13 @@ _EVENT_STATUSES = (
 
 
 def _now(now=None):
-    """Единая точка времени (как hot_routes._now): тесты передают now=, прод — системное."""
+    """Единая точка времени (как hot_routes._now): тесты передают now=, прод — системное.
+
+    now может быть epoch-float ИЛИ datetime (PR-4 #339: rotate_journal-тесты оперируют
+    datetime-константой; datetime.timestamp() — тот же UTC-epoch, offset-aware)."""
     if now is not None:
+        if isinstance(now, datetime):
+            return now.timestamp()
         try:
             return float(now)
         except (TypeError, ValueError):
@@ -244,6 +249,36 @@ def _event_ts(line):
     return float(ts)
 
 
+def iso_timestamp_ts(line):
+    """epoch-ts из JSON-поля 'timestamp' (ISO-8601 с любым offset) — формат watchdog
+    status/lifecycle-журналов (#315). Не JSON/нет поля/битый ISO → None. Не бросает."""
+    try:
+        event = json.loads(line)
+    except ValueError:
+        return None
+    if not isinstance(event, dict):
+        return None
+    raw = event.get("timestamp")
+    if not isinstance(raw, str):
+        return None
+    try:
+        return datetime.fromisoformat(raw).timestamp()
+    except ValueError:
+        return None
+
+
+def iso_prefix_ts(line):
+    """epoch-ts из ISO-префикса plain-text строки ('<iso> [Sound] msg') — формат
+    notify.log. Первые токен до пробела; не ISO → None. Не бросает."""
+    head = line.strip().split(" ", 1)[0] if line.strip() else ""
+    if not head:
+        return None
+    try:
+        return datetime.fromisoformat(head).timestamp()
+    except ValueError:
+        return None
+
+
 def _median(values):
     vals = [v for v in values if isinstance(v, (int, float)) and not isinstance(v, bool)]
     if not vals:
@@ -374,14 +409,16 @@ def summarize(events, now=None, window_sec=WINDOW_SEC, ratio_threshold=DEGRADE_R
     return {"latest": latest, "baseline": baseline, "ratio": ratio, "trend": trend}
 
 
-def rotate_metrics_log(log_path=None, retention_days=None, max_bytes=None, now=None):
-    """Переписать JSONL без событий старше retention / сверх max_bytes (atomic).
-
-    Вызывается writer'ом не чаще раза в час (RETENTION_CHECK_INTERVAL_SEC), чтобы
-    не гонять rewrite на каждом watchdog-тике. True если файл переписан/чист, False
-    при сбое (существующий файл остаётся нетронутым — temp + os.replace). Не бросает.
-    """
-    path = Path(log_path) if log_path else METRICS_LOG
+def rotate_journal(log_path, *, retention_days=None, max_bytes=None, now=None,
+                   ts_of_line=None, log_name="journal"):
+    """Обобщённая ротация append-only журнала (PR-4 #339, контракт §3: D2/D3 — к примитиву
+    rotate_metrics_log). Отличие от метрик — только экстрактор ts строки: метрики несут
+    epoch 'ts' (_event_ts), watchdog-журналы — ISO 'timestamp' (iso_timestamp_ts) или
+    ISO-префикс plain-text (iso_prefix_ts, notify.log). Остальная семантика перенесена
+    без изменений: atomic rewrite, early-exit на свежей голове, битые строки вырезаются,
+    сбой → False и файл не тронут. Не бросает."""
+    path = Path(log_path)
+    ts_of_line = ts_of_line or _event_ts
     try:
         retention_days = max(1, int(retention_days)) if retention_days is not None else DEFAULT_RETENTION_DAYS
     except (TypeError, ValueError):
@@ -400,12 +437,11 @@ def rotate_metrics_log(log_path=None, retention_days=None, max_bytes=None, now=N
             return True
         cutoff = _now(now) - retention_days * 24 * 3600.0
         # Early-exit: файл append-only и монотонен по ts, поэтому самое старое событие —
-        # первая строка. Свежая голова + размер в пределах лимита = переписывать нечего,
-        # и полный парс всех ~10k строк (сотни мс на watchdog-тике) не нужен.
+        # первая строка. Свежая голова + размер в пределах лимита = переписывать нечего.
         if size <= max_bytes:
             with open(path, "r", encoding="utf-8") as f:
                 head = f.readline().strip()
-            head_ts = _event_ts(head) if head else None
+            head_ts = ts_of_line(head) if head else None
             if head_ts is not None and head_ts >= cutoff:
                 return True
         with open(path, "r", encoding="utf-8") as f:
@@ -416,7 +452,7 @@ def rotate_metrics_log(log_path=None, retention_days=None, max_bytes=None, now=N
             stripped = line.strip()
             if not stripped:
                 continue
-            ts = _event_ts(stripped)
+            ts = ts_of_line(stripped)
             if ts is not None and ts >= cutoff:
                 kept.append(stripped)
             else:
@@ -426,5 +462,20 @@ def rotate_metrics_log(log_path=None, retention_days=None, max_bytes=None, now=N
         return local_state._atomic_write_text(
             path, "".join(line + "\n" for line in kept[-_READ_MAX_LINES:]))
     except OSError as exc:
-        _log.warning("metrics retention rotate failed: %s — файл не тронут", exc)
+        _log.warning("%s retention rotate failed: %s — файл не тронут", log_name, exc)
         return False
+
+
+def rotate_metrics_log(log_path=None, retention_days=None, max_bytes=None, now=None):
+    """Переписать metrics JSONL без событий старше retention / сверх max_bytes (atomic).
+
+    Вызывается writer'ом не чаще раза в час (RETENTION_CHECK_INTERVAL_SEC), чтобы
+    не гонять rewrite на каждом watchdog-тике. True если файл переписан/чист, False
+    при сбое (существующий файл остаётся нетронутым — temp + os.replace). Не бросает.
+
+    PR-4 #339: реализация делегирует обобщённому rotate_journal (та же семантика,
+    экстрактор epoch-'ts' метрик) — D2/D3-журналы ротируются тем же примитивом.
+    """
+    path = log_path if log_path is not None else METRICS_LOG
+    return rotate_journal(path, retention_days=retention_days, max_bytes=max_bytes,
+                          now=now, ts_of_line=_event_ts, log_name="metrics")

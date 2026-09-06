@@ -165,6 +165,20 @@ def check_backup_slots(state_path=None, *, claude_settings=None, vscode_settings
                 f"накопление: {name} — {len(generations)} поколений у {config_path} "
                 f"(>{ACCUMULATION_WARN}; сигнал, что rotation не работала — PR-2 #339)")
 
+    # ---- A5 root-snapshots: накопление без manifest-ссылки (PR-4 #339, count-only) ----
+    # Read-only: /Library/.../backups/privoxy из user-процесса обычно 0700-root → report
+    # вернёт error и грань молчит (fail-soft); root-контекст (helper) увидит картину.
+    try:
+        import privoxy_system
+        snap = privoxy_system.snapshot_accumulation_report()
+        if not snap.get("error") and snap.get("old_unreferenced"):
+            findings.append(
+                f"накопление root-snapshots: {len(snap['old_unreferenced'])} каталогов "
+                f"старше {snap['older_than_days']}d без manifest-ссылки (PR-4 #339; "
+                "count-only — удаление только явное решение оператора)")
+    except ImportError as exc:
+        _log.debug("privoxy_system недоступен: %s — A5-чек пропущен", exc)
+
     # ---- sidecar-lease: чеки 1/5 (claude/vscode) ----
     probes = [_claude_settings_target(claude_settings)]
     probes.extend(_vscode_settings_targets(vscode_settings))
