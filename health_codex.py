@@ -452,7 +452,7 @@ def _privoxy_log_observability_check(layout=privoxy_system.DEFAULT_LAYOUT):
     except ValueError as exc:
         return {"status": "warn",
                 "detail": f"privoxy config не парсится ({exc}) — debug-уровень неизвестен, "
-                          f"observability под вопросом (osознанно тихий дефолт #141 неотличим от "
+                          f"observability под вопросом (осознанно тихий дефолт #141 неотличим от "
                           f"битого конфига). Проверить: privoxy --config-test"}
     debug_raw = directives.get("debug", "0").strip()
     try:
