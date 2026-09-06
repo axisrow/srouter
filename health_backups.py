@@ -19,6 +19,7 @@ unknown (не угадываем), не warn. Модуль ничего не м�
 """
 import json
 import logging
+import os
 from pathlib import Path
 
 import backup_lib
@@ -63,14 +64,18 @@ def _sidecar_findings(target, managed_key_present, findings):
             "НЕ удалять молча, данные чужие)")
 
 
-def _claude_settings_target():
-    """(target, managed-ключ-присутствует|None). None = unreadable → не оцениваем."""
+def _claude_settings_target(path=None):
+    """(target, managed-ключ-присутствует|None). None = unreadable → не оцениваем.
+
+    Путь: явный path > env SROUTER_CLAUDE_SETTINGS (канон more-options-better, review
+    #351: детерминированная интеграция без monkeypatch) > claude_proxy.SETTINGS (прод)."""
     try:
         import claude_proxy
     except ImportError as exc:
         _log.debug("claude_proxy недоступен: %s — sidecar-чек пропущен", exc)
         return None
-    settings = claude_proxy.SETTINGS
+    settings = Path(path or os.environ.get("SROUTER_CLAUDE_SETTINGS")
+                    or claude_proxy.SETTINGS)
     data = _load_json(settings)
     if data is None and settings.exists():
         return (settings, None)  # битый settings — не угадываем (#307 unknown-семантика)
@@ -79,15 +84,19 @@ def _claude_settings_target():
     return (settings, any(k in env for k in claude_proxy.ENV_KEYS))
 
 
-def _vscode_settings_targets():
-    """[(target, managed|None)] по vscode_proxy._settings_paths (env-override для тестов)."""
-    try:
-        import vscode_proxy
-    except ImportError as exc:
-        _log.debug("vscode_proxy недоступен: %s — sidecar-чек пропущен", exc)
-        return []
+def _vscode_settings_targets(paths=None):
+    """[(target, managed|None)]. paths: явный override > vscode_proxy._settings_paths
+    (который сам чтит env SROUTER_VSCODE_SETTINGS — канон more-options-better)."""
+    if not paths:
+        try:
+            import vscode_proxy
+        except ImportError as exc:
+            _log.debug("vscode_proxy недоступен: %s — sidecar-чек пропущен", exc)
+            return []
+        paths = vscode_proxy._settings_paths()
+    settings_list = [Path(p) for p in paths]
     out = []
-    for settings in vscode_proxy._settings_paths():
+    for settings in settings_list:
         data = _load_json(settings)
         if data is None and settings.exists():
             out.append((settings, None))
@@ -96,11 +105,15 @@ def _vscode_settings_targets():
     return out
 
 
-def check_backup_slots(state_path=None):
+def check_backup_slots(state_path=None, *, claude_settings=None, vscode_settings=None):
     """{status: ok|warn|unknown, detail, findings}. Доктор-грань контракта #339 §6.
 
     Read-only: ничего не удаляет и не чинит — только докладывает (образец
-    persists-across-boot #330: warn требует внимания, но канал в моменте работает)."""
+    persists-across-boot #330: warn требует внимания, но канал в моменте работает).
+
+    claude_settings/vscode_settings — явные override целей sidecar-чеков (для
+    детерминированного тестирования; иначе env SROUTER_CLAUDE_SETTINGS /
+    SROUTER_VSCODE_SETTINGS, потом прод-дефолты модулей)."""
     import local_state
 
     findings = []
@@ -126,18 +139,36 @@ def check_backup_slots(state_path=None):
                 "(оригинал невосстановим, #293)")
         accounted = {str(pointer), str(entry.get("restored_from_backup") or "")}
         unaccounted = [g for g in generations if str(g) not in accounted]
-        if unaccounted and not pointer and not entry.get("restored_from_backup"):
-            findings.append(
-                f"orphaned_backup: {name} — {len(unaccounted)} поколение(й) рядом с "
-                f"{config_path}, state молчит (crash-окно install, #124); "
-                "disk-доказательство: " + ", ".join(g.name for g in unaccounted))
+        # Review #351: «state молчит» бывает полным (поинтера нет вовсе — warn на любое
+        # неучтённое поколение) и ЧАСТИЧНЫМ (свежий pointer + неучтённые реликты — crash
+        # между двумя install'ами). Частичное молчание оцениваем только СВЕРХ окна
+        # ротации: здоровая машина при окне KEEP легально держит KEEP-1 неучтённых
+        # реликта (окно хранит новейшие, поинтер — новейший из них) — без допуска чек
+        # ложно срабатывал бы на каждом штатном install'е. Ротация выключена
+        # (SROUTER_BACKUP_KEEP=0) → реликты легальны по выбору оператора, молчим.
+        if unaccounted:
+            names = ", ".join(g.name for g in unaccounted)
+            keep = backup_lib._resolve_keep(None)
+            has_pointer = bool(pointer or entry.get("restored_from_backup"))
+            if not has_pointer:
+                findings.append(
+                    f"orphaned_backup: {name} — {len(unaccounted)} поколение(й) рядом с "
+                    f"{config_path}, state молчит (crash-окно install, #124); "
+                    f"disk-доказательство: {names}")
+            elif keep >= 1 and len(unaccounted) > max(keep - 1, 0):
+                findings.append(
+                    f"orphaned_backup: {name} — {len(unaccounted)} поколение(й) рядом с "
+                    f"{config_path} не учтены state сверх окна ротации (поинтер ссылается "
+                    f"лишь на одно; crash-окно между install'ами): {names}")
         if len(generations) > ACCUMULATION_WARN:
             findings.append(
                 f"накопление: {name} — {len(generations)} поколений у {config_path} "
                 f"(>{ACCUMULATION_WARN}; сигнал, что rotation не работала — PR-2 #339)")
 
     # ---- sidecar-lease: чеки 1/5 (claude/vscode) ----
-    for probe in (_claude_settings_target(), *_vscode_settings_targets()):
+    probes = [_claude_settings_target(claude_settings)]
+    probes.extend(_vscode_settings_targets(vscode_settings))
+    for probe in probes:
         if probe is None:
             continue
         target, managed = probe

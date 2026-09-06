@@ -121,6 +121,46 @@ def test_generation_accumulation_warns(tmp_path):
     assert any("накопление" in f for f in result["findings"])
 
 
+# ============================ чек 3, частичное молчание (review #351) ============================
+def test_partial_silence_relics_beyond_window_warn(tmp_path):
+    """Review #351: свежий pointer + реликты СВЕРХ окна ротации (crash между двумя
+    install'ами) — раньше это молчало (4 поколения < порога накопления 5). Теперь —
+    отдельная формулировка orphaned_backup «не учтены сверх окна»."""
+    cfg = tmp_path / "config"
+    cfg.write_text("managed\n", encoding="utf-8")
+    stamps = ["2026-0%d-01T000000Z" % m for m in range(1, 6)]  # 5 поколений
+    for s in stamps:
+        _gen(cfg, s)
+    newest = cfg.with_name(cfg.name + backup_lib.BACKUP_INFIX + stamps[-1])
+    state = _write_state(tmp_path, {"privoxy": {
+        "config_path": str(cfg), "backup": str(newest),
+        "management": {"mode": "managed", "managed": True}}})
+
+    result = health_backups.check_backup_slots(state_path=state)
+
+    assert result["status"] == "warn"
+    assert any("сверх окна" in f for f in result["findings"]), result["findings"]
+
+
+def test_pointer_with_window_sized_relics_stays_silent(tmp_path):
+    """Здоровая машина при окне 3 легально держит 2 неучтённых реликта (окно хранит
+    новейшие, поинтер — новейший) — частично-молчаливый чек НЕ должен ложно срабатывать
+    на каждом штатном install'е (допуск keep-1, review #351)."""
+    cfg = tmp_path / "config"
+    cfg.write_text("managed\n", encoding="utf-8")
+    stamps = ["2026-0%d-01T000000Z" % m for m in range(1, 4)]  # 3 поколения = окно
+    for s in stamps:
+        _gen(cfg, s)
+    newest = cfg.with_name(cfg.name + backup_lib.BACKUP_INFIX + stamps[-1])
+    state = _write_state(tmp_path, {"privoxy": {
+        "config_path": str(cfg), "backup": str(newest),
+        "management": {"mode": "managed", "managed": True}}})
+
+    result = health_backups.check_backup_slots(state_path=state)
+
+    assert result["findings"] == [], result["findings"]
+
+
 # ============================ чек 1: сирота-sidecar ============================
 def test_orphan_sidecar_warns(tmp_path, monkeypatch):
     """Sidecar-lease существует, а managed-ключа в settings нет → warn «сиротский
@@ -168,6 +208,36 @@ def test_generation_and_lease_slot_mixing_warns(tmp_path, monkeypatch):
 
     assert result["status"] == "warn"
     assert any("смешение" in f for f in result["findings"])
+
+
+# ============================ override-ручки целей sidecar-чеков (review #351) ============================
+def test_claude_settings_env_override(tmp_path, monkeypatch):
+    """SROUTER_CLAUDE_SETTINGS (канон more-options-better): детерминированная интеграция
+    без monkeypatch по claude_proxy.SETTINGS."""
+    settings = tmp_path / "claude-settings.json"
+    settings.write_text(json.dumps({"env": {}}), encoding="utf-8")
+    backup_lib.sidecar_path(settings).write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("SROUTER_CLAUDE_SETTINGS", str(settings))
+
+    result = health_backups.check_backup_slots(state_path=_write_state(tmp_path, {}))
+
+    assert any("сиротский sidecar" in f and str(settings) in f
+               for f in result["findings"]), result["findings"]
+
+
+def test_explicit_settings_params_override(tmp_path):
+    """Явные параметры claude_settings/vscode_settings — прямая ручка для тестов/кастома,
+    приоритетнее env и прод-дефолтов."""
+    settings = tmp_path / "claude-settings.json"
+    settings.write_text(json.dumps({"env": {}}), encoding="utf-8")
+    backup_lib.sidecar_path(settings).write_text("{}", encoding="utf-8")
+
+    result = health_backups.check_backup_slots(
+        state_path=_write_state(tmp_path, {}),
+        claude_settings=settings, vscode_settings=[tmp_path / "absent-settings.json"])
+
+    assert any("сиротский sidecar" in f and str(settings) in f
+               for f in result["findings"]), result["findings"]
 
 
 # ============================ интеграция в health.check_all ============================
