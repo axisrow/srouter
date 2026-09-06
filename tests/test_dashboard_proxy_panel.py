@@ -28,6 +28,7 @@ var _KEYS = {
   // issue #307: новые ключи маппятся сами в себя — ассерт «proxy_foreign in html» ловит
   // именно использование ключа, а не совпадение человеческого текста.
   proxy_foreign: 'proxy_foreign', proxy_mixed_state: 'proxy_mixed_state',
+  proxy_running_yes: 'процесс жив', proxy_running_no: 'процесс не найден',
   proxy_on: 'Включить', proxy_off: 'Выключить'
 };
 var I18N = { ru: _KEYS, en: _KEYS };
@@ -124,6 +125,28 @@ def test_multiline_detail_does_not_break_row_layout():
                     "manageable": True})
     body = html.split("</tr>")[-2] if "</tr>" in html else html
     assert "\n" not in body.replace("\\n", "")
+
+
+# ==================== issue #302: process-alive ось running видна в строке ====================
+
+def test_running_true_is_visible_in_row():
+    """#302: running=True (process-alive) обязан быть виден — ось не только в API."""
+    html = _render({"id": "desktop", "title": "Desktop / ChatGPT.app", "configured": None,
+                    "runtime": "n/a", "running": True, "proxy": "", "detail": "", "manageable": False})
+    assert "процесс жив" in html
+
+
+def test_running_false_is_visible_in_row():
+    html = _render({"id": "vscode", "title": "VSCode / codex", "configured": True,
+                    "runtime": "n/a", "running": False, "proxy": "", "detail": "", "manageable": True})
+    assert "процесс не найден" in html
+
+
+def test_running_none_adds_no_marker():
+    """None = не измеряли (probe=False) — никакого маркера, не выдумываем состояние."""
+    html = _render({"id": "git", "title": "git → github", "configured": True,
+                    "runtime": "n/a", "running": None, "proxy": "", "detail": "", "manageable": True})
+    assert "процесс жив" not in html and "процесс не найден" not in html
 
 
 # ==================== issue #307: foreign/mixed видны пользователю ====================

@@ -22,14 +22,18 @@ def _spec(reg, consumer_id):
 
 
 def test_every_consumer_has_both_axes(monkeypatch):
-    """Каждая строка обязана нести configured И runtime — это суть панели."""
+    """Каждая строка обязана нести configured И runtime — это суть панели.
+    #302: плюс явный класс evidence и process-alive ось running."""
     monkeypatch.setattr(proxy_registry, "_effective", lambda: {"status": "ok"})
     reg = proxy_registry.overview(probe=False)
     assert reg["consumers"], "реестр не может быть пустым"
     for c in reg["consumers"]:
-        assert set(("id", "title", "configured", "runtime", "proxy", "detail", "manageable")) <= set(c), c
+        assert set(("id", "title", "configured", "runtime", "proxy", "detail", "manageable",
+                    "evidence", "running")) <= set(c), c
         assert c["configured"] in (True, False, None)
         assert c["runtime"] in ("ok", "down", "warn", "unknown", "mixed", "n/a")
+        assert c["evidence"] in ("physical", "active-probe", "config-only"), c
+        assert c["running"] in (True, False, None), c
 
 
 def test_git_unknown_branch_without_status_key_is_not_read_as_configured(monkeypatch):
@@ -155,15 +159,16 @@ def test_not_configured_consumer_does_not_claim_working_proxy(monkeypatch):
 
 
 def test_not_configured_but_leaking_still_reports_down(monkeypatch):
-    """Обратная сторона: 'не настроен' НЕ повод скрывать доказанную утечку/поломку."""
-    monkeypatch.setattr(proxy_registry.git_proxy, "status",
-                        lambda: {"enabled": False, "present": False, "proxy": "",
-                                 "values": [], "multi": False, "key": "k"})
+    """Обратная сторона: 'не настроен' НЕ повод скрывать доказанную утечку/поломку.
+    #302: инвариант держится для physical-потребителя (claude) — config-only/active-probe
+    строки при configured=False честно уходят в n/a (прокси-путь не задействован)."""
+    monkeypatch.setattr(proxy_registry.claude_proxy, "status",
+                        lambda: {"enabled": False, "proxy": ""})
     monkeypatch.setattr(proxy_registry, "_health_call",
                         lambda fn: {"status": "down", "detail": "идёт мимо прокси"})
     monkeypatch.setattr(proxy_registry, "_effective", lambda: {"status": "ok"})
-    git = _spec(proxy_registry.overview(probe=True), "git")
-    assert git["runtime"] == "down"
+    row = _spec(proxy_registry.overview(probe=True), "claude")
+    assert row["runtime"] == "down"
 
 
 def test_broken_status_fn_forces_unknown_runtime_even_if_health_fn_succeeds(monkeypatch):
@@ -231,3 +236,355 @@ def test_apply_passes_conflict_flag_through(monkeypatch):
     r = proxy_registry.apply(["git"], action="enable")
     assert r["ok"] is False
     assert r["results"][0]["conflict"] is True
+
+
+# ==================== issue #302: трёхуровневая ось configured/running/verified ====================
+
+def test_config_only_consumers_never_claim_runtime_ok(monkeypatch):
+    """ДЫРА #302 (эмпирика design-анализа): конфиг-пробы vscode/desktop НЕ являются
+    доказательством физической работы — их health_fn читает settings.json/launchctl,
+    т.е. тот же класс артефакта, что ось configured. Даже когда проба отдаёт ok,
+    runtime обязан быть честным 'n/a' (noisy-log-better-than-no-log: ложный ok хуже
+    отсутствия ответа)."""
+    monkeypatch.setattr(proxy_registry.vscode_proxy, "status",
+                        lambda: {"enabled": True, "proxy": "socks5h://127.0.0.1:10808",
+                                 "paths": {"/a/settings.json": {"present": True, "proxy": "socks5h://127.0.0.1:10808"}}})
+    monkeypatch.setattr(proxy_registry, "_health_call",
+                        lambda fn: {"status": "ok", "detail": "якобы физически ok"})
+    monkeypatch.setattr(proxy_registry, "_effective", lambda: {"status": "ok"})
+    reg = proxy_registry.overview(probe=True)
+    for cid in ("vscode", "desktop"):
+        row = _spec(reg, cid)
+        assert row["evidence"] == "config-only", row
+        assert row["runtime"] == "n/a", (
+            f"{cid}: конфиг-проба не доказывает трафик — runtime обязан быть n/a, "
+            f"получено {row['runtime']}")
+
+
+def test_running_reflects_process_alive_gated(monkeypatch):
+    """running — process-alive ось (#302): заполняется ТОЛЬКО когда есть с чем сравнивать
+    (гейт по образцу #337), и не выдумывается для потребителей без процесса (git/system)."""
+    monkeypatch.setattr(proxy_registry, "_effective", lambda: {"status": "ok"})
+    monkeypatch.setattr(proxy_registry, "_process_running",
+                        lambda cid: {"claude": True, "desktop": True, "vscode": False}.get(cid))
+    reg = proxy_registry.overview(probe=True)
+    assert _spec(reg, "claude")["running"] is True
+    assert _spec(reg, "desktop")["running"] is True
+    assert _spec(reg, "vscode")["running"] is False
+    assert _spec(reg, "git")["running"] is None
+
+
+def test_running_not_measured_without_probe(monkeypatch):
+    """probe=False — открытие страницы лёгкое: running не измеряется (None), не выдумывается."""
+    monkeypatch.setattr(proxy_registry, "_effective", lambda: {"status": "ok"})
+    monkeypatch.setattr(proxy_registry, "_process_running",
+                        lambda cid: (_ for _ in ()).throw(AssertionError("ps не должен зваться без probe")))
+    reg = proxy_registry.overview(probe=False)
+    assert _spec(reg, "desktop")["running"] is None
+
+
+def test_git_active_probe_only_when_configured(monkeypatch):
+    """git (#302): физический замер возможен только АКТИВНЫЙ (процесс <2с, пассивный lsof
+    промахивается — эмпирика design-анализа). runtime идёт из активной пробы; когда
+    configured=False/None, прокси-путь git не задействован — проба не зовётся вовсе."""
+    monkeypatch.setattr(proxy_registry.git_proxy, "status",
+                        lambda: {"enabled": False, "present": False, "proxy": "",
+                                 "values": [], "multi": False, "key": "k"})
+    monkeypatch.setattr(proxy_registry, "_git_verified",
+                        lambda: (_ for _ in ()).throw(AssertionError("проба не должна зваться при configured=False")))
+    monkeypatch.setattr(proxy_registry, "_effective", lambda: {"status": "ok"})
+    git = _spec(proxy_registry.overview(probe=True), "git")
+    assert git["evidence"] == "active-probe"
+    assert git["runtime"] == "n/a"
+
+
+def test_git_verified_probe_failure_explains_unknown(monkeypatch):
+    """Code-review #347: unknown от упавшей активной пробы обязан нести причину в detail —
+    «unknown из ниоткуда» нечитаем (noisy-log-better-than-no-log)."""
+    monkeypatch.setattr(proxy_registry.git_proxy, "status",
+                        lambda: {"enabled": True, "present": True, "proxy": "http://127.0.0.1:8118",
+                                 "values": [], "multi": False, "key": "k"})
+
+    def boom():
+        raise RuntimeError("git сломан")
+    monkeypatch.setattr(proxy_registry, "_git_verified", boom)
+    monkeypatch.setattr(proxy_registry, "_effective", lambda: {"status": "ok"})
+    git = _spec(proxy_registry.overview(probe=True), "git")
+    assert git["runtime"] == "unknown"
+    assert "не удалась" in git["detail"], git
+
+
+def test_git_verified_probe_result_becomes_runtime(monkeypatch):
+    """configured=True + probe=True: активный ls-remote стеком самого git — настоящий
+    per-потребительский физический замер; его вердикт и есть runtime."""
+    monkeypatch.setattr(proxy_registry.git_proxy, "status",
+                        lambda: {"enabled": True, "present": True,
+                                 "proxy": "http://127.0.0.1:8118",
+                                 "values": ["http://127.0.0.1:8118"], "multi": False, "key": "k"})
+    monkeypatch.setattr(proxy_registry, "_git_verified",
+                        lambda: {"status": "down", "detail": "туннель мёртв"})
+    monkeypatch.setattr(proxy_registry, "_effective", lambda: {"status": "ok"})
+    reg = proxy_registry.overview(probe=True)
+    git = _spec(reg, "git")
+    assert git["runtime"] == "down"
+    # главный сценарий панели работает и для git: настроен + не идёт = предупреждение
+    assert any("git" in w for w in reg["warnings"]), reg["warnings"]
+
+
+def test_git_without_probe_runtime_is_na(monkeypatch):
+    """Без явного запроса активной пробы НЕТ (секунды через GFW) — git runtime 'n/a',
+    а не выдуманный 'unknown' от конфиг-пробы."""
+    monkeypatch.setattr(proxy_registry.git_proxy, "status",
+                        lambda: {"enabled": True, "present": True, "proxy": "http://127.0.0.1:8118",
+                                 "values": [], "multi": False, "key": "k"})
+    monkeypatch.setattr(proxy_registry, "_git_verified",
+                        lambda: (_ for _ in ()).throw(AssertionError("активная проба только по probe=True")))
+    monkeypatch.setattr(proxy_registry, "_effective", lambda: {"status": "ok"})
+    git = _spec(proxy_registry.overview(probe=False), "git")
+    assert git["runtime"] == "n/a"
+
+
+# ==================== issue #303: атомарный apply + rollback при partial failure ====================
+
+class _Spy:
+    """Шпион мутации: считает вызовы; возвращает result или бросает exc."""
+
+    def __init__(self, exc=None, result=None):
+        self.calls = []
+        self._exc = exc
+        self._result = result
+
+    def __call__(self, *args, **kwargs):
+        self.calls.append(1)
+        if self._exc is not None:
+            raise self._exc
+        return self._result if self._result is not None else {"ok": True}
+
+
+def _spy(exc=None, result=None):
+    return _Spy(exc=exc, result=result)
+
+
+def test_apply_stops_on_first_failure(monkeypatch):
+    """ДЫРА #303: после первой ошибки apply НЕ продолжает — не расширяет частично
+    изменённое состояние (fail-closed: частично применённый прокси хуже явного отказа)."""
+    ok_enable = _spy()
+    boom = _spy(exc=RuntimeError("settings.json read-only"))
+    vscode_enable = _spy()
+    monkeypatch.setattr(proxy_registry.git_proxy, "status",
+                        lambda: {"enabled": False, "proxy": "", "state": "absent"})
+    monkeypatch.setattr(proxy_registry.git_proxy, "enable", ok_enable)
+    monkeypatch.setattr(proxy_registry.git_proxy, "disable", _spy(result={"ok": True}))
+    monkeypatch.setattr(proxy_registry.claude_proxy, "enable", boom)
+    monkeypatch.setattr(proxy_registry.vscode_proxy, "enable", vscode_enable)
+    r = proxy_registry.apply(action="enable")
+    assert ok_enable.calls == [1]
+    assert boom.calls == [1]
+    assert vscode_enable.calls == [], "после первой ошибки оставшиеся потребители не мутируются"
+    assert r["ok"] is False
+    assert r["failed"]["id"] == "claude"
+    assert r["applied"] == ["git"]
+    assert r["unattempted"] == ["vscode"]
+
+
+def test_apply_rolls_back_applied_consumers(monkeypatch):
+    """ДЫРА #303: успешные до сбоя мутации откатываются компенсирующим действием —
+    пользователь не остаётся в частично применённом состоянии без явного сигнала."""
+    monkeypatch.setattr(proxy_registry.git_proxy, "enable", lambda force=False: {"ok": True})
+    monkeypatch.setattr(proxy_registry.claude_proxy, "enable",
+                        lambda force=False: {"ok": False, "err": "disk full"})
+    git_disable = _spy(result={"ok": True})
+    monkeypatch.setattr(proxy_registry.git_proxy, "disable", git_disable)
+    r = proxy_registry.apply(action="enable")
+    assert git_disable.calls == [1], "успешно применённый git обязан быть откачен"
+    assert r["rolled_back"] == ["git"]
+    assert r["partial"] is True
+    assert r["ok"] is False
+
+
+def test_apply_rollback_failure_is_reported_loudly(monkeypatch):
+    """Откат сам может упасть — это НЕ может быть тихим: rollback_errors обязателен."""
+    monkeypatch.setattr(proxy_registry.git_proxy, "enable", lambda force=False: {"ok": True})
+    monkeypatch.setattr(proxy_registry.claude_proxy, "enable",
+                        lambda force=False: (_ for _ in ()).throw(RuntimeError("boom")))
+    def broken_disable():
+        raise RuntimeError("git config unwritable")
+    monkeypatch.setattr(proxy_registry.git_proxy, "disable", broken_disable)
+    r = proxy_registry.apply(action="enable")
+    assert r["rolled_back"] == []
+    assert r["rollback_errors"] == [{"id": "git", "err": "git config unwritable"}]
+    assert r["ok"] is False
+
+
+def test_apply_disable_rollback_restores_via_enable_force(monkeypatch):
+    """Откат disable — enable(force=True): восстанавливаем СОБСТВЕННОЕ только что снятое
+    значение; conflict-гейт не имеет права заблокировать восстановление."""
+    monkeypatch.setattr(proxy_registry.git_proxy, "status",
+                        lambda: {"enabled": True, "proxy": "http://127.0.0.1:8118", "state": "managed-on"})
+    monkeypatch.setattr(proxy_registry.git_proxy, "disable", lambda: {"ok": True})
+    monkeypatch.setattr(proxy_registry.claude_proxy, "disable",
+                        lambda: {"ok": False, "err": "boom"})
+    seen = {}
+    def fake_enable(force=False):
+        seen["force"] = force
+        return {"ok": True}
+    monkeypatch.setattr(proxy_registry.git_proxy, "enable", fake_enable)
+    r = proxy_registry.apply(action="disable")
+    assert seen["force"] is True
+    assert r["rolled_back"] == ["git"]
+
+
+def test_apply_full_success_reports_no_partial(monkeypatch):
+    monkeypatch.setattr(proxy_registry.git_proxy, "enable", lambda force=False: {"ok": True})
+    monkeypatch.setattr(proxy_registry.claude_proxy, "enable", lambda force=False: {"ok": True})
+    monkeypatch.setattr(proxy_registry.vscode_proxy, "enable", lambda force=False: {"ok": True})
+    r = proxy_registry.apply(action="enable")
+    assert r["ok"] is True
+    assert r["partial"] is False
+    assert r["rolled_back"] == [] and r["rollback_errors"] == []
+    assert r["applied"] == ["git", "claude", "vscode"]
+    assert r["unattempted"] == []
+
+
+# ==================== review #347: rollback восстанавливает pre-state, не слепая инверсия ====================
+
+def test_apply_rollback_skips_already_enabled_consumer(monkeypatch):
+    """Сценарий axisrow: claude УЖЕ был включён до apply; его enable — no-op по состоянию.
+    Слепой откат выключил бы рабочее состояние. Откатывать можно только изменённое."""
+    monkeypatch.setattr(proxy_registry.git_proxy, "status",
+                        lambda: {"enabled": False, "proxy": "", "state": "absent"})
+    monkeypatch.setattr(proxy_registry.git_proxy, "enable", lambda force=False: {"ok": True})
+    monkeypatch.setattr(proxy_registry.claude_proxy, "status",
+                        lambda: {"enabled": True, "proxy": "http://127.0.0.1:8118"})
+    monkeypatch.setattr(proxy_registry.claude_proxy, "enable", lambda force=False: {"ok": True})
+    monkeypatch.setattr(proxy_registry.vscode_proxy, "enable",
+                        lambda force=False: {"ok": False, "err": "boom"})
+    git_disable = _spy(result={"ok": True})
+    claude_disable = _spy(result={"ok": True})
+    monkeypatch.setattr(proxy_registry.git_proxy, "disable", git_disable)
+    monkeypatch.setattr(proxy_registry.claude_proxy, "disable", claude_disable)
+    r = proxy_registry.apply(action="enable")
+    assert claude_disable.calls == [], "уже включённый до apply потребитель не выключается откатом"
+    assert git_disable.calls == [1], "изменённый (был выключен) потребитель откатывается"
+    assert r["rolled_back"] == ["git"]
+    assert r["rollback_skipped"] == [
+        {"id": "claude", "reason": "уже был включён до apply — откат выключил бы рабочее состояние"}]
+
+
+def test_apply_rollback_restores_only_changed_consumer(monkeypatch):
+    """Изменённый (был выключен, мы включили) — откатывается; symmetrical to previous."""
+    monkeypatch.setattr(proxy_registry.git_proxy, "status",
+                        lambda: {"enabled": False, "proxy": "", "state": "absent"})
+    monkeypatch.setattr(proxy_registry.git_proxy, "enable", lambda force=False: {"ok": True})
+    monkeypatch.setattr(proxy_registry.claude_proxy, "enable",
+                        lambda force=False: (_ for _ in ()).throw(RuntimeError("boom")))
+    git_disable = _spy(result={"ok": True})
+    monkeypatch.setattr(proxy_registry.git_proxy, "disable", git_disable)
+    r = proxy_registry.apply(action="enable")
+    assert git_disable.calls == [1]
+    assert r["rolled_back"] == ["git"]
+
+
+def test_apply_disable_rollback_skips_foreign_prestate(monkeypatch):
+    """Сценарий axisrow #307: до apply у git стояло ЧУЖОЕ включённое значение; наш disable
+    его снял. Слепой enable(force=True) перезаписал бы чужое НАШИМ без consent — откат
+    обязан быть честным отказом с причиной, а не молчаливой перезаписью."""
+    monkeypatch.setattr(proxy_registry.git_proxy, "status",
+                        lambda: {"enabled": True, "proxy": "https://corp:8443", "state": "foreign"})
+    monkeypatch.setattr(proxy_registry.git_proxy, "disable", lambda: {"ok": True})
+    monkeypatch.setattr(proxy_registry.claude_proxy, "disable",
+                        lambda: {"ok": False, "err": "boom"})
+    seen = {}
+    def spy_enable(force=False):
+        seen["force"] = force
+        return {"ok": True}
+    monkeypatch.setattr(proxy_registry.git_proxy, "enable", spy_enable)
+    r = proxy_registry.apply(action="disable")
+    assert seen == {}, "чужое значение не перезаписывается force-откатом (#307)"
+    assert r["rolled_back"] == []
+    assert len(r["rollback_skipped"]) == 1
+    assert "#307" in r["rollback_skipped"][0]["reason"]
+
+
+def test_apply_disable_rollback_restores_previously_enabled_own_state(monkeypatch):
+    monkeypatch.setattr(proxy_registry.git_proxy, "status",
+                        lambda: {"enabled": True, "proxy": "http://127.0.0.1:8118", "state": "managed-on"})
+    monkeypatch.setattr(proxy_registry.git_proxy, "disable", lambda: {"ok": True})
+    monkeypatch.setattr(proxy_registry.claude_proxy, "disable",
+                        lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+    seen = {}
+    def spy_enable(force=False):
+        seen["force"] = force
+        return {"ok": True}
+    monkeypatch.setattr(proxy_registry.git_proxy, "enable", spy_enable)
+    r = proxy_registry.apply(action="disable")
+    assert seen["force"] is True
+    assert r["rolled_back"] == ["git"]
+
+
+def test_apply_rollback_skipped_when_prestate_unknown(monkeypatch):
+    """status_fn упал ДО мутации — pre-state неизвестен; слепой откат = та же слепая
+    инверсия. Честный отказ с причиной, состояние остаётся как есть, ok=False."""
+    def boom():
+        raise RuntimeError("config unreadable")
+    monkeypatch.setattr(proxy_registry.git_proxy, "status", boom)
+    monkeypatch.setattr(proxy_registry.git_proxy, "enable", lambda force=False: {"ok": True})
+    monkeypatch.setattr(proxy_registry.claude_proxy, "enable",
+                        lambda force=False: (_ for _ in ()).throw(RuntimeError("boom")))
+    git_disable = _spy(result={"ok": True})
+    monkeypatch.setattr(proxy_registry.git_proxy, "disable", git_disable)
+    r = proxy_registry.apply(action="enable")
+    assert git_disable.calls == []
+    assert r["rolled_back"] == []
+    assert len(r["rollback_skipped"]) == 1
+    assert "неизвестен" in r["rollback_skipped"][0]["reason"]
+    assert r["ok"] is False
+
+
+def test_apply_unmanageable_in_ids_validated_before_mutation(monkeypatch):
+    """Review #347: unmanageable в ids отказывается ДО любых мутаций (канон докстринга
+    «мутирующий путь валидирует до мутации») — иначе git применён, ok=False, rollback
+    не запущен: тихий partial-state в обход контракта #303."""
+    git_enable = _spy()
+    monkeypatch.setattr(proxy_registry.git_proxy, "enable", git_enable)
+    r = proxy_registry.apply(["git", "system"], action="enable")
+    assert git_enable.calls == [], "при неуправляемом id в запросе мутаций быть не должно"
+    assert r["ok"] is False
+    assert r["applied"] == [] and r["partial"] is False
+    ids_failed = [e["id"] for e in r["results"] if not e["ok"]]
+    assert "system" in ids_failed
+
+
+def test_apply_force_over_foreign_enabled_prestate_honest_skip_reason(monkeypatch):
+    """Code-review 2-й pass: force-enable поверх ВКЛЮЧЁННОГО foreign pre-state перезаписал
+    чужое значение; откат не может value-восстановить (enable_fn не принимает значение),
+    и «уже был включён» — вводящий в заблуждение reason. Честный skip называет перезапись
+    и прежнее значение для ручного восстановления (noisy-log-better-than-no-log)."""
+    monkeypatch.setattr(proxy_registry.git_proxy, "status",
+                        lambda: {"enabled": True, "proxy": "https://corp:8443", "state": "foreign"})
+    monkeypatch.setattr(proxy_registry.git_proxy, "enable", lambda force=False: {"ok": True})
+    monkeypatch.setattr(proxy_registry.claude_proxy, "enable",
+                        lambda force=False: (_ for _ in ()).throw(RuntimeError("boom")))
+    git_disable = _spy(result={"ok": True})
+    monkeypatch.setattr(proxy_registry.git_proxy, "disable", git_disable)
+    r = proxy_registry.apply(action="enable", force=True)
+    assert git_disable.calls == [], "выключать нельзя: до apply прокси был включён (чужим значением)"
+    assert r["rolled_back"] == []
+    reason = r["rollback_skipped"][0]["reason"]
+    assert "corp:8443" in reason, reason
+    assert "перезаписан" in reason, reason
+
+
+def test_apply_conflict_aborts_and_rolls_back(monkeypatch):
+    """conflict = неудавшаяся мутация: apply останавливается, ранее применённое откатывается."""
+    monkeypatch.setattr(proxy_registry.git_proxy, "enable", lambda force=False: {"ok": True})
+    monkeypatch.setattr(proxy_registry.claude_proxy, "enable",
+                        lambda force=False: {"ok": False, "conflict": True, "state": "foreign",
+                                             "err": "foreign value"})
+    git_disable = _spy(result={"ok": True})
+    monkeypatch.setattr(proxy_registry.git_proxy, "disable", git_disable)
+    r = proxy_registry.apply(action="enable")
+    assert git_disable.calls == [1]
+    assert r["failed"]["id"] == "claude"
+    assert r["rolled_back"] == ["git"]
+    assert r["ok"] is False
