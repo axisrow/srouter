@@ -3852,6 +3852,23 @@ def test_hysteresis_pending_reset_on_ok(monkeypatch, tmp_path):
     assert len(notified) == 0, "после ok счётчик гистерезиса начинается с 1, не продолжается"
 
 
+def test_hysteresis_fresh_startup_alert_not_lost(monkeypatch, tmp_path):
+    """#358 (cycle-review Codex): fresh state (файла нет) + дефолтный гистерезис —
+    стартовое degraded НЕ теряет нотификацию навсегда: пуш на 2-й подтверждённой пробе.
+    Регрессия: fresh-тик писал notified_failed=failed → на 2-м тике unnotified=False,
+    pending очищался, 4 одинаковых тика — ноль пушей."""
+    notified, _, _ = _wd315_watchdog_harness(
+        monkeypatch, tmp_path, "degraded", ["claude-proxy"],
+        prev_state=None, env={_COOLDOWN_ENV: "0", _CONFIRM_ENV: "2"})
+    health.cmd_watchdog()  # проба 1: streak=1 < 2, молчим (baseline-тик)
+    assert len(notified) == 0
+    health.cmd_watchdog()  # проба 2: состав подтверждён — пуш
+    assert len(notified) == 1, "fresh degraded обязан пушиться на 2-й пробе, не теряться"
+    health.cmd_watchdog()
+    health.cmd_watchdog()
+    assert len(notified) == 1, "после пуша — тишина, пока состав не сменится"
+
+
 def test_hysteresis_cooldown_still_applies_on_top(monkeypatch, tmp_path):
     """#358: гистерезис — фильтр на входе, cooldown #326 — верхняя граница частоты:
     устойчивая смена (N достигнут) при неистёкшем cooldown — молчание; после истечения — пуш."""

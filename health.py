@@ -1174,10 +1174,15 @@ def _cmd_watchdog_locked(result):
         # канон local_state): передаём dict, не строку. notified_failed=None (legacy-строка
         # или битый JSON) → baseline текущим составом (Codex F3 round 3): тихая миграция
         # один раз, все ПОСЛЕДУЮЩИЕ смены состава детектятся (не null навсегда).
+        # #358 (cycle-review Codex): baseline=failed — ТОЛЬКО legacy/битый prev (prev не
+        # None). FRESH-прогон (prev=None) базлайнит []: иначе при гистерезисе N>1 fresh
+        # degraded-тик тихо писал notified=failed, 2-й тик видел «не уведомлять» и
+        # чистил pending — стартовое degraded теряло нотификацию навсегда.
+        fallback_notified = failed if prev is not None else []
         _write_watchdog_state(WATCHDOG_STATE, {
             "status": cur,
             "failed": failed,
-            "notified_failed": (notified_failed if notified_failed is not None else failed)
+            "notified_failed": (notified_failed if notified_failed is not None else fallback_notified)
             if cur != "ok" else [],
             "last_degraded_push": last_push,
             # #358 п.2: гистерезисный кандидат переживает рестарт watchdog'а — счётчик
