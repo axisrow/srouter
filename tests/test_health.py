@@ -2961,6 +2961,10 @@ def _block_real_watchdog_lifecycle(monkeypatch, tmp_path):
     # {added} или малый PUSH_MAX краснит тесты пуша независимо от кода.
     monkeypatch.delenv("SROUTER_WATCHDOG_DEGRADED_DIFF_TEMPLATE", raising=False)
     monkeypatch.delenv("SROUTER_WATCHDOG_DEGRADED_PUSH_MAX", raising=False)
+    # #358: env гистерезиса и причин — те же правила (ambient не травит параметры).
+    monkeypatch.delenv("SROUTER_WATCHDOG_DEGRADED_CONFIRM", raising=False)
+    monkeypatch.delenv("SROUTER_WATCHDOG_DEGRADED_ADDED_TEMPLATE", raising=False)
+    monkeypatch.delenv("SROUTER_WATCHDOG_DEGRADED_REASON_MAX", raising=False)
 
 
 def test_watchdog_pushes_on_degraded_to_down(monkeypatch, tmp_path):
@@ -3092,6 +3096,8 @@ def test_watchdog_transition_matrix(prev, cur, expected, desc, monkeypatch, tmp_
     if prev:
         state_file.write_text(prev)
     monkeypatch.setattr(health, "WATCHDOG_STATE", state_file)
+    # Матрица проверяет семантику ПЕРЕХОДОВ, не анти-флап (#358): гистерезис выключен.
+    monkeypatch.setenv("SROUTER_WATCHDOG_DEGRADED_CONFIRM", "1")
     monkeypatch.setattr(health, "check_all",
                         lambda **kw: {"status": cur, "checks": [{"name": "test", "ok": False}] if cur != "ok" else []})
     notified = []
@@ -3112,10 +3118,14 @@ import time as _time315  # noqa: E402 — локальный импорт бло
 _COOLDOWN_ENV = "SROUTER_WATCHDOG_DEGRADED_COOLDOWN"
 
 
-def _wd315_watchdog_harness(monkeypatch, tmp_path, cur, failed, prev_state=None, env=None):
+def _wd315_watchdog_harness(monkeypatch, tmp_path, cur, failed, prev_state=None, env=None,
+                            details=None):
     """Общая обвязка тестов #315: state-файл (JSON или legacy-строка), мок check_all/_notify.
 
     Возвращает список (msg, sound) нотификаций и путь status-JSONL (tmp_path).
+    details: {имя драйвера: detail-строка пробы} — причина деградации (#358).
+    Дефолт env: CONFIRM=1 (гистерезис #358 выключен) — тесты #315/#353/#326 проверяют
+    семантику переходов/разницы, а не анти-флап; гистерезис — отдельные тесты #358.
     """
     state_file = tmp_path / "watchdog.last"
     if isinstance(prev_state, dict):
@@ -3130,12 +3140,14 @@ def _wd315_watchdog_harness(monkeypatch, tmp_path, cur, failed, prev_state=None,
     monkeypatch.setattr(health, "WATCHDOG_STATUS_LOG", status_log)
     monkeypatch.setattr(health, "check_all", lambda **kw: {
         "status": cur,
-        "checks": ([{"name": name, "ok": False} for name in failed] if failed
+        "checks": ([{"name": name, "ok": False,
+                     **({"detail": details[name]} if details and name in details else {})}
+                    for name in failed] if failed
                    else [{"name": "privoxy", "ok": True}]),
     })
     notified = []
     monkeypatch.setattr(health, "_notify", lambda msg, sound="Glass": notified.append((msg, sound)))
-    for key, value in (env or {}).items():
+    for key, value in {**{"SROUTER_WATCHDOG_DEGRADED_CONFIRM": "1"}, **(env or {})}.items():
         monkeypatch.setenv(key, value)
     return notified, status_log, state_file
 
@@ -3429,6 +3441,7 @@ def test_watchdog_last_degraded_push_clamped(monkeypatch, tmp_path):
             "status": "degraded", "checks": [{"name": "claude-proxy", "ok": False}]})
         monkeypatch.setattr(health, "_notify", lambda msg, sound="Glass": notified.append(msg))
         monkeypatch.setenv(_COOLDOWN_ENV, "0")
+        monkeypatch.setenv("SROUTER_WATCHDOG_DEGRADED_CONFIRM", "1")
         health.cmd_watchdog()
         assert len(notified) == 1, f"bad last_degraded_push={bad!r} не должен глушить пуш"
 
@@ -3619,6 +3632,260 @@ def test_degradation_diff_empty_set(monkeypatch):
     """#353: пустая разница — пустая строка (noop-путь не строит текст)."""
     # env-скраб — в autouse-фикстуре _block_real_watchdog_lifecycle (канон #265)
     assert health._format_degradation_diff([], []) == ""
+
+
+# ============================ #358: причина добавившегося драйвера + анти-флап гистерезис ============================
+# Эмпирика 2026-09-08/09: пуш называет, КТО деградировал («+туннель»), но не ПОЧЕМУ; и
+# спамится из-за флапа состава — каждое ok↔degraded-колебание драйвера = «смена состава»
+# = новый пуш. Надстройка над #353 (diff) и #326 (cooldown), не их замена.
+
+_CONFIRM_ENV = "SROUTER_WATCHDOG_DEGRADED_CONFIRM"
+_ADDED_TEMPLATE_ENV = "SROUTER_WATCHDOG_DEGRADED_ADDED_TEMPLATE"
+_REASON_MAX_ENV = "SROUTER_WATCHDOG_DEGRADED_REASON_MAX"
+
+
+# ---------- п.1: причина/метрика добавившегося драйвера в пуше ----------
+
+def test_watchdog_added_driver_carries_reason(monkeypatch, tmp_path):
+    """#358 п.1: добавившийся драйвер несёт краткую причину из пробы (detail)."""
+    notified, _, _ = _wd315_watchdog_harness(
+        monkeypatch, tmp_path, "degraded", ["claude-proxy", "туннель"],
+        prev_state={"status": "degraded", "failed": ["claude-proxy"],
+                    "notified_failed": ["claude-proxy"], "last_degraded_push": 0.0},
+        env={_COOLDOWN_ENV: "0"},
+        details={"claude-proxy": "5xx 0.42 за 15м", "туннель": "rc=35 timeout"})
+    health.cmd_watchdog()
+    assert len(notified) == 1
+    assert "+туннель (rc=35 timeout)" in notified[0][0], \
+        "добавившийся драйвер — с причиной из пробы, не голое имя"
+
+
+def test_watchdog_added_driver_without_reason_stays_bare(monkeypatch, tmp_path):
+    """#358: у чека без detail (или info) — голое «+имя», без пустых скобок-артефактов."""
+    notified, _, _ = _wd315_watchdog_harness(
+        monkeypatch, tmp_path, "degraded", ["claude-proxy", "туннель"],
+        prev_state={"status": "degraded", "failed": ["claude-proxy"],
+                    "notified_failed": ["claude-proxy"], "last_degraded_push": 0.0},
+        env={_COOLDOWN_ENV: "0"},
+        details={"claude-proxy": "5xx 0.42"})
+    health.cmd_watchdog()
+    assert len(notified) == 1
+    assert notified[0][0] == "состав деградации изменился (+туннель)", \
+        "нет detail — нет причинной части и нет «()»-артефакта"
+
+
+def test_degradation_added_template_env(monkeypatch):
+    """#358 (more-options-better): формат added-причины env-параметризуем; мусор → дефолт."""
+    # env-скраб — в autouse-фикстуре (канон #265)
+    assert health._format_degradation_diff(
+        ["туннель"], [], {"туннель": "rc=35"}) == "+туннель (rc=35)"
+    monkeypatch.setenv(_ADDED_TEMPLATE_ENV, "добавился {name}: {reason}")
+    assert health._format_degradation_diff(
+        ["туннель"], ["x"], {"туннель": "rc=35"}) == "добавился туннель: rc=35; −x"
+    monkeypatch.setenv(_ADDED_TEMPLATE_ENV, "{name {broken")
+    assert health._format_degradation_diff(
+        ["туннель"], [], {"туннель": "rc=35"}) == "+туннель (rc=35)", \
+        "битый шаблон → дефолт (форма пуша не роняет watchdog, канон #355)"
+    # атрибутный доступ ({name.real}) — AttributeError тоже уводится в дефолт (PR #355)
+    monkeypatch.setenv(_ADDED_TEMPLATE_ENV, "{name.real}")
+    assert health._format_degradation_diff(
+        ["туннель"], [], {"туннель": "rc=35"}) == "+туннель (rc=35)"
+
+
+def test_degradation_reason_len_limit(monkeypatch):
+    """#358: причина обрезается до REASON_MAX (дефолт разумной длины) — пуш читается на телефоне."""
+    long_reason = "очень длинная причина " * 10
+    out = health._format_degradation_diff(["туннель"], [], {"туннель": long_reason})
+    assert long_reason not in out, "полная длинная причина не должна попасть в пуш"
+    assert len(out) <= len("+туннель (") + 48 + len(")"), \
+        f"причина обрезана до дефолтного лимита 48, получено: {out!r}"
+    monkeypatch.setenv(_REASON_MAX_ENV, "8")
+    out = health._format_degradation_diff(["туннель"], [], {"туннель": long_reason})
+    assert "очень дл" in out and "очень длин" not in out, "env-лимит 8 срезает причину"
+
+
+def test_watchdog_status_jsonl_event_carries_added_details(monkeypatch, tmp_path):
+    """#358 п.1: событие смены состава в status.jsonl несёт detail добавившихся
+    (расширение diff #353), ушедшие — только имена."""
+    _, status_log, _ = _wd315_watchdog_harness(
+        monkeypatch, tmp_path, "degraded", ["claude-proxy", "туннель"],
+        prev_state={"status": "degraded", "failed": ["claude-proxy", "codex-proxy"],
+                    "notified_failed": ["claude-proxy", "codex-proxy"],
+                    "last_degraded_push": 0.0},
+        env={_COOLDOWN_ENV: "0"},
+        details={"claude-proxy": "старая причина", "туннель": "rc=35 timeout"})
+    health.cmd_watchdog()
+    lines = [json.loads(line) for line in status_log.read_text(encoding="utf-8").splitlines()
+             if line.strip()]
+    assert len(lines) == 1
+    assert lines[0]["diff"]["added"] == ["туннель"]
+    assert lines[0]["diff"]["removed"] == ["codex-proxy"]
+    assert lines[0]["diff"]["added_details"] == {"туннель": "rc=35 timeout"}, \
+        "detail только добавившихся; для ушедших причин нет"
+    # audit — форензика: причина в полном виде, без пуш-обрезки
+    assert lines[0]["diff"]["added_details"]["туннель"] == "rc=35 timeout"
+
+
+# ---------- п.2: анти-флап гистерезис смены состава ----------
+
+def test_degraded_confirm_probes_env_parsing(monkeypatch):
+    """#358: env гистерезиса — дефолт 2, мусор → дефолт, clamp [1, 10]."""
+    monkeypatch.delenv(_CONFIRM_ENV, raising=False)
+    assert health._degraded_confirm_probes() == 2
+    monkeypatch.setenv(_CONFIRM_ENV, "garbage")
+    assert health._degraded_confirm_probes() == 2
+    monkeypatch.setenv(_CONFIRM_ENV, "0")
+    assert health._degraded_confirm_probes() == 1, "0 (выключить гистерезис) → легаси N=1"
+    monkeypatch.setenv(_CONFIRM_ENV, "-5")
+    assert health._degraded_confirm_probes() == 1
+    monkeypatch.setenv(_CONFIRM_ENV, "99")
+    assert health._degraded_confirm_probes() == 10
+    monkeypatch.setenv(_CONFIRM_ENV, "3")
+    assert health._degraded_confirm_probes() == 3
+
+
+def test_hysteresis_n1_legacy_immediate_push(monkeypatch, tmp_path):
+    """#358: N=1 — легаси-поведение: смена состава пушится на первой пробе."""
+    notified, _, _ = _wd315_watchdog_harness(
+        monkeypatch, tmp_path, "degraded", ["claude-proxy", "туннель"],
+        prev_state={"status": "degraded", "failed": ["claude-proxy"],
+                    "notified_failed": ["claude-proxy"], "last_degraded_push": 0.0},
+        env={_COOLDOWN_ENV: "0", _CONFIRM_ENV: "1"})
+    health.cmd_watchdog()
+    assert len(notified) == 1
+
+
+def test_hysteresis_n2_quick_return_silent(monkeypatch, tmp_path):
+    """#358 ядро: драйвер добавился (проба 1) и ушёл (проба 2), вернулся (проба 3) —
+    ни одного пуша: осцилляция, не устойчивая смена состава (живой лог 15:47→16:17)."""
+    notified, _, state_file = _wd315_watchdog_harness(
+        monkeypatch, tmp_path, "degraded", ["claude-proxy", "туннель"],
+        prev_state={"status": "degraded", "failed": ["claude-proxy"],
+                    "notified_failed": ["claude-proxy"], "last_degraded_push": 0.0},
+        env={_COOLDOWN_ENV: "0", _CONFIRM_ENV: "2"})
+    health.cmd_watchdog()  # проба 1: +туннель — streak=1 < 2, молчим
+    assert len(notified) == 0, "первая проба нового состава — не пуш (гистерезис N=2)"
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    assert state["pending_failed"] == ["claude-proxy", "туннель"]
+    assert state["pending_streak"] == 1, "кандидат и счётчик проб персистятся в state"
+    # проба 2: состав вернулся к уведомлённому — счётчик сброшен
+    monkeypatch.setattr(health, "check_all", lambda **kw: {
+        "status": "degraded",
+        "checks": [{"name": "claude-proxy", "ok": False}]})
+    health.cmd_watchdog()
+    assert len(notified) == 0
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    assert state["pending_failed"] is None and state["pending_streak"] == 0
+    # проба 3: снова +туннель — счётчик с нуля, снова молчим
+    monkeypatch.setattr(health, "check_all", lambda **kw: {
+        "status": "degraded",
+        "checks": [{"name": name, "ok": False} for name in ("claude-proxy", "туннель")]})
+    health.cmd_watchdog()
+    assert len(notified) == 0, "флап добавился-ушёл-добавился не должен давать ни одного пуша"
+
+
+def test_hysteresis_n2_stable_change_pushes_on_second_probe(monkeypatch, tmp_path):
+    """#358: состав держится 2 пробы подряд — пуш идёт на второй пробе, с причиной."""
+    notified, _, _ = _wd315_watchdog_harness(
+        monkeypatch, tmp_path, "degraded", ["claude-proxy", "туннель"],
+        prev_state={"status": "degraded", "failed": ["claude-proxy"],
+                    "notified_failed": ["claude-proxy"], "last_degraded_push": 0.0},
+        env={_COOLDOWN_ENV: "0", _CONFIRM_ENV: "2"},
+        details={"туннель": "rc=35 timeout"})
+    health.cmd_watchdog()
+    assert len(notified) == 0, "проба 1 нового состава — молчим"
+    health.cmd_watchdog()  # state-файл между прогонами не трогаем — это и есть «пронумерованные пробы»
+    assert len(notified) == 1, "проба 2 того же состава — пуш"
+    assert "+туннель (rc=35 timeout)" in notified[0][0]
+
+
+def test_hysteresis_first_degradation_also_gated(monkeypatch, tmp_path):
+    """#358: ok→degraded («стек деградировал») — тоже смена состава ([]→{...}): флапный
+    вход в деградацию не пушится до N устойчивых проб."""
+    notified, _, _ = _wd315_watchdog_harness(
+        monkeypatch, tmp_path, "degraded", ["claude-proxy"],
+        prev_state={"status": "ok", "failed": [], "notified_failed": [],
+                    "last_degraded_push": 0.0},
+        env={_COOLDOWN_ENV: "0", _CONFIRM_ENV: "2"})
+    health.cmd_watchdog()
+    assert len(notified) == 0, "первая проба входа в degraded — молчим"
+    health.cmd_watchdog()
+    assert len(notified) == 1
+    assert "деградир" in notified[0][0]
+
+
+def test_hysteresis_state_migration_no_false_push(monkeypatch, tmp_path):
+    """#358: state от старой версии (без pending-полей) — миграция без ложного пуша:
+    первый прогон считает пробу №1, пуш не раньше N-й. Рестарт не должен рождать пуш."""
+    notified, _, state_file = _wd315_watchdog_harness(
+        monkeypatch, tmp_path, "degraded", ["claude-proxy", "туннель"],
+        prev_state={"status": "degraded", "failed": ["claude-proxy"],
+                    "notified_failed": ["claude-proxy"], "last_degraded_push": 0.0},
+        env={_COOLDOWN_ENV: "0", _CONFIRM_ENV: "2"})
+    health.cmd_watchdog()
+    assert len(notified) == 0, "state без pending-полей (миграция) — не пуш на первой пробе"
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    assert state["pending_failed"] == ["claude-proxy", "туннель"]
+    assert state["pending_streak"] == 1
+    # рестарт watchdog: state пережил, счётчик продолжается — вторая проба пушит
+    health.cmd_watchdog()
+    assert len(notified) == 1, "рестарт не теряет счётчик: устойчивая смена пушится"
+
+
+def test_hysteresis_pending_reset_on_ok(monkeypatch, tmp_path):
+    """#358: ok-прогон сбрасывает счётчик — degraded(1)→ok→degraded(тот же состав) не
+    пушится мгновенно за счёт накопленного до ok streak."""
+    notified, _, _ = _wd315_watchdog_harness(
+        monkeypatch, tmp_path, "degraded", ["claude-proxy", "туннель"],
+        prev_state={"status": "degraded", "failed": ["claude-proxy"],
+                    "notified_failed": ["claude-proxy"], "last_degraded_push": 0.0},
+        env={_COOLDOWN_ENV: "0", _CONFIRM_ENV: "2"})
+    health.cmd_watchdog()  # streak=1 по [cp, туннель]
+    assert len(notified) == 0
+    monkeypatch.setattr(health, "check_all", lambda **kw: {
+        "status": "ok", "checks": [{"name": "privoxy", "ok": True}]})
+    health.cmd_watchdog()
+    monkeypatch.setattr(health, "check_all", lambda **kw: {
+        "status": "degraded",
+        "checks": [{"name": name, "ok": False} for name in ("claude-proxy", "туннель")]})
+    health.cmd_watchdog()  # после ok — streak обязан начать заново
+    assert len(notified) == 0, "после ok счётчик гистерезиса начинается с 1, не продолжается"
+
+
+def test_hysteresis_fresh_startup_alert_not_lost(monkeypatch, tmp_path):
+    """#358 (cycle-review Codex): fresh state (файла нет) + дефолтный гистерезис —
+    стартовое degraded НЕ теряет нотификацию навсегда: пуш на 2-й подтверждённой пробе.
+    Регрессия: fresh-тик писал notified_failed=failed → на 2-м тике unnotified=False,
+    pending очищался, 4 одинаковых тика — ноль пушей."""
+    notified, _, _ = _wd315_watchdog_harness(
+        monkeypatch, tmp_path, "degraded", ["claude-proxy"],
+        prev_state=None, env={_COOLDOWN_ENV: "0", _CONFIRM_ENV: "2"})
+    health.cmd_watchdog()  # проба 1: streak=1 < 2, молчим (baseline-тик)
+    assert len(notified) == 0
+    health.cmd_watchdog()  # проба 2: состав подтверждён — пуш
+    assert len(notified) == 1, "fresh degraded обязан пушиться на 2-й пробе, не теряться"
+    health.cmd_watchdog()
+    health.cmd_watchdog()
+    assert len(notified) == 1, "после пуша — тишина, пока состав не сменится"
+
+
+def test_hysteresis_cooldown_still_applies_on_top(monkeypatch, tmp_path):
+    """#358: гистерезис — фильтр на входе, cooldown #326 — верхняя граница частоты:
+    устойчивая смена (N достигнут) при неистёкшем cooldown — молчание; после истечения — пуш."""
+    notified, _, state_file = _wd315_watchdog_harness(
+        monkeypatch, tmp_path, "degraded", ["claude-proxy", "туннель"],
+        prev_state={"status": "degraded", "failed": ["claude-proxy"],
+                    "notified_failed": ["claude-proxy"],
+                    "last_degraded_push": _time315.time() - 60},
+        env={_COOLDOWN_ENV: "900", _CONFIRM_ENV: "2"})
+    health.cmd_watchdog()  # проба 1: streak=1
+    health.cmd_watchdog()  # проба 2: streak=2 ≥ N, но cooldown не истёк — молчим
+    assert len(notified) == 0, "cooldown #326 продолжает троттлить поверх гистерезиса"
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    state["last_degraded_push"] = _time315.time() - 1000
+    state_file.write_text(json.dumps(state, ensure_ascii=False))
+    health.cmd_watchdog()
+    assert len(notified) == 1, "после истечения cooldown устойчивый состав пушится (P1-1 #315)"
 
 
 def test_notify_logs_to_file(monkeypatch, tmp_path):

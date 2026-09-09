@@ -91,6 +91,19 @@ _DEGRADED_DIFF_TEMPLATE_DEFAULT = "{added}; {removed}"
 _DEGRADED_DIFF_PUSH_MAX_LEN_ENV = "SROUTER_WATCHDOG_DEGRADED_PUSH_MAX"
 _DEGRADED_DIFF_PUSH_MAX_LEN_DEFAULT = 160
 
+# #358 п.1: причина добавившегося драйвера в пуше — detail пробы (или компактная цифра
+# из него). Формат env-параметризуем (канон more-options-better), причина обрезается
+# до REASON_MAX — пуш читается на телефоне. Без detail — голое «+имя».
+_DEGRADED_ADDED_TEMPLATE_ENV = "SROUTER_WATCHDOG_DEGRADED_ADDED_TEMPLATE"
+_DEGRADED_ADDED_TEMPLATE_DEFAULT = "+{name} ({reason})"
+_DEGRADED_REASON_MAX_ENV = "SROUTER_WATCHDOG_DEGRADED_REASON_MAX"
+_DEGRADED_REASON_MAX_DEFAULT = 48
+# #358 п.2: анти-флап гистерезис — смена состава пушится только после N проб подряд
+# с одним и тем же новым составом (probe-интервал ~20с → окно ~40с при N=2). Фильтр на
+# входе; cooldown (#326) остаётся верхней границей частоты поверх него. 1 = легаси.
+_DEGRADED_CONFIRM_ENV = "SROUTER_WATCHDOG_DEGRADED_CONFIRM"
+_DEGRADED_CONFIRM_DEFAULT = 2
+
 # Ротация watchdog-журналов D2 (PR-4 #339, контракт §3 — дефолты «статус-jsonl: 14d/2MB»).
 # Выключена по умолчанию — включение SROUTER_WATCHDOG_LOG_ROTATE=1 (граница согласия).
 WATCHDOG_JOURNAL_RETENTION_DAYS = 14
@@ -808,18 +821,62 @@ def _degraded_notify_cooldown_sec():
         return _DEGRADED_NOTIFY_COOLDOWN_DEFAULT_SEC
 
 
-def _format_degradation_diff(added, removed):
+def _degraded_confirm_probes():
+    """Гистерезис смены состава (#358 п.2) из env: сколько проб подряд должен держаться
+    новый состав до пуша. Clamp [1, 10]: 1 — легаси-поведение (немедленный пуш),
+    мусор/отсутствие → дефолт 2 (~40с при probe-интервале ~20с)."""
+    raw = os.environ.get(_DEGRADED_CONFIRM_ENV)
+    if raw is None:
+        return _DEGRADED_CONFIRM_DEFAULT
+    try:
+        return max(1, min(10, int(raw)))
+    except ValueError:
+        return _DEGRADED_CONFIRM_DEFAULT
+
+
+def _degraded_reason_max_len():
+    """Лимит длины причины добавившегося драйвера (#358): clamp [0, 200], 0 — причины
+    выключены (голое «+имя»). Мусор → дефолт."""
+    raw = os.environ.get(_DEGRADED_REASON_MAX_ENV)
+    if raw is None:
+        return _DEGRADED_REASON_MAX_DEFAULT
+    try:
+        return max(0, min(200, int(raw)))
+    except ValueError:
+        return _DEGRADED_REASON_MAX_DEFAULT
+
+
+def _format_added_driver(name, reason):
+    """«+имя (причина)» — добавившийся драйвер в пуше (#358 п.1). Без причины (или при
+    REASON_MAX=0) — голое «+имя»; битый env-шаблон → дефолт (канон #355: форма пуша
+    не должна ронять watchdog-тик, включая AttributeError от атрибутного доступа)."""
+    if not reason:
+        return "+" + name
+    limit = _degraded_reason_max_len()
+    if limit <= 0:
+        return "+" + name
+    reason = str(reason)[:limit]
+    template = os.environ.get(_DEGRADED_ADDED_TEMPLATE_ENV) or _DEGRADED_ADDED_TEMPLATE_DEFAULT
+    try:
+        return template.format(name=name, reason=reason)
+    except (AttributeError, KeyError, IndexError, ValueError):
+        return _DEGRADED_ADDED_TEMPLATE_DEFAULT.format(name=name, reason=reason)
+
+
+def _format_degradation_diff(added, removed, reasons=None):
     """Текст разницы состава деградации (#353): «+новые; −ушедшие», новые первыми.
 
-    Лимит длины (SROUTER_WATCHDOG_DEGRADED_PUSH_MAX, дефолт 160) с приоритетом added:
-    при обрезке добавившиеся перечисляются максимально полно (+N др.), ушедшие
-    схлопываются в счётчик (−N ушедших). Пустая разница → "". Не бросает
-    (битый шаблон → дефолт): текст пуша не должен ронять watchdog-тик.
+    #358 п.1: добавившиеся несут краткую причину из пробы (reasons: {имя: detail}),
+    ушедшие — только имена. Лимит длины (SROUTER_WATCHDOG_DEGRADED_PUSH_MAX, дефолт
+    160) с приоритетом added: при обрезке добавившиеся перечисляются максимально полно
+    (+N др.), ушедшие схлопываются в счётчик (−N ушедших). Пустая разница → "".
+    Не бросает (битый шаблон → дефолт): текст пуша не должен ронять watchdog-тик.
     """
     added = sorted(added)
     removed = sorted(removed)
     if not added and not removed:
         return ""
+    reasons = reasons or {}
     template = os.environ.get(_DEGRADED_DIFF_TEMPLATE_ENV) or _DEGRADED_DIFF_TEMPLATE_DEFAULT
 
     def _join(added_part, removed_part):
@@ -840,7 +897,7 @@ def _format_degradation_diff(added, removed):
     except ValueError:
         limit = _DEGRADED_DIFF_PUSH_MAX_LEN_DEFAULT
 
-    added_full = ", ".join("+" + name for name in added)
+    added_full = ", ".join(_format_added_driver(name, reasons.get(name)) for name in added)
     removed_full = ", ".join("−" + name for name in removed)
     full = _join(added_full, removed_full)
     if len(full) <= limit:
@@ -851,7 +908,7 @@ def _format_degradation_diff(added, removed):
     if len(candidate) <= limit:
         return candidate
     for keep in range(len(added), 0, -1):
-        head = ", ".join("+" + name for name in added[:keep])
+        head = ", ".join(_format_added_driver(name, reasons.get(name)) for name in added[:keep])
         rest = len(added) - keep
         if rest:
             head += f", +{rest} др."
@@ -905,6 +962,13 @@ def _read_watchdog_prev_state():
                 return None
             return sorted(x for x in value if isinstance(x, str))
 
+        # #358 п.2: pending_failed/pending_streak — гистерезис смены состава (кандидат
+        # и сколько проб подряд он держится). Отсутствуют (state от старой версии) →
+        # None/0: миграция без ложного пуша — первый прогон считает пробу №1.
+        try:
+            pending_streak = max(0, min(1_000_000, int(parsed.get("pending_streak") or 0)))
+        except (TypeError, ValueError):
+            pending_streak = 0
         return {
             "status": status if isinstance(status, str) else "",
             "failed": _canon_names(parsed.get("failed")),
@@ -912,14 +976,16 @@ def _read_watchdog_prev_state():
             # подавлении cooldown'ом НЕ продвигается, чтобы событие не терялось навсегда.
             "notified_failed": _canon_names(parsed.get("notified_failed")),
             "last_degraded_push": last_push,
+            "pending_failed": _canon_names(parsed.get("pending_failed")),
+            "pending_streak": pending_streak,
         }
     # Legacy: голая строка статуса (в т.ч. закавыченная валидным JSON — тоже строка).
     legacy = parsed if isinstance(parsed, str) else raw
     return {"status": legacy.strip(), "failed": None, "notified_failed": None,
-            "last_degraded_push": 0.0}
+            "last_degraded_push": 0.0, "pending_failed": None, "pending_streak": 0}
 
 
-def _append_watchdog_status_event(previous, current):
+def _append_watchdog_status_event(previous, current, reasons=None):
     """Audit-JSONL статуса (#315 п.2): событие при изменении {status, failed}.
 
     Канон _record_watchdog_lifecycle: best-effort (сбой записи не роняет watchdog),
@@ -940,6 +1006,12 @@ def _append_watchdog_status_event(previous, current):
                 "added": sorted(set(cur_failed) - set(prev_failed)),
                 "removed": sorted(set(prev_failed) - set(cur_failed)),
             }
+            # #358 п.1: detail добавившихся — форензика в полном виде, без пуш-обрезки;
+            # ключ только когда есть хоть одна причина (старый reader без ключа не ломается).
+            added_details = {name: reasons[name] for name in diff["added"]
+                             if reasons and isinstance(reasons.get(name), str) and reasons[name]}
+            if added_details:
+                diff["added_details"] = added_details
         WATCHDOG_STATUS_LOG.parent.mkdir(parents=True, exist_ok=True)
         event = {
             "timestamp": datetime.now().astimezone().isoformat(),
@@ -1012,13 +1084,21 @@ def _cmd_watchdog_locked(result):
     # notified_failed — последний УВЕДОМЛЁННЫЙ состав (Codex P1-1): не продвигается при
     # подавленном cooldown'ом событии, иначе подавленная смена состава терялась бы навсегда.
     notified_failed = prev["notified_failed"] if prev else None
+    # #358 п.2: гистерезис — кандидат нового состава и сколько проб подряд он держится.
+    pending_failed = prev["pending_failed"] if prev else None
+    pending_streak = prev["pending_streak"] if prev else 0
+    # #358 п.1: причины деградации добавившихся — detail пробы (info-чеки не в failed,
+    # но гвард дешёвый и явный). O(1) по состоянию, новых проб нет.
+    reasons = {c["name"]: c["detail"] for c in result["checks"]
+               if not c["ok"] and not c.get("info") and isinstance(c.get("detail"), str)
+               and c["detail"]}
 
     # Audit-JSONL статуса (#315 п.2): ДО нотификаций и без cooldown — форензика полная,
     # даже когда звук затроттлен. Fresh-прогон (prev=None) — тихий baseline, как lifecycle.
     if prev is not None:
         _append_watchdog_status_event(
             {"status": prev_status, "failed": prev_failed},
-            {"status": cur, "failed": failed})
+            {"status": cur, "failed": failed}, reasons=reasons)
 
     # Exact-state transitions (#109 + #133 C1 + #315 симметрия):
     # - «упал»: переход ok/degraded/fresh → down (громко, без троттлинга).
@@ -1033,21 +1113,38 @@ def _cmd_watchdog_locked(result):
     if cur == "down" and prev_status in ("ok", "degraded", ""):
         _notify(f"туннель/стек упал ({', '.join(failed)})", "Basso")
         notified_failed = failed
+        pending_failed, pending_streak = None, 0
     elif cur == "ok" and prev_status == "down":
         _notify("стек восстановлен", "Glass")
         notified_failed = []
+        pending_failed, pending_streak = None, 0
     elif cur in ("degraded", "down"):
         # Гейт cur in (degraded, down) обязателен (Codex F1 round 3): без него ok-прогон с
         # «не уведомлённым» составом прошлого degraded пушит ложное «стек деградировал ()».
         new_degradation = cur == "degraded" and prev_status in ("ok", "")
         # Состав не уведомлён: либо сменился, либо был подавлен cooldown'ом (P1-1).
         unnotified = notified_failed is not None and list(notified_failed) != failed
-        if (new_degradation or unnotified) and \
+        # #358 п.2: гистерезис — фильтр на входе (до cooldown). Новый состав считается
+        # событием только после N проб ПОДРЯД с ним; флап «добавился и через пробу ушёл»
+        # не пушится и в notified не попадает. O(1): сравнение списков, новых проб нет.
+        if new_degradation or unnotified:
+            if pending_failed is not None and list(pending_failed) == failed:
+                pending_streak += 1
+            else:
+                pending_failed = failed
+                pending_streak = 1
+        else:
+            # Нечего уведомлять — кандидата нет (streak не «донашивается» через noop).
+            pending_failed, pending_streak = None, 0
+        confirmed = pending_streak >= _degraded_confirm_probes()
+        if (new_degradation or unnotified) and confirmed and \
                 time.time() - last_push >= _degraded_notify_cooldown_sec():
             # Лейбл по prev_status (PR #326 review P3): «деградировал» — только вход из
             # ok/fresh; не-ok→не-ok (в т.ч. down→degraded с СОКРАТИВШИМСЯ набором) —
-            # «состав изменился», не ложное ухудшение в момент улучшения.
-            if prev_status in ("", "ok"):
+            # «состав изменился», не ложное ухудшение в момент улучшения. #358: при
+            # гистерезисном подтверждении входа в degraded prev_status УЖЕ degraded,
+            # но уведомлённый состав пуст (до этого ок) — это вход, не смена.
+            if prev_status in ("", "ok") or notified_failed == []:
                 label = "стек деградировал"
             else:
                 label = "состав отказа изменился" if cur == "down" else "состав деградации изменился"
@@ -1055,28 +1152,43 @@ def _cmd_watchdog_locked(result):
             # («+новые; −ушедшие», новые первыми). Первый ok→degraded: notified=[]
             # → весь состав виден как added (п.2). Legacy notified=None → старый
             # перечень (разница неизвестна). Тяжесть проб не растёт: множества уже
-            # вычислены в state.
+            # вычислены в state. #358 п.1: добавившиеся несут причину из пробы.
             if notified_failed is not None:
                 diff_added = sorted(set(failed) - set(notified_failed))
                 diff_removed = sorted(set(notified_failed) - set(failed))
-                detail = _format_degradation_diff(diff_added, diff_removed) or ", ".join(failed)
+                detail = _format_degradation_diff(
+                    diff_added, diff_removed, reasons=reasons) or ", ".join(failed)
             else:
                 detail = ", ".join(failed)
             _notify(f"{label} ({detail})", "Ping")
             notified_failed = failed
             last_push = time.time()
+            pending_failed, pending_streak = None, 0
+    else:
+        # ok/degraded→ok без пуша (#315 п.1): гистерезисный счётчик не «донашивается»
+        # через ok-прогон — следующая деградация считает пробы заново (#358).
+        pending_failed, pending_streak = None, 0
 
     try:
         # _write_watchdog_state сам делает json.dumps + atomic-write (tmp+fsync+rename,
         # канон local_state): передаём dict, не строку. notified_failed=None (legacy-строка
         # или битый JSON) → baseline текущим составом (Codex F3 round 3): тихая миграция
         # один раз, все ПОСЛЕДУЮЩИЕ смены состава детектятся (не null навсегда).
+        # #358 (cycle-review Codex): baseline=failed — ТОЛЬКО legacy/битый prev (prev не
+        # None). FRESH-прогон (prev=None) базлайнит []: иначе при гистерезисе N>1 fresh
+        # degraded-тик тихо писал notified=failed, 2-й тик видел «не уведомлять» и
+        # чистил pending — стартовое degraded теряло нотификацию навсегда.
+        fallback_notified = failed if prev is not None else []
         _write_watchdog_state(WATCHDOG_STATE, {
             "status": cur,
             "failed": failed,
-            "notified_failed": (notified_failed if notified_failed is not None else failed)
+            "notified_failed": (notified_failed if notified_failed is not None else fallback_notified)
             if cur != "ok" else [],
             "last_degraded_push": last_push,
+            # #358 п.2: гистерезисный кандидат переживает рестарт watchdog'а — счётчик
+            # проб не теряется и не рождает ложный пуш (пуш только по confirmed-составу).
+            "pending_failed": pending_failed,
+            "pending_streak": pending_streak,
         })
     except OSError as exc:
         _log.warning("watchdog state write failed: %s — следующий прогон может ложно "
