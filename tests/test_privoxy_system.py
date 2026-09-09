@@ -524,6 +524,78 @@ def test_unprotect_refuses_new_user_shadow_without_original_backup(tmp_path):
 
 
 
+def test_rotation_keeps_snapshot_with_live_user_plist_backup_reference(tmp_path):
+    """#360: три protect-генерации A→B→C — манифест наследует user_plist_backup из A
+    (на две генерации старше previous_protection_backup_dir). Opt-in ротация обязана
+    защищать ВСЕ манифест-пути внутри backup_root, иначе unprotect --restore теряет
+    исходный LaunchAgent пользователя: источник удалён при живой ссылке."""
+    layout = _layout(tmp_path)
+    identity = pwd.getpwuid(os.getuid())
+    original_plist = b"original-user-launchagent"
+
+    # Три генерации root-snapshots, A старше 28-дневного окна ротации
+    def snapshot_dir(name, age_days):
+        d = layout.backup_root / name
+        d.mkdir(parents=True)
+        stamp = datetime.now(timezone.utc) - timedelta(days=age_days)
+        os.utime(d, (stamp.timestamp(), stamp.timestamp()))
+        return d
+
+    gen_a = snapshot_dir("2026-08-01T000000Z-aaa", 40)
+    gen_b = snapshot_dir("2026-08-05T000000Z-bbb", 35)
+    gen_c = snapshot_dir("2026-08-10T000000Z-ccc", 30)
+    stale = snapshot_dir("2026-08-12T000000Z-ddd", 28.5)
+    plist_backup = gen_a / "user" / f"{privoxy_system.USER_LABEL}.plist"
+    plist_backup.parent.mkdir(parents=True)
+    plist_backup.write_bytes(original_plist)
+    # файл внутри каталога поднимает его mtime — возвращаем возраст генерации
+    stamp = datetime.now(timezone.utc) - timedelta(days=40)
+    os.utime(gen_a, (stamp.timestamp(), stamp.timestamp()))
+
+    home = tmp_path / "home"
+    user_plist = home / "Library" / "LaunchAgents" / f"{privoxy_system.USER_LABEL}.plist"
+    user_plist.parent.mkdir(parents=True)
+    user_plist.write_text("shadow", encoding="utf-8")
+
+    layout.config_path.parent.mkdir(parents=True)
+    layout.config_path.write_text(privoxy_system.protected_config_text(layout), encoding="utf-8")
+    layout.launchdaemon_path.parent.mkdir(parents=True)
+    layout.launchdaemon_path.write_bytes(privoxy_system.launchdaemon_bytes(layout=layout))
+    layout.sudoers_path.parent.mkdir(parents=True)
+    layout.sudoers_path.write_text(privoxy_system._sudoers_text(identity.pw_name), encoding="utf-8")
+    layout.manifest_path.write_text(json.dumps({
+        "uid": identity.pw_uid,
+        "gid": identity.pw_gid,
+        "user_plist": str(user_plist),
+        "user_plist_backup": str(plist_backup),
+        "backup_dir": str(gen_c),
+        "previous_protection_backup_dir": str(gen_b),
+    }), encoding="utf-8")
+
+    rotation = privoxy_system.rotate_old_snapshots(layout=layout, older_than_days=28,
+                                                   enforce_root=False)
+
+    assert rotation["ok"] is True, rotation
+    assert rotation["deleted"] == [str(stale)], rotation
+    assert plist_backup.exists(), "ротация удалила снапшот с живой user_plist_backup-ссылкой"
+
+    def runner(cmd, timeout):
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+
+    restored = privoxy_system.unprotect_as_root(
+        restore=True,
+        layout=layout,
+        runner=runner,
+        checker=lambda: False,
+        chown=lambda path, uid, gid: None,
+        enforce_root=False,
+    )
+
+    assert restored["ok"] is True, restored
+    assert restored["restored"] is True
+    assert user_plist.read_bytes() == original_plist, "исходный LaunchAgent потерян (#360)"
+
+
 def test_root_transaction_rolls_back_before_touching_user_job_on_bad_config_test(tmp_path, monkeypatch):
     layout = _layout(tmp_path)
     prefix = _fake_prefix(tmp_path)

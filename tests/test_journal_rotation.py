@@ -215,6 +215,43 @@ def test_snapshot_report_counts_unreferenced_old_dirs(tmp_path):
     assert stale.exists() and fresh_unref.exists() and referenced.exists() and previous.exists()
 
 
+def test_snapshot_report_protects_any_manifest_path_inside_backup_root(tmp_path):
+    """#360: protect наследует из previous-манифеста user_plist_backup — путь ВНУТРИ
+    снапшота на две генерации старше previous_protection_backup_dir. Защита — белый
+    список путей из ВСЕХ манифест-значений внутри backup_root, а не хардкод двух ключей:
+    иначе report считает живой источник restore'а кандидатом на чистку (doctor врёт)."""
+    import privoxy_system
+
+    layout, backup_root = _layout(tmp_path)
+    gen_a = _make_snapshot(backup_root, "2026-08-01T000000Z-aaa", age_days=40)
+    gen_b = _make_snapshot(backup_root, "2026-08-05T000000Z-bbb", age_days=35)
+    gen_c = _make_snapshot(backup_root, "2026-08-10T000000Z-ccc", age_days=30)
+    stale = _make_snapshot(backup_root, "2026-08-12T000000Z-ddd", age_days=28.5)
+    plist_backup = gen_a / "user" / "homebrew.mxcl.privoxy.plist"
+    plist_backup.parent.mkdir(parents=True)
+    plist_backup.write_bytes(b"original-launchagent")
+    # файл внутри каталога поднимает его mtime — возвращаем возраст генерации
+    stamp = datetime.now(timezone.utc) - timedelta(days=40)
+    os.utime(gen_a, (stamp.timestamp(), stamp.timestamp()))
+    layout.manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    layout.manifest_path.write_text(json.dumps({
+        "backup_dir": str(gen_c),
+        "previous_protection_backup_dir": str(gen_b),
+        "user_plist_backup": str(plist_backup),
+    }), encoding="utf-8")
+
+    report = privoxy_system.snapshot_accumulation_report(layout=layout, older_than_days=28)
+
+    assert set(report["referenced"]) == {str(gen_a), str(gen_b), str(gen_c)}, report
+    assert report["old_unreferenced"] == [str(stale)], report
+    # rotate по тому же отчёту не удаляет A, пока манифест ссылается на его содержимое
+    result = privoxy_system.rotate_old_snapshots(layout=layout, older_than_days=28,
+                                                 enforce_root=False)
+    assert result["ok"] is True, result
+    assert result["deleted"] == [str(stale)], result
+    assert plist_backup.exists(), "живая user_plist_backup-ссылка удалена ротацией (#360)"
+
+
 def test_snapshot_report_no_manifest_marks_all_old_as_candidates(tmp_path):
     """Manifest отсутствует → все старые каталоги кандидаты, но опять же БЕЗ удаления
     (fail-closed: manifest_missing мы не знаем, что уже не нужно)."""
