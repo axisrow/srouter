@@ -554,11 +554,35 @@ def protect_as_root(*, username, uid, prefix, staged_config, layout=DEFAULT_LAYO
 SNAPSHOT_ACCUMULATION_DEFAULT_DAYS = 28  # A5-ротация: «старше N» для кандидатов на чистку
 
 
+def _manifest_referenced_snapshot_dirs(manifest, backup_root):
+    """#360: top-level каталоги backup_root, на которые ссылается ХОТЬ КАКОЕ-ТО
+    манифест-значение (абсолютный путь внутри backup_root). Белый список из значений,
+    а не хардкод ключей: protect наследует в манифест любые *_backup*-пути (например
+    user_plist_backup, который может лежать в снапшоте на генерацию старше
+    previous_protection_backup_dir) — все они protected, не удаляются никогда."""
+    referenced = set()
+    for value in manifest.values():
+        if not isinstance(value, str) or not value:
+            continue
+        path = Path(value)
+        if not path.is_absolute():
+            continue
+        try:
+            rel = path.relative_to(backup_root)
+        except ValueError:
+            continue
+        if rel.parts:
+            referenced.add(str(backup_root / rel.parts[0]))
+    return referenced
+
+
 def snapshot_accumulation_report(layout=None, older_than_days=None, now=None):
     """Count-only отчёт накопления root-snapshot'ов A5 (PR-4 #339, контракт §3/v2 §5).
 
-    Какие каталоги в backup_root НЕ ссылаются manifest'ом (backup_dir /
-    previous_protection_backup_dir) и старше older_than_days — кандидаты на чистку.
+    Какие каталоги в backup_root НЕ ссылаются manifest'ом (любое манифест-значение —
+    абсолютный путь внутри backup_root: backup_dir, previous_protection_backup_dir,
+    user_plist_backup и будущие *_backup*-пути; #360 — белый список значений, не
+    хардкод ключей) и старше older_than_days — кандидаты на чистку.
     НИЧЕГО НЕ УДАЛЯЕТ: v2 §5 — первая итерация «только считаем»; удаление — отдельное
     явное решение оператора (граница согласия автора). Возраст — по mtime каталога
     (mkdtemp-имя `<stamp>-<rand>` несёт тот же момент, mtime переживает копирование).
@@ -581,8 +605,7 @@ def snapshot_accumulation_report(layout=None, older_than_days=None, now=None):
         result["manifest_missing"] = True
     else:
         result["referenced"] = sorted(
-            {str(manifest[key]) for key in ("backup_dir", "previous_protection_backup_dir")
-             if manifest.get(key)})
+            _manifest_referenced_snapshot_dirs(manifest, layout.backup_root))
     try:
         cutoff = (float(now) if now is not None
                   else datetime.now(timezone.utc).timestamp()) - older * 24 * 3600.0
@@ -603,8 +626,10 @@ def rotate_old_snapshots(layout=None, older_than_days=None, now=None, *,
     """Удалить root-snapshot'ы БЕЗ manifest-ссылки старше N (контракт #339 §3, PR-4 —
     вторая итерация после count-only #354; удаление — только явный opt-in оператора).
 
-    Fail-closed (канон PR-2): manifest-поинтеры backup_dir/previous_protection_backup_dir
-    — protected, не удаляются никогда; manifest отсутствует/битый → НИЧЕГО не удаляется
+    Fail-closed (канон PR-2): manifest-поинтеры (ЛЮБОЕ манифест-значение — абсолютный
+    путь внутри backup_root, #360: не только backup_dir/previous_protection_backup_dir,
+    но и наследуемые *_backup*-пути вроде user_plist_backup) — protected, не удаляются
+    никогда; manifest отсутствует/битый → НИЧЕГО не удаляется
     (без manifest неизвестно, что уже не нужно). Best-effort: сбой удаления одного
     каталога не останавливает остальные — failed-список в отчёте. Сбой чтения root →
     ошибка, не исключение. stdlib-only (helper-tree)."""
