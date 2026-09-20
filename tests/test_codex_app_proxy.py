@@ -456,9 +456,22 @@ def test_app_proxy_rust_not_running_with_empty_gui_env_is_not_degradation(monkey
     monkeypatch.setattr(health.sys_probe, "run", _fake(ps, _gui_env({})))
     res = health._codex_app_proxy_check()
     assert res["status"] == "unknown", \
-        f"«не запущен» — не деградация (#362), observe: got {res}"
+        f"«не запущен» без доказанного утечного маршрута — не деградация (#362): got {res}"
     assert "не запущен" in res["detail"].lower(), \
         f"detail честно называет причину: Rust не запущен; got {res}"
+
+
+def test_app_proxy_generic_helper_leak_stays_down_with_empty_gui_env(monkeypatch):
+    """#362 cycle-review: «не запущен» — не деградация, но ДОКАЗАННЫЙ утечный маршрут
+    generic (.app)-helper'а при пустом gui-env — по-прежнему down: unknown-ветка обязана
+    проверить сокеты через _app_pids_route, а не возвращать unknown вслепую
+    (chromium-check покрывает только NetworkService, generic-helper — только здесь)."""
+    ps = f"81234 {GENERIC_HELPER_COMM}\n"
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _fake(ps, _gui_env({}), lsof_out=_lsof_external("81234")))
+    res = health._codex_app_proxy_check()
+    assert res["status"] == "down", \
+        f"generic helper с external-сокетом при пустом gui-env — driver, не observe: got {res}"
 
 
 def test_app_proxy_empty_gui_env_does_not_blame_rust_when_only_chromium_running(monkeypatch):

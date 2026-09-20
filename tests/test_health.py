@@ -5633,9 +5633,10 @@ def test_check_all_tunnel_down_reason_carries_window_numbers(monkeypatch):
     assert "rc=56" in tun["detail"], f"rc-класс отказа в причине: {tun['detail']!r}"
 
 
-def test_check_all_tunnel_single_fail_below_threshold_is_observe(monkeypatch):
-    """#362 п.2 (per-driver порог): редкий фейл (rate < порога при достатке замеров) —
-    observe (info): единичный провал — не деградация, не driver, вердикт не роняет."""
+def test_check_all_tunnel_single_fail_below_threshold_stays_honest_driver(monkeypatch):
+    """#362 п.2 (cycle-review: вердикт не гейтится): редкий фейл НЕ скрывает деградацию
+    из check_all — doctor//health видят честный degraded с цифрами окна сразу; пуш
+    гейтится отдельно в watchdog-составе (см. watchdog-тесты ниже)."""
     _all_up_monkey(monkeypatch)
     monkeypatch.setattr(health, "_tunnel_up", lambda: (
         False, "connection-failed", False, {"status": "connection-failed", "rc": 35, "err": ""}))
@@ -5643,33 +5644,96 @@ def test_check_all_tunnel_single_fail_below_threshold_is_observe(monkeypatch):
                         lambda now=None, log_path=None: {"fails": 1, "samples": 14, "rate": 0.071})
     result = health.check_all()
     tun = next(c for c in result["checks"] if c.get("id") == "tunnel")
-    assert tun.get("info") is True, "1/14 ниже порога 0.5 — наблюдаем, не деградация"
-    assert result["status"] == "ok"
-    assert "ниже порога" in tun["detail"], f"причина объясняет, почему не деградация: {tun['detail']!r}"
+    assert tun["ok"] is False and not tun.get("info"), \
+        "вердикт честен: туннель остаётся driver, гейт — только для нотификаций"
+    assert "ниже порога" in tun["detail"], f"цифры/порог в причине: {tun['detail']!r}"
+    assert result["status"] == "degraded"
 
 
-def test_check_all_tunnel_gate_fail_open_without_metrics(monkeypatch):
-    """#362 п.2: метрик нет (выключены/пусто) → гейт неприменим (fail-open): туннель driver
-    как раньше — отсутствие данных не глушит сигнал."""
-    _all_up_monkey(monkeypatch)
-    monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed", False, None))
-    monkeypatch.setattr(health, "_tunnel_window_stats", lambda now=None, log_path=None: None)
-    result = health.check_all()
-    tun = next(c for c in result["checks"] if c.get("id") == "tunnel")
-    assert tun["ok"] is False and not tun.get("info"), "нет данных метрик — легаси-поведение"
+def _tunnel_notify_harness(monkeypatch, tmp_path, *, stats, env=None, tunnel_detail="connection-failed"):
+    """Обвязка notify-гейта туннеля (#362): check_all = degraded, упал только туннель
+    (id=tunnel, канон структурного ключа); stats — мок окна (_tunnel_window_stats)."""
+    checks = [{"id": "tunnel", "name": "туннель (api.anthropic.com через прокси)",
+               "ok": False, "detail": tunnel_detail}]
+    notified, _, _ = _wd315_watchdog_harness(
+        monkeypatch, tmp_path, "degraded", [],  # failed=[] → харнесс даст ok-заглушку; чеки подменяем
+        prev_state={"status": "ok", "failed": [], "notified_failed": [],
+                    "last_degraded_push": 0.0},
+        env={**{"SROUTER_WATCHDOG_DEGRADED_CONFIRM": "1", _COOLDOWN_ENV: "0"}, **(env or {})})
+    # _wd315_watchdog_harness строит чеки из failed=[]; подменяем своим списком (late-binding).
+    # Обогащение причины — через РЕАЛЬНЫЙ _apply_tunnel_window_gate (контракт check_all:
+    # цифры окна в detail), чтобы пуш нёс те же цифры, что и прод-путь.
+    def fake_check_all(**kw):
+        check = dict(checks[0])
+        health._apply_tunnel_window_gate(check)
+        return {"status": "degraded", "checks": [check]}
 
-
-def test_check_all_tunnel_gate_disabled_by_env(monkeypatch):
-    """#362 п.2 (more-options-better): SROUTER_WATCHDOG_TUNNEL_FAIL_RATE=0 — гейт выключен,
-    любой фейл = driver (легаси-поведение, независимо от окна)."""
-    monkeypatch.setenv("SROUTER_WATCHDOG_TUNNEL_FAIL_RATE", "0")
-    _all_up_monkey(monkeypatch)
-    monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed", False, None))
+    monkeypatch.setattr(health, "check_all", fake_check_all)
     monkeypatch.setattr(health, "_tunnel_window_stats",
-                        lambda now=None, log_path=None: {"fails": 1, "samples": 14, "rate": 0.071})
-    result = health.check_all()
-    tun = next(c for c in result["checks"] if c.get("id") == "tunnel")
-    assert tun["ok"] is False and not tun.get("info"), "порог 0 → гейт выключен"
+                        lambda now=None, log_path=None: stats)
+    # metrics-запись не предмет гейта — глушим (иначе пишет в живой METRICS_LOG)
+    monkeypatch.setattr(health, "_record_watchdog_metrics", lambda result: None)
+    return notified
+
+
+def test_watchdog_tunnel_gate_fail_open_without_metrics(monkeypatch, tmp_path):
+    """#362 п.2: метрик нет (выключены/пусто) → гейт неприменим (fail-open): туннель
+    в notify-составе, пуш идёт как раньше — отсутствие данных не глушит сигнал."""
+    notified = _tunnel_notify_harness(monkeypatch, tmp_path, stats=None)
+    health.cmd_watchdog()
+    assert len(notified) == 1, "нет данных окна — легаси-поведение (пуш)"
+
+
+def test_watchdog_tunnel_gate_disabled_by_env(monkeypatch, tmp_path):
+    """#362 п.2 (more-options-better): SROUTER_WATCHDOG_TUNNEL_FAIL_RATE=0 — гейт выключен,
+    редкий фейл пушится (легаси), независимо от окна."""
+    notified = _tunnel_notify_harness(monkeypatch, tmp_path,
+                                      stats={"fails": 1, "samples": 14, "rate": 0.071},
+                                      env={"SROUTER_WATCHDOG_TUNNEL_FAIL_RATE": "0"})
+    health.cmd_watchdog()
+    assert len(notified) == 1, "порог 0 → гейт выключен (пуш)"
+
+
+def test_tunnel_fail_rate_threshold_rejects_non_finite(monkeypatch):
+    """#362 review: nan/inf в env — не ValueError, но «мусор → дефолт»: после clamp
+    nan/inf давали порог 1.0 (fail-open сильнее задуманного)."""
+    for garbage in ("nan", "inf", "-inf"):
+        monkeypatch.setenv("SROUTER_WATCHDOG_TUNNEL_FAIL_RATE", garbage)
+        assert health._tunnel_fail_rate_threshold() == health._TUNNEL_FAIL_RATE_DEFAULT, \
+            f"{garbage!r} → дефолт, не clamp-артефакт"
+
+
+def test_tunnel_reason_window_minutes_follow_constant(monkeypatch):
+    """#362 review: «за Nм» следует WINDOW_SEC из metrics_store, не захардкоженные 15 —
+    при смене константы текст причины не врёт."""
+    tun = {"id": "tunnel", "ok": False, "detail": "connection-failed", "timing": {"rc": 56}}
+    monkeypatch.setattr(health, "_tunnel_window_stats",
+                        lambda now=None, log_path=None: {"fails": 12, "samples": 15, "rate": 0.8})
+    monkeypatch.setattr(metrics_store, "WINDOW_SEC", 600)
+    health._apply_tunnel_window_gate(tun)
+    assert "за 10м" in tun["detail"], f"окно из константы: {tun['detail']!r}"
+
+
+def test_truncate_reason_strips_nested_unbalanced_parens():
+    """#362 review: стрижка скобки многоходовая — вложенная незакрытая «(» тоже снимается
+    (rc-суффикс «(curl: (56 …)» с обрывом внутри — реальный кейс из _apply_tunnel_window_gate)."""
+    out = health._truncate_reason_text("rc=56 (curl: (56 Recv failure now", 21)
+    assert out == "rc=56…", f"висячих «(» нет: {out!r}"
+
+
+def test_watchdog_tunnel_gate_suppresses_until_threshold_then_pushes(monkeypatch, tmp_path):
+    """#362 п.2 (regression cycle-review): sustained-деградация после здоровой истории —
+    пока rate ниже порога, пуши молчат; после пересечения порога туннель входит в состав
+    и пушится с цифрами (задержка ~8 мин при 60s-интервале — осознанный tradeoff)."""
+    stats = {"fails": 1, "samples": 14, "rate": 0.071}
+    notified = _tunnel_notify_harness(monkeypatch, tmp_path, stats=stats)
+    health.cmd_watchdog()
+    assert notified == [], "1/14 ниже порога — observe, пуши нет"
+    # окно наполняется фейлами → rate пересекает порог
+    stats.update(fails=12, rate=0.8)
+    health.cmd_watchdog()
+    assert len(notified) == 1, "12/14 ≥ порога — туннель в составе, пуш"
+    assert "12/14" in notified[0][0], f"цифры окна в пуше: {notified[0][0]!r}"
 
 
 def test_watchdog_no_push_when_tunnel_below_threshold(monkeypatch, tmp_path):
