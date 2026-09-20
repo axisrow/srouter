@@ -944,7 +944,9 @@ def _truncate_reason_text(text, limit):
     if space > 0:
         cut = cut[:space]
     if cut.count("(") > cut.count(")"):
-        cut = cut[:cut.rfind("(")]
+        trimmed = cut[:cut.rfind("(")]
+        if trimmed.strip():
+            cut = trimmed  # иначе (скобка в начале при малом лимите) жёсткий срез — не пустота
     return cut.rstrip().rstrip(",;—-") + "…"
 
 

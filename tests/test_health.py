@@ -5726,3 +5726,13 @@ def test_added_reason_truncated_at_word_boundary_with_ellipsis(monkeypatch):
     assert out.endswith("…)"), f"маркер обрыва на причине (шаблон закрывает скобку): {out!r}"
     assert "(PID" not in out, f"висячая скобка снята: {out!r}"
     assert "runtime: Claude Code MIXED" in out, f"начало причины сохранено: {out!r}"
+
+
+def test_added_reason_truncation_never_collapses_to_bare_ellipsis():
+    """#362 review: скобка-стрижка не съедает ВСЁ — «(abcdef» при малом лимите даёт
+    жёсткий срез, а не пустую причину-«…» без единого символа содержания."""
+    out = health._truncate_reason_text("(abcdef", 3)
+    assert len(out) > 1, f"не голое «…»: {out!r}"
+    assert out != "…"
+    # и начало без скобки тоже живо (жёсткий срез без пробела в лимите)
+    assert health._truncate_reason_text("abcdefghij", 4).endswith("…")
