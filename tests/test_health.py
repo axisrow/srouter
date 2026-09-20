@@ -45,6 +45,10 @@ _REAL_CODEX_ISOLATION_CHECK = health._codex_isolation_check
 # (ps/lsof через мок sys_probe.run), а не заглушку из _all_up_monkey.
 _REAL_CLAUDE_PROXY_PROBE = health._claude_proxy_probe
 
+# #362: реальная статистика окна туннеля — unit-тест зовёт напрямую, autouse-фикстура
+# (_block_real_watchdog_lifecycle) глушит её для остальных тестов (изоляция от живого metrics-JSONL).
+_REAL_TUNNEL_WINDOW_STATS = getattr(health, "_tunnel_window_stats", None)
+
 
 def _std_endpoint(monkeypatch):
     """#329: мок endpoint-конфига «стандартный, без override» для probe-тестов.
@@ -2965,6 +2969,14 @@ def _block_real_watchdog_lifecycle(monkeypatch, tmp_path):
     monkeypatch.delenv("SROUTER_WATCHDOG_DEGRADED_CONFIRM", raising=False)
     monkeypatch.delenv("SROUTER_WATCHDOG_DEGRADED_ADDED_TEMPLATE", raising=False)
     monkeypatch.delenv("SROUTER_WATCHDOG_DEGRADED_REASON_MAX", raising=False)
+    # #362: env флап-гейта туннеля — тот же скраб.
+    monkeypatch.delenv("SROUTER_WATCHDOG_TUNNEL_FAIL_RATE", raising=False)
+    # #362: окна туннеля читают ЖИВОЙ metrics-JSONL launchd-watchdog — изоляция от dev-машины
+    # (канон unmocked-probe-is-both-slow-and-machine-dependent): дефолт «нет данных» = fail-open
+    # (статус/состав туннеля в остальных тестах — как до #362). Тесты окна/гейта переопределяют
+    # этот мок ПОСЛЕ фикстуры (late-binding).
+    if hasattr(health, "_tunnel_window_stats"):
+        monkeypatch.setattr(health, "_tunnel_window_stats", lambda now=None, log_path=None: None)
 
 
 def test_watchdog_pushes_on_degraded_to_down(monkeypatch, tmp_path):
@@ -3701,7 +3713,10 @@ def test_degradation_reason_len_limit(monkeypatch):
         f"причина обрезана до дефолтного лимита 48, получено: {out!r}"
     monkeypatch.setenv(_REASON_MAX_ENV, "8")
     out = health._format_degradation_diff(["туннель"], [], {"туннель": long_reason})
-    assert "очень дл" in out and "очень длин" not in out, "env-лимит 8 срезает причину"
+    # #362 п.3: лимит 8 режет по слову (последний пробел) с «…», не посреди токена
+    # (старое «очень дл» без маркера было обрывом на полуслове).
+    assert "очень" in out and "очень длин" not in out, f"env-лимит 8 срезает причину: {out!r}"
+    assert out.endswith("…)"), f"маркер обрыва «…» на месте: {out!r}"
 
 
 def test_watchdog_status_jsonl_event_carries_added_details(monkeypatch, tmp_path):
@@ -5504,3 +5519,210 @@ def test_port_up_lsof_hit_short_circuits_without_connect(monkeypatch):
     monkeypatch.setattr(health_probes.sys_probe, "port_open", _no_connect)
     assert health_probes._port_up(10808) is True
     assert not called, "lsof-попадание не должно долбить connect'ом"
+
+
+# ============================ #362: спам пушами — override-гейт в статусе, цифры туннеля, мелочи ============================
+# Эмпирика 2026-09-18/19 после #358/#359: (1) claude-proxy при endpoint-override пушится как
+# деградация — doctor-грань (#329/#335) говорит «проба неприменима», watchdog-контур клеймит
+# degraded (класс #341 «два контура противоречат»); (2) туннель флапает парами «+»/«−», причина
+# «connection-failed; connection-failed» без цифр; (3) обрезка состава/причины прячет суть,
+# codex-app «не запущен» считается деградацией.
+
+
+def test_probe_override_results_carry_overridden_flag(monkeypatch):
+    """#362 п.1: ОБЕ ветки override-гейта (#329 unknown и #337 down-leak) несут структурный
+    флаг overridden=True — check_all применяет гейт без повторного чтения конфига в hot path."""
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _ps_lsof_fake(f"12345 {CLI_COMM}\n", _EXTERNAL_LEAK_LINE))
+    monkeypatch.setattr(health, "_read_endpoint_config", lambda: _ZAI_OVERRIDE_CFG)
+    # ветка #329: external без атрибуции → unknown
+    _override_runtime_mocks(monkeypatch, per_pid={}, readable=set())
+    unknown = health._claude_proxy_probe()
+    assert unknown["status"] == "unknown"
+    assert unknown.get("overridden") is True, "unknown-ветка override должна нести флаг гейта"
+    # ветка #337: readable PID на стандартном endpoint → down (доказуемая утечка)
+    _override_runtime_mocks(
+        monkeypatch,
+        per_pid={"12345": {"ANTHROPIC_BASE_URL": "https://api.anthropic.com"}},
+        readable={"12345"})
+    leak = health._claude_proxy_probe()
+    assert leak["status"] == "down"
+    assert leak.get("overridden") is True, "leak-ветка при override тоже несёт флаг гейта"
+
+
+def test_check_all_claude_proxy_override_leak_is_observe_not_driver(monkeypatch):
+    """#362 п.1: при endpoint-override claude-proxy — observe (info), не driver, даже при
+    #337-утечке: не входит в failed/degraded-состав, вердикт не роняет."""
+    _all_up_monkey(monkeypatch)
+    monkeypatch.setattr(health, "_claude_proxy_probe", _REAL_CLAUDE_PROXY_PROBE)
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _ps_lsof_fake(f"12345 {CLI_COMM}\n", _EXTERNAL_LEAK_LINE))
+    monkeypatch.setattr(health, "_read_endpoint_config", lambda: _ZAI_OVERRIDE_CFG)
+    _override_runtime_mocks(
+        monkeypatch,
+        per_pid={"12345": {"ANTHROPIC_BASE_URL": "https://api.anthropic.com"}},
+        readable={"12345"})
+    result = health.check_all()
+    cp = next(c for c in result["checks"] if "claude-proxy" in c["name"])
+    assert cp.get("info") is True, "override → observe-статус, не driver"
+    drivers = [c["name"] for c in result["checks"] if not c.get("info")]
+    assert "claude-proxy (HTTPS_PROXY для CLI)" not in drivers, \
+        "claude-proxy при override не входит в failed/degraded-состав"
+    assert result["status"] == "ok", "единственный «фейл» под гейтом не роняет вердикт"
+
+
+def test_watchdog_no_push_when_claude_proxy_override_only(monkeypatch, tmp_path):
+    """#362 п.1 (красный тест из issue): runtime-env с override → состав деградации не
+    содержит claude-proxy, пуш не отправляется."""
+    monkeypatch.setenv("SROUTER_WATCHDOG_DEGRADED_CONFIRM", "1")
+    monkeypatch.setenv(_COOLDOWN_ENV, "0")
+    state_file = tmp_path / "watchdog.last"
+    state_file.write_text(json.dumps({"status": "ok", "failed": [], "notified_failed": [],
+                                      "last_degraded_push": 0.0}))
+    monkeypatch.setattr(health, "WATCHDOG_STATE", state_file)
+    monkeypatch.setattr(health, "_record_watchdog_metrics", lambda result: None)
+    _all_up_monkey(monkeypatch)
+    monkeypatch.setattr(health, "_claude_proxy_probe", _REAL_CLAUDE_PROXY_PROBE)
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _ps_lsof_fake(f"12345 {CLI_COMM}\n", _EXTERNAL_LEAK_LINE))
+    monkeypatch.setattr(health, "_read_endpoint_config", lambda: _ZAI_OVERRIDE_CFG)
+    _override_runtime_mocks(
+        monkeypatch,
+        per_pid={"12345": {"ANTHROPIC_BASE_URL": "https://api.anthropic.com"}},
+        readable={"12345"})
+    notified = []
+    monkeypatch.setattr(health, "_notify", lambda msg, sound="Glass": notified.append((msg, sound)))
+    health.cmd_watchdog()
+    assert notified == [], "override-гейт: claude-proxy observe — деградации нет, пуша нет"
+
+
+# ---------- #362 п.2: туннель — цифры окна в причине + per-driver флап-гейт ----------
+
+
+def test_tunnel_window_stats_counts_fails_in_window(monkeypatch):
+    """#362 п.2: окно WINDOW_SEC из metrics-JSONL → {fails, samples, rate}; пусто → None."""
+    assert _REAL_TUNNEL_WINDOW_STATS is not None
+    now = 1_000_000.0
+    events = [
+        {"ts": now - 60, "status": "ok"},
+        {"ts": now - 300, "status": "connection-failed"},
+        {"ts": now - 600, "status": "timeout"},
+        {"ts": now - 16 * 60, "status": "timeout"},  # вне 15м окна — не считается
+    ]
+    monkeypatch.setattr(health.metrics_store, "read_timing_events", lambda **kw: events)
+    stats = _REAL_TUNNEL_WINDOW_STATS(now=now)
+    assert stats["samples"] == 3 and stats["fails"] == 2, stats
+    assert stats["rate"] == _pytest.approx(2 / 3)
+    monkeypatch.setattr(health.metrics_store, "read_timing_events", lambda **kw: [])
+    assert _REAL_TUNNEL_WINDOW_STATS(now=now) is None, "нет замеров → None (fail-open гейта)"
+
+
+def test_check_all_tunnel_down_reason_carries_window_numbers(monkeypatch):
+    """#362 п.2: причина упавшего туннеля в составе несёт цифры окна из metrics
+    (12/15 фейлов за 15м) и rc текущей пробы — не голое «connection-failed»."""
+    _all_up_monkey(monkeypatch)
+    monkeypatch.setattr(health, "_tunnel_up", lambda: (
+        False, "connection-failed (оба таргета)", False,
+        {"status": "connection-failed", "rc": 56, "err": "curl: (56) Recv failure"}))
+    monkeypatch.setattr(health, "_tunnel_window_stats",
+                        lambda now=None, log_path=None: {"fails": 12, "samples": 15, "rate": 0.8})
+    result = health.check_all()
+    tun = next(c for c in result["checks"] if c.get("id") == "tunnel")
+    assert tun["ok"] is False and not tun.get("info"), "rate 0.8 ≥ порога — туннель driver"
+    assert "12/15" in tun["detail"], f"цифры окна в причине: {tun['detail']!r}"
+    assert "rc=56" in tun["detail"], f"rc-класс отказа в причине: {tun['detail']!r}"
+
+
+def test_check_all_tunnel_single_fail_below_threshold_is_observe(monkeypatch):
+    """#362 п.2 (per-driver порог): редкий фейл (rate < порога при достатке замеров) —
+    observe (info): единичный провал — не деградация, не driver, вердикт не роняет."""
+    _all_up_monkey(monkeypatch)
+    monkeypatch.setattr(health, "_tunnel_up", lambda: (
+        False, "connection-failed", False, {"status": "connection-failed", "rc": 35, "err": ""}))
+    monkeypatch.setattr(health, "_tunnel_window_stats",
+                        lambda now=None, log_path=None: {"fails": 1, "samples": 14, "rate": 0.071})
+    result = health.check_all()
+    tun = next(c for c in result["checks"] if c.get("id") == "tunnel")
+    assert tun.get("info") is True, "1/14 ниже порога 0.5 — наблюдаем, не деградация"
+    assert result["status"] == "ok"
+    assert "ниже порога" in tun["detail"], f"причина объясняет, почему не деградация: {tun['detail']!r}"
+
+
+def test_check_all_tunnel_gate_fail_open_without_metrics(monkeypatch):
+    """#362 п.2: метрик нет (выключены/пусто) → гейт неприменим (fail-open): туннель driver
+    как раньше — отсутствие данных не глушит сигнал."""
+    _all_up_monkey(monkeypatch)
+    monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed", False, None))
+    monkeypatch.setattr(health, "_tunnel_window_stats", lambda now=None, log_path=None: None)
+    result = health.check_all()
+    tun = next(c for c in result["checks"] if c.get("id") == "tunnel")
+    assert tun["ok"] is False and not tun.get("info"), "нет данных метрик — легаси-поведение"
+
+
+def test_check_all_tunnel_gate_disabled_by_env(monkeypatch):
+    """#362 п.2 (more-options-better): SROUTER_WATCHDOG_TUNNEL_FAIL_RATE=0 — гейт выключен,
+    любой фейл = driver (легаси-поведение, независимо от окна)."""
+    monkeypatch.setenv("SROUTER_WATCHDOG_TUNNEL_FAIL_RATE", "0")
+    _all_up_monkey(monkeypatch)
+    monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed", False, None))
+    monkeypatch.setattr(health, "_tunnel_window_stats",
+                        lambda now=None, log_path=None: {"fails": 1, "samples": 14, "rate": 0.071})
+    result = health.check_all()
+    tun = next(c for c in result["checks"] if c.get("id") == "tunnel")
+    assert tun["ok"] is False and not tun.get("info"), "порог 0 → гейт выключен"
+
+
+def test_watchdog_no_push_when_tunnel_below_threshold(monkeypatch, tmp_path):
+    """#362 п.2: туннель ниже порога флапа — не входит в состав деградации, пары
+    «+туннель»/«−туннель» каждые 15 минут молчат."""
+    monkeypatch.setenv("SROUTER_WATCHDOG_DEGRADED_CONFIRM", "1")
+    monkeypatch.setenv(_COOLDOWN_ENV, "0")
+    state_file = tmp_path / "watchdog.last"
+    state_file.write_text(json.dumps({"status": "ok", "failed": [], "notified_failed": [],
+                                      "last_degraded_push": 0.0}))
+    monkeypatch.setattr(health, "WATCHDOG_STATE", state_file)
+    monkeypatch.setattr(health, "_record_watchdog_metrics", lambda result: None)
+    _all_up_monkey(monkeypatch)
+    monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed", False, None))
+    monkeypatch.setattr(health, "_tunnel_window_stats",
+                        lambda now=None, log_path=None: {"fails": 1, "samples": 14, "rate": 0.071})
+    notified = []
+    monkeypatch.setattr(health, "_notify", lambda msg, sound="Glass": notified.append((msg, sound)))
+    health.cmd_watchdog()
+    assert notified == [], "туннель ниже порога — observe, пуша нет"
+
+
+def test_tunnel_up_dedupes_identical_failure_kinds(monkeypatch):
+    """#362 п.2: одинаковые kind'и обоих таргетов не дублируются в detail —
+    «connection-failed; connection-failed» → «connection-failed (оба таргета)»."""
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _tunnel_curl_per_target({"anthropic": "000", "openai": "000"}))
+    ok, detail, _, _ = health._tunnel_up()
+    assert ok is False
+    assert "connection-failed; connection-failed" not in detail, f"дублирование: {detail!r}"
+    assert detail == "connection-failed (оба таргета)", f"got: {detail!r}"
+
+
+# ---------- #362 п.3: обрезка состава по словам, имена важнее причин ----------
+
+
+def test_degradation_diff_prints_all_names_before_dropping_reasons(monkeypatch):
+    """#362 п.3: при переполнении причины отбрасываются ПЕРВЫМИ — 2-3 драйвера печатаются
+    полным списком имён; «+N др.» не скрывает состав."""
+    monkeypatch.setenv(_DIFF_MAX_LEN_ENV, "100")
+    reasons = {"claude-proxy": "runtime: Claude Code MIXED — local proxy (PID 10) + direct-leak (PID 11)",
+               "туннель": "connection-failed (оба таргета) — 12/15 фейлов за 15м, rc=56 Recv failure"}
+    out = health._format_degradation_diff(["claude-proxy", "туннель"], [], reasons)
+    assert "+claude-proxy" in out and "+туннель" in out, f"все имена видны: {out!r}"
+    assert "др." not in out, f"состав при 2 драйверах не схлопывается в счётчик: {out!r}"
+
+
+def test_added_reason_truncated_at_word_boundary_with_ellipsis(monkeypatch):
+    """#362 п.3: длинная причина режется по словам с «…», не посреди токена и не с висячей
+    открывающей скобкой («(PID 10» — мусор в пуше)."""
+    reason = ("runtime: Claude Code MIXED — local proxy (PID 10) + direct-leak "
+              "(PID 11) — нарушение fail-closed")
+    out = health._format_added_driver("claude-proxy", reason)
+    assert out.endswith("…)"), f"маркер обрыва на причине (шаблон закрывает скобку): {out!r}"
+    assert "(PID" not in out, f"висячая скобка снята: {out!r}"
+    assert "runtime: Claude Code MIXED" in out, f"начало причины сохранено: {out!r}"

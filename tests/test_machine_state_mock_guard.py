@@ -105,6 +105,10 @@ _SAFE_WITHOUT_DIRECT_MOCK = {
     # тестовый мок (monkeypatch.setattr — последний вызов побеждает). Тесты, которые НЕ мокают
     # _codenv_job_check явно (в tests/test_health.py), получают реальный launchctl print —
     # безопасно, потому что codenv опционален и unknown/ok/down не роняют их конкретные assert'ы.
+    "_apply_tunnel_window_gate",  # #362: -> _tunnel_window_stats (bounded-хвост metrics-JSONL,
+    # БЕЗ subprocess) — глушится autouse-фикстурой _block_real_watchdog_lifecycle
+    # (health._tunnel_window_stats → None = fail-open), изоляция от живого metrics-JSONL
+    # launchd-watchdog; вызывается только при не-vendor провале туннеля.
 }
 
 

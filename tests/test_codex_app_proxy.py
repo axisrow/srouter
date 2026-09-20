@@ -409,9 +409,12 @@ def test_app_proxy_detects_chromium_helper_without_codex_basename(monkeypatch):
     ps = f"71234 {CHROMIUM_HELPER_COMM}\n"
     monkeypatch.setattr(health.sys_probe, "run", _fake(ps, _gui_env({})))
     res = health._codex_app_proxy_check()
-    assert res["status"] != "unknown", (
-        f"Chromium network-service helper активен — не должно быть ложного "
-        f"'App не запущен'; got {res}"
+    # #362: статус теперь unknown («не запущен» — не деградация), но интент теста прежний —
+    # helper ДОЛЖЕН быть детектен как App-related (старый код видел app_pids=[] и лгал
+    # «ChatGPT.app/Codex.app не запущен» целиком): detail называет именно Rust app-server.
+    assert "rust app-server не запущен" in res["detail"].lower(), (
+        f"Chromium network-service helper активен — App-PID детектен, detail называет "
+        f"именно Rust app-server; got {res}"
     )
     # codex-review (PR #314): detail теперь честно уточняет, что именно Rust app-server не запущен
     # (Chromium жив) — это НЕ тот баг, для которого написан тест (старый код видел app_pids=[] и
@@ -442,6 +445,20 @@ def test_app_proxy_down_when_chromium_helper_leaks_direct_despite_gui_socks5(mon
 # _codex_app_proxy_check проверяет external_by_kind ТОЛЬКО по "chromium"/"rust" (health_codenv.py
 # :700-713) — leak с "helper"-kind PID падает в generic Rust-ветку и врёт диагнозом.
 GENERIC_HELPER_COMM = "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"
+
+
+def test_app_proxy_rust_not_running_with_empty_gui_env_is_not_degradation(monkeypatch):
+    """#362 п.3 (красный тест из issue): «Rust app-server не запущен» (живы только non-rust
+    App-процессы, gui-env пуст) — НЕ деградация: пользователь сам закрыл App / Rust ещё не
+    спавнится. unknown (info-only), не down — не входит в состав пуша watchdog'а
+    (класс «драйвер по природе флапует» при обычном открытии/закрытии ChatGPT.app)."""
+    ps = f"71234 {CHROMIUM_HELPER_COMM}\n"
+    monkeypatch.setattr(health.sys_probe, "run", _fake(ps, _gui_env({})))
+    res = health._codex_app_proxy_check()
+    assert res["status"] == "unknown", \
+        f"«не запущен» — не деградация (#362), observe: got {res}"
+    assert "не запущен" in res["detail"].lower(), \
+        f"detail честно называет причину: Rust не запущен; got {res}"
 
 
 def test_app_proxy_empty_gui_env_does_not_blame_rust_when_only_chromium_running(monkeypatch):
