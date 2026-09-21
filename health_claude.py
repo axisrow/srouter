@@ -152,11 +152,11 @@ def _claude_proxy_probe():
             # ps eww ТОЛЬКО при external PID (паттерн _pids_env_readable #335); readable
             # берётся из ТОГО ЖЕ eww-вывода (env_readable_pids, #337 review perf).
             rt = _health_facade._read_runtime_endpoint_config()
-            leak_pids = _health_facade._override_runtime_leak_pids(
+            divergent_pids = _health_facade._override_runtime_divergent_pids(
                 sorted(external_pids), rt, rt.get("env_readable_pids", set()), ov["host"])
-            if leak_pids:
+            if divergent_pids:
                 unproven = []
-                for pid in sorted(leak_pids):
+                for pid in sorted(divergent_pids):
                     base = rt.get("per_pid", {}).get(pid, {}).get("ANTHROPIC_BASE_URL", "")
                     # #337 review семантика: «без override» (стандартный endpoint) и «чужой
                     # override» (другой нестандартный хост) — разные подкатегории дивергенции;
@@ -175,10 +175,10 @@ def _claude_proxy_probe():
                                    f"ПОВЕРХ exec-env при старте (#337), файлы — источник "
                                    f"правды; расхождение exec-env не доказывает утечку "
                                    f"(verify-dont-guess). Проверить маршрут можно только по "
-                                   f"назначению соединения (future work)."
+                                   f"назначению соединения (peer-IP vs DNS endpoint)."
                                    + (f". Остальные external на override / с нечитаемым env: "
-                                      f"PID {','.join(sorted(external_pids - leak_pids))}"
-                                      if external_pids - leak_pids else "")),
+                                      f"PID {','.join(sorted(external_pids - divergent_pids))}"
+                                      if external_pids - divergent_pids else "")),
                         # #362 п.1: флаг гейта на результате — check_all применяет
                         # override-гейт в статусном/нотификационном пути структурно.
                         "overridden": True}
