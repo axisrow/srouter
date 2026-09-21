@@ -125,8 +125,14 @@ def test_watchdog_journal_rotation_off_by_default(tmp_path, monkeypatch):
 
 
 def test_watchdog_journal_rotation_enabled_by_env(tmp_path, monkeypatch):
-    """SROUTER_WATCHDOG_LOG_ROTATE=1 — осознанный opt-in: протухшие строки вырезаются."""
+    """SROUTER_WATCHDOG_LOG_ROTATE=1 — осознанный opt-in: протухшие строки вырезаются.
+
+    Канон wall-clock (PR #263): fixture-даты относительно ЗАФИКСИРОВАННОГО now
+    (metrics_store._now), не живого календаря — иначе тест краснеет сам собой,
+    когда даты стареют за retention (случилось 2026-09-20: 2026-09-06 вышло из 14d).
+    """
     import health
+    from datetime import datetime, timezone
 
     status = tmp_path / "status.jsonl"
     lifecycle = tmp_path / "lifecycle.jsonl"
@@ -141,6 +147,10 @@ def test_watchdog_journal_rotation_enabled_by_env(tmp_path, monkeypatch):
     monkeypatch.setattr(health, "WATCHDOG_STATUS_LOG", status)
     monkeypatch.setattr(health, "WATCHDOG_LIFECYCLE_LOG", lifecycle)
     monkeypatch.setattr(health, "WATCHDOG_NOTIFY_LOG", notify)
+    # frozen now = 2026-09-10: cutoff retention(14d) = 2026-08-27 → 2026-08-01 протух,
+    # 2026-09-06 свеж.
+    monkeypatch.setattr(metrics_store, "_now",
+                        lambda now=None: datetime(2026, 9, 10, tzinfo=timezone.utc).timestamp())
 
     health._rotate_watchdog_journals()
 

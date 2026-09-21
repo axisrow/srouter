@@ -23,6 +23,7 @@ main остаются здесь: тесты monkeypatch'ат отдельные
 from pathlib import Path
 import fcntl  # macOS-only проект (PF/osascript/launchd) — flock для watchdog-лока
 import json
+import math  # isfinite для env-парсера флап-гейта (#362 review: nan/inf → дефолт)
 import logging
 import os
 import socket  # noqa: F401 — re-export для monkeypatch health.socket.getaddrinfo (health_probes._resolve_host)
@@ -103,12 +104,95 @@ _DEGRADED_REASON_MAX_DEFAULT = 48
 # входе; cooldown (#326) остаётся верхней границей частоты поверх него. 1 = легаси.
 _DEGRADED_CONFIRM_ENV = "SROUTER_WATCHDOG_DEGRADED_CONFIRM"
 _DEGRADED_CONFIRM_DEFAULT = 2
+# #362 п.2: per-driver флап-гейт туннеля — degraded только после M% фейлов в окне
+# (metrics_store.WINDOW_SEC = 15м, тот же порог, что тренд-детектор дашборда — канон #341:
+# два контура не расходятся), не единичного. 0 — гейт выключен (легаси: любой фейл = driver).
+# fail-open: метрик нет (выключены/пусто) → гейт неприменим, драйвер считается как раньше.
+_TUNNEL_FAIL_RATE_ENV = "SROUTER_WATCHDOG_TUNNEL_FAIL_RATE"
+_TUNNEL_FAIL_RATE_DEFAULT = metrics_store.DEGRADE_FAILURE_RATE
 
 # Ротация watchdog-журналов D2 (PR-4 #339, контракт §3 — дефолты «статус-jsonl: 14d/2MB»).
 # Выключена по умолчанию — включение SROUTER_WATCHDOG_LOG_ROTATE=1 (граница согласия).
 WATCHDOG_JOURNAL_RETENTION_DAYS = 14
 WATCHDOG_JOURNAL_MAX_BYTES = 2 * 1024 * 1024
 WATCHDOG_JOURNAL_ROTATE_ENV = "SROUTER_WATCHDOG_LOG_ROTATE"
+
+
+def _tunnel_fail_rate_threshold():
+    """Порог флап-гейта туннеля (#362 п.2) из env: clamp [0, 1], 0 — гейт выключен,
+    мусор → дефолт (= DEGRADE_FAILURE_RATE тренд-детектора, 0.5). nan/inf — тоже мусор
+    (не ValueError; после clamp nan/inf давали 1.0 — fail-open сильнее задуманного)."""
+    raw = os.environ.get(_TUNNEL_FAIL_RATE_ENV)
+    if raw is None:
+        return _TUNNEL_FAIL_RATE_DEFAULT
+    try:
+        value = float(raw)
+    except ValueError:
+        return _TUNNEL_FAIL_RATE_DEFAULT
+    if not math.isfinite(value):
+        return _TUNNEL_FAIL_RATE_DEFAULT
+    return max(0.0, min(1.0, value))
+
+
+def _tunnel_window_stats(now=None, log_path=None):
+    """Окно фейлов туннеля из metrics-JSONL (#362 п.2): {fails, samples, rate} | None.
+
+    Bounded-хвост (read_timing_events, ≤120 строк) — вызывается из check_all ТОЛЬКО когда
+    туннель-проба упала: healthy-тик не платит ничего (hot-path ~20с без новых проб).
+    Окно = WINDOW_SEC (15м) — то же, что тренд-детектор дашборда. Нет данных → None
+    (fail-open: гейт неприменим). Не бросает.
+    """
+    try:
+        events = metrics_store.read_timing_events(hours=1, max_lines=120,
+                                                  log_path=log_path, now=now)
+        now_ts = metrics_store._now(now)
+        window = []
+        for event in events:
+            try:
+                age = now_ts - float(event.get("ts") or 0)
+            except (TypeError, ValueError):
+                continue
+            if 0.0 <= age <= metrics_store.WINDOW_SEC:
+                window.append(event)
+        if not window:
+            return None
+        fails = sum(1 for e in window if e.get("status") != "ok")
+        return {"fails": fails, "samples": len(window), "rate": fails / float(len(window))}
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _apply_tunnel_window_gate(tun_check):
+    """Цифры окна в причине туннеля (#362 п.2), мутирует check. Вердикт НЕ меняет:
+    гейт нотификаций живёт в notify-составе watchdog'а (_cmd_watchdog_locked) —
+    cycle-review: /health и doctor обязаны видеть деградацию честно и сразу.
+
+    Driver-фейл → detail дополняется цифрами окна («12/15 фейлов за 15м, rc=56 …») —
+    класс отказа текущей пробы из её же timing (#326), без новых сетевых проб.
+    Редкий фейл (rate < порога) честно помечается «ниже порога» в detail.
+    """
+    stats = _tunnel_window_stats()
+    if stats is None:
+        return
+    # #362 review (тред 4): stats едут в чеке — notify-гейт (_cmd_watchdog_locked)
+    # переиспользует их, без второго чтения хвоста metrics-JSONL на том же тике.
+    tun_check["window_stats"] = stats
+    # минуты окна — из константы, не литерал: смена WINDOW_SEC не должна врать в причине
+    nums = f"{stats['fails']}/{stats['samples']} фейлов за {metrics_store.WINDOW_SEC // 60}м"
+    threshold = _tunnel_fail_rate_threshold()
+    if (stats["samples"] >= metrics_store.MIN_WINDOW_SAMPLES
+            and stats["rate"] < threshold):
+        tun_check["detail"] = (f"{tun_check['detail']} — {nums} ниже порога "
+                               f"{threshold:.0%} (флап, наблюдаем)")
+        return
+    timing = tun_check.get("timing")
+    suffix = nums
+    if isinstance(timing, dict) and isinstance(timing.get("rc"), int):
+        suffix += f", rc={timing['rc']}"
+        err = timing.get("err")
+        if isinstance(err, str) and err.strip():
+            suffix += f" ({err.strip().splitlines()[0][:60]})"
+    tun_check["detail"] = f"{tun_check['detail']} — {suffix}"
 
 
 def check_all(*, active_claude=False):
@@ -136,6 +220,10 @@ def check_all(*, active_claude=False):
                  "detail": tun_detail, "timing": tun_timing}
     if tun_vendor_outage:
         tun_check["category"] = "vendor-outage"
+    elif not tun_ok:
+        # #362 п.2: цифры окна в причине + per-driver флап-гейт (единичный фейл — не деградация).
+        # Только для не-vendor провалов: vendor outage (#207) — событие вендора, не флап канала.
+        _apply_tunnel_window_gate(tun_check)
     checks.append(tun_check)
     # #203: активный сетевой интерфейс/маршрут — ПЕРВЫЙ чек каскада (нет сети → VPS → локальный
     # прокси → ...). Эпик #201 ситуация 1: doctor не различал «нет сети» (Wi-Fi/eth выкл, нет
@@ -236,7 +324,14 @@ def check_all(*, active_claude=False):
     cp = _claude_proxy_probe()
     cp_check = {"name": "claude-proxy (HTTPS_PROXY для CLI)",
                 "ok": cp["status"] == "ok", "detail": cp["detail"]}
-    if cp["status"] == "unknown":
+    if cp["status"] == "unknown" or cp.get("overridden"):
+        # #329/#335 + #362 п.1: override-гейт применён в статусном/нотификационном пути
+        # (раньше был только в doctor-грани — класс #341 «два контура противоречат»).
+        # При endpoint-override в NO_PROXY проба неприменима (unknown) ИЛИ утечка
+        # ретроспективно-доказуема (#337, down) — в обоих случаях observe-статус (info):
+        # НЕ входит в failed/degraded-состав и не пушится watchdog'ом (спам ~15 пушей/день
+        # #362). Doctor по-прежнему показывает detail с форензикой. Флаг overridden несёт
+        # сам probe — повторного чтения конфига в hot path нет.
         cp_check["info"] = True  # не участвует в агрегации (drivers ниже фильтруют info)
     checks.append(cp_check)
     # Issue #331: консистентность прокси-env — SOCKS-плечо (ALL_PROXY/all_proxy из launchctl
@@ -846,6 +941,27 @@ def _degraded_reason_max_len():
         return _DEGRADED_REASON_MAX_DEFAULT
 
 
+def _truncate_reason_text(text, limit):
+    """Обрезка причины по словам с «…» (#362 п.3): не посреди токена и не с висячей
+    открывающей скобкой («(PID 10» — мусор в пуше). Нет пробела в пределах лимита
+    (один длинный токен) — жёсткий срез."""
+    text = str(text)
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    space = cut.rfind(" ")
+    if space > 0:
+        cut = cut[:space]
+    # многоходовая стрижка: вложенная незакрытая «(» (rc-суффикс «(curl: (56 …)» с обрывом
+    # внутри) тоже снимается; пустой результат не допускаем — жёсткий срез лучше пустоты.
+    while cut.count("(") > cut.count(")"):
+        trimmed = cut[:cut.rfind("(")]
+        if not trimmed.strip():
+            break
+        cut = trimmed
+    return cut.rstrip().rstrip(",;—-") + "…"
+
+
 def _format_added_driver(name, reason):
     """«+имя (причина)» — добавившийся драйвер в пуше (#358 п.1). Без причины (или при
     REASON_MAX=0) — голое «+имя»; битый env-шаблон → дефолт (канон #355: форма пуша
@@ -855,7 +971,7 @@ def _format_added_driver(name, reason):
     limit = _degraded_reason_max_len()
     if limit <= 0:
         return "+" + name
-    reason = str(reason)[:limit]
+    reason = _truncate_reason_text(reason, limit)
     template = os.environ.get(_DEGRADED_ADDED_TEMPLATE_ENV) or _DEGRADED_ADDED_TEMPLATE_DEFAULT
     try:
         return template.format(name=name, reason=reason)
@@ -869,7 +985,9 @@ def _format_degradation_diff(added, removed, reasons=None):
     #358 п.1: добавившиеся несут краткую причину из пробы (reasons: {имя: detail}),
     ушедшие — только имена. Лимит длины (SROUTER_WATCHDOG_DEGRADED_PUSH_MAX, дефолт
     160) с приоритетом added: при обрезке добавившиеся перечисляются максимально полно
-    (+N др.), ушедшие схлопываются в счётчик (−N ушедших). Пустая разница → "".
+    (+N др.), ушедшие схлопываются в счётчик (−N ушедших). #362 п.3: причины при
+    переполнении отбрасываются первыми — полный список имён важнее причин (2-3 драйвера
+    печатаются целиком). Пустая разница → "".
     Не бросает (битый шаблон → дефолт): текст пуша не должен ронять watchdog-тик.
     """
     added = sorted(added)
@@ -907,8 +1025,15 @@ def _format_degradation_diff(added, removed, reasons=None):
     candidate = _join(added_full, removed_short)
     if len(candidate) <= limit:
         return candidate
+    # #362 п.3: имена важнее причин — при переполнении причины отбрасываются ПЕРВЫМИ:
+    # 2-3 драйвера печатаются ПОЛНЫМ списком имён, «+N др.» не скрывает состав.
+    # Причины остаются только когда влезают целиком (ветка выше).
+    bare_added = ", ".join("+" + name for name in added)
+    candidate = _join(bare_added, removed_short)
+    if len(candidate) <= limit:
+        return candidate
     for keep in range(len(added), 0, -1):
-        head = ", ".join(_format_added_driver(name, reasons.get(name)) for name in added[:keep])
+        head = ", ".join("+" + name for name in added[:keep])
         rest = len(added) - keep
         if rest:
             head += f", +{rest} др."
@@ -1078,6 +1203,20 @@ def _cmd_watchdog_locked(result):
     # Канонический вид набора (round 4 P2): sorted — порядок перечисления драйверов не
     # событие, иначе перестановка [a,b]→[b,a] давала ложный Ping и ложный audit-diff.
     failed = sorted({c["name"] for c in result["checks"] if not c["ok"] and not c.get("info")})
+    # #362 п.2: notify-состав. Туннель ниже флап-порога (единичный/редкий провал, не
+    # устойчивый) не входит в состав пушей — пары «+»/«−» молчат; вердикт check_all
+    # (status + detail с цифрами окна) остаётся честным для doctor//health (cycle-review:
+    # гейт не меняет общий вердикт, только нотификации). Fail-open: нет данных окна →
+    # состав как есть; vendor-outage (#207) гейту не подлежит.
+    tun_check = next((c for c in result["checks"] if c.get("id") == "tunnel"), None)
+    if (tun_check is not None and not tun_check["ok"] and not tun_check.get("info")
+            and tun_check.get("category") != "vendor-outage"):
+        # #362 review (тред 4): stats кладёт _apply_tunnel_window_gate (одно чтение окна
+        # на тик); ключа нет (vendor-outage/живой туннель/битые метрики) — fail-open.
+        stats = tun_check.get("window_stats")
+        if (stats and stats["samples"] >= metrics_store.MIN_WINDOW_SAMPLES
+                and stats["rate"] < _tunnel_fail_rate_threshold()):
+            failed = [name for name in failed if name != tun_check["name"]]
     prev = _read_watchdog_prev_state()
     prev_status = prev["status"] if prev else ""
     prev_failed = prev["failed"] if prev else None
@@ -1137,7 +1276,9 @@ def _cmd_watchdog_locked(result):
             # Нечего уведомлять — кандидата нет (streak не «донашивается» через noop).
             pending_failed, pending_streak = None, 0
         confirmed = pending_streak >= _degraded_confirm_probes()
-        if (new_degradation or unnotified) and confirmed and \
+        # Гвард пустого notify-состава (#362 п.2): cur=degraded при выгейт-туннеле —
+        # «деградировал ()» не пушим, анонсировать нечего.
+        if failed and (new_degradation or unnotified) and confirmed and \
                 time.time() - last_push >= _degraded_notify_cooldown_sec():
             # Лейбл по prev_status (PR #326 review P3): «деградировал» — только вход из
             # ok/fresh; не-ok→не-ok (в т.ч. down→degraded с СОКРАТИВШИМСЯ набором) —

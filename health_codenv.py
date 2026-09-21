@@ -706,7 +706,9 @@ def _codex_app_proxy_check():
 
     Чек: (1) App-related PID активны (ps по _is_codex_app_comm, ЛЮБОЙ helper внутри .app/-бандла);
     (2) gui-env через _read_gui_proxy_env; (3) реальный runtime-маршрут через _app_pids_route (lsof).
-      status="down"    — App активен, gui-env пуст (codenv не загружен) — DRIVER;
+      status="down"    — Rust app-server активен, gui-env пуст (codenv не загружен) — DRIVER
+                         (#362 п.3: только non-rust процессы при пустом gui-env — unknown,
+                         «не запущен» не деградация);
       status="warn"    — App активен, gui-env только HTTP (privoxy рвёт WS #120) — DRIVER;
       status="ok"      — App активен, gui-env SOCKS5 (codenv работает) — DRIVER;
       status="unknown" — App не запущен ИЛИ gui-env не верифицируем — info-only (fail-closed).
@@ -749,13 +751,26 @@ def _codex_app_proxy_check():
             # codex-review (PR #314): gui-env пуст, но живы только Chromium/generic-helper PID —
             # Rust app-server НЕ запущен. codenv нужен только Rust'у (Chromium берёт прокси из
             # системного SOCKS, см. _codex_app_chromium_proxy_check) — не приписываем Rust'у.
-            # Статус остаётся down (App-related процесс без launchd-прокси — по-прежнему сигнал,
-            # не unknown), но detail честно называет причину непричастности codenv.
-            return {"status": "down", "source": "gui-env",
+            # #362 п.3: «не запущен» — НЕ деградация (пользователь сам закрыл App / Rust ещё
+            # не спавнится): Rust-движок флапает при обычном открытии/закрытии ChatGPT.app,
+            # down здесь клепал пары пушей «+»/«−». Но прежде чем уйти в unknown — проверить
+            # сокеты оставшихся App-PID (cycle-review): generic (.app)-helper с внешним
+            # ESTABLISHED — доказанный обход прокси, и его не видит chromium-check (тот
+            # покрывает только NetworkService). lsof — тот же бюджет, что в socks_keys-ветке.
+            route = _app_pids_route(app_pids, app_kinds=app_kinds)
+            if route.get("external"):
+                ext = ",".join(sorted(route["external"]))
+                return {"status": "down", "source": "runtime",
+                        "detail": (f"ChatGPT.app helper НАПРЯМУЮ (PID {ext} держит external-сокеты; "
+                                   f"Rust app-server не запущен, gui-env codenv пуст — codenv для "
+                                   f"текущих процессов неприменим). Проверь системный SOCKS "
+                                   f"(srouter system-proxy repair) / wrapper запуска App")}
+            return {"status": "unknown", "source": "gui-env",
                     "detail": (f"ChatGPT.app: Rust app-server не запущен (только non-rust "
                                f"App-процессы, {pid_hint}), gui-env codenv пуст — codenv нужен только "
-                               f"Rust app-server, для текущих процессов неприменим. Если Chromium "
-                               f"network-service течёт мимо прокси — см. отдельный system-proxy check.")}
+                               f"Rust app-server, для текущих процессов неприменим, деградацией не "
+                               f"считается (#362). Если Chromium network-service течёт мимо прокси — "
+                               f"см. отдельный system-proxy check.")}
         return {"status": "down", "source": "gui-env",
                 "detail": (f"ChatGPT.app Rust app-server без прокси: launchctl gui-env пуст — codenv "
                            f"не загружен/битый ({pid_hint}). WS к chatgpt.com рвётся (GFW). "

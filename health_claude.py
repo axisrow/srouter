@@ -173,9 +173,12 @@ def _claude_proxy_probe():
                                    f"settings.json)."
                                    + (f". Остальные external на override / с нечитаемым env: "
                                       f"PID {','.join(sorted(external_pids - leak_pids))}"
-                                      if external_pids - leak_pids else ""))}
+                                      if external_pids - leak_pids else "")),
+                        # #362 п.1: флаг гейта на результате — check_all применяет
+                        # override-гейт в статусном/нотификационном пути структурно.
+                        "overridden": True}
             detail += f". Наблюдение: external ESTABLISHED PID {','.join(sorted(external_pids))}"
-        return {"status": "unknown", "source": "runtime", "detail": detail}
+        return {"status": "unknown", "source": "runtime", "detail": detail, "overridden": True}
 
     # #329 «Дополнительно»: атрибуция external по читаемости env. `ps eww` читает env только
     # same-UID (см. _read_runtime_endpoint_config): нечитаемый PID (sandbox/чужой UID) — процесс,

@@ -700,6 +700,10 @@ def _tunnel_up():
     is_vendor_outage = all(k == "upstream-error" for k in kinds)
     if is_vendor_outage:
         return False, f"{VENDOR_OUTAGE_MARKER} — оба вендора лежат, канал жив ({'; '.join(details)})", True, first_timing
+    # #362 п.2: одинаковый отказ обоих таргетов не дублируется — «connection-failed;
+    # connection-failed» в пуше читается как шум; цифры окна добавляет check_all (гейт #362).
+    if len(details) > 1 and len(set(details)) == 1:
+        return False, f"{details[0]} (оба таргета)", False, first_timing
     return False, "; ".join(details), False, first_timing
 
 
