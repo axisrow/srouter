@@ -91,10 +91,12 @@ def _claude_proxy_probe():
 
     Важно (#127): ESTABLISHED к 10808 доказывает только TCP до SOCKS listener, но не SOCKS
     handshake и не доставку запроса к API. Поэтому 10808 без active real-CLI probe никогда не
-    получает ok. External socket остаётся доказательством direct leak — КРОМЕ двух случаев #329:
-    endpoint-override в NO_PROXY (прямой ход к endpoint намеренно, lsof endpoint-слеп) и external
+    получает ok. External socket остаётся доказательством direct leak — КРОМЕ трёх случаев:
+    endpoint-override в NO_PROXY (прямой ход к endpoint намеренно, lsof endpoint-слеп), external
     у PID с нечитаемым env (sandbox/чужой UID — HTTPS_PROXY неприменим/непроверяем, атрибуция
-    невозможна). Оба деградируют в unknown, не down (parity с endpoint-пробой).
+    невозможна) и дивергенции exec-env PID от файловского override при активном гейте (дока CC:
+    settings.json env перезаписывает exec-env при старте, маршрут по exec-env неверифицируем,
+    #337). Все три деградируют в unknown, не down (parity с endpoint-пробой).
     """
     r = sys_probe.run([PS, "-axo", "pid=,comm="], timeout=3)
     if r.get("timeout"):
@@ -140,37 +142,40 @@ def _claude_proxy_probe():
                   f"намеренно (direct-first); claude-proxy проба при override неприменима "
                   f"(lsof не различает endpoint и утечку)")
         if external_pids:
-            # #337: гейт схлопывал доказуемую утечку в unknown, когда ФАЙЛЫ на override
-            # (класс #143: живой CC запущен раньше со стандартным endpoint). Атрибутируем
-            # per-PID: readable env БЕЗ override-хоста → down; override/нечитаемый → unknown.
-            # Cost-гейт (hot path watchdog ~90с + /health): доп. ps eww ТОЛЬКО при external
-            # PID (паттерн _pids_env_readable #335); readable берётся из ТОГО ЖЕ eww-вывода
-            # (env_readable_pids, #337 review perf — не второй перекрывающийся батч).
+            # #337: exec-env PID (ps eww) выглядит иначе, чем файлы (класс #143: живой CC
+            # запущен раньше / без раздачи override при рождении). Но дока CC: settings.json
+            # env-блок ПЕРЕЗАПИСЫВАЕТ shell-унаследованные переменные при старте → exec-env
+            # НЕ определяет реальный маршрут, когда файлы несут ключ; дивергенция exec-env
+            # не доказывает утечку → unknown с per-PID форензикой (verify-dont-guess, parity
+            # с нечитаемым env #329). down остаётся достижимым ТОЛЬКО без файловского
+            # override (ветки ниже). Cost-гейт (hot path watchdog ~90с + /health): доп.
+            # ps eww ТОЛЬКО при external PID (паттерн _pids_env_readable #335); readable
+            # берётся из ТОГО ЖЕ eww-вывода (env_readable_pids, #337 review perf).
             rt = _health_facade._read_runtime_endpoint_config()
             leak_pids = _health_facade._override_runtime_leak_pids(
                 sorted(external_pids), rt, rt.get("env_readable_pids", set()), ov["host"])
             if leak_pids:
-                leaks = []
+                unproven = []
                 for pid in sorted(leak_pids):
                     base = rt.get("per_pid", {}).get(pid, {}).get("ANTHROPIC_BASE_URL", "")
                     # #337 review семантика: «без override» (стандартный endpoint) и «чужой
-                    # override» (другой нестандартный хост) — разные дивергенции; у второй
-                    # прямой ход намеренный В ЕЁ конфигурации, совет «подобрать override»
-                    # вводил бы в заблуждение.
+                    # override» (другой нестандартный хост) — разные подкатегории дивергенции;
+                    # обе неверифицируемы при файловском override (файлы побеждают exec-env).
                     host = urlparse(base).hostname.lower().rstrip(".") if base else ""
                     if not base or host == urlparse(CLAUDE_API_BASE_URL).hostname:
-                        leaks.append(f"{pid} (без override — runtime endpoint стандартный)")
+                        unproven.append(f"{pid} (без override — runtime endpoint стандартный)")
                     else:
-                        leaks.append(f"{pid} (runtime endpoint {base} ≠ файловский "
-                                     f"{ov['base_url']})")
-                return {"status": "down", "source": "runtime",
+                        unproven.append(f"{pid} (runtime endpoint {base} ≠ файловский "
+                                        f"{ov['base_url']})")
+                return {"status": "unknown", "source": "runtime",
                         "detail": (f"runtime: endpoint override {ov['base_url']} в NO_PROXY "
-                                   f"(direct-first), но PID {', '.join(leaks)} идёт напрямую "
-                                   f"(external ESTABLISHED) — доказуемая утечка мимо прокси "
-                                   f"(дивергенция файлы-vs-runtime, #337), нарушение "
-                                   f"fail-closed. Приведи runtime-конфигурацию CC в "
-                                   f"соответствие с файлами (перезапусти CC / синхронизируй "
-                                   f"settings.json)."
+                                   f"(direct-first), но exec-env PID {', '.join(unproven)} "
+                                   f"расходится с файлами — маршрут по exec-env "
+                                   f"неверифицируем: CC применяет env из settings.json "
+                                   f"ПОВЕРХ exec-env при старте (#337), файлы — источник "
+                                   f"правды; расхождение exec-env не доказывает утечку "
+                                   f"(verify-dont-guess). Проверить маршрут можно только по "
+                                   f"назначению соединения (future work)."
                                    + (f". Остальные external на override / с нечитаемым env: "
                                       f"PID {','.join(sorted(external_pids - leak_pids))}"
                                       if external_pids - leak_pids else "")),
