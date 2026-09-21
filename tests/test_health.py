@@ -5721,6 +5721,25 @@ def test_truncate_reason_strips_nested_unbalanced_parens():
     assert out == "rc=56…", f"висячих «(» нет: {out!r}"
 
 
+def test_watchdog_reads_tunnel_window_once_per_tick(monkeypatch, tmp_path):
+    """#362 review (тред 4): на тике с упавшим туннелем окно читается ОДИН раз —
+    _apply_tunnel_window_gate кладёт stats в чек, notify-гейт переиспользует их
+    (fail-open, если ключа нет), а не читает хвост metrics-JSONL второй раз."""
+    notified = _tunnel_notify_harness(monkeypatch, tmp_path,
+                                      stats={"fails": 12, "samples": 15, "rate": 0.8})
+    calls = []
+    real_stats = health._tunnel_window_stats
+
+    def counting(now=None, log_path=None):
+        calls.append(1)
+        return real_stats(now=now, log_path=log_path)
+
+    monkeypatch.setattr(health, "_tunnel_window_stats", counting)
+    health.cmd_watchdog()
+    assert len(calls) == 1, f"одно чтение окна на тик, получено {len(calls)}"
+    assert len(notified) == 1, "поведение пуша не меняется"
+
+
 def test_watchdog_tunnel_gate_suppresses_until_threshold_then_pushes(monkeypatch, tmp_path):
     """#362 п.2 (regression cycle-review): sustained-деградация после здоровой истории —
     пока rate ниже порога, пуши молчат; после пересечения порога туннель входит в состав

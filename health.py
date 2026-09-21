@@ -174,6 +174,9 @@ def _apply_tunnel_window_gate(tun_check):
     stats = _tunnel_window_stats()
     if stats is None:
         return
+    # #362 review (тред 4): stats едут в чеке — notify-гейт (_cmd_watchdog_locked)
+    # переиспользует их, без второго чтения хвоста metrics-JSONL на том же тике.
+    tun_check["window_stats"] = stats
     # минуты окна — из константы, не литерал: смена WINDOW_SEC не должна врать в причине
     nums = f"{stats['fails']}/{stats['samples']} фейлов за {metrics_store.WINDOW_SEC // 60}м"
     threshold = _tunnel_fail_rate_threshold()
@@ -1208,7 +1211,9 @@ def _cmd_watchdog_locked(result):
     tun_check = next((c for c in result["checks"] if c.get("id") == "tunnel"), None)
     if (tun_check is not None and not tun_check["ok"] and not tun_check.get("info")
             and tun_check.get("category") != "vendor-outage"):
-        stats = _tunnel_window_stats()
+        # #362 review (тред 4): stats кладёт _apply_tunnel_window_gate (одно чтение окна
+        # на тик); ключа нет (vendor-outage/живой туннель/битые метрики) — fail-open.
+        stats = tun_check.get("window_stats")
         if (stats and stats["samples"] >= metrics_store.MIN_WINDOW_SAMPLES
                 and stats["rate"] < _tunnel_fail_rate_threshold()):
             failed = [name for name in failed if name != tun_check["name"]]
