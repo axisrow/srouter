@@ -327,8 +327,9 @@ def check_all(*, active_claude=False):
     if cp["status"] == "unknown" or cp.get("overridden"):
         # #329/#335 + #362 п.1: override-гейт применён в статусном/нотификационном пути
         # (раньше был только в doctor-грани — класс #341 «два контура противоречат»).
-        # При endpoint-override в NO_PROXY проба неприменима (unknown) ИЛИ утечка
-        # ретроспективно-доказуема (#337, down) — в обоих случаях observe-статус (info):
+        # При endpoint-override в NO_PROXY проба неприменима: прямой ход by design (#329)
+        # ИЛИ дивергенция exec-env неверифицируема — files побеждают exec-env при старте
+        # (#337, unknown с форензикой) — в обоих случаях observe-статус (info):
         # НЕ входит в failed/degraded-состав и не пушится watchdog'ом (спам ~15 пушей/день
         # #362). Doctor по-прежнему показывает detail с форензикой. Флаг overridden несёт
         # сам probe — повторного чтения конфига в hot path нет.

@@ -20,7 +20,7 @@ _log = logging.getLogger("srouter.health")
 # star-import re-export (канон star-import-reexport-contract) — см. health_probes.py докстринг __all__.
 __all__ = [
     "_read_endpoint_config", "_endpoint_override_check", "_host_in_no_proxy",
-    "_endpoint_direct_override", "_pids_env_readable", "_override_runtime_leak_pids",
+    "_endpoint_direct_override", "_pids_env_readable", "_override_runtime_divergent_pids",
     "_endpoint_xray_sync_check", "_read_runtime_endpoint_config", "_runtime_model_override_check",
     "_ENDPOINT_SYNC_STATE_PATH", "_ENDPOINT_SYNC_XRAY_PATH",
 ]
@@ -95,28 +95,30 @@ def _endpoint_direct_override():
             "base_url": base, "host": host}
 
 
-def _override_runtime_leak_pids(external_pids, rt, readable, override_host):
-    """#337: какие external-PID доказуемо утекают ПРИ активном override-гейте?
+def _override_runtime_divergent_pids(external_pids, rt, readable, override_host):
+    """#337: какие external-PID дивергентны с файлами ПРИ активном override-гейте?
 
-    Гейт #329 схлопывал ВСЕ external в unknown «проба неприменима», но прямое соединение
-    намеренно только у PID, чей runtime env СОДЕРЖИТ override. Чистая функция (обе ветки
-    тестируемы, канон detector-must-be-function-not-constant): PID утекает, когда
+    Гейт #329 схлопывал ВСЕ external в unknown «проба неприменима», но exec-env PID может
+    выглядеть иначе, чем файлы. Чистая функция (обе ветки тестируемы, канон
+    detector-must-be-function-not-constant): PID дивергентен, когда
       - env читается (pid в `readable`, критерий _pids_env_readable из #335), И
-      - его ANTHROPIC_BASE_URL НЕ на override-хосте (пустой/нестандартный = CC идёт на
-        стандартный или чужой endpoint напрямую — это утечка, класс дивергенции #143).
-    PID с env на override-хосте — by design; нечитаемый — атрибуция невозможна. Оба не утечка.
+      - его ANTHROPIC_BASE_URL НЕ на override-хосте (пустой/чужой хост, класс #143).
+    «Дивергентен» ≠ «утекает»: дока CC — settings.json env ПЕРЕЗАПИСЫВАЕТ exec-env при
+    старте, когда файлы несут ключ, поэтому exec-env не определяет маршрут; probe
+    классифицирует дивергенцию как unknown с форензикой (#337), не down. PID с env на
+    override-хосте — by design; нечитаемый — атрибуция невозможна.
     rt — результат _read_runtime_endpoint_config (per_pid с ANTHROPIC_*); override_host —
     hostname файлового override. Никогда не бросает; возвращает подмножество external_pids.
     """
-    leaks = set()
+    divergent = set()
     for pid in external_pids:
         if pid not in readable:
             continue
         base = rt.get("per_pid", {}).get(pid, {}).get("ANTHROPIC_BASE_URL", "")
         host = (urlparse(base).hostname or "").lower().rstrip(".") if base else ""
         if host != (override_host or ""):
-            leaks.add(pid)
-    return leaks
+            divergent.add(pid)
+    return divergent
 
 
 def _endpoint_override_check():

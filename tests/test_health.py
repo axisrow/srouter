@@ -7,10 +7,13 @@ handshake или ответ API (#127). Поддержку доказывает 
 
 _claude_proxy_probe() возвращает {status, source, detail}:
   status="ok"      — CC держит коннект к ожидаемому HTTP bridge 8118;
-  status="down"    — CC имеет внешний direct socket с читаемым env (атрибутируемая утечка);
+  status="down"    — CC имеет внешний direct socket с читаемым env и БЕЗ файловского
+                     endpoint-override (атрибутируемая утечка);
   status="unknown" — только SOCKS TCP socket, idle, timeout, CC не запущен, endpoint-override
-                     в NO_PROXY (прямой ход намеренно, #329) или external у PID с нечитаемым
-                     env (sandbox/чужой UID — атрибуция невозможна, #329).
+                     в NO_PROXY (прямой ход намеренно, #329), external у PID с нечитаемым
+                     env (sandbox/чужой UID — атрибуция невозможна, #329) или exec-env PID
+                     расходится с файловским override: CC применяет env из settings.json
+                     ПОВЕРХ exec-env, маршрут по exec-env неверифицируем (#337).
 """
 import json
 import os
@@ -490,13 +493,40 @@ def test_check_all_no_false_verdict_when_endpoint_override(monkeypatch):
     assert "неприменима" in cp["detail"]
 
 
+def test_check_all_unknown_when_files_override_runtime_diverges(monkeypatch):
+    """#337 интеграция: файловский override + дивергентный exec-env → unknown-чек, вердикт ok.
+
+    До рефакторинга семантики дивергенция драйвила down → degraded + ложные пуши
+    (#315-класс). Теперь чек info: неизвестное не драйвит вердикт, форензика PID в detail.
+    """
+    _all_up_monkey(monkeypatch)
+    monkeypatch.setattr(health, "_claude_proxy_probe", _REAL_CLAUDE_PROXY_PROBE)
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _ps_lsof_fake(f"12345 {CLI_COMM}\n", _EXTERNAL_LEAK_LINE))
+    monkeypatch.setattr(health, "_read_endpoint_config", lambda: _ZAI_OVERRIDE_CFG)
+    _override_runtime_mocks(
+        monkeypatch,
+        per_pid={"12345": {"ANTHROPIC_BASE_URL": "https://api.anthropic.com"}},
+        readable={"12345"})
+    result = health.check_all()
+    assert result["status"] == "ok", "дивергенция exec-env при files-override — не driver"
+    cp = [c for c in result["checks"] if "claude" in c["name"].lower()][0]
+    assert cp.get("info") is True, "unknown-check помечен info (не driver)"
+    assert "12345" in cp["detail"], "форензика дивергентного PID остаётся в detail"
+    assert "нарушение fail-closed" not in cp["detail"], \
+        "ложная формулировка «нарушение fail-closed» ушла из detail"
+    assert "перезапусти CC" not in cp["detail"], "бессмысленный совет уходит из detail"
+
+
 # ============================ #337: per-PID атрибуция при override-гейте ============================
-# Дивергенция файлы-vs-runtime (класс #143): ФАЙЛЫ уже на z.ai-override (гейт #329 активен →
-# probe отвечает unknown «проба неприменима»), а живой CC запущен РАНЬШЕ со стандартным
-# endpoint и реально идёт мимо прокси — доказуемая утечка, которую гейт схлопывал в unknown.
-# Ожидание: readable external PID с runtime env БЕЗ override → down (PID в detail); все
-# external с override или нечитаемым env → прежний unknown без изменений. Cost-гейт: доп.
-# ps eww ТОЛЬКО когда есть external PID (г hot path watchdog ~90с + /health).
+# Дивергенция файлы-vs-runtime (класс #143): ФАЙЛЫ уже на z.ai-override (гейт #329 активен),
+# а exec-env живого PID (ps eww) выглядит иначе — стандартный endpoint, чужой хост или без
+# ANTHROPIC_BASE_URL. Дока CC: settings.json env-блок ПЕРЕЗАПИСЫВАЕТ shell-унаследованные
+# переменные при старте → exec-env НЕ определяет реальный маршрут, когда файлы несут ключ.
+# Дивергенция exec-env не доказывает утечку → unknown с per-PID форензикой (verify-dont-guess;
+# parity с нечитаемым env #329). down для external остаётся достижимым ТОЛЬКО без файловского
+# override (граница — гвард-тест ниже и #329-тесты). Cost-гейт: доп. ps eww ТОЛЬКО когда есть
+# external PID (hot path watchdog ~90с + /health).
 
 
 def _override_runtime_mocks(monkeypatch, *, per_pid, readable):
@@ -514,12 +544,12 @@ def _override_runtime_mocks(monkeypatch, *, per_pid, readable):
                                  "env_readable_pids": set(readable)})
 
 
-def test_probe_down_when_override_files_but_live_pid_standard(monkeypatch):
-    """#337 RED: файловый z.ai override + живой external PID на СТАНДАРТНОМ endpoint → down.
+def test_probe_unknown_when_files_override_and_runtime_standard(monkeypatch):
+    """#337: файловый z.ai override + exec-env PID на СТАНДАРТНОМ endpoint → unknown.
 
-    Гейт #329 раньше схлопывал эту доказуемую утечку в unknown: файлы говорят «direct by
-    design», а runtime env PID 12345 — стандартный api.anthropic.com, значит его external
-    ESTABLISHED — утечка мимо прокси (дивергенция файлы-vs-runtime). Per-PID: PID в detail.
+    Дока CC: settings.json env-блок перезаписывает shell-переменные при старте → exec-env
+    PID 12345 (стандартный api.anthropic.com) не определяет его реальный маршрут. Дивергенция
+    exec-env не доказывает утечку → unknown с per-PID форензикой (verify-dont-guess).
     """
     monkeypatch.setattr(health.sys_probe, "run",
                         _ps_lsof_fake(f"12345 {CLI_COMM}\n", _EXTERNAL_LEAK_LINE))
@@ -530,24 +560,28 @@ def test_probe_down_when_override_files_but_live_pid_standard(monkeypatch):
                            "ANTHROPIC_AUTH_TOKEN": "sk-secret"}},
         readable={"12345"})
     res = health._claude_proxy_probe()
-    assert res["status"] == "down", \
-        "external PID с runtime env без override — доказуемая утечка, не «неприменима»"
-    assert "12345" in res["detail"], "утёкший PID должен быть в detail (per-PID атрибуция)"
+    assert res["status"] == "unknown", \
+        "файлы побеждают exec-env по доке CC — дивергенция не доказывает утечку"
+    assert "12345" in res["detail"], "дивергентный PID остаётся в detail (per-PID форензика)"
     assert "без override" in res["detail"] and "стандартный" in res["detail"], \
         "стандартный runtime endpoint PID помечен как «без override»"
     assert "sk-secret" not in res["detail"], "секреты env не попадают в detail"
 
 
-def test_probe_down_when_override_files_but_live_pid_no_base_url(monkeypatch):
-    """#337: readable env БЕЗ ANTHROPIC_BASE_URL → CC по умолчанию стандартный → утечка."""
+def test_probe_unknown_when_files_override_and_runtime_base_url_missing(monkeypatch):
+    """#337: readable env БЕЗ ANTHROPIC_BASE_URL → exec-env не определяет маршрут → unknown.
+
+    Пустой base_url в exec-env — не доказательство стандартного endpoint: CC применит
+    файловский override при старте (дока CC) → дивергенция неверифицируема, не утечка.
+    """
     monkeypatch.setattr(health.sys_probe, "run",
                         _ps_lsof_fake(f"12345 {CLI_COMM}\n", _EXTERNAL_LEAK_LINE))
     monkeypatch.setattr(health, "_read_endpoint_config", lambda: _ZAI_OVERRIDE_CFG)
     _override_runtime_mocks(monkeypatch,
                             per_pid={"12345": {"HTTPS_PROXY": ""}}, readable={"12345"})
     res = health._claude_proxy_probe()
-    assert res["status"] == "down", \
-        "читаемый env без base_url = стандартный endpoint → external = утечка"
+    assert res["status"] == "unknown", \
+        "exec-env без base_url при файловском override — неверифицируемо, не утечка"
     assert "12345" in res["detail"]
 
 
@@ -578,8 +612,8 @@ def test_probe_unknown_when_override_pid_env_unreadable(monkeypatch):
     assert "12345" in res["detail"], "нечитаемый PID остаётся форензикой"
 
 
-def test_probe_override_mixed_leak_and_by_design(monkeypatch):
-    """#337: mixed external — leak-PID 111 драйвит down, override-PID 222 не маскирует."""
+def test_probe_override_mixed_divergence_and_by_design(monkeypatch):
+    """#337: mixed external — дивергентный PID 111 не драйвит down, by-design 222 не маскирует."""
     lsof_out = (
         "claude 111 axisrow 7u IPv4 ... TCP 192.168.1.5:51235->160.79.104.10:443 (ESTABLISHED)\n"
         "claude 222 axisrow 7u IPv4 ... TCP 192.168.1.5:51236->104.18.7.113:443 (ESTABLISHED)\n"
@@ -593,17 +627,17 @@ def test_probe_override_mixed_leak_and_by_design(monkeypatch):
                  "222": {"ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic"}},
         readable={"111", "222"})
     res = health._claude_proxy_probe()
-    assert res["status"] == "down"
-    assert "111" in res["detail"], "утёкший PID атрибутирован"
+    assert res["status"] == "unknown"
+    assert "111" in res["detail"], "дивергентный PID атрибутирован как форензика"
     assert "222" in res["detail"], "by-design PID упомянут (не утечка)"
 
 
-def test_probe_override_foreign_host_pid_labeled_distinctly(monkeypatch):
+def test_probe_unknown_when_files_override_and_foreign_runtime_host(monkeypatch):
     """#337 review: PID на ДРУГОМ нестандартном хосте — «≠ файловский», не «без override».
 
-    У такого PID свой override: прямой ход намеренный в его конфигурации, а вердикт down
-    корректен по семантике файлов (его хост не в файловском NO_PROXY). Формулировка detail
-    не должна советовать ему «подобрать override».
+    Чужой хост в exec-env — та же неверифицируемость: файлы побеждают exec-env по доке CC
+    (более приоритетные источники probe не видит). Формулировка detail различает подкатегории,
+    вердикт — unknown с форензикой, без совета «подобрать override».
     """
     monkeypatch.setattr(health.sys_probe, "run",
                         _ps_lsof_fake(f"12345 {CLI_COMM}\n", _EXTERNAL_LEAK_LINE))
@@ -613,10 +647,24 @@ def test_probe_override_foreign_host_pid_labeled_distinctly(monkeypatch):
         per_pid={"12345": {"ANTHROPIC_BASE_URL": "https://other.example.com/v1"}},
         readable={"12345"})
     res = health._claude_proxy_probe()
-    assert res["status"] == "down"
+    assert res["status"] == "unknown"
     assert "≠ файловский" in res["detail"], "чужой override помечен как дивергенция, не «без override»"
     assert "other.example.com" in res["detail"]
     assert "без override" not in res["detail"]
+
+
+def test_probe_down_when_no_files_override_and_runtime_base_diverges(monkeypatch):
+    """Граница #337: БЕЗ файловского override расхождение exec-env — по-прежнему утечка.
+
+    Файлы не несут ключ → ничто не исправит маршрут в рантайме → down остаётся достижимым
+    (канон detector-must-be-function-not-constant: расслабление не убивает красную ветку).
+    """
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _ps_lsof_fake(f"12345 {CLI_COMM}\n", _EXTERNAL_LEAK_LINE,
+                                      eww_out=f"12345 ttys000 0:01.00 {CLI_COMM} HTTPS_PROXY=http://127.0.0.1:8118\n"))
+    _std_endpoint(monkeypatch)
+    res = health._claude_proxy_probe()
+    assert res["status"] == "down", "без файловского override external = доказанная утечка"
 
 
 def test_runtime_config_env_readable_pids_independent_of_anthropic(monkeypatch):
@@ -5530,8 +5578,9 @@ def test_port_up_lsof_hit_short_circuits_without_connect(monkeypatch):
 
 
 def test_probe_override_results_carry_overridden_flag(monkeypatch):
-    """#362 п.1: ОБЕ ветки override-гейта (#329 unknown и #337 down-leak) несут структурный
-    флаг overridden=True — check_all применяет гейт без повторного чтения конфига в hot path."""
+    """#362 п.1: ОБЕ ветки override-гейта (#329 unknown и #337 unknown-дивергенция) несут
+    структурный флаг overridden=True — check_all применяет гейт без повторного чтения
+    конфига в hot path."""
     monkeypatch.setattr(health.sys_probe, "run",
                         _ps_lsof_fake(f"12345 {CLI_COMM}\n", _EXTERNAL_LEAK_LINE))
     monkeypatch.setattr(health, "_read_endpoint_config", lambda: _ZAI_OVERRIDE_CFG)
@@ -5540,19 +5589,19 @@ def test_probe_override_results_carry_overridden_flag(monkeypatch):
     unknown = health._claude_proxy_probe()
     assert unknown["status"] == "unknown"
     assert unknown.get("overridden") is True, "unknown-ветка override должна нести флаг гейта"
-    # ветка #337: readable PID на стандартном endpoint → down (доказуемая утечка)
+    # ветка #337: readable PID на стандартном endpoint → unknown (дивергенция неверифицируема)
     _override_runtime_mocks(
         monkeypatch,
         per_pid={"12345": {"ANTHROPIC_BASE_URL": "https://api.anthropic.com"}},
         readable={"12345"})
-    leak = health._claude_proxy_probe()
-    assert leak["status"] == "down"
-    assert leak.get("overridden") is True, "leak-ветка при override тоже несёт флаг гейта"
+    divergent = health._claude_proxy_probe()
+    assert divergent["status"] == "unknown"
+    assert divergent.get("overridden") is True, "дивергентная ветка при override тоже несёт флаг гейта"
 
 
 def test_check_all_claude_proxy_override_leak_is_observe_not_driver(monkeypatch):
     """#362 п.1: при endpoint-override claude-proxy — observe (info), не driver, даже при
-    #337-утечке: не входит в failed/degraded-состав, вердикт не роняет."""
+    #337-дивергенции exec-env: не входит в failed/degraded-состав, вердикт не роняет."""
     _all_up_monkey(monkeypatch)
     monkeypatch.setattr(health, "_claude_proxy_probe", _REAL_CLAUDE_PROXY_PROBE)
     monkeypatch.setattr(health.sys_probe, "run",
