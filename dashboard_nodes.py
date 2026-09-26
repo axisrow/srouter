@@ -144,7 +144,12 @@ def _node_probe_status(ping_ms, loss, throughput_kbps, *, has_socks, socks_open,
         if ping_ms is None or (loss is not None and loss >= 50) or ping_ms > 250:
             return "warn"
         return "ok"
-    if socks_open and reachable:
+    if not socks_open:
+        # issue #365: порт объявлен, но никто не слушает — рассинхрон конфига (xray не
+        # регенерился), а не смерть узла; честный вердикт «не измеряемо». down остаётся
+        # для «порт открыт, трафик сквозь него не идёт».
+        return "unknown"
+    if reachable:
         return "warn"
     return "down"
 

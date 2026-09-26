@@ -178,6 +178,51 @@ def test_probe_nodes_missing_or_invalid_socks_degrades_without_curl(monkeypatch,
     assert all(call[0] == dashboard.PING for call in calls)
 
 
+def test_probe_nodes_closed_socks_port_reports_unknown_not_down(monkeypatch, tmp_path):
+    # issue #365: порт объявлен в local.json, но никто не слушает — рассинхрон конфига
+    # (xray не регенерился), а не смерть узла. Вердикт unknown («не измеряемо»);
+    # down остаётся для честного «порт открыт, трафик сквозь него не идёт».
+    dashboard = _fresh_dashboard(monkeypatch)
+    dashboard_geo = importlib.import_module("dashboard_geo")
+    state_path = tmp_path / "srouter.local.json"
+    _write_state(
+        state_path,
+        {
+            "nodes": [
+                {
+                    "name": "sg-1",
+                    "endpoint_host": "203.0.113.10",
+                    "route_ip": "203.0.113.10",
+                    "enabled": True,
+                    "probe": {"socks_port": 11080},
+                }
+            ]
+        },
+    )
+
+    def fake_run(cmd, timeout):
+        assert cmd[0] == dashboard.PING
+        return {
+            "rc": 0,
+            "out": (
+                "3 packets transmitted, 3 packets received, 0.0% packet loss\n"
+                "round-trip min/avg/max/stddev = 10.0/20.0/30.0/1.0 ms"
+            ),
+            "err": "",
+            "timeout": False,
+        }
+
+    monkeypatch.setattr(sys_probe, "run", fake_run)
+    monkeypatch.setattr(sys_probe, "port_open", lambda host, port, timeout=0.5: False)
+    monkeypatch.setattr(dashboard_geo, "_geo_lookup", lambda ip: {})
+
+    out = dashboard.probe_nodes(state_path=state_path)
+
+    assert out[0]["status"] == "unknown"
+    assert out[0]["ping_ms"] == 20  # ICMP-половина пробы живёт и при unknown — узел пингуется
+    assert out[0]["throughput_kbps"] is None
+
+
 def test_gather_status_returns_node_snapshot_without_running_heavy_probe(monkeypatch):
     dashboard = _fresh_dashboard(monkeypatch)
     # issue #227: gather_status и её probe_*-зависимости физически живут в dashboard_app.py
