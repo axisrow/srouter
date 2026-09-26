@@ -4,13 +4,42 @@
 #                 ./diag-proxy.sh novpn      (метка сразу аргументом)
 
 LABEL="${1:-?}"
-BRIDGE="http://127.0.0.1:8118"
-SOCKS="socks5h://USER:PASS@YOUR_VPS_IP:1080"
-
 # Бинарники параметризуемы через env — тот же канон подмены, что в srouter-diag.sh
 # (shell-тесты подставляют fake curl/dig, чтобы гонять скрипт без реальной сети).
 CURL_BIN="${SROUTER_CURL:-curl}"
 DIG_BIN="${SROUTER_DIG:-dig}"
+PY_BIN="${SROUTER_PYTHON:-python3}"
+
+BRIDGE="http://127.0.0.1:8118"
+
+# SOCKS5-плечо (issue #366): цель берём из local.json (первый enabled node →
+# probe.socks_port), а не из плейсхолдера: заглушка YOUR_VPS_IP давала вечный FAIL(6)
+# и ложную тревогу «SOCKS сломан» при живой сети. Override: SROUTER_SOCKS=<proxy-url>.
+# Не настроено → колонка честно SKIPPED, а не FAIL.
+STATE_PATH="${SROUTER_STATE_PATH:-$(dirname "$0")/srouter.local.json}"
+SOCKS="${SROUTER_SOCKS:-}"
+if [ -z "$SOCKS" ] && [ -f "$STATE_PATH" ]; then
+  SOCKS_PORT=$("$PY_BIN" - "$STATE_PATH" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        state = json.load(fh)
+except Exception:
+    raise SystemExit(0)
+for node in state.get("nodes") or []:
+    if not (isinstance(node, dict) and node.get("enabled")):
+        continue
+    probe = node.get("probe") if isinstance(node.get("probe"), dict) else {}
+    port = probe.get("socks_port")
+    if isinstance(port, int) and not isinstance(port, bool) and 1 <= port <= 65535:
+        print(port)
+    break
+PY
+)
+  [ -n "$SOCKS_PORT" ] && SOCKS="socks5h://127.0.0.1:$SOCKS_PORT"
+fi
 
 HOSTS=(api.anthropic.com claude.ai platform.claude.com downloads.claude.ai \
        storage.googleapis.com bridge.claudeusercontent.com raw.githubusercontent.com \
@@ -54,7 +83,11 @@ for h in "${HOSTS[@]}"; do
   [ -z "$dns" ] && dns="NXDOMAIN"
   direct=$(probe_direct "$h")
   bridge=$(probe "$h" -x "$BRIDGE")
-  socks=$(probe "$h" -x "$SOCKS")
+  if [ -n "$SOCKS" ]; then
+    socks=$(probe "$h" -x "$SOCKS")
+  else
+    socks="SKIPPED"
+  fi
   printf "%-30s | %-15s | %-10s | %-10s | %-10s\n" "$h" "$dns" "$direct" "$bridge" "$socks"
 done
 
@@ -69,5 +102,6 @@ echo " DIRECT ok без VPN          → хост НЕ заблокирован,
 echo " DIRECT=FAIL, BRIDGE=ok     → хост блокируется, мост спасает (это норма для Китая)"
 echo " BRIDGE=FAIL, SOCKS5=ok     → проблема в privoxy/HTTP-слое, не в SOCKS"
 echo " BRIDGE=FAIL и SOCKS5=FAIL  → GFW режет хост даже через VPS SOCKS5 (по SNI) → нужна обфускация"
+echo " SOCKS5=SKIPPED             → per-node SOCKS не настроен (нет local.json/probe.socks_port); задай SROUTER_SOCKS"
 echo " код 000 / FAIL             → соединение оборвано/таймаут (блок); 2xx-4xx = хост ответил (ok)"
 echo "================================================================"
