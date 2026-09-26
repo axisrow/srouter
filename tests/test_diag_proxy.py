@@ -192,6 +192,41 @@ def test_diag_proxy_socks_target_comes_from_local_state(tmp_path):
     assert "YOUR_VPS_IP" not in args  # плейсхолдер не утекает в curl
 
 
+def test_diag_proxy_socks_prefers_active_node_over_first_enabled(tmp_path):
+    """Codex P2 на #366: BRIDGE-плечо маршрутизирует через active_node (генерированный
+    xray-роут), поэтому SOCKS5-колонка обязана мерить порт активного узла, а не первого
+    enabled. Fallback на первый enabled — только если активного нет/без валидного порта."""
+    state_path = tmp_path / "srouter.local.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "nodes": [
+                    {
+                        "name": "sg-1",
+                        "endpoint_host": "203.0.113.10",
+                        "enabled": True,
+                        "probe": {"socks_port": 11080},
+                    },
+                    {
+                        "name": "hk-1",
+                        "endpoint_host": "203.0.113.20",
+                        "enabled": True,
+                        "probe": {"socks_port": 11081},
+                    },
+                ],
+                "active_node": {"name": "hk-1", "pending": None},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result, capture = _run_diag_recorder(tmp_path, state_path)
+
+    args = capture.read_text(encoding="utf-8")
+    assert "socks5h://127.0.0.1:11081" in args  # активный hk-1, не первый enabled sg-1
+    assert "socks5h://127.0.0.1:11080" not in args
+
+
 def test_diag_proxy_without_state_skips_socks_column_honestly(tmp_path):
     """#366: нет state/порта → колонка SKIPPED, а не FAIL от попытки подключиться
     к несуществующему хосту-заглушке."""

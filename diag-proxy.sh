@@ -28,14 +28,26 @@ try:
         state = json.load(fh)
 except Exception:
     raise SystemExit(0)
+active = state.get("active_node")
+active_name = active.get("name") if isinstance(active, dict) else None
+fallback = None
 for node in state.get("nodes") or []:
     if not (isinstance(node, dict) and node.get("enabled")):
         continue
     probe = node.get("probe") if isinstance(node.get("probe"), dict) else {}
     port = probe.get("socks_port")
-    if isinstance(port, int) and not isinstance(port, bool) and 1 <= port <= 65535:
+    if not (isinstance(port, int) and not isinstance(port, bool) and 1 <= port <= 65535):
+        continue
+    # Codex P2 (#366): BRIDGE-плечо идёт через active_node — меряем его порт;
+    # первый enabled — только fallback (активного нет / без валидного порта).
+    if node.get("name") == active_name:
         print(port)
-    break
+        break
+    if fallback is None:
+        fallback = port
+else:
+    if fallback is not None:
+        print(fallback)
 PY
 )
   [ -n "$SOCKS_PORT" ] && SOCKS="socks5h://127.0.0.1:$SOCKS_PORT"
