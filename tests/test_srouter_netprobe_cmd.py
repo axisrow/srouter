@@ -165,6 +165,71 @@ def test_netprobe_template_in_repo_has_marker_and_placeholders():
     assert "StartInterval" in template
 
 
+# ============================ netname — автоопределение сети по отпечатку ============================
+def test_dns_servers_parses_resolv(tmp_path):
+    resolv = tmp_path / "resolv.conf"
+    resolv.write_text(
+        "# комментарий\nnameserver 211.136.192.6\nnameserver fe80::52f7:edff:fe36:9923%en0\n"
+        "search lan\n", encoding="utf-8")
+    assert diag_netprobe._dns_servers(resolv) == ("211.136.192.6", "fe80::52f7:edff:fe36:9923%en0")
+
+
+def test_dns_servers_missing_file(tmp_path):
+    assert diag_netprobe._dns_servers(tmp_path / "absent.conf") == ()
+
+
+def test_net_name_matches_by_dns_intersection(monkeypatch, tmp_path):
+    nets = tmp_path / "nets.json"
+    nets.write_text(json.dumps({
+        "103": {"dns": ["192.168.3.1", "fe80::52f7:edff:fe36:9923%en0"]},
+        "888-5G": {"dns": ["211.136.192.6", "120.196.165.24"]},
+    }), encoding="utf-8")
+    monkeypatch.setattr(diag_netprobe, "NETS_MAP", nets)
+    assert diag_netprobe._net_name(("120.196.165.24",)) == "888-5G"
+    assert diag_netprobe._net_name(("192.168.3.1",)) == "103"
+
+
+def test_net_name_none_without_match_or_map(monkeypatch, tmp_path):
+    monkeypatch.setattr(diag_netprobe, "NETS_MAP", tmp_path / "absent.json")
+    assert diag_netprobe._net_name(("8.8.8.8",)) is None
+    assert diag_netprobe._net_name(()) is None
+
+
+def test_learn_net_writes_and_replaces(monkeypatch, tmp_path):
+    nets = tmp_path / "nets.json"
+    monkeypatch.setattr(diag_netprobe, "NETS_MAP", nets)
+    monkeypatch.setattr(diag_netprobe, "_default_route", lambda: (None, "ipsec0"))
+    monkeypatch.setattr(diag_netprobe, "_dns_servers",
+                        lambda path=None: ("211.136.192.6",))
+
+    diag_netprobe.learn_net("888-5G")
+    first = json.loads(nets.read_text(encoding="utf-8"))
+    assert first["888-5G"]["dns"] == ["211.136.192.6"]
+    assert first["888-5G"]["iface"] == "ipsec0"
+
+    monkeypatch.setattr(diag_netprobe, "_dns_servers", lambda path=None: ("192.168.3.1",))
+    monkeypatch.setattr(diag_netprobe, "_default_route", lambda: ("192.168.3.1", "en0"))
+    diag_netprobe.learn_net("888-5G")
+    replaced = json.loads(nets.read_text(encoding="utf-8"))
+    assert replaced["888-5G"]["dns"] == ["192.168.3.1"], "повторный learn перезаписывает"
+
+
+def test_netprobe_netname_passes_name(monkeypatch, tmp_path):
+    _env(monkeypatch, tmp_path)
+    calls = []
+
+    def runner(cmd, timeout):
+        calls.append(list(cmd))
+        return {"rc": 0, "out": "ok\n", "err": "", "timeout": False}
+
+    monkeypatch.setattr(srouter_cli, "run", runner, raising=False)
+
+    rc = srouter_cli.cmd_netprobe(argparse.Namespace(netprobe_action="netname", name="103"))
+
+    assert rc == 0
+    assert calls[0][-2:] == ["netname", "103"]
+
+
 # ============================ ssid — ручная аннотация сети ============================
 def test_default_route_parses_gateway_and_iface(monkeypatch):
     def fake_run(cmd, timeout):

@@ -574,10 +574,13 @@ def _netprobe_env():
                    log_err=env.log_err.with_name("srouter-netprobe.err.log"))
 
 
-def _netprobe_subprocess(env, mode, timeout):
-    """Прогон diag_netprobe.py <mode> в subprocess: граница таймаута + изоляция fail-soft.
-    Печатает stdout/stderr, возвращает rc (0 ок, 2 ошибка/таймаут)."""
-    res = run([sys.executable, str(env.root / NETPROBE_SCRIPT), mode], timeout)
+def _netprobe_subprocess(env, mode, timeout, extra=None):
+    """Прогон diag_netprobe.py <mode> [extra] в subprocess: граница таймаута + изоляция
+    fail-soft. Печатает stdout/stderr, возвращает rc (0 ок, 2 ошибка/таймаут)."""
+    cmd = [sys.executable, str(env.root / NETPROBE_SCRIPT), mode]
+    if extra:
+        cmd.append(extra)
+    res = run(cmd, timeout)
     out = (res.get("out") or "").strip()
     err = (res.get("err") or "").strip()
     if out:
@@ -647,6 +650,11 @@ def cmd_netprobe(args) -> int:
         print(f"Netprobe: не выгружен/не удалён ({res.get('blocked', 'unknown')}) — "
               f"plist оставлен (fail-safe). Проверь: launchctl list | grep {NETPROBE_LABEL}")
         return 2
+    if action == "netname":
+        if not getattr(args, "name", None):
+            print("Netprobe: netname требует имя сети.")
+            return 2
+        return _netprobe_subprocess(env, "netname", 30, extra=args.name)
     if action in ("report", "ssid"):
         return _netprobe_subprocess(env, action, 120 if action == "report" else 30)
     # неизвестный action — argparse не пустит, но fail-closed
@@ -1084,6 +1092,11 @@ def build_parser() -> argparse.ArgumentParser:
     ):
         sp = p_netprobe_sub.add_parser(sub_name, help=sub_help)
         sp.set_defaults(func=cmd_netprobe)
+    sp_nn = p_netprobe_sub.add_parser(
+        "netname",
+        help="Запомнить текущую сеть под именем (обучение отпечатка DNS; один прогон на сеть).")
+    sp_nn.add_argument("name", help="Имя сети (напр. 103 / 888-5G).")
+    sp_nn.set_defaults(func=cmd_netprobe)
 
     # routing (#136): управление routing-доменами production xray-config. Отдельная подкоманда —
     # свои sub-subcommands (add-domain/remove-domain/list). НЕ "route" (конфликт с split-route).

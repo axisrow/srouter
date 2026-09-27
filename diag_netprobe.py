@@ -30,6 +30,8 @@ import metrics_store
 from sys_probe import run
 
 NETPROBE_LOG = Path.home() / "Library" / "Logs" / "srouter-netprobe.jsonl"
+NETS_MAP = Path.home() / "Library" / "Logs" / "srouter-netprobe-networks.json"
+RESOLV_CONF = Path("/etc/resolv.conf")
 PING = "/sbin/ping"
 ROUTE = "/sbin/route"
 IPCONFIG = "/usr/sbin/ipconfig"
@@ -114,7 +116,7 @@ def probe():
         recv, avg = _ping(target)
         lines.append(json.dumps(
             {"ts": round(now, 3), "timestamp": timestamp, "leg": leg, "target": target,
-             "iface": iface, "sent": 3, "recv": recv, "avg_ms": avg},
+             "net": _net_name(), "iface": iface, "sent": 3, "recv": recv, "avg_ms": avg},
             ensure_ascii=False, sort_keys=True))
     if not lines:
         return
@@ -174,6 +176,57 @@ def ssid():
         print(f"SSID: {name} (метка в JSONL не записана: {exc})")
         return
     print(f"SSID: {name} — метка записана в {NETPROBE_LOG}")
+
+
+def _dns_servers(path=None):
+    """Отсортированный кортеж DNS-резолверов из resolv.conf — отпечаток сети.
+
+    SSID macOS заредактировал (геоданные), а DNS у двух роутеров разные (роутер vs карьерные)
+    → это и есть дискриминатор. Fail-soft: нет файла → ().
+    """
+    try:
+        text = (Path(path) if path else RESOLV_CONF).read_text(encoding="utf-8")
+    except OSError:
+        return ()
+    return tuple(sorted(line.split()[1] for line in text.splitlines()
+                        if line.startswith("nameserver") and len(line.split()) > 1))
+
+
+def _load_nets():
+    """Мапа обученных сетей {имя: {dns, gateway, iface}}. Нет/битый файл → {}."""
+    try:
+        data = json.loads(NETS_MAP.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _net_name(dns=None):
+    """Имя сети по пересечению dns-множеств с обученной мапой; None — не матчился."""
+    current = set(dns if dns is not None else _dns_servers())
+    if not current:
+        return None
+    for name, info in _load_nets().items():
+        if current & set((info or {}).get("dns") or []):
+            return name
+    return None
+
+
+def learn_net(name):
+    """Запомнить текущую сеть под именем (обучение: один прогон на сеть, без прав)."""
+    dns = list(_dns_servers())
+    gateway, iface = _default_route()
+    nets = _load_nets()
+    nets[name] = {"dns": dns, "gateway": gateway, "iface": iface}
+    try:
+        from local_state import _atomic_write_text  # канон atomic-save (tmp+fsync+rename) #139
+        if not _atomic_write_text(NETS_MAP, json.dumps(
+                nets, ensure_ascii=False, sort_keys=True, indent=1) + "\n"):
+            raise OSError("atomic write вернул False")
+    except OSError as exc:
+        print(f"netname: не удалось сохранить мапу ({exc})")
+        return
+    print(f"netname: сеть {name!r} запомнена (dns={dns}, gateway={gateway}, iface={iface})")
 
 
 def _blackout_windows(events, since_ts=None):
@@ -267,7 +320,15 @@ def report():
 
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
-    if mode in ("report", "ssid"):
+    if mode == "netname":
+        try:
+            if len(sys.argv) > 2:
+                learn_net(sys.argv[2])
+            else:
+                print("usage: diag_netprobe.py netname <имя сети>")
+        except Exception as exc:  # noqa: BLE001 — ручные режимы не должны падать (канон fail-soft)
+            print(f"netname failed: {exc}")
+    elif mode in ("report", "ssid"):
         try:
             (report if mode == "report" else ssid)()
         except Exception as exc:  # noqa: BLE001 — ручные режимы не должны падать (канон fail-soft)
