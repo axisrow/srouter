@@ -1098,7 +1098,9 @@ def test_dashboard_refuses_unprivileged_protected_privoxy_action(monkeypatch):
     assert calls == []
 
 
-def test_health_lifecycle_switches_privoxy_to_system_domain(monkeypatch):
+def test_health_lifecycle_switches_privoxy_to_system_domain(monkeypatch, tmp_path):
+    """#368: xray-снапшот таргетит резолвленный label — детерминированно через tmp-мок
+    `_user_launchagent_plist` (без мока ассерт зависел бы от $HOME тестовой машины)."""
     calls = []
     monkeypatch.setattr(privoxy_system, "protection_present", lambda: True)
     monkeypatch.setattr(
@@ -1106,12 +1108,16 @@ def test_health_lifecycle_switches_privoxy_to_system_domain(monkeypatch):
         "_launchd_job_snapshot",
         lambda label, **kwargs: calls.append((label, kwargs)) or {"label": label},
     )
+    agents = tmp_path / "LaunchAgents"
+    agents.mkdir()
+    (agents / "sh.brew.xray.plist").write_text("<plist/>", encoding="utf-8")
+    monkeypatch.setattr(health, "_user_launchagent_plist", lambda label: agents / f"{label}.plist")
 
     health._collect_launchd_lifecycle()
 
     assert calls[0][0] == privoxy_system.SYSTEM_LABEL
     assert calls[0][1]["domain"] == "system"
-    assert calls[1][0] == "homebrew.mxcl.xray"
+    assert calls[1][0] == "sh.brew.xray"
 
 
 def test_health_checks_protected_privoxy_with_loopback_connect_not_lsof(monkeypatch):

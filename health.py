@@ -630,7 +630,7 @@ def _collect_launchd_lifecycle():
             plist_path=(privoxy_system.DEFAULT_LAYOUT.launchdaemon_path if protected else None),
             domain=("system" if protected else None),
         ),
-        "xray": _launchd_job_snapshot("homebrew.mxcl.xray"),
+        "xray": _launchd_job_snapshot(_xray_service_target()),
     }
 
 
