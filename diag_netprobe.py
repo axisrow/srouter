@@ -128,7 +128,8 @@ def read_ssid():
     match = re.search(r"Current Wi-Fi Network:\s*(.+)", proc.get("out") or "")
     if match:
         ssid = match.group(1).strip()
-        if ssid and "<redacted>" not in ssid:
+        # выключенный Wi-Fi/нет интерфейса: '** Error **', '<generic error>' — мусор, не SSID
+        if ssid and "<" not in ssid and "**" not in ssid:
             return ssid
     return None
 

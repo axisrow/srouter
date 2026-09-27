@@ -215,6 +215,17 @@ def test_read_ssid_none_when_redacted_everywhere(monkeypatch):
     assert diag_netprobe.read_ssid() is None
 
 
+def test_read_ssid_none_when_networksetup_reports_error(monkeypatch):
+    """Wi-Fi выключен: networksetup печатает '** Error **' — мусор не должен пройти как SSID."""
+    def fake_run(cmd, timeout):
+        if cmd[1] == "getsummary":
+            return {"rc": 0, "out": "  SSID : <redacted>\n", "err": "", "timeout": False}
+        return {"rc": 0, "out": "Current Wi-Fi Network: ** Error **\n", "err": "", "timeout": False}
+
+    monkeypatch.setattr(diag_netprobe, "run", fake_run)
+    assert diag_netprobe.read_ssid() is None
+
+
 def test_report_ignores_ssid_rows(monkeypatch, tmp_path, capsys):
     """Строки-метки leg="ssid" (без sent/recv) не считаются раундами и не ломают отчёт."""
     now = time.time()
