@@ -6,8 +6,11 @@ _launchd_reload); stop = семантика _remove_launchctl_env (чужой pl
 test_srouter_codex_launchctl_env: print → rc 113 (не загружен), остальное rc 0.
 """
 import argparse
+import json
+import time
 from pathlib import Path
 
+import diag_netprobe
 import srouter_cli
 
 
@@ -160,3 +163,179 @@ def test_netprobe_template_in_repo_has_marker_and_placeholders():
     assert "__SROUTER_NETPROBE_PATH__" in template
     assert "__SROUTER_PYTHON_BIN__" in template
     assert "StartInterval" in template
+
+
+# ============================ netname — автоопределение сети по отпечатку ============================
+def test_dns_servers_parses_resolv(tmp_path):
+    resolv = tmp_path / "resolv.conf"
+    resolv.write_text(
+        "# комментарий\nnameserver 211.136.192.6\nnameserver fe80::52f7:edff:fe36:9923%en0\n"
+        "search lan\n", encoding="utf-8")
+    assert diag_netprobe._dns_servers(resolv) == ("211.136.192.6", "fe80::52f7:edff:fe36:9923%en0")
+
+
+def test_dns_servers_missing_file(tmp_path):
+    assert diag_netprobe._dns_servers(tmp_path / "absent.conf") == ()
+
+
+def test_net_name_matches_by_dns_intersection(monkeypatch, tmp_path):
+    nets = tmp_path / "nets.json"
+    nets.write_text(json.dumps({
+        "103": {"dns": ["192.168.3.1", "fe80::52f7:edff:fe36:9923%en0"]},
+        "888-5G": {"dns": ["211.136.192.6", "120.196.165.24"]},
+    }), encoding="utf-8")
+    monkeypatch.setattr(diag_netprobe, "NETS_MAP", nets)
+    assert diag_netprobe._net_name(("120.196.165.24",)) == "888-5G"
+    assert diag_netprobe._net_name(("192.168.3.1",)) == "103"
+
+
+def test_net_name_none_without_match_or_map(monkeypatch, tmp_path):
+    monkeypatch.setattr(diag_netprobe, "NETS_MAP", tmp_path / "absent.json")
+    assert diag_netprobe._net_name(("8.8.8.8",)) is None
+    assert diag_netprobe._net_name(()) is None
+
+
+def test_learn_net_writes_and_replaces(monkeypatch, tmp_path):
+    nets = tmp_path / "nets.json"
+    monkeypatch.setattr(diag_netprobe, "NETS_MAP", nets)
+    monkeypatch.setattr(diag_netprobe, "_default_route", lambda: (None, "ipsec0"))
+    monkeypatch.setattr(diag_netprobe, "_dns_servers",
+                        lambda path=None: ("211.136.192.6",))
+
+    diag_netprobe.learn_net("888-5G")
+    first = json.loads(nets.read_text(encoding="utf-8"))
+    assert first["888-5G"]["dns"] == ["211.136.192.6"]
+    assert first["888-5G"]["iface"] == "ipsec0"
+
+    monkeypatch.setattr(diag_netprobe, "_dns_servers", lambda path=None: ("192.168.3.1",))
+    monkeypatch.setattr(diag_netprobe, "_default_route", lambda: ("192.168.3.1", "en0"))
+    diag_netprobe.learn_net("888-5G")
+    replaced = json.loads(nets.read_text(encoding="utf-8"))
+    assert replaced["888-5G"]["dns"] == ["192.168.3.1"], "повторный learn перезаписывает"
+
+
+def test_netprobe_netname_passes_name(monkeypatch, tmp_path):
+    _env(monkeypatch, tmp_path)
+    calls = []
+
+    def runner(cmd, timeout):
+        calls.append(list(cmd))
+        return {"rc": 0, "out": "ok\n", "err": "", "timeout": False}
+
+    monkeypatch.setattr(srouter_cli, "run", runner, raising=False)
+
+    rc = srouter_cli.cmd_netprobe(argparse.Namespace(netprobe_action="netname", name="103"))
+
+    assert rc == 0
+    assert calls[0][-2:] == ["netname", "103"]
+
+
+# ============================ ssid — ручная аннотация сети ============================
+def test_default_route_parses_gateway_and_iface(monkeypatch):
+    def fake_run(cmd, timeout):
+        return {"rc": 0, "out": "   gateway: 192.168.3.1\n   interface: en0\n",
+                "err": "", "timeout": False}
+
+    monkeypatch.setattr(diag_netprobe, "run", fake_run)
+    assert diag_netprobe._default_route() == ("192.168.3.1", "en0")
+
+
+def test_default_route_vpn_iface_without_gateway(monkeypatch):
+    """ipsec0 (VPN) не имеет gateway: — iface фиксируется, нога gateway пропускается."""
+    def fake_run(cmd, timeout):
+        return {"rc": 0, "out": "   interface: ipsec0\n", "err": "", "timeout": False}
+
+    monkeypatch.setattr(diag_netprobe, "run", fake_run)
+    assert diag_netprobe._default_route() == (None, "ipsec0")
+
+
+def test_netprobe_ssid_runs_script(monkeypatch, tmp_path):
+    _env(monkeypatch, tmp_path)
+    calls = []
+
+    def runner(cmd, timeout):
+        calls.append(list(cmd))
+        return {"rc": 0, "out": "SSID: X\n", "err": "", "timeout": False}
+
+    monkeypatch.setattr(srouter_cli, "run", runner, raising=False)
+
+    rc = srouter_cli.cmd_netprobe(_cmd("ssid"))
+
+    assert rc == 0
+    assert Path(calls[0][-2]).name == "diag_netprobe.py"
+    assert calls[0][-1] == "ssid"
+
+
+def test_read_ssid_parses_ipconfig(monkeypatch):
+    def fake_run(cmd, timeout):
+        if cmd[1] == "getsummary":
+            return {"rc": 0, "out": "  SSID : HomeWifi\n  BSSID : <redacted>\n",
+                    "err": "", "timeout": False}
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+
+    monkeypatch.setattr(diag_netprobe, "run", fake_run)
+    assert diag_netprobe.read_ssid() == "HomeWifi"
+
+
+def test_read_ssid_falls_back_to_networksetup(monkeypatch):
+    def fake_run(cmd, timeout):
+        if cmd[1] == "getsummary":
+            return {"rc": 0, "out": "  SSID : <redacted>\n", "err": "", "timeout": False}
+        return {"rc": 0, "out": "Current Wi-Fi Network: OfficeNet\n", "err": "", "timeout": False}
+
+    monkeypatch.setattr(diag_netprobe, "run", fake_run)
+    assert diag_netprobe.read_ssid() == "OfficeNet"
+
+
+def test_read_ssid_none_when_redacted_everywhere(monkeypatch):
+    def fake_run(cmd, timeout):
+        if cmd[1] == "getsummary":
+            return {"rc": 0, "out": "  SSID : <redacted>\n", "err": "", "timeout": False}
+        return {"rc": 1, "out": "You are not associated with an AirPort network.\n",
+                "err": "", "timeout": False}
+
+    monkeypatch.setattr(diag_netprobe, "run", fake_run)
+    assert diag_netprobe.read_ssid() is None
+
+
+def test_read_ssid_none_when_networksetup_reports_error(monkeypatch):
+    """Wi-Fi выключен: networksetup печатает '** Error **' — мусор не должен пройти как SSID."""
+    def fake_run(cmd, timeout):
+        if cmd[1] == "getsummary":
+            return {"rc": 0, "out": "  SSID : <redacted>\n", "err": "", "timeout": False}
+        return {"rc": 0, "out": "Current Wi-Fi Network: ** Error **\n", "err": "", "timeout": False}
+
+    monkeypatch.setattr(diag_netprobe, "run", fake_run)
+    assert diag_netprobe.read_ssid() is None
+
+
+def test_report_ignores_ssid_rows(monkeypatch, tmp_path, capsys):
+    """Строки-метки leg="ssid" (без sent/recv) не считаются раундами и не ломают отчёт."""
+    now = time.time()
+    tunnel = tmp_path / "metrics.jsonl"
+    statuses = ["ok"] * 6 + ["connection-failed"] * 3 + ["ok"] * 6
+    tunnel.write_text(
+        "\n".join(json.dumps({"ts": now - 1000 + i * 10, "status": s})
+                  for i, s in enumerate(statuses)) + "\n", encoding="utf-8")
+    netlog = tmp_path / "netprobe.jsonl"
+    rows = []
+    for i in range(27):  # 27 раундов шагом 30с от t0; окно фейлов [300, 320] → inside [180, 440]
+        ts = now - 1000 + i * 30
+        rows.append(json.dumps({"ts": ts, "leg": "gateway", "target": "192.168.3.1",
+                                "sent": 3, "recv": 3, "avg_ms": 3.0}))
+        rows.append(json.dumps({"ts": ts, "leg": "vps", "target": "85.136.181.198",
+                                "sent": 3, "recv": 3, "avg_ms": 230.0}))
+    rows.append(json.dumps({"ts": now - 1000 + 310, "leg": "ssid",
+                            "target": "192.168.3.1", "ssid": "HomeWifi"}))
+    netlog.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    monkeypatch.setattr(diag_netprobe, "NETPROBE_LOG", netlog)
+    monkeypatch.setattr(diag_netprobe.metrics_store, "METRICS_LOG", tunnel)
+
+    diag_netprobe.report()
+
+    out = capsys.readouterr().out
+    assert "блэкаут-окон туннеля за это время: 1" in out
+    vps_line = next(line for line in out.splitlines() if line.startswith("vps"))
+    # фейлы туннеля на смещениях 60–80с, окно ±120с → inside = i*30 ∈ [0,200] → 7 раундов
+    assert "7 раундов, потери 0/21" in vps_line, "ssid-строка не посчитана раундом"
+    assert "20 раундов, потери 0/60" in vps_line, "7+20=27 vps-строк; ssid-строка исключена"

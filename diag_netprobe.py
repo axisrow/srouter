@@ -30,8 +30,13 @@ import metrics_store
 from sys_probe import run
 
 NETPROBE_LOG = Path.home() / "Library" / "Logs" / "srouter-netprobe.jsonl"
+NETS_MAP = Path.home() / "Library" / "Logs" / "srouter-netprobe-networks.json"
+RESOLV_CONF = Path("/etc/resolv.conf")
 PING = "/sbin/ping"
 ROUTE = "/sbin/route"
+IPCONFIG = "/usr/sbin/ipconfig"
+NETWORKSETUP = "/usr/sbin/networksetup"
+WIFI_IFACE = "en0"  # ponytail: Wi-Fi-интерфейс этой машины; перебор en0–en9 не нужен
 DOMESTIC_TARGET = "223.5.5.5"  # AliDNS — domestica без GFW-нюансов ICMP
 # ponytail: DEFAULT_VPS_TARGET — fallback кампании; первоисточник VPS-цели — активный узел из
 # local.json (_vps_target), env SROUTER_NETPROBE_VPS — override для тестов/форензики.
@@ -41,11 +46,24 @@ WINDOW_PAD_SEC = 120          # запас вокруг блэкаут-окна 
 CLUSTER_GAP_SEC = 300         # фейлы реже чем через 5м — разные блэкауты
 
 
-def _default_gateway():
-    """Gateway текущего default route ('gateway: X' из route -n get default). None при сбое."""
+def _default_route():
+    """(gateway|None, iface|None) из одного route -n get default.
+
+    iface — конфаундер кампании: при поднятом VPN (ipsec0) ВСЕ raw-ноги и дозвон xray
+    идут через него, поэтому интерфейс пишется в каждый раунд — данные делятся на
+    VPN-периоды при анализе.
+    """
     proc = run([ROUTE, "-n", "get", "default"], 5)
-    match = re.search(r"^\s*gateway:\s*(\S+)", proc.get("out") or "", re.MULTILINE)
-    return match.group(1) if match else None
+    out = proc.get("out") or ""
+    gateway = re.search(r"^\s*gateway:\s*(\S+)", out, re.MULTILINE)
+    iface = re.search(r"^\s*interface:\s*(\S+)", out, re.MULTILINE)
+    return (gateway.group(1) if gateway else None,
+            iface.group(1) if iface else None)
+
+
+def _default_gateway():
+    """Gateway текущего default route. None при сбое/VPN-интерфейсе (ipsec0 без gateway)."""
+    return _default_route()[0]
 
 
 def _vps_target():
@@ -82,8 +100,9 @@ def probe():
     # atomic rewrite): 7 дней/8МиБ — с запасом покрывает кампанию.
     metrics_store.rotate_journal(NETPROBE_LOG, ts_of_line=metrics_store._event_ts,
                                  log_name="netprobe")
+    gateway, iface = _default_route()
     targets = {
-        "gateway": _default_gateway(),
+        "gateway": gateway,
         "domestic": DOMESTIC_TARGET,
         "vps": _vps_target(),
     }
@@ -97,7 +116,7 @@ def probe():
         recv, avg = _ping(target)
         lines.append(json.dumps(
             {"ts": round(now, 3), "timestamp": timestamp, "leg": leg, "target": target,
-             "sent": 3, "recv": recv, "avg_ms": avg},
+             "net": _net_name(), "iface": iface, "sent": 3, "recv": recv, "avg_ms": avg},
             ensure_ascii=False, sort_keys=True))
     if not lines:
         return
@@ -107,6 +126,107 @@ def probe():
             f.write("\n".join(lines) + "\n")
     except OSError:
         pass  # forensic-лог не роняет джобу (канон append_timing_event)
+
+
+def read_ssid():
+    """SSID текущей Wi-Fi сети, None если macOS его не отдаёт.
+
+    macOS 15.4+/26 считает SSID геоданными: без Location Services у ВЫЗЫВАЮЩЕГО приложения
+    ipconfig/networksetup отвечают «<redacted>»/ошибкой (launchd-джобе разрешение выдать
+    нечем — поэтому ssid() только ручной режим из терминала пользователя).
+    """
+    proc = run([IPCONFIG, "getsummary", WIFI_IFACE], 5)
+    match = re.search(r"^\s*SSID\s*:\s*(.+?)\s*$", proc.get("out") or "", re.MULTILINE)
+    ssid = match.group(1).strip() if match else ""
+    if ssid and ssid != "<redacted>":
+        return ssid
+    proc = run([NETWORKSETUP, "-getairportnetwork", WIFI_IFACE], 5)
+    match = re.search(r"Current Wi-Fi Network:\s*(.+)", proc.get("out") or "")
+    if match:
+        ssid = match.group(1).strip()
+        # выключенный Wi-Fi/нет интерфейса: '** Error **', '<generic error>' — мусор, не SSID
+        if ssid and "<" not in ssid and "**" not in ssid:
+            return ssid
+    return None
+
+
+def ssid():
+    """Ручной режим: показать SSID и записать метку сети в JSONL кампании.
+
+    Метка {"leg": "ssid"} без sent/recv — report игнорирует её по построению (LEGS);
+    target = шлюз, чтобы связка сеть↔шлюз была видна прямо в строке. Без полученного
+    SSID JSONL не загрязняется.
+    """
+    name = read_ssid()
+    if not name:
+        print("SSID недоступен: macOS отдаёт <redacted> без Location Services у терминала.\n"
+              "Выдай терминалу доступ (Системные настройки → Конфиденциальность и безопасность "
+              "→ Location Services) и повтори.")
+        return
+    gateway = _default_gateway()
+    try:
+        NETPROBE_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(NETPROBE_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(
+                {"ts": round(time.time(), 3),
+                 "timestamp": datetime.now().astimezone().isoformat(),
+                 "leg": "ssid", "target": gateway, "ssid": name},
+                ensure_ascii=False, sort_keys=True) + "\n")
+    except OSError as exc:
+        print(f"SSID: {name} (метка в JSONL не записана: {exc})")
+        return
+    print(f"SSID: {name} — метка записана в {NETPROBE_LOG}")
+
+
+def _dns_servers(path=None):
+    """Отсортированный кортеж DNS-резолверов из resolv.conf — отпечаток сети.
+
+    SSID macOS заредактировал (геоданные), а DNS у двух роутеров разные (роутер vs карьерные)
+    → это и есть дискриминатор. Fail-soft: нет файла → ().
+    """
+    try:
+        text = (Path(path) if path else RESOLV_CONF).read_text(encoding="utf-8")
+    except OSError:
+        return ()
+    return tuple(sorted(line.split()[1] for line in text.splitlines()
+                        if line.startswith("nameserver") and len(line.split()) > 1))
+
+
+def _load_nets():
+    """Мапа обученных сетей {имя: {dns, gateway, iface}}. Нет/битый файл → {}."""
+    try:
+        data = json.loads(NETS_MAP.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _net_name(dns=None):
+    """Имя сети по пересечению dns-множеств с обученной мапой; None — не матчился."""
+    current = set(dns if dns is not None else _dns_servers())
+    if not current:
+        return None
+    for name, info in _load_nets().items():
+        if current & set((info or {}).get("dns") or []):
+            return name
+    return None
+
+
+def learn_net(name):
+    """Запомнить текущую сеть под именем (обучение: один прогон на сеть, без прав)."""
+    dns = list(_dns_servers())
+    gateway, iface = _default_route()
+    nets = _load_nets()
+    nets[name] = {"dns": dns, "gateway": gateway, "iface": iface}
+    try:
+        from local_state import _atomic_write_text  # канон atomic-save (tmp+fsync+rename) #139
+        if not _atomic_write_text(NETS_MAP, json.dumps(
+                nets, ensure_ascii=False, sort_keys=True, indent=1) + "\n"):
+            raise OSError("atomic write вернул False")
+    except OSError as exc:
+        print(f"netname: не удалось сохранить мапу ({exc})")
+        return
+    print(f"netname: сеть {name!r} запомнена (dns={dns}, gateway={gateway}, iface={iface})")
 
 
 def _blackout_windows(events, since_ts=None):
@@ -199,11 +319,20 @@ def report():
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "report":
+    mode = sys.argv[1] if len(sys.argv) > 1 else ""
+    if mode == "netname":
         try:
-            report()
-        except Exception as exc:  # noqa: BLE001 — отчёт не должен падать (канон fail-soft)
-            print(f"report failed: {exc}")
+            if len(sys.argv) > 2:
+                learn_net(sys.argv[2])
+            else:
+                print("usage: diag_netprobe.py netname <имя сети>")
+        except Exception as exc:  # noqa: BLE001 — ручные режимы не должны падать (канон fail-soft)
+            print(f"netname failed: {exc}")
+    elif mode in ("report", "ssid"):
+        try:
+            (report if mode == "report" else ssid)()
+        except Exception as exc:  # noqa: BLE001 — ручные режимы не должны падать (канон fail-soft)
+            print(f"{mode} failed: {exc}")
     else:
         try:
             probe()
