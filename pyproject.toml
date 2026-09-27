@@ -30,6 +30,7 @@ py-modules = [
     "dashboard_app",
     "dashboard_routes",
     "backup_lib",
+    "diag_netprobe",
     "srouter",
     "srouter_cli",
     "srouter_privileged",

@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from dataclasses import replace
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path  # noqa: F401 — публичный контракт srouter (мокается в тестах)
 
@@ -36,6 +37,8 @@ from install_lib import (
     _launchd_domain,
     _launchd_is_loaded,
     _launchd_reload,
+    _read_head,
+    _unload_launchagent,
     _write_text_atomic,  # noqa: F401 — публичный контракт srouter (мокается в тестах)
     apply_install,
     apply_uninstall,
@@ -554,6 +557,92 @@ def cmd_status(args) -> int:
     return 1
 
 
+# Диагностическая кампания деградации туннеля (2026-09): ping участков сети (gateway/domestica/VPS
+# мимо туннеля) раз в 60с → корреляция с блэкаутами туннеля (diag_netprobe.py report).
+NETPROBE_LABEL = "com.srouter.netprobe"
+NETPROBE_MARKER = "srouter-managed-netprobe-v1"
+NETPROBE_TEMPLATE = "com.srouter.netprobe.plist"
+NETPROBE_SCRIPT = "diag_netprobe.py"
+NETPROBE_JSONL_HINT = "~/Library/Logs/srouter-netprobe.jsonl"  # подпись в сообщениях (путь живёт в diag_netprobe.NETPROBE_LOG)
+
+
+def _netprobe_env():
+    """InstallEnv кампании: те же SROUTER_*-переопределения, но СВОИ логи (не dashboard-файлы)."""
+    env = InstallEnv.from_env()
+    return replace(env,
+                   log_out=env.log_out.with_name("srouter-netprobe.out.log"),
+                   log_err=env.log_err.with_name("srouter-netprobe.err.log"))
+
+
+def cmd_netprobe(args) -> int:
+    """apply|stop|report диагностической LaunchAgent-джобы netprobe (кампания 2026-09).
+
+    apply — тонкая обёртка _install_generic_launchagent (канон watchdog/codenv: marker-gate,
+    рендер, atomic write, bootout→bootstrap идемпотентно). stop — канон _unload_launchagent:
+    marker-gate своим маркером, identity-связка plist↔Label (plistlib), unlink только после
+    ПОДТВЕРЖДЁННОЙ выгрузки (tristate через None — fail-safe, plist остаётся). JSONL/логи при
+    stop НЕ удаляются — форензика кампании.
+    report — прогон коррелятора diag_netprobe.py (блэкауты туннеля × потери по участкам пути).
+    """
+    action = args.netprobe_action
+    env = _netprobe_env()
+    if action == "apply":
+        ok, err = _install_generic_launchagent(
+            env, run,
+            template_name=NETPROBE_TEMPLATE, label=NETPROBE_LABEL, marker=NETPROBE_MARKER,
+            script_path=env.root / NETPROBE_SCRIPT)
+        if ok:
+            print(f"Netprobe: установлен ({NETPROBE_LABEL}, ping участков раз в 60с, "
+                  f"JSONL {NETPROBE_JSONL_HINT}). Отчёт: srouter netprobe report")
+            return 0
+        if "_foreign" in err:
+            print(f"Netprobe: чужой plist {NETPROBE_LABEL} (без маркера {NETPROBE_MARKER}) — "
+                  f"не трогаю. Если это остаток ручной установки, выгрузи и удали его вручную:\n"
+                  f"  launchctl bootout gui/501/{NETPROBE_LABEL}\n"
+                  f"  rm ~/Library/LaunchAgents/{NETPROBE_LABEL}.plist")
+        else:
+            print(f"Netprobe: не установлен ({err}).")
+        return 2
+    if action == "stop":
+        plist = env.launchagent_dir / f"{NETPROBE_LABEL}.plist"
+        if not plist.exists():
+            print(f"Netprobe: не установлен ({plist} отсутствует).")
+            return 2
+        # marker-gate своим маркером (не generic LAUNCHAGENT_MARKER), затем канон
+        # _unload_launchagent: identity-связка plist↔Label через plistlib (#94 DEFECT B),
+        # unlink только при ПОДТВЕРЖДЁННОЙ выгрузке (tristate None — fail-safe, plist остаётся).
+        try:
+            marker_present = NETPROBE_MARKER in _read_head(plist)
+        except OSError as exc:
+            print(f"Netprobe: plist нечитаем ({exc}) — не трогаю.")
+            return 2
+        if not marker_present:
+            print(f"Netprobe: чужой plist {NETPROBE_LABEL} (без маркера) — не трогаю.")
+            return 2
+        res = _unload_launchagent({"plist_path": str(plist), "label": NETPROBE_LABEL,
+                                   "removable": True}, run)
+        if res.get("ok"):
+            print(f"Netprobe: остановлен. JSONL-данные кампании сохранены "
+                  f"({NETPROBE_JSONL_HINT}).")
+            return 0
+        print(f"Netprobe: не выгружен/не удалён ({res.get('blocked', 'unknown')}) — "
+              f"plist оставлен (fail-safe). Проверь: launchctl list | grep {NETPROBE_LABEL}")
+        return 2
+    # report
+    res = run([sys.executable, str(env.root / NETPROBE_SCRIPT), "report"], 120)
+    out = (res.get("out") or "").strip()
+    err = (res.get("err") or "").strip()
+    if out:
+        print(out)
+    if err:
+        print(err)
+    if res.get("timeout") or res.get("rc") != 0:
+        print(f"Netprobe: report завершился с ошибкой (rc={res.get('rc')}, "
+              f"timeout={res.get('timeout')}).")
+        return 2
+    return 0
+
+
 def cmd_doctor(args) -> int:
     """Проверить здоровье стека: порты + реальный туннель. Отчёт ✅/❌ + подсказки."""
     result = health.check_all(active_claude=True)
@@ -969,6 +1058,21 @@ def build_parser() -> argparse.ArgumentParser:
                             help="Восстановить только указанный network service "
                                  "(по умолчанию — все известные leases).")
         sp.set_defaults(func=cmd_system_proxy)
+
+    # netprobe (кампания деградации туннеля 2026-09): LaunchAgent ping'ует участки сети
+    # (gateway/domestica/VPS мимо туннеля) раз в 60с; report — корреляция блэкаутов туннеля
+    # (metrics-JSONL watchdog'а) с потерями по участкам → вердикт «транзит vs DPI».
+    p_netprobe = sub.add_parser(
+        "netprobe",
+        help="Диагностика участков сети: launchd-джоба (apply/stop) + отчёт корреляции (report).")
+    p_netprobe_sub = p_netprobe.add_subparsers(dest="netprobe_action", required=True)
+    for sub_name, sub_help in (
+        ("apply", "Установить/обновить LaunchAgent com.srouter.netprobe (ping раз в 60с)."),
+        ("stop", "Выгрузить джобу и удалить plist (JSONL-данные кампании сохраняются)."),
+        ("report", "Корреляция блэкаутов туннеля с потерями по участкам (diag_netprobe.py)."),
+    ):
+        sp = p_netprobe_sub.add_parser(sub_name, help=sub_help)
+        sp.set_defaults(func=cmd_netprobe)
 
     # routing (#136): управление routing-доменами production xray-config. Отдельная подкоманда —
     # свои sub-subcommands (add-domain/remove-domain/list). НЕ "route" (конфликт с split-route).

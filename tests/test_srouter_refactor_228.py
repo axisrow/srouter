@@ -115,6 +115,7 @@ class TestParserSurface:
         assert top == {
             "install", "uninstall", "start", "stop", "restart",
             "status", "doctor", "sync", "system-proxy", "routing", "privoxy",
+            "netprobe",
         }
 
     def test_nested_subcommand_paths_preserved(self, surface):
