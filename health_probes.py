@@ -30,7 +30,8 @@ _log = logging.getLogger("srouter.health")
 # consumer этого __all__; внешний код импортирует health, не health_probes напрямую).
 __all__ = [
     "_launchd_field", "_port_up", "PRIVOXY_SYSTEM_LABEL", "PRIVOXY_BREW_LABEL", "XRAY_BREW_LABEL",
-    "_privoxy_service_target", "_privoxy_registrations", "_launchd_pid", "_listener_pid",
+    "XRAY_BREW_LABELS", "_privoxy_service_target", "_xray_service_target", "_privoxy_registrations",
+    "_launchd_pid", "_listener_pid",
     "_service_running", "_local_proxy_up",
     "_zombie_recheck_delay", "_ZOMBIE_RECHECK_DELAY_SEC", "_launchd_loaded_status",
     "_user_launchagent_plist", "_local_proxy_boot_persistence",
@@ -98,7 +99,11 @@ def _port_up(port):
 # Re-export privoxy system label — тесты (test_health #204) и единый источник для _local_proxy_up.
 PRIVOXY_SYSTEM_LABEL = privoxy_system.SYSTEM_LABEL  # com.srouter.privoxy
 PRIVOXY_BREW_LABEL = privoxy_system.USER_LABEL      # homebrew.mxcl.privoxy
-XRAY_BREW_LABEL = "homebrew.mxcl.xray"
+# #368: свежие brew services регистрируют xray как sh.brew.xray (plist sh.brew.xray.plist),
+# старые — homebrew.mxcl.xray. Порядок кортежа = приоритет резолва; фактический label —
+# _xray_service_target(). XRAY_BREW_LABEL — legacy alias для экспорт-контракта star-import.
+XRAY_BREW_LABELS = ("sh.brew.xray", "homebrew.mxcl.xray")
+XRAY_BREW_LABEL = XRAY_BREW_LABELS[-1]
 
 
 def _privoxy_service_target():
@@ -189,6 +194,21 @@ def _user_launchagent_plist(label):
     return Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
 
 
+def _xray_service_target():
+    """Актуальный brew-label xray для launchctl (#368): свежие brew services регистрируют
+    sh.brew.xray (plist sh.brew.xray.plist, Label совпадает с именем файла), старые —
+    homebrew.mxcl.xray. Резолв по существованию plist-файла: stat БЕЗ subprocess (пробы
+    дергаются в бюджете 12с; кэша нет — 2 stat() дешевле риска протухнуть между brew
+    services start/stop). Приоритет sh.brew: обе plist — считаем миграцию завершённой.
+    Ни одной → legacy fallback: вердикты «нет регистрации» (зомби при живом порте, warn
+    персистентности) ведут себя как раньше. Возврат только label — домен xray всегда
+    gui/<uid> (не пара, как _privoxy_service_target)."""
+    for label in XRAY_BREW_LABELS:
+        if _health_facade._user_launchagent_plist(label).is_file():
+            return label
+    return XRAY_BREW_LABELS[-1]
+
+
 def _launchd_disabled_status(label, domain):
     """Персистентно ли выключен сервис (launchctl print-disabled) — tri-state (#330 P2).
 
@@ -256,7 +276,7 @@ def _local_proxy_up():
     privoxy_label, privoxy_domain = _privoxy_service_target()
     components = [
         ("privoxy", PRIVOXY_PORT, privoxy_label, privoxy_domain),
-        ("xray", XRAY_PORT, XRAY_BREW_LABEL, f"gui/{os.getuid()}"),
+        ("xray", XRAY_PORT, _xray_service_target(), f"gui/{os.getuid()}"),
     ]
     problems = []
     facets = []  # #341: грани режима (info/warn), НЕ роняющие вердикт — отдельная от «зомби»
@@ -389,14 +409,15 @@ def _local_proxy_boot_persistence():
     through_facade). Возвращает {status, detail}: "ok" | "warn". Не бросает.
     """
     privoxy_label, privoxy_domain = _privoxy_service_target()
+    xray_label = _xray_service_target()  # #368: один резолв на вызов пробы
     protected = privoxy_system.protection_present()
     components = [
         ("privoxy", PRIVOXY_PORT, privoxy_label, privoxy_domain,
          privoxy_system.DEFAULT_LAYOUT.launchdaemon_path if protected
          else _health_facade._user_launchagent_plist(PRIVOXY_BREW_LABEL),
          privoxy_system.PROTECTED_MARKER if protected else None),
-        ("xray", XRAY_PORT, XRAY_BREW_LABEL, f"gui/{os.getuid()}",
-         _health_facade._user_launchagent_plist(XRAY_BREW_LABEL), None),
+        ("xray", XRAY_PORT, xray_label, f"gui/{os.getuid()}",
+         _health_facade._user_launchagent_plist(xray_label), None),
     ]
     problems = []
     notes = []

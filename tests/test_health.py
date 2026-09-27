@@ -1356,6 +1356,89 @@ def test_local_proxy_facets_survive_down_and_hint_alternate_aware(monkeypatch):
     assert "НЕ рестартить" in result["detail"], "подсказка alternate-aware"
 
 
+# Issue #368: свежие brew services регистрируют xray как sh.brew.xray (plist
+# ~/Library/LaunchAgents/sh.brew.xray.plist), legacy — homebrew.mxcl.xray. Детектор обязан
+# резолвить фактический label: захардкоженный legacy даёт ложного зомби и ложный
+# «plist отсутствует» на свежих brew (sh.brew-машина: launchctl по legacy-label — «не загружен»).
+
+# Живой захват `launchctl print gui/501/sh.brew.xray` (macOS 25.6): формат key-строк идентичен
+# legacy — парсер _launchd_field матчит построчно, заголовочная строка не участвует.
+SH_BREW_PRINT_RUNNING = (
+    "gui/501/sh.brew.xray = {\n"
+    "\ttype = LaunchAgent\n"
+    "\tstate = running\n"
+    "\tpid = 93317\n"
+    "\truns = 3\n"
+    "\tlast exit code = 0\n"
+    "\tproperties = keepalive | runatload | inferred program\n"
+    "}\n"
+)
+
+
+def test_xray_service_target_prefers_sh_brew_when_both_plists_exist(monkeypatch, tmp_path):
+    """#368: обе регистрации на диске → sh.brew.xray (актуальный brew — приоритет резолва)."""
+    agents = tmp_path / "LaunchAgents"
+    agents.mkdir()
+    for label in ("sh.brew.xray", "homebrew.mxcl.xray"):
+        (agents / f"{label}.plist").write_text("<plist/>", encoding="utf-8")
+    monkeypatch.setattr(health, "_user_launchagent_plist", lambda label: agents / f"{label}.plist")
+    assert health._xray_service_target() == "sh.brew.xray"
+
+
+def test_xray_service_target_falls_back_to_legacy_when_only_legacy_plist(monkeypatch, tmp_path):
+    """#368: машина до апгрейда brew (legacy-plist единственный) → homebrew.mxcl.xray —
+    fallback-ветка, поведение прежнее."""
+    agents = tmp_path / "LaunchAgents"
+    agents.mkdir()
+    (agents / "homebrew.mxcl.xray.plist").write_text("<plist/>", encoding="utf-8")
+    monkeypatch.setattr(health, "_user_launchagent_plist", lambda label: agents / f"{label}.plist")
+    assert health._xray_service_target() == "homebrew.mxcl.xray"
+
+
+def test_xray_service_target_falls_back_to_legacy_when_no_plists(monkeypatch):
+    """#368: ни одной регистрации (настоящий orphan) → legacy fallback — вердикты
+    «нет регистрации» (зомби при живом порте, warn персистентности) не меняются."""
+    _mock_no_registrations(monkeypatch)
+    assert health._xray_service_target() == "homebrew.mxcl.xray"
+
+
+def test_local_proxy_up_green_with_sh_brew_xray_registration(monkeypatch, tmp_path):
+    """#368 ГЛАВНЫЙ: sh.brew-машина (launchctl по legacy-label отвечает «не загружен») →
+    probe ok. До фикса: label homebrew.mxcl.xray → not_running + порт жив → ложный зомби
+    (down); после: резолв sh.brew.xray → running → ok."""
+
+    def fake_run(cmd, timeout):
+        joined = " ".join(cmd)
+        if "homebrew.mxcl.xray" in joined:
+            return {"rc": 3, "out": "", "err": "not loaded", "timeout": False}
+        if "sh.brew.xray" in joined:
+            return {"rc": 0, "out": SH_BREW_PRINT_RUNNING, "err": "", "timeout": False}
+        return {"rc": 0, "out": "\tstate = running;\n", "err": "", "timeout": False}  # privoxy brew
+
+    monkeypatch.setattr(health, "_port_up", lambda port: True)
+    monkeypatch.setattr(health, "_zombie_recheck_delay", lambda: None)
+    monkeypatch.setattr(health.privoxy_system, "protection_present", lambda: False)
+    monkeypatch.setattr(health.sys_probe, "run", fake_run)
+    agents = tmp_path / "LaunchAgents"
+    agents.mkdir()
+    (agents / "sh.brew.xray.plist").write_text("<plist/>", encoding="utf-8")
+    monkeypatch.setattr(health, "_user_launchagent_plist", lambda label: agents / f"{label}.plist")
+    result = health._local_proxy_up()
+    assert result["status"] == "ok", "sh.brew-регистрация running → НЕ зомби"
+    assert "зомби" not in result["detail"].lower()
+
+
+def test_local_proxy_true_zombie_without_any_xray_registration(monkeypatch):
+    """#368 негатив-гвард: ни одной xray-регистрации + порт жив → настоящий зомби остаётся
+    down (резолв-fallback не должен ослабить детекцию реального orphan'а)."""
+    monkeypatch.setattr(health, "_port_up", lambda port: True)
+    monkeypatch.setattr(health, "_zombie_recheck_delay", lambda: None)
+    _mock_no_registrations(monkeypatch)
+    result = health._local_proxy_up()
+    assert result["status"] == "down"
+    assert "xray зомби" in result["detail"].lower()
+
+
 def test_check_all_surfaces_registration_mode_facet_as_info(monkeypatch):
     """#341: грань режима регистрации попадает в check_all как ОТДЕЛЬНЫЙ info-only warn —
     ok=False (это предупреждение, не подтверждение здоровья — канон #225), info=True (не driver)."""
@@ -1536,6 +1619,24 @@ def test_boot_persistence_ok_when_plist_present_and_loaded(monkeypatch, tmp_path
     monkeypatch.setattr(health, "_user_launchagent_plist", lambda label: agents / f"{label}.plist")
     result = health._local_proxy_boot_persistence()
     assert result["status"] == "ok", "plist + loaded → ok"
+
+
+def test_boot_persistence_ok_with_sh_brew_xray_registration(monkeypatch, tmp_path):
+    """#368: sh.brew-машина (legacy-plist отсутствует) → plist резолвится через
+    sh.brew.xray.plist → ok. До фикса: путь строился по legacy-label → «plist отсутствует»
+    → ложный warn «после перезагрузки не поднимется»."""
+    monkeypatch.setattr(health, "_port_up", lambda port: True)
+    monkeypatch.setattr(health.sys_probe, "run", lambda cmd, timeout:
+                        {"rc": 0, "out": SH_BREW_PRINT_RUNNING, "err": "", "timeout": False})
+    monkeypatch.setattr(health.privoxy_system, "protection_present", lambda: False)
+    agents = tmp_path / "LaunchAgents"
+    agents.mkdir()
+    for label in (health.PRIVOXY_BREW_LABEL, "sh.brew.xray"):
+        (agents / f"{label}.plist").write_text("<plist/>", encoding="utf-8")
+    monkeypatch.setattr(health, "_user_launchagent_plist", lambda label: agents / f"{label}.plist")
+    result = health._local_proxy_boot_persistence()
+    assert result["status"] == "ok", "sh.brew-plist на диске + job загружен → ok"
+    assert "не поднимется" not in result["detail"].lower()
 
 
 def test_boot_persistence_warns_when_port_dead_and_unregistered(monkeypatch):
