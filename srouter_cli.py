@@ -574,15 +574,34 @@ def _netprobe_env():
                    log_err=env.log_err.with_name("srouter-netprobe.err.log"))
 
 
+def _netprobe_subprocess(env, mode, timeout):
+    """Прогон diag_netprobe.py <mode> в subprocess: граница таймаута + изоляция fail-soft.
+    Печатает stdout/stderr, возвращает rc (0 ок, 2 ошибка/таймаут)."""
+    res = run([sys.executable, str(env.root / NETPROBE_SCRIPT), mode], timeout)
+    out = (res.get("out") or "").strip()
+    err = (res.get("err") or "").strip()
+    if out:
+        print(out)
+    if err:
+        print(err)
+    if res.get("timeout") or res.get("rc") != 0:
+        print(f"Netprobe: {mode} завершился с ошибкой (rc={res.get('rc')}, "
+              f"timeout={res.get('timeout')}).")
+        return 2
+    return 0
+
+
 def cmd_netprobe(args) -> int:
-    """apply|stop|report диагностической LaunchAgent-джобы netprobe (кампания 2026-09).
+    """apply|stop|report|ssid диагностической LaunchAgent-джобы netprobe (кампания 2026-09).
 
     apply — тонкая обёртка _install_generic_launchagent (канон watchdog/codenv: marker-gate,
     рендер, atomic write, bootout→bootstrap идемпотентно). stop — канон _unload_launchagent:
     marker-gate своим маркером, identity-связка plist↔Label (plistlib), unlink только после
     ПОДТВЕРЖДЁННОЙ выгрузки (tristate через None — fail-safe, plist остаётся). JSONL/логи при
     stop НЕ удаляются — форензика кампании.
-    report — прогон коррелятора diag_netprobe.py (блэкауты туннеля × потери по участкам пути).
+    report — коррелятор (блэкауты туннеля × потери по участкам пути).
+    ssid — ручной режим из ТЕРМИНАЛА пользователя: показать SSID и записать метку сети
+    в JSONL (launchd-джоба SSID получить не может — геоданные, см. diag_netprobe.read_ssid).
     """
     action = args.netprobe_action
     env = _netprobe_env()
@@ -628,19 +647,10 @@ def cmd_netprobe(args) -> int:
         print(f"Netprobe: не выгружен/не удалён ({res.get('blocked', 'unknown')}) — "
               f"plist оставлен (fail-safe). Проверь: launchctl list | grep {NETPROBE_LABEL}")
         return 2
-    # report
-    res = run([sys.executable, str(env.root / NETPROBE_SCRIPT), "report"], 120)
-    out = (res.get("out") or "").strip()
-    err = (res.get("err") or "").strip()
-    if out:
-        print(out)
-    if err:
-        print(err)
-    if res.get("timeout") or res.get("rc") != 0:
-        print(f"Netprobe: report завершился с ошибкой (rc={res.get('rc')}, "
-              f"timeout={res.get('timeout')}).")
-        return 2
-    return 0
+    if action in ("report", "ssid"):
+        return _netprobe_subprocess(env, action, 120 if action == "report" else 30)
+    # неизвестный action — argparse не пустит, но fail-closed
+    return 2
 
 
 def cmd_doctor(args) -> int:
@@ -1070,6 +1080,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("apply", "Установить/обновить LaunchAgent com.srouter.netprobe (ping раз в 60с)."),
         ("stop", "Выгрузить джобу и удалить plist (JSONL-данные кампании сохраняются)."),
         ("report", "Корреляция блэкаутов туннеля с потерями по участкам (diag_netprobe.py)."),
+        ("ssid", "Показать SSID и записать метку сети в JSONL (из терминала с Location Services)."),
     ):
         sp = p_netprobe_sub.add_parser(sub_name, help=sub_help)
         sp.set_defaults(func=cmd_netprobe)

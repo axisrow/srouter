@@ -32,6 +32,9 @@ from sys_probe import run
 NETPROBE_LOG = Path.home() / "Library" / "Logs" / "srouter-netprobe.jsonl"
 PING = "/sbin/ping"
 ROUTE = "/sbin/route"
+IPCONFIG = "/usr/sbin/ipconfig"
+NETWORKSETUP = "/usr/sbin/networksetup"
+WIFI_IFACE = "en0"  # ponytail: Wi-Fi-интерфейс этой машины; перебор en0–en9 не нужен
 DOMESTIC_TARGET = "223.5.5.5"  # AliDNS — domestica без GFW-нюансов ICMP
 # ponytail: DEFAULT_VPS_TARGET — fallback кампании; первоисточник VPS-цели — активный узел из
 # local.json (_vps_target), env SROUTER_NETPROBE_VPS — override для тестов/форензики.
@@ -107,6 +110,55 @@ def probe():
             f.write("\n".join(lines) + "\n")
     except OSError:
         pass  # forensic-лог не роняет джобу (канон append_timing_event)
+
+
+def read_ssid():
+    """SSID текущей Wi-Fi сети, None если macOS его не отдаёт.
+
+    macOS 15.4+/26 считает SSID геоданными: без Location Services у ВЫЗЫВАЮЩЕГО приложения
+    ipconfig/networksetup отвечают «<redacted>»/ошибкой (launchd-джобе разрешение выдать
+    нечем — поэтому ssid() только ручной режим из терминала пользователя).
+    """
+    proc = run([IPCONFIG, "getsummary", WIFI_IFACE], 5)
+    match = re.search(r"^\s*SSID\s*:\s*(.+?)\s*$", proc.get("out") or "", re.MULTILINE)
+    ssid = match.group(1).strip() if match else ""
+    if ssid and ssid != "<redacted>":
+        return ssid
+    proc = run([NETWORKSETUP, "-getairportnetwork", WIFI_IFACE], 5)
+    match = re.search(r"Current Wi-Fi Network:\s*(.+)", proc.get("out") or "")
+    if match:
+        ssid = match.group(1).strip()
+        if ssid and "<redacted>" not in ssid:
+            return ssid
+    return None
+
+
+def ssid():
+    """Ручной режим: показать SSID и записать метку сети в JSONL кампании.
+
+    Метка {"leg": "ssid"} без sent/recv — report игнорирует её по построению (LEGS);
+    target = шлюз, чтобы связка сеть↔шлюз была видна прямо в строке. Без полученного
+    SSID JSONL не загрязняется.
+    """
+    name = read_ssid()
+    if not name:
+        print("SSID недоступен: macOS отдаёт <redacted> без Location Services у терминала.\n"
+              "Выдай терминалу доступ (Системные настройки → Конфиденциальность и безопасность "
+              "→ Location Services) и повтори.")
+        return
+    gateway = _default_gateway()
+    try:
+        NETPROBE_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(NETPROBE_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(
+                {"ts": round(time.time(), 3),
+                 "timestamp": datetime.now().astimezone().isoformat(),
+                 "leg": "ssid", "target": gateway, "ssid": name},
+                ensure_ascii=False, sort_keys=True) + "\n")
+    except OSError as exc:
+        print(f"SSID: {name} (метка в JSONL не записана: {exc})")
+        return
+    print(f"SSID: {name} — метка записана в {NETPROBE_LOG}")
 
 
 def _blackout_windows(events, since_ts=None):
@@ -199,11 +251,12 @@ def report():
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "report":
+    mode = sys.argv[1] if len(sys.argv) > 1 else ""
+    if mode in ("report", "ssid"):
         try:
-            report()
-        except Exception as exc:  # noqa: BLE001 — отчёт не должен падать (канон fail-soft)
-            print(f"report failed: {exc}")
+            (report if mode == "report" else ssid)()
+        except Exception as exc:  # noqa: BLE001 — ручные режимы не должны падать (канон fail-soft)
+            print(f"{mode} failed: {exc}")
     else:
         try:
             probe()

@@ -6,8 +6,11 @@ _launchd_reload); stop = семантика _remove_launchctl_env (чужой pl
 test_srouter_codex_launchctl_env: print → rc 113 (не загружен), остальное rc 0.
 """
 import argparse
+import json
+import time
 from pathlib import Path
 
+import diag_netprobe
 import srouter_cli
 
 
@@ -160,3 +163,85 @@ def test_netprobe_template_in_repo_has_marker_and_placeholders():
     assert "__SROUTER_NETPROBE_PATH__" in template
     assert "__SROUTER_PYTHON_BIN__" in template
     assert "StartInterval" in template
+
+
+# ============================ ssid — ручная аннотация сети ============================
+def test_netprobe_ssid_runs_script(monkeypatch, tmp_path):
+    _env(monkeypatch, tmp_path)
+    calls = []
+
+    def runner(cmd, timeout):
+        calls.append(list(cmd))
+        return {"rc": 0, "out": "SSID: X\n", "err": "", "timeout": False}
+
+    monkeypatch.setattr(srouter_cli, "run", runner, raising=False)
+
+    rc = srouter_cli.cmd_netprobe(_cmd("ssid"))
+
+    assert rc == 0
+    assert Path(calls[0][-2]).name == "diag_netprobe.py"
+    assert calls[0][-1] == "ssid"
+
+
+def test_read_ssid_parses_ipconfig(monkeypatch):
+    def fake_run(cmd, timeout):
+        if cmd[1] == "getsummary":
+            return {"rc": 0, "out": "  SSID : HomeWifi\n  BSSID : <redacted>\n",
+                    "err": "", "timeout": False}
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+
+    monkeypatch.setattr(diag_netprobe, "run", fake_run)
+    assert diag_netprobe.read_ssid() == "HomeWifi"
+
+
+def test_read_ssid_falls_back_to_networksetup(monkeypatch):
+    def fake_run(cmd, timeout):
+        if cmd[1] == "getsummary":
+            return {"rc": 0, "out": "  SSID : <redacted>\n", "err": "", "timeout": False}
+        return {"rc": 0, "out": "Current Wi-Fi Network: OfficeNet\n", "err": "", "timeout": False}
+
+    monkeypatch.setattr(diag_netprobe, "run", fake_run)
+    assert diag_netprobe.read_ssid() == "OfficeNet"
+
+
+def test_read_ssid_none_when_redacted_everywhere(monkeypatch):
+    def fake_run(cmd, timeout):
+        if cmd[1] == "getsummary":
+            return {"rc": 0, "out": "  SSID : <redacted>\n", "err": "", "timeout": False}
+        return {"rc": 1, "out": "You are not associated with an AirPort network.\n",
+                "err": "", "timeout": False}
+
+    monkeypatch.setattr(diag_netprobe, "run", fake_run)
+    assert diag_netprobe.read_ssid() is None
+
+
+def test_report_ignores_ssid_rows(monkeypatch, tmp_path, capsys):
+    """Строки-метки leg="ssid" (без sent/recv) не считаются раундами и не ломают отчёт."""
+    now = time.time()
+    tunnel = tmp_path / "metrics.jsonl"
+    statuses = ["ok"] * 6 + ["connection-failed"] * 3 + ["ok"] * 6
+    tunnel.write_text(
+        "\n".join(json.dumps({"ts": now - 1000 + i * 10, "status": s})
+                  for i, s in enumerate(statuses)) + "\n", encoding="utf-8")
+    netlog = tmp_path / "netprobe.jsonl"
+    rows = []
+    for i in range(27):  # 27 раундов шагом 30с от t0; окно фейлов [300, 320] → inside [180, 440]
+        ts = now - 1000 + i * 30
+        rows.append(json.dumps({"ts": ts, "leg": "gateway", "target": "192.168.3.1",
+                                "sent": 3, "recv": 3, "avg_ms": 3.0}))
+        rows.append(json.dumps({"ts": ts, "leg": "vps", "target": "85.136.181.198",
+                                "sent": 3, "recv": 3, "avg_ms": 230.0}))
+    rows.append(json.dumps({"ts": now - 1000 + 310, "leg": "ssid",
+                            "target": "192.168.3.1", "ssid": "HomeWifi"}))
+    netlog.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    monkeypatch.setattr(diag_netprobe, "NETPROBE_LOG", netlog)
+    monkeypatch.setattr(diag_netprobe.metrics_store, "METRICS_LOG", tunnel)
+
+    diag_netprobe.report()
+
+    out = capsys.readouterr().out
+    assert "блэкаут-окон туннеля за это время: 1" in out
+    vps_line = next(line for line in out.splitlines() if line.startswith("vps"))
+    # фейлы туннеля на смещениях 60–80с, окно ±120с → inside = i*30 ∈ [0,200] → 7 раундов
+    assert "7 раундов, потери 0/21" in vps_line, "ssid-строка не посчитана раундом"
+    assert "20 раундов, потери 0/60" in vps_line, "7+20=27 vps-строк; ssid-строка исключена"
