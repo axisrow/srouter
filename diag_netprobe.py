@@ -44,11 +44,24 @@ WINDOW_PAD_SEC = 120          # запас вокруг блэкаут-окна 
 CLUSTER_GAP_SEC = 300         # фейлы реже чем через 5м — разные блэкауты
 
 
-def _default_gateway():
-    """Gateway текущего default route ('gateway: X' из route -n get default). None при сбое."""
+def _default_route():
+    """(gateway|None, iface|None) из одного route -n get default.
+
+    iface — конфаундер кампании: при поднятом VPN (ipsec0) ВСЕ raw-ноги и дозвон xray
+    идут через него, поэтому интерфейс пишется в каждый раунд — данные делятся на
+    VPN-периоды при анализе.
+    """
     proc = run([ROUTE, "-n", "get", "default"], 5)
-    match = re.search(r"^\s*gateway:\s*(\S+)", proc.get("out") or "", re.MULTILINE)
-    return match.group(1) if match else None
+    out = proc.get("out") or ""
+    gateway = re.search(r"^\s*gateway:\s*(\S+)", out, re.MULTILINE)
+    iface = re.search(r"^\s*interface:\s*(\S+)", out, re.MULTILINE)
+    return (gateway.group(1) if gateway else None,
+            iface.group(1) if iface else None)
+
+
+def _default_gateway():
+    """Gateway текущего default route. None при сбое/VPN-интерфейсе (ipsec0 без gateway)."""
+    return _default_route()[0]
 
 
 def _vps_target():
@@ -85,8 +98,9 @@ def probe():
     # atomic rewrite): 7 дней/8МиБ — с запасом покрывает кампанию.
     metrics_store.rotate_journal(NETPROBE_LOG, ts_of_line=metrics_store._event_ts,
                                  log_name="netprobe")
+    gateway, iface = _default_route()
     targets = {
-        "gateway": _default_gateway(),
+        "gateway": gateway,
         "domestic": DOMESTIC_TARGET,
         "vps": _vps_target(),
     }
@@ -100,7 +114,7 @@ def probe():
         recv, avg = _ping(target)
         lines.append(json.dumps(
             {"ts": round(now, 3), "timestamp": timestamp, "leg": leg, "target": target,
-             "sent": 3, "recv": recv, "avg_ms": avg},
+             "iface": iface, "sent": 3, "recv": recv, "avg_ms": avg},
             ensure_ascii=False, sort_keys=True))
     if not lines:
         return

@@ -166,6 +166,24 @@ def test_netprobe_template_in_repo_has_marker_and_placeholders():
 
 
 # ============================ ssid — ручная аннотация сети ============================
+def test_default_route_parses_gateway_and_iface(monkeypatch):
+    def fake_run(cmd, timeout):
+        return {"rc": 0, "out": "   gateway: 192.168.3.1\n   interface: en0\n",
+                "err": "", "timeout": False}
+
+    monkeypatch.setattr(diag_netprobe, "run", fake_run)
+    assert diag_netprobe._default_route() == ("192.168.3.1", "en0")
+
+
+def test_default_route_vpn_iface_without_gateway(monkeypatch):
+    """ipsec0 (VPN) не имеет gateway: — iface фиксируется, нога gateway пропускается."""
+    def fake_run(cmd, timeout):
+        return {"rc": 0, "out": "   interface: ipsec0\n", "err": "", "timeout": False}
+
+    monkeypatch.setattr(diag_netprobe, "run", fake_run)
+    assert diag_netprobe._default_route() == (None, "ipsec0")
+
+
 def test_netprobe_ssid_runs_script(monkeypatch, tmp_path):
     _env(monkeypatch, tmp_path)
     calls = []
