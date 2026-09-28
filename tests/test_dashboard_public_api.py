@@ -156,6 +156,7 @@ EXPECTED_ROUTES = {
     ("/api/claude-proxy/disable", "POST"),
     ("/api/claude-proxy/enable", "POST"),
     ("/api/git-proxy", "GET"),
+    ("/api/incidents", "GET"),
     ("/api/metrics/tunnel", "GET"),
     ("/api/proxy/overview", "GET"),
     ("/api/proxy/<action>", "POST"),
