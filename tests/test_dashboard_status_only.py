@@ -41,6 +41,14 @@ def _stub_probes(monkeypatch, dashboard_app, calls):
     monkeypatch.setattr(dashboard_app, "STATUS_CACHE_TTL_SEC", 999)
 
 
+# ключи полного ответа gather_status (= ключи probes-словаря dashboard_app)
+RESPONSE_KEYS = {
+    "services", "tunnel", "exit_ip", "vpn", "route", "direct", "traffic_guard",
+    "hot_routes", "isolate", "connectivity", "ips", "ping", "dns", "ifaces",
+    "exit_ips", "geo_distance",
+}
+
+
 def _setup(monkeypatch, tmp_path, active="sg-1"):
     state_path = tmp_path / "srouter.local.json"
     _write_state(state_path, _state(active))
@@ -100,15 +108,19 @@ def test_gather_status_waves_merge_in_cache(monkeypatch, tmp_path):
     dashboard.gather_status("services")
     dashboard.gather_status("ping")
 
+    # волны мержатся в общем кэше, а не затирают друг друга
     assert "services" in dashboard._cache["data"]
     assert "ping" in dashboard._cache["data"]
-    full = dashboard.gather_status()  # TTL-hit: отдаём мерженный кэш
-    assert full is dashboard._cache["data"]
-    assert sorted(calls) == ["probe_ping", "probe_services"]
 
+    # partial-волны не делают кэш «полным»: легаси-запрос перегоняет всё
+    full = dashboard.gather_status()
+    assert full is dashboard._cache["data"]
+    assert RESPONSE_KEYS <= set(full)
+
+    before = calls.count("probe_services")
     dashboard.gather_status("services")
     # only-запросы не садятся на TTL short-circuit — light-данные остаются свежими
-    assert calls.count("probe_services") == 2
+    assert calls.count("probe_services") == before + 1
 
 
 def test_gather_status_only_drops_stale_keys_on_route_change(monkeypatch, tmp_path):
@@ -125,6 +137,45 @@ def test_gather_status_only_drops_stale_keys_on_route_change(monkeypatch, tmp_pa
     assert "ping" not in out
     assert dashboard._cache["active_route_key"] == ("hk-1", "203.0.113.20", "203.0.113.20")
     assert sorted(calls) == ["probe_ping", "probe_services"]
+
+
+def test_gather_status_full_request_does_not_serve_partial_wave_from_cache(monkeypatch, tmp_path):
+    """Находка code-review #376: partial-волна пишет в общий кэш — полный запрос
+    в пределах TTL не должен получить partial-данные как «полный» ответ."""
+    dashboard, calls = _setup(monkeypatch, tmp_path)
+
+    dashboard.gather_status("services")  # light-волна: в кэше только services
+    full = dashboard.gather_status()  # легаси-запрос в пределах TTL
+
+    assert len(calls) == len(PROBE_NAMES) + 1, (
+        "полный запрос после partial-волны обязан перегнать все пробы"
+    )
+    assert sorted(set(calls)) == sorted(PROBE_NAMES)
+    assert RESPONSE_KEYS <= set(full)
+    assert full is dashboard._cache["data"]
+
+    # обратное направление: полный прогон, затем partial, затем полный в TTL — кэш валиден
+    before = sorted(calls)
+    dashboard.gather_status("services")
+    cached = dashboard.gather_status()
+    assert cached is dashboard._cache["data"]
+    assert len(calls) == len(before) + 1, "partial между полными не должен будить полный TTL-кэш"
+
+
+def test_gather_status_partial_after_route_change_does_not_serve_stale_full_cache(monkeypatch, tmp_path):
+    """Смена маршрута сбрасывает и полноту кэша: полный запрос не берёт union старого VPS."""
+    dashboard, calls = _setup(monkeypatch, tmp_path)
+
+    dashboard.gather_status()  # полный прогон, маршрут sg-1
+    full_calls = len(calls)
+    _write_state(tmp_path / "srouter.local.json", _state("hk-1"))
+    dashboard.gather_status("services")  # волна нового маршрута
+    full = dashboard.gather_status()
+
+    assert "ping" in full and "tunnel" in full, (
+        "полный запрос после смены маршрута обязан пересчитать все пробы заново"
+    )
+    assert len(calls) > full_calls + 1
 
 
 def test_api_status_route_passes_only(monkeypatch, tmp_path):

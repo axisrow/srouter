@@ -438,6 +438,46 @@ def test_poll_light_failure_is_loud():
     assert res["renders"] == [], "без light-данных рендера нет"
 
 
+def test_poll_heavy_success_after_light_failure_renders_nothing():
+    """Находка code-review #376: успешный heavy при упавшем light не должен
+    перерендерить страницу (render глушит FETCH_FAILED) и маскировать сбой."""
+    body = _LAZY_STUBS.replace(
+        "function fetchJson(url) {",
+        "function fetchJson(url) {"
+        "  if (url.indexOf('services') !== -1) return Promise.reject(new Error('down'));"
+        "  if (url.indexOf('tunnel') !== -1) return Promise.resolve({ ping: { status: 'ok' } });",
+    )
+    body += (
+        "poll(true).then(function () {"
+        "  console.log(JSON.stringify({ calls: _calls, renders: _renders, "
+        "failed: _failed, toasts: _toasts }));"
+        "});"
+    )
+    res = _run_node(_harness(["poll", "statusQuery", "tabHeavy", "mergeStatus", "curTab", "validTab"], body))
+    assert res["failed"] == 1, "сбой light обязан остаться видимым"
+    assert res["renders"] == [], "heavy не рендерит страницу при упавшем light"
+
+
+def test_poll_heavy_success_rerenders_merged_after_light():
+    """Happy path: обе волны ок — heavy перерендеривает merged LAST_STATUS."""
+    body = _LAZY_STUBS.replace(
+        "function fetchJson(url) {",
+        "function fetchJson(url) {"
+        "  if (url.indexOf('tunnel') !== -1) return Promise.resolve({ ping: { status: 'ok' } });",
+    )
+    body += (
+        "poll(true).then(function () {"
+        "  console.log(JSON.stringify({ renders: _renders }));"
+        "});"
+    )
+    res = _run_node(_harness(["poll", "statusQuery", "tabHeavy", "mergeStatus", "curTab", "validTab"], body))
+    assert len(res["renders"]) == 2, "два рендера: light и heavy"
+    # light-данные не затёрты heavy-волной; heavy смержен и отрисован.
+    # (порядок волн не фиксируем: с instant-стабами heavy может смержиться до light-рендера)
+    assert all("services" in r for r in res["renders"]), "light-данные не затёрты heavy-волной"
+    assert res["renders"][-1].get("ping", {}).get("status") == "ok", "heavy-данные смержены и отрисованы"
+
+
 def test_ensure_tab_data_loads_history_panels_only_on_history():
     """observe-панели истории грузятся только при входе на history; poll — на любой вкладке."""
     body = (

@@ -41,7 +41,7 @@ app = Flask(__name__)
 
 
 # ============================ сборка статуса ============================
-_cache = {"ts": 0.0, "data": None, "active_route_ip": "", "active_route_key": None}
+_cache = {"ts": 0.0, "full_ts": 0.0, "data": None, "active_route_ip": "", "active_route_key": None}
 _lock = threading.Lock()
 
 
@@ -95,7 +95,9 @@ def gather_status(only=None):
                 only is None
                 and _cache["data"]
                 and _cache.get("active_route_key") == active_route_key
-                and now - _cache["ts"] < STATUS_CACHE_TTL_SEC
+                # full_ts — ts последнего ПОЛНОГО прогона: partial-волна пишет в общий
+                # кэш, но легаси-запрос не должен получить partial-данные из TTL-кэша.
+                and now - _cache.get("full_ts", 0.0) < STATUS_CACHE_TTL_SEC
             ):
                 return _cache["data"]
     except lock_hierarchy.LockAcquireTimeout:
@@ -132,12 +134,16 @@ def gather_status(only=None):
         ):
             # Кэш МЕРЖИТ волны ?only= (light-ответ не затирает fresh heavy-ключи);
             # смена маршрута сбрасывает базу — устаревшие heavy-ключи не протекают.
+            # full_ts: полнота кэша — только от полного прогона (merge её сохраняет,
+            # сброс базы и partial-волна — нет).
             if _cache["data"] and _cache.get("active_route_key") == active_route_key:
                 base = dict(_cache["data"])
                 base.update(out)
+                full_ts = now if only is None else _cache.get("full_ts", 0.0)
             else:
                 base = out
-            _cache.update(ts=now, data=base, active_route_ip=active_route_ip, active_route_key=active_route_key)
+                full_ts = now if only is None else 0.0
+            _cache.update(ts=now, full_ts=full_ts, data=base, active_route_ip=active_route_ip, active_route_key=active_route_key)
     except lock_hierarchy.LockAcquireTimeout:
         pass  # skip-write; кэш не критичен
     if only is None:

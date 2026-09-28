@@ -2200,9 +2200,11 @@
       setRefreshing(true);
       var tab = curTab();
       var heavy = tabHeavy(tab);
+      var lightOk = false;
       // Волна 1: локальные пробы — первый рендер не ждёт сеть. Ошибка → no_server + toast.
       var light = fetchJson('/api/status?' + statusQuery(tab, 'light'))
         .then(function (d) {
+          lightOk = true;
           mergeStatus(d);
           // ranking нужен только селектору узлов на вкладке прокси
           var ranking = (tab === 'proxy')
@@ -2211,9 +2213,14 @@
           return ranking.then(function (r) { render(LAST_STATUS, r); });
         });
       // Волна 2: тяжёлые сетевые пробы вкладки. Тихий catch — волна 1 уже отрисовала.
+      // При упавшем light НЕ рендерим: render глушит FETCH_FAILED и маскировал бы сбой.
       var heavyWave = heavy
         ? fetchJson('/api/status?' + statusQuery(tab, 'heavy'))
-            .then(function (d) { mergeStatus(d); render(LAST_STATUS, LAST_RANKING); })
+            .then(function (d) {
+              mergeStatus(d);
+              if (!lightOk) return;
+              render(LAST_STATUS, LAST_RANKING);
+            })
             .catch(function () {})
         : null;
       currentPoll = light
