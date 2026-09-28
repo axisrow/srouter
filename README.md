@@ -271,15 +271,18 @@ VPN и добавляет split-route (от root, без osascript). Дашбо�
 Watchdog пушит события деградации, и каждый пуш отвечает на два вопроса: **что** произошло и
 **почему** (какой участок сети виноват).
 
-События (звук): «туннель/стек упал» (Basso) — всё мертво; «стек деградировал» / «состав деградации
-изменился» (Ping) — упали driver-проверки (порты/туннель/маршруты), а не метрика скорости; «стек
-восстановлен» и «стек восстановился из деградации» (Glass) — возврат в ok, второй только если
-деградация была уведомлена пушем (симметрия против спама осцилляции, #315). Частоту держат cooldown
-900с + гистерезис 2 пробы + флап-гейт туннеля (50% фейлов за 15м).
+События (звук): «Упало: …» (Basso) — всё мертво; «Деградация N/M: …» (Ping) — упали
+driver-проверки (порты/туннель/маршруты), а не метрика скорости; «Восстановлено» и «Деградация
+прошла (было: …)» (Glass) — возврат в ok, второй только если деградация была уведомлена пушем
+(симметрия против спама осцилляции, #315). Частоту держат cooldown 900с + гистерезис 2 пробы +
+флап-гейт туннеля (50% фейлов за 15м).
 
-Формат пула: `стек деградировал (+туннель (…) (connection-failed — 7/11 фейлов за 15м)) — 2 из 9
-проверок; сегмент: транзит до VPS — RTT до VPS ×3.1 (85→265мс), потери 14%`. Счётчик «N из M» —
-масштаб (M = driver-проверки); «сегмент: …» — атрибуция.
+Формат пушей — под баннер macOS (~90 видимых символов, инверсия пирамиды): `Деградация 1/9:
+туннель — connection-failed, rc=28 SSL connection timeout, 6/12 фейлов/15м; транзит до VPS (RTT
+до VPS ×3.1)`. Счётчик N/M в лейбле (M = driver-проверки); при смене состава — `+VPS, −codex;
+деградируют: …`; хвост — тех. характеристики (kind, rc, err, окно) первого driver'а с причиной
+и сегмент-атрибуция. Имена чеков без скобок-описаний (полные — в `srouter netprobe report` и
+status.jsonl).
 
 Атрибуция (`diagnose_degradation` в `diag_netprobe.py`) переиспользует два существующих источника,
 без новых проб: фазные тайминги curl через туннель (`metrics_store.summarize`: ratio каждой фазы
@@ -289,7 +292,7 @@ Watchdog пушит события деградации, и каждый пуш 
 TLS при чистом connect → **DPI/потери на пути**. Пороги: ratio ≥ 1.5, потери ≥ 10% или ≥ 2× фона.
 Данных не хватает → заметки нет (fail-open). Полный разбор — `srouter netprobe report`; форензика —
 `~/Library/Logs/srouter-watchdog.status.jsonl` (поле `segment`). Env-ручки:
-`SROUTER_WATCHDOG_DEGRADED_{COOLDOWN,CONFIRM,PUSH_MAX,REASON_MAX}`.
+`SROUTER_WATCHDOG_DEGRADED_{COOLDOWN,CONFIRM}`, `SROUTER_WATCHDOG_TUNNEL_FAIL_RATE`.
 
 ## Изоляция Codex: PF kill-switch + SOCKS5-wrappers
 
@@ -723,15 +726,18 @@ goes up and adds the split-route (as root, no osascript). The dashboard shows th
 Watchdog pushes degradation events, and each push answers two questions: **what** happened and
 **why** (which network segment is to blame).
 
-Events (sound): "tunnel/stack down" (Basso) — everything is dead; "stack degraded" / "degradation
-set changed" (Ping) — driver checks failed (ports/tunnel/routes), not a speed metric; "stack
-recovered" and "stack recovered from degradation" (Glass) — back to ok, the latter only if the
-degradation was actually pushed (anti-oscillation symmetry, #315). Frequency is held by a 900s
-cooldown + 2-probe hysteresis + tunnel flap gate (50% failures per 15m).
+Events (sound): `Упало: …` (Basso) — everything is dead; `Деградация N/M: …` (Ping) — driver
+checks failed (ports/tunnel/routes), not a speed metric; `Восстановлено` and `Деградация прошла
+(было: …)` (Glass) — back to ok, the latter only if the degradation was actually pushed
+(anti-oscillation symmetry, #315). Frequency is held by a 900s cooldown + 2-probe hysteresis +
+tunnel flap gate (50% failures per 15m).
 
-Push format: `stack degraded (+tunnel (…) (connection-failed — 7/11 failures per 15m)) — 2 of 9
-checks; segment: transit to VPS — RTT to VPS ×3.1 (85→265ms), loss 14%`. The "N of M" counter shows
-the scale (M = driver checks); "segment: …" is the attribution.
+Push format — sized for the macOS banner (~90 visible chars, inverted pyramid; push texts are
+in Russian): `Деградация 1/9: туннель — connection-failed, rc=28 SSL connection timeout, 6/12
+фейлов/15м; транзит до VPS (RTT ×3.1)`. The N/M counter sits in the label (M = driver checks);
+on set change — `+VPS, −codex; деградируют: …`; the tail carries the tech specs (kind, rc, err,
+window) of the first failing driver plus the segment attribution. Check names drop their
+parenthetical descriptions (full names live in `srouter netprobe report` and status.jsonl).
 
 Attribution (`diagnose_degradation` in `diag_netprobe.py`) reuses two existing sources, no new
 probes: per-phase curl timings through the tunnel (`metrics_store.summarize`: each phase's ratio
@@ -741,7 +747,7 @@ phase up → **transit to VPS**; legs clean but TTFB up → **the VPS itself**; 
 connect → **DPI/path loss**. Thresholds: ratio ≥ 1.5, loss ≥ 10% or ≥ 2× baseline. Not enough
 data → no note (fail-open). Full breakdown — `srouter netprobe report`; forensics —
 `~/Library/Logs/srouter-watchdog.status.jsonl` (`segment` field). Env knobs:
-`SROUTER_WATCHDOG_DEGRADED_{COOLDOWN,CONFIRM,PUSH_MAX,REASON_MAX}`.
+`SROUTER_WATCHDOG_DEGRADED_{COOLDOWN,CONFIRM}`, `SROUTER_WATCHDOG_TUNNEL_FAIL_RATE`.
 
 ## Codex isolation: PF kill-switch + SOCKS5 wrappers
 

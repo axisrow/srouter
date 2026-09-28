@@ -26,6 +26,7 @@ import json
 import math  # isfinite для env-парсера флап-гейта (#362 review: nan/inf → дефолт)
 import logging
 import os
+import re
 import socket  # noqa: F401 — re-export для monkeypatch health.socket.getaddrinfo (health_probes._resolve_host)
 import subprocess
 import sys as _sys
@@ -85,25 +86,6 @@ WATCHDOG_STATUS_LOG = Path.home() / "Library" / "Logs" / "srouter-watchdog.statu
 _DEGRADED_NOTIFY_COOLDOWN_DEFAULT_SEC = 900
 _DEGRADED_NOTIFY_COOLDOWN_ENV = "SROUTER_WATCHDOG_DEGRADED_COOLDOWN"
 
-# #353: разница состава в пуше «состав деградации изменился» — что добавилось/что ушло.
-# Формат env-параметризуем (канон more-options-better), лимит длины — пуш читается
-# на телефоне; приоритет added (новые первыми), ушедшие при обрезке — счётчиком.
-_DEGRADED_DIFF_TEMPLATE_ENV = "SROUTER_WATCHDOG_DEGRADED_DIFF_TEMPLATE"
-_DEGRADED_DIFF_TEMPLATE_DEFAULT = "{added}; {removed}"
-_DEGRADED_DIFF_PUSH_MAX_LEN_ENV = "SROUTER_WATCHDOG_DEGRADED_PUSH_MAX"
-# 400 (было 160): причина «как именно деградировало» не должна резаться до «10808…»;
-# счётчик «N из M» и хвост полного состава за лимитом не считаются (осознанно).
-_DEGRADED_DIFF_PUSH_MAX_LEN_DEFAULT = 400
-
-# #358 п.1: причина добавившегося драйвера в пуше — detail пробы (или компактная цифра
-# из него). Формат env-параметризуем (канон more-options-better), причина обрезается
-# до REASON_MAX — пуш читается на телефоне. Без detail — голое «+имя».
-_DEGRADED_ADDED_TEMPLATE_ENV = "SROUTER_WATCHDOG_DEGRADED_ADDED_TEMPLATE"
-_DEGRADED_ADDED_TEMPLATE_DEFAULT = "+{name} ({reason})"
-_DEGRADED_REASON_MAX_ENV = "SROUTER_WATCHDOG_DEGRADED_REASON_MAX"
-# 100 (было 48): «runtime: смешанные сессии — 10808 (PID …)» обрезалось до «10808…» —
-# пользователь пуша не видел, КАК именно деградировало.
-_DEGRADED_REASON_MAX_DEFAULT = 100
 # #358 п.2: анти-флап гистерезис — смена состава пушится только после N проб подряд
 # с одним и тем же новым составом (probe-интервал ~20с → окно ~40с при N=2). Фильтр на
 # входе; cooldown (#326) остаётся верхней границей частоты поверх него. 1 = легаси.
@@ -946,18 +928,19 @@ def _print_degradation_legend():
     """Легенда модели деградации для doctor (srouter doctor): что пушится, с какой
     частотой, чем регулируется — «что вообще база деградации» отвечает документация
     рядом с выводом, без чтения исходников (#315-серия)."""
-    print("\nПуши деградации (watchdog):")
-    print("  • «туннель/стек упал» (Basso) — всё мертво; «стек восстановлен» и "
-          "«стек восстановился из деградации» (Glass) — возврат в ok; второй — только "
-          "если деградация была уведомлена пушем.")
-    print("  • «стек деградировал» / «состав деградации изменился» (Ping) — упали "
-          "driver-проверки (порты/туннель/маршруты), а не метрика скорости; «N из M "
-          "проверок» — масштаб; cooldown 900с и гистерезис 2 пробы против флапа.")
-    print("  • «; сегмент: …» — атрибуция «почему тормозит» (Wi-Fi/провайдер/транзит/"
-          "VPS/DPI); полный разбор — srouter netprobe report, форензика — "
+    print("\nПуши деградации (watchdog), формат под баннер (~90 симв. видимых):")
+    print("  • «Упало: …» (Basso) — всё мертво; «Восстановлено» и «Деградация прошла "
+          "(было: …)» (Glass) — возврат в ok; второй — только если деградация была "
+          "уведомлена пушем.")
+    print("  • «Деградация N/M: имена — спец» (Ping) — упали driver-проверки (порты/"
+          "туннель/маршруты), а не метрика скорости; спец = kind отказа, rc, окно "
+          "фейлов; при смене состава: «+X, −Y; деградируют: …»; cooldown 900с и "
+          "гистерезис 2 пробы против флапа.")
+    print("  • «; сегмент (evidence)» — атрибуция «почему тормозит» (Wi-Fi/провайдер/"
+          "транзит/VPS/DPI); полный разбор — srouter netprobe report, форензика — "
           f"{WATCHDOG_STATUS_LOG.name}")
-    print("  • env-ручки: SROUTER_WATCHDOG_DEGRADED_COOLDOWN, _CONFIRM, _PUSH_MAX, "
-          "_REASON_MAX (README: «Пуши деградации»).")
+    print("  • env-ручки: SROUTER_WATCHDOG_DEGRADED_COOLDOWN, _CONFIRM, "
+          "SROUTER_WATCHDOG_TUNNEL_FAIL_RATE (README: «Пуши деградации»).")
 
 
 def _degraded_notify_cooldown_sec():
@@ -984,29 +967,6 @@ def _degraded_confirm_probes():
         return _DEGRADED_CONFIRM_DEFAULT
 
 
-def _degraded_reason_max_len():
-    """Лимит длины причины добавившегося драйвера (#358): clamp [0, 400], 0 — причины
-    выключены (голое «+имя»). Мусор → дефолт."""
-    raw = os.environ.get(_DEGRADED_REASON_MAX_ENV)
-    if raw is None:
-        return _DEGRADED_REASON_MAX_DEFAULT
-    try:
-        return max(0, min(400, int(raw)))
-    except ValueError:
-        return _DEGRADED_REASON_MAX_DEFAULT
-
-
-def _degraded_diff_push_max_len():
-    """Лимит длины diff-части пуша (#353): clamp [40, 1000], мусор → дефолт."""
-    raw = os.environ.get(_DEGRADED_DIFF_PUSH_MAX_LEN_ENV)
-    if raw is None:
-        return _DEGRADED_DIFF_PUSH_MAX_LEN_DEFAULT
-    try:
-        return max(40, min(1000, int(raw)))
-    except ValueError:
-        return _DEGRADED_DIFF_PUSH_MAX_LEN_DEFAULT
-
-
 def _truncate_reason_text(text, limit):
     """Обрезка причины по словам с «…» (#362 п.3): не посреди токена и не с висячей
     открывающей скобкой («(PID 10» — мусор в пуше). Нет пробела в пределах лимита
@@ -1028,104 +988,49 @@ def _truncate_reason_text(text, limit):
     return cut.rstrip().rstrip(",;—-") + "…"
 
 
-def _format_added_driver(name, reason):
-    """«+имя (причина)» — добавившийся драйвер в пуше (#358 п.1). Без причины (или при
-    REASON_MAX=0) — голое «+имя»; битый env-шаблон → дефолт (канон #355: форма пуша
-    не должна ронять watchdog-тик, включая AttributeError от атрибутного доступа)."""
-    if not reason:
-        return "+" + name
-    limit = _degraded_reason_max_len()
-    if limit <= 0:
-        return "+" + name
-    reason = _truncate_reason_text(reason, limit)
-    template = os.environ.get(_DEGRADED_ADDED_TEMPLATE_ENV) or _DEGRADED_ADDED_TEMPLATE_DEFAULT
-    try:
-        return template.format(name=name, reason=reason)
-    except (AttributeError, KeyError, IndexError, ValueError):
-        return _DEGRADED_ADDED_TEMPLATE_DEFAULT.format(name=name, reason=reason)
+def _short_check_name(name):
+    """Имя чека без хвостовой скобки-описания: «туннель (api.anthropic.com через прокси)»
+    → «туннель» — для текста пуша (бюджет баннера ~90 симв.). Полные имена остаются
+    в audit-JSONL и report. Не бросает."""
+    return re.sub(r"\s*\([^)]*\)\s*$", "", str(name or "")).strip()
 
 
-def _format_degradation_tail(failed, reasons):
-    """Хвост «деградируют: имя (причина), …» — полный ТЕКУЩИЙ состав с причинами.
-
-    Ставится в пуши «состав … изменился», где diff отвечает только «что изменилось»,
-    а пользователь спрашивает ещё и «что деградирует сейчас» (один пуш — полная
-    картина). Причины режутся тем же _truncate_reason_text; пустой failed → ""
-    (хвост не добавляется). Не бросает.
-    """
-    parts = []
-    for name in sorted(failed):
-        reason = reasons.get(name) if isinstance(reasons, dict) else None
-        if isinstance(reason, str) and reason:
-            parts.append(f"{name} ({_truncate_reason_text(reason, _degraded_reason_max_len())})")
-        else:
-            parts.append(name)
-    return f"деградируют: {', '.join(parts)}" if parts else ""
-
-
-def _format_degradation_diff(added, removed, reasons=None):
-    """Текст разницы состава деградации (#353): «+новые; −ушедшие», новые первыми.
-
-    #358 п.1: добавившиеся несут краткую причину из пробы (reasons: {имя: detail}),
-    ушедшие — только имена. Лимит длины (SROUTER_WATCHDOG_DEGRADED_PUSH_MAX, дефолт
-    160) с приоритетом added: при обрезке добавившиеся перечисляются максимально полно
-    (+N др.), ушедшие схлопываются в счётчик (−N ушедших). #362 п.3: причины при
-    переполнении отбрасываются первыми — полный список имён важнее причин (2-3 драйвера
-    печатаются целиком). Пустая разница → "".
-    Не бросает (битый шаблон → дефолт): текст пуша не должен ронять watchdog-тик.
-    """
-    added = sorted(added)
-    removed = sorted(removed)
-    if not added and not removed:
+def _compact_reason(detail):
+    """Тех. характеристики деградации одной строкой: kind отказа, rc=NN + err-фраза
+    (≤25 симв.), окно «6/12 фейлов/15м». Структурный парсинг — только для гейт-формата
+    («{kind} — N/M фейлов за Nм, rc=NN (err)»); произвольный detail — обрезка по
+    словам до 60, без выдуманного разбора. Не бросает."""
+    text = str(detail or "").strip()
+    if not text:
         return ""
-    reasons = reasons or {}
-    template = os.environ.get(_DEGRADED_DIFF_TEMPLATE_ENV) or _DEGRADED_DIFF_TEMPLATE_DEFAULT
+    win = re.search(r"\b(\d+/\d+) фейлов за (\d+)м", text)
+    if not win:
+        return _truncate_reason_text(text, 60)
+    rc = re.search(r"\brc=(\d+)(?: \((?:curl: \(\d+\) )?([^)]+))?", text)
+    parts = []
+    kind = _short_check_name(text.split(" — ")[0])
+    if kind:
+        parts.append(kind)
+    if rc:
+        err = (rc.group(2) or "").strip()
+        if len(err) > 25:
+            err = err[:25].rstrip() + "…"
+        parts.append(f"rc={rc.group(1)}" + (f" {err}" if err else ""))
+    parts.append(f"{win.group(1)} фейлов/{win.group(2)}м")
+    return ", ".join(parts)
 
-    def _join(added_part, removed_part):
-        try:
-            out = template.format(added=added_part, removed=removed_part)
-        # AttributeError — тоже (cycle-review #355): str.format разрешает доступ к
-        # атрибутам ({added.real}) — вместе с KeyError/IndexError/ValueError уводим
-        # в дефолт: битый env-шаблон не должен валить watchdog-тик (прод 24/7).
-        except (AttributeError, KeyError, IndexError, ValueError):
-            out = _DEGRADED_DIFF_TEMPLATE_DEFAULT.format(added=added_part, removed=removed_part)
-        # «; »-разделитель не оставляет хвостов при пустой стороне — ни хвостового,
-        # ни ВЕДУЩЕГО (review P2: "{added}; {removed}" с пустым added → "; −x");
-        # имена драйверов «;» не содержат, шаблоны без «;»-краёв не затронуты.
-        return out.strip().strip(";").strip()
 
-    limit = _degraded_diff_push_max_len()
-
-    added_full = ", ".join(_format_added_driver(name, reasons.get(name)) for name in added)
-    removed_full = ", ".join("−" + name for name in removed)
-    full = _join(added_full, removed_full)
-    if len(full) <= limit:
-        return full
-    # Не влезло: ушедшие — кратко (счётчиком), added — максимально полно.
-    removed_short = f"−{len(removed)} ушедших" if removed else ""
-    candidate = _join(added_full, removed_short)
-    if len(candidate) <= limit:
-        return candidate
-    # #362 п.3: имена важнее причин — при переполнении причины отбрасываются ПЕРВЫМИ:
-    # 2-3 драйвера печатаются ПОЛНЫМ списком имён, «+N др.» не скрывает состав.
-    # Причины остаются только когда влезают целиком (ветка выше).
-    bare_added = ", ".join("+" + name for name in added)
-    candidate = _join(bare_added, removed_short)
-    if len(candidate) <= limit:
-        return candidate
-    for keep in range(len(added), 0, -1):
-        head = ", ".join("+" + name for name in added[:keep])
-        rest = len(added) - keep
-        if rest:
-            head += f", +{rest} др."
-        # Приоритет added: сначала жертвуем полнотой added-перечня (счётчик), затем
-        # removed-частью вовсе — новые драйверы важнее перечня ушедших (#353 п.1).
-        for removed_part in (removed_short, ""):
-            candidate = _join(head, removed_part)
-            if len(candidate) <= limit:
-                return candidate
-    # Экзотика (одно имя длиннее лимита): сигнал важнее длины — отдаём последний вариант.
-    return candidate
+def _segment_short(note):
+    """«транзит до VPS (RTT до VPS ×3.1)» — компактный суффикс из полной заметки
+    «сегмент: {suspect} — {evidence}» (_tunnel_parameter_note): главный параметр
+    атрибуции, остальное — в netprobe report. Не бросает."""
+    body = note.removeprefix("сегмент: ") if isinstance(note, str) else ""
+    suspect, _, evidence = body.partition(" — ")
+    if not suspect:
+        return ""
+    if not evidence.strip():
+        return suspect
+    return f"{suspect} ({_truncate_reason_text(evidence.split(', ')[0], 30)})"
 
 
 def _read_watchdog_prev_state():
@@ -1345,11 +1250,11 @@ def _cmd_watchdog_locked(result):
     #   от фактического — включая подавленный cooldown'ом (P1-1) — событие с cooldown.
     last_push = prev["last_degraded_push"] if prev else 0.0
     if cur == "down" and prev_status in ("ok", "degraded", ""):
-        _notify(f"туннель/стек упал ({', '.join(failed)})", "Basso")
+        _notify(f"Упало: {', '.join(_short_check_name(n) for n in failed)}", "Basso")
         notified_failed = failed
         pending_failed, pending_streak = None, 0
     elif cur == "ok" and prev_status == "down":
-        _notify("стек восстановлен", "Glass")
+        _notify("Восстановлено", "Glass")
         notified_failed = []
         pending_failed, pending_streak = None, 0
     elif cur in ("degraded", "down"):
@@ -1375,39 +1280,36 @@ def _cmd_watchdog_locked(result):
         # «деградировал ()» не пушим, анонсировать нечего.
         if failed and (new_degradation or unnotified) and confirmed and \
                 time.time() - last_push >= _degraded_notify_cooldown_sec():
-            # Лейбл по prev_status (PR #326 review P3): «деградировал» — только вход из
-            # ok/fresh; не-ok→не-ok (в т.ч. down→degraded с СОКРАТИВШИМСЯ набором) —
-            # «состав изменился», не ложное ухудшение в момент улучшения. #358: при
-            # гистерезисном подтверждении входа в degraded prev_status УЖЕ degraded,
-            # но уведомлённый состав пуст (до этого ок) — это вход, не смена.
-            if prev_status in ("", "ok") or notified_failed == []:
-                label = "стек деградировал"
+            # Формат под баннер macOS (~90 видимых симв., 2 строки): тех. характеристики
+            # — вперёд; дубль имён/причин и скобки-описания имён — долой. Вход в
+            # деградацию: состав + спец; смена состава: delta + текущий состав + спец.
+            label = f"Деградация {len(failed)}/{driver_total}" if driver_total else "Деградация"
+            short_failed = [_short_check_name(n) for n in failed]
+            if prev_status in ("", "ok") or notified_failed in (None, []):
+                # #353 п.2: вход в деградацию — весь состав виден целиком; #358: при
+                # гистерезисном подтверждении notified=[] — это вход, не смена.
+                body = ", ".join(short_failed)
             else:
-                label = "состав отказа изменился" if cur == "down" else "состав деградации изменился"
-            # #353: текст пуша — сама разница с последнего УВЕДОМЛЁННОГО состава
-            # («+новые; −ушедшие», новые первыми). Первый ok→degraded: notified=[]
-            # → весь состав виден как added (п.2). Legacy notified=None → старый
-            # перечень (разница неизвестна). Тяжесть проб не растёт: множества уже
-            # вычислены в state. #358 п.1: добавившиеся несут причину из пробы.
-            if notified_failed is not None:
                 diff_added = sorted(set(failed) - set(notified_failed))
                 diff_removed = sorted(set(notified_failed) - set(failed))
-                detail = _format_degradation_diff(
-                    diff_added, diff_removed, reasons=reasons) or ", ".join(failed)
-            else:
-                detail = ", ".join(failed)
-            # «Состав … изменился» отвечает «что изменилось»; хвост добавляет «что
-            # деградирует СЕЙЧАС» (полный состав с причинами). На «стек деградировал»
-            # diff уже и есть полный состав — дубль не нужен.
-            tail = _format_degradation_tail(failed, reasons) if "изменился" in label else ""
-            inner = f"{detail}; {tail}" if tail else detail
-            # Счётчик «N из M»: масштаб сразу виден и ясно, что база деградации —
-            # упавшие driver-проверки, а не метрика скорости. За PUSH-лимитом не режется.
-            counter = (f" — {len(failed)} из {driver_total} проверок"
-                       if driver_total else "")
-            msg = f"{label} ({inner}){counter}"
+                delta = []
+                if diff_added:
+                    delta.append("+" + ", +".join(_short_check_name(n) for n in diff_added))
+                if diff_removed:
+                    delta.append("−" + ", −".join(_short_check_name(n) for n in diff_removed))
+                body = "; ".join(delta) + f"; деградируют: {', '.join(short_failed)}"
+            # Тех. характеристики: компакт detail'а первого (sorted) driver'а с причиной —
+            # kind отказа, rc=NN + err-фраза, окно «6/12 фейлов/15м» (#кампания-2026-09).
+            spec = ""
+            for name in sorted(failed):
+                if reasons.get(name):
+                    spec = _compact_reason(reasons[name])
+                    break
+            msg = f"{label}: {body}"
+            if spec:
+                msg += f" — {spec}"
             if segment_note:
-                msg += f"; {segment_note}"
+                msg += f"; {_segment_short(segment_note)}"
             _notify(msg, "Ping")
             notified_failed = failed
             last_push = time.time()
@@ -1423,8 +1325,8 @@ def _cmd_watchdog_locked(result):
         # recovery невозможен: state-запись ниже обнуляет notified_failed при cur=ok.
         if (prev_status in ("ok", "degraded") and isinstance(notified_failed, list)
                 and notified_failed):
-            _notify(f"стек восстановился из деградации ({', '.join(notified_failed)})",
-                    "Glass")
+            _notify(f"Деградация прошла (было: "
+                    f"{', '.join(_short_check_name(n) for n in notified_failed)})", "Glass")
 
     try:
         # _write_watchdog_state сам делает json.dumps + atomic-write (tmp+fsync+rename,
