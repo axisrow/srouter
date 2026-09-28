@@ -59,6 +59,7 @@
     /* Календарь инцидентов: строка = день, 24 часовых сегмента (status-page стиль). */
     .inc-row { display:flex; align-items:center; gap:2px; margin-bottom:2px; }
     .inc-date { width:44px; flex:none; font-size:.72rem; color:var(--bs-secondary-color); }
+    .inc-hour { flex:1 1 0; min-width:3px; text-align:center; font-size:.6rem; color:var(--bs-secondary-color); }
     .inc-seg { flex:1 1 0; height:13px; min-width:3px; border-radius:2px; }
     .inc-ok { background:var(--bs-success); opacity:.85; }
     .inc-low { background:var(--bs-warning); }
@@ -1859,7 +1860,11 @@
         el.innerHTML = '<div class="text-body-secondary small">' + esc(t('incidents_none')) + '</div>';
         return;
       }
-      var rows = d.days.map(function (day) {
+      var hoursHead = '<div class="inc-row"><span class="inc-date"></span>' +
+        d.days[0].hours.map(function (_, h) {
+          return '<div class="inc-hour">' + pad2(h) + '</div>';
+        }).join('') + '</div>';
+      var rows = hoursHead + d.days.map(function (day) {
         var cells = day.hours.map(function (h, hr) {
           var cls = incClass(h);
           if (!h) return '<div class="inc-seg ' + cls + '"></div>';
