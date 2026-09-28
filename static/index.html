@@ -20,6 +20,13 @@
     .toast-container { z-index: 1090; }
     /* cinematic */
     body.mode-simple .cine { display: none !important; }
+    /* Вкладки: показываем только карточки активной вкладки (data-tab на body).
+       Селектор по [data-tab] без .card: у JS-карточек атрибут на внешнем col-диве —
+       иначе скрытый .card оставлял бы пустую колонку в .row. */
+    body[data-tab="overview"] [data-tab]:not([data-tab="overview"]) { display: none; }
+    body[data-tab="proxy"] [data-tab]:not([data-tab="proxy"]) { display: none; }
+    body[data-tab="history"] [data-tab]:not([data-tab="history"]) { display: none; }
+    body[data-tab="diag"] [data-tab]:not([data-tab="diag"]) { display: none; }
     .flow-strip { display:flex; flex-wrap:wrap; align-items:stretch; gap:.5rem; }
     .flow-node { flex:1 1 0; min-width:150px; border:1px solid var(--bs-border-color);
       border-radius:.6rem; padding:.6rem .75rem; background:var(--bs-body-bg);
@@ -102,7 +109,14 @@
   </nav>
 
   <div class="container-fluid">
-    <div class="card mb-3">
+    <ul class="nav nav-pills mb-3">
+      <li class="nav-item"><a class="nav-link" href="#overview" data-tab-btn="overview" data-i18n="tab_overview">Overview</a></li>
+      <li class="nav-item"><a class="nav-link" href="#proxy" data-tab-btn="proxy" data-i18n="tab_proxy">Proxy</a></li>
+      <li class="nav-item"><a class="nav-link" href="#history" data-tab-btn="history" data-i18n="tab_history">History</a></li>
+      <li class="nav-item"><a class="nav-link" href="#diag" data-tab-btn="diag" data-i18n="tab_diag">Diagnostics</a></li>
+    </ul>
+
+    <div class="card mb-3" data-tab="overview">
       <div class="card-header d-flex align-items-center">
         <i class="bi bi-diagram-3 me-2"></i>
         <span data-i18n="flow_title">Connection flow</span>
@@ -115,7 +129,7 @@
 
     <div id="cards" class="row g-3"></div>
 
-    <div class="card mt-3">
+    <div class="card mt-3" data-tab="proxy">
       <div class="card-header d-flex align-items-center">
         <i class="bi bi-hdd-rack me-2"></i>
         <span data-i18n="node_selector_title">Node selection</span>
@@ -126,7 +140,7 @@
       </div>
     </div>
 
-    <div class="card mt-3">
+    <div class="card mt-3" data-tab="proxy">
       <div class="card-header d-flex align-items-center">
         <i class="bi bi-wifi me-2"></i>
         <span data-i18n="channel_title">Network channel</span>
@@ -137,7 +151,7 @@
       </div>
     </div>
 
-    <div class="card mt-3">
+    <div class="card mt-3" data-tab="diag">
       <div class="card-header d-flex align-items-center">
         <i class="bi bi-shield-check me-2"></i>
         <span data-i18n="guard_title">Traffic Guard</span>
@@ -150,7 +164,7 @@
       </div>
     </div>
 
-    <div class="card mt-3">
+    <div class="card mt-3" data-tab="proxy">
       <div class="card-header d-flex align-items-center">
         <i class="bi bi-shield-lock me-2"></i>
         <span data-i18n="isolate_title">Domain isolation (PF)</span>
@@ -161,7 +175,7 @@
       </div>
     </div>
 
-    <div class="card mt-3">
+    <div class="card mt-3" data-tab="proxy">
       <div class="card-header d-flex align-items-center">
         <i class="bi bi-sliders me-2"></i> <span data-i18n="ctrl_title">Control</span>
       </div>
@@ -192,7 +206,7 @@
   <!-- Единая панель прокси (вместо разрозненных карточек git/claude): одна таблица, где
        ДВЕ НЕЗАВИСИМЫЕ КОЛОНКИ — «настроен» (конфиг) и «физически» (замер трафика). Их
        расхождение и есть ответ на «работает ли прокси вообще». -->
-  <div class="card mt-3">
+  <div class="card mt-3" data-tab="proxy">
     <div class="card-header d-flex align-items-center flex-wrap gap-2">
       <i class="bi bi-shield-lock me-2"></i>
       <span data-i18n="proxy_panel_title">Proxy</span>
@@ -211,7 +225,7 @@
        connect/TLS/TTFB/total из уже идущих проб — ноль доп. трафика) + пассивный
        5xx-rate реального трафика из privoxy-лога. Тренд = медиана 15 мин против
        baseline «тот же час прошлых дней»; ничего не переключает автоматически. -->
-  <div class="card mt-3">
+  <div class="card mt-3" data-tab="history">
     <div class="card-header d-flex align-items-center flex-wrap gap-2">
       <i class="bi bi-activity me-2"></i>
       <span data-i18n="metrics_title">Tunnel quality (trend)</span>
@@ -223,7 +237,7 @@
   </div>
 
   <!-- Инциденты watchdog: почасовой календарь из status.jsonl (наблюдение, ничего не переключает). -->
-  <div class="card mt-3">
+  <div class="card mt-3" data-tab="history">
     <div class="card-header d-flex align-items-center flex-wrap gap-2">
       <i class="bi bi-calendar3-week me-2"></i>
       <span data-i18n="incidents_title">Incidents — hourly, 30 days</span>
@@ -351,6 +365,7 @@
         hot_routes_empty: "no cached domains yet", hot_routes_count: "count",
         hot_routes_help: "Observe-only: the cache stays local and is not uploaded.",
         metrics_title: "Tunnel quality (trend)",
+        tab_overview: "Overview", tab_proxy: "Proxy", tab_history: "History", tab_diag: "Diagnostics",
         incidents_title: "Incidents — hourly, 30 days",
         incidents_tooltip: "incidents: {0} · {1}",
         incidents_none: "no incident data yet",
@@ -477,6 +492,7 @@
         hot_routes_empty: "в кэше пока нет доменов", hot_routes_count: "счётчик",
         hot_routes_help: "Только наблюдение: кэш остаётся локальным и не загружается наружу.",
         metrics_title: "Качество туннеля (тренд)",
+        tab_overview: "Обзор", tab_proxy: "Прокси", tab_history: "История", tab_diag: "Диагностика",
         incidents_title: "Инциденты — по часам, 30 дней",
         incidents_tooltip: "инцидентов: {0} · {1}",
         incidents_none: "данных об инцидентах пока нет",
@@ -601,6 +617,7 @@
         hot_routes_empty: "缓存中暂无域名", hot_routes_count: "计数",
         hot_routes_help: "仅观察：缓存保留在本机，不会上传。",
         metrics_title: "隧道质量（趋势）",
+        tab_overview: "概览", tab_proxy: "代理", tab_history: "历史", tab_diag: "诊断",
         incidents_title: "事件 — 按小时，30 天",
         incidents_tooltip: "事件数：{0} · {1}",
         incidents_none: "暂无事件数据",
@@ -779,11 +796,12 @@
     /* ============================ Card builder ============================ */
     function card(opts) {
       var col = opts.col || 'col-12 col-md-6 col-xl-4';
+      var tab = opts.tab || 'overview';
       var spark = opts.sparkKey
         ? '<div class="mt-2 text-secondary">' + sparkline(opts.sparkKey, sparkColor(opts.status)) + '</div>'
         : '';
       return '' +
-        '<div class="' + col + '">' +
+        '<div class="' + col + '" data-tab="' + tab + '">' +
           '<div class="card h-100">' +
             '<div class="card-body">' +
               '<div class="d-flex align-items-start">' +
@@ -1891,21 +1909,21 @@
       var html = '';
 
       html += card({
-        icon: 'bi-reception-4', title: t('card_anthropic'),
+        icon: 'bi-reception-4', title: t('card_anthropic'), tab: 'overview',
         value: (an.ms != null ? an.ms + ' ' + t('ms') : '—'),
         sub: 'HTTP ' + esc(an.code != null ? an.code : '—') + ' · ' + (an.up ? t('reachable') : t('unreachable')),
         status: (an.up ? 'ok' : 'down'), sparkKey: 'anthropic'
       });
 
       html += card({
-        icon: 'bi-reception-4', title: t('card_openai'),
+        icon: 'bi-reception-4', title: t('card_openai'), tab: 'overview',
         value: (oa.ms != null ? oa.ms + ' ' + t('ms') : '—'),
         sub: 'HTTP ' + esc(oa.code != null ? oa.code : '—') + ' · ' + (oa.up ? t('reachable') : t('unreachable')),
         status: (oa.up ? 'ok' : 'down'), sparkKey: 'openai'
       });
 
       html += card({
-        icon: 'bi-hdd-network', title: t('card_tunnel'),
+        icon: 'bi-hdd-network', title: t('card_tunnel'), tab: 'overview',
         value: badgeText(tun.status),
         sub: t('tunnel_sub'),
         status: tun.status
@@ -1913,7 +1931,7 @@
 
       var di = d.direct || {};
       html += card({
-        icon: 'bi-globe', title: t('card_direct'),
+        icon: 'bi-globe', title: t('card_direct'), tab: 'overview',
         value: (di.ms != null ? di.ms + ' ' + t('ms') : '—'),
         sub: 'HTTP ' + esc(di.code != null ? di.code : '—'),
         status: di.status, sparkKey: 'direct'
@@ -1921,7 +1939,7 @@
 
       var vp = d.vpn || {};
       html += card({
-        icon: 'bi-shield-lock', title: t('card_vpn'),
+        icon: 'bi-shield-lock', title: t('card_vpn'), tab: 'overview',
         value: (vp.vpn_up ? t('on') : t('off')),
         sub: t('iface') + ' ' + esc(vp.default_iface || '—') + ' · ' + t('srv') + ' ' + esc(vp.vpn_server || '—'),
         status: vp.status
@@ -1934,7 +1952,7 @@
         : '<button class="btn btn-sm btn-success act mt-2" data-url="/api/route/add">' +
           '<span class="lbl"><i class="bi bi-plus-lg"></i> ' + esc(t('split_enable')) + '</span></button>';
       html += card({
-        icon: 'bi-signpost-2', title: t('card_route'),
+        icon: 'bi-signpost-2', title: t('card_route'), tab: 'overview',
         value: (rt.split_active ? t('split_on') : t('split_off')),
         sub: t('iface') + ' ' + esc(rt.interface || '—') + ' · ' + t('gw') + ' ' + esc(rt.gateway || '—') +
              '<div>' + routeBtn + '</div>',
@@ -1944,7 +1962,7 @@
       var sv = d.services || {};
       var pv = sv.privoxy || {};
       html += card({
-        icon: 'bi-funnel', title: t('card_privoxy'),
+        icon: 'bi-funnel', title: t('card_privoxy'), tab: 'proxy',
         value: badgeText(pv.status),
         sub: svcLine(pv),
         status: pv.status
@@ -1952,7 +1970,7 @@
 
       var xr = sv.xray || {};
       html += card({
-        icon: 'bi-lightning-charge', title: t('card_xray'),
+        icon: 'bi-lightning-charge', title: t('card_xray'), tab: 'proxy',
         value: badgeText(xr.status),
         sub: svcLine(xr),
         status: xr.status
@@ -1961,7 +1979,7 @@
       var hr = d.hot_routes || {};
       var hotDomains = Array.isArray(hr.domains) ? hr.domains : [];
       html += card({
-        icon: 'bi-fire', title: t('card_hot_routes'),
+        icon: 'bi-fire', title: t('card_hot_routes'), tab: 'diag',
         value: hr.enabled === true ? (hotDomains.length + '/' + (hr.top_n || '—')) : t('off'),
         sub: hotRoutesSub(hr),
         status: hr.enabled === true ? (hr.status || 'ok') : 'disabled'
@@ -1973,14 +1991,14 @@
 
       var pg = d.ping || {};
       pushHistory('ping_vps', pg.vps_ms);
-      html += cineCard({ icon: 'bi-speedometer2', title: t('card_ping'),
+      html += cineCard({ icon: 'bi-speedometer2', title: t('card_ping'), tab: 'overview',
         value: (pg.vps_ms != null ? pg.vps_ms + ' ' + t('ms') : '—'),
         sub: t('ping_sub', (pg.vps_loss != null ? pg.vps_loss : 0),
                 (pg.vpn_ms != null ? pg.vpn_ms + ' ' + t('ms') : '—')),
         status: pg.status, sparkKey: 'ping_vps' });
 
       var gd = d.geo_distance || {};
-      html += cineCard({ icon: 'bi-rulers', title: t('card_distance'),
+      html += cineCard({ icon: 'bi-rulers', title: t('card_distance'), tab: 'overview',
         value: (gd.km != null ? gd.km.toLocaleString() + ' ' + t('km') : '—'),
         sub: (gd.from_city || gd.to_city) ? esc(gd.from_city || '?') + ' → ' + esc(gd.to_city || '?') : t('no_geo'),
         status: gd.status });
@@ -1991,7 +2009,7 @@
                (s.name ? ' <span class="opacity-75">' + esc(s.name) + '</span>' : '') +
                '<span class="dns-dot ' + (s.up ? 'dns-up' : 'dns-down') + '"></span></span>';
       }).join('');
-      html += cineCard({ icon: 'bi-globe-americas', title: t('card_dns_public'),
+      html += cineCard({ icon: 'bi-globe-americas', title: t('card_dns_public'), tab: 'diag',
         value: (dns.public || []).filter(function (s) { return s.up; }).length + '/' +
                (dns.public || []).length,
         sub: dnsList || t('no_data'), status: dnsCardStatus(dns), col: 'col-12 col-md-6 col-xl-4' });
@@ -2003,7 +2021,7 @@
           '<span class="fw-semibold">' + esc(i.name) + '</span> <span class="k">' + esc(i.addr || '—') +
           '</span> <span class="k">MTU ' + esc(i.mtu) + '</span></div>';
       }).join('');
-      html += cineCard({ icon: 'bi-ethernet', title: t('card_ifaces'),
+      html += cineCard({ icon: 'bi-ethernet', title: t('card_ifaces'), tab: 'diag',
         value: (ifd.ifaces || []).length + ' ' + t('active'),
         sub: ifList || t('no_data'), status: ifd.status, col: 'col-12 col-md-6 col-xl-8' });
 
@@ -2017,7 +2035,7 @@
           '<span class="fw-semibold">' + esc(e.iface) + '</span> ' +
           '<span class="k">' + esc(e.local_ip || '—') + '</span> → ' + ip + '</div>';
       }).join('');
-      html += cineCard({ icon: 'bi-globe', title: t('card_exit_ips'),
+      html += cineCard({ icon: 'bi-globe', title: t('card_exit_ips'), tab: 'diag',
         value: (eid.exits || []).length + ' ' + t('active'),
         sub: eiList || t('no_data'), status: eid.status, col: 'col-12 col-md-6 col-xl-8' });
 
@@ -2088,17 +2106,17 @@
     function renderFetchFailed() {
       FETCH_FAILED = true;
       var keys = [
-        ['bi-reception-4', 'card_anthropic'],
-        ['bi-reception-4', 'card_openai'],
-        ['bi-hdd-network', 'card_tunnel'],
-        ['bi-globe', 'card_direct'],
-        ['bi-shield-lock', 'card_vpn'],
-        ['bi-signpost-2', 'card_route'],
-        ['bi-funnel', 'card_privoxy'],
-        ['bi-lightning-charge', 'card_xray']
+        ['bi-reception-4', 'card_anthropic', 'overview'],
+        ['bi-reception-4', 'card_openai', 'overview'],
+        ['bi-hdd-network', 'card_tunnel', 'overview'],
+        ['bi-globe', 'card_direct', 'overview'],
+        ['bi-shield-lock', 'card_vpn', 'overview'],
+        ['bi-signpost-2', 'card_route', 'overview'],
+        ['bi-funnel', 'card_privoxy', 'proxy'],
+        ['bi-lightning-charge', 'card_xray', 'proxy']
       ];
       var html = keys.map(function (k) {
-        return card({ icon: k[0], title: t(k[1]), value: '—', sub: t('no_server'), status: 'unknown' });
+        return card({ icon: k[0], title: t(k[1]), tab: k[2], value: '—', sub: t('no_server'), status: 'unknown' });
       }).join('');
       document.getElementById('cards').innerHTML = html;
       var fs = document.getElementById('flow-strip');
@@ -2448,6 +2466,39 @@
     renderProxyPanel();  // каркас панели прокси до ответа сервера
     renderMetricsPanel();  // каркас панели качества туннеля до ответа сервера
     loadGuard();       // подтянуть block/allow правила + активный throttle из /api/guard
+    // ---- Вкладки: Обзор / Прокси / История / Диагностика ----
+    // Карточки помечены data-tab; скрытие — CSS по body[data-tab]. Фетчи не зависят
+    // от видимости (бейджи скрытых вкладок остаются свежими). Состояние: hash ↔
+    // localStorage['tab'] (ключи lang/theme/mode заняты), дефолт — обзор.
+    function validTab(name) {
+      // массив литералом (не константой снаружи): экстрактор тестов берёт только тела функций
+      return ['overview', 'proxy', 'history', 'diag'].indexOf(name) !== -1 ? name : '';
+    }
+
+    function initialTab(hash, stored) {
+      var fromHash = validTab(String(hash || '').replace(/^#/, ''));
+      if (fromHash) return fromHash;
+      return validTab(stored) || 'overview';
+    }
+
+    function applyTab(name) {
+      name = validTab(name);
+      if (!name) return false;
+      document.body.setAttribute('data-tab', name);
+      var btns = document.querySelectorAll('[data-tab-btn]');
+      for (var i = 0; i < btns.length; i++) {
+        btns[i].classList.toggle('active', btns[i].getAttribute('data-tab-btn') === name);
+      }
+      return true;
+    }
+
+    function onTabChange() {
+      var name = initialTab(location.hash, localStorage.getItem('tab'));
+      applyTab(name);
+      localStorage.setItem('tab', name);
+    }
+    window.addEventListener('hashchange', onTabChange);
+
     // Лёгкая загрузка: только конфиги. Тяжёлый замер трафика — по кнопке «Проверить».
     loadProxyPanel(false);
     loadMetricsPanel();  // тренд качества: данные минутной гранулярности — реже, чем poll статуса
@@ -2456,6 +2507,7 @@
     setInterval(poll, 5000);
     setInterval(loadMetricsPanel, 60000);
     setInterval(loadIncidentsPanel, 60000);
+    onTabChange();  // применить вкладку из hash/localStorage после сборки таб-бара
   })();
   </script>
 </body>

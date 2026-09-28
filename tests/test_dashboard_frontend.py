@@ -13,6 +13,7 @@ node-ом. Проверяем ровно контракт рендера, а н�
   #12 t() не должен разворачивать $-паттерны ($&, $`, $', $n) в подставляемом тексте.
 """
 import json
+import re
 import shutil
 import subprocess
 
@@ -247,3 +248,73 @@ def test_dns_card_down_when_all_public_unreachable():
         "public": [{"ip": "1.1.1.1", "up": False}, {"ip": "8.8.8.8", "up": False}],
     }
     assert _dns_card_status(dns) == "down"
+
+
+# --- вкладки дашборда: applyTab / initialTab / разметка ----------------------
+
+def test_tab_functions_present_in_html():
+    """Экстракция не бросает = функции вкладок существуют в index.html."""
+    extract_functions(HTML, ["validTab", "applyTab", "initialTab"])
+
+
+_TAB_DOM = r"""
+document = {
+  body: { _a: {}, setAttribute: function (k, v) { this._a[k] = v; },
+          getAttribute: function (k) { return this._a[k]; } },
+  _btns: ['overview', 'proxy', 'history', 'diag'].map(function (name) {
+    var b = { name: name, active: false,
+      getAttribute: function () { return b.name; },
+      classList: { toggle: function (c, on) { b.active = !!on; } } };
+    return b;
+  }),
+  querySelectorAll: function () { return this._btns; }
+};
+"""
+
+
+def _apply_tab(name):
+    body = _TAB_DOM + "applyTab(" + json.dumps(name) + ");" + \
+        "console.log(JSON.stringify({ok: true, tab: document.body.getAttribute('data-tab'), " + \
+        "active: document._btns.filter(function (b) { return b.active; }).map(function (b) { return b.name; })}));"
+    return _run_node(_harness(["validTab", "applyTab"], body))
+
+
+def test_apply_tab_sets_body_attr_and_active_button():
+    res = _apply_tab("history")
+    assert res["tab"] == "history"
+    assert res["active"] == ["history"], "активен ровно один таб"
+
+
+def test_apply_tab_rejects_unknown():
+    body = _TAB_DOM + "console.log(JSON.stringify({changed: applyTab('javascript:alert(1)'), " + \
+        "tab: document.body.getAttribute('data-tab') || null}));"
+    res = _run_node(_harness(["validTab", "applyTab"], body))
+    assert res["changed"] is False
+    assert res["tab"] is None, "неизвестная вкладка не применяётся (вайтлист)"
+
+
+def _initial_tab(hash_v, stored):
+    body = _TAB_DOM + "console.log(JSON.stringify({tab: initialTab(" + \
+        json.dumps(hash_v) + ", " + json.dumps(stored) + ")}));"
+    return _run_node(_harness(["validTab", "initialTab"], body))["tab"]
+
+
+def test_initial_tab_precedence_hash_then_stored_then_default():
+    assert _initial_tab("#proxy", "history") == "proxy", "hash сильнее localStorage"
+    assert _initial_tab("", "history") == "history", "без hash — запомненная вкладка"
+    assert _initial_tab("#мусор", None) == "overview", "битый hash — дефолт"
+    assert _initial_tab(None, None) == "overview"
+    assert _initial_tab("#javascript:alert(1)", "diag") == "diag", "невалидный hash игнорируется"
+
+
+def test_static_cards_carry_data_tab_and_tabbar_exists():
+    """Разметка: каждая статическая карточка помечена data-tab; таб-бар с 4 кнопками;
+    JS-карточки (card()) выводят data-tab из opts."""
+    cards = re.findall(r'<div class="card(?: mb-3| mt-3)"[^>]*>', HTML)
+    assert len(cards) >= 9, f"ожидаются статические карточки, найдено {len(cards)}"
+    missing = [c for c in cards if 'data-tab="' not in c]
+    assert not missing, f"карточки без data-tab: {missing}"
+    for tab in ("overview", "proxy", "history", "diag"):
+        assert f'data-tab-btn="{tab}"' in HTML, f"нет кнопки вкладки {tab}"
+    assert 'data-tab="' in extract_functions(HTML, ["card"]), \
+        "card() обязан выводить data-tab из opts (JS-карточки #cards)"
