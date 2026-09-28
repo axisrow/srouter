@@ -36,6 +36,7 @@ PING = "/sbin/ping"
 ROUTE = "/sbin/route"
 IPCONFIG = "/usr/sbin/ipconfig"
 NETWORKSETUP = "/usr/sbin/networksetup"
+ARP = "/usr/sbin/arp"
 WIFI_IFACE = "en0"  # ponytail: Wi-Fi-интерфейс этой машины; перебор en0–en9 не нужен
 DOMESTIC_TARGET = "223.5.5.5"  # AliDNS — domestica без GFW-нюансов ICMP
 # ponytail: DEFAULT_VPS_TARGET — fallback кампании; первоисточник VPS-цели — активный узел из
@@ -110,6 +111,11 @@ def probe():
     metrics_store.rotate_journal(NETPROBE_LOG, ts_of_line=metrics_store._event_ts,
                                  log_name="netprobe")
     gateway, iface = _default_route()
+    # net — распознавание по ФИЗИЧЕСКОМУ шлюзу (при VPN ipsec0 route-default ведёт в
+    # туннель и MAC недоступен); поля iface/target в JSONL не трогаем — конфаундер
+    # VPN-периодов, на них опирается анализ кампании.
+    net_gateway = _physical_gateway()[0]
+    gateway_mac = _gateway_mac(net_gateway)
     targets = {
         "gateway": gateway,
         "domestic": DOMESTIC_TARGET,
@@ -125,7 +131,8 @@ def probe():
         recv, avg = _ping(target)
         lines.append(json.dumps(
             {"ts": round(now, 3), "timestamp": timestamp, "leg": leg, "target": target,
-             "net": _net_name(), "iface": iface, "sent": 3, "recv": recv, "avg_ms": avg},
+             "net": _net_name(gateway=net_gateway, gateway_mac=gateway_mac),
+             "iface": iface, "sent": 3, "recv": recv, "avg_ms": avg},
             ensure_ascii=False, sort_keys=True))
     if not lines:
         return
@@ -187,11 +194,22 @@ def ssid():
     print(f"SSID: {name} — метка записана в {NETPROBE_LOG}")
 
 
-def _dns_servers(path=None):
-    """Отсортированный кортеж DNS-резолверов из resolv.conf — отпечаток сети.
+def _gateway_mac(ip):
+    """MAC шлюза из ARP-таблицы — BSSID-прокси, железный дискриминатор сетей
+    (hotspot мобилки ≠ домашний Wi-Fi даже при одинаковых DNS оператора, кейс
+    2026-09-28). «no entry»/rc≠0/timeout → None. Fail-soft, не бросает."""
+    if not ip:
+        return None
+    out = run([ARP, "-n", ip], 5).get("out") or ""
+    mac = re.search(r"\bat ([0-9a-fA-F:]{17})\b", out)
+    return mac.group(1).lower() if mac else None
 
-    SSID macOS заредактировал (геоданные), а DNS у двух роутеров разные (роутер vs карьерные)
-    → это и есть дискриминатор. Fail-soft: нет файла → ().
+
+def _dns_servers(path=None):
+    """Отсортированный кортеж DNS-резолверов из resolv.conf — слабый отпечаток сети
+    (operator-DNS совпадает между роутером и hotspot'ом; ночные DHCP-коктейли).
+    Дискриминатор — MAC шлюза (_gateway_mac); DNS — legacy-fallback для записей без
+    gateway/MAC. Fail-soft: нет файла → ().
     """
     try:
         text = (Path(path) if path else RESOLV_CONF).read_text(encoding="utf-8")
@@ -210,23 +228,49 @@ def _load_nets():
     return data if isinstance(data, dict) else {}
 
 
-def _net_name(dns=None):
-    """Имя сети по пересечению dns-множеств с обученной мапой; None — не матчился."""
-    current = set(dns if dns is not None else _dns_servers())
-    if not current:
-        return None
+def _net_name(dns=None, gateway=None, gateway_mac=None):
+    """Имя сети по отпечатку; None — не матчился. Приоритет специфичности, для
+    каждой записи: MAC шлюза (совпал = кандидат, другой = блок записи — DNS не
+    спасает, кейс «hotspot как 888-5G»), затем gateway (старые записи без MAC),
+    затем legacy DNS-пересечение (записи без gateway). Не бросает."""
+    current_dns = set(dns if dns is not None else _dns_servers())
     for name, info in _load_nets().items():
-        if current & set((info or {}).get("dns") or []):
+        info = info or {}
+        rec_mac = info.get("gateway_mac")
+        rec_gw = info.get("gateway")
+        if rec_mac:
+            if gateway_mac and rec_mac.lower() == gateway_mac.lower():
+                return name
+            continue
+        if rec_gw:
+            if gateway and rec_gw == gateway:
+                return name
+            continue
+        if current_dns and current_dns & set(info.get("dns") or []):
             return name
     return None
+
+
+def _physical_gateway():
+    """(gateway|None, iface|None) физического линка: route default; при туннельном
+    default (VPN: ipsec/utun/ppp) — DHCP-router en0, иначе «сеть» = туннель и
+    распознавание/обучение пишут мусор (кейс 2026-09-28). ponytail: en0 захардкожен
+    (Wi-Fi этой машины), перебор линковых en* — когда физика переедет с en0."""
+    gateway, iface = _default_route()
+    if iface and re.match(r"^(ipsec|utun|ppp)", iface):
+        tokens = (run([IPCONFIG, "getoption", "en0", "router"], 5).get("out") or "").split()
+        if tokens:
+            return tokens[-1], "en0"
+    return gateway, iface
 
 
 def learn_net(name):
     """Запомнить текущую сеть под именем (обучение: один прогон на сеть, без прав)."""
     dns = list(_dns_servers())
-    gateway, iface = _default_route()
+    gateway, iface = _physical_gateway()
     nets = _load_nets()
-    nets[name] = {"dns": dns, "gateway": gateway, "iface": iface}
+    nets[name] = {"dns": dns, "gateway": gateway, "iface": iface,
+                  "gateway_mac": _gateway_mac(gateway)}
     try:
         from local_state import _atomic_write_text  # канон atomic-save (tmp+fsync+rename) #139
         if not _atomic_write_text(NETS_MAP, json.dumps(
