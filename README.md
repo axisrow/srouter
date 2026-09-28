@@ -266,6 +266,31 @@ VPN и добавляет split-route (от root, без osascript). Дашбо�
 | **watchdog** (авто) | launchd-задача (раз в 20с): пассивные проверки и пинг туннеля, без запуска Claude Code. При падении — **macOS-нотификация** + звук. При восстановлении — тихое уведомление. |
 | **PF-изоляция** | fail-closed: прокси упал → трафик в никуда, не напрямую. См. ниже. |
 
+### Пуши деградации и атрибуция сегмента
+
+Watchdog пушит события деградации, и каждый пуш отвечает на два вопроса: **что** произошло и
+**почему** (какой участок сети виноват).
+
+События (звук): «туннель/стек упал» (Basso) — всё мертво; «стек деградировал» / «состав деградации
+изменился» (Ping) — упали driver-проверки (порты/туннель/маршруты), а не метрика скорости; «стек
+восстановлен» и «стек восстановился из деградации» (Glass) — возврат в ok, второй только если
+деградация была уведомлена пушем (симметрия против спама осцилляции, #315). Частоту держат cooldown
+900с + гистерезис 2 пробы + флап-гейт туннеля (50% фейлов за 15м).
+
+Формат пула: `стек деградировал (+туннель (…) (connection-failed — 7/11 фейлов за 15м)) — 2 из 9
+проверок; сегмент: транзит до VPS — RTT до VPS ×3.1 (85→265мс), потери 14%`. Счётчик «N из M» —
+масштаб (M = driver-проверки); «сегмент: …» — атрибуция.
+
+Атрибуция (`diagnose_degradation` в `diag_netprobe.py`) переиспользует два существующих источника,
+без новых проб: фазные тайминги curl через туннель (`metrics_store.summarize`: ratio каждой фазы
+против circadian-baseline того же часа 1–7 дней) и ICMP-ноги netprobe (gateway/domestic/vps, раз в
+60с). Правила по порядку: RTT до шлюза вырос → **Wi-Fi/роутер**; до domestica → **провайдер**;
+потери до VPS + рост TLS-фазы → **транзит до VPS**; ноги чистые, но TTFB вырос → **сам VPS**; рост
+TLS при чистом connect → **DPI/потери на пути**. Пороги: ratio ≥ 1.5, потери ≥ 10% или ≥ 2× фона.
+Данных не хватает → заметки нет (fail-open). Полный разбор — `srouter netprobe report`; форензика —
+`~/Library/Logs/srouter-watchdog.status.jsonl` (поле `segment`). Env-ручки:
+`SROUTER_WATCHDOG_DEGRADED_{COOLDOWN,CONFIRM,PUSH_MAX,REASON_MAX}`.
+
 ## Изоляция Codex: PF kill-switch + SOCKS5-wrappers
 
 Codex (CLI и App) нестабилен через privoxy (8118, HTTP-CONNECT) — тот портит WebSocket-стриминг →
@@ -692,6 +717,31 @@ goes up and adds the split-route (as root, no osascript). The dashboard shows th
 | **`GET /health`** | Lightweight HTTP endpoint (`http://127.0.0.1:8787/health`). 200=ok, 503=degraded/down. Never launches Claude Code. |
 | **watchdog** (auto) | launchd job (every 20s): passive checks and tunnel ping without launching Claude Code. On drop — **macOS notification** + sound; recovery is quiet. |
 | **PF isolation** | fail-closed: proxy down → traffic to nowhere, not direct. See below. |
+
+### Degradation pushes and segment attribution
+
+Watchdog pushes degradation events, and each push answers two questions: **what** happened and
+**why** (which network segment is to blame).
+
+Events (sound): "tunnel/stack down" (Basso) — everything is dead; "stack degraded" / "degradation
+set changed" (Ping) — driver checks failed (ports/tunnel/routes), not a speed metric; "stack
+recovered" and "stack recovered from degradation" (Glass) — back to ok, the latter only if the
+degradation was actually pushed (anti-oscillation symmetry, #315). Frequency is held by a 900s
+cooldown + 2-probe hysteresis + tunnel flap gate (50% failures per 15m).
+
+Push format: `stack degraded (+tunnel (…) (connection-failed — 7/11 failures per 15m)) — 2 of 9
+checks; segment: transit to VPS — RTT to VPS ×3.1 (85→265ms), loss 14%`. The "N of M" counter shows
+the scale (M = driver checks); "segment: …" is the attribution.
+
+Attribution (`diagnose_degradation` in `diag_netprobe.py`) reuses two existing sources, no new
+probes: per-phase curl timings through the tunnel (`metrics_store.summarize`: each phase's ratio
+vs the circadian same-hour baseline over 1–7 days) and netprobe ICMP legs (gateway/domestic/vps,
+every 60s). Rules in order: gateway RTT up → **Wi-Fi/router**; domestic → **ISP**; VPS loss + TLS
+phase up → **transit to VPS**; legs clean but TTFB up → **the VPS itself**; TLS up with flat
+connect → **DPI/path loss**. Thresholds: ratio ≥ 1.5, loss ≥ 10% or ≥ 2× baseline. Not enough
+data → no note (fail-open). Full breakdown — `srouter netprobe report`; forensics —
+`~/Library/Logs/srouter-watchdog.status.jsonl` (`segment` field). Env knobs:
+`SROUTER_WATCHDOG_DEGRADED_{COOLDOWN,CONFIRM,PUSH_MAX,REASON_MAX}`.
 
 ## Codex isolation: PF kill-switch + SOCKS5 wrappers
 

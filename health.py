@@ -32,6 +32,7 @@ import sys as _sys
 import time  # noqa: F401 — re-export для monkeypatch health.time.sleep (health_codenv._codenv_unloaded_is_persistent)
 
 import local_state  # noqa: F401 — re-export для monkeypatch health.local_state.* (health_probes/health_endpoint)
+import diag_netprobe  # атрибуция деградации (leg_snapshots/diagnose_degradation) — top-level безопасен
 import metrics_store
 import privoxy_system
 import sys_probe
@@ -90,7 +91,9 @@ _DEGRADED_NOTIFY_COOLDOWN_ENV = "SROUTER_WATCHDOG_DEGRADED_COOLDOWN"
 _DEGRADED_DIFF_TEMPLATE_ENV = "SROUTER_WATCHDOG_DEGRADED_DIFF_TEMPLATE"
 _DEGRADED_DIFF_TEMPLATE_DEFAULT = "{added}; {removed}"
 _DEGRADED_DIFF_PUSH_MAX_LEN_ENV = "SROUTER_WATCHDOG_DEGRADED_PUSH_MAX"
-_DEGRADED_DIFF_PUSH_MAX_LEN_DEFAULT = 160
+# 400 (было 160): причина «как именно деградировало» не должна резаться до «10808…»;
+# счётчик «N из M» и хвост полного состава за лимитом не считаются (осознанно).
+_DEGRADED_DIFF_PUSH_MAX_LEN_DEFAULT = 400
 
 # #358 п.1: причина добавившегося драйвера в пуше — detail пробы (или компактная цифра
 # из него). Формат env-параметризуем (канон more-options-better), причина обрезается
@@ -98,7 +101,9 @@ _DEGRADED_DIFF_PUSH_MAX_LEN_DEFAULT = 160
 _DEGRADED_ADDED_TEMPLATE_ENV = "SROUTER_WATCHDOG_DEGRADED_ADDED_TEMPLATE"
 _DEGRADED_ADDED_TEMPLATE_DEFAULT = "+{name} ({reason})"
 _DEGRADED_REASON_MAX_ENV = "SROUTER_WATCHDOG_DEGRADED_REASON_MAX"
-_DEGRADED_REASON_MAX_DEFAULT = 48
+# 100 (было 48): «runtime: смешанные сессии — 10808 (PID …)» обрезалось до «10808…» —
+# пользователь пуша не видел, КАК именно деградировало.
+_DEGRADED_REASON_MAX_DEFAULT = 100
 # #358 п.2: анти-флап гистерезис — смена состава пушится только после N проб подряд
 # с одним и тем же новым составом (probe-интервал ~20с → окно ~40с при N=2). Фильтр на
 # входе; cooldown (#326) остаётся верхней границей частоты поверх него. 1 = легаси.
@@ -110,6 +115,11 @@ _DEGRADED_CONFIRM_DEFAULT = 2
 # fail-open: метрик нет (выключены/пусто) → гейт неприменим, драйвер считается как раньше.
 _TUNNEL_FAIL_RATE_ENV = "SROUTER_WATCHDOG_TUNNEL_FAIL_RATE"
 _TUNNEL_FAIL_RATE_DEFAULT = metrics_store.DEGRADE_FAILURE_RATE
+# Атрибуция деградации: «почему тормозит» (Wi-Fi/провайдер/транзит/VPS/DPI) — заметка
+# к деградационному пушу и doctor-выводу. Тяжёлый сбор (полный retention metrics-хвост
+# + netprobe-хвост) — ТОЛЬКО в момент сборки пуша (cooldown 15м ограничивает сверху)
+# и в doctor, НЕ на каждый тик и не в check_all (туда ходит /health дашборда).
+_SEGMENT_NOTE_MAX = 120
 
 # Ротация watchdog-журналов D2 (PR-4 #339, контракт §3 — дефолты «статус-jsonl: 14d/2MB»).
 # Выключена по умолчанию — включение SROUTER_WATCHDOG_LOG_ROTATE=1 (граница согласия).
@@ -193,6 +203,27 @@ def _apply_tunnel_window_gate(tun_check):
         if isinstance(err, str) and err.strip():
             suffix += f" ({err.strip().splitlines()[0][:60]})"
     tun_check["detail"] = f"{tun_check['detail']} — {suffix}"
+
+
+def _tunnel_parameter_note(now=None):
+    """Заметка-атрибуция «сегмент: X — evidence» при деградации туннеля, None без данных.
+
+    Тяжёлый сбор: полный retention metrics-хвоста (summarize: фазные ratios) +
+    netprobe-хвост (leg_snapshots: RTT/loss по ногам) → diagnose_degradation. Вызывать
+    ТОЛЬКО в момент сборки деградационного пуша и в doctor — не на каждый тик и не
+    в check_all (см. комментарий у _SEGMENT_NOTE_MAX). Fail-open: любые проблемы
+    данных → None (канон fail-soft, пуш уходит без заметки).
+    """
+    try:
+        summary = metrics_store.summarize(metrics_store.read_timing_events(now=now))
+        legs = diag_netprobe.leg_snapshots(now=now)
+        diag = diag_netprobe.diagnose_degradation(summary, legs)
+        if not diag:
+            return None
+        note = f"сегмент: {diag['suspect']} — {diag['evidence']}"
+        return note[:_SEGMENT_NOTE_MAX]
+    except (OSError, ValueError, TypeError):
+        return None
 
 
 def check_all(*, active_claude=False):
@@ -864,6 +895,11 @@ def _print_report(result):
                       "подожди восстановления. Узел и локальный прокси трогать не нужно.")
             else:
                 print("  • туннель: проверь узел (srouter status / дашборд nodes), возможно узел недоступен")
+            # Атрибуция «почему тормозит» (Wi-Fi/провайдер/транзит/VPS/DPI): ручной
+            # doctor — тяжёлый сбор оправдан; None (мало данных) — строки нет.
+            segment_note = _tunnel_parameter_note()
+            if segment_note:
+                print(f"  • {segment_note}")
         if "DNS" in failed_names:
             # #205: DNS точно сломан (getaddrinfo не резолвил) — НЕ чинить VPS/локальный прокси,
             # проблема в резолвере. Домены не разрешаются = всё выглядит connection-failed.
@@ -906,6 +942,24 @@ def _print_report(result):
             print("    через privoxy 8118 long-lived WS рвётся (#120); нужен SOCKS5 10808 (~/bin/codex-srouter)")
 
 
+def _print_degradation_legend():
+    """Легенда модели деградации для doctor (srouter doctor): что пушится, с какой
+    частотой, чем регулируется — «что вообще база деградации» отвечает документация
+    рядом с выводом, без чтения исходников (#315-серия)."""
+    print("\nПуши деградации (watchdog):")
+    print("  • «туннель/стек упал» (Basso) — всё мертво; «стек восстановлен» и "
+          "«стек восстановился из деградации» (Glass) — возврат в ok; второй — только "
+          "если деградация была уведомлена пушем.")
+    print("  • «стек деградировал» / «состав деградации изменился» (Ping) — упали "
+          "driver-проверки (порты/туннель/маршруты), а не метрика скорости; «N из M "
+          "проверок» — масштаб; cooldown 900с и гистерезис 2 пробы против флапа.")
+    print("  • «; сегмент: …» — атрибуция «почему тормозит» (Wi-Fi/провайдер/транзит/"
+          "VPS/DPI); полный разбор — srouter netprobe report, форензика — "
+          f"{WATCHDOG_STATUS_LOG.name}")
+    print("  • env-ручки: SROUTER_WATCHDOG_DEGRADED_COOLDOWN, _CONFIRM, _PUSH_MAX, "
+          "_REASON_MAX (README: «Пуши деградации»).")
+
+
 def _degraded_notify_cooldown_sec():
     """Cooldown degraded-класса нотификаций из env (#315): 0..86400с, мусор → дефолт."""
     raw = os.environ.get(_DEGRADED_NOTIFY_COOLDOWN_ENV)
@@ -931,15 +985,26 @@ def _degraded_confirm_probes():
 
 
 def _degraded_reason_max_len():
-    """Лимит длины причины добавившегося драйвера (#358): clamp [0, 200], 0 — причины
+    """Лимит длины причины добавившегося драйвера (#358): clamp [0, 400], 0 — причины
     выключены (голое «+имя»). Мусор → дефолт."""
     raw = os.environ.get(_DEGRADED_REASON_MAX_ENV)
     if raw is None:
         return _DEGRADED_REASON_MAX_DEFAULT
     try:
-        return max(0, min(200, int(raw)))
+        return max(0, min(400, int(raw)))
     except ValueError:
         return _DEGRADED_REASON_MAX_DEFAULT
+
+
+def _degraded_diff_push_max_len():
+    """Лимит длины diff-части пуша (#353): clamp [40, 1000], мусор → дефолт."""
+    raw = os.environ.get(_DEGRADED_DIFF_PUSH_MAX_LEN_ENV)
+    if raw is None:
+        return _DEGRADED_DIFF_PUSH_MAX_LEN_DEFAULT
+    try:
+        return max(40, min(1000, int(raw)))
+    except ValueError:
+        return _DEGRADED_DIFF_PUSH_MAX_LEN_DEFAULT
 
 
 def _truncate_reason_text(text, limit):
@@ -980,6 +1045,24 @@ def _format_added_driver(name, reason):
         return _DEGRADED_ADDED_TEMPLATE_DEFAULT.format(name=name, reason=reason)
 
 
+def _format_degradation_tail(failed, reasons):
+    """Хвост «деградируют: имя (причина), …» — полный ТЕКУЩИЙ состав с причинами.
+
+    Ставится в пуши «состав … изменился», где diff отвечает только «что изменилось»,
+    а пользователь спрашивает ещё и «что деградирует сейчас» (один пуш — полная
+    картина). Причины режутся тем же _truncate_reason_text; пустой failed → ""
+    (хвост не добавляется). Не бросает.
+    """
+    parts = []
+    for name in sorted(failed):
+        reason = reasons.get(name) if isinstance(reasons, dict) else None
+        if isinstance(reason, str) and reason:
+            parts.append(f"{name} ({_truncate_reason_text(reason, _degraded_reason_max_len())})")
+        else:
+            parts.append(name)
+    return f"деградируют: {', '.join(parts)}" if parts else ""
+
+
 def _format_degradation_diff(added, removed, reasons=None):
     """Текст разницы состава деградации (#353): «+новые; −ушедшие», новые первыми.
 
@@ -1011,10 +1094,7 @@ def _format_degradation_diff(added, removed, reasons=None):
         # имена драйверов «;» не содержат, шаблоны без «;»-краёв не затронуты.
         return out.strip().strip(";").strip()
 
-    try:
-        limit = max(40, min(1000, int(os.environ.get(_DEGRADED_DIFF_PUSH_MAX_LEN_ENV, ""))))
-    except ValueError:
-        limit = _DEGRADED_DIFF_PUSH_MAX_LEN_DEFAULT
+    limit = _degraded_diff_push_max_len()
 
     added_full = ", ".join(_format_added_driver(name, reasons.get(name)) for name in added)
     removed_full = ", ".join("−" + name for name in removed)
@@ -1111,11 +1191,14 @@ def _read_watchdog_prev_state():
             "last_degraded_push": 0.0, "pending_failed": None, "pending_streak": 0}
 
 
-def _append_watchdog_status_event(previous, current, reasons=None):
+def _append_watchdog_status_event(previous, current, reasons=None, segment=None):
     """Audit-JSONL статуса (#315 п.2): событие при изменении {status, failed}.
 
     Канон _record_watchdog_lifecycle: best-effort (сбой записи не роняет watchdog),
     без изменения — не пишем (не раздуваем лог на каждом тике).
+    segment — заметка-атрибуция деградации туннеля (см. _tunnel_parameter_note):
+    пишется в событие, чтобы форензика отвечала «какой сегмент виноват» без
+    пересчёта (пуш-текст в notify.log её мог обрезать).
     """
     if previous == current:
         return
@@ -1146,6 +1229,8 @@ def _append_watchdog_status_event(previous, current, reasons=None):
         }
         if diff is not None:
             event["diff"] = diff
+        if segment:
+            event["segment"] = segment
         with open(WATCHDOG_STATUS_LOG, "a", encoding="utf-8") as log_file:
             log_file.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
     except OSError as exc:
@@ -1232,13 +1317,22 @@ def _cmd_watchdog_locked(result):
     reasons = {c["name"]: c["detail"] for c in result["checks"]
                if not c["ok"] and not c.get("info") and isinstance(c.get("detail"), str)
                and c["detail"]}
+    # Атрибуция «почему тормозит» — только когда туннель в notify-составе (driver,
+    # тот же structural-key, что у флап-гейта). События статуса редки (audit пишет
+    # только изменения, флап-гейт фильтрует осцилляцию) → тяжёлое чтение метрик-
+    # и netprobe-хвостов здесь приемлемо; пуш ниже переиспользует заметку.
+    tun_driver = any(c.get("id") == "tunnel" and not c["ok"] and not c.get("info")
+                     for c in result["checks"])
+    segment_note = _tunnel_parameter_note() if tun_driver else None
+    # M для счётчика «N из M проверок» — все driver-чеки пробы (не только упавшие).
+    driver_total = sum(1 for c in result["checks"] if not c.get("info"))
 
     # Audit-JSONL статуса (#315 п.2): ДО нотификаций и без cooldown — форензика полная,
     # даже когда звук затроттлен. Fresh-прогон (prev=None) — тихий baseline, как lifecycle.
     if prev is not None:
         _append_watchdog_status_event(
             {"status": prev_status, "failed": prev_failed},
-            {"status": cur, "failed": failed}, reasons=reasons)
+            {"status": cur, "failed": failed}, reasons=reasons, segment=segment_note)
 
     # Exact-state transitions (#109 + #133 C1 + #315 симметрия):
     # - «упал»: переход ok/degraded/fresh → down (громко, без троттлинга).
@@ -1302,14 +1396,35 @@ def _cmd_watchdog_locked(result):
                     diff_added, diff_removed, reasons=reasons) or ", ".join(failed)
             else:
                 detail = ", ".join(failed)
-            _notify(f"{label} ({detail})", "Ping")
+            # «Состав … изменился» отвечает «что изменилось»; хвост добавляет «что
+            # деградирует СЕЙЧАС» (полный состав с причинами). На «стек деградировал»
+            # diff уже и есть полный состав — дубль не нужен.
+            tail = _format_degradation_tail(failed, reasons) if "изменился" in label else ""
+            inner = f"{detail}; {tail}" if tail else detail
+            # Счётчик «N из M»: масштаб сразу виден и ясно, что база деградации —
+            # упавшие driver-проверки, а не метрика скорости. За PUSH-лимитом не режется.
+            counter = (f" — {len(failed)} из {driver_total} проверок"
+                       if driver_total else "")
+            msg = f"{label} ({inner}){counter}"
+            if segment_note:
+                msg += f"; {segment_note}"
+            _notify(msg, "Ping")
             notified_failed = failed
             last_push = time.time()
             pending_failed, pending_streak = None, 0
     else:
-        # ok/degraded→ok без пуша (#315 п.1): гистерезисный счётчик не «донашивается»
-        # через ok-прогон — следующая деградация считает пробы заново (#358).
+        # ok/degraded→ok без пуша деградации (#315 п.1): гистерезисный счётчик не
+        # «донашивается» через ok-прогон — следующая деградация считает пробы заново (#358).
         pending_failed, pending_streak = None, 0
+        # Recovery из деградации — симметрично ПУШНУТОЙ (notified_failed непуст = пуш
+        # реально выходил). Осцилляция, заглушенная cooldown'ом/гистерезисом, recovery
+        # не порождает (#315 п.1 сохраняется). Без cooldown (как «восстановлен» из
+        # down); last_push не трогаем — cooldown следующей деградации тикает. Повторный
+        # recovery невозможен: state-запись ниже обнуляет notified_failed при cur=ok.
+        if (prev_status in ("ok", "degraded") and isinstance(notified_failed, list)
+                and notified_failed):
+            _notify(f"стек восстановился из деградации ({', '.join(notified_failed)})",
+                    "Glass")
 
     try:
         # _write_watchdog_state сам делает json.dumps + atomic-write (tmp+fsync+rename,

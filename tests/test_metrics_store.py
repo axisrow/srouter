@@ -280,3 +280,53 @@ def test_summarize_flap_threshold_parameterized():
     out = metrics_store.summarize(events, now=now, failure_rate_threshold=0.3)
     assert out["trend"] == "degraded"
     assert out["latest"]["failure_rate"] == 0.4
+
+
+# ============================ summarize: фазные baseline/ratios ============================
+# Атрибуция деградации: connect растёт = сеть/локал, tls = DPI/потери пути,
+# ttfb = сам VPS. Для «×N vs норма» нужны baseline-медианы ФАЗ, а не только total.
+
+def test_summarize_baseline_phases_and_ratios():
+    now = 1_000_000.0
+    events = [_event(now - 3600.0 * 10, total_ms=200, connect_ms=10, tls_ms=100, ttfb_ms=80)
+              for _ in range(40)]
+    events += [_event(now - 60.0 * i, total_ms=400, connect_ms=20, tls_ms=250, ttfb_ms=100)
+               for i in range(1, 11)]
+    out = metrics_store.summarize(events, now=now)
+    assert out["baseline"]["phases"] == {"connect_ms": 10.0, "tls_ms": 100.0, "ttfb_ms": 80.0}
+    assert out["ratios"] == {"connect": 2.0, "tls": 2.5, "ttfb": 1.25, "total": 2.0}
+
+
+def test_summarize_phase_ratio_none_when_phase_missing():
+    """Фаза отсутствует в baseline (None у ok-замеров) → ratio фазы None, остальные живы."""
+    now = 1_000_000.0
+    events = [_event(now - 3600.0 * 10, total_ms=200, connect_ms=10, tls_ms=None, ttfb_ms=80)
+              for _ in range(40)]
+    events += [_event(now - 60.0 * i, total_ms=400, connect_ms=20, tls_ms=250, ttfb_ms=100)
+               for i in range(1, 11)]
+    out = metrics_store.summarize(events, now=now)
+    assert out["baseline"]["phases"]["tls_ms"] is None
+    assert out["ratios"]["tls"] is None
+    assert out["ratios"]["connect"] == 2.0
+    assert out["ratios"]["ttfb"] == 1.25
+
+
+def test_summarize_same_hour_baseline_carries_phases():
+    now = 1_700_000_000.0
+    same_hour = [_event(now - 24 * 3600.0, total_ms=300, connect_ms=15, tls_ms=120, ttfb_ms=90)
+                 for _ in range(40)]
+    trailing = [_event(now - 10 * 3600.0, total_ms=150) for _ in range(40)]
+    window = [_event(now - 60.0 * i, total_ms=600, connect_ms=30, tls_ms=240, ttfb_ms=180)
+              for i in range(1, 11)]
+    out = metrics_store.summarize(same_hour + trailing + window, now=now)
+    assert out["baseline"]["source"] == "same-hour"
+    assert out["baseline"]["phases"] == {"connect_ms": 15.0, "tls_ms": 120.0, "ttfb_ms": 90.0}
+    assert out["ratios"] == {"connect": 2.0, "tls": 2.0, "ttfb": 2.0, "total": 2.0}
+
+
+def test_summarize_empty_ratios_shape():
+    """Стабильность формы: пустой вход — ratios со всеми ключами None, phases все None
+    (потребители атрибуции не должны гадать о наборе ключей)."""
+    out = metrics_store.summarize([], now=1000000.0)
+    assert out["ratios"] == {"connect": None, "tls": None, "ttfb": None, "total": None}
+    assert out["baseline"]["phases"] == {"connect_ms": None, "tls_ms": None, "ttfb_ms": None}

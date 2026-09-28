@@ -45,6 +45,15 @@ LEGS = ("gateway", "domestic", "vps")  # один источник правды:
 WINDOW_PAD_SEC = 120          # запас вокруг блэкаут-окна (хвост пробы до ~70с)
 CLUSTER_GAP_SEC = 300         # фейлы реже чем через 5м — разные блэкауты
 
+# Пороги атрибуции деградации (diagnose_degradation/вердикт report) — один источник
+# правды. Без env-ручек: это текст диагностики, не гейт действий; ручка появится
+# при первой реальной мисатрибуции (канон more-options-better по потребности).
+RATIO_MIN = metrics_store.DEGRADE_RATIO  # 1.5 — тот же порог, что тренд-детектор фаз
+LOSS_BAD = 0.10                # потери ≥10% — канал «умирает»
+LOSS_MULT = 2.0                # ... или ≥2× собственного фона
+LOSS_CALM = 0.03               # <3% по обе стороны — ICMP чист (вердикт DPI)
+CONNECT_FLAT = 1.2             # connect-фаза «норма» — ниже этого ratio
+
 
 def _default_route():
     """(gateway|None, iface|None) из одного route -n get default.
@@ -272,6 +281,162 @@ def _packet_loss(bucket):
     return bucket["lost"] / packets if packets else 0.0
 
 
+def _snap_loss(rows):
+    """Доля потерь по строкам (1 − Σrecv/Σsent); None — нет валидных строк (sent≤0/мусор)."""
+    sent = recv = 0
+    for e in rows:
+        s, r = e.get("sent"), e.get("recv")
+        if isinstance(s, int) and not isinstance(s, bool) and s > 0 \
+                and isinstance(r, int) and not isinstance(r, bool):
+            sent += s
+            recv += r
+    return round(1.0 - recv / sent, 3) if sent else None
+
+
+def _snap_median(rows):
+    """Медиана avg_ms по числовым строкам; None — числовых нет."""
+    vals = [e.get("avg_ms") for e in rows if isinstance(e.get("avg_ms"), (int, float))
+            and not isinstance(e.get("avg_ms"), bool)]
+    return metrics_store._median(vals) if vals else None
+
+
+def leg_snapshots(window_sec=900, hours=168, now=None, log_path=None):
+    """Снимок «сейчас vs норма» по каждой ноге — ОДНО чтение хвоста netprobe-JSONL.
+
+    Окно [now−window_sec, now] — текущее состояние; база — весь hours-хвост (7д
+    retention) — норма. Формат: {leg: {avg_ms, avg_ms_base, loss, loss_base,
+    samples}}; avg_* — медианы, loss — доля потерь валидных раундов. Нет лога или
+    данных → None-поля (fail-open, не бросает).
+    # ponytail: хвост ~20k строк ≈ 4-5 суток кампании — для фона достаточно;
+    >7д истории всё равно нет (ротация).
+    """
+    try:
+        events = metrics_store.read_timing_events(
+            hours=hours, log_path=log_path or NETPROBE_LOG, now=now)
+    except (OSError, ValueError):
+        events = []
+    now_ts = metrics_store._now(now)
+    win = {leg: [] for leg in LEGS}
+    base = {leg: [] for leg in LEGS}
+    for e in events:
+        if not isinstance(e, dict):
+            continue
+        leg = e.get("leg")
+        if leg not in win:
+            continue  # ssid-метки и мусор
+        ts = e.get("ts")
+        if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+            continue
+        base[leg].append(e)
+        if now_ts - window_sec <= ts <= now_ts:
+            win[leg].append(e)
+    return {leg: {"avg_ms": _snap_median(win[leg]),
+                  "avg_ms_base": _snap_median(base[leg]),
+                  "loss": _snap_loss(win[leg]),
+                  "loss_base": _snap_loss(base[leg]),
+                  "samples": len(win[leg])}
+            for leg in LEGS}
+
+
+def _fmt_ratio(cur, base):
+    """ratio cur/base по числовым (base>0); None — не сравнимо (fail-open)."""
+    if isinstance(cur, (int, float)) and not isinstance(cur, bool) \
+            and isinstance(base, (int, float)) and not isinstance(base, bool) and base > 0:
+        return cur / float(base)
+    return None
+
+
+def _fmt_pair(cur, base):
+    """« (норма→сейчас)» по числовым; пустая строка — не сравнимо."""
+    if isinstance(cur, (int, float)) and not isinstance(cur, bool) \
+            and isinstance(base, (int, float)) and not isinstance(base, bool):
+        return f" ({base:.0f}→{cur:.0f}мс)"
+    return ""
+
+
+def _leg_bad(snap):
+    """Потери ноги плохие: ≥LOSS_BAD или ≥LOSS_MULT×фона. Нет данных → False."""
+    loss, base = snap.get("loss"), snap.get("loss_base")
+    if isinstance(loss, bool) or not isinstance(loss, (int, float)):
+        return False
+    if loss >= LOSS_BAD:
+        return True
+    return isinstance(base, (int, float)) and not isinstance(base, bool) \
+        and base > 0 and loss >= LOSS_MULT * base
+
+
+def _leg_calm(snap):
+    """Потери ноги чистые: <LOSS_BAD и <LOSS_MULT×фона (данные есть). Нет данных → False."""
+    loss, base = snap.get("loss"), snap.get("loss_base")
+    if isinstance(loss, bool) or not isinstance(loss, (int, float)) or loss >= LOSS_BAD:
+        return False
+    if isinstance(base, (int, float)) and not isinstance(base, bool):
+        return loss < max(LOSS_BAD, LOSS_MULT * base)
+    return True
+
+
+def diagnose_degradation(summary, legs):
+    """Атрибуция деградации туннеля: {suspect, evidence} | None. Чистая, fail-open.
+
+    summary — вывод metrics_store.summarize (фазные ratios: connect=сеть/локал,
+    tls=DPI/потери пути, ttfb=сервер/выход), legs — вывод leg_snapshots (ICMP-ноги).
+    Правила по порядку, первое совпадение выигрывает; None — данных не хватает,
+    подозреваемого назвать нельзя (пуш/отчёт печатаются без заметки).
+    """
+    summary = summary if isinstance(summary, dict) else {}
+    raw = summary.get("ratios")
+    ratios = raw if isinstance(raw, dict) else {}
+    raw = summary.get("latest")
+    latest = raw if isinstance(raw, dict) else {}
+    raw = summary.get("baseline")
+    baseline = raw if isinstance(raw, dict) else {}
+    raw = baseline.get("phases")
+    phases = raw if isinstance(raw, dict) else {}
+    legs = legs if isinstance(legs, dict) else {}
+    r_connect = ratios.get("connect")
+    r_tls = ratios.get("tls")
+    r_ttfb = ratios.get("ttfb")
+
+    def snap(leg):
+        s = legs.get(leg)
+        return s if isinstance(s, dict) else {}
+
+    gw, dom, vps = snap("gateway"), snap("domestic"), snap("vps")
+
+    rt = _fmt_ratio(gw.get("avg_ms"), gw.get("avg_ms_base"))
+    if rt is not None and rt >= RATIO_MIN:
+        return {"suspect": "Wi-Fi/роутер",
+                "evidence": "RTT до шлюза ×%.1f%s" % (rt, _fmt_pair(gw.get("avg_ms"),
+                                                                    gw.get("avg_ms_base")))}
+    rt = _fmt_ratio(dom.get("avg_ms"), dom.get("avg_ms_base"))
+    if rt is not None and rt >= RATIO_MIN:
+        return {"suspect": "провайдер (дом→интернет)",
+                "evidence": "RTT до domestica ×%.1f%s" % (rt, _fmt_pair(dom.get("avg_ms"),
+                                                                        dom.get("avg_ms_base")))}
+    connect_flat = r_connect is None or r_connect < CONNECT_FLAT
+    if _leg_bad(vps) and isinstance(r_tls, (int, float)) and r_tls >= RATIO_MIN \
+            and connect_flat:
+        parts = []
+        vps_rt = _fmt_ratio(vps.get("avg_ms"), vps.get("avg_ms_base"))
+        if vps_rt is not None:
+            parts.append("RTT до VPS ×%.1f%s" % (vps_rt, _fmt_pair(vps.get("avg_ms"),
+                                                                   vps.get("avg_ms_base"))))
+        parts.append("потери %.0f%%" % (vps["loss"] * 100))
+        return {"suspect": "транзит до VPS", "evidence": ", ".join(parts)}
+    if _leg_calm(vps) and isinstance(r_ttfb, (int, float)) and r_ttfb >= RATIO_MIN:
+        return {"suspect": "сам VPS",
+                "evidence": "TTFB ×%.1f%s — нагрузка/канал сервера"
+                            % (r_ttfb, _fmt_pair(latest.get("ttfb_ms"),
+                                                 phases.get("ttfb_ms")))}
+    if isinstance(r_tls, (int, float)) and r_tls >= RATIO_MIN and connect_flat:
+        ev = "TLS-фаза ×%.1f%s" % (r_tls, _fmt_pair(latest.get("tls_ms"),
+                                                    phases.get("tls_ms")))
+        if _leg_calm(vps):
+            ev += ", ICMP до VPS чист"
+        return {"suspect": "DPI/потери на пути (Reality-паттерн)", "evidence": ev}
+    return None
+
+
 def _fmt_bucket(bucket):
     loss = _packet_loss(bucket) * 100
     packets = bucket["rounds"] * 3
@@ -294,6 +459,14 @@ def report():
     windows = _blackout_windows(tunnel, since_ts=first_leg_ts)
     span_h = (time.time() - first_leg_ts) / 3600
     print(f"netprobe-данные: {span_h:.1f}ч, блэкаут-окон туннеля за это время: {len(windows)}")
+    # Атрибуция по текущему окну (фазы туннеля × ICMP-ноги) — тот же движок, что
+    # в деградационном пуше watchdog'а. Печатается ДО loss-корреляции: DPI-кейс
+    # блэкаутов не даёт, а ранний return ниже её не отменяет.
+    diag = diagnose_degradation(metrics_store.summarize(tunnel), leg_snapshots())
+    if diag:
+        print(f"Сегмент (текущее окно): {diag['suspect']} — {diag['evidence']}")
+    else:
+        print("Сегмент (текущее окно): неопределим (мало данных)")
     if not windows:
         print("За время кампании блэкаутов не было — вердикта нет, копим данные дальше.")
         return
@@ -308,10 +481,10 @@ def report():
     inside_loss = _packet_loss(stats_by_leg["vps"]["inside"])
     outside_loss = _packet_loss(stats_by_leg["vps"]["outside"])
     print("\nВердикт по VPS-участку:")
-    if inside_loss >= 0.10 and inside_loss >= outside_loss * 2:
+    if inside_loss >= LOSS_BAD and inside_loss >= outside_loss * LOSS_MULT:
         print("  (а) ТРАНЗИТ: ICMP до VPS умирает в блэкауты — линия теряет пакеты до VPS.")
         print("      Фикс: смена узла/региона (APAC), VPS-сторону трогать бессмысленно.")
-    elif inside_loss < 0.03 and outside_loss < 0.03:
+    elif inside_loss < LOSS_CALM and outside_loss < LOSS_CALM:
         print("  (б) DPI: ICMP до VPS чист даже в блэкауты — режутся только TLS/Reality-потоки.")
         print("      Фикс: смена порта/протокола/узла (серверная часть, вне репо).")
     else:
