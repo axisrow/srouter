@@ -322,10 +322,11 @@ def summarize(events, now=None, window_sec=WINDOW_SEC, ratio_threshold=DEGRADE_R
     фиксированный порог дал бы ложные срабатывания каждый вечер). Данных того же
     часа < MIN_BASELINE_SAMPLES → fallback: окно 2–24ч назад.
 
-    Возвращает {latest, baseline, ratio, trend}:
+    Возвращает {latest, baseline, ratio, ratios, trend}:
       latest    — медианы connect/tls/ttfb/total окна + failure_rate + samples (None без замеров);
-      baseline  — {total_ms, source: same-hour|trailing|none, samples};
+      baseline  — {total_ms, source: same-hour|trailing|none, samples, phases: {фаза: медиана|None}};
       ratio     — latest.total_ms / baseline.total_ms (None без baseline);
+      ratios    — {connect, tls, ttfb, total}: фазные latest/baseline (None — не сравнимо);
       trend     — stable | degraded | insufficient.
     degraded: ratio ≥ threshold (при ok-замерах окна ≥ min_window_samples) ИЛИ
     failure_rate ≥ failure_rate_threshold — flap-гейт по ВСЕМ замерам окна
@@ -360,6 +361,11 @@ def summarize(events, now=None, window_sec=WINDOW_SEC, ratio_threshold=DEGRADE_R
     sod_now = _seconds_of_day(now_ts)
     window, ok_window = [], []
     same_hour_vals, trailing_vals = [], []  # только числовые total_ms (len == samples)
+    # Фазные накопители baseline (атрибуция «connect=сеть / tls=DPI / ttfb=VPS»):
+    # та же выборка, что у total — нечисловые фазы отфильтрует _median на выходе.
+    _PHASES = ("connect_ms", "tls_ms", "ttfb_ms")
+    same_hour_phases = {k: [] for k in _PHASES}
+    trailing_phases = {k: [] for k in _PHASES}
     for e in events:
         if not isinstance(e, dict):
             continue
@@ -384,8 +390,16 @@ def summarize(events, now=None, window_sec=WINDOW_SEC, ratio_threshold=DEGRADE_R
             continue
         if 24 * 3600 <= age <= DEFAULT_RETENTION_DAYS * 24 * 3600 and _same_hour(e.get("ts"), sod_now):
             same_hour_vals.append(total)
+            for k in _PHASES:
+                v = e.get(k)
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    same_hour_phases[k].append(v)
         elif 2 * 3600 <= age <= 24 * 3600:
             trailing_vals.append(total)
+            for k in _PHASES:
+                v = e.get(k)
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    trailing_phases[k].append(v)
 
     latest = None
     if window:
@@ -401,10 +415,13 @@ def summarize(events, now=None, window_sec=WINDOW_SEC, ratio_threshold=DEGRADE_R
 
     # Baseline: сначала circadian (тот же час прошлых дней), затем trailing-окно.
     # samples — размер выборки, реально прошедшей порог (накопители уже только числовые).
-    baseline = {"total_ms": None, "source": "none", "samples": 0}
-    for source, vals in (("same-hour", same_hour_vals), ("trailing", trailing_vals)):
+    baseline = {"total_ms": None, "source": "none", "samples": 0,
+                "phases": {k: None for k in _PHASES}}
+    for source, vals, phases in (("same-hour", same_hour_vals, same_hour_phases),
+                                 ("trailing", trailing_vals, trailing_phases)):
         if len(vals) >= MIN_BASELINE_SAMPLES:
-            baseline = {"total_ms": _median(vals), "source": source, "samples": len(vals)}
+            baseline = {"total_ms": _median(vals), "source": source, "samples": len(vals),
+                        "phases": {k: _median(v) for k, v in phases.items()}}
             break
 
     ratio = None
@@ -413,6 +430,18 @@ def summarize(events, now=None, window_sec=WINDOW_SEC, ratio_threshold=DEGRADE_R
             ratio = round(latest["total_ms"] / float(baseline["total_ms"]), 2)
         except (TypeError, ValueError, ZeroDivisionError):
             ratio = None
+
+    # Фазные ratio latest/baseline (атрибуция: какая фаза просела). None с любой
+    # стороны — фаза не сравнима, атрибуция её пропускает (fail-open).
+    def _phase_ratio(key):
+        cur = latest.get(key) if latest else None
+        base = baseline["phases"].get(key)
+        if isinstance(cur, (int, float)) and isinstance(base, (int, float)) and base > 0:
+            return round(cur / float(base), 2)
+        return None
+
+    ratios = {"connect": _phase_ratio("connect_ms"), "tls": _phase_ratio("tls_ms"),
+              "ttfb": _phase_ratio("ttfb_ms"), "total": ratio}
 
     # Тренд: degraded — по ЛЮБОЙ из двух причин при достатке замеров окна:
     #   флап (failure_rate ≥ порога; гейт по ВСЕМ замерам окна, не только ok —
@@ -431,7 +460,8 @@ def summarize(events, now=None, window_sec=WINDOW_SEC, ratio_threshold=DEGRADE_R
         elif baseline["total_ms"] is not None and len(ok_window) >= min_window_samples:
             trend = "stable"
 
-    return {"latest": latest, "baseline": baseline, "ratio": ratio, "trend": trend}
+    return {"latest": latest, "baseline": baseline, "ratio": ratio, "ratios": ratios,
+            "trend": trend}
 
 
 def rotate_journal(log_path, *, retention_days=None, max_bytes=None, now=None,

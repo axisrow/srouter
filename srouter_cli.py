@@ -665,6 +665,7 @@ def cmd_doctor(args) -> int:
     """Проверить здоровье стека: порты + реальный туннель. Отчёт ✅/❌ + подсказки."""
     result = health.check_all(active_claude=True)
     health._print_report(result)
+    health._print_degradation_legend()
     return 0 if result["status"] == "ok" else 1
 
 

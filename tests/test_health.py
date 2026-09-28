@@ -3531,7 +3531,7 @@ def test_watchdog_state_write_is_atomic(monkeypatch, tmp_path):
 # ============================ #315 round 3: Codex findings ============================
 
 def test_watchdog_silent_on_degraded_to_ok_with_notified_set(monkeypatch, tmp_path):
-    """F1 (round 3): degraded с уведомлённым составом → ok — ТИШИНА, не ложный
+    """F1 (round 3): degraded с уведомлённым составом → ok — recovery-пуш, но НЕ ложный
     «стек деградировал ()»: unnotified не должен вычисляться при cur=ok."""
     notified, _, _ = _wd315_watchdog_harness(
         monkeypatch, tmp_path, "ok", [],
@@ -3539,7 +3539,9 @@ def test_watchdog_silent_on_degraded_to_ok_with_notified_set(monkeypatch, tmp_pa
                     "notified_failed": ["claude-proxy"], "last_degraded_push": 0.0},
         env={_COOLDOWN_ENV: "0"})
     health.cmd_watchdog()
-    assert len(notified) == 0, "degraded→ok — молчим (#315 п.1), даже если состав был уведомлён"
+    assert len(notified) == 1, "degraded→ok с пушнутой деградацией — recovery-пуш"
+    assert "восстановился" in notified[0][0]
+    assert "деградир" not in notified[0][0], "регрессия F1: «ложный деградировал ()» остаётся закрытым"
 
 
 def test_watchdog_set_comparison_order_insensitive(monkeypatch, tmp_path):
@@ -3618,7 +3620,8 @@ def test_watchdog_down_to_degraded_shrinking_set_not_degradation(monkeypatch, tm
     health.cmd_watchdog()
     assert len(notified) == 1
     assert "состав" in notified[0][0], "не-ok→не-ok — всегда «состав изменился»"
-    assert "деградир" not in notified[0][0], "ложное ухудшение в момент улучшения"
+    assert not notified[0][0].startswith("стек деградировал"), \
+        "ложное ухудшение в момент улучшения (хвост «деградируют:» в составе пуше легитимен)"
 
 
 def test_degraded_cooldown_env_parsing_branches(monkeypatch):
@@ -3689,8 +3692,9 @@ def test_watchdog_set_change_push_contains_diff_removed(monkeypatch, tmp_path):
     assert len(notified) == 1
     # точное равенство (review P2): substring-assert пропускал ведущий «; » при
     # пустой added-стороне («изменился (; −туннель)»)
-    assert notified[0][0] == "состав деградации изменился (−туннель)", \
-        "ушедший драйвер с маркером «−», без артефактов пустой added-стороны"
+    assert notified[0][0] == ("состав деградации изменился "
+                              "(−туннель; деградируют: claude-proxy) — 1 из 1 проверок"), \
+        "ушедший драйвер с «−» + полный текущий состав в хвосте + счётчик"
     assert "+" not in notified[0][0], "ничего не добавилось — плюс-части быть не должно"
 
 
@@ -3831,8 +3835,10 @@ def test_watchdog_added_driver_without_reason_stays_bare(monkeypatch, tmp_path):
         details={"claude-proxy": "5xx 0.42"})
     health.cmd_watchdog()
     assert len(notified) == 1
-    assert notified[0][0] == "состав деградации изменился (+туннель)", \
-        "нет detail — нет причинной части и нет «()»-артефакта"
+    assert notified[0][0] == ("состав деградации изменился "
+                              "(+туннель; деградируют: claude-proxy (5xx 0.42), туннель) "
+                              "— 2 из 2 проверок"), \
+        "нет detail у added — голое «+имя»; хвост несёт полный состав с причинами"
 
 
 def test_degradation_added_template_env(monkeypatch):
@@ -3858,8 +3864,8 @@ def test_degradation_reason_len_limit(monkeypatch):
     long_reason = "очень длинная причина " * 10
     out = health._format_degradation_diff(["туннель"], [], {"туннель": long_reason})
     assert long_reason not in out, "полная длинная причина не должна попасть в пуш"
-    assert len(out) <= len("+туннель (") + 48 + len(")"), \
-        f"причина обрезана до дефолтного лимита 48, получено: {out!r}"
+    assert len(out) <= len("+туннель (") + 100 + len(")"), \
+        f"причина обрезана до дефолтного лимита 100, получено: {out!r}"
     monkeypatch.setenv(_REASON_MAX_ENV, "8")
     out = health._format_degradation_diff(["туннель"], [], {"туннель": long_reason})
     # #362 п.3: лимит 8 режет по слову (последний пробел) с «…», не посреди токена
@@ -4002,7 +4008,7 @@ def test_hysteresis_pending_reset_on_ok(monkeypatch, tmp_path):
     notified, _, _ = _wd315_watchdog_harness(
         monkeypatch, tmp_path, "degraded", ["claude-proxy", "туннель"],
         prev_state={"status": "degraded", "failed": ["claude-proxy"],
-                    "notified_failed": ["claude-proxy"], "last_degraded_push": 0.0},
+                    "notified_failed": [], "last_degraded_push": 0.0},
         env={_COOLDOWN_ENV: "0", _CONFIRM_ENV: "2"})
     health.cmd_watchdog()  # streak=1 по [cp, туннель]
     assert len(notified) == 0
@@ -5952,7 +5958,8 @@ def test_degradation_diff_prints_all_names_before_dropping_reasons(monkeypatch):
 
 def test_added_reason_truncated_at_word_boundary_with_ellipsis(monkeypatch):
     """#362 п.3: длинная причина режется по словам с «…», не посреди токена и не с висячей
-    открывающей скобкой («(PID 10» — мусор в пуше)."""
+    открывающей скобкой («(PID 10» — мусор в пуше). Лимит 48 — механика среза, не дефолт."""
+    monkeypatch.setenv(_REASON_MAX_ENV, "48")
     reason = ("runtime: Claude Code MIXED — local proxy (PID 10) + direct-leak "
               "(PID 11) — нарушение fail-closed")
     out = health._format_added_driver("claude-proxy", reason)
@@ -5969,3 +5976,336 @@ def test_added_reason_truncation_never_collapses_to_bare_ellipsis():
     assert out != "…"
     # и начало без скобки тоже живо (жёсткий срез без пробела в лимите)
     assert health._truncate_reason_text("abcdefghij", 4).endswith("…")
+
+
+# ============================ атрибуция деградации: заметка сегмента в пуше/doctor ============================
+# «Стек деградировал (+туннель … 7/11 фейлов…)» не отвечает «почему тормозит». Заметка
+# сегмента (diagnose_degradation: Wi-Fi/провайдер/транзит/VPS/DPI) добавляется к пуши
+# и doctor-выводу ТОЛЬКО при упавшем туннеле и только в момент сборки (тяжёлое чтение
+# метрик+netprobe — не на каждый тик и не в check_all, куда ходит /health дашборда).
+
+def _tunnel_note_harness(monkeypatch, tmp_path, note):
+    """Деградация: упал только туннель (id=tunnel); _tunnel_parameter_note подменён."""
+    notified = _tunnel_notify_harness(monkeypatch, tmp_path,
+                                      stats={"fails": 12, "samples": 15, "rate": 0.8})
+    calls = []
+
+    def fake_note(now=None):
+        calls.append(1)
+        return note
+
+    monkeypatch.setattr(health, "_tunnel_parameter_note", fake_note)
+    return notified, calls
+
+
+# Живая реализация — тестам самой заметки (autouse-заглушка ниже её подменяет).
+_real_tunnel_parameter_note = health._tunnel_parameter_note
+
+
+@pytest.fixture(autouse=True)
+def _stub_tunnel_parameter_note(monkeypatch):
+    """Сегмент-заметка читает живые metrics/netprobe-хвосты (~МБ) — в тестах по
+    умолчанию None (изоляция: немоканная проба медленна И machine-dependent, #251;
+    канон autouse-scrubber, PR #265). Тесты заметки подменяют её явно или ставят
+    живую _real_tunnel_parameter_note."""
+    monkeypatch.setattr(health, "_tunnel_parameter_note", lambda now=None: None)
+
+
+def test_watchdog_push_appends_segment_note(monkeypatch, tmp_path):
+    notified, calls = _tunnel_note_harness(
+        monkeypatch, tmp_path, "сегмент: транзит до VPS — RTT до VPS ×3.1, потери 14%")
+    health.cmd_watchdog()
+    assert len(notified) == 1
+    assert "; сегмент: транзит до VPS" in notified[0][0], notified[0][0]
+    assert len(calls) == 1, "заметка собирается один раз на пуш"
+
+
+def test_segment_note_skipped_without_tunnel_driver(monkeypatch, tmp_path):
+    """Деградация без туннеля (claude-proxy) — тяжёлый сбор не запускается вовсе."""
+    notified, _, _ = _wd315_watchdog_harness(
+        monkeypatch, tmp_path, "degraded", ["claude-proxy"],
+        prev_state={"status": "ok", "failed": [], "last_degraded_push": 0.0},
+        env={_COOLDOWN_ENV: "0"})
+    calls = []
+
+    def counting(now=None):
+        calls.append(1)
+        return "сегмент: X"
+
+    monkeypatch.setattr(health, "_tunnel_parameter_note", counting)
+    health.cmd_watchdog()
+    assert len(notified) == 1
+    assert calls == [], "заметка нужна только при деградации туннеля"
+    assert "сегмент" not in notified[0][0]
+
+
+def test_segment_note_fail_open(monkeypatch, tmp_path):
+    """Нет данных для атрибуции (note=None) → пуш как раньше, без «сегмент», без падений."""
+    notified, _ = _tunnel_note_harness(monkeypatch, tmp_path, None)
+    health.cmd_watchdog()
+    assert len(notified) == 1
+    assert "сегмент" not in notified[0][0]
+
+
+def test_tunnel_parameter_note_shape_and_budget(monkeypatch, tmp_path):
+    """Живая _tunnel_parameter_note: формат «сегмент: …», бюджет _SEGMENT_NOTE_MAX;
+    данные — моки summarize-источника и leg_snapshots."""
+    monkeypatch.setattr(health, "_tunnel_parameter_note", _real_tunnel_parameter_note)
+    now = _time315.time()
+    events = [{"ts": now - 3600 * 10, "status": "ok", "connect_ms": 10, "tls_ms": 100,
+               "ttfb_ms": 80, "total_ms": 200}] * 40
+    events += [{"ts": now - 60 * i, "status": "ok", "connect_ms": 10, "tls_ms": 250,
+                "ttfb_ms": 100, "total_ms": 400} for i in range(1, 12)]
+    monkeypatch.setattr(metrics_store, "read_timing_events",
+                        lambda hours=None, max_lines=None, log_path=None, now=None: list(events))
+    monkeypatch.setattr(health.diag_netprobe, "leg_snapshots", lambda **kw: {
+        "gateway": {"avg_ms": None, "avg_ms_base": None, "loss": None, "loss_base": None, "samples": 0},
+        "domestic": {"avg_ms": None, "avg_ms_base": None, "loss": None, "loss_base": None, "samples": 0},
+        "vps": {"avg_ms": 265, "avg_ms_base": 85, "loss": 0.14, "loss_base": 0.0, "samples": 3}})
+    note = health._tunnel_parameter_note()
+    assert note is not None
+    assert note.startswith("сегмент: ")
+    assert len(note) <= health._SEGMENT_NOTE_MAX
+
+
+def test_tunnel_parameter_note_fail_open_on_garbage(monkeypatch):
+    """Битые данные (read_timing_events бросает) → None, не исключение (канон fail-soft)."""
+
+    def boom(**kw):
+        raise ValueError("битый jsonl")
+
+    monkeypatch.setattr(health, "_tunnel_parameter_note", _real_tunnel_parameter_note)
+    monkeypatch.setattr(metrics_store, "read_timing_events", boom)
+    assert health._tunnel_parameter_note() is None
+
+
+def test_doctor_report_prints_segment(monkeypatch, tmp_path, capsys):
+    """Doctor: при упавшем туннеле печатается заметка сегмента; при живом — сбор не зовётся."""
+    result = {"status": "degraded", "checks": [
+        {"id": "tunnel", "name": "туннель (api.anthropic.com через прокси)",
+         "ok": False, "detail": "connection-failed"}]}
+    calls = []
+
+    def counting(now=None):
+        calls.append(1)
+        return "сегмент: сам VPS — TTFB ×2.1"
+
+    monkeypatch.setattr(health, "_tunnel_parameter_note", counting)
+    health._print_report(result)
+    out = capsys.readouterr().out
+    assert "сегмент: сам VPS" in out
+    assert len(calls) == 1
+
+    ok_result = {"status": "ok", "checks": [
+        {"id": "tunnel", "name": "туннель", "ok": True}]}
+    health._print_report(ok_result)
+    capsys.readouterr()
+    assert len(calls) == 1, "живой туннель — тяжёлый сбор не запускается"
+
+
+# ============================ recovery degraded→ok + счётчик N из M + лимиты ============================
+# Пуш «стек деградировал» молчал и при восстановлении (degraded→ok — тишина, #315 п.1),
+# и о причине усекался (REASON_MAX 48 / PUSH_MAX 160 — «10808…» вместо «как именно»).
+# Recovery — симметрично ПУШНУТОЙ деградации (notified_failed непуст), иначе осцилляция,
+# заглушенная cooldown'ом, родила бы «восстановился» без «деградировал».
+
+def test_watchdog_recovery_from_degraded_pushes_when_notified(monkeypatch, tmp_path):
+    notified, _, state_file = _wd315_watchdog_harness(
+        monkeypatch, tmp_path, "ok", [],
+        prev_state={"status": "degraded", "failed": ["claude-proxy"],
+                    "notified_failed": ["claude-proxy"], "last_degraded_push": 0.0},
+        env={_COOLDOWN_ENV: "0"})
+    health.cmd_watchdog()
+    assert len(notified) == 1
+    msg, sound = notified[0]
+    assert "восстановился из деградации" in msg
+    assert "claude-proxy" in msg, "состав ушедшей деградации в тексте"
+    assert sound == "Glass"
+    state = json.loads(state_file.read_text())
+    assert state["notified_failed"] == [], "после recovery повторного пуша нет"
+
+
+def test_watchdog_recovery_lists_all_notified_names(monkeypatch, tmp_path):
+    notified, _, _ = _wd315_watchdog_harness(
+        monkeypatch, tmp_path, "ok", [],
+        prev_state={"status": "degraded", "failed": ["claude-proxy", "туннель"],
+                    "notified_failed": ["claude-proxy", "туннель"], "last_degraded_push": 0.0},
+        env={_COOLDOWN_ENV: "0"})
+    health.cmd_watchdog()
+    assert len(notified) == 1
+    assert "claude-proxy" in notified[0][0] and "туннель" in notified[0][0]
+
+
+def test_watchdog_no_recovery_on_fresh(monkeypatch, tmp_path):
+    """Fresh-прогон (prev=None) — baseline, никаких пушей (в т.ч. recovery)."""
+    notified, _, _ = _wd315_watchdog_harness(monkeypatch, tmp_path, "ok", [], prev_state=None)
+    health.cmd_watchdog()
+    assert notified == []
+
+
+def test_watchdog_no_recovery_on_legacy_prev(monkeypatch, tmp_path):
+    """Legacy-строка в state (notified_failed=None) — состав неизвестен, recovery молчит."""
+    notified, _, _ = _wd315_watchdog_harness(
+        monkeypatch, tmp_path, "ok", [], prev_state="degraded")
+    health.cmd_watchdog()
+    assert notified == []
+
+
+def test_watchdog_down_to_ok_single_recovery_push(monkeypatch, tmp_path):
+    """down→ok — прежний «стек восстановлен», дубля recovery нет."""
+    notified, _, _ = _wd315_watchdog_harness(
+        monkeypatch, tmp_path, "ok", [],
+        prev_state={"status": "down", "failed": ["privoxy"],
+                    "notified_failed": ["privoxy"], "last_degraded_push": 0.0},
+        env={_COOLDOWN_ENV: "0"})
+    health.cmd_watchdog()
+    assert len(notified) == 1
+    assert "стек восстановлен" in notified[0][0]
+    assert "восстановился" not in notified[0][0]
+
+
+def test_watchdog_recovery_not_repeated_on_next_ok_tick(monkeypatch, tmp_path):
+    notified, _, _ = _wd315_watchdog_harness(
+        monkeypatch, tmp_path, "ok", [],
+        prev_state={"status": "degraded", "failed": ["claude-proxy"],
+                    "notified_failed": ["claude-proxy"], "last_degraded_push": 0.0},
+        env={_COOLDOWN_ENV: "0"})
+    health.cmd_watchdog()
+    health.cmd_watchdog()
+    assert len(notified) == 1, "второй ok-тик: notified уже обнулён — тишина"
+
+
+def test_watchdog_no_recovery_when_degradation_suppressed(monkeypatch, tmp_path):
+    """Деградация была заглушена cooldown'ом (notified_failed=[]) — recovery не пушится:
+    симметрия «не пушшилось → не восстанавливаемся» (против спама #315)."""
+    notified, _, _ = _wd315_watchdog_harness(
+        monkeypatch, tmp_path, "ok", [],
+        prev_state={"status": "degraded", "failed": ["claude-proxy"],
+                    "notified_failed": [], "last_degraded_push": 0.0},
+        env={_COOLDOWN_ENV: "0"})
+    health.cmd_watchdog()
+    assert notified == []
+
+
+def test_watchdog_recovery_preserves_cooldown_clock(monkeypatch, tmp_path):
+    """Recovery не двигает last_degraded_push — cooldown следующей деградации тикает."""
+    last_push = _time315.time() - 100
+    notified, _, state_file = _wd315_watchdog_harness(
+        monkeypatch, tmp_path, "ok", [],
+        prev_state={"status": "degraded", "failed": ["claude-proxy"],
+                    "notified_failed": ["claude-proxy"], "last_degraded_push": last_push},
+        env={_COOLDOWN_ENV: "900"})
+    health.cmd_watchdog()
+    assert len(notified) == 1, "recovery без cooldown (как «восстановлен» из down)"
+    state = json.loads(state_file.read_text())
+    assert state["last_degraded_push"] == last_push
+
+
+def test_watchdog_recovery_broken_notified_no_crash(monkeypatch, tmp_path):
+    """Битый notified_failed ([None, «x»]) — канонизация в [«x»], recovery с «x», без TypeError."""
+    notified, _, _ = _wd315_watchdog_harness(
+        monkeypatch, tmp_path, "ok", [],
+        prev_state={"status": "degraded", "failed": ["x"],
+                    "notified_failed": [None, "x"], "last_degraded_push": 0.0},
+        env={_COOLDOWN_ENV: "0"})
+    health.cmd_watchdog()  # не бросает
+    assert len(notified) == 1
+    assert "x" in notified[0][0]
+
+
+def test_watchdog_degraded_push_carries_n_of_m_counter(monkeypatch, tmp_path):
+    """Счётчик «N из M проверок» в деградационном пуше: масштаб виден сразу,
+    и ясно, что деградация = упавшие driver-проверки, а не метрика скорости."""
+    notified, _, _ = _wd315_watchdog_harness(
+        monkeypatch, tmp_path, "degraded", ["claude-proxy", "туннель"],
+        prev_state={"status": "ok", "failed": [], "last_degraded_push": 0.0},
+        env={_COOLDOWN_ENV: "0"})
+    health.cmd_watchdog()
+    assert len(notified) == 1
+    assert "2 из 2 проверок" in notified[0][0], notified[0][0]
+    # info-чек не считается ни в N, ни в M; смена состава даёт второй пуш
+    monkeypatch.setattr(health, "check_all", lambda **kw: {
+        "status": "degraded",
+        "checks": [{"name": "claude-proxy", "ok": False},
+                   {"name": "туннель", "ok": False},
+                   {"name": "codex-proxy", "ok": False},
+                   {"name": "codenv", "ok": True, "info": True}]})
+    health.cmd_watchdog()
+    assert len(notified) == 2
+    assert "3 из 3 проверок" in notified[1][0], notified[1][0]  # info-чек не в M
+
+
+def test_watchdog_counter_on_fresh_fallback_path(monkeypatch, tmp_path):
+    """Счётчик и на fresh/fallback-пути (notified=None → «, »-список вместо diff)."""
+    notified, _, _ = _wd315_watchdog_harness(
+        monkeypatch, tmp_path, "degraded", ["claude-proxy"], prev_state=None)
+    health.cmd_watchdog()
+    assert len(notified) == 1
+    assert "1 из 1 проверок" in notified[0][0], notified[0][0]
+
+
+def test_watchdog_set_change_push_appends_full_composition(monkeypatch, tmp_path):
+    """«Состав изменился» — после diff полный текущий состав с причинами:
+    видно, ЧТО изменилось И что деградирует сейчас (один пуш — полная картина)."""
+    notified, _, _ = _wd315_watchdog_harness(
+        monkeypatch, tmp_path, "degraded", ["claude-proxy", "туннель"],
+        prev_state={"status": "degraded", "failed": ["claude-proxy"],
+                    "notified_failed": ["claude-proxy"], "last_degraded_push": 0.0},
+        env={_COOLDOWN_ENV: "0"}, details={"claude-proxy": "5xx 0.42"})
+    health.cmd_watchdog()
+    assert len(notified) == 1
+    assert "; деградируют: " in notified[0][0], notified[0][0]
+    assert "claude-proxy (5xx 0.42)" in notified[0][0]
+    assert "туннель" in notified[0][0]
+
+
+def test_watchdog_first_degradation_push_has_no_composition_tail(monkeypatch, tmp_path):
+    """На «стек деградировал» diff уже и есть полный состав — хвост-дубль не нужен."""
+    notified, _, _ = _wd315_watchdog_harness(
+        monkeypatch, tmp_path, "degraded", ["claude-proxy"],
+        prev_state={"status": "ok", "failed": [], "last_degraded_push": 0.0},
+        env={_COOLDOWN_ENV: "0"}, details={"claude-proxy": "5xx 0.42"})
+    health.cmd_watchdog()
+    assert len(notified) == 1
+    assert "деградируют" not in notified[0][0]
+
+
+def test_degradation_tail_truncates_reasons():
+    """Причины в хвосте режутся тем же _truncate_reason_text (без висячих скобок)."""
+    out = health._format_degradation_tail(
+        ["туннель"], {"туннель": "очень длинная причина " * 10})
+    assert out.startswith("деградируют: туннель (")
+    assert "…" in out
+    assert "(ПИД" not in out  # висячая скобка снята — контракта _truncate_reason_text
+    assert health._format_degradation_tail([], {}) == ""
+
+
+def test_degradation_reason_max_default_100_and_clamp_400(monkeypatch):
+    assert health._degraded_reason_max_len() == 100, "новый дефолт 100 — причина видна целиком"
+    monkeypatch.setenv(_REASON_MAX_ENV, "500")
+    assert health._degraded_reason_max_len() == 400, "верхний кламп поднят до 400"
+    monkeypatch.setenv(_REASON_MAX_ENV, "мусор")
+    assert health._degraded_reason_max_len() == 100
+
+
+def test_degradation_push_max_default_400(monkeypatch):
+    """Дефолт пуш-лимита 400: состав с причинами, не влезавший в 160, выходит целиком."""
+    reasons = {f"driver-{i:02d}": "причина деградации драйвера, достаточно длинная" * 2
+               for i in range(3)}
+    out = health._format_degradation_diff([f"driver-{i:02d}" for i in range(3)],
+                                          ["gone-01", "gone-02"], reasons)
+    assert len(out) > 160, f"подготовлен текст длиннее старого лимита: {len(out)}"
+    assert "др." not in out and "ушед" not in out, f"при 400 влезает целиком: {out!r}"
+    monkeypatch.setenv(_DIFF_MAX_LEN_ENV, "5000")
+    assert health._degraded_diff_push_max_len() == 1000, "верхний кламп 1000 сохранён"
+
+
+def test_doctor_prints_degradation_legend(monkeypatch, tmp_path, capsys):
+    """Doctor объясняет модель деградации: события/звуки, счётчик, env-ручки —
+    «что вообще база деградации» отвечает документация рядом с выводом."""
+    health._print_degradation_legend()
+    out = capsys.readouterr().out
+    assert "состав деградации изменился" in out
+    assert "восстановился" in out
+    assert "SROUTER_WATCHDOG_DEGRADED_COOLDOWN" in out
+    assert "driver" in out or "driver-проверки" in out
