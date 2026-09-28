@@ -318,3 +318,135 @@ def test_static_cards_carry_data_tab_and_tabbar_exists():
         assert f'data-tab-btn="{tab}"' in HTML, f"нет кнопки вкладки {tab}"
     assert 'data-tab="' in extract_functions(HTML, ["card"]), \
         "card() обязан выводить data-tab из opts (JS-карточки #cards)"
+
+
+# --- lazy load: двухволновый /api/status per-tab ------------------------------
+# Контракт: light-волна — только локальные пробы (мгновенный первый рендер), heavy —
+# сетевые пробы активной вкладки; ключи = ключи gather_status, бэкенд ?only= гоняет
+# только запрошенное. Наборы light/TAB_HEAVY проверяем ТОЧНЫМ множеством, чтобы
+# нельзя было молча протащить тяжёлую пробу в light (и наоборот).
+
+_LIGHT_KEYS = {"services", "vpn", "route", "traffic_guard", "hot_routes", "isolate", "ifaces"}
+_TAB_HEAVY_KEYS = {
+    "overview": {"tunnel", "direct", "ping", "ips", "geo_distance"},
+    "proxy": {"connectivity"},
+    "history": set(),
+    "diag": {"dns", "exit_ips"},
+}
+
+
+def _query_keys(tab, wave):
+    q = _run_node(_harness(["statusQuery", "tabHeavy", "validTab"], (
+        "console.log(JSON.stringify({q: statusQuery(" + json.dumps(tab) + ", " +
+        json.dumps(wave) + ")}));"
+    )))["q"]
+    assert q.startswith("only="), q
+    return set(filter(None, q[len("only="):].split(",")))
+
+
+def test_status_query_light_has_local_probes_only():
+    """light-волна: ровно локальные пробы, ни одной сетевой — иначе первый рендер ждёт сеть."""
+    assert _query_keys("overview", "light") == _LIGHT_KEYS
+    assert _query_keys("diag", "light") == _LIGHT_KEYS, "light не зависит от вкладки"
+
+
+def test_status_query_heavy_per_tab():
+    """heavy-волна: ровно сетевые пробы активной вкладки (map TAB_HEAVY)."""
+    for tab, keys in _TAB_HEAVY_KEYS.items():
+        assert _query_keys(tab, "heavy") == keys, tab
+
+
+def test_status_query_unknown_tab_falls_back_to_empty_heavy():
+    """Невалидная вкладка не должна протащить чужой heavy-набор (validTab-гвард)."""
+    assert _query_keys("javascript:alert(1)", "heavy") == set()
+    assert _query_keys("", "heavy") == set()
+
+
+def test_merge_status_is_shallow_and_null_safe():
+    """mergeStatus: shallow-merge волн в LAST_STATUS, null-ответ волны — no-op."""
+    body = (
+        "LAST_STATUS = { ping: { status: 'ok' } };"
+        "mergeStatus({ services: { status: 'ok' } });"
+        "mergeStatus(null);"
+        "var s = LAST_STATUS;"
+        "console.log(JSON.stringify({ keys: Object.keys(s).sort(), "
+        "ping: s.ping.status, services: s.services.status }));"
+    )
+    res = _run_node(_harness(["mergeStatus"], body))
+    assert res["keys"] == ["ping", "services"], "волны мержатся, а не затираются"
+    assert res["ping"] == "ok" and res["services"] == "ok"
+
+
+_LAZY_STUBS = r"""
+LAST_STATUS = null;
+LAST_RANKING = {};
+inFlight = false; currentPoll = null; paused = false;
+refreshBtn = { disabled: false, querySelector: function () { return { className: '' }; } };
+var _calls = [], _renders = [], _failed = 0, _toasts = 0;
+function fetchJson(url) {
+  _calls.push(url);
+  if (url.indexOf('tunnel') !== -1) return Promise.reject(new Error('heavy boom'));
+  if (url.indexOf('services') !== -1) return Promise.resolve({ services: { status: 'ok' } });
+  if (url.indexOf('connectivity') !== -1) return Promise.resolve({ connectivity: { status: 'ok' } });
+  return Promise.resolve({ ping: { status: 'ok' } });
+}
+function render(d, r) { _renders.push(JSON.parse(JSON.stringify(d || {}))); }
+function renderFetchFailed() { _failed++; }
+function toast() { _toasts++; }
+function setRefreshing() {}
+var document = { body: { getAttribute: function () { return 'overview'; } } };
+"""
+
+
+def _run_pollScenario():
+    body = _LAZY_STUBS + (
+        "poll(true).then(function () {"
+        "  console.log(JSON.stringify({ calls: _calls, renders: _renders, "
+        "failed: _failed, toasts: _toasts }));"
+        "});"
+    )
+    return _run_node(_harness(
+        ["poll", "statusQuery", "tabHeavy", "mergeStatus", "curTab", "validTab"], body,
+    ))
+
+
+def test_poll_two_waves_render_light_before_heavy():
+    """Light-волна рендерит страницу до heavy; провал heavy — тихий (страница уже отрисована)."""
+    res = _run_pollScenario()
+    assert res["failed"] == 0 and res["toasts"] == 0, "провал heavy не должен будить no_server-тост"
+    assert res["renders"], "light-волна обязана отрисовать страницу"
+    assert "services" in res["renders"][-1]
+    assert "ping" not in res["renders"][-1], "упавший heavy не подменяет данные"
+    # ranking на overview не запрашивается (нужен только вкладке прокси)
+    assert not any("ranking" in c for c in res["calls"])
+
+
+def test_poll_light_failure_is_loud():
+    """Провал light-волны — видимый: renderFetchFailed + toast (как раньше)."""
+    body = _LAZY_STUBS.replace(
+        "function fetchJson(url) {",
+        "function fetchJson(url) { if (url.indexOf('services') !== -1) return Promise.reject(new Error('down'));",
+    )
+    body += (
+        "poll(true).then(function () {"
+        "  console.log(JSON.stringify({ calls: _calls, renders: _renders, "
+        "failed: _failed, toasts: _toasts }));"
+        "});"
+    )
+    res = _run_node(_harness(["poll", "statusQuery", "tabHeavy", "mergeStatus", "curTab", "validTab"], body))
+    assert res["failed"] == 1 and res["toasts"] == 1, "падение light обязано быть видимым"
+    assert res["renders"] == [], "без light-данных рендера нет"
+
+
+def test_ensure_tab_data_loads_history_panels_only_on_history():
+    """observe-панели истории грузятся только при входе на history; poll — на любой вкладке."""
+    body = (
+        "var calls = [];"
+        "loadMetricsPanel = function () { calls.push('metrics'); };"
+        "loadIncidentsPanel = function () { calls.push('incidents'); };"
+        "poll = function (m) { calls.push('poll:' + m); };"
+        "ensureTabData('history'); ensureTabData('proxy'); ensureTabData('overview');"
+        "console.log(JSON.stringify({ calls: calls }));"
+    )
+    res = _run_node(_harness(["ensureTabData"], body))
+    assert res["calls"] == ["metrics", "incidents", "poll:true", "poll:true", "poll:true"]
