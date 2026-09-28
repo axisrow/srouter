@@ -5,10 +5,14 @@
 перенос кода, без редизайна. Flask app/gather_status/guard'ы — в dashboard_app.py, общие
 статус-хелперы — в dashboard_common.py. dashboard.py остаётся тонким фасадом.
 """
+import json
 import logging
 import re
 import threading
 import time
+from datetime import datetime, timedelta
+from pathlib import Path
+
 from flask import jsonify, request
 
 import local_state
@@ -26,6 +30,7 @@ import claude_proxy  # вкл/откл HTTPS_PROXY для Claude Code (~/.claude
 import health  # check_all для /health эндпоинта
 import proxy_registry  # единая картина прокси: кто настроен + идёт ли трафик
 import metrics_store  # heartbeat-метрики туннеля (JSONL watchdog'а) для /api/metrics/tunnel
+import hot_routes  # _read_tail — bounded-чтение хвоста status.jsonl для /api/incidents
 import proxy_errors  # пассивный 5xx-rate из privoxy access-лога (observe-only)
 import concurrent.futures  # bounded-ожидание apply: git_proxy берёт БЛОКИРУЮЩИЙ flock
 import privoxy_system  # protected system-service gate (#122)
@@ -921,6 +926,116 @@ def api_metrics_tunnel():
             _metrics_cache.update({"key": hours, "at": now, "payload": payload})
     except lock_hierarchy.LockAcquireTimeout:
         pass  # не закэшировали — ответ всё равно корректный
+    return jsonify(payload)
+
+
+# ============================ /api/incidents (почасовой календарь деградаций) ============================
+# status.jsonl watchdog'а — журнал переходов {previous, current, timestamp}; инцидент =
+# начало не-ok эпизода (ok→degraded/down). Флап 5 раз за час = 5 инцидентов — честно
+# показывает моргание (решение по кампании 2026-09: пуш исчезает, календарь остаётся).
+_INCIDENTS_LOG = Path.home() / "Library" / "Logs" / "srouter-watchdog.status.jsonl"
+_INCIDENTS_DAYS_MIN, _INCIDENTS_DAYS_MAX, _INCIDENTS_DAYS_DEFAULT = 1, 90, 30
+# События редкие (десятки/день даже при флапе) — 100k строк с запасом перекрывают 90 дней.
+_INCIDENTS_MAX_LINES = 100_000
+
+
+def _read_status_events(max_lines=None, log_path=None):
+    """Хвост status.jsonl сырыми строками (битые не режем здесь — их пропустит
+    агрегатор). Bounded-чтение, отсутствующий файл → []. Никогда не бросает."""
+    path = Path(log_path) if log_path else _INCIDENTS_LOG
+    try:
+        max_lines = max(1, int(max_lines)) if max_lines is not None else _INCIDENTS_MAX_LINES
+    except (TypeError, ValueError):
+        max_lines = _INCIDENTS_MAX_LINES
+    try:
+        return list(hot_routes._read_tail(path, max_lines, metrics_store._READ_MAX_BYTES))
+    except OSError:
+        return []
+
+
+def _incident_counts(lines, days, now=None):
+    """Бакеты (локальная дата ISO, час) → {count, down} за последние days дней.
+
+    Инцидент = previous.status == "ok" и current.status in (degraded, down); переходы
+    внутри эпизода (down→degraded) и закрытие (→ok) не считаются. Битый JSON, legacy
+    строки (previous/current не dict), отсутствующий/битый timestamp, события вне окна —
+    пропуск. Чистая функция, не бросает.
+    """
+    now = now or datetime.now()
+    if now.tzinfo is not None:
+        now = now.astimezone().replace(tzinfo=None)  # бакеты в локальной шкале
+    start = (now - timedelta(days=days - 1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    buckets = {}
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        prev, cur = event.get("previous"), event.get("current")
+        if not (isinstance(prev, dict) and isinstance(cur, dict)):
+            continue
+        if prev.get("status") != "ok" or cur.get("status") not in ("degraded", "down"):
+            continue
+        raw = event.get("timestamp")
+        try:
+            dt = datetime.fromisoformat(raw).astimezone().replace(tzinfo=None)
+        except (ValueError, TypeError):
+            continue
+        if dt < start:
+            continue
+        key = (dt.date().isoformat(), dt.hour)
+        bucket = buckets.setdefault(key, {"count": 0, "down": 0})
+        bucket["count"] += 1
+        if cur.get("status") == "down":
+            bucket["down"] += 1
+    return buckets
+
+
+def _incidents_payload(days, now=None):
+    """Сетка days×24: {date, hours:[{count,down}|null×24]} — null = час ещё не наступил.
+    Дни в порядке «старые → новые» (лента слева направо, как у status-страниц)."""
+    now = now or datetime.now()
+    lines = _read_status_events()
+    buckets = _incident_counts(lines, days, now)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    out = []
+    for i in range(days):
+        day = today_start - timedelta(days=days - 1 - i)
+        hours = []
+        for h in range(24):
+            if day + timedelta(hours=h) > now:
+                hours.append(None)
+                continue
+            b = buckets.get((day.date().isoformat(), h))
+            hours.append({"count": b["count"], "down": b["down"]} if b
+                         else {"count": 0, "down": 0})
+        out.append({"date": day.date().isoformat(), "hours": hours})
+    return {"status": "ok", "days": out}
+
+
+@app.get("/api/incidents")
+def api_incidents():
+    """Почасовой календарь инцидентов watchdog за ?days= (1..90, default 30).
+
+    Observe-only, GET (без _MUTATION_LOCK). Fail-soft: сбой чтения → 200 status=warn
+    (probe-канон), не 500.
+    """
+    raw = (request.args.get("days") or "").strip()
+    days = _INCIDENTS_DAYS_DEFAULT
+    if raw:
+        try:
+            days = int(raw)
+        except ValueError:
+            return jsonify({"status": "warn", "error": "days must be an integer"}), 400
+        if not _INCIDENTS_DAYS_MIN <= days <= _INCIDENTS_DAYS_MAX:
+            return jsonify({"status": "warn",
+                            "error": f"days must be {_INCIDENTS_DAYS_MIN}..{_INCIDENTS_DAYS_MAX}"}), 400
+    try:
+        payload = _incidents_payload(days)
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        return jsonify({"status": "warn", "error": str(exc) or exc.__class__.__name__})
     return jsonify(payload)
 
 
