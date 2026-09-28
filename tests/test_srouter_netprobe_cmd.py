@@ -201,17 +201,144 @@ def test_learn_net_writes_and_replaces(monkeypatch, tmp_path):
     monkeypatch.setattr(diag_netprobe, "_default_route", lambda: (None, "ipsec0"))
     monkeypatch.setattr(diag_netprobe, "_dns_servers",
                         lambda path=None: ("211.136.192.6",))
+    monkeypatch.setattr(diag_netprobe, "run",
+                        lambda cmd, timeout, **kw: {"rc": 0, "err": "", "timeout": False,
+                                                    "out": "   router 10.9.9.1\n"})
+    monkeypatch.setattr(diag_netprobe, "_gateway_mac", lambda ip: "b6:00:11:22:33:44")
 
     diag_netprobe.learn_net("888-5G")
     first = json.loads(nets.read_text(encoding="utf-8"))
     assert first["888-5G"]["dns"] == ["211.136.192.6"]
-    assert first["888-5G"]["iface"] == "ipsec0"
+    assert first["888-5G"]["iface"] == "en0", "туннельный default → физический en0"
+    assert first["888-5G"]["gateway"] == "10.9.9.1"
 
     monkeypatch.setattr(diag_netprobe, "_dns_servers", lambda path=None: ("192.168.3.1",))
     monkeypatch.setattr(diag_netprobe, "_default_route", lambda: ("192.168.3.1", "en0"))
+    monkeypatch.setattr(diag_netprobe, "_gateway_mac", lambda ip: "a4:2b:8c:11:22:33")
     diag_netprobe.learn_net("888-5G")
     replaced = json.loads(nets.read_text(encoding="utf-8"))
     assert replaced["888-5G"]["dns"] == ["192.168.3.1"], "повторный learn перезаписывает"
+    assert replaced["888-5G"]["gateway_mac"] == "a4:2b:8c:11:22:33", \
+        "learn запоминает MAC шлюза — дискриминатор hotspot vs роутер"
+
+
+# ---------- MAC шлюза из ARP — дискриминатор «мобилка ≠ домашний Wi-Fi» ----------
+
+def _mock_arp(monkeypatch, out, rc=0):
+    monkeypatch.setattr(diag_netprobe, "run",
+                        lambda cmd, timeout, **kw: {"rc": rc, "out": out, "err": "",
+                                                    "timeout": False})
+
+
+def test_gateway_mac_parses_arp_output(monkeypatch):
+    _mock_arp(monkeypatch, "172.20.10.1 (172.20.10.1) at ae:df:a1:f0:2d:64 on en0 ifscope [ethernet]\n")
+    assert diag_netprobe._gateway_mac("172.20.10.1") == "ae:df:a1:f0:2d:64"
+
+
+def test_gateway_mac_soft_fails(monkeypatch):
+    _mock_arp(monkeypatch, "172.20.10.1 (172.20.10.1) -- no entry\n")
+    assert diag_netprobe._gateway_mac("172.20.10.1") is None, "нет ARP-записи — None"
+    _mock_arp(monkeypatch, "arp: foo", rc=1)
+    assert diag_netprobe._gateway_mac("foo") is None, "rc≠0 — None, не бросает"
+    monkeypatch.setattr(diag_netprobe, "run",
+                        lambda cmd, timeout, **kw: {"rc": None, "out": "", "err": "",
+                                                    "timeout": True})
+    assert diag_netprobe._gateway_mac("x") is None, "timeout — None"
+    assert diag_netprobe._gateway_mac(None) is None, "без gateway arp не зовётся"
+
+
+def test_net_name_matches_by_gateway_mac_even_without_dns(monkeypatch, tmp_path):
+    nets = tmp_path / "nets.json"
+    nets.write_text(json.dumps({
+        "mobile-hotspot": {"dns": [], "gateway": "172.20.10.1",
+                           "gateway_mac": "ae:df:a1:f0:2d:64"},
+    }), encoding="utf-8")
+    monkeypatch.setattr(diag_netprobe, "NETS_MAP", nets)
+    assert diag_netprobe._net_name(("8.8.8.8",), gateway="172.20.10.1",
+                                   gateway_mac="ae:df:a1:f0:2d:64") == "mobile-hotspot", \
+        "MAC-совпадение матчит сеть даже при пустом DNS-пересечении"
+
+
+def test_net_name_mac_conflict_blocks_dns(monkeypatch, tmp_path):
+    """Кейс 2026-09-28: hotspot мобилки отдаёт DNS домашнего оператора — раньше склеивался
+    с 888-5G. Теперь MAC в записи другой → запись блокируется, DNS не спасает."""
+    nets = tmp_path / "nets.json"
+    nets.write_text(json.dumps({
+        "888-5G": {"dns": ["211.136.192.6", "120.196.165.24"],
+                   "gateway": "192.168.1.1", "gateway_mac": "a4:2b:8c:11:22:33"},
+    }), encoding="utf-8")
+    monkeypatch.setattr(diag_netprobe, "NETS_MAP", nets)
+    assert diag_netprobe._net_name(("211.136.192.6",), gateway="172.20.10.1",
+                                   gateway_mac="ae:df:a1:f0:2d:64") is None, \
+        "MAC другой — сеть не 888-5G, хотя DNS оператора совпал"
+
+
+def test_net_name_gateway_conflict_blocks_dns(monkeypatch, tmp_path):
+    """Запись старого формата (без MAC), но шлюз другой подсети — тоже блок."""
+    nets = tmp_path / "nets.json"
+    nets.write_text(json.dumps({
+        "103": {"dns": ["192.168.3.1"], "gateway": "192.168.3.1"},
+    }), encoding="utf-8")
+    monkeypatch.setattr(diag_netprobe, "NETS_MAP", nets)
+    assert diag_netprobe._net_name(("192.168.3.1",), gateway="172.20.10.1") is None
+
+
+def test_net_name_gateway_match_for_legacy_record_without_mac(monkeypatch, tmp_path):
+    nets = tmp_path / "nets.json"
+    nets.write_text(json.dumps({
+        "103": {"dns": ["192.168.3.1"], "gateway": "192.168.3.1"},
+    }), encoding="utf-8")
+    monkeypatch.setattr(diag_netprobe, "NETS_MAP", nets)
+    assert diag_netprobe._net_name(("192.168.3.1",), gateway="192.168.3.1") == "103", \
+        "старая запись без MAC матчится по шлюзу"
+
+
+def test_learn_net_records_gateway_mac(monkeypatch, tmp_path):
+    nets = tmp_path / "nets.json"
+    monkeypatch.setattr(diag_netprobe, "NETS_MAP", nets)
+    monkeypatch.setattr(diag_netprobe, "_default_route", lambda: ("172.20.10.1", "en0"))
+    monkeypatch.setattr(diag_netprobe, "_dns_servers", lambda path=None: ())
+    monkeypatch.setattr(diag_netprobe, "_gateway_mac",
+                        lambda ip: "ae:df:a1:f0:2d:64" if ip == "172.20.10.1" else None)
+    diag_netprobe.learn_net("mobile-hotspot")
+    rec = json.loads(nets.read_text(encoding="utf-8"))["mobile-hotspot"]
+    assert rec["gateway_mac"] == "ae:df:a1:f0:2d:64"
+    assert rec["gateway"] == "172.20.10.1"
+
+
+def test_learn_net_vpn_iface_uses_physical_dhcp_router(monkeypatch, tmp_path):
+    """VPN перехватил default (iface=ipsec0) — learn обязан обучить физический Wi-Fi
+    (DHCP-router en0), а не туннель: иначе запись мусорная (gateway=None, кейс
+    2026-09-28)."""
+    nets = tmp_path / "nets.json"
+    monkeypatch.setattr(diag_netprobe, "NETS_MAP", nets)
+    monkeypatch.setattr(diag_netprobe, "_default_route", lambda: (None, "ipsec0"))
+    monkeypatch.setattr(diag_netprobe, "_dns_servers", lambda path=None: ())
+    monkeypatch.setattr(diag_netprobe, "_gateway_mac", lambda ip: "ae:df:a1:f0:2d:64")
+    monkeypatch.setattr(diag_netprobe, "run",
+                        lambda cmd, timeout, **kw: {"rc": 0, "err": "", "timeout": False,
+                                                    "out": "   router 172.20.10.1\n"})
+    diag_netprobe.learn_net("mobile-hotspot")
+    rec = json.loads(nets.read_text(encoding="utf-8"))["mobile-hotspot"]
+    assert rec["gateway"] == "172.20.10.1" and rec["iface"] == "en0"
+    assert rec["gateway_mac"] == "ae:df:a1:f0:2d:64"
+
+
+def test_physical_gateway_passthrough_and_vpn_fallback(monkeypatch):
+    monkeypatch.setattr(diag_netprobe, "_default_route", lambda: ("192.168.3.1", "en0"))
+    assert diag_netprobe._physical_gateway() == ("192.168.3.1", "en0"), \
+        "физический default — без запросов DHCP"
+    monkeypatch.setattr(diag_netprobe, "_default_route", lambda: (None, "ipsec0"))
+    monkeypatch.setattr(diag_netprobe, "run",
+                        lambda cmd, timeout, **kw: {"rc": 0, "err": "", "timeout": False,
+                                                    "out": "   router 172.20.10.1\n"})
+    assert diag_netprobe._physical_gateway() == ("172.20.10.1", "en0"), \
+        "туннельный default → DHCP-router en0 (MAC шлюза становится доступен)"
+    monkeypatch.setattr(diag_netprobe, "run",
+                        lambda cmd, timeout, **kw: {"rc": 0, "err": "", "timeout": False,
+                                                    "out": ""})
+    assert diag_netprobe._physical_gateway() == (None, "ipsec0"), \
+        "DHCP-router не читается → честный None, не выдумка"
 
 
 def test_netprobe_netname_passes_name(monkeypatch, tmp_path):
