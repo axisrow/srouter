@@ -2161,6 +2161,33 @@
         });
     }
 
+    /* Lazy load: две волны /api/status. light — локальные пробы (мгновенный первый
+       рендер), heavy — сетевые пробы активной вкладки (бюджет 12с, догружаются
+       параллельно). Бэкенд ?only= гоняет только запрошенные пробы (gather_status(only));
+       ключи волн не пересекаются → shallow-merge в LAST_STATUS безопасен. */
+    function tabHeavy(tab) {
+      // Наборы литералом (не константой снаружи): экстрактор тестов берёт только тела функций
+      var HEAVY = {
+        overview: 'tunnel,direct,ping,ips,geo_distance',
+        proxy: 'connectivity',
+        history: '',
+        diag: 'dns,exit_ips'
+      };
+      return HEAVY[validTab(tab)] || '';
+    }
+    function statusQuery(tab, wave) {
+      // Чистый шов для тестов: only-параметр волны для вкладки.
+      var LIGHT = 'services,vpn,route,traffic_guard,hot_routes,isolate,ifaces';
+      return 'only=' + (wave === 'heavy' ? tabHeavy(tab) : LIGHT);
+    }
+    function curTab() {
+      return validTab(document.body.getAttribute('data-tab')) || 'overview';
+    }
+    function mergeStatus(d) {
+      if (!d) return;
+      LAST_STATUS = Object.assign({}, LAST_STATUS || {}, d);
+    }
+
     function poll(manual) {
       if (inFlight) {
         if (manual) {
@@ -2171,12 +2198,33 @@
       if (paused && !manual) return Promise.resolve();
       inFlight = true;
       setRefreshing(true);
-      currentPoll = fetchJson('/api/status')
+      var tab = curTab();
+      var heavy = tabHeavy(tab);
+      var lightOk = false;
+      // Волна 1: локальные пробы — первый рендер не ждёт сеть. Ошибка → no_server + toast.
+      var light = fetchJson('/api/status?' + statusQuery(tab, 'light'))
         .then(function (d) {
-          return fetchJson('/api/nodes/ranking')
-            .catch(function () { return {}; })
-            .then(function (ranking) { render(d, ranking); });
-        })
+          lightOk = true;
+          mergeStatus(d);
+          // ranking нужен только селектору узлов на вкладке прокси
+          var ranking = (tab === 'proxy')
+            ? fetchJson('/api/nodes/ranking').catch(function () { return {}; })
+            : Promise.resolve(LAST_RANKING || {});
+          return ranking.then(function (r) { render(LAST_STATUS, r); });
+        });
+      // Волна 2: тяжёлые сетевые пробы вкладки. Тихий catch — волна 1 уже отрисовала.
+      // При упавшем light НЕ рендерим: render глушит FETCH_FAILED и маскировал бы сбой.
+      var heavyWave = heavy
+        ? fetchJson('/api/status?' + statusQuery(tab, 'heavy'))
+            .then(function (d) {
+              mergeStatus(d);
+              if (!lightOk) return;
+              render(LAST_STATUS, LAST_RANKING);
+            })
+            .catch(function () {})
+        : null;
+      currentPoll = light
+        .then(function () { return heavyWave; })  // manual-poll после мутации ждёт обе волны
         .catch(function (e) {
           renderFetchFailed();
           toast(t('fetch_status_failed', e.message), 'err');
@@ -2467,8 +2515,9 @@
     renderMetricsPanel();  // каркас панели качества туннеля до ответа сервера
     loadGuard();       // подтянуть block/allow правила + активный throttle из /api/guard
     // ---- Вкладки: Обзор / Прокси / История / Диагностика ----
-    // Карточки помечены data-tab; скрытие — CSS по body[data-tab]. Фетчи не зависят
-    // от видимости (бейджи скрытых вкладок остаются свежими). Состояние: hash ↔
+    // Карточки помечены data-tab; скрытие — CSS по body[data-tab]. Данные — лениво:
+    // light-волна статуса идёт всегда, heavy — только активной вкладки (poll()),
+    // observe-панели истории — по входу на вкладку (ensureTabData). Состояние: hash ↔
     // localStorage['tab'] (ключи lang/theme/mode заняты), дефолт — обзор.
     function validTab(name) {
       // массив литералом (не константой снаружи): экстрактор тестов берёт только тела функций
@@ -2492,22 +2541,28 @@
       return true;
     }
 
+    function ensureTabData(name) {
+      // Per-tab догрузка: observe-панели истории — при входе на вкладку, не на старте.
+      if (name === 'history') { loadMetricsPanel(); loadIncidentsPanel(); }
+      poll(true);  // light всегда + heavy новой активной вкладки
+    }
+
     function onTabChange() {
       var name = initialTab(location.hash, localStorage.getItem('tab'));
       applyTab(name);
       localStorage.setItem('tab', name);
+      ensureTabData(name);
     }
     window.addEventListener('hashchange', onTabChange);
 
     // Лёгкая загрузка: только конфиги. Тяжёлый замер трафика — по кнопке «Проверить».
     loadProxyPanel(false);
-    loadMetricsPanel();  // тренд качества: данные минутной гранулярности — реже, чем poll статуса
-    loadIncidentsPanel();  // календарь инцидентов: hourly-данные — тем же минутным ритмом
-    poll(true);
     setInterval(poll, 5000);
-    setInterval(loadMetricsPanel, 60000);
-    setInterval(loadIncidentsPanel, 60000);
-    onTabChange();  // применить вкладку из hash/localStorage после сборки таб-бара
+    setInterval(function () {
+      // observe-панели истории тикают только пока открыта вкладка истории (минутный ритм)
+      if (curTab() === 'history') { loadMetricsPanel(); loadIncidentsPanel(); }
+    }, 60000);
+    onTabChange();  // применить вкладку из hash/localStorage и подтянуть её данные
   })();
   </script>
 </body>
