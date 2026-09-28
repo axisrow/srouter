@@ -176,6 +176,11 @@ def service_control(name, action):
 # ============================ Flask-роуты ============================
 @app.get("/api/status")
 def api_status():
+    # ?only=services,ping — частичный прогон probe для двухволнового lazy-UI.
+    # Пустой/отсутствующий only — легаси ноль-арг вызов (тесты гардов монкипатчат лямбдой).
+    only = (request.args.get("only") or "").strip() or None
+    if only is not None:
+        return jsonify(gather_status(only))
     return jsonify(gather_status())
 
 

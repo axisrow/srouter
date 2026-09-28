@@ -71,7 +71,16 @@ def _run_status_probe_set(probes, budget_sec):
     return out
 
 
-def gather_status():
+def _select_probes(probes, only):
+    """Вайтлист ?only= (lazy-UI дашборда): None — весь набор (легаси); иначе только
+    известные ключи, неизвестные молча игнорируются (fail-soft, не 4xx)."""
+    if only is None:
+        return probes
+    want = {s.strip() for s in str(only).split(",") if s.strip()}
+    return {k: fn for k, fn in probes.items() if k in want}
+
+
+def gather_status(only=None):
     now = time.time()
     active_route = _active_route_context()
     active_route_ip = active_route["route_ip"]
@@ -83,7 +92,8 @@ def gather_status():
             _lock, name="status-cache", level=lock_hierarchy.LEVEL_CACHE
         ):
             if (
-                _cache["data"]
+                only is None
+                and _cache["data"]
                 and _cache.get("active_route_key") == active_route_key
                 and now - _cache["ts"] < STATUS_CACHE_TTL_SEC
             ):
@@ -110,18 +120,34 @@ def gather_status():
         "exit_ips": probe_exit_ips_per_iface,
         "geo_distance": lambda: probe_geo_distance(route_ip=active_route_ip),
     }
-    out = _run_status_probe_set(probes, STATUS_PROBE_BUDGET_SEC)
+    out = _run_status_probe_set(_select_probes(probes, only), STATUS_PROBE_BUDGET_SEC)
     out["nodes"] = probe_nodes_snapshot()
     out["ts"] = now
+    base = out  # skip-write путь (lock timeout): отдаём непмерженную волну, как без кэша
     # issue #159: bounded acquire (уровень CACHE). Write-точка: таймаут → пропускаем
     # запись кэша (следующий /api/status пересчитает).
     try:
         with lock_hierarchy.bounded_acquire(
             _lock, name="status-cache", level=lock_hierarchy.LEVEL_CACHE
         ):
-            _cache.update(ts=now, data=out, active_route_ip=active_route_ip, active_route_key=active_route_key)
+            # Кэш МЕРЖИТ волны ?only= (light-ответ не затирает fresh heavy-ключи);
+            # смена маршрута сбрасывает базу — устаревшие heavy-ключи не протекают.
+            if _cache["data"] and _cache.get("active_route_key") == active_route_key:
+                base = dict(_cache["data"])
+                base.update(out)
+            else:
+                base = out
+            _cache.update(ts=now, data=base, active_route_ip=active_route_ip, active_route_key=active_route_key)
     except lock_hierarchy.LockAcquireTimeout:
         pass  # skip-write; кэш не критичен
+    if only is None:
+        return base
+    # Фильтр выдачи: partial-ответ содержит только запрошенное (+nodes/ts всегда),
+    # иначе более поздний light-ответ перезаписал бы heavy-ключи на клиенте.
+    wanted = _select_probes(probes, only)
+    out = {k: base[k] for k in wanted if k in base}
+    out["nodes"] = base["nodes"]
+    out["ts"] = base["ts"]
     return out
 
 
