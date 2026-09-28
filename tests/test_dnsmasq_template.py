@@ -30,6 +30,9 @@ def test_client_template_is_split_dns_not_all_servers():
         "честный резолвер в all-servers бесполезен — только split через conf-dir"
     )
     assert "conf-dir=" in _CLIENT, "список китайских доменов подключается через conf-dir"
+    # code-review #377: glob ",*" грузит ВСЕ файлы каталога (бэкапы редактора отравят
+    # резолвер) — только суффикс .conf
+    assert ".conf" in _CLIENT.split("conf-dir=")[1].splitlines()[0], "conf-dir фильтрует по .conf"
     assert "min-cache-ttl" in _CLIENT, "холодный зарубежный резолв ~225 мс — кэш обязан держаться"
 
 
@@ -47,3 +50,17 @@ def test_vps_template_reference_exists():
         "upstream с VPS — публичные резолверы (оттуда доступны)"
     )
     assert "cache-size" in text
+
+
+def test_vps_template_is_fail_closed():
+    """code-review #377: активный listen — только loopback; 0.0.0.0 закомментирован.
+    Иначе пропущенный шаг rate-limit даёт открытый DNS-amplification relay."""
+    active = [l for l in _VPS_PATH.read_text(encoding="utf-8").splitlines()
+              if l.startswith("listen-address")]
+    assert active == ["listen-address=127.0.0.1"], (
+        f"fail-closed нарушен: активные listen-address = {active}"
+    )
+    assert any(l.strip().startswith("# listen-address=0.0.0.0") for l in
+               _VPS_PATH.read_text(encoding="utf-8").splitlines()), (
+        "открытие наружу — закомментированное осознанное действие"
+    )
