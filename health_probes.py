@@ -697,6 +697,15 @@ def _tunnel_target_up(url, head=False):
         tokens, url, kind, rc=r.get("rc"), err=r.get("err"))
 
 
+def _url_host(url):
+    """hostname URL'а для дедупа целей (None если не распарсился — фейл-софт)."""
+    try:
+        from urllib.parse import urlsplit
+        return urlsplit(url).hostname
+    except ValueError:
+        return None
+
+
 def _tunnel_up(extra_targets=None):
     """Реальный туннель жив? curl через прокси к TUNNEL_TARGETS (ровно как probe_tunnel).
 
@@ -727,11 +736,15 @@ def _tunnel_up(extra_targets=None):
     if not canaries:
         return False, "no tunnel targets", False, None
     extras = []
-    seen = set(canaries)
+    # дедуп по ХОСТУ, не по строке URL: "https://api.anthropic.com" (без слэша) — та же
+    # цель, что канарейка; строковый дедуп пропустил бы HEAD-дубль в канареечную серию (PR #378)
+    seen = {h for h in (_url_host(u) for u in canaries) if h}
     for url in extra_targets or []:
-        if isinstance(url, str) and url not in seen:
-            seen.add(url)
-            extras.append(url)
+        if isinstance(url, str):
+            host = _url_host(url)
+            if host and host not in seen:
+                seen.add(host)
+                extras.append(url)
     urls = canaries + extras
     head_set = set(extras)
     with ThreadPoolExecutor(max_workers=min(len(urls), 8)) as pool:

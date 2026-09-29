@@ -1691,6 +1691,15 @@ def test_normalize_http_targets_drops_junk_keeps_order():
         ["https://github.com/", "https://discord.com/"]
 
 
+def test_normalize_http_targets_drops_scheme_without_host():
+    """URL без хоста ("https://", "https:///path") отбрасывается: иначе в событие уходит
+    target=None, а канареечные фильтры серий трактуют None как «legacy канарейка» —
+    connection-fail мёртвой цели читались бы как фейлы канарейки (cycle-review PR #378)."""
+    assert local_state.normalize_http_targets(["https://", "https:///path"], []) == []
+    assert local_state.normalize_http_targets(
+        ["https://", "https://ok.example/"], []) == ["https://ok.example/"]
+
+
 def test_normalize_http_targets_empty_falls_back_to_filtered_default():
     fallback = ["https://a.com/", "junk", 7]
     assert local_state.normalize_http_targets([], fallback) == ["https://a.com/"]

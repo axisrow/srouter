@@ -18,6 +18,7 @@ _claude_proxy_probe() возвращает {status, source, detail}:
 import json
 import os
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest as _pytest
 import pytest  # noqa: ICN003 — pytest.fail/raises в тестах ниже (#194)
@@ -6279,6 +6280,26 @@ def test_tunnel_up_bare_call_keeps_canary_only_shape(monkeypatch):
     ok, _, _, timings = health._tunnel_up()
     assert ok is True
     assert isinstance(timings, list) and len(timings) == 2
+
+
+def test_tunnel_up_dedups_extras_by_host_not_url(monkeypatch):
+    """Дедуп extra против канарейки по ХОСТУ, не по строке URL: "https://api.anthropic.com"
+    (без слэша) — та же цель, что канарейка. Иначе в серию канарейки пишется второй
+    (HEAD) тик с тем же target и ok_rate/медианы смешиваются (cycle-review PR #378)."""
+    monkeypatch.setattr(health.sys_probe, "run", _tunnel_curl_returning("404"))
+    ok, _, _, timings = health._tunnel_up(extra_targets=["https://api.anthropic.com"])
+    assert ok is True
+    hosts = [t.get("target") for t in timings]
+    assert hosts.count("api.anthropic.com") == 1, "дубль канарейки отсечён по хосту"
+
+
+def test_metrics_canary_target_guard_matches_first_tunnel_target():
+    """Гвард связки констант: канареечный фильтр серий = хост первой канарейки. Смена
+    TUNNEL_TARGETS без METRICS_CANARY_TARGET молча опустошила бы все фильтры и деградация
+    перестала бы детектиться (cycle-review PR #378)."""
+    assert health.TUNNEL_TARGETS, "канарейки не пусты"
+    assert urlsplit(health.TUNNEL_TARGETS[0]).hostname == \
+        metrics_store.METRICS_CANARY_TARGET
 
 
 def test_record_watchdog_metrics_writes_event_per_target(monkeypatch, tmp_path):

@@ -33,6 +33,7 @@ import socket  # noqa: F401 — re-export surface: local_state.socket патчи
                 # local_state_nodes.py, но это ТОТ ЖЕ объект модуля socket (sys.modules) — патч
                 # local_state.socket.gethostbyname виден и там.
 from pathlib import Path
+from urllib.parse import urlsplit
 
 # Путь к локальному state по умолчанию — рядом с этим модулем, не cwd.
 _DEFAULT_PATH = Path(__file__).resolve().parent / "srouter.local.json"
@@ -55,7 +56,14 @@ def normalize_http_targets(raw, fallback):
     валидация не дублируется в consumer'ах (канон loose-validator-recurring-leak — строгий
     первоисточник, а не «почти-regex» на месте)."""
     def _valid(value):
-        return isinstance(value, str) and value.startswith(("http://", "https://"))
+        if not (isinstance(value, str) and value.startswith(("http://", "https://"))):
+            return False
+        try:
+            # без хоста ("https://") hostname=None → такой URL дал бы события с target=None,
+            # которые канареечные фильтры серий читают как «legacy канарейка» (PR #378)
+            return bool(urlsplit(value).hostname)
+        except ValueError:  # кривые скобки IPv6 и т.п. — фейл-софт контракт модуля
+            return False
 
     items = raw if isinstance(raw, list) else []
     targets = [x for x in items if _valid(x)]
