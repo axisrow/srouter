@@ -3278,6 +3278,83 @@ def test_watchdog_transition_matrix(prev, cur, expected, desc, monkeypatch, tmp_
 import time as _time315  # noqa: E402 — локальный импорт блока #315
 
 _COOLDOWN_ENV = "SROUTER_WATCHDOG_DEGRADED_COOLDOWN"
+_DOWN_COOLDOWN_ENV = "SROUTER_WATCHDOG_DOWN_COOLDOWN"
+
+
+def test_watchdog_down_push_suppressed_within_cooldown(monkeypatch, tmp_path):
+    """ok→down при недавнем down-пуше — «Упало» молчит (кампания 09-2026: ~93 пуша/24ч
+    при флапе VPS, down↔ok каждые 20с без всякого гейта)."""
+    notified, _, _ = _wd315_watchdog_harness(
+        monkeypatch, tmp_path, "down", ["туннель"],
+        prev_state={"status": "ok", "failed": [], "last_down_push": _time315.time() - 60},
+        env={_DOWN_COOLDOWN_ENV: "600"})
+    health.cmd_watchdog()
+    assert notified == [], "down-cooldown 600с не истёк — «Упало» не пушится"
+
+
+def test_watchdog_down_recovery_silent_after_suppressed_down(monkeypatch, tmp_path):
+    """Восстановление заглушенного падения молчит: пары не разъезжаются — иначе «Восстановлено»
+    без прозвучавшего «Упало» = шум #315-класса."""
+    notified, _, state_file = _wd315_watchdog_harness(
+        monkeypatch, tmp_path, "down", ["туннель"],
+        prev_state={"status": "ok", "failed": [], "last_down_push": _time315.time() - 60,
+                    "down_push_sent": False},
+        env={_DOWN_COOLDOWN_ENV: "600"})
+    health.cmd_watchdog()
+    assert notified == []
+    monkeypatch.setattr(health, "check_all", lambda **kw: {
+        "status": "ok", "checks": [{"name": "privoxy", "ok": True}]})
+    health.cmd_watchdog()
+    assert notified == [], "recovery заглушенного эпизода не пушится"
+
+
+def test_watchdog_sandwich_down_degraded_down_keeps_pair_guarantee(monkeypatch, tmp_path):
+    """Сэндвич down→degraded→down одного эпизода: подавленное повторное «Упало» НЕ затирает
+    флаг прозвучавшего — его «Восстановлено» обязано прийти (review #380 P2)."""
+    notified, _, _ = _wd315_watchdog_harness(
+        monkeypatch, tmp_path, "down", ["туннель"],
+        prev_state={"status": "ok", "failed": [], "last_down_push": 0.0},
+        env={_DOWN_COOLDOWN_ENV: "600"})
+    health.cmd_watchdog()
+    assert [n[1] for n in notified] == ["Basso"]
+    monkeypatch.setattr(health, "check_all", lambda **kw: {
+        "status": "degraded", "checks": [{"name": "туннель", "ok": False}]})
+    health.cmd_watchdog()
+    assert [n[1] for n in notified] == ["Basso"]
+    monkeypatch.setattr(health, "check_all", lambda **kw: {
+        "status": "down", "checks": [{"name": "туннель", "ok": False}]})
+    health.cmd_watchdog()
+    assert len(notified) == 1, "повтор в cooldown молчит"
+    monkeypatch.setattr(health, "check_all", lambda **kw: {
+        "status": "ok", "checks": [{"name": "privoxy", "ok": True}]})
+    health.cmd_watchdog()
+    assert [n[1] for n in notified] == ["Basso", "Glass"], "сэндвич не разъезжает пару"
+
+
+def test_watchdog_down_pair_pushes_outside_cooldown(monkeypatch, tmp_path):
+    """Вне cooldown пара целая: «Упало» (Basso) → «Восстановлено» (Glass)."""
+    notified, _, _ = _wd315_watchdog_harness(
+        monkeypatch, tmp_path, "down", ["туннель"],
+        prev_state={"status": "ok", "failed": [], "last_down_push": _time315.time() - 700},
+        env={_DOWN_COOLDOWN_ENV: "600"})
+    health.cmd_watchdog()
+    assert len(notified) == 1 and notified[0][1] == "Basso"
+    monkeypatch.setattr(health, "check_all", lambda **kw: {
+        "status": "ok", "checks": [{"name": "privoxy", "ok": True}]})
+    health.cmd_watchdog()
+    assert len(notified) == 2 and notified[1][1] == "Glass"
+
+
+def test_watchdog_legacy_down_state_recovery_still_pushes(monkeypatch, tmp_path):
+    """Миграция: state старой версии без down_push_sent пушил «Упало» безусловно → живой
+    down-эпизод считается уведомлённым, апгрейд не глушит его «Восстановлено»."""
+    notified, _, _ = _wd315_watchdog_harness(
+        monkeypatch, tmp_path, "ok", [],
+        prev_state={"status": "down", "failed": ["туннель"], "last_degraded_push": 0.0},
+        env={_DOWN_COOLDOWN_ENV: "600"})
+    health.cmd_watchdog()
+    assert len(notified) == 1 and notified[0][1] == "Glass", \
+        "legacy down-эпизод: recovery обязан прийти"
 
 
 def _wd315_watchdog_harness(monkeypatch, tmp_path, cur, failed, prev_state=None, env=None,
