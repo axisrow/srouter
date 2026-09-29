@@ -1190,6 +1190,17 @@ def test_local_proxy_no_log_facet_when_config_absent(monkeypatch, tmp_path):
     assert not any("не персистятся" in f for f in result.get("facets", []))
 
 
+def test_local_proxy_log_facet_survives_binary_config(monkeypatch, tmp_path):
+    """Битый UTF-8 конфиг не роняет пробу: UnicodeDecodeError ⊂ ValueError (review #381 P2)."""
+    monkeypatch.setattr(health, "_port_up", lambda port: True)
+    monkeypatch.setattr(health, "_service_running", lambda label, domain=None: "running")
+    cfg = tmp_path / "config.json"
+    cfg.write_bytes(b"\xff\xfe{\xff")
+    monkeypatch.setattr(health, "_XRAY_CONFIG_PATH", str(cfg))
+    result = health._local_proxy_up()
+    assert result["status"] == "ok"
+
+
 def test_local_proxy_down_when_port_closed(monkeypatch):
     """ДЫРА #204: privoxy port closed → down «крах» (демон не слушает). Раньше _port_up сам по себе
     молчал о причине. Теперь service-status объясняет: порт не слушается = прокси упал/не стартовал."""

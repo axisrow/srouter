@@ -275,7 +275,9 @@ def _xray_log_persistence_facet(config_path=None):
         raw = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return None
-    except OSError:
+    except (OSError, ValueError):
+        # UnicodeDecodeError ⊂ ValueError — бинарный/битый UTF-8 конфиг не роняет пробу
+        # (probe-канон «не бросает», review #381 P2)
         return "xray: конфиг не читается — персист лога не проверить"
     try:
         parsed = json.loads(raw)

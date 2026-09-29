@@ -84,7 +84,15 @@ def _load_template(path=None):
             return _default_template()
     except (OSError, ValueError, TypeError):
         return _default_template()
-    data.setdefault("log", _default_log_section())
+    # Персист error-лога мёрджим даже когда ключ log уже есть (чекин-шаблон несёт
+    # "log": {"loglevel": ...} без error — setdefault мёртв на основном пути, review #381 P1).
+    log_sec = data.get("log")
+    if not isinstance(log_sec, dict):
+        data["log"] = _default_log_section()
+    elif not (isinstance(log_sec.get("error"), str) and log_sec.get("error")):
+        merged = _default_log_section()
+        if merged.get("error"):
+            log_sec["error"] = merged["error"]
     data.setdefault("srouter", {})
     data.setdefault("inbounds", [])
     data.setdefault("outbounds", [])

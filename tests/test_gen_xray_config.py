@@ -364,3 +364,10 @@ def test_default_log_section_survives_unwritable_home(tmp_path):
 def test_default_template_uses_persisted_log_section():
     """Дефолт-шаблон (и setdefault в _load_template) отдают секцию с error-путём."""
     assert "error" in gen_xray_config._default_template()["log"]
+
+
+def test_generate_config_persists_error_log_through_real_template():
+    """Через реальный чекин-шаблон (review #381 P1): в нём ключ log уже есть, setdefault
+    мёртв — generate_config обязан мёрджить error в существующую секцию."""
+    cfg = gen_xray_config.generate_config(state_path=EXAMPLE)
+    assert isinstance(cfg["log"].get("error"), str) and cfg["log"]["error"]
