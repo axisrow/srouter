@@ -3378,6 +3378,26 @@ def test_watchdog_sandwich_down_degraded_down_keeps_pair_guarantee(monkeypatch, 
     assert [n[1] for n in notified] == ["Basso", "Glass"], "сэндвич не разъезжает пару"
 
 
+def test_watchdog_suppressed_down_then_degraded_announces_before_recovery(monkeypatch, tmp_path):
+    """P3 (review #380): заглушенный down → degraded → ok — сначала ОБЯЗАТЕЛЬНО объявление
+    («Деградация», Ping); «прошла» без прозвучавшего пуша — сирота #315-класса, запрещена."""
+    notified, _, _ = _wd315_watchdog_harness(
+        monkeypatch, tmp_path, "down", ["туннель"],
+        prev_state={"status": "ok", "failed": [], "last_down_push": _time315.time() - 60},
+        env={_DOWN_COOLDOWN_ENV: "600", _COOLDOWN_ENV: "0"})
+    health.cmd_watchdog()
+    assert notified == []
+    monkeypatch.setattr(health, "check_all", lambda **kw: {
+        "status": "degraded", "checks": [{"name": "туннель", "ok": False}]})
+    health.cmd_watchdog()
+    assert len(notified) == 1 and notified[0][1] == "Ping", \
+        "деградация после заглушенного down честно анонсируется"
+    monkeypatch.setattr(health, "check_all", lambda **kw: {
+        "status": "ok", "checks": [{"name": "privoxy", "ok": True}]})
+    health.cmd_watchdog()
+    assert [n[1] for n in notified] == ["Ping", "Glass"], "recovery после объявления разрешён"
+
+
 def test_watchdog_down_pair_pushes_outside_cooldown(monkeypatch, tmp_path):
     """Вне cooldown пара целая: «Упало» (Basso) → «Восстановлено» (Glass)."""
     notified, _, _ = _wd315_watchdog_harness(

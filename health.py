@@ -1326,10 +1326,14 @@ def _cmd_watchdog_locked(result):
             _notify(f"Упало: {', '.join(_short_check_name(n) for n in failed)}", "Basso")
             last_down_push = time.time()
             down_push_sent = True
-        # else: подавленный повтор НЕ трогает down_push_sent — флаг живёт с начала
-        # эпизода: сэндвич down→degraded→down→ok обязан донести «Восстановлено»
-        # прозвучавшего «Упало» (review #380 P2); флаг сбрасывается только на down→ok.
-        notified_failed = failed
+            notified_failed = failed
+        else:
+            # Подавленный повтор НЕ трогает down_push_sent (review #380 P2): флаг живёт с
+            # начала эпизода — сэндвич down→degraded→down→ok донесёт «Восстановлено»
+            # прозвучавшего «Упало»; сброс только на down→ok. notified=[]: эпизод молчал —
+            # последующий degraded идёт через unnotified→push, и его recovery не сирота
+            # «Деградация прошла» без прозвучавшего пуша (review #380 P3).
+            notified_failed = []
         pending_failed, pending_streak = None, 0
     elif cur == "ok" and prev_status == "down":
         if down_push_sent:
