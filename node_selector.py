@@ -536,6 +536,10 @@ def _select_node_locked(name, *, enabled_names, runner=None, state_path=None, co
         # Отказ до любых мутаций (канон foreign_config_needs_adopt, local_state_routing);
         # на adopt-машине узел переключают вручную — address/port в reality-out под
         # local_state._routing_config_lock + рестарт xray.
+        # Известное fail-open окно (осознанный residual): state без routing-секции →
+        # _routing_outbound_tag = "active" → guard пропустит; детект adopt-режима иначе
+        # невозможен (для srouter такая машина неотличима от canonical), контракт
+        # fail-soft тот же у compare_endpoint_with_xray/sync_*.
         if local_state_xray._routing_outbound_tag(state_path) != "active":
             return {"ok": False, "active": previous, "step": "adopt-mode",
                     "error": "hybrid-adopt config (#136/#313): select регенерирует конфиг "
