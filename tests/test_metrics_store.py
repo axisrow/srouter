@@ -86,6 +86,28 @@ def test_build_event_rc_err_absent_stays_none():
     assert ev["err"] is None
 
 
+# ============================ net — метка сети (#384) ============================
+
+def test_build_event_carries_net():
+    ev = metrics_store.build_event({"status": "ok", "total_ms": 10}, now=1.0, net="888-5G")
+    assert ev["net"] == "888-5G"
+
+
+def test_build_event_net_defaults_null_and_rejects_junk():
+    ev = metrics_store.build_event({"status": "ok"}, now=1.0)
+    assert ev["net"] is None
+    for junk in (123, True, "   ", ""):
+        assert metrics_store.build_event({"status": "ok"}, now=1.0, net=junk)["net"] is None
+
+
+def test_read_tolerates_legacy_lines_without_net(tmp_path):
+    """Старые строки журнала без поля net читаются агрегаторами как раньше."""
+    log = tmp_path / "metrics.jsonl"
+    _write_events(log, [_event(1000.0)])
+    events = metrics_store.read_timing_events(hours=1, log_path=log, now=2000.0)
+    assert len(events) == 1 and "net" not in events[0]
+
+
 # ============================ append/read ============================
 
 def test_append_and_read_roundtrip(tmp_path):

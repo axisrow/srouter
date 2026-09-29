@@ -203,3 +203,65 @@ def test_blackout_windows_ignore_foreign_targets(monkeypatch, tmp_path):
     tunnel = metrics_store.read_timing_events(log_path=tmp_path / "m.jsonl")
     windows = diag_netprobe._blackout_windows(diag_netprobe._canary_tunnel_events(tunnel))
     assert windows == [], "вендор-фейлы не создают окон туннеля"
+
+
+# ============================ current_net — метка сети для замеров (#384) ============================
+
+def test_current_net_prefers_raw_ssid(monkeypatch):
+    monkeypatch.setattr(diag_netprobe, "read_ssid", lambda: "MySSID")
+    assert diag_netprobe.current_net() == "MySSID"
+
+
+def test_current_net_uses_map_name_when_ssid_unreadable(monkeypatch, tmp_path):
+    monkeypatch.setattr(diag_netprobe, "read_ssid", lambda: None)
+    monkeypatch.setattr(diag_netprobe, "_physical_gateway", lambda: ("192.168.1.1", "en0"))
+    monkeypatch.setattr(diag_netprobe, "_gateway_mac", lambda ip: "ac:c4:a9:ff:e0:a0")
+    monkeypatch.setattr(diag_netprobe, "NETS_MAP", tmp_path / "nets.json")
+    (tmp_path / "nets.json").write_text(json.dumps(
+        {"888-5G": {"gateway": "192.168.1.1", "iface": "en0",
+                    "gateway_mac": "ac:c4:a9:ff:e0:a0", "dns": []}}), encoding="utf-8")
+    assert diag_netprobe.current_net() == "888-5G"
+
+
+def test_current_net_gw_label_when_unmapped(monkeypatch, tmp_path):
+    monkeypatch.setattr(diag_netprobe, "read_ssid", lambda: None)
+    monkeypatch.setattr(diag_netprobe, "_physical_gateway", lambda: ("10.0.0.1", "en0"))
+    monkeypatch.setattr(diag_netprobe, "_gateway_mac", lambda ip: "aa:bb:cc:dd:ee:ff")
+    monkeypatch.setattr(diag_netprobe, "NETS_MAP", tmp_path / "nets.json")
+    (tmp_path / "nets.json").write_text("{}", encoding="utf-8")
+    diag_netprobe._GW_HINTED.clear()
+    assert diag_netprobe.current_net() == "gw:10.0.0.1:aa:bb:cc:dd:ee:ff"
+
+
+def test_current_net_none_without_any_source(monkeypatch, tmp_path):
+    monkeypatch.setattr(diag_netprobe, "read_ssid", lambda: None)
+    monkeypatch.setattr(diag_netprobe, "_physical_gateway", lambda: (None, None))
+    monkeypatch.setattr(diag_netprobe, "_gateway_mac", lambda ip: None)
+    monkeypatch.setattr(diag_netprobe, "NETS_MAP", tmp_path / "nets.json")
+    (tmp_path / "nets.json").write_text("{}", encoding="utf-8")
+    assert diag_netprobe.current_net() is None
+
+
+def test_current_net_never_raises(monkeypatch, tmp_path):
+    """Fail-soft контракт (#384): сбой любого источника — валидный результат, не исключение
+    (резолвер зовётся из watchdog-тика, forensic-писатель ронять нельзя)."""
+    def boom(*args, **kwargs):
+        raise RuntimeError("boom")
+    monkeypatch.setattr(diag_netprobe, "read_ssid", boom)
+    monkeypatch.setattr(diag_netprobe, "_physical_gateway", boom)
+    monkeypatch.setattr(diag_netprobe, "_gateway_mac", boom)
+    monkeypatch.setattr(diag_netprobe, "NETS_MAP", tmp_path / "nets.json")
+    (tmp_path / "nets.json").write_text("не-json{", encoding="utf-8")
+    assert diag_netprobe.current_net() is None
+
+
+def test_current_net_gw_hint_printed_once(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(diag_netprobe, "read_ssid", lambda: None)
+    monkeypatch.setattr(diag_netprobe, "_physical_gateway", lambda: ("10.0.0.1", "en0"))
+    monkeypatch.setattr(diag_netprobe, "_gateway_mac", lambda ip: None)
+    monkeypatch.setattr(diag_netprobe, "NETS_MAP", tmp_path / "nets.json")
+    (tmp_path / "nets.json").write_text("{}", encoding="utf-8")
+    diag_netprobe._GW_HINTED.clear()
+    assert diag_netprobe.current_net() == "gw:10.0.0.1:?"
+    assert diag_netprobe.current_net() == "gw:10.0.0.1:?"
+    assert capsys.readouterr().err.count("netname") == 1, "подсказка одноразовая, не спам"

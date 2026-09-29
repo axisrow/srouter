@@ -282,6 +282,42 @@ def learn_net(name):
     print(f"netname: сеть {name!r} запомнена (dns={dns}, gateway={gateway}, iface={iface})")
 
 
+_GW_HINTED = set()  # gw-метки, подсказка для которых уже напечатана (не спамим каждый тик)
+
+
+def current_net():
+    """Метка текущей сети для замеров (#384): сырой SSID → netname из мапы
+    (gateway+MAC, как в probe()) → `gw:<ip>:<mac>` для необученной сети → None.
+
+    Fail-soft: каждый источник в своём except — сбой read_ssid не убивает
+    netname-ветку; функция никогда не бросает (зовётся из watchdog-тика).
+    Один вызов = 3 subprocess — вызывающий кэширует границей тика (health
+    зовёт раз на записывающий тик, не на событие).
+    """
+    try:
+        ssid_name = read_ssid()
+    except Exception:  # noqa: BLE001 — fail-soft резолвер (#384): сбой SSID-ветки не убивает netname
+        ssid_name = None
+    if isinstance(ssid_name, str) and ssid_name.strip():
+        return ssid_name.strip()
+    try:
+        gateway, _ = _physical_gateway()
+        gateway_mac = _gateway_mac(gateway)
+        name = _net_name(gateway=gateway, gateway_mac=gateway_mac)
+    except Exception:  # noqa: BLE001 — то же: любой сбой отпечатка деградирует в None, не бросает
+        return None
+    if name:
+        return name
+    if gateway:
+        label = f"gw:{gateway}:{gateway_mac or '?'}"
+        if label not in _GW_HINTED:
+            _GW_HINTED.add(label)
+            print(f"net: сеть не распознана ({label}); обучить: "
+                  f"python3 diag_netprobe.py netname <имя>", file=sys.stderr, flush=True)
+        return label
+    return None
+
+
 def _canary_tunnel_events(events):
     """Канареечная серия metrics-журнала (мульти-таргет 2026-09-29): api.anthropic.com
     (+None — legacy fallback-события). Вендор-цели (netflix/github) вырезаются: их фейлы

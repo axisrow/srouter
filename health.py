@@ -818,6 +818,9 @@ def _record_watchdog_metrics(result):
         if not opts["enabled"] or now - _state_float(state, "last_write") < opts["interval_sec"]:
             return
 
+        # Метка сети один раз на записывающий тик (#384): резолвер — 3 subprocess
+        # (ipconfig/route/arp), на троттлинговых тиках не зовём вовсе.
+        net = diag_netprobe.current_net()
         # Мульти-таргет (2026-09-29): timings-список → по событию на цель (схема события
         # та же, target различается). Легаси-shape (timing-дикт без timings) и fallback
         # (curl убит до -w) — по-прежнему одна запись: failure_rate окна видит и падения.
@@ -827,17 +830,18 @@ def _record_watchdog_metrics(result):
             for entry in timings:
                 if isinstance(entry, dict):
                     metrics_store.append_timing_event(
-                        metrics_store.build_event(entry, now=now))
+                        metrics_store.build_event(entry, now=now, net=net))
                     wrote += 1
         if not wrote:
             timing = tun_check.get("timing")
             if isinstance(timing, dict):
-                event = metrics_store.build_event(timing, now=now)
+                event = metrics_store.build_event(timing, now=now, net=net)
             else:
                 # curl не успел вывести -w (sys_probe timeout) — фиксируем сам факт
                 # провала как замер: failure_rate окна обязан видеть и падения тоже.
                 event = metrics_store.build_event(
-                    {"status": "down" if not tun_check.get("ok") else "unknown"}, now=now)
+                    {"status": "down" if not tun_check.get("ok") else "unknown"},
+                    now=now, net=net)
             metrics_store.append_timing_event(event)
 
         if now - _state_float(state, "last_rotate") >= metrics_store.RETENTION_CHECK_INTERVAL_SEC:
@@ -1203,6 +1207,11 @@ def _append_watchdog_status_event(previous, current, reasons=None, segment=None)
             event["diff"] = diff
         if segment:
             event["segment"] = segment
+        # #384: в какой сети случился переход (статус-события редки — цена резолвера
+        # несущественна); не определилась — ключа нет, старые reader'ы не ломаются.
+        net = diag_netprobe.current_net()
+        if isinstance(net, str) and net:
+            event["net"] = net
         with open(WATCHDOG_STATUS_LOG, "a", encoding="utf-8") as log_file:
             log_file.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
     except OSError as exc:
