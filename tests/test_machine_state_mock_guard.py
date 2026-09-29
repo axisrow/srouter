@@ -109,6 +109,9 @@ _SAFE_WITHOUT_DIRECT_MOCK = {
     # БЕЗ subprocess) — глушится autouse-фикстурой _block_real_watchdog_lifecycle
     # (health._tunnel_window_stats → None = fail-open), изоляция от живого metrics-JSONL
     # launchd-watchdog; вызывается только при не-vendor провале туннеля.
+    "_metrics_probe_options",  # мульти-таргет 2026-09-29: читает local.json (fail-soft, без
+    # subprocess, свои ошибки гасит внутри → дефолты). Результат только параметризует список
+    # целей _tunnel_up (который в check_all-тестах всё равно замокан) — на вердикт не влияет.
 }
 
 

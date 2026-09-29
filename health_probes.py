@@ -10,6 +10,7 @@ health.py остаётся тонким фасадом: `from health_probes impo
 """
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import socket
 import subprocess
@@ -634,7 +635,7 @@ def _timing_from_tokens(tokens, url, kind, rc=None, err=None):
     }
 
 
-def _tunnel_target_up(url):
+def _tunnel_target_up(url, head=False):
     """Один таргет через прокси: (ok, detail, kind, timing). Живой = сервер ответил
     HTTP < 500 (sys_probe.tunnel_code_up). 000/timeout/5xx — не жив. Не бросает.
 
@@ -643,13 +644,22 @@ def _tunnel_target_up(url):
     upstream-error. #207: upstream-error = HTTP 5xx (сервер ответил через туннель → канал жив,
     но сам вендор лежит); прочие = curl не достучался (сеть/VPS).
 
+    head=True (-I) — для измерительных целей мульти-таргетной пробы: тело ответа не качаем
+    (корни github/netflix — сотни КБ каждую минуту), фазы connect/tls/ttfb сохраняют смысл
+    (TCP+TLS+первый байт идут одинаково). Канарейки решения ходят GET — метод существующей
+    серии не меняется.
+
     timing — dict разложения времени ЭТОГО ЖЕ curl-запроса (connect_ms/tls_ms/ttfb_ms/
     total_ms + target/code/status=kind): watcher пишет его в metrics_store, не делая
     ни одного дополнительного сетевого запроса. None только при sys_probe timeout
     (процесс убит до вывода -w)."""
-    r = sys_probe.run([CURL, "-sS", "-o", "/dev/null", "-x", _PROXY,
-                       "--connect-timeout", "4", "--max-time", "8",
-                       "-w", _TIMING_WRITE_FORMAT, url], timeout=10)
+    cmd = [CURL, "-sS", "-o", "/dev/null"]
+    if head:
+        cmd.append("-I")
+    cmd += ["-x", _PROXY,
+            "--connect-timeout", "4", "--max-time", "8",
+            "-w", _TIMING_WRITE_FORMAT, url]
+    r = sys_probe.run(cmd, timeout=10)
     if r.get("timeout"):
         # timing-минимум, не None (#315 round 2 / Codex P2-4): rc/err причины доступны
         # даже когда процесс убит до вывода -w — timeout-класс не терял бы err в metrics.
@@ -687,7 +697,7 @@ def _tunnel_target_up(url):
         tokens, url, kind, rc=r.get("rc"), err=r.get("err"))
 
 
-def _tunnel_up():
+def _tunnel_up(extra_targets=None):
     """Реальный туннель жив? curl через прокси к TUNNEL_TARGETS (ровно как probe_tunnel).
 
     Бьём ДВА таргета (Anthropic + OpenAI), up = первый OR второй — та же избыточность, что у
@@ -698,34 +708,53 @@ def _tunnel_up():
     #207: если ВСЕ таргеты дали HTTP 5xx (kind=="upstream-error" — сервер ответил через туннель,
     значит канал жив, но сами вендоры лежат) → detail = «vendor outage», is_vendor_outage=True.
     Это различает HTTP-level vendor-down от network/VPS-death (timeout/connection-failed/...).
-    Возвращает (ok, detail, is_vendor_outage, first_timing). is_vendor_outage — структурный
+
+    extra_targets — измерительные цели мульти-таргетной пробы (probes.metrics_targets):
+    зондируются ВМЕСТЕ с канарейками (параллельно, ThreadPool — 9 последовательных curl
+    по ≤10с не влезают в 20-с тик), пишутся в metrics-серию (timings), но на РЕШЕНИЕ не
+    влияют: лежащий netflix — вендор, не «туннель упал». Канарейки ходят GET, extras —
+    HEAD (тело ответа не качаем).
+
+    Возвращает (ok, detail, is_vendor_outage, timings). is_vendor_outage — структурный
     сигнал (не parse detail-строки), consumer'ы (check_all → _print_report) читают его, а не
-    подстроку. first_timing — timing-замер ПЕРВОГО таргета (стабильная серия для тренда
-    metrics_store: замер всегда по одному и тому же таргету, даже когда up по второму).
+    подстроку. timings — список timing-диктов по ВСЕМ прозондированным целям в порядке
+    (канарейки, затем extras без дублей); timings[0] — стабильная канареечная серия для
+    тренда metrics_store (замер всегда по одному и тому же таргету). Список/None/дикт —
+    consumer'ы (_record_watchdog_metrics) принимают все три формы (обратная совместимость
+    моков/старых вызовов).
     """
-    if not _health_facade.TUNNEL_TARGETS:
+    canaries = [str(u) for u in _health_facade.TUNNEL_TARGETS]
+    if not canaries:
         return False, "no tunnel targets", False, None
+    extras = []
+    seen = set(canaries)
+    for url in extra_targets or []:
+        if isinstance(url, str) and url not in seen:
+            seen.add(url)
+            extras.append(url)
+    urls = canaries + extras
+    head_set = set(extras)
+    with ThreadPoolExecutor(max_workers=min(len(urls), 8)) as pool:
+        results = list(pool.map(lambda u: _tunnel_target_up(u, head=u in head_set), urls))
+    timings = [timing for (_, _, _, timing) in results]
+
     details, kinds = [], []
-    first_timing = None
-    for url in _health_facade.TUNNEL_TARGETS:
-        ok, detail, kind, timing = _tunnel_target_up(url)
-        if first_timing is None:
-            first_timing = timing
+    for ok, detail, kind, _timing in results[:len(canaries)]:
         if ok:
-            return True, detail, False, first_timing  # любой живой таргет = туннель жив
+            return True, detail, False, timings  # любой живой канарейк = туннель жив
         details.append(detail)
         kinds.append(kind)
-    # ни один таргет не ответил живым HTTP < 500 → туннель/прокси down.
+    # ни одна канарейка не ответила живым HTTP < 500 → туннель/прокси down.
     # #207: vendor outage = ВСЕ kind'и upstream-error (HTTP 5xx, канал жив). Структурный
     # дискриминатор по kind, не parse detail-строки (канон loose-validator-recurring-leak).
     is_vendor_outage = all(k == "upstream-error" for k in kinds)
     if is_vendor_outage:
-        return False, f"{VENDOR_OUTAGE_MARKER} — оба вендора лежат, канал жив ({'; '.join(details)})", True, first_timing
-    # #362 п.2: одинаковый отказ обоих таргетов не дублируется — «connection-failed;
+        return False, f"{VENDOR_OUTAGE_MARKER} — оба вендора лежат, канал жив ({'; '.join(details)})", True, timings
+    # #362 п.2: одинаковый отказ обеих канареек не дублируется — «connection-failed;
     # connection-failed» в пуше читается как шум; цифры окна добавляет check_all (гейт #362).
     if len(details) > 1 and len(set(details)) == 1:
-        return False, f"{details[0]} (оба таргета)", False, first_timing
-    return False, "; ".join(details), False, first_timing
+        return False, f"{details[0]} (оба таргета)", False, timings
+    return False, "; ".join(details), False, timings
 
 
 # ============================ #203: активный сетевой интерфейс/маршрут (нет сети vs VPS мёртв) ============================

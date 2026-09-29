@@ -5,6 +5,8 @@
 5-секундного поллинга статуса. GET → без _MUTATION_LOCK: observe-only чтение
 не ловит 409. Observe-only: тренд ни на что не влияет, только показывается.
 """
+import time
+
 import pytest
 
 import dashboard
@@ -126,3 +128,55 @@ def test_metrics_tunnel_cached_within_ttl(monkeypatch):
     assert _get("/api/metrics/tunnel").status_code == 200
     assert _get("/api/metrics/tunnel").status_code == 200
     assert len(calls) == 1, "второй запрос обязан прийти из TTL-кэша"
+
+
+# ============================ мульти-таргет: строки по сайтам (2026-09-29) ============================
+
+_NOW = time.time()  # payload считает возраст от реального now — база та же, не «будущее»
+
+
+def _event(target, status="ok", age_sec=60.0, **phases):
+    e = {"ts": _NOW - age_sec, "target": target, "status": status,
+         "code": "000" if status != "ok" else "200",
+         "connect_ms": 1, "tls_ms": None, "ttfb_ms": None, "total_ms": None}
+    e.update(phases)
+    return e
+
+
+def test_metrics_target_rows_groups_rates_and_medians():
+    """ok-rate за 1ч/24ч и медианы фаз считаются per-target, не в общей куче."""
+    events = [
+        _event("api.anthropic.com", "ok", 60, tls_ms=40, ttfb_ms=60, total_ms=150),
+        _event("github.com", "ok", 120, tls_ms=90, ttfb_ms=20, total_ms=300),
+        _event("github.com", "connection-failed", 180, tls_ms=None, ttfb_ms=None, total_ms=None),
+    ]
+    rows = {r["target"]: r for r in dashboard_routes._metrics_target_rows(events, now=_NOW)}
+    assert rows["api.anthropic.com"]["ok_rate_1h"] == 1.0
+    assert rows["github.com"]["ok_rate_24h"] == 0.5
+    assert rows["github.com"]["ok_rate_1h"] == 0.5
+    assert rows["github.com"]["tls_ms"] == 90, "медиана только по ok-замерам цели"
+    assert rows["github.com"]["samples"] == 2
+
+
+def test_metrics_target_rows_skips_legacy_and_junk():
+    """None-target (legacy fallback-события) и мусор не порождают строк."""
+    events = [_event(None, "ok"), {"ts": _NOW, "target": 42, "status": "ok"}, "мусор"]
+    assert dashboard_routes._metrics_target_rows(events, now=_NOW) == []
+
+
+def test_metrics_tunnel_payload_has_targets_and_canary_summary(monkeypatch):
+    """payload.targets — по сайту; legacy top-level summary считается ТОЛЬКО по канарейке:
+    деградация github не должна читать trend=degraded для туннеля."""
+    events = [_event("api.anthropic.com", "ok", 60 * i, total_ms=150, tls_ms=40, ttfb_ms=60)
+              for i in range(6)]
+    events += [_event("github.com", "connection-failed", 60 * i) for i in range(6)]
+    _mock_events(monkeypatch, events)
+    monkeypatch.setattr(dashboard_routes.proxy_errors, "probe_error_rate",
+                        lambda **kw: {"status": "disabled", "window_hours": 1,
+                                      "total": 0, "errors": 0, "error_rate": None, "by_code": {}})
+    data = _get("/api/metrics/tunnel").get_json()
+    targets = {r["target"]: r for r in data["targets"]}
+    assert set(targets) == {"api.anthropic.com", "github.com"}
+    assert targets["github.com"]["ok_rate_1h"] == 0.0
+    assert data["latest"]["failure_rate"] == 0.0, \
+        "top-level summary — канареечная серия: фейлы github в неё не попадают"

@@ -47,6 +47,23 @@ def _is_valid_host(host):
     return bool(isinstance(host, str) and _HOST_RE.match(host))
 
 
+def normalize_http_targets(raw, fallback):
+    """Список http(s)-URL из state: не-строки/чужие схемы отбрасываются, порядок сохранён;
+    пусто (или сырой мусор) → fallback, отфильтрованный тем же правилом. Чистая функция.
+
+    Один источник для всех списков URL-целей проб (reachability_targets, metrics_targets):
+    валидация не дублируется в consumer'ах (канон loose-validator-recurring-leak — строгий
+    первоисточник, а не «почти-regex» на месте)."""
+    def _valid(value):
+        return isinstance(value, str) and value.startswith(("http://", "https://"))
+
+    items = raw if isinstance(raw, list) else []
+    targets = [x for x in items if _valid(x)]
+    if targets:
+        return targets
+    return [x for x in (fallback if isinstance(fallback, list) else []) if _valid(x)]
+
+
 # Safe-default state: секции v1 (#2). probes — эталонные defaults (G3);
 # реальную запись делает #5 setup/check на реальной машине.
 _DEFAULT_STATE = {
@@ -64,6 +81,20 @@ _DEFAULT_STATE = {
         "metrics_enabled": True,
         "metrics_interval_sec": 60,
         "metrics_retention_days": 7,
+        # Мульти-таргет проба (2026-09-29): сравнение сайтов между собой. Зарубежные —
+        # через туннель (маршрут решает xray-whitelist), baidu — мимо whitelist → direct
+        # (эталон domestica). Канарейки решения — TUNNEL_TARGETS (health_probes), не этот
+        # список: вендор-блок одной цели не должен читать «туннель упал».
+        "metrics_targets": [
+            "https://api.anthropic.com/",
+            "https://chatgpt.com/",
+            "https://github.com/",
+            "https://discord.com/",
+            "https://www.youtube.com/",
+            "https://www.netflix.com/",
+            "https://www.gstatic.com/generate_204",
+            "https://www.baidu.com/",
+        ],
     },
     "network": {"gateway": "", "vpn_server": "", "vpn_exit_ip": "", "channels": {}},
     "traffic_guard": {"mode": "off", "domains": {}},

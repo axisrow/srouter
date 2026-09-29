@@ -98,3 +98,37 @@ def test_baseline_label_sources():
     assert "тот же час" in _call("metricsBaselineLabel", ["'same-hour'"])
     assert "24" in _call("metricsBaselineLabel", ["'trailing'"])
     assert "базы" in _call("metricsBaselineLabel", ["'none'"])
+
+
+# ============================ мульти-таргет: таблица сайтов (2026-09-29) ============================
+
+def _targets_call(payload):
+    return _call("metricsTargetsSectionHtml", [json.dumps(payload, ensure_ascii=False)])
+
+
+def test_metrics_targets_table_renders_all_sites():
+    """Все цели из payload попадают в таблицу: ok-rate в %, мс-фазы, последний статус."""
+    html = _targets_call([
+        {"target": "api.anthropic.com", "ok_rate_1h": 1.0, "ok_rate_24h": 0.98,
+         "tls_ms": 40, "ttfb_ms": 60, "last_status": "ok"},
+        {"target": "github.com", "ok_rate_1h": 0.5, "ok_rate_24h": 0.9,
+         "tls_ms": None, "ttfb_ms": None, "last_status": "connection-failed"},
+    ])
+    assert "api.anthropic.com" in html and "github.com" in html
+    assert "100%" in html and "50%" in html
+    assert "connection-failed" in html
+    assert "<table" in html
+
+
+def test_metrics_targets_empty_payload_renders_nothing():
+    """Без целей (старый payload/нет данных) секция не рисуется вовсе."""
+    assert _targets_call([]) == ""
+    assert _targets_call(None) == ""
+
+
+def test_metrics_targets_escapes_host_html():
+    """target из state (не доверенный) экранируется — без HTML-инъекции в панель."""
+    html = _targets_call([{"target": "<script>alert(1)</script>", "ok_rate_1h": 1.0,
+                           "ok_rate_24h": 1.0, "tls_ms": 1, "ttfb_ms": 1, "last_status": "ok"}])
+    assert "<script>" not in html
+    assert "&lt;script&gt;" in html

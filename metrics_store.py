@@ -44,6 +44,13 @@ METRICS_LOG = Path.home() / "Library" / "Logs" / "srouter-watchdog.metrics.jsonl
 DEFAULT_INTERVAL_SEC = 60
 DEFAULT_RETENTION_DAYS = 7
 
+# Канарейка метрик: серия «здоровья туннеля» в мульти-таргетном журнале (2026-09-29).
+# Хост первой TUNNEL_TARGETS (health_probes) — литералом, не выводом: metrics_store не
+# зависит от health_probes (слои без циклов). Consumers (flap-гейт health, сегмент-заметка,
+# /api/metrics/tunnel top-level, diag_netprobe.report) фильтруют журнал по нему (+None —
+# legacy fallback-события), иначе фейл одного вендора (netflix) читался бы как «туннель флапает».
+METRICS_CANARY_TARGET = "api.anthropic.com"
+
 # Ретеншн: при записи не чаще раза в час файл переписывается, если в нём есть
 # события старше retention или он дорос до max_bytes (atomic rewrite).
 RETENTION_MAX_BYTES = 8 * 1024 * 1024
