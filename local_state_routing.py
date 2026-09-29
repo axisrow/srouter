@@ -11,12 +11,32 @@ restart → promote. Эталон read-xray: local_state_xray._read_xray_vless_a
 local_state.save_state; restart: install_lib._restart_component.
 """
 import json
+import json
 from pathlib import Path
 
 import local_state
 
 ROUTING_MARKER = "_srouter_managed"  # ключ в rule (xray игнорирует неизвестные ключи — безопасно)
 DEFAULT_ROUTING_OUTBOUND = "reality-out"
+
+
+def routing_has_managed_marker(config_path=None):
+    """Живой конфиг содержит managed-правило (_srouter_managed:true) = hybrid-adopt (#136/#313).
+
+    Вторая нога select-гвара рядом с state-тегом (_routing_outbound_tag): state без
+    routing-секции (потерян/будущая миграция) не должен открывать мину регенерации на
+    adopt-машине (review #379). Фейл-софт: конфиг absent/битый → False. Несколько
+    managed-правил (ambiguous) → True — adopt тем более. Не бросает."""
+    from local_state_xray import XRAY_CONFIG_PATH
+    path = Path(config_path or XRAY_CONFIG_PATH)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return False
+    rules = (data.get("routing") or {}).get("rules") if isinstance(data, dict) else None
+    if not isinstance(rules, list):
+        return False
+    return _routing_find_managed_rule(rules) != -1
 
 
 def routing_plan(current_domains, hosts, action="add"):

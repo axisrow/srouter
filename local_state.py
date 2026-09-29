@@ -403,6 +403,7 @@ _SUBMODULE_NAMES = {
     "_routing_domains_hash": "local_state_routing",
     "routing_apply": "local_state_routing",
     "_routing_apply_locked": "local_state_routing",
+    "routing_has_managed_marker": "local_state_routing",
 }
 
 

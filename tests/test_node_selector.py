@@ -238,6 +238,35 @@ def test_select_node_canonical_mode_not_blocked_by_adopt_guard(tmp_path):
     assert out["step"] == "begin", "canonical-режим не должен отказывать по adopt"
 
 
+def test_select_node_marker_in_live_config_refuses_even_without_state_routing(tmp_path):
+    """Fail-open окно (review #379): state без routing-секции (потерян/будущая миграция),
+    но живой конфиг содержит managed-маркер → это adopt-машина, отказ обязателен."""
+    import node_selector
+
+    state_path = tmp_path / "srouter.local.json"
+    _write_state(state_path, _state(hk_enabled=False))
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"routing": {"rules": [
+        {"_srouter_managed": True, "outboundTag": "reality-out",
+         "domain": ["domain:example.com"]},
+    ]}}), encoding="utf-8")
+    before = state_path.read_bytes()
+    runner_calls = []
+
+    out = node_selector.select_node(
+        "hk-1",
+        enabled_names={"hk-1"},
+        runner=lambda cmd, timeout: runner_calls.append((cmd, timeout)),
+        state_path=state_path,
+        config_path=config_path,
+    )
+
+    assert out["ok"] is False
+    assert out["step"] == "adopt-mode"
+    assert state_path.read_bytes() == before
+    assert runner_calls == []
+
+
 def test_select_node_blocks_invalid_traffic_guard_before_pending_write(tmp_path):
     import node_selector
 

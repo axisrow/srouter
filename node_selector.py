@@ -13,6 +13,7 @@ import threading
 
 import gen_xray_config
 import local_state
+import local_state_routing
 import local_state_xray
 import os
 import sys_probe
@@ -540,7 +541,8 @@ def _select_node_locked(name, *, enabled_names, runner=None, state_path=None, co
         # _routing_outbound_tag = "active" → guard пропустит; детект adopt-режима иначе
         # невозможен (для srouter такая машина неотличима от canonical), контракт
         # fail-soft тот же у compare_endpoint_with_xray/sync_*.
-        if local_state_xray._routing_outbound_tag(state_path) != "active":
+        if (local_state_xray._routing_outbound_tag(state_path) != "active"
+                or local_state_routing.routing_has_managed_marker(config_path)):
             return {"ok": False, "active": previous, "step": "adopt-mode",
                     "error": "hybrid-adopt config (#136/#313): select регенерирует конфиг "
                              "и сносит managed whitelist; переключение узла — вручную "
