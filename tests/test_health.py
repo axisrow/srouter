@@ -3308,6 +3308,29 @@ def test_watchdog_down_recovery_silent_after_suppressed_down(monkeypatch, tmp_pa
     assert notified == [], "recovery заглушенного эпизода не пушится"
 
 
+def test_watchdog_sandwich_down_degraded_down_keeps_pair_guarantee(monkeypatch, tmp_path):
+    """Сэндвич down→degraded→down одного эпизода: подавленное повторное «Упало» НЕ затирает
+    флаг прозвучавшего — его «Восстановлено» обязано прийти (review #380 P2)."""
+    notified, _, _ = _wd315_watchdog_harness(
+        monkeypatch, tmp_path, "down", ["туннель"],
+        prev_state={"status": "ok", "failed": [], "last_down_push": 0.0},
+        env={_DOWN_COOLDOWN_ENV: "600"})
+    health.cmd_watchdog()
+    assert [n[1] for n in notified] == ["Basso"]
+    monkeypatch.setattr(health, "check_all", lambda **kw: {
+        "status": "degraded", "checks": [{"name": "туннель", "ok": False}]})
+    health.cmd_watchdog()
+    assert [n[1] for n in notified] == ["Basso"]
+    monkeypatch.setattr(health, "check_all", lambda **kw: {
+        "status": "down", "checks": [{"name": "туннель", "ok": False}]})
+    health.cmd_watchdog()
+    assert len(notified) == 1, "повтор в cooldown молчит"
+    monkeypatch.setattr(health, "check_all", lambda **kw: {
+        "status": "ok", "checks": [{"name": "privoxy", "ok": True}]})
+    health.cmd_watchdog()
+    assert [n[1] for n in notified] == ["Basso", "Glass"], "сэндвич не разъезжает пару"
+
+
 def test_watchdog_down_pair_pushes_outside_cooldown(monkeypatch, tmp_path):
     """Вне cooldown пара целая: «Упало» (Basso) → «Восстановлено» (Glass)."""
     notified, _, _ = _wd315_watchdog_harness(
