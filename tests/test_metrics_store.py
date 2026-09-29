@@ -330,3 +330,14 @@ def test_summarize_empty_ratios_shape():
     out = metrics_store.summarize([], now=1000000.0)
     assert out["ratios"] == {"connect": None, "tls": None, "ttfb": None, "total": None}
     assert out["baseline"]["phases"] == {"connect_ms": None, "tls_ms": None, "ttfb_ms": None}
+
+
+def test_retention_caps_cover_retention_days_at_multi_target_rate():
+    """Гвард калибровки: хвосты чтения/ретеншна покрывают DEFAULT_RETENTION_DAYS при дефолтном
+    мульти-таргет-ритме (9 соб/мин, ~233 Б/событие — замер живого JSONL 2026-09-29). Иначе
+    горизонт трендов/бейслайнов молча сжимается до ~1.5–2.7 сут (PR #378, adversarial 3a)."""
+    events_per_min = 9
+    minutes = metrics_store.DEFAULT_RETENTION_DAYS * 24 * 60
+    assert metrics_store._READ_MAX_LINES >= events_per_min * minutes
+    assert metrics_store._READ_MAX_BYTES >= events_per_min * minutes * 233
+    assert metrics_store.RETENTION_MAX_BYTES >= events_per_min * minutes * 233

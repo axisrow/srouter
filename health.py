@@ -135,8 +135,19 @@ def _tunnel_window_stats(now=None, log_path=None):
     (fail-open: гейт неприменим). Не бросает.
     """
     try:
-        events = metrics_store.read_timing_events(hours=1, max_lines=120,
+        # Хвост обязан покрывать WINDOW_SEC при любом числе целей: за тик пишется событие
+        # НА КАЖДУЮ (канарейки + extras), а 120 строк калибровали эпоху одной канарейки —
+        # при дефолтных 9 целях хвост 120 строк ≈ 13.3 мин < окна 15м, при интервале 20с
+        # гейт уходит в fail-open (PR #378, adversarial). Опции фейл-софт, пусто не бывает.
+        max_lines = 120 * (1 + len(_metrics_probe_options()["metrics_targets"]))
+        events = metrics_store.read_timing_events(hours=1, max_lines=max_lines,
                                                   log_path=log_path, now=now)
+        # Мульти-таргет (2026-09-29): гейт считает только канарейку (+legacy None-события).
+        # Фейл вендора (netflix) — не «туннель флапает»: OR-семантика пробы решает это,
+        # гейт должен видеть ту же серию, что и проба решения.
+        events = [e for e in events
+                  if not isinstance(e, dict)
+                  or e.get("target") in (None, metrics_store.METRICS_CANARY_TARGET)]
         now_ts = metrics_store._now(now)
         window = []
         for event in events:
@@ -197,7 +208,12 @@ def _tunnel_parameter_note(now=None):
     данных → None (канон fail-soft, пуш уходит без заметки).
     """
     try:
-        summary = metrics_store.summarize(metrics_store.read_timing_events(now=now))
+        # Канареечная серия (мульти-таргет 2026-09-29): вендор-события не участвуют в
+        # атрибуции деградации туннеля — тот же фильтр, что у flap-гейта.
+        events = [e for e in metrics_store.read_timing_events(now=now)
+                  if not isinstance(e, dict)
+                  or e.get("target") in (None, metrics_store.METRICS_CANARY_TARGET)]
+        summary = metrics_store.summarize(events)
         legs = diag_netprobe.leg_snapshots(now=now)
         diag = diag_netprobe.diagnose_degradation(summary, legs)
         if not diag:
@@ -219,18 +235,22 @@ def check_all(*, active_claude=False):
     checks.append({"name": f"privoxy ({PRIVOXY_PORT})", "ok": _port_up(PRIVOXY_PORT)})
     checks.append({"name": f"xray ({XRAY_PORT})", "ok": _port_up(XRAY_PORT)})
     checks.append({"name": f"dashboard ({DASHBOARD_PORT})", "ok": _port_up(DASHBOARD_PORT)})
-    tun_ok, tun_detail, tun_vendor_outage, tun_timing = _tunnel_up()
+    tun_ok, tun_detail, tun_vendor_outage, tun_timings = _tunnel_up(
+        extra_targets=_metrics_probe_options()["metrics_targets"])
     # #207: vendor outage (оба вендора HTTP 5xx = канал жив, вендоры лежат) структурно помечаем
     # в check["category"] (как vps_check["info"] / lp_check["info"] ниже) — _print_report читает
     # поле, а не парсит detail-строку. Каскад #201: ...→сеть→VPS→туннель→vendor outage. При vendor
     # outage туннель driver-down, но VPS/local-proxy чеки ниже остаются info (они живы).
-    # tun_timing — разложение времени того же curl-запроса (connect/tls/ttfb/total):
-    # consumer (heartbeat-метрики) читает его, не делая доп. сетевых запросов.
+    # tun_timings — разложения времени тех же curl-запросов (connect/tls/ttfb/total) по ВСЕМ
+    # целям мульти-таргетной пробы: consumer (heartbeat-метрики) пишет их, не делая доп.
+    # сетевых запросов. "timing" — первая (канареечная) запись: стабильная серия для
+    # window_stats-rc и легаси-потребителей.
     # id — структурный ключ чека (как category ниже): consumer'ы находят туннель по нему,
     # а не по префиксу человекочитаемого name (канон loose-validator-recurring-leak:
     # переименование строки не должно тихо гасить потребителя).
+    tun_first = tun_timings[0] if isinstance(tun_timings, list) and tun_timings else tun_timings
     tun_check = {"id": "tunnel", "name": "туннель (api.anthropic.com через прокси)", "ok": tun_ok,
-                 "detail": tun_detail, "timing": tun_timing}
+                 "detail": tun_detail, "timing": tun_first, "timings": tun_timings}
     if tun_vendor_outage:
         tun_check["category"] = "vendor-outage"
     elif not tun_ok:
@@ -736,6 +756,10 @@ def _metrics_probe_options(state_path=None):
         "interval_sec": _int_or("metrics_interval_sec", metrics_store.DEFAULT_INTERVAL_SEC,
                                 _METRICS_INTERVAL_MIN_SEC, 86400),
         "retention_days": _int_or("metrics_retention_days", metrics_store.DEFAULT_RETENTION_DAYS, 1, 90),
+        # Мульти-таргет проба: список URL (сравнение сайтов). Валидация — общий хелпер
+        # local_state (один источник с reachability_targets); мусор → дефолт схемы.
+        "metrics_targets": local_state.normalize_http_targets(
+            raw.get("metrics_targets"), defaults.get("metrics_targets", [])),
     }
 
 
@@ -790,15 +814,27 @@ def _record_watchdog_metrics(result):
         if not opts["enabled"] or now - _state_float(state, "last_write") < opts["interval_sec"]:
             return
 
-        timing = tun_check.get("timing")
-        if isinstance(timing, dict):
-            event = metrics_store.build_event(timing, now=now)
-        else:
-            # curl не успел вывести -w (sys_probe timeout) — фиксируем сам факт
-            # провала как замер: failure_rate окна обязан видеть и падения тоже.
-            event = metrics_store.build_event(
-                {"status": "down" if not tun_check.get("ok") else "unknown"}, now=now)
-        metrics_store.append_timing_event(event)
+        # Мульти-таргет (2026-09-29): timings-список → по событию на цель (схема события
+        # та же, target различается). Легаси-shape (timing-дикт без timings) и fallback
+        # (curl убит до -w) — по-прежнему одна запись: failure_rate окна видит и падения.
+        wrote = 0
+        timings = tun_check.get("timings")
+        if isinstance(timings, list):
+            for entry in timings:
+                if isinstance(entry, dict):
+                    metrics_store.append_timing_event(
+                        metrics_store.build_event(entry, now=now))
+                    wrote += 1
+        if not wrote:
+            timing = tun_check.get("timing")
+            if isinstance(timing, dict):
+                event = metrics_store.build_event(timing, now=now)
+            else:
+                # curl не успел вывести -w (sys_probe timeout) — фиксируем сам факт
+                # провала как замер: failure_rate окна обязан видеть и падения тоже.
+                event = metrics_store.build_event(
+                    {"status": "down" if not tun_check.get("ok") else "unknown"}, now=now)
+            metrics_store.append_timing_event(event)
 
         if now - _state_float(state, "last_rotate") >= metrics_store.RETENTION_CHECK_INTERVAL_SEC:
             metrics_store.rotate_metrics_log(retention_days=opts["retention_days"])

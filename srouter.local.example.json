@@ -44,7 +44,17 @@
     "max_time_sec": 8,
     "metrics_enabled": true,
     "metrics_interval_sec": 60,
-    "metrics_retention_days": 7
+    "metrics_retention_days": 7,
+    "metrics_targets": [
+      "https://api.anthropic.com/",
+      "https://chatgpt.com/",
+      "https://github.com/",
+      "https://discord.com/",
+      "https://www.youtube.com/",
+      "https://www.netflix.com/",
+      "https://www.gstatic.com/generate_204",
+      "https://www.baidu.com/"
+    ]
   },
   "network": {
     "gateway": "192.0.2.1",

@@ -179,9 +179,9 @@ def _probe_defaults():
 
 
 def _normalize_reachability_targets(raw, defaults):
-    items = raw if isinstance(raw, list) else defaults.get("reachability_targets", [])
-    targets = [x for x in items if _http_url(x)]
-    return targets or [x for x in defaults.get("reachability_targets", []) if _http_url(x)]
+    # Валидация — единый хелпер local_state (один источник, как _is_valid_host);
+    # семантика прежняя: не-список/пусто → дефолт из схемы probes.
+    return local_state.normalize_http_targets(raw, defaults.get("reachability_targets", []))
 
 
 def _normalize_throughput_targets(raw, defaults):

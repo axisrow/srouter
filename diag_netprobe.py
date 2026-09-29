@@ -282,6 +282,16 @@ def learn_net(name):
     print(f"netname: сеть {name!r} запомнена (dns={dns}, gateway={gateway}, iface={iface})")
 
 
+def _canary_tunnel_events(events):
+    """Канареечная серия metrics-журнала (мульти-таргет 2026-09-29): api.anthropic.com
+    (+None — legacy fallback-события). Вендор-цели (netflix/github) вырезаются: их фейлы
+    не должны рисовать окна блэкаутов туннеля и портить корреляцию с netprobe-ногами.
+    Чистая функция, не бросает."""
+    return [e for e in events
+            if isinstance(e, dict)
+            and e.get("target") in (None, metrics_store.METRICS_CANARY_TARGET)]
+
+
 def _blackout_windows(events, since_ts=None):
     """[start, end] кластеров подряд идущих фейлов туннеля (gap ≤ CLUSTER_GAP_SEC).
 
@@ -491,7 +501,10 @@ def _fmt_bucket(bucket):
 
 def report():
     """Корреляция блэкаутов туннеля с потерями по участкам пути → вердикт (а)/(б). Не бросает."""
-    tunnel = metrics_store.read_timing_events(log_path=metrics_store.METRICS_LOG)
+    # Канареечная серия: окна блэкаутов и корреляция считаются по api.anthropic.com —
+    # вендор-цели мульти-таргетной пробы корреляцию не портят (2026-09-29).
+    tunnel = _canary_tunnel_events(
+        metrics_store.read_timing_events(log_path=metrics_store.METRICS_LOG))
     legs = metrics_store.read_timing_events(log_path=NETPROBE_LOG)
     if not tunnel:
         print("metrics-JSONL watchdog'а пуст/отсутствует — корреляция невозможна")

@@ -1671,3 +1671,39 @@ def test_sync_endpoint_writes_to_active_node_not_disabled(tmp_path):
     # compare теперь видит синхрон (active = enabled-1 = 85.136.181.198 == xray)
     cmp = local_state.compare_endpoint_with_xray(state_path=state_p, xray_config_path=xray_p)
     assert cmp["synced"] is True, cmp
+
+
+# ============================ metrics_targets: мульти-таргет проба (2026-09-29) ============================
+
+def test_default_state_has_metrics_targets():
+    """Дефолтный список целей metrics-пробы: зарубежные сайты пользователя + китайский
+    эталон (baidu идёт мимо whitelist → direct — сравнение «туннель vs domestica»)."""
+    targets = local_state._DEFAULT_STATE["probes"]["metrics_targets"]
+    assert isinstance(targets, list) and len(targets) >= 8
+    assert all(isinstance(u, str) and u.startswith("https://") for u in targets)
+    assert any("baidu" in u for u in targets), "китайский сайт-эталон в дефолте"
+    assert any("anthropic" in u for u in targets), "канареечная серия остаётся в списке"
+
+
+def test_normalize_http_targets_drops_junk_keeps_order():
+    raw = ["https://github.com/", "ftp://x", 42, None, "https://discord.com/"]
+    assert local_state.normalize_http_targets(raw, []) == \
+        ["https://github.com/", "https://discord.com/"]
+
+
+def test_normalize_http_targets_drops_scheme_without_host():
+    """URL без хоста ("https://", "https:///path") отбрасывается: иначе в событие уходит
+    target=None, а канареечные фильтры серий трактуют None как «legacy канарейка» —
+    connection-fail мёртвой цели читались бы как фейлы канарейки (cycle-review PR #378)."""
+    assert local_state.normalize_http_targets(["https://", "https:///path"], []) == []
+    assert local_state.normalize_http_targets(
+        ["https://", "https://ok.example/"], []) == ["https://ok.example/"]
+
+
+def test_normalize_http_targets_empty_falls_back_to_filtered_default():
+    fallback = ["https://a.com/", "junk", 7]
+    assert local_state.normalize_http_targets([], fallback) == ["https://a.com/"]
+    assert local_state.normalize_http_targets(None, fallback) == ["https://a.com/"]
+    assert local_state.normalize_http_targets("мусор", fallback) == ["https://a.com/"]
+    # и fallback целиком мусорный → пустой список (не падаем)
+    assert local_state.normalize_http_targets([], ["nope"]) == []

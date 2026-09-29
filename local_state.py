@@ -33,6 +33,7 @@ import socket  # noqa: F401 — re-export surface: local_state.socket патчи
                 # local_state_nodes.py, но это ТОТ ЖЕ объект модуля socket (sys.modules) — патч
                 # local_state.socket.gethostbyname виден и там.
 from pathlib import Path
+from urllib.parse import urlsplit
 
 # Путь к локальному state по умолчанию — рядом с этим модулем, не cwd.
 _DEFAULT_PATH = Path(__file__).resolve().parent / "srouter.local.json"
@@ -45,6 +46,30 @@ _HOST_RE = re.compile(r"^[A-Za-z0-9.:_-]+\Z")
 def _is_valid_host(host):
     """True если строка содержит только безопасные для shell символы."""
     return bool(isinstance(host, str) and _HOST_RE.match(host))
+
+
+def normalize_http_targets(raw, fallback):
+    """Список http(s)-URL из state: не-строки/чужие схемы отбрасываются, порядок сохранён;
+    пусто (или сырой мусор) → fallback, отфильтрованный тем же правилом. Чистая функция.
+
+    Один источник для всех списков URL-целей проб (reachability_targets, metrics_targets):
+    валидация не дублируется в consumer'ах (канон loose-validator-recurring-leak — строгий
+    первоисточник, а не «почти-regex» на месте)."""
+    def _valid(value):
+        if not (isinstance(value, str) and value.startswith(("http://", "https://"))):
+            return False
+        try:
+            # без хоста ("https://") hostname=None → такой URL дал бы события с target=None,
+            # которые канареечные фильтры серий читают как «legacy канарейка» (PR #378)
+            return bool(urlsplit(value).hostname)
+        except ValueError:  # кривые скобки IPv6 и т.п. — фейл-софт контракт модуля
+            return False
+
+    items = raw if isinstance(raw, list) else []
+    targets = [x for x in items if _valid(x)]
+    if targets:
+        return targets
+    return [x for x in (fallback if isinstance(fallback, list) else []) if _valid(x)]
 
 
 # Safe-default state: секции v1 (#2). probes — эталонные defaults (G3);
@@ -64,6 +89,20 @@ _DEFAULT_STATE = {
         "metrics_enabled": True,
         "metrics_interval_sec": 60,
         "metrics_retention_days": 7,
+        # Мульти-таргет проба (2026-09-29): сравнение сайтов между собой. Зарубежные —
+        # через туннель (маршрут решает xray-whitelist), baidu — мимо whitelist → direct
+        # (эталон domestica). Канарейки решения — TUNNEL_TARGETS (health_probes), не этот
+        # список: вендор-блок одной цели не должен читать «туннель упал».
+        "metrics_targets": [
+            "https://api.anthropic.com/",
+            "https://chatgpt.com/",
+            "https://github.com/",
+            "https://discord.com/",
+            "https://www.youtube.com/",
+            "https://www.netflix.com/",
+            "https://www.gstatic.com/generate_204",
+            "https://www.baidu.com/",
+        ],
     },
     "network": {"gateway": "", "vpn_server": "", "vpn_exit_ip": "", "channels": {}},
     "traffic_guard": {"mode": "off", "domains": {}},

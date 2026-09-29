@@ -169,3 +169,37 @@ def test_report_prints_segment_line(tmp_path, capsys, monkeypatch):
     out = capsys.readouterr().out
     assert "Сегмент" in out
     assert "транзит" in out or "неопределим" in out
+
+
+# ============================ мульти-таргет: корреляция по канарейке (2026-09-29) ============================
+# Metrics-JSONL теперь мульти-таргетный: вендор-события (netflix/github) не должны
+# участвовать ни в окнах блэкаутов туннеля, ни в diagnose_degradation — корреляция
+# с netprobe-ногами остаётся на стабильной канареечной серии (api.anthropic.com).
+
+def test_canary_tunnel_events_keeps_canary_and_legacy_only():
+    events = [
+        {"target": "api.anthropic.com", "status": "ok", "ts": 1.0},
+        {"target": "www.netflix.com", "status": "ok", "ts": 2.0},
+        {"target": None, "status": "down", "ts": 3.0},
+        {"ts": 4.0, "status": "ok"},                 # без ключа target = legacy
+        "мусор-строка",
+        42,
+    ]
+    out = diag_netprobe._canary_tunnel_events(events)
+    targets = [e.get("target") for e in out]
+    assert targets == ["api.anthropic.com", None, None], \
+        "вендор-цели вырезаны, канарейка и legacy-события остались"
+
+
+def test_blackout_windows_ignore_foreign_targets(monkeypatch, tmp_path):
+    """Окна блэкаутов строятся из канареечных фейлов: вечный лежащий netflix
+    не рисует «блэкауты туннеля» и не портит вердикт (а)/(б)."""
+    now = 1_000_000.0
+    rows = [{"ts": now - 3600, "target": "www.netflix.com", "status": "connection-failed"},
+            {"ts": now - 3500, "target": "www.netflix.com", "status": "connection-failed"},
+            {"ts": now - 300, "target": "api.anthropic.com", "status": "ok"}]
+    monkeypatch.setattr(metrics_store, "METRICS_LOG", tmp_path / "m.jsonl")
+    _write_log(tmp_path / "m.jsonl", rows)
+    tunnel = metrics_store.read_timing_events(log_path=tmp_path / "m.jsonl")
+    windows = diag_netprobe._blackout_windows(diag_netprobe._canary_tunnel_events(tunnel))
+    assert windows == [], "вендор-фейлы не создают окон туннеля"

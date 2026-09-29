@@ -858,11 +858,66 @@ def _metrics_empty_payload(hours, opts):
     return {
         "status": "no-data", "hours": hours,
         "interval_sec": opts["interval_sec"], "retention_days": opts["retention_days"],
-        "enabled": opts["enabled"], "last_event_at": None, "series": [],
+        "enabled": opts["enabled"], "last_event_at": None, "series": [], "targets": [],
         "latest": summary["latest"], "baseline": summary["baseline"],
         "ratio": summary["ratio"], "trend": summary["trend"],
         "proxy_errors": proxy_errors._empty_payload("disabled", 1),
     }
+
+
+def _metrics_target_rows(events, now=None):
+    """Строки per-target для сравнения сайтов (мульти-таргет проба 2026-09-29). Чистая.
+
+    По каждой цели: ok-rate за 1ч/24ч, медианы tls/ttfb/total по ok-замерам 24ч,
+    samples (24ч) и последний статус. None-target (legacy fallback) и мусор строк
+    не порождают. Смешивать цели нельзя — быстрый сайт разбавил бы деградацию
+    медленного (зеркало бага одноканальности)."""
+    now_ts = time.time() if now is None else now
+    by_target = {}
+    for e in events:
+        if not isinstance(e, dict):
+            continue
+        target = e.get("target")
+        if not isinstance(target, str) or not target:
+            continue
+        by_target.setdefault(target, []).append(e)
+    rows = []
+    for target in sorted(by_target):
+        evs = by_target[target]
+
+        def _ages(items):
+            out = []
+            for e in items:
+                try:
+                    out.append(now_ts - float(e.get("ts") or 0))
+                except (TypeError, ValueError):
+                    out.append(None)
+            return out
+
+        def _rate(window_sec):
+            win = [e for e, age in zip(evs, _ages(evs))
+                   if age is not None and 0.0 <= age <= window_sec]
+            if not win:
+                return None
+            return round(sum(1 for e in win if e.get("status") == "ok") / float(len(win)), 3)
+
+        ok_24h = [e for e, age in zip(evs, _ages(evs))
+                  if age is not None and 0.0 <= age <= 86400.0 and e.get("status") == "ok"]
+        try:
+            last = max(evs, key=lambda e: float(e.get("ts") or 0))
+        except (TypeError, ValueError):
+            last = evs[-1]
+        rows.append({
+            "target": target,
+            "ok_rate_1h": _rate(3600.0),
+            "ok_rate_24h": _rate(86400.0),
+            "tls_ms": metrics_store._median([e.get("tls_ms") for e in ok_24h]),
+            "ttfb_ms": metrics_store._median([e.get("ttfb_ms") for e in ok_24h]),
+            "total_ms": metrics_store._median([e.get("total_ms") for e in ok_24h]),
+            "samples": len(evs),
+            "last_status": last.get("status"),
+        })
+    return rows
 
 
 def _metrics_payload(hours):
@@ -876,9 +931,14 @@ def _metrics_payload(hours):
         return payload
     events = metrics_store.read_timing_events(hours=None)  # весь retention для baseline
     if events:
-        summary = metrics_store.summarize(events)
+        # Legacy top-level summary — ТОЛЬКО канареечная серия (+None): деградация
+        # одного вендора (netflix) не должна читать trend=degraded для туннеля.
+        canary_events = [e for e in events
+                         if not isinstance(e, dict)
+                         or e.get("target") in (None, metrics_store.METRICS_CANARY_TARGET)]
+        summary = metrics_store.summarize(canary_events)
         now = time.time()
-        window_events = [e for e in events if e.get("ts", 0) >= now - hours * 3600.0]
+        window_events = [e for e in canary_events if e.get("ts", 0) >= now - hours * 3600.0]
         payload.update({
             "status": "ok",
             "last_event_at": events[-1].get("timestamp"),
@@ -887,6 +947,7 @@ def _metrics_payload(hours):
             "baseline": summary["baseline"],
             "ratio": summary["ratio"],
             "trend": summary["trend"],
+            "targets": _metrics_target_rows(events),
         })
     payload["proxy_errors"] = proxy_errors.probe_error_rate(window_hours=1)
     return payload

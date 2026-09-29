@@ -44,15 +44,26 @@ METRICS_LOG = Path.home() / "Library" / "Logs" / "srouter-watchdog.metrics.jsonl
 DEFAULT_INTERVAL_SEC = 60
 DEFAULT_RETENTION_DAYS = 7
 
+# Канарейка метрик: серия «здоровья туннеля» в мульти-таргетном журнале (2026-09-29).
+# Хост первой TUNNEL_TARGETS (health_probes) — литералом, не выводом: metrics_store не
+# зависит от health_probes (слои без циклов). Consumers (flap-гейт health, сегмент-заметка,
+# /api/metrics/tunnel top-level, diag_netprobe.report) фильтруют журнал по нему (+None —
+# legacy fallback-события), иначе фейл одного вендора (netflix) читался бы как «туннель флапает».
+METRICS_CANARY_TARGET = "api.anthropic.com"
+
 # Ретеншн: при записи не чаще раза в час файл переписывается, если в нём есть
 # события старше retention или он дорос до max_bytes (atomic rewrite).
-RETENTION_MAX_BYTES = 8 * 1024 * 1024
+# Калибровка мульти-таргета (PR #378): 9 событий/мин × ~233 Б ≈ 21 МиБ за 7 суток —
+# старые 8 МиБ держали горизонт ~2.7 сут, заявленный retention_days=7 становился враньём.
+RETENTION_MAX_BYTES = 32 * 1024 * 1024
 RETENTION_CHECK_INTERVAL_SEC = 3600
 
-# Читаем только хвост (bounded) через hot_routes._read_tail: файл после ротации ≤ 8 МиБ,
-# но defensive-лимит на случай внешне раздутого файла. Границы — те же, что у hot_routes.
-_READ_MAX_BYTES = hot_routes._DEFAULT_MAX_BYTES
-_READ_MAX_LINES = hot_routes._DEFAULT_MAX_LINES
+# Читаем только хвост (bounded) через hot_routes._read_tail: файл после ротации ≤ 32 МиБ,
+# но defensive-лимит на случай внешне раздутого файла. Свои значения, не hot_routes:
+# у hot_routes свой лог и свой ритм записи (1 событие/тик), а здесь 9/мин — 90k строк
+# и 24 МиБ держат те же 7 суток, что 20k/4 МиБ держали до мульти-таргета.
+_READ_MAX_BYTES = 24 * 1024 * 1024
+_READ_MAX_LINES = 100_000
 
 # Окно/пороги детектора деградации.
 WINDOW_SEC = 15 * 60            # медиана «сейчас» — последние 15 минут

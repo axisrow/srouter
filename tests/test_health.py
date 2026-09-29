@@ -18,6 +18,7 @@ _claude_proxy_probe() возвращает {status, source, detail}:
 import json
 import os
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest as _pytest
 import pytest  # noqa: ICN003 — pytest.fail/raises в тестах ниже (#194)
@@ -80,7 +81,7 @@ def _all_up_monkey(monkeypatch, *, probe_status="ok", probe_detail="runtime: к�
     machine-state probe добавляй в ОБА списка — гвард test_machine_state_mock_guard.py падает,
     если этот (канонический) набор перестанет быть подмножеством versions-набора (issue #267)."""
     monkeypatch.setattr(health, "_port_up", lambda port: True)
-    monkeypatch.setattr(health, "_tunnel_up", lambda: (True, "HTTP 200", False, None))
+    monkeypatch.setattr(health, "_tunnel_up", lambda *a, **k: (True, "HTTP 200", False, None))
     monkeypatch.setattr(health, "_claude_proxy_probe",
                         lambda: {"status": probe_status, "source": "runtime" if probe_status != "unknown" else "n/a",
                                  "detail": probe_detail})
@@ -754,7 +755,7 @@ def test_check_all_has_claude_proxy_check(monkeypatch):
 def test_check_all_down_when_everything_dead(monkeypatch):
     """Всё мертво → down (не degraded, не ok)."""
     monkeypatch.setattr(health, "_port_up", lambda port: False)
-    monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed", False, None))
+    monkeypatch.setattr(health, "_tunnel_up", lambda *a, **k: (False, "connection-failed", False, None))
     monkeypatch.setattr(health, "_claude_proxy_probe",
                         lambda: {"status": "down", "source": "runtime", "detail": "runtime"})
     monkeypatch.setattr(health, "_desktop_proxy_check",
@@ -820,7 +821,7 @@ def test_vps_unreachable_when_tunnel_fail_is_driver_down(monkeypatch):
     → driver-чек роняет вердикт в down (не degraded). VPS-смерть = critical-infra DOWN (#194).
     """
     _all_up_monkey(monkeypatch)  # порты + claude/codex/app/desktop — info/ok (не роняют)
-    monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed", False, None))
+    monkeypatch.setattr(health, "_tunnel_up", lambda *a, **k: (False, "connection-failed", False, None))
     _mock_active_node(monkeypatch, {"name": "vps-1", "endpoint_host": "198.51.100.7", "port": 443})
     _mock_vps_tcp(monkeypatch, reachable=False)
     result = health.check_all()
@@ -839,7 +840,7 @@ def test_vps_reachable_when_tunnel_fail_distinguishes_local_proxy(monkeypatch):
     поверх туннель-fail — туннель уже driver). Канон: verify-don't-guess (прямая причина).
     """
     _all_up_monkey(monkeypatch)
-    monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed", False, None))
+    monkeypatch.setattr(health, "_tunnel_up", lambda *a, **k: (False, "connection-failed", False, None))
     _mock_active_node(monkeypatch, {"name": "vps-1", "endpoint_host": "198.51.100.7", "port": 443})
     _mock_vps_tcp(monkeypatch, reachable=True)
     result = health.check_all()
@@ -854,7 +855,7 @@ def test_vps_reachable_when_tunnel_fail_distinguishes_local_proxy(monkeypatch):
 def test_vps_reachable_when_tunnel_ok_is_info(monkeypatch):
     """Туннель ok + VPS reachable → ok; VPS-чек info-only (VPS-доступность не релевантна когда туннель жив)."""
     _all_up_monkey(monkeypatch, probe_status="ok")
-    monkeypatch.setattr(health, "_tunnel_up", lambda: (True, "HTTP 200", False, None))
+    monkeypatch.setattr(health, "_tunnel_up", lambda *a, **k: (True, "HTTP 200", False, None))
     _mock_active_node(monkeypatch, {"name": "vps-1", "endpoint_host": "198.51.100.7", "port": 443})
     _mock_vps_tcp(monkeypatch, reachable=True)
     result = health.check_all()
@@ -882,7 +883,7 @@ def test_vps_placeholder_testnet_203_0_113_is_warn(monkeypatch):
     placeholder, не врёт «VPS мёртв» и не падает. status=warn, чек info (placeholder — не сбой стека).
     """
     _all_up_monkey(monkeypatch, probe_status="ok")
-    monkeypatch.setattr(health, "_tunnel_up", lambda: (True, "HTTP 200", False, None))
+    monkeypatch.setattr(health, "_tunnel_up", lambda *a, **k: (True, "HTTP 200", False, None))
     _mock_active_node(monkeypatch, {"name": "example", "endpoint_host": "203.0.113.7", "port": 443})
     # port_open не должно вызываться для placeholder (детект до пробы).
     monkeypatch.setattr(health.sys_probe, "port_open",
@@ -938,7 +939,7 @@ def test_vps_unreachable_does_not_mask_down_into_degraded(monkeypatch):
     unreachable — проверка упадёт. status обязан остаться down, VPS-чек — driver ok=False.
     """
     monkeypatch.setattr(health, "_port_up", lambda port: False)
-    monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed", False, None))
+    monkeypatch.setattr(health, "_tunnel_up", lambda *a, **k: (False, "connection-failed", False, None))
     monkeypatch.setattr(health, "_claude_proxy_probe",
                         lambda: {"status": "down", "source": "runtime", "detail": "runtime"})
     monkeypatch.setattr(health, "_desktop_proxy_check", lambda: {"status": "down", "detail": "down"})
@@ -1072,7 +1073,7 @@ def test_network_down_takes_precedence_over_vps_dead_in_check_all(monkeypatch):
     """
     _all_up_monkey(monkeypatch)  # порты живы; claude/codex/app/desktop — info/ok
     monkeypatch.setattr(health, "_network_interface_up", _REAL_NETWORK_INTERFACE_UP)  # #271: real fn
-    monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed", False, None))
+    monkeypatch.setattr(health, "_tunnel_up", lambda *a, **k: (False, "connection-failed", False, None))
     # route + ifconfig: нет сети
     monkeypatch.setattr(health.sys_probe, "run", lambda cmd, timeout:
                         _ROUTE_DEFAULT_NONE if cmd[:3] == [ROUTE, "-n", "get"]
@@ -1100,7 +1101,7 @@ def test_network_up_proceeds_to_vps_probe_in_check_all(monkeypatch):
     """
     _all_up_monkey(monkeypatch)
     monkeypatch.setattr(health, "_network_interface_up", _REAL_NETWORK_INTERFACE_UP)  # #271: real fn
-    monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed", False, None))
+    monkeypatch.setattr(health, "_tunnel_up", lambda *a, **k: (False, "connection-failed", False, None))
     monkeypatch.setattr(health.sys_probe, "run", lambda cmd, timeout:
                         {"rc": 0, "out": _ROUTE_DEFAULT_UP, "err": "", "timeout": False}
                         if cmd[:3] == [ROUTE, "-n", "get"]
@@ -1123,7 +1124,7 @@ def test_network_check_is_info_only_when_up(monkeypatch):
     """
     _all_up_monkey(monkeypatch, probe_status="ok")
     monkeypatch.setattr(health, "_network_interface_up", _REAL_NETWORK_INTERFACE_UP)  # #271: real fn
-    monkeypatch.setattr(health, "_tunnel_up", lambda: (True, "HTTP 200", False, None))
+    monkeypatch.setattr(health, "_tunnel_up", lambda *a, **k: (True, "HTTP 200", False, None))
     monkeypatch.setattr(health.sys_probe, "run", lambda cmd, timeout:
                         {"rc": 0, "out": _ROUTE_DEFAULT_UP, "err": "", "timeout": False}
                         if cmd[:3] == [ROUTE, "-n", "get"]
@@ -1468,7 +1469,7 @@ def test_local_proxy_driver_down_when_tunnel_fail_and_port_closed(monkeypatch):
     """ДЫРА #204: туннель fail + локальный прокси down (port closed) → driver. Раньше туннель-fail
     без причины. Теперь _local_proxy_up объясняет: «локальный прокси упал — restart»."""
     _all_up_monkey(monkeypatch)  # порты/claude/codex/app/desktop — ok/info, не роняют
-    monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed", False, None))
+    monkeypatch.setattr(health, "_tunnel_up", lambda *a, **k: (False, "connection-failed", False, None))
     # VPS жив (info-only, не маскирует локальный прокси) — различение от ситуации #2 (#194):
     _mock_active_node(monkeypatch, {"name": "vps-1", "endpoint_host": "198.51.100.7", "port": 443})
     _mock_vps_tcp(monkeypatch, reachable=True)
@@ -1882,7 +1883,7 @@ def test_dns_fail_masks_vps_dead_in_check_all(monkeypatch):
     """
     _all_up_monkey(monkeypatch)  # порты живы; claude/codex/app/desktop — info/ok
     monkeypatch.setattr(health, "_network_interface_up", _REAL_NETWORK_INTERFACE_UP)  # #271: real fn
-    monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed", False, None))
+    monkeypatch.setattr(health, "_tunnel_up", lambda *a, **k: (False, "connection-failed", False, None))
     # сеть есть (route default → en0) — мок sys_probe.run, как #203-каскадные тесты.
     monkeypatch.setattr(health.sys_probe, "run", lambda cmd, timeout:
                         {"rc": 0, "out": _ROUTE_DEFAULT_UP, "err": "", "timeout": False}
@@ -1913,7 +1914,7 @@ def test_network_down_suppresses_dns_check_in_check_all(monkeypatch):
     """
     _all_up_monkey(monkeypatch)  # порты живы; _resolve_host замокан True, но ниже переопределим
     monkeypatch.setattr(health, "_network_interface_up", _REAL_NETWORK_INTERFACE_UP)  # #271: real fn
-    monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed", False, None))
+    monkeypatch.setattr(health, "_tunnel_up", lambda *a, **k: (False, "connection-failed", False, None))
     # НЕТ сети: route rc!=0 + ifconfig только loopback (как test_network_down_* из #203)
     monkeypatch.setattr(health.sys_probe, "run", lambda cmd, timeout:
                         _ROUTE_DEFAULT_NONE if cmd[:3] == [ROUTE, "-n", "get"]
@@ -1940,7 +1941,7 @@ def test_dns_ok_proceeds_to_vps_probe_in_check_all(monkeypatch):
     """
     _all_up_monkey(monkeypatch)
     monkeypatch.setattr(health, "_network_interface_up", _REAL_NETWORK_INTERFACE_UP)  # #271: real fn
-    monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed", False, None))
+    monkeypatch.setattr(health, "_tunnel_up", lambda *a, **k: (False, "connection-failed", False, None))
     monkeypatch.setattr(health.sys_probe, "run", lambda cmd, timeout:
                         {"rc": 0, "out": _ROUTE_DEFAULT_UP, "err": "", "timeout": False}
                         if cmd[:3] == [ROUTE, "-n", "get"]
@@ -1964,7 +1965,7 @@ def test_dns_check_is_info_only_when_up(monkeypatch):
     """
     _all_up_monkey(monkeypatch, probe_status="ok")
     monkeypatch.setattr(health, "_network_interface_up", _REAL_NETWORK_INTERFACE_UP)  # #271: real fn
-    monkeypatch.setattr(health, "_tunnel_up", lambda: (True, "HTTP 200", False, None))
+    monkeypatch.setattr(health, "_tunnel_up", lambda *a, **k: (True, "HTTP 200", False, None))
     monkeypatch.setattr(health.sys_probe, "run", lambda cmd, timeout:
                         {"rc": 0, "out": _ROUTE_DEFAULT_UP, "err": "", "timeout": False}
                         if cmd[:3] == [ROUTE, "-n", "get"]
@@ -2167,7 +2168,7 @@ def test_gfw_check_info_only_in_check_all(monkeypatch):
     в detail), не driver (избегаем шума — github может не быть нужен пользователю прямо сейчас).
     """
     _all_up_monkey(monkeypatch, probe_status="ok")
-    monkeypatch.setattr(health, "_tunnel_up", lambda: (True, "HTTP 200", False, None))
+    monkeypatch.setattr(health, "_tunnel_up", lambda *a, **k: (True, "HTTP 200", False, None))
     _mock_domain_probe(monkeypatch, {
         "github.com": {"reachable": False, "kind": "timeout"},
         "api.z.ai": {"reachable": True, "kind": "ok"},
@@ -2212,7 +2213,7 @@ def test_print_report_gfw_cut_advises_proxy_for_domain(monkeypatch, capsys):
     verify-dont-guess (точная причина), noisy-log-better-than-no-log (подсказка в отчёте).
     """
     _all_up_monkey(monkeypatch, probe_status="ok")
-    monkeypatch.setattr(health, "_tunnel_up", lambda: (True, "HTTP 200", False, None))
+    monkeypatch.setattr(health, "_tunnel_up", lambda *a, **k: (True, "HTTP 200", False, None))
     _mock_domain_probe(monkeypatch, {
         "github.com": {"reachable": False, "kind": "timeout"},
         "api.z.ai": {"reachable": True, "kind": "ok"},
@@ -2252,7 +2253,7 @@ def test_direct_first_check_info_only_in_check_all(monkeypatch):
     это resilience-оптимизация (переживает смерть VPS для direct-доменов), не health-инвариант.
     """
     _all_up_monkey(monkeypatch, probe_status="ok")
-    monkeypatch.setattr(health, "_tunnel_up", lambda: (True, "HTTP 200", False, None))
+    monkeypatch.setattr(health, "_tunnel_up", lambda *a, **k: (True, "HTTP 200", False, None))
     _mock_direct_first(monkeypatch, reachable=["z.ai"], blocked=[])
     _mock_doctor_only_checks(monkeypatch)
     result = health.check_all(active_claude=True)
@@ -2279,7 +2280,7 @@ def test_direct_first_check_absent_in_light_health(monkeypatch):
 
 def test_direct_first_check_ok_when_all_reachable(monkeypatch):
     _all_up_monkey(monkeypatch, probe_status="ok")
-    monkeypatch.setattr(health, "_tunnel_up", lambda: (True, "HTTP 200", False, None))
+    monkeypatch.setattr(health, "_tunnel_up", lambda *a, **k: (True, "HTTP 200", False, None))
     _mock_direct_first(monkeypatch, reachable=["z.ai"], blocked=[])
     _mock_doctor_only_checks(monkeypatch)
     result = health.check_all(active_claude=True)
@@ -2289,7 +2290,7 @@ def test_direct_first_check_ok_when_all_reachable(monkeypatch):
 
 def test_direct_first_check_info_when_some_blocked(monkeypatch):
     _all_up_monkey(monkeypatch, probe_status="ok")
-    monkeypatch.setattr(health, "_tunnel_up", lambda: (True, "HTTP 200", False, None))
+    monkeypatch.setattr(health, "_tunnel_up", lambda *a, **k: (True, "HTTP 200", False, None))
     _mock_direct_first(monkeypatch, reachable=["z.ai"], blocked=["cut.example.com"])
     _mock_doctor_only_checks(monkeypatch)
     result = health.check_all(active_claude=True)
@@ -2495,7 +2496,7 @@ def _vendor_outage_check_all(monkeypatch, codes=("503", "502")):
     _all_up_monkey(monkeypatch, probe_status="ok")
     joined = "; ".join(f"upstream-error HTTP {code}" for code in codes)
     detail = f"{health.VENDOR_OUTAGE_MARKER} — оба вендора лежат, канал жив ({joined})"
-    monkeypatch.setattr(health, "_tunnel_up", lambda: (False, detail, True, None))
+    monkeypatch.setattr(health, "_tunnel_up", lambda *a, **k: (False, detail, True, None))
     monkeypatch.setattr(health, "_route_default_interface", lambda: "en0")
     _mock_active_node(monkeypatch, {"name": "vps-1", "endpoint_host": "198.51.100.7", "port": 443})
     _mock_vps_tcp(monkeypatch, reachable=True)
@@ -2550,7 +2551,7 @@ def test_print_report_tunnel_fail_no_vendor_outage_advises_node(monkeypatch, cap
     Регресс-гвард: vendor outage-ветка не должна маскировать настоящий туннель-fail.
     """
     _all_up_monkey(monkeypatch, probe_status="ok")
-    monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed", False, None))
+    monkeypatch.setattr(health, "_tunnel_up", lambda *a, **k: (False, "connection-failed", False, None))
     monkeypatch.setattr(health, "_route_default_interface", lambda: "en0")
     _mock_active_node(monkeypatch, {"name": "vps-1", "endpoint_host": "198.51.100.7", "port": 443})
     _mock_vps_tcp(monkeypatch, reachable=False)
@@ -5367,29 +5368,32 @@ def test_tunnel_target_up_timing_minimum_on_probe_timeout(monkeypatch):
 
 
 def test_tunnel_up_keeps_first_target_timing_for_series(monkeypatch):
-    """timing всегда от ПЕРВОГО таргета — стабильная серия, даже когда up по второму."""
+    """timings[0] — всегда от ПЕРВОГО таргета — стабильная серия, даже когда up по второму."""
     def fake_run(cmd, timeout):
         url = cmd[-1] if cmd else ""
         if "anthropic" in url:
             return {"rc": 0, "out": "503 0.010 0.050 0.060 0.080", "err": "", "timeout": False}
         return {"rc": 0, "out": "200 0.009 0.030 0.040 0.050", "err": "", "timeout": False}
     monkeypatch.setattr(health.sys_probe, "run", fake_run)
-    ok, detail, vendor, timing = health._tunnel_up()
+    ok, detail, vendor, timings = health._tunnel_up()
     assert ok is True
-    assert timing["target"] == "api.anthropic.com"
-    assert timing["code"] == "503"
+    assert timings[0]["target"] == "api.anthropic.com"
+    assert timings[0]["code"] == "503"
+    assert timings[1]["code"] == "200"
 
 
 def test_check_all_carries_tunnel_timing(monkeypatch):
     """timing доезжает до check-дикта туннеля — consumer (watchdog) не парсит detail."""
     _all_up_monkey(monkeypatch)
     monkeypatch.setattr(health, "_tunnel_up",
-                        lambda: (True, "HTTP 200", False,
-                                 {"target": "api.anthropic.com", "code": "200", "status": "ok",
-                                  "connect_ms": 1, "tls_ms": 40, "ttfb_ms": 60, "total_ms": 150}))
+                        lambda *a, **k: (True, "HTTP 200", False,
+                                         [{"target": "api.anthropic.com", "code": "200",
+                                           "status": "ok", "connect_ms": 1, "tls_ms": 40,
+                                           "ttfb_ms": 60, "total_ms": 150}]))
     result = health.check_all()
     tun = next(c for c in result["checks"] if c["name"].startswith("туннель"))
     assert tun["timing"]["total_ms"] == 150
+    assert tun["timings"][0]["total_ms"] == 150
 
 
 def test_check_all_tunnel_check_carries_structural_id(monkeypatch):
@@ -5397,7 +5401,7 @@ def test_check_all_tunnel_check_carries_structural_id(monkeypatch):
     ключу, а не по префиксу человекочитаемого name (переименование метки не должно
     тихо ломать потребителя — канон loose-validator-recurring-leak)."""
     monkeypatch.setattr(health, "_port_up", lambda port: True)
-    monkeypatch.setattr(health, "_tunnel_up", lambda: (True, "HTTP 200", False, None))
+    monkeypatch.setattr(health, "_tunnel_up", lambda *a, **k: (True, "HTTP 200", False, None))
     result = health.check_all(active_claude=False)
     assert any(c.get("id") == "tunnel" for c in result["checks"])
 
@@ -5410,16 +5414,20 @@ def _mock_state(monkeypatch, probes):
 
 
 def test_metrics_probe_options_defaults(monkeypatch):
+    import local_state
     _mock_state(monkeypatch, {})
     opts = health._metrics_probe_options()
-    assert opts == {"enabled": True, "interval_sec": 60, "retention_days": 7}
+    assert opts == {"enabled": True, "interval_sec": 60, "retention_days": 7,
+                    "metrics_targets": local_state._DEFAULT_STATE["probes"]["metrics_targets"]}
 
 
 def test_metrics_probe_options_respects_config(monkeypatch):
+    import local_state
     _mock_state(monkeypatch, {"metrics_enabled": False, "metrics_interval_sec": 300,
                               "metrics_retention_days": 3})
     opts = health._metrics_probe_options()
-    assert opts == {"enabled": False, "interval_sec": 300, "retention_days": 3}
+    assert opts == {"enabled": False, "interval_sec": 300, "retention_days": 3,
+                    "metrics_targets": local_state._DEFAULT_STATE["probes"]["metrics_targets"]}
 
 
 def test_metrics_probe_options_clamps_garbage(monkeypatch):
@@ -5703,7 +5711,7 @@ def test_check_all_tunnel_down_reason_carries_window_numbers(monkeypatch):
     """#362 п.2: причина упавшего туннеля в составе несёт цифры окна из metrics
     (12/15 фейлов за 15м) и rc текущей пробы — не голое «connection-failed»."""
     _all_up_monkey(monkeypatch)
-    monkeypatch.setattr(health, "_tunnel_up", lambda: (
+    monkeypatch.setattr(health, "_tunnel_up", lambda *a, **k: (
         False, "connection-failed (оба таргета)", False,
         {"status": "connection-failed", "rc": 56, "err": "curl: (56) Recv failure"}))
     monkeypatch.setattr(health, "_tunnel_window_stats",
@@ -5720,7 +5728,7 @@ def test_check_all_tunnel_single_fail_below_threshold_stays_honest_driver(monkey
     из check_all — doctor//health видят честный degraded с цифрами окна сразу; пуш
     гейтится отдельно в watchdog-составе (см. watchdog-тесты ниже)."""
     _all_up_monkey(monkeypatch)
-    monkeypatch.setattr(health, "_tunnel_up", lambda: (
+    monkeypatch.setattr(health, "_tunnel_up", lambda *a, **k: (
         False, "connection-failed", False, {"status": "connection-failed", "rc": 35, "err": ""}))
     monkeypatch.setattr(health, "_tunnel_window_stats",
                         lambda now=None, log_path=None: {"fails": 1, "samples": 14, "rate": 0.071})
@@ -5848,7 +5856,7 @@ def test_watchdog_no_push_when_tunnel_below_threshold(monkeypatch, tmp_path):
     monkeypatch.setattr(health, "WATCHDOG_STATE", state_file)
     monkeypatch.setattr(health, "_record_watchdog_metrics", lambda result: None)
     _all_up_monkey(monkeypatch)
-    monkeypatch.setattr(health, "_tunnel_up", lambda: (False, "connection-failed", False, None))
+    monkeypatch.setattr(health, "_tunnel_up", lambda *a, **k: (False, "connection-failed", False, None))
     monkeypatch.setattr(health, "_tunnel_window_stats",
                         lambda now=None, log_path=None: {"fails": 1, "samples": 14, "rate": 0.071})
     notified = []
@@ -6227,3 +6235,146 @@ def test_doctor_prints_degradation_legend(monkeypatch, tmp_path, capsys):
     assert "Деградация прошла" in out
     assert "SROUTER_WATCHDOG_DEGRADED_COOLDOWN" in out
     assert "driver" in out
+
+
+# ============================ мульти-таргет проба (metrics_targets, 2026-09-29) ============================
+# Одноканальность: 7692/7692 событий metrics-JSONL = api.anthropic.com — heatmap «деградации»
+# измерял один сайт. Теперь _tunnel_up зондирует metrics_targets (измерение), решение о
+# жизни туннеля — по канарейкам TUNNEL_TARGETS (семантика #82/#207 не трогается).
+
+def test_tunnel_up_measures_extra_targets_without_flipping_decision(monkeypatch):
+    """extras измеряются, решение — по канарейкам: github/baidu лежат, канарейки живы → up;
+    timings покрывает все цели, первая запись — стабильная канареечная серия."""
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _tunnel_curl_per_target({"anthropic": "404", "openai": "421",
+                                                 "github": "000", "baidu": "000"}))
+    ok, detail, vendor, timings = health._tunnel_up(
+        extra_targets=["https://github.com/", "https://www.baidu.com/"])
+    assert ok is True, "фейл extras не должен переворачивать решение канареек"
+    assert isinstance(timings, list) and len(timings) == 4
+    hosts = [t.get("target") for t in timings]
+    assert hosts[0] == "api.anthropic.com", "первая запись — стабильная серия канарейки"
+    assert "github.com" in hosts and "www.baidu.com" in hosts
+
+
+def test_tunnel_up_extra_target_probed_with_head_canary_with_get(monkeypatch):
+    """extras ходят HEAD (-I: тело ответа не качаем — МБ-страницы каждую минуту), канарейки —
+    GET как раньше (существующая серия не меняет метод)."""
+    cmds = []
+
+    def fake_run(cmd, timeout):
+        cmds.append(list(cmd))
+        return {"rc": 0, "out": "404 0.1 0.2 0.3 0.4", "err": "", "timeout": False}
+
+    monkeypatch.setattr(health.sys_probe, "run", fake_run)
+    health._tunnel_up(extra_targets=["https://github.com/"])
+    anthropic = next(c for c in cmds if "anthropic" in c[-1])
+    github = next(c for c in cmds if "github" in c[-1])
+    assert "-I" not in anthropic, "канарейка остаётся GET"
+    assert "-I" in github, "extra-цель качается HEAD'ом"
+
+
+def test_tunnel_up_bare_call_keeps_canary_only_shape(monkeypatch):
+    """Вызов без extra_targets = прежние 2 канарейки (обратная совместимость моков/софта)."""
+    monkeypatch.setattr(health.sys_probe, "run", _tunnel_curl_returning("404"))
+    ok, _, _, timings = health._tunnel_up()
+    assert ok is True
+    assert isinstance(timings, list) and len(timings) == 2
+
+
+def test_tunnel_up_dedups_extras_by_host_not_url(monkeypatch):
+    """Дедуп extra против канарейки по ХОСТУ, не по строке URL: "https://api.anthropic.com"
+    (без слэша) — та же цель, что канарейка. Иначе в серию канарейки пишется второй
+    (HEAD) тик с тем же target и ok_rate/медианы смешиваются (cycle-review PR #378)."""
+    monkeypatch.setattr(health.sys_probe, "run", _tunnel_curl_returning("404"))
+    ok, _, _, timings = health._tunnel_up(extra_targets=["https://api.anthropic.com"])
+    assert ok is True
+    hosts = [t.get("target") for t in timings]
+    assert hosts.count("api.anthropic.com") == 1, "дубль канарейки отсечён по хосту"
+
+
+def test_tunnel_window_stats_tail_covers_window_with_multi_target_writes(tmp_path):
+    """Хвост чтения гейта масштабируется по числу целей: 15 поминутных записей × 9 событий
+    (135 строк) — все 15 канареечных фейлов внутри 15-м окна считаются. Старый лимит 120
+    строк калибровал эпоху одной канарейки: хвост 13.3 мин < окна, «N/15» врёт, а при
+    metrics_interval 20с гейт fail-open (PR #378, adversarial 3b)."""
+    now = 1_800_000_000.0
+    extras = ("chatgpt.com", "github.com", "discord.com", "youtube.com",
+              "netflix.com", "www.gstatic.com", "www.baidu.com", "api.openai.com")
+    lines = []
+    for minute in range(15):
+        ts = now - (14 - minute) * 60.0
+        lines.append(json.dumps({"ts": ts, "status": "fail", "target": "api.anthropic.com"}))
+        lines.extend(json.dumps({"ts": ts, "status": "ok", "target": host})
+                     for host in extras)
+    log = tmp_path / "metrics.jsonl"
+    log.write_text("\n".join(lines) + "\n")
+    stats = _REAL_TUNNEL_WINDOW_STATS(now=now, log_path=str(log))
+    assert stats == {"fails": 15, "samples": 15, "rate": 1.0}
+
+
+def test_metrics_canary_target_guard_matches_first_tunnel_target():
+    """Гвард связки констант: канареечный фильтр серий = хост первой канарейки. Смена
+    TUNNEL_TARGETS без METRICS_CANARY_TARGET молча опустошила бы все фильтры и деградация
+    перестала бы детектиться (cycle-review PR #378)."""
+    assert health.TUNNEL_TARGETS, "канарейки не пусты"
+    assert urlsplit(health.TUNNEL_TARGETS[0]).hostname == \
+        metrics_store.METRICS_CANARY_TARGET
+
+
+def test_record_watchdog_metrics_writes_event_per_target(monkeypatch, tmp_path):
+    """timings-список → по JSONL-строке на цель (схема события не меняется)."""
+    _metrics_env(monkeypatch, tmp_path)
+    res = _tunnel_result()
+    res["checks"][0]["timings"] = [
+        {"target": "api.anthropic.com", "code": "404", "status": "ok", "total_ms": 150},
+        {"target": "github.com", "code": "000", "status": "connection-failed", "total_ms": None},
+    ]
+    health._record_watchdog_metrics(res)
+    import metrics_store
+    events = metrics_store.read_timing_events(log_path=tmp_path / "metrics.jsonl")
+    assert len(events) == 2
+    assert {e["target"] for e in events} == {"api.anthropic.com", "github.com"}
+    assert events[0]["total_ms"] == 150
+
+
+def test_record_watchdog_metrics_legacy_single_timing_still_works(monkeypatch, tmp_path):
+    """Старый shape (timing-дикт, timings нет) — по-прежнему ровно одна запись."""
+    _metrics_env(monkeypatch, tmp_path)
+    health._record_watchdog_metrics(_tunnel_result(timing={"status": "ok", "total_ms": 100}))
+    import metrics_store
+    events = metrics_store.read_timing_events(log_path=tmp_path / "metrics.jsonl")
+    assert len(events) == 1 and events[0]["total_ms"] == 100
+
+
+def test_tunnel_window_stats_counts_only_canary_and_legacy_events(monkeypatch):
+    """Флап-гейт считает канарейку (+legacy None-события): фейлы netflix/github не читаются
+    как «туннель флапает» — вендор-события решаются OR-семантикой пробы, не гейтом."""
+    now = 1_000_000.0
+    events = []
+    for i in range(4):
+        events.append({"ts": now - 60 * (i + 1), "target": "api.anthropic.com", "status": "ok"})
+        events.append({"ts": now - 60 * (i + 1) + 1, "target": "netflix.com",
+                       "status": "connection-failed"})
+    events.append({"ts": now - 61, "target": None, "status": "down"})
+    monkeypatch.setattr(health.metrics_store, "read_timing_events", lambda **kw: list(events))
+    assert _REAL_TUNNEL_WINDOW_STATS is not None
+    stats = _REAL_TUNNEL_WINDOW_STATS(now=now)
+    assert stats == {"fails": 1, "samples": 5, "rate": 0.2}, \
+        "netflix-фейлы вне окна гейта: считаются anthropic + legacy-None"
+
+
+def test_metrics_probe_options_normalizes_metrics_targets(monkeypatch, tmp_path):
+    """Битые URL в probes.metrics_targets отбрасываются, валидные остаются."""
+    _metrics_env(monkeypatch, tmp_path, probes={
+        "metrics_targets": ["https://github.com/", "ftp://bad", 42, None]})
+    opts = health._metrics_probe_options()
+    assert opts["metrics_targets"] == ["https://github.com/"]
+
+
+def test_metrics_probe_options_metrics_targets_empty_falls_back_to_default(monkeypatch, tmp_path):
+    """Пустой/битый список → дефолт из local_state._DEFAULT_STATE (единый источник схемы)."""
+    import local_state
+    _metrics_env(monkeypatch, tmp_path, probes={"metrics_targets": ["nonsense"]})
+    opts = health._metrics_probe_options()
+    assert opts["metrics_targets"] == local_state._DEFAULT_STATE["probes"]["metrics_targets"]
