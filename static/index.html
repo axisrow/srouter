@@ -66,7 +66,7 @@
     /* Календарь инцидентов: строка = день, 24 часовых сегмента (status-page стиль). */
     .inc-row { display:flex; align-items:center; gap:2px; margin-bottom:2px; }
     .inc-date { width:44px; flex:none; font-size:.72rem; color:var(--bs-secondary-color); }
-    .inc-hour { flex:1 1 0; min-width:3px; text-align:center; font-size:.6rem; color:var(--bs-secondary-color); }
+    .inc-hour { flex:1 1 0; min-width:3px; text-align:center; font-size:.6rem; color:var(--bs-secondary-color); white-space:nowrap; }
     .inc-seg { flex:1 1 0; height:13px; min-width:3px; border-radius:2px; }
     .inc-ok { background:var(--bs-success); opacity:.85; }
     .inc-low { background:var(--bs-warning); }
@@ -236,11 +236,17 @@
     </div>
   </div>
 
-  <!-- Инциденты watchdog: почасовой календарь из status.jsonl (наблюдение, ничего не переключает). -->
+  <!-- Инциденты watchdog: календарь деградаций из status.jsonl (наблюдение, ничего не переключает). -->
   <div class="card mt-3" data-tab="history">
     <div class="card-header d-flex align-items-center flex-wrap gap-2">
       <i class="bi bi-calendar3-week me-2"></i>
-      <span data-i18n="incidents_title">Incidents — hourly, 30 days</span>
+      <span data-i18n="incidents_title">Incidents — 30 days</span>
+      <div class="btn-group btn-group-sm ms-auto" role="group" aria-label="bucket size">
+        <button type="button" class="btn btn-primary inc-bucket" id="inc-bucket-60"
+                data-bucket="60" data-i18n="incidents_bucket_hour">Hourly</button>
+        <button type="button" class="btn btn-outline-secondary inc-bucket" id="inc-bucket-10"
+                data-bucket="10" data-i18n="incidents_bucket_10m">10 min</button>
+      </div>
     </div>
     <div class="card-body">
       <div id="incidents-panel"></div>
@@ -366,7 +372,9 @@
         hot_routes_help: "Observe-only: the cache stays local and is not uploaded.",
         metrics_title: "Tunnel quality (trend)",
         tab_overview: "Overview", tab_proxy: "Proxy", tab_history: "History", tab_diag: "Diagnostics",
-        incidents_title: "Incidents — hourly, 30 days",
+        incidents_title: "Incidents — 30 days",
+        incidents_bucket_hour: "Hourly",
+        incidents_bucket_10m: "10 min",
         incidents_tooltip: "incidents: {0} · {1}",
         incidents_none: "no incident data yet",
         metrics_phase_connect: "connect → proxy", metrics_phase_tls: "path + TLS",
@@ -498,7 +506,9 @@
         hot_routes_help: "Только наблюдение: кэш остаётся локальным и не загружается наружу.",
         metrics_title: "Качество туннеля (тренд)",
         tab_overview: "Обзор", tab_proxy: "Прокси", tab_history: "История", tab_diag: "Диагностика",
-        incidents_title: "Инциденты — по часам, 30 дней",
+        incidents_title: "Инциденты — 30 дней",
+        incidents_bucket_hour: "По часам",
+        incidents_bucket_10m: "По 10 минут",
         incidents_tooltip: "инцидентов: {0} · {1}",
         incidents_none: "данных об инцидентах пока нет",
         metrics_phase_connect: "connect → прокси", metrics_phase_tls: "путь + TLS",
@@ -628,7 +638,9 @@
         hot_routes_help: "仅观察：缓存保留在本机，不会上传。",
         metrics_title: "隧道质量（趋势）",
         tab_overview: "概览", tab_proxy: "代理", tab_history: "历史", tab_diag: "诊断",
-        incidents_title: "事件 — 按小时，30 天",
+        incidents_title: "事件 — 30 天",
+        incidents_bucket_hour: "按小时",
+        incidents_bucket_10m: "按 10 分钟",
         incidents_tooltip: "事件数：{0} · {1}",
         incidents_none: "暂无事件数据",
         metrics_phase_connect: "连接 → 代理", metrics_phase_tls: "链路 + TLS",
@@ -1896,14 +1908,31 @@
         .then(function () { renderMetricsPanel(); });
     }
 
-    // ---- Инциденты watchdog: почасовая лента дней (observe-only) ----
+    // ---- Инциденты watchdog: лента дней (observe-only), бакет час / 10 минут ----
     var INCIDENTS_DATA = null;
+    var INCIDENTS_BUCKET = 60;
+    try { if (localStorage.getItem('incidents_bucket') === '10') INCIDENTS_BUCKET = 10; } catch (e) {}
 
     function loadIncidentsPanel() {
-      return fetchJson('/api/incidents?days=30')
+      return fetchJson('/api/incidents?days=30&bucket=' + INCIDENTS_BUCKET)
         .then(function (d) { INCIDENTS_DATA = d; })
         .catch(function () {})
         .then(function () { renderIncidentsPanel(); });
+    }
+
+    function syncIncidentsButtons() {
+      var b60 = document.getElementById('inc-bucket-60');
+      var b10 = document.getElementById('inc-bucket-10');
+      // 'inc-bucket' обязателен в className: на нём держится делегированный клик.
+      if (b60) b60.className = 'btn inc-bucket ' + (INCIDENTS_BUCKET === 60 ? 'btn-primary' : 'btn-outline-secondary');
+      if (b10) b10.className = 'btn inc-bucket ' + (INCIDENTS_BUCKET === 10 ? 'btn-primary' : 'btn-outline-secondary');
+    }
+
+    function setIncidentsBucket(m) {
+      INCIDENTS_BUCKET = (m === 10 ? 10 : 60);
+      try { localStorage.setItem('incidents_bucket', String(INCIDENTS_BUCKET)); } catch (e) {}
+      syncIncidentsButtons();
+      loadIncidentsPanel();
     }
 
     function incClass(h) {
@@ -1922,21 +1951,31 @@
         el.innerHTML = '<div class="text-body-secondary small">' + esc(t('incidents_none')) + '</div>';
         return;
       }
-      var hoursHead = '<div class="inc-row"><span class="inc-date"></span>' +
-        d.days[0].hours.map(function (_, h) {
-          return '<div class="inc-hour">' + pad2(h) + '</div>';
+      var bm = d.bucket_minutes === 10 ? 10 : 60;   // бэкенд отдаёт 60|10; прочее — как час
+      var labelEvery = bm === 10 ? 6 : 1;           // подпись часа на каждом 6-м 10-минутном слоте
+      var head = '<div class="inc-row"><span class="inc-date"></span>' +
+        d.days[0].slots.map(function (_, s) {
+          return '<div class="inc-hour">' + (s % labelEvery === 0 ? pad2(s * bm / 60) : '') + '</div>';
         }).join('') + '</div>';
-      var rows = hoursHead + d.days.map(function (day) {
-        var cells = day.hours.map(function (h, hr) {
-          var cls = incClass(h);
-          if (!h) return '<div class="inc-seg ' + cls + '"></div>';
-          var range = pad2(hr) + ':00–' + pad2((hr + 1) % 24) + ':00';
-          return '<div class="inc-seg ' + cls + '" title="' + esc(t('incidents_tooltip', h.count, range)) + '"></div>';
+      var rows = head + d.days.map(function (day) {
+        var cells = day.slots.map(function (s, i) {
+          var cls = incClass(s);
+          if (!s) return '<div class="inc-seg ' + cls + '"></div>';
+          var from = i * bm, to = from + bm;
+          var range = pad2(Math.floor(from / 60)) + ':' + pad2(from % 60) + '–' +
+                      pad2(Math.floor(to / 60) % 24) + ':' + pad2(to % 60);
+          return '<div class="inc-seg ' + cls + '" title="' + esc(t('incidents_tooltip', s.count, range)) + '"></div>';
         }).join('');
         return '<div class="inc-row"><span class="inc-date">' + esc(day.date.slice(5)) + '</span>' + cells + '</div>';
       }).join('');
       el.innerHTML = rows;
+      syncIncidentsButtons();
     }
+
+    document.addEventListener('click', function (ev) {
+      var btn = ev.target.closest('.inc-bucket');
+      if (btn) setIncidentsBucket(parseInt(btn.getAttribute('data-bucket'), 10));
+    });
 
     function pad2(n) { return (n < 10 ? '0' : '') + n; }
 

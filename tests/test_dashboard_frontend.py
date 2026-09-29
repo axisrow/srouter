@@ -490,3 +490,53 @@ def test_ensure_tab_data_loads_history_panels_only_on_history():
     )
     res = _run_node(_harness(["ensureTabData"], body))
     assert res["calls"] == ["metrics", "incidents", "poll:true", "poll:true", "poll:true"]
+
+
+# --- календарь инцидентов: переключатель час / 10 минут ----------------------
+
+def test_render_incidents_panel_10m_grid():
+    """bucket_minutes=10: 144 слотов в дне, подпись часа на каждом 6-м, tooltip 10-минутный."""
+    slots = [{"count": 1, "down": 1}] * 87 + [{"count": 0, "down": 0}] * 57
+    data = {"status": "ok", "bucket_minutes": 10,
+            "days": [{"date": "2026-09-28", "slots": slots}]}
+    body = (
+        "var INCIDENTS_BUCKET = 10;"   # syncIncidentsButtons читает режим (страница держит его глобально)
+        "I18N.en.incidents_tooltip = 'incidents: {0} · {1}';"   # в _STUBS этого ключа нет
+        "var INCIDENTS_DATA = " + json.dumps(data) + ";"
+        "var _html = '';"
+        "document = { getElementById: function () {"
+        "  return { set innerHTML(v) { _html = v; }, get innerHTML() { return _html; } };"
+        "} };"
+        "renderIncidentsPanel();"
+        "console.log(JSON.stringify({"
+        "  segs: (_html.match(/inc-seg/g) || []).length,"
+        "  heads: (_html.match(/inc-hour\">[0-9]/g) || []).length,"
+        "  hasRange: _html.indexOf('14:30–14:40') !== -1"
+        "}));"
+    )
+    res = _run_node(_harness(["renderIncidentsPanel", "incClass", "pad2", "syncIncidentsButtons"], body))
+    assert res["segs"] == 144, "144 ячейки в дне"
+    assert res["heads"] == 24, "подписи часов — каждый 6-й слот"
+    assert res["hasRange"], "tooltip несёт 10-минутный диапазон слота"
+
+
+def test_incidents_bucket_toggle_refetches_with_bucket_param():
+    """Переключение на 10 минут: повторный fetch с bucket=10, кнопка подсвечена."""
+    body = (
+        "var calls = [], classes = {};"
+        "fetchJson = function (url) { calls.push(url); return Promise.resolve({ status: 'ok', days: [] }); };"
+        "renderIncidentsPanel = function () {};"
+        "document = { getElementById: function (id) {"
+        "  return { set className(v) { classes[id] = v; }, get className() { return classes[id] || ''; } };"
+        "} };"
+        "setIncidentsBucket(10);"
+        "console.log(JSON.stringify({"
+        "  calls: calls, active10: classes['inc-bucket-10'], active60: classes['inc-bucket-60']"
+        "}));"
+    )
+    res = _run_node(_harness(["setIncidentsBucket", "loadIncidentsPanel", "syncIncidentsButtons"], body))
+    assert any("bucket=10" in u for u in res["calls"]), "fetch уходит с bucket=10"
+    assert "btn-primary" in (res["active10"] or ""), "кнопка 10-минут подсвечена"
+    assert "btn-primary" not in (res["active60"] or ""), "кнопка часов не подсвечена"
+    assert "inc-bucket" in (res["active10"] or ""), \
+        "hook-класс .inc-bucket сохранён (className-rewrite его убивал — делегированный клик умирал)"

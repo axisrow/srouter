@@ -100,13 +100,14 @@ def test_incidents_payload_shape_days_grid_and_future_nulls(monkeypatch):
     _lines(monkeypatch, [event])
     payload = dashboard_routes._incidents_payload(3, now=now)
     assert payload["status"] == "ok"
+    assert payload["bucket_minutes"] == 60, "дефолтный бакет — час"
     assert [d["date"] for d in payload["days"]] == \
         [(now - timedelta(days=i)).date().isoformat() for i in (2, 1, 0)], "новые дни последними"
     today = payload["days"][-1]
-    assert len(today["hours"]) == 24
-    assert today["hours"][14] == {"count": 1, "down": 1}, "текущий час несёт бакет"
-    assert today["hours"][16] is None and today["hours"][23] is None, "часы после now — null"
-    assert all(h is not None for h in payload["days"][0]["hours"]), "прошлые дни — все 24 часа"
+    assert len(today["slots"]) == 24
+    assert today["slots"][14] == {"count": 1, "down": 1}, "текущий час несёт бакет"
+    assert today["slots"][16] is None and today["slots"][23] is None, "часы после now — null"
+    assert all(s is not None for s in payload["days"][0]["slots"]), "прошлые дни — все 24 часа"
 
 
 def test_incidents_payload_empty_log_still_full_grid(monkeypatch, tmp_path):
@@ -115,8 +116,8 @@ def test_incidents_payload_empty_log_still_full_grid(monkeypatch, tmp_path):
                                                   now=datetime(2026, 9, 28, 15, 0))
     assert payload["status"] == "ok"
     assert len(payload["days"]) == 2
-    assert payload["days"][-1]["hours"][0] == {"count": 0, "down": 0}
-    assert payload["days"][-1]["hours"][15] == {"count": 0, "down": 0}
+    assert payload["days"][-1]["slots"][0] == {"count": 0, "down": 0}
+    assert payload["days"][-1]["slots"][15] == {"count": 0, "down": 0}
 
 
 # ---------------- читатель: fail-soft хвост JSONL ----------------
@@ -154,7 +155,7 @@ def test_incidents_route_ok(monkeypatch):
     assert r.status_code == 200
     data = r.get_json()
     assert data["status"] == "ok"
-    assert sum(h["count"] for h in data["days"][-1]["hours"] if h) == 1
+    assert sum(s["count"] for s in data["days"][-1]["slots"] if s) == 1
 
 
 def test_incidents_route_days_validated(monkeypatch):
@@ -182,3 +183,47 @@ def test_incidents_route_is_get_only_no_mutation_lock(monkeypatch):
         assert _get("/api/incidents").status_code == 200
     finally:
         dashboard._MUTATION_LOCK.release()
+
+
+# ---------------- 10-минутные бакеты (переключатель календаря) ----------------
+
+def test_incident_counts_bucket_10m_slot_boundaries():
+    now = datetime(2026, 9, 28, 19, 15)
+
+    def ev(ts):
+        return json.dumps({"timestamp": _local_iso(ts),
+                           "previous": {"status": "ok", "failed": []},
+                           "current": {"status": "down", "failed": ["x"]}}, ensure_ascii=False)
+
+    lines = [ev(now - timedelta(minutes=8)),   # 19:07
+             ev(now - timedelta(minutes=5))]   # 19:10 — граница бакетов
+    buckets = dashboard_routes._incident_counts(lines, days=30, now=now, bucket_minutes=10)
+    day = now.date().isoformat()
+    assert buckets[(day, 114)]["count"] == 1, "19:07 — в слот 19:00–19:10 (114)"
+    assert buckets[(day, 115)]["count"] == 1, "19:10 — уже следующий слот (115)"
+    assert buckets[(day, 115)]["down"] == 1
+
+
+def test_incidents_payload_bucket_10m_grid(monkeypatch):
+    now = datetime(2026, 9, 28, 15, 0)
+    event = json.dumps({"timestamp": _local_iso(now - timedelta(minutes=30)),  # 14:30 → слот 87
+                        "previous": {"status": "ok", "failed": []},
+                        "current": {"status": "down", "failed": ["x"]}}, ensure_ascii=False)
+    _lines(monkeypatch, [event])
+    payload = dashboard_routes._incidents_payload(2, now=now, bucket_minutes=10)
+    assert payload["bucket_minutes"] == 10
+    today = payload["days"][-1]
+    assert len(today["slots"]) == 144
+    assert today["slots"][87] == {"count": 1, "down": 1}, "14:30 — в слот 87"
+    assert today["slots"][91] is None and today["slots"][143] is None, "бакеты после now — null"
+    assert all(s is not None for s in payload["days"][0]["slots"]), "прошлый день — все 144 слота"
+
+
+def test_incidents_route_bucket_validated(monkeypatch):
+    _lines(monkeypatch, [])
+    assert _get("/api/incidents?bucket=abc").status_code == 400
+    assert _get("/api/incidents?bucket=7").status_code == 400
+    assert _get("/api/incidents?bucket=0").status_code == 400
+    assert _get("/api/incidents?bucket=10").status_code == 200
+    assert _get("/api/incidents?bucket=10").get_json()["bucket_minutes"] == 10
+    assert _get("/api/incidents").get_json()["bucket_minutes"] == 60, "без параметра — дефолтный час"
