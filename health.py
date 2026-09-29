@@ -85,6 +85,10 @@ WATCHDOG_STATUS_LOG = Path.home() / "Library" / "Logs" / "srouter-watchdog.statu
 # Env-параметризуемо (канон more-options-better): 0 — выключить троттлинг.
 _DEGRADED_NOTIFY_COOLDOWN_DEFAULT_SEC = 900
 _DEGRADED_NOTIFY_COOLDOWN_ENV = "SROUTER_WATCHDOG_DEGRADED_COOLDOWN"
+# Down-пара «Упало/Восстановлено» (кампания 09-2026: при флапе VPS down↔ok каждые 20с
+# давал ~93 пуша/24ч — пара ходила без всякого гейта).
+_DOWN_NOTIFY_COOLDOWN_DEFAULT_SEC = 600
+_DOWN_NOTIFY_COOLDOWN_ENV = "SROUTER_WATCHDOG_DOWN_COOLDOWN"
 
 # #358 п.2: анти-флап гистерезис — смена состава пушится только после N проб подряд
 # с одним и тем же новым составом (probe-интервал ~20с → окно ~40с при N=2). Фильтр на
@@ -990,6 +994,17 @@ def _degraded_notify_cooldown_sec():
         return _DEGRADED_NOTIFY_COOLDOWN_DEFAULT_SEC
 
 
+def _down_notify_cooldown_sec():
+    """Cooldown пары «Упало/Восстановлено» из env: 0..86400с, мусор → дефолт."""
+    raw = os.environ.get(_DOWN_NOTIFY_COOLDOWN_ENV)
+    if raw is None:
+        return _DOWN_NOTIFY_COOLDOWN_DEFAULT_SEC
+    try:
+        return max(0, min(86400, int(raw)))
+    except ValueError:
+        return _DOWN_NOTIFY_COOLDOWN_DEFAULT_SEC
+
+
 def _degraded_confirm_probes():
     """Гистерезис смены состава (#358 п.2) из env: сколько проб подряд должен держаться
     новый состав до пуша. Clamp [1, 10]: 1 — легаси-поведение (немедленный пуш),
@@ -1099,6 +1114,17 @@ def _read_watchdog_prev_state():
         # навсегда глушат degraded-класс (сравнение с nan всегда False) — сбрасываем в 0.
         if not (0.0 <= last_push <= time.time()):
             last_push = 0.0
+        try:
+            last_down_push = float(parsed.get("last_down_push") or 0.0)
+        except (TypeError, ValueError):
+            last_down_push = 0.0
+        if not (0.0 <= last_down_push <= time.time()):
+            last_down_push = 0.0
+        # Миграция: state старой версии не писал down_push_sent, но старый код пушил
+        # «Упало» безусловно → живой down-эпизод считается уведомлённым (иначе апгрейд
+        # заглушил бы «Восстановлено» уже идущего падения).
+        down_push_sent = (bool(parsed["down_push_sent"])
+                          if "down_push_sent" in parsed else status == "down")
 
         def _canon_names(value):
             # sorted-канонизация набора имён (round 4 P2: перестановка — не смена
@@ -1123,13 +1149,18 @@ def _read_watchdog_prev_state():
             # подавлении cooldown'ом НЕ продвигается, чтобы событие не терялось навсегда.
             "notified_failed": _canon_names(parsed.get("notified_failed")),
             "last_degraded_push": last_push,
+            "last_down_push": last_down_push,
+            "down_push_sent": down_push_sent,
             "pending_failed": _canon_names(parsed.get("pending_failed")),
             "pending_streak": pending_streak,
         }
     # Legacy: голая строка статуса (в т.ч. закавыченная валидным JSON — тоже строка).
     legacy = parsed if isinstance(parsed, str) else raw
-    return {"status": legacy.strip(), "failed": None, "notified_failed": None,
-            "last_degraded_push": 0.0, "pending_failed": None, "pending_streak": 0}
+    legacy_status = legacy.strip()
+    return {"status": legacy_status, "failed": None, "notified_failed": None,
+            "last_degraded_push": 0.0, "last_down_push": 0.0,
+            "down_push_sent": legacy_status == "down",
+            "pending_failed": None, "pending_streak": 0}
 
 
 def _append_watchdog_status_event(previous, current, reasons=None, segment=None):
@@ -1285,12 +1316,24 @@ def _cmd_watchdog_locked(result):
     # - «состав изменился» (#315 п.3): не-ok статус, а уведомлённый состав отличается
     #   от фактического — включая подавленный cooldown'ом (P1-1) — событие с cooldown.
     last_push = prev["last_degraded_push"] if prev else 0.0
+    last_down_push = prev["last_down_push"] if prev else 0.0
+    down_push_sent = bool(prev["down_push_sent"]) if prev else False
     if cur == "down" and prev_status in ("ok", "degraded", ""):
-        _notify(f"Упало: {', '.join(_short_check_name(n) for n in failed)}", "Basso")
+        # Cooldown даун-пары (кампания 09-2026): повторное «Упало» в окне молчит, а его
+        # «Восстановлено» тоже — пары не разъезжаются (recovery необъявленного падения —
+        # шум #315-класса). Флаг down_push_sent переживает тики эпизода в state.
+        if time.time() - last_down_push >= _down_notify_cooldown_sec():
+            _notify(f"Упало: {', '.join(_short_check_name(n) for n in failed)}", "Basso")
+            last_down_push = time.time()
+            down_push_sent = True
+        else:
+            down_push_sent = False
         notified_failed = failed
         pending_failed, pending_streak = None, 0
     elif cur == "ok" and prev_status == "down":
-        _notify("Восстановлено", "Glass")
+        if down_push_sent:
+            _notify("Восстановлено", "Glass")
+        down_push_sent = False
         notified_failed = []
         pending_failed, pending_streak = None, 0
     elif cur in ("degraded", "down"):
@@ -1380,6 +1423,9 @@ def _cmd_watchdog_locked(result):
             "notified_failed": (notified_failed if notified_failed is not None else fallback_notified)
             if cur != "ok" else [],
             "last_degraded_push": last_push,
+            "last_down_push": last_down_push,
+            # флаг эпизода живёт, пока cur != ok; на ok эпизод закрыт
+            "down_push_sent": down_push_sent if cur != "ok" else False,
             # #358 п.2: гистерезисный кандидат переживает рестарт watchdog'а — счётчик
             # проб не теряется и не рождает ложный пуш (пуш только по confirmed-составу).
             "pending_failed": pending_failed,
