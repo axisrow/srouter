@@ -340,3 +340,34 @@ def test_generate_config_mode_off_is_valid_without_guard_rules(tmp_path):
     rendered = json.dumps(cfg, ensure_ascii=False)
     assert "traffic-guard-blackhole" not in rendered
     assert "domain:video.example.com" not in rendered
+
+
+def test_default_log_section_persists_error_log(tmp_path):
+    """Персист error-лога xray (кампания 09-2026: stdout launchd терялся — форензика
+    отказов вслепую). Каталог создаётся при генерации: xray создаёт файл, но не каталог."""
+    sec = gen_xray_config._default_log_section(home=tmp_path)
+    expected = tmp_path / "Library" / "Logs" / "srouter" / "xray-error.log"
+    assert sec["loglevel"] == "warning"
+    assert sec["error"] == str(expected)
+    assert expected.parent.is_dir()
+
+
+def test_default_log_section_survives_unwritable_home(tmp_path):
+    """Фейл-софт: каталог лога недоступен → error-пути нет, loglevel остаётся (генерация
+    не должна падать из-за персиста лога)."""
+    blocked = tmp_path / "blocked"
+    blocked.write_text("", encoding="utf-8")
+    sec = gen_xray_config._default_log_section(home=blocked)
+    assert sec == {"loglevel": "warning"}
+
+
+def test_default_template_uses_persisted_log_section():
+    """Дефолт-шаблон (и setdefault в _load_template) отдают секцию с error-путём."""
+    assert "error" in gen_xray_config._default_template()["log"]
+
+
+def test_generate_config_persists_error_log_through_real_template():
+    """Через реальный чекин-шаблон (review #381 P1): в нём ключ log уже есть, setdefault
+    мёртв — generate_config обязан мёрджить error в существующую секцию."""
+    cfg = gen_xray_config.generate_config(state_path=EXAMPLE)
+    assert isinstance(cfg["log"].get("error"), str) and cfg["log"]["error"]

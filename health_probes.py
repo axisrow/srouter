@@ -8,6 +8,7 @@ health.py остаётся тонким фасадом: `from health_probes impo
 
 Не бросает: все чеки здесь возвращают dict/tuple со status, probe-канон (см. health.py docstring).
 """
+import json
 import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
@@ -17,6 +18,7 @@ import subprocess
 import time
 
 import local_state
+import local_state_xray
 import privoxy_system
 import sys_probe
 
@@ -31,6 +33,7 @@ _log = logging.getLogger("srouter.health")
 # consumer этого __all__; внешний код импортирует health, не health_probes напрямую).
 __all__ = [
     "_launchd_field", "_port_up", "PRIVOXY_SYSTEM_LABEL", "PRIVOXY_BREW_LABEL", "XRAY_BREW_LABEL",
+    "_XRAY_CONFIG_PATH",
     "XRAY_BREW_LABELS", "_privoxy_service_target", "_xray_service_target", "_privoxy_registrations",
     "_launchd_pid", "_listener_pid",
     "_service_running", "_local_proxy_up",
@@ -105,6 +108,10 @@ PRIVOXY_BREW_LABEL = privoxy_system.USER_LABEL      # homebrew.mxcl.privoxy
 # _xray_service_target(). XRAY_BREW_LABEL — legacy alias для экспорт-контракта star-import.
 XRAY_BREW_LABELS = ("sh.brew.xray", "homebrew.mxcl.xray")
 XRAY_BREW_LABEL = XRAY_BREW_LABELS[-1]
+
+# Живой конфиг xray (для warn-фасета персиста лога). Тесты патчат ЗДЕСЬ (caller-модуль,
+# канон moving-caller-inverts-mock-ownership), не в local_state_xray.
+_XRAY_CONFIG_PATH = local_state_xray.XRAY_CONFIG_PATH
 
 
 def _privoxy_service_target():
@@ -258,6 +265,31 @@ def _service_running(label, domain=None):
     return "running" if state == "running" else "not_running"
 
 
+def _xray_log_persistence_facet(config_path=None):
+    """Facet-строка, если error-лог xray не настроен в живом конфиге; None если ок.
+    Конфиг отсутствует (fresh install) → None (нечего персистить, шум не плодим).
+    Кампания 09-2026: stdout launchd терялся — форензика TLS-таймаутов была вслепую.
+    Не бросает."""
+    path = Path(config_path or _health_facade._XRAY_CONFIG_PATH)
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        # UnicodeDecodeError ⊂ ValueError — бинарный/битый UTF-8 конфиг не роняет пробу
+        # (probe-канон «не бросает», review #381 P2)
+        return "xray: конфиг не читается — персист лога не проверить"
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        return "xray: конфиг не парсится — персист лога не проверить"
+    log_sec = parsed.get("log") if isinstance(parsed, dict) else None
+    if isinstance(log_sec, dict) and isinstance(log_sec.get("error"), str) and log_sec.get("error"):
+        return None
+    return ("xray: логи не персистятся (log.error не задан) — отказы видит только stdout "
+            "launchd, форензика вслепую; см. gen_xray_config log-секцию")
+
+
 def _local_proxy_up():
     """Локальный прокси жив? privoxy + xray port-open AND service-running (#204).
 
@@ -377,6 +409,11 @@ def _local_proxy_up():
                   "регистрацию (выбранный по режиму сервис не Running — см. грань режима)")
     if unverified:
         detail += f" (⚠ service-status не верифицирован для {', '.join(unverified)} — launchctl timeout)"
+    # Персист лога xray — грань конфигурации, не сбой (#341-канон): warn-фасет на ok-пути
+    # (down-путь и так знает свою причину, шум не плодим).
+    log_facet = _xray_log_persistence_facet()
+    if log_facet:
+        facets.append(log_facet)
     # #341: facets — отдельные грани (режим регистрации), НЕ зомби; check_all показывает их
     # отдельным warn-чеком (info-only, не driver).
     return {"status": "ok", "detail": detail, "facets": facets}

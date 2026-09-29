@@ -1154,6 +1154,53 @@ def test_local_proxy_ok_when_ports_up_and_services_running(monkeypatch):
     assert result["status"] == "ok", "порты up + сервисы running → ok"
 
 
+def test_local_proxy_warns_when_xray_logs_not_persisted(monkeypatch, tmp_path):
+    """Живой конфиг без log.error → warn-фасет «логи не персистятся», вердикт не роняет
+    (#341 facets; кампания 09-2026: форензика TLS-таймаутов была вслепую)."""
+    monkeypatch.setattr(health, "_port_up", lambda port: True)
+    monkeypatch.setattr(health, "_service_running", lambda label, domain=None: "running")
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({"log": {"loglevel": "warning"}}), encoding="utf-8")
+    monkeypatch.setattr(health, "_XRAY_CONFIG_PATH", str(cfg))
+    result = health._local_proxy_up()
+    assert result["status"] == "ok", "отсутствие персиста лога — грань, не сбой"
+    assert any("не персистятся" in f for f in result.get("facets", []))
+
+
+def test_local_proxy_no_log_facet_when_error_persisted(monkeypatch, tmp_path):
+    """log.error настроен → фасета нет."""
+    monkeypatch.setattr(health, "_port_up", lambda port: True)
+    monkeypatch.setattr(health, "_service_running", lambda label, domain=None: "running")
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({"log": {"error": "/tmp/xray-error.log", "loglevel": "warning"}}),
+                   encoding="utf-8")
+    monkeypatch.setattr(health, "_XRAY_CONFIG_PATH", str(cfg))
+    result = health._local_proxy_up()
+    assert result["status"] == "ok"
+    assert not any("не персистятся" in f for f in result.get("facets", []))
+
+
+def test_local_proxy_no_log_facet_when_config_absent(monkeypatch, tmp_path):
+    """Конфига нет (fresh install) → фасета нет (нечего персистить, шум не плодим)."""
+    monkeypatch.setattr(health, "_port_up", lambda port: True)
+    monkeypatch.setattr(health, "_service_running", lambda label, domain=None: "running")
+    monkeypatch.setattr(health, "_XRAY_CONFIG_PATH", str(tmp_path / "absent.json"))
+    result = health._local_proxy_up()
+    assert result["status"] == "ok"
+    assert not any("не персистятся" in f for f in result.get("facets", []))
+
+
+def test_local_proxy_log_facet_survives_binary_config(monkeypatch, tmp_path):
+    """Битый UTF-8 конфиг не роняет пробу: UnicodeDecodeError ⊂ ValueError (review #381 P2)."""
+    monkeypatch.setattr(health, "_port_up", lambda port: True)
+    monkeypatch.setattr(health, "_service_running", lambda label, domain=None: "running")
+    cfg = tmp_path / "config.json"
+    cfg.write_bytes(b"\xff\xfe{\xff")
+    monkeypatch.setattr(health, "_XRAY_CONFIG_PATH", str(cfg))
+    result = health._local_proxy_up()
+    assert result["status"] == "ok"
+
+
 def test_local_proxy_down_when_port_closed(monkeypatch):
     """ДЫРА #204: privoxy port closed → down «крах» (демон не слушает). Раньше _port_up сам по себе
     молчал о причине. Теперь service-status объясняет: порт не слушается = прокси упал/не стартовал."""
