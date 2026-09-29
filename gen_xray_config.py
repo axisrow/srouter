@@ -49,9 +49,25 @@ class TrafficGuardValidationError(ValueError):
         super().__init__("traffic_guard невалиден: " + "; ".join(self.errors))
 
 
+def _default_log_section(home=None):
+    """log-секция с персистом error-лога (кампания 09-2026: stdout launchd терялся —
+    форензика отказов вслепую). Путь абсолютный на момент генерации — xray читает литерал;
+    каталог создаёт генерация (xray создаёт файл, но не каталог). Фейл-софт: каталог
+    недоступен → без error-пути. ponytail: ротации нет — error/warning растёт ~МБ за
+    недели; newsyslog при реальном росте."""
+    section = {"loglevel": "warning"}
+    log_dir = Path(home or Path.home()) / "Library" / "Logs" / "srouter"
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        section["error"] = str(log_dir / "xray-error.log")
+    except OSError:
+        pass
+    return section
+
+
 def _default_template():
     return {
-        "log": {"loglevel": "warning"},
+        "log": _default_log_section(),
         "srouter": {"marker": MARKER, "managed": True, "generated_by": "gen_xray_config.py"},
         "inbounds": [],
         "outbounds": [],
@@ -68,7 +84,7 @@ def _load_template(path=None):
             return _default_template()
     except (OSError, ValueError, TypeError):
         return _default_template()
-    data.setdefault("log", {"loglevel": "warning"})
+    data.setdefault("log", _default_log_section())
     data.setdefault("srouter", {})
     data.setdefault("inbounds", [])
     data.setdefault("outbounds", [])
