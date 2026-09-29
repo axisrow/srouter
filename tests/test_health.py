@@ -6293,6 +6293,26 @@ def test_tunnel_up_dedups_extras_by_host_not_url(monkeypatch):
     assert hosts.count("api.anthropic.com") == 1, "дубль канарейки отсечён по хосту"
 
 
+def test_tunnel_window_stats_tail_covers_window_with_multi_target_writes(tmp_path):
+    """Хвост чтения гейта масштабируется по числу целей: 15 поминутных записей × 9 событий
+    (135 строк) — все 15 канареечных фейлов внутри 15-м окна считаются. Старый лимит 120
+    строк калибровал эпоху одной канарейки: хвост 13.3 мин < окна, «N/15» врёт, а при
+    metrics_interval 20с гейт fail-open (PR #378, adversarial 3b)."""
+    now = 1_800_000_000.0
+    extras = ("chatgpt.com", "github.com", "discord.com", "youtube.com",
+              "netflix.com", "www.gstatic.com", "www.baidu.com", "api.openai.com")
+    lines = []
+    for minute in range(15):
+        ts = now - (14 - minute) * 60.0
+        lines.append(json.dumps({"ts": ts, "status": "fail", "target": "api.anthropic.com"}))
+        lines.extend(json.dumps({"ts": ts, "status": "ok", "target": host})
+                     for host in extras)
+    log = tmp_path / "metrics.jsonl"
+    log.write_text("\n".join(lines) + "\n")
+    stats = _REAL_TUNNEL_WINDOW_STATS(now=now, log_path=str(log))
+    assert stats == {"fails": 15, "samples": 15, "rate": 1.0}
+
+
 def test_metrics_canary_target_guard_matches_first_tunnel_target():
     """Гвард связки констант: канареечный фильтр серий = хост первой канарейки. Смена
     TUNNEL_TARGETS без METRICS_CANARY_TARGET молча опустошила бы все фильтры и деградация

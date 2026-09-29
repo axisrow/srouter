@@ -135,7 +135,12 @@ def _tunnel_window_stats(now=None, log_path=None):
     (fail-open: гейт неприменим). Не бросает.
     """
     try:
-        events = metrics_store.read_timing_events(hours=1, max_lines=120,
+        # Хвост обязан покрывать WINDOW_SEC при любом числе целей: за тик пишется событие
+        # НА КАЖДУЮ (канарейки + extras), а 120 строк калибровали эпоху одной канарейки —
+        # при дефолтных 9 целях хвост 120 строк ≈ 13.3 мин < окна 15м, при интервале 20с
+        # гейт уходит в fail-open (PR #378, adversarial). Опции фейл-софт, пусто не бывает.
+        max_lines = 120 * (1 + len(_metrics_probe_options()["metrics_targets"]))
+        events = metrics_store.read_timing_events(hours=1, max_lines=max_lines,
                                                   log_path=log_path, now=now)
         # Мульти-таргет (2026-09-29): гейт считает только канарейку (+legacy None-события).
         # Фейл вендора (netflix) — не «туннель флапает»: OR-семантика пробы решает это,
