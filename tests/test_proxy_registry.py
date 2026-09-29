@@ -390,6 +390,10 @@ def test_apply_stops_on_first_failure(monkeypatch):
 def test_apply_rolls_back_applied_consumers(monkeypatch):
     """ДЫРА #303: успешные до сбоя мутации откатываются компенсирующим действием —
     пользователь не остаётся в частично применённом состоянии без явного сигнала."""
+    # pre-state изолирован (enabled=False): иначе тест читает РЕАЛЬНЫЙ ~/.gitconfig и на машине
+    # с включённым managed-ключом rollback честно скипаается («уже был включён») — machine-dependent.
+    monkeypatch.setattr(proxy_registry.git_proxy, "status",
+                        lambda: {"enabled": False, "present": False, "state": "absent"})
     monkeypatch.setattr(proxy_registry.git_proxy, "enable", lambda force=False: {"ok": True})
     monkeypatch.setattr(proxy_registry.claude_proxy, "enable",
                         lambda force=False: {"ok": False, "err": "disk full"})
@@ -404,6 +408,9 @@ def test_apply_rolls_back_applied_consumers(monkeypatch):
 
 def test_apply_rollback_failure_is_reported_loudly(monkeypatch):
     """Откат сам может упасть — это НЕ может быть тихим: rollback_errors обязателен."""
+    # pre-state изолирован (enabled=False) — см. test_apply_rolls_back_applied_consumers.
+    monkeypatch.setattr(proxy_registry.git_proxy, "status",
+                        lambda: {"enabled": False, "present": False, "state": "absent"})
     monkeypatch.setattr(proxy_registry.git_proxy, "enable", lambda force=False: {"ok": True})
     monkeypatch.setattr(proxy_registry.claude_proxy, "enable",
                         lambda force=False: (_ for _ in ()).throw(RuntimeError("boom")))
@@ -577,6 +584,9 @@ def test_apply_force_over_foreign_enabled_prestate_honest_skip_reason(monkeypatc
 
 def test_apply_conflict_aborts_and_rolls_back(monkeypatch):
     """conflict = неудавшаяся мутация: apply останавливается, ранее применённое откатывается."""
+    # pre-state изолирован (enabled=False) — см. test_apply_rolls_back_applied_consumers.
+    monkeypatch.setattr(proxy_registry.git_proxy, "status",
+                        lambda: {"enabled": False, "present": False, "state": "absent"})
     monkeypatch.setattr(proxy_registry.git_proxy, "enable", lambda force=False: {"ok": True})
     monkeypatch.setattr(proxy_registry.claude_proxy, "enable",
                         lambda force=False: {"ok": False, "conflict": True, "state": "foreign",

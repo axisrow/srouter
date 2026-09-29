@@ -302,3 +302,129 @@ def test_disable_self_heal_partial_restore_does_not_get_stuck_permanently(monkey
     )
     assert git_proxy._backup_state()["present"] is False, "backup убран после успешного восстановления"
 
+
+# ============================ effective_proxy: композер слоёв (2026-09-30) ============================
+# Мотивация: git резолвит прокси по ЛЕСТНИЦЕ слоёв (local urlmatch > global urlmatch > global
+# generic http.proxy/https.proxy > env), а status() читал только один слой — doctor рапортовал
+# «github идёт напрямую», пока бесхозный глобальный http.proxy=8118 реально проксировал git
+# (живой факт машины 2026-09-30). effective_proxy() вычисляет ЭФФЕКТИВНОЕ значение.
+
+@pytest.fixture
+def no_proxy_env(monkeypatch):
+    """Убрать ambient env-прокси (канон ambient-env-poisons-env-parameterized-stubs):
+    effective_proxy читает env последним слоем — shell-переменные хоста ломали бы лестницу."""
+    for var in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
+        monkeypatch.delenv(var, raising=False)
+    return monkeypatch
+
+
+def _raw_local_set(repo, key, val):
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "--local", key, val],
+        env=dict(os.environ), capture_output=True, text=True, check=True,
+    )
+
+
+@pytest.fixture
+def tmp_repo(tmp_path):
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True, capture_output=True)
+    return tmp_path
+
+
+def test_effective_local_urlmatch_beats_global(no_proxy_env, real_git_home, tmp_repo):
+    """Пустой local urlmatch = ОСОЗНАННЫЙ direct в этом репо — побеждает global managed-ключ."""
+    assert git_proxy.enable(force=True)["ok"] is True
+    _raw_local_set(tmp_repo, git_proxy.KEY, "")
+    eff = git_proxy.effective_proxy(repo=tmp_repo)
+    assert eff["layer"] == "local-urlmatch"
+    assert eff["proxy"] == "", "пустой local override = direct, а не socks"
+
+
+def test_effective_global_urlmatch_beats_generic(no_proxy_env, real_git_home):
+    """Managed urlmatch-ключ побеждает бесхозный общий http.proxy (приоритет git)."""
+    _raw_set_add("http.proxy", "http://127.0.0.1:8118", real_git_home)
+    assert git_proxy.enable(force=True)["ok"] is True
+    nonrepo = real_git_home / "not-a-repo"
+    eff = git_proxy.effective_proxy(repo=nonrepo)  # вне репо — локальный слой отсутствует
+    assert eff["layer"] == "global-urlmatch"
+    assert eff["proxy"] == EXPECTED_GIT_PROXY
+
+
+def test_effective_generic_fires_when_urlmatch_absent(no_proxy_env, real_git_home):
+    """БЕЗ urlmatch-ключа бесхозный глобальный http.proxy=8118 реально проксирует git — слой
+    global-generic. Ровно живое состояние машины 2026-09-30, которое doctor называл «напрямую»."""
+    _raw_set_add("https.proxy", "http://127.0.0.1:8118", real_git_home)
+    eff = git_proxy.effective_proxy()
+    assert eff["layer"] == "global-generic"
+    assert eff["proxy"] == "http://127.0.0.1:8118"
+
+
+def test_effective_env_is_last_layer(no_proxy_env, real_git_home):
+    """Env-прокси работает только при пустом git-config (нижняя ступень лестницы)."""
+    no_proxy_env.setenv("HTTPS_PROXY", "http://wprp.example:3128")
+    eff = git_proxy.effective_proxy()
+    assert eff["layer"] == "env"
+    assert eff["proxy"] == "http://wprp.example:3128"
+
+
+def test_effective_direct_when_nothing_set(no_proxy_env, real_git_home, tmp_repo):
+    eff = git_proxy.effective_proxy(repo=tmp_repo)
+    assert eff["layer"] == "direct"
+    assert eff["proxy"] == ""
+
+
+def test_effective_foreign_urlmatch_passthrough(no_proxy_env, real_git_home):
+    _raw_set(git_proxy.KEY, "http://corp.example:8080", real_git_home)
+    eff = git_proxy.effective_proxy()
+    assert eff["layer"] == "global-urlmatch"
+    assert eff["proxy"] == "http://corp.example:8080"
+
+
+def test_effective_never_raises(no_proxy_env, real_git_home, monkeypatch):
+    """Мусор от status()/env → layer в {"unknown", "direct", ...}, не бросает (probe-канон)."""
+    monkeypatch.setattr(git_proxy, "status", lambda: None)
+    eff = git_proxy.effective_proxy()
+    assert isinstance(eff, dict) and "layer" in eff
+
+
+# ============================ stray_global: бесхозные глобальные ключи ============================
+
+def test_stray_global_absent(no_proxy_env, real_git_home):
+    s = git_proxy.stray_global()
+    assert s["http"]["present"] is False and s["https"]["present"] is False
+
+
+def test_stray_global_present(no_proxy_env, real_git_home):
+    _raw_set_add("http.proxy", "http://127.0.0.1:8118", real_git_home)
+    _raw_set_add("https.proxy", "http://127.0.0.1:8118", real_git_home)
+    s = git_proxy.stray_global()
+    assert s["http"]["values"] == ["http://127.0.0.1:8118"]
+    assert s["https"]["values"] == ["http://127.0.0.1:8118"]
+
+
+def test_stray_global_multi_value(no_proxy_env, real_git_home):
+    _raw_set_add("http.proxy", "http://a:1", real_git_home)
+    _raw_set_add("http.proxy", "http://b:2", real_git_home)
+    s = git_proxy.stray_global()
+    assert s["http"]["multi"] is True
+    assert s["http"]["values"] == ["http://a:1", "http://b:2"]
+
+
+# ============================ local_override: пер-репо .git/config ============================
+
+def test_local_override_present_empty_value(tmp_repo):
+    _raw_local_set(tmp_repo, git_proxy.KEY, "")
+    lo = git_proxy.local_override(repo=tmp_repo)
+    assert lo["present"] is True
+    assert lo["values"] == [""]
+
+
+def test_local_override_absent_clean_repo(tmp_repo):
+    assert git_proxy.local_override(repo=tmp_repo)["present"] is False
+
+
+def test_local_override_outside_repo_is_absent_not_unknown(tmp_path):
+    """Вне репо `git config --local` даёт rc=128 — это «слоя нет», а не сбой чтения."""
+    assert git_proxy.local_override(repo=tmp_path)["present"] is False
+    assert git_proxy.local_override(repo=tmp_path)["unknown"] is False
+

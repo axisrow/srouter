@@ -669,6 +669,92 @@ def cmd_doctor(args) -> int:
     return 0 if result["status"] == "ok" else 1
 
 
+def cmd_git_proxy(args) -> int:
+    """status|enable|disable git-прокси для github (git_proxy: socks5h xray 10808, ~/.gitconfig).
+
+    status — ЭФФЕКТИВНЫЙ вердикт по всем слоям лестницы git (effective_proxy: local urlmatch >
+    global urlmatch > глобальные generic http.proxy/https.proxy > env). Мотивация 2026-09-30:
+    doctor называл «напрямую» состояние, где бесхозный глобальный 8118 реально проксировал git.
+    enable/disable — managed-ключ (транзакция + backup). disable --full — дополнительно снимает
+    бесхозные глобальные ключи (purge_stray; чужие значения — только с --force, контракт #307).
+    """
+    action = getattr(args, "gitproxy_action", "status")
+
+    if action == "status":
+        st = git_proxy.status()
+        lo = git_proxy.local_override()
+        sg = git_proxy.stray_global()
+        print("git-proxy: слои прокси для git → github.com")
+        print(f"  1. local urlmatch (.git/config этого репо): "
+              + (f"{lo['values']}" if lo["present"] else "нет"))
+        print(f"  2. global urlmatch {git_proxy.KEY}: "
+              + (f"{st.get('values')} (state={st.get('state')})" if st.get("present") else "нет"))
+        for name, rec in (("https.proxy", sg["https"]), ("http.proxy", sg["http"])):
+            print(f"  3. глобальный {name}: "
+                  + (f"{rec['values']}" if rec["present"] else "нет"))
+        eff = git_proxy.effective_proxy()
+        if not isinstance(eff, dict) or not eff.get("layer") or eff.get("layer") == "unknown":
+            print("Вердикт: конфиг нечитаем (unknown).")
+            return 1
+        if eff["layer"] == "direct" or (eff["layer"] == "local-urlmatch" and not eff.get("proxy")):
+            print(f"Вердикт: git→github идёт НАПРЯМУЮ ({eff.get('detail')}).")
+        else:
+            print(f"Вердикт: git→github идёт через {eff.get('proxy')} "
+                  f"(слой {eff['layer']}: {eff.get('detail')}).")
+        print("Управление: srouter git-proxy enable [--force] / disable [--full]")
+        return 0
+
+    if action == "enable":
+        r = git_proxy.enable(force=args.force)
+        if not r.get("ok"):
+            if r.get("conflict"):
+                cur = git_proxy.status()
+                print(f"git-proxy: отказ — {r.get('err')}\n"
+                      f"  текущие значения: {cur.get('values')}\n"
+                      f"  перезаписать осознанно: srouter git-proxy enable --force")
+            else:
+                print(f"git-proxy: не включён ({r.get('err')}).")
+            return 1
+        print(f"git-proxy: включён ({r.get('proxy')}) — ключ {git_proxy.KEY} в ~/.gitconfig.")
+        lo = git_proxy.local_override()
+        if lo["present"]:
+            print(f"  ВНИМАНИЕ: локальный override .git/config ЭТОГО репо ({lo['values']}) "
+                  f"побеждает глобальный ключ. Снять: git config --local --unset {git_proxy.KEY}")
+        return 0
+
+    if action == "disable":
+        r = git_proxy.disable()
+        if not r.get("ok"):
+            print(f"git-proxy: managed-ключ не снят ({r.get('err')}).")
+            return 1
+        print(f"git-proxy: managed-ключ снят ({git_proxy.KEY}).")
+        ok = True
+        if args.full:
+            pr = git_proxy.purge_stray(force=args.force)
+            for key, vals in pr.get("purged", {}).items():
+                adds = " ; ".join(f"git config --global --add {key} '{v}'" for v in vals)
+                print(f"  снят бесхозный {key}: {vals} (восстановить: {adds})")
+            for key, info in pr.get("refused", {}).items():
+                ok = False
+                print(f"  ОТКАЗ на {key}: {info.get('err')} значения={info.get('values')} "
+                      f"(чужое — осознанно: srouter git-proxy disable --full --force)")
+            sg = git_proxy.stray_global()
+            left = {k: rec["values"] for k, rec in sg.items() if rec["present"]}
+            if left:
+                ok = False
+                print(f"  остались бесхозные ключи: {left} — git продолжает ходить через них.")
+            elif not pr.get("purged"):
+                print("  бесхозных глобальных http.proxy/https.proxy нет.")
+        else:
+            sg = git_proxy.stray_global()
+            left = {k: rec["values"] for k, rec in sg.items() if rec["present"]}
+            if left:
+                print(f"  осталось проксирование через бесхозный слой: {left} "
+                      f"(полное отключение: srouter git-proxy disable --full)")
+        return 0 if ok else 1
+    return 2
+
+
 def cmd_sync(args) -> int:
     """Синхронизировать endpoint активного узла из РАБОЧЕГО xray config в srouter.local.json (#200).
 
@@ -1077,6 +1163,29 @@ def build_parser() -> argparse.ArgumentParser:
                             help="Восстановить только указанный network service "
                                  "(по умолчанию — все известные leases).")
         sp.set_defaults(func=cmd_system_proxy)
+
+    # git-proxy (2026-09-30): единый тумблер git-прокси для github — status всех слоёв
+    # (effective_proxy), enable/disable managed-ключа; disable --full снимает и бесхозные
+    # глобальные http.proxy/https.proxy (force-гейт на чужие значения, #307).
+    p_gitproxy = sub.add_parser(
+        "git-proxy",
+        help="Тумблер git-прокси для github: status/enable/disable (--full — и бесхозные глобальные).")
+    p_gp_sub = p_gitproxy.add_subparsers(dest="gitproxy_action", required=True)
+    for sub_name, sub_help in (
+        ("status", "Эффективный вердикт по всем слоям прокси (local urlmatch/global/generic/env)."),
+        ("enable", "Включить managed SOCKS5 xray в ~/.gitconfig (чужое значение — только --force)."),
+        ("disable", "Снять managed-ключ (--full — плюс бесхозные http.proxy/https.proxy)."),
+    ):
+        sp = p_gp_sub.add_parser(sub_name, help=sub_help)
+        if sub_name == "enable":
+            sp.add_argument("--force", action="store_true",
+                            help="Перезаписать ЧУЖОЕ значение (backup сохраняется, #307).")
+        if sub_name == "disable":
+            sp.add_argument("--full", action="store_true",
+                            help="Также снять бесхозные глобальные http.proxy/https.proxy.")
+            sp.add_argument("--force", action="store_true",
+                            help="Снять и ЧУЖИЕ значения бесхозных ключей (снятое печатается).")
+        sp.set_defaults(func=cmd_git_proxy)
 
     # netprobe (кампания деградации туннеля 2026-09): LaunchAgent ping'ует участки сети
     # (gateway/domestica/VPS мимо туннеля) раз в 60с; report — корреляция блэкаутов туннеля

@@ -101,12 +101,20 @@ GH_DIRECT_HINT = (
 def _github_direct_check():
     """Подсказка VPS-независимого dev-workflow для gh/git (issue #199). info-only ВСЕГДА.
 
+    2026-09-30 багфикс: раньше чек читал ТОЛЬКО git_proxy.status() (scoped urlmatch-ключ) и на
+    живой машине рапортовал «git github-proxy выключен — github идёт напрямую» (ok), пока
+    бесхозный глобальный http.proxy=8118 реально проксировал git через privoxy, а локальные
+    override'ы репо наоборот глушили глобальное. Теперь вердикт строится на
+    git_proxy.effective_proxy() — композер ВСЕХ слоёв по приоритету git (local urlmatch >
+    global urlmatch > global generic http.proxy/https.proxy > env): warn для ЛЮБОГО активного
+    слоя с именем слоя и источника, ok только когда эффективно direct. Канон
+    detector-must-be-function-not-constant: вердикт по эффективному значению, не по одному слою.
+
     Диагноз #199 (verify, эмпирически): github доступен напрямую через gh — Go HTTP/TLS-стек gh
-    обходит GFW TLS-блокировку (в отличие от curl/git на LibreSSL + системном resolver). Но если в
-    ~/.gitconfig включён scoped git-прокси `http.https://github.com.proxy → privoxy 8118` (git_proxy),
-    то git pull/push идёт ЧЕРЕЗ прокси → зависит от VPS: мёртвый VPS = git timeout (выглядело как
-    «флап gh»). Подсказка РАЗДЕЛЯЕТ стеки (cycle-1 FIX): gh → снять env-прокси (оба регистра) через
-    `env -u`; git-over-https → env -u НЕ трогает git-config, нужен `git -c http.https://github.com.proxy=`.
+    обходит GFW TLS-блокировку (в отличие от curl/git на LibreSSL + системном resolver). git
+    через прокси зависит от VPS: мёртвый VPS = git timeout. Подсказка РАЗДЕЛЯЕТ стеки (cycle-1
+    FIX): gh → снять env-прокси (оба регистра) через `env -u`; git-over-https → env -u НЕ трогает
+    git-config, нужен `git -c http.https://github.com.proxy=`.
 
     Предикт = статичный git-config (verify-don't-guess — не догадки о таймаутах, а проверяемый
     факт конфигурации). Чек info-only ВСЕГДА (как endpoint-override): git-proxy-настройка — это
@@ -115,41 +123,56 @@ def _github_direct_check():
     (dev-workflow не должен зависеть от VPS — github-операции переживают смерть VPS).
 
     Возвращает {status, detail}:
-      ok      — git-config github-proxy выключен (github уже идёт напрямую);
-      warn    — git-config ВКЛЮЧЁН (scoped github → privoxy) → git зависит от VPS, подсказка env -u;
-                ИЛИ state=foreign — указан ПОСТОРОННИЙ прокси (#309: enabled=False не различает
-                «выключено» и «чужое»; канон detector-must-be-function-not-constant);
-      unknown — git_proxy.status unknown/ошибка (git config timeout/недоступен).
+      ok      — эффективный прокси пуст (direct или осознанный пустой local override);
+      warn    — эффективный прокси ЕСТЬ → подсказка по конкретному слою (managed socks =
+                зависимость от VPS; global-generic = бесхозный слой вне управления; env =
+                переменная окружения; local-urlmatch = локальный override задаёт прокси;
+                foreign = посторонний прокси, #309);
+      unknown — effective_proxy unknown/ошибка/мусор (git config timeout/недоступен).
     Не бросает (probe-канон).
     """
     try:
         import git_proxy
-        st = git_proxy.status()
+        eff = git_proxy.effective_proxy()
     except (ImportError, RuntimeError, OSError, ValueError) as exc:
-        # ImportError — модуль недоступен; RuntimeError/OSError/ValueError — сбой status() (fail-soft).
+        # ImportError — модуль недоступен; RuntimeError/OSError/ValueError — сбой effective_proxy() (fail-soft).
         _log.debug("git_proxy недоступен/сбой: %s — check пропущен", exc)
         return {"status": "unknown", "detail": "git_proxy недоступен — check пропущен"}
     # isinstance ДО .get: git_proxy.status может вернуть None/не-dict (мусор) — .get упал бы
     # (probe-канон: чек не бросает). git_proxy.status при timeout отдаёт {status:"unknown"} — это
     # НЕ «git-proxy выключен» (enabled=False без status — другое; ниже разделяем).
-    if not isinstance(st, dict) or st.get("status") == "unknown":
+    if not isinstance(eff, dict) or not eff.get("layer") or eff.get("layer") == "unknown":
         return {"status": "unknown",
-                "detail": "git config недоступен (timeout) — github-direct check пропущен"}
-    enabled = bool(st.get("enabled"))
-    # #309 (1.1): enabled=False склеивает absent и foreign — чужой прокси печатался как «выключен,
-    # идёт напрямую». Корень починен в #307/PR #328 (state: absent/managed-on/foreign) — читаем его.
-    # Старые моки/потребители без ключа state (старый контракт) трактуем по enabled как раньше.
-    state = st.get("state")
-    if state == "foreign":
-        return {"status": "warn",
-                "detail": f"git github-proxy указывает на ЧУЖОЙ прокси ({st.get('proxy') or '?'}) — "
-                          f"git ходит через посторонний посредник, НЕ srouter-стек. Если это не "
-                          f"осознанная настройка — снять: git config --global --unset {st.get('key') or 'http.https://github.com.proxy'}. "
-                          + GH_DIRECT_HINT}
-    if not enabled:
+                "detail": "git config недоступен (timeout/мусор) — github-direct check пропущен"}
+    layer = eff.get("layer")
+    proxy = eff.get("proxy") or ""
+    # Осознанный direct: ни один слой не задан ИЛИ пустой локальный override (direct В ЭТОМ репо).
+    if layer == "direct" or (layer == "local-urlmatch" and not proxy):
         return {"status": "ok",
                 "detail": "git github-proxy выключен — github идёт напрямую (VPS-независимо). "
                           "Если gh/git timeout через прокси: " + GH_DIRECT_HINT}
+    if layer == "local-urlmatch":
+        return {"status": "warn",
+                "detail": f"git→github идёт через ЛОКАЛЬНЫЙ override .git/config этого репо ({proxy}) — "
+                          f"глобальное управление обойдено; снять: git config --local --unset "
+                          f"http.https://github.com.proxy. " + GH_DIRECT_HINT}
+    if layer == "global-urlmatch" and eff.get("state") == "foreign":
+        return {"status": "warn",
+                "detail": f"git github-proxy указывает на ЧУЖОЙ прокси ({proxy or '?'}) — "
+                          f"git ходит через постороннего посредника, НЕ srouter-стек. Если это не "
+                          f"осознанная настройка — снять: git config --global --unset "
+                          f"http.https://github.com.proxy. "
+                          + GH_DIRECT_HINT}
+    if layer == "global-urlmatch":
+        return {"status": "warn",
+                "detail": f"git github-proxy ВКЛЮЧЁН ({proxy or 'xray SOCKS5 10808'}) → "
+                          f"git pull/push зависит от VPS. " + GH_DIRECT_HINT}
+    if layer == "global-generic":
+        return {"status": "warn",
+                "detail": f"git→github идёт через БЕСХОЗНЫЙ глобальный слой ({proxy}; {eff.get('detail')}) "
+                          f"— общий прокси для ВСЕХ хостов, вне управления srouter. Управление: "
+                          f"srouter git-proxy status / disable --full. " + GH_DIRECT_HINT}
+    # env — последний слой лестницы
     return {"status": "warn",
-            "detail": f"git github-proxy ВКЛЮЧЁН ({st.get('proxy') or 'xray SOCKS5 10808'}) → "
-                      f"git pull/push зависит от VPS. " + GH_DIRECT_HINT}
+            "detail": f"git→github идёт через ENV-прокси ({proxy}; {eff.get('detail')}) — снимается "
+                      f"env -u. " + GH_DIRECT_HINT}
