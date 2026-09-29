@@ -762,6 +762,28 @@ def test_routing_plan_remove_domain():
     assert "domain:anthropic.com" in new
 
 
+def test_routing_has_managed_marker_detects_adopt_config(tmp_path):
+    """Живой конфиг с managed-правилом = hybrid-adopt (#136/#313). Фейл-софт: отсутствующий/
+    битый конфиг → False; несколько managed-правил (ambiguous) → True (adopt тем более)."""
+    def _cfg(rules):
+        path = tmp_path / "config.json"
+        path.write_text(json.dumps({"routing": {"rules": rules}}), encoding="utf-8")
+        return str(path)
+
+    marker = {"_srouter_managed": True, "outboundTag": "reality-out",
+              "domain": ["domain:example.com"]}
+    assert local_state.routing_has_managed_marker(_cfg([marker])) is True
+    assert local_state.routing_has_managed_marker(
+        _cfg([marker, dict(marker)])) is True, "ambiguous — adopt тем более"
+    assert local_state.routing_has_managed_marker(
+        _cfg([{"outboundTag": "direct", "network": "tcp,udp"}])) is False
+    assert local_state.routing_has_managed_marker(
+        str(tmp_path / "absent.json")) is False
+    broken = tmp_path / "broken.json"
+    broken.write_text("{нет json", encoding="utf-8")
+    assert local_state.routing_has_managed_marker(str(broken)) is False
+
+
 def test_routing_apply_adopt_captures_existing_and_adds(tmp_path):
     """adopt foreign-config: захватывает существующие домены + добавляет telegram, ставит маркер,
     пишет state (active+hash), restart xray. adopt — первый раз."""

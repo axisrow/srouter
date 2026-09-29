@@ -13,6 +13,8 @@ import threading
 
 import gen_xray_config
 import local_state
+import local_state_routing
+import local_state_xray
 import os
 import sys_probe
 
@@ -529,6 +531,22 @@ def _select_node_locked(name, *, enabled_names, runner=None, state_path=None, co
     begun = False
     try:
         previous = _active_name(state_path)
+        # #136/#313 hybrid-adopt: живой конфиг hand-managed (whitelist _srouter_managed →
+        # reality-out). write_config регенерирует канонический конфиг С НУЛЯ — whitelist
+        # ПРОПАДАЕТ, при этом рестарт УСПЕШЕН и rollback (тоже write_config) не спасает.
+        # Отказ до любых мутаций (канон foreign_config_needs_adopt, local_state_routing);
+        # на adopt-машине узел переключают вручную — address/port в reality-out под
+        # local_state._routing_config_lock + рестарт xray.
+        # Известное fail-open окно (осознанный residual): state без routing-секции →
+        # _routing_outbound_tag = "active" → guard пропустит; детект adopt-режима иначе
+        # невозможен (для srouter такая машина неотличима от canonical), контракт
+        # fail-soft тот же у compare_endpoint_with_xray/sync_*.
+        if (local_state_xray._routing_outbound_tag(state_path) != "active"
+                or local_state_routing.routing_has_managed_marker(config_path)):
+            return {"ok": False, "active": previous, "step": "adopt-mode",
+                    "error": "hybrid-adopt config (#136/#313): select регенерирует конфиг "
+                             "и сносит managed whitelist; переключение узла — вручную "
+                             "(address/port в reality-out)"}
         allowed = {n for n in enabled_names if isinstance(n, str)} if enabled_names is not None else set()
         if name not in allowed:
             return {"ok": False, "active": previous, "step": "whitelist", "error": "node not enabled or unknown"}

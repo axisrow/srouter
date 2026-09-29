@@ -202,6 +202,9 @@ def api_node_select(name):
     if name not in enabled:
         return jsonify({"ok": False, "err": "node not enabled or unknown"}), 400
     result = node_selector.select_node(name, enabled_names=enabled, runner=sys_probe.run, state_path=None)
+    if not result.get("ok") and result.get("step") == "adopt-mode":
+        # ожидаемый отказ hand-managed машины (#136/#313), не серверная ошибка
+        return jsonify(result), 409
     return jsonify(result), (200 if result.get("ok") else 500)
 
 
