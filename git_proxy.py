@@ -349,18 +349,29 @@ def local_override(repo=".", timeout=4):
     """Локальный urlmatch-override KEY в .git/config репо repo. {present, values, multi, unknown}.
 
     `git -C <repo> config --local ...` — scope local, cwd-независимо (CLI в репо пользователя,
-    тесты в tmp-репо). rc=1 («ключа нет») И rc=128 («вне репо») — absent, unknown=False:
-    «слоя нет» — не сбой чтения. Остальные rc — unknown=True (fail-closed, как в _get_all).
+    тесты в tmp-репо). absent: rc=1 («ключа нет») и rc=128 с явным «inside/not a git repository»
+    в stderr («слоя нет» — не сбой чтения; сообщение форсируется в английский через LC_ALL=C —
+    git локализуем). Прочий rc (битый config, permission denied) — unknown=True (fail-closed,
+    как в _get_all; code-review #386: 128 без узнаваемого «вне репо» = нечитаемый конфиг).
 
     Пустое значение (values=[""]) — валидный ОСОЗНАННЫЙ direct в этом репо; present=True,
     эффективный прокси пуст (побеждает любой глобальный слой — приоритет git).
     """
+    # LC_ALL=C: сообщение об «вне репо» матчится по stderr, а git локализуем (verify 2026-09-30:
+    # русский git печатает «--local можно использовать только внутри git репозитория»).
     r = sys_probe.run([GIT, "-C", str(repo), "config", "--local", "--get-all", "-z", KEY],
-                      timeout=timeout)
+                      timeout=timeout, env=dict(os.environ, LC_ALL="C", LANG="C"))
     if r.get("timeout"):
         return {"present": False, "values": [], "multi": False, "unknown": True}
     rc = r.get("rc")
-    if rc in (1, 128):
+    # rc=128 — не только «вне репо»: git отдаёт 128 и на фатальных ошибках (битый config,
+    # permission denied). Fail-closed (code-review #386): absent только при явном
+    # «inside/not a git repository/not in a git dir» в stderr; прочий 128 — unknown.
+    if rc == 1:
+        return {"present": False, "values": [], "multi": False, "unknown": False}
+    err = r.get("err") or ""
+    if rc == 128 and ("inside a git repositor" in err or "not a git repositor" in err
+                      or "not in a git dir" in err):
         return {"present": False, "values": [], "multi": False, "unknown": False}
     if rc != 0:
         return {"present": False, "values": [], "multi": False, "unknown": True}
@@ -433,7 +444,8 @@ def effective_proxy(repo=".", env=None, timeout=4):
     if lo["unknown"]:
         return _unknown("local .git/config unreadable")
     if lo["present"]:
-        proxy = lo["values"][0] if lo["values"] else ""
+        # last-wins (code-review #386): git при multi-value одного ключа берёт ПОСЛЕДНЕЕ.
+        proxy = lo["values"][-1] if lo["values"] else ""
         return {"proxy": proxy, "layer": "local-urlmatch",
                 "detail": "локальный override .git/config этого репо"}
 
@@ -441,7 +453,9 @@ def effective_proxy(repo=".", env=None, timeout=4):
     if not isinstance(st, dict) or st.get("state") == "unknown":
         return _unknown("global gitconfig unreadable")
     if st.get("present"):
-        return {"proxy": st.get("proxy") or "", "layer": "global-urlmatch",
+        # last-wins: status()["proxy"] — первое значение (контракт PR #223), git берёт последнее.
+        proxy = (st.get("values") or [st.get("proxy") or ""])[-1]
+        return {"proxy": proxy, "layer": "global-urlmatch",
                 "state": st.get("state"),
                 "detail": f"urlmatch-ключ {KEY} (state={st.get('state')})"}
 
@@ -450,7 +464,8 @@ def effective_proxy(repo=".", env=None, timeout=4):
         if rec["unknown"]:
             return _unknown(f"global {name} unreadable")
         if rec["present"]:
-            return {"proxy": rec["values"][0] if rec["values"] else "", "layer": "global-generic",
+            # last-wins (code-review #386)
+            return {"proxy": rec["values"][-1] if rec["values"] else "", "layer": "global-generic",
                     "detail": f"бесхозный глобальный {name}"}
 
     src = os.environ if env is None else env

@@ -345,6 +345,7 @@ def test_effective_global_urlmatch_beats_generic(no_proxy_env, real_git_home):
     _raw_set_add("http.proxy", "http://127.0.0.1:8118", real_git_home)
     assert git_proxy.enable(force=True)["ok"] is True
     nonrepo = real_git_home / "not-a-repo"
+    nonrepo.mkdir()  # существующий каталог вне репо (несуществующий дал бы честный unknown)
     eff = git_proxy.effective_proxy(repo=nonrepo)  # вне репо — локальный слой отсутствует
     assert eff["layer"] == "global-urlmatch"
     assert eff["proxy"] == EXPECTED_GIT_PROXY
@@ -427,4 +428,39 @@ def test_local_override_outside_repo_is_absent_not_unknown(tmp_path):
     """Вне репо `git config --local` даёт rc=128 — это «слоя нет», а не сбой чтения."""
     assert git_proxy.local_override(repo=tmp_path)["present"] is False
     assert git_proxy.local_override(repo=tmp_path)["unknown"] is False
+
+
+def test_effective_multi_value_last_wins_local(no_proxy_env, real_git_home, tmp_repo):
+    """Code-review #386: git при multi-value одного ключа берёт ПОСЛЕДНЕЕ значение (last-wins),
+    не первое. ["", "socks://x:1"] → эффективно socks, а не ложный direct."""
+    subprocess.run(["git", "-C", str(tmp_repo), "config", "--local", "--add", git_proxy.KEY, ""],
+                   check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(tmp_repo), "config", "--local", "--add", git_proxy.KEY,
+                    "socks5h://x.example:1080"], check=True, capture_output=True)
+    eff = git_proxy.effective_proxy(repo=tmp_repo)
+    assert eff["layer"] == "local-urlmatch"
+    assert eff["proxy"] == "socks5h://x.example:1080"
+
+
+def test_effective_multi_value_last_wins_generic(no_proxy_env, real_git_home):
+    """Last-wins и для бесхозного generic-ключа: последний URL побеждает."""
+    _raw_set_add("http.proxy", "http://a.example:1", real_git_home)
+    _raw_set_add("http.proxy", "http://b.example:2", real_git_home)
+    eff = git_proxy.effective_proxy()
+    assert eff["proxy"] == "http://b.example:2"
+
+
+def test_local_override_rc128_fatal_is_unknown(no_proxy_env, real_git_home, monkeypatch, tmp_path):
+    """Code-review #386: rc=128 — не только «вне репо», но и фатальные ошибки (битый config,
+    permission denied). Только stderr «not a git repositor*/not in a git dir» = absent; прочий
+    rc=128 — unknown (fail-closed: нечитаемый конфиг не превращается в «direct»)."""
+    real = git_proxy.sys_probe.run
+
+    def _fatal(cmd, **kwargs):
+        return {"rc": 128, "out": "", "err": "fatal: bad config line 1 in .git/config",
+                "timeout": False}
+
+    monkeypatch.setattr(git_proxy.sys_probe, "run", _fatal)
+    lo = git_proxy.local_override(repo=tmp_path)
+    assert lo["unknown"] is True and lo["present"] is False
 
