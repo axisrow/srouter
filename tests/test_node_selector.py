@@ -188,6 +188,56 @@ def test_select_node_begin_rejection_preserves_previous_and_skips_apply(tmp_path
     assert runner_calls == []
 
 
+def test_select_node_refuses_adopt_mode_before_any_mutation(tmp_path):
+    """#136/#313 hybrid-adopt: write_config регенерирует канонический конфиг с нуля —
+    managed whitelist ПРОПАДАЕТ, рестарт при этом УСПЕШЕН и rollback (тоже write_config)
+    не спасает. Отказ до любых мутаций (канон foreign_config_needs_adopt); на adopt-машине
+    узел переключают вручную — address/port в reality-out под _routing_config_lock."""
+    import node_selector
+
+    state_path = tmp_path / "srouter.local.json"
+    state = _state()
+    state["routing"] = {"outbound": "reality-out"}
+    _write_state(state_path, state)
+    before = state_path.read_bytes()
+    runner_calls = []
+
+    out = node_selector.select_node(
+        "hk-1",
+        enabled_names={"sg-1", "hk-1"},
+        runner=lambda cmd, timeout: runner_calls.append((cmd, timeout)),
+        state_path=state_path,
+        config_path=tmp_path / "config.json",
+    )
+
+    assert out["ok"] is False
+    assert out["step"] == "adopt-mode"
+    assert out["active"] == "sg-1"
+    assert _active_state(state_path) == {"name": "sg-1", "pending": None}
+    assert state_path.read_bytes() == before
+    assert runner_calls == []
+    assert not (tmp_path / "config.json").exists()
+
+
+def test_select_node_canonical_mode_not_blocked_by_adopt_guard(tmp_path):
+    """Canonical state (routing-секции нет → тег "active") — adopt-guard молчит,
+    селект доходит до привычного пути (здесь: до begin-rejection)."""
+    import node_selector
+
+    state_path = tmp_path / "srouter.local.json"
+    _write_state(state_path, _state(hk_enabled=False))
+
+    out = node_selector.select_node(
+        "hk-1",
+        enabled_names={"hk-1"},
+        runner=lambda cmd, timeout: None,
+        state_path=state_path,
+        config_path=tmp_path / "config.json",
+    )
+
+    assert out["step"] == "begin", "canonical-режим не должен отказывать по adopt"
+
+
 def test_select_node_blocks_invalid_traffic_guard_before_pending_write(tmp_path):
     import node_selector
 
@@ -453,6 +503,25 @@ def test_api_node_select_apply_failure_returns_500(monkeypatch):
 
     assert response.status_code == 500
     assert response.get_json() == {"ok": False, "active": "sg-1", "step": "restart"}
+
+
+def test_api_node_select_adopt_mode_returns_409(monkeypatch):
+    """Отказ в adopt-режиме — ожидаемый исход (машина сконфигурирована вручную), не серверная
+    ошибка: 409, чтобы UI/логи не читали защиту как поломку."""
+    dashboard = _fresh_dashboard(monkeypatch)
+    monkeypatch.setattr(dashboard.local_state, "enabled_nodes", lambda path=None: [{"name": "de-1"}])
+    monkeypatch.setattr(
+        dashboard.node_selector,
+        "select_node",
+        lambda name, *, enabled_names, runner, state_path: {
+            "ok": False, "active": "sg-1", "step": "adopt-mode", "error": "hybrid-adopt",
+        },
+    )
+
+    response = dashboard.app.test_client().post("/api/node/select/de-1")
+
+    assert response.status_code == 409
+    assert response.get_json()["step"] == "adopt-mode"
 
 
 # ============================ split-route auto-sync (issue #21) ============================
