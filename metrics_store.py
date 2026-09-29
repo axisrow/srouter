@@ -112,10 +112,12 @@ def _safe_ms(value):
     return ms if ms >= 0 else 0
 
 
-def build_event(timing, now=None):
+def build_event(timing, now=None, net=None):
     """Нормализовать timing-словарь пробы (health_probes) в событие JSONL.
 
     timing может быть None/битым — тогда событие-минимум (ts + status). Не бросает.
+    net — метка сети замера (#384): строка от резолвера или None («строка или null»,
+    поле присутствует всегда; старые строки журнала без ключа читаются как раньше).
     """
     ts = _now(now)
     raw = timing if isinstance(timing, dict) else {}
@@ -138,6 +140,7 @@ def build_event(timing, now=None):
         # Многострочный stderr curl → одна строка (join), bounded (канон hot_routes: лог
         # bounded, иначе деградация сама раздувает файл метрик).
         err = " | ".join(line.strip() for line in err.splitlines() if line.strip())[:200]
+    net = net.strip() if isinstance(net, str) and net.strip() else None
     return {
         "timestamp": datetime.fromtimestamp(ts).astimezone().isoformat(),
         "ts": ts,
@@ -150,6 +153,7 @@ def build_event(timing, now=None):
         "total_ms": _safe_ms(raw.get("total_ms")),
         "rc": rc,
         "err": err,
+        "net": net,
     }
 
 

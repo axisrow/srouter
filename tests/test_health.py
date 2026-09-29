@@ -5589,6 +5589,10 @@ def _metrics_env(monkeypatch, tmp_path, probes=None):
     monkeypatch.setattr(health, "WATCHDOG_METRICS_STATE", tmp_path / "metrics.last.json")
     monkeypatch.setattr(health.metrics_store, "METRICS_LOG", tmp_path / "metrics.jsonl")
     _mock_state(monkeypatch, probes if probes is not None else {})
+    # Резолвер сети (#384) мокается по умолчанию: живой гоняет 3 subprocess
+    # (ipconfig/route/arp) — медленно и machine-dependent (канон: немоканная
+    # проба = чинить изоляцию). Net-тесты перекрывают мок своим setattr.
+    monkeypatch.setattr(health.diag_netprobe, "current_net", lambda: "TestNet")
     # legacy-блок lifecycle не нужен: _record_watchdog_lifecycle закрыт autouse-фикстурой
     _ = local_state
 
@@ -5659,6 +5663,62 @@ def test_record_watchdog_metrics_never_raises(monkeypatch, tmp_path):
     monkeypatch.setattr(health.metrics_store, "append_timing_event",
                         lambda event, log_path=None: (_ for _ in ()).throw(OSError("disk full")))
     health._record_watchdog_metrics(_tunnel_result(timing={"status": "ok"}))  # не бросает
+
+
+# ============================ net — метка сети в замерах (#384) ============================
+
+def test_record_watchdog_metrics_stamps_net_on_events(monkeypatch, tmp_path):
+    _metrics_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(health.diag_netprobe, "current_net", lambda: "888-5G")
+    health._record_watchdog_metrics(_tunnel_result(
+        timing={"target": "api.anthropic.com", "code": "200", "status": "ok",
+                "total_ms": 150}))
+    events = metrics_store.read_timing_events(log_path=tmp_path / "metrics.jsonl")
+    assert len(events) == 1
+    assert events[0]["net"] == "888-5G"
+
+
+def test_record_watchdog_metrics_net_null_when_resolver_none(monkeypatch, tmp_path):
+    _metrics_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(health.diag_netprobe, "current_net", lambda: None)
+    health._record_watchdog_metrics(_tunnel_result(timing={"status": "ok", "total_ms": 5}))
+    events = metrics_store.read_timing_events(log_path=tmp_path / "metrics.jsonl")
+    assert events[0]["net"] is None, "резолвер не определил — поле null, замер не теряется"
+
+
+def test_record_watchdog_metrics_resolver_not_called_when_throttled(monkeypatch, tmp_path):
+    """Троттлинг-гейт раньше резолвера: сеть не опрашиваем вне записывающего тика
+    (3 subprocess на вызов). Первый тик (last_write=0) всегда пишущий — готовим
+    уже-писавший state, чтобы попасть в троттлинг сразу."""
+    _metrics_env(monkeypatch, tmp_path, probes={"metrics_interval_sec": 3600})
+    health._write_watchdog_state(
+        health.WATCHDOG_METRICS_STATE, {"last_write": _time315.time()})
+    calls = []
+
+    def spy():
+        calls.append(1)
+        return None
+
+    monkeypatch.setattr(health.diag_netprobe, "current_net", spy)
+    health._record_watchdog_metrics(_tunnel_result(timing={"status": "ok"}))
+    assert calls == [], "на троттлинговом тике резолвер сети не зовётся"
+
+
+def test_watchdog_status_event_carries_net(monkeypatch, tmp_path):
+    monkeypatch.setattr(health, "WATCHDOG_STATUS_LOG", tmp_path / "status.jsonl")
+    monkeypatch.setattr(health.diag_netprobe, "current_net", lambda: "888-5G")
+    health._append_watchdog_status_event({"status": "ok", "failed": []},
+                                         {"status": "down", "failed": ["tunnel"]})
+    event = json.loads((tmp_path / "status.jsonl").read_text(encoding="utf-8").splitlines()[0])
+    assert event["net"] == "888-5G"
+
+
+def test_watchdog_status_event_omits_net_when_unknown(monkeypatch, tmp_path):
+    monkeypatch.setattr(health, "WATCHDOG_STATUS_LOG", tmp_path / "status.jsonl")
+    monkeypatch.setattr(health.diag_netprobe, "current_net", lambda: None)
+    health._append_watchdog_status_event({"status": "ok"}, {"status": "down"})
+    event = json.loads((tmp_path / "status.jsonl").read_text(encoding="utf-8"))
+    assert "net" not in event, "сеть не определилась — ключа нет (схема не пухнет)"
 
 
 def test_cmd_watchdog_records_metrics(monkeypatch, tmp_path):
