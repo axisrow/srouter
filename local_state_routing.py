@@ -11,7 +11,6 @@ restart → promote. Эталон read-xray: local_state_xray._read_xray_vless_a
 local_state.save_state; restart: install_lib._restart_component.
 """
 import json
-import json
 from pathlib import Path
 
 import local_state
