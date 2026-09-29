@@ -1004,6 +1004,8 @@ def api_metrics_tunnel():
 # показывает моргание (решение по кампании 2026-09: пуш исчезает, календарь остаётся).
 _INCIDENTS_LOG = Path.home() / "Library" / "Logs" / "srouter-watchdog.status.jsonl"
 _INCIDENTS_DAYS_MIN, _INCIDENTS_DAYS_MAX, _INCIDENTS_DAYS_DEFAULT = 1, 90, 30
+# Размер бакета в минутах (переключатель календаря «по часам / по 10 минут»).
+_INCIDENTS_BUCKETS = (60, 10)
 # События редкие (десятки/день даже при флапе) — 100k строк с запасом перекрывают 90 дней.
 _INCIDENTS_MAX_LINES = 100_000
 
@@ -1022,13 +1024,14 @@ def _read_status_events(max_lines=None, log_path=None):
         return []
 
 
-def _incident_counts(lines, days, now=None):
-    """Бакеты (локальная дата ISO, час) → {count, down} за последние days дней.
+def _incident_counts(lines, days, now=None, bucket_minutes=60):
+    """Бакеты (локальная дата ISO, слот) → {count, down} за последние days дней.
 
-    Инцидент = previous.status == "ok" и current.status in (degraded, down); переходы
-    внутри эпизода (down→degraded) и закрытие (→ok) не считаются. Битый JSON, legacy
-    строки (previous/current не dict), отсутствующий/битый timestamp, события вне окна —
-    пропуск. Чистая функция, не бросает.
+    Слот = (час*60 + минута) // bucket_minutes: 60 → почасовые бакеты (0..23),
+    10 → 10-минутные (0..143). Инцидент = previous.status == "ok" и
+    current.status in (degraded, down); переходы внутри эпизода (down→degraded) и
+    закрытие (→ok) не считаются. Битый JSON, legacy строки (previous/current не dict),
+    отсутствующий/битый timestamp, события вне окна — пропуск. Чистая функция, не бросает.
     """
     now = now or datetime.now()
     if now.tzinfo is not None:
@@ -1054,7 +1057,8 @@ def _incident_counts(lines, days, now=None):
             continue
         if dt < start:
             continue
-        key = (dt.date().isoformat(), dt.hour)
+        slot = (dt.hour * 60 + dt.minute) // bucket_minutes
+        key = (dt.date().isoformat(), slot)
         bucket = buckets.setdefault(key, {"count": 0, "down": 0})
         bucket["count"] += 1
         if cur.get("status") == "down":
@@ -1062,31 +1066,34 @@ def _incident_counts(lines, days, now=None):
     return buckets
 
 
-def _incidents_payload(days, now=None):
-    """Сетка days×24: {date, hours:[{count,down}|null×24]} — null = час ещё не наступил.
-    Дни в порядке «старые → новые» (лента слева направо, как у status-страниц)."""
+def _incidents_payload(days, now=None, bucket_minutes=60):
+    """Сетка days×(1440//bucket_minutes): {date, slots:[{count,down}|null×N]} — null =
+    бакет ещё не наступил. Дни в порядке «старые → новые» (лента слева направо,
+    как у status-страниц)."""
     now = now or datetime.now()
     lines = _read_status_events()
-    buckets = _incident_counts(lines, days, now)
+    buckets = _incident_counts(lines, days, now, bucket_minutes)
+    slots_per_day = 1440 // bucket_minutes
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     out = []
     for i in range(days):
         day = today_start - timedelta(days=days - 1 - i)
-        hours = []
-        for h in range(24):
-            if day + timedelta(hours=h) > now:
-                hours.append(None)
+        slots = []
+        for s in range(slots_per_day):
+            if day + timedelta(minutes=s * bucket_minutes) > now:
+                slots.append(None)
                 continue
-            b = buckets.get((day.date().isoformat(), h))
-            hours.append({"count": b["count"], "down": b["down"]} if b
+            b = buckets.get((day.date().isoformat(), s))
+            slots.append({"count": b["count"], "down": b["down"]} if b
                          else {"count": 0, "down": 0})
-        out.append({"date": day.date().isoformat(), "hours": hours})
-    return {"status": "ok", "days": out}
+        out.append({"date": day.date().isoformat(), "slots": slots})
+    return {"status": "ok", "bucket_minutes": bucket_minutes, "days": out}
 
 
 @app.get("/api/incidents")
 def api_incidents():
-    """Почасовой календарь инцидентов watchdog за ?days= (1..90, default 30).
+    """Календарь инцидентов watchdog за ?days= (1..90, default 30) с бакетом
+    ?bucket= (вайтлист {60, 10} минут, default 60).
 
     Observe-only, GET (без _MUTATION_LOCK). Fail-soft: сбой чтения → 200 status=warn
     (probe-канон), не 500.
@@ -1101,8 +1108,18 @@ def api_incidents():
         if not _INCIDENTS_DAYS_MIN <= days <= _INCIDENTS_DAYS_MAX:
             return jsonify({"status": "warn",
                             "error": f"days must be {_INCIDENTS_DAYS_MIN}..{_INCIDENTS_DAYS_MAX}"}), 400
+    raw_bucket = (request.args.get("bucket") or "").strip()
+    bucket = _INCIDENTS_BUCKETS[0]
+    if raw_bucket:
+        try:
+            bucket = int(raw_bucket)
+        except ValueError:
+            return jsonify({"status": "warn", "error": "bucket must be an integer"}), 400
+        if bucket not in _INCIDENTS_BUCKETS:
+            return jsonify({"status": "warn",
+                            "error": f"bucket must be one of {_INCIDENTS_BUCKETS}"}), 400
     try:
-        payload = _incidents_payload(days)
+        payload = _incidents_payload(days, bucket_minutes=bucket)
     except (OSError, ValueError, TypeError, KeyError) as exc:
         return jsonify({"status": "warn", "error": str(exc) or exc.__class__.__name__})
     return jsonify(payload)
