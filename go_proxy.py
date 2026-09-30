@@ -25,7 +25,6 @@ import contextlib
 import fcntl
 import os
 import shutil
-import stat
 from pathlib import Path
 
 import sys_probe
@@ -201,7 +200,9 @@ def disable(full=False, force=False):
                     errors.append(f"чужой GOPROXY={cur['value']!r} — нужен --force (#307)")
                 else:
                     r = _run_go(["env", "-u", "GOPROXY"])
-                    if r.get("timeout") or r.get("rc") == 0 and goproxy_layer()["state"] == "foreign":
+                    if r.get("timeout") or r.get("rc") != 0:
+                        errors.append(f"go env -u failed: {r.get('err')}")
+                    elif goproxy_layer()["state"] == "foreign":
                         errors.append("read-back verify failed: чужой GOPROXY не снят")
                     else:
                         removed.append(f"GOPROXY={cur['value']} (go env -u --force)")

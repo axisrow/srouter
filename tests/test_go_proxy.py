@@ -179,6 +179,27 @@ def test_disable_full_idempotent(go_home):
     assert go_proxy.disable(full=True)["ok"] is True
 
 
+@requires_go
+def test_disable_full_foreign_reports_unset_failure(go_home, monkeypatch):
+    """Fault-injection: go env -u вернул rc!=0 — disable НЕ должен рапортовать успех
+    (code-review #390: `timeout or rc == 0 and ...` проглатывал rc!=0 как успех)."""
+    import subprocess
+    subprocess.run([go_proxy.GO, "env", "-w", "GOPROXY=http://corp.example:8080"], check=True)
+    real_run = go_proxy._run_go
+
+    def failing_unset(args, timeout=10):
+        if "env" in args and "-u" in args:
+            return {"timeout": False, "rc": 1, "out": "", "err": "boom: unset failed"}
+        return real_run(args, timeout=timeout)
+
+    monkeypatch.setattr(go_proxy, "_run_go", failing_unset)
+    res = go_proxy.disable(full=True, force=True)
+    assert res["ok"] is False, res
+    assert "go env -u failed" in res["error"], res["error"]
+    assert all("GOPROXY" not in item for item in res["removed"]), res["removed"]
+    assert _goproxy() == "http://corp.example:8080", "чужое значение не тронуто"
+
+
 # ============================ status ============================
 
 @requires_go
