@@ -55,6 +55,7 @@ from sys_probe import run
 
 import claude_proxy  # вкл/откл HTTPS_PROXY для Claude Code (~/.claude/settings.json)
 import git_proxy  # issue #130: вкл/откл SOCKS5 github-proxy в ~/.gitconfig (xray 10808)
+import go_proxy  # 2026-09-30: тумблер Go-модулей в обход GFW (goproxy.cn-зеркало / wrapper-туннель)
 import vscode_proxy  # issue #185: scoped SOCKS5 для codex-расширения через VSCode http.proxy
 import health  # doctor-проверки стека
 import privoxy_audit  # пассивный root-owned аудит lifecycle-команд Privoxy (#122)
@@ -755,6 +756,62 @@ def cmd_git_proxy(args) -> int:
     return 2
 
 
+def cmd_go_proxy(args) -> int:
+    """status|enable|disable go-прокси для модулей (go_proxy).
+
+    proxy.golang.org — GFW-чёрная дыра напрямую (эмпирика 2026-09-30), а транспортного
+    конфига у Go нет (`go env -w HTTPS_PROXY` отвергается) — отсюда два режима:
+    mirror (GOPROXY=goproxy.cn, VPS-независимо) и tunnel (wrapper ~/bin/go + socks5 xray).
+    Чужой GOPROXY/чужой ~/bin/go — только с --force (#307-канон).
+    """
+    action = getattr(args, "goproxy_action", "status")
+
+    if action == "status":
+        st = go_proxy.status()
+        g, w = st["goproxy"], st["wrapper"]
+        print("go-proxy: слои прокси для Go-модулей (go build / go mod download)")
+        print(f"  1. wrapper {go_proxy.WRAPPER_PATH}: "
+              + (f"managed → {w['target']}" if w["managed"]
+                 else ("присутствует БЕЗ маркера (чужой)" if w["present"] else "нет")))
+        print(f"  2. GOPROXY (go env): {g.get('value') or '—'} (state={g.get('state')})")
+        print(f"  3. env процесса (HTTPS_PROXY/HTTP_PROXY): {st.get('env_proxy') or 'нет'}")
+        verdicts = {
+            "tunnel": f"Go-модули идут через туннель ({go_proxy.TUNNEL_PROXY}, wrapper ~/bin/go).",
+            "mirror": f"Go-модули идут через зеркало {go_proxy.MIRROR_GOPROXY} (VPS-независимо).",
+            "foreign": f"GOPROXY задан вручную ({g.get('value')}) — srouter этим не управляет.",
+            "direct": "Go-модули идут НАПРЯМУЮ на proxy.golang.org — GFW-чёрная дыра "
+                      "(эмпирика 2026-09-30): go build будет падать по таймауту.",
+        }
+        print(f"Вердикт: {verdicts.get(st['verdict'], st['verdict'])}")
+        print("Управление: srouter go-proxy enable [--mode=mirror|tunnel] [--force] / "
+              "disable [--full] [--force]")
+        return 0
+
+    if action == "enable":
+        r = go_proxy.enable(mode=getattr(args, "mode", "mirror"), force=args.force)
+        if not r.get("ok"):
+            print(f"go-proxy: не включён — {r.get('error')}")
+            return 1
+        if r["mode"] == "mirror":
+            print(f"go-proxy: включён mirror — GOPROXY={r['goproxy']} "
+                  f"(go env -w, VPS-независимо).")
+        else:
+            print(f"go-proxy: включён tunnel — wrapper {r['wrapper']} → {r['target']} "
+                  f"через {go_proxy.TUNNEL_PROXY}.")
+        return 0
+
+    if action == "disable":
+        r = go_proxy.disable(full=args.full, force=args.force)
+        if not r.get("ok"):
+            print(f"go-proxy: не выключен — {r.get('error')}")
+            return 1
+        for item in r.get("removed", []):
+            print(f"  снято: {item}")
+        print("go-proxy: выключен" + (" (полностью)" if args.full else "") + ".")
+        return 0
+    return 2
+
+
 def cmd_sync(args) -> int:
     """Синхронизировать endpoint активного узла из РАБОЧЕГО xray config в srouter.local.json (#200).
 
@@ -1186,6 +1243,32 @@ def build_parser() -> argparse.ArgumentParser:
             sp.add_argument("--force", action="store_true",
                             help="Снять и ЧУЖИЕ значения бесхозных ключей (снятое печатается).")
         sp.set_defaults(func=cmd_git_proxy)
+
+    # go-proxy (2026-09-30): тумблер Go-модулей в обход GFW. proxy.golang.org — чёрная дыра
+    # напрямую; транспортного конфига у Go нет → режимы mirror (GOPROXY=goproxy.cn) и
+    # tunnel (wrapper ~/bin/go + socks5). Чужой GOPROXY/чужой wrapper — только --force (#307).
+    p_goproxy = sub.add_parser(
+        "go-proxy",
+        help="Тумблер Go-модулей: status/enable/disable (--mode=mirror|tunnel, --full).")
+    p_gpx_sub = p_goproxy.add_subparsers(dest="goproxy_action", required=True)
+    for sub_name, sub_help in (
+        ("status", "Слои (wrapper/GOPROXY/env) + вердикт: куда реально идут go-модули."),
+        ("enable", "Включить режим: --mode=mirror (дефолт, goproxy.cn) | tunnel (wrapper ~/bin/go)."),
+        ("disable", "Выключить: снять wrapper; --full — плюс managed GOPROXY (go env -u)."),
+    ):
+        sp = p_gpx_sub.add_parser(sub_name, help=sub_help)
+        if sub_name == "enable":
+            sp.add_argument("--mode", choices=("mirror", "tunnel"), default="mirror",
+                            help="mirror = GOPROXY=goproxy.cn (VPS-независимо, дефолт); "
+                                 "tunnel = wrapper ~/bin/go через socks5 xray 10808.")
+            sp.add_argument("--force", action="store_true",
+                            help="Перезаписать ЧУЖОЙ GOPROXY / чужой ~/bin/go (#307).")
+        if sub_name == "disable":
+            sp.add_argument("--full", action="store_true",
+                            help="Также снять managed GOPROXY (go env -u GOPROXY).")
+            sp.add_argument("--force", action="store_true",
+                            help="Снять и ЧУЖИЕ значения (снятое печатается).")
+        sp.set_defaults(func=cmd_go_proxy)
 
     # netprobe (кампания деградации туннеля 2026-09): LaunchAgent ping'ует участки сети
     # (gateway/domestica/VPS мимо туннеля) раз в 60с; report — корреляция блэкаутов туннеля

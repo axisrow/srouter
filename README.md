@@ -507,6 +507,25 @@ srouter git-proxy disable --full    # + снять бесхозные ГЛОБА
 отвечал на SYN), при этом путь через туннель давал 200 за ~0.7 c, а `api.github.com` оставался
 прямодоступным. Прямой путь — вероятностный fallback, не гарантия; в GFW-окнах живёт туннель.
 
+## Тумблер `srouter go-proxy` (2026-09-30)
+
+`proxy.golang.org` — та же GFW-чёрная дыра, что и github.com в плохие окна (эмпирика
+2026-09-30: напрямую TCP-timeout, через туннель 200 за 1.2 с). Транспортного конфига у Go нет
+(`go env -w HTTPS_PROXY` отвергается), поэтому два режима:
+
+```bash
+srouter go-proxy status                    # слои: wrapper ~/bin/go | GOPROXY | env + вердикт
+srouter go-proxy enable                    # mirror (дефолт): GOPROXY=https://goproxy.cn,direct
+                                           #   — зеркало в Китае, GFW не трогает, VPS-независимо
+srouter go-proxy enable --mode=tunnel      # wrapper ~/bin/go (marker-managed, как codex-wrappers):
+                                           #   HTTPS_PROXY=socks5://127.0.0.1:10808 → proxy.golang.org
+srouter go-proxy disable [--full]          # снять wrapper; --full — и managed GOPROXY (go env -u)
+```
+
+Mirror — дефолт по канону #199: Go-сборки живут при мёртвом туннеле. Чужой `GOPROXY`/чужой
+`~/bin/go` без маркера не перезаписываются без `--force` (#307-канон). Реальная проба 2026-09-30:
+`go mod download` свежего модуля после `enable` проходит, включая чистый env без прокси.
+
 ## PF-изоляция доменов (опционально)
 
 **Цель:** пакеты к Proxy-доменам (`api.anthropic.com`, `console.anthropic.com`, `claude.ai`) физически
@@ -1009,6 +1028,26 @@ GFW windows, direct `github.com` was a TCP black hole from a cellular hotspot an
 (20.205.243.166 dropped SYN), while the tunnel path returned 200 in ~0.7 s and `api.github.com`
 stayed directly reachable. Treat the direct path as a probabilistic fallback, not a guarantee;
 during GFW windows the tunnel is what works.
+
+## The `srouter go-proxy` toggle (2026-09-30)
+
+`proxy.golang.org` is the same kind of GFW black hole github.com is in bad windows (2026-09-30:
+direct TCP timeout, 200 in 1.2 s through the tunnel). Go has no transport-proxy config
+(`go env -w HTTPS_PROXY` is rejected), hence two modes:
+
+```bash
+srouter go-proxy status                    # layers: ~/bin/go wrapper | GOPROXY | env + verdict
+srouter go-proxy enable                    # mirror (default): GOPROXY=https://goproxy.cn,direct
+                                           #   — China mirror, GFW-immune, VPS-independent
+srouter go-proxy enable --mode=tunnel      # ~/bin/go wrapper (marker-managed, like codex wrappers):
+                                           #   HTTPS_PROXY=socks5://127.0.0.1:10808 → proxy.golang.org
+srouter go-proxy disable [--full]          # remove the wrapper; --full also resets managed GOPROXY
+```
+
+Mirror is the default per the #199 canon: Go builds survive a dead tunnel. A foreign `GOPROXY`
+or a marker-less `~/bin/go` is never overwritten without `--force` (#307 canon). Live check
+2026-09-30: `go mod download` of a fresh module passes after `enable`, including with a
+proxy-free environment.
 
 ## PF domain isolation (optional)
 
