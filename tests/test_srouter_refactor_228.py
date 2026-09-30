@@ -56,6 +56,7 @@ COMMAND_FUNCS = [
     "cmd_sync",
     "cmd_privoxy",
     "cmd_routing",
+    "cmd_go_proxy",
 ]
 
 
@@ -115,7 +116,7 @@ class TestParserSurface:
         assert top == {
             "install", "uninstall", "start", "stop", "restart",
             "status", "doctor", "sync", "system-proxy", "routing", "privoxy",
-            "netprobe", "git-proxy",
+            "netprobe", "git-proxy", "go-proxy",
         }
 
     def test_nested_subcommand_paths_preserved(self, surface):
@@ -131,6 +132,9 @@ class TestParserSurface:
             ("git-proxy", "status"),
             ("git-proxy", "enable"),
             ("git-proxy", "disable"),
+            ("go-proxy", "status"),
+            ("go-proxy", "enable"),
+            ("go-proxy", "disable"),
             ("privoxy", "status"),
             ("privoxy", "protect"),
             ("privoxy", "start"),
@@ -223,6 +227,9 @@ class TestDispatchContract:
             (["routing", "list"], "cmd_routing"),
             (["privoxy", "status"], "cmd_privoxy"),
             (["privoxy", "audit", "status"], "cmd_privoxy"),
+            (["go-proxy", "status"], "cmd_go_proxy"),
+            (["go-proxy", "enable"], "cmd_go_proxy"),
+            (["go-proxy", "disable"], "cmd_go_proxy"),
         ],
     )
     def test_func_default_points_at_command(self, parser, argv, expected):
