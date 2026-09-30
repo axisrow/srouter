@@ -500,21 +500,25 @@ def test_render_incidents_panel_10m_grid():
     data = {"status": "ok", "bucket_minutes": 10,
             "days": [{"date": "2026-09-28", "slots": slots}]}
     body = (
-        "var INCIDENTS_BUCKET = 10;"   # syncIncidentsButtons читает режим (страница держит его глобально)
+        "var INCIDENTS_BUCKET = 10;"   # syncIncidentsButtons/incClass читают режим
+        "var INCIDENTS_NET = 'all';"   # syncIncidentsNet читает фильтр
         "I18N.en.incidents_tooltip = 'incidents: {0} · {1}';"   # в _STUBS этого ключа нет
         "var INCIDENTS_DATA = " + json.dumps(data) + ";"
-        "var _html = '';"
-        "document = { getElementById: function () {"
-        "  return { set innerHTML(v) { _html = v; }, get innerHTML() { return _html; } };"
+        "var _html = {}, els = {};"
+        "document = { getElementById: function (id) {"
+        "  return els[id] || (els[id] = { set innerHTML(v) { _html[id] = v; },"
+        "                                get innerHTML() { return _html[id] || ''; } });"
         "} };"
         "renderIncidentsPanel();"
+        "var panel = _html['incidents-panel'] || '';"
         "console.log(JSON.stringify({"
-        "  segs: (_html.match(/inc-seg/g) || []).length,"
-        "  heads: (_html.match(/inc-hour\">[0-9]/g) || []).length,"
-        "  hasRange: _html.indexOf('14:30–14:40') !== -1"
+        "  segs: (panel.match(/inc-seg/g) || []).length,"
+        "  heads: (panel.match(/inc-hour\">[0-9]/g) || []).length,"
+        "  hasRange: panel.indexOf('14:30–14:40') !== -1"
         "}));"
     )
-    res = _run_node(_harness(["renderIncidentsPanel", "incClass", "pad2", "syncIncidentsButtons"], body))
+    res = _run_node(_harness(["renderIncidentsPanel", "incClass", "pad2",
+                              "syncIncidentsButtons", "syncIncidentsNet"], body))
     assert res["segs"] == 144, "144 ячейки в дне"
     assert res["heads"] == 24, "подписи часов — каждый 6-й слот"
     assert res["hasRange"], "tooltip несёт 10-минутный диапазон слота"
@@ -524,6 +528,7 @@ def test_incidents_bucket_toggle_refetches_with_bucket_param():
     """Переключение на 10 минут: повторный fetch с bucket=10, кнопка подсвечена."""
     body = (
         "var calls = [], classes = {};"
+        "var INCIDENTS_NET = 'all';"   # loadIncidentsPanel строит netQ от этого состояния
         "fetchJson = function (url) { calls.push(url); return Promise.resolve({ status: 'ok', days: [] }); };"
         "renderIncidentsPanel = function () {};"
         "document = { getElementById: function (id) {"
@@ -540,3 +545,71 @@ def test_incidents_bucket_toggle_refetches_with_bucket_param():
     assert "btn-primary" not in (res["active60"] or ""), "кнопка часов не подсвечена"
     assert "inc-bucket" in (res["active10"] or ""), \
         "hook-класс .inc-bucket сохранён (className-rewrite его убивал — делегированный клик умирал)"
+
+
+# --- календарь инцидентов: фильтр сети и bad_min-раскраска -------------------
+
+def test_incidents_net_filter_refetches_with_net_param():
+    """Выбор сети: повторный fetch с &net=, выбор сохраняется в localStorage."""
+    body = (
+        "var calls = [], stored = {};"
+        "var INCIDENTS_BUCKET = 60;"   # loadIncidentsPanel строит URL от активного бакета
+        "var localStorage = { setItem: function (k, v) { stored[k] = v; },"
+        "                     getItem: function (k) { return stored[k] || null; } };"
+        "fetchJson = function (url) { calls.push(url);"
+        "  return Promise.resolve({ status: 'ok', days: [], nets: ['103'] }); };"
+        "renderIncidentsPanel = function () {};"
+        "setIncidentsNet('103');"
+        "console.log(JSON.stringify({ calls: calls, stored: stored }));"
+    )
+    res = _run_node(_harness(["setIncidentsNet", "loadIncidentsPanel"], body))
+    assert any("net=103" in u for u in res["calls"]), "fetch уходит с &net=103"
+    assert res["stored"].get("incidents_net") == "103", "выбор сети персистится"
+
+
+def test_incidents_net_selector_lists_payload_nets():
+    """Селектор: «Все сети» + nets из payload; выбранная сеть вне списка не теряется."""
+    body = (
+        "var byId = {};"
+        "var INCIDENTS_BUCKET = 60;"   # incClass читает режим для доли bad_min
+        "var localStorage = { getItem: function () { return null; }, setItem: function () {} };"
+        "document = { getElementById: function (id) {"
+        "  return byId[id] || (byId[id] = { _html: '',"
+        "    set innerHTML(v) { this._html = v; }, get innerHTML() { return this._html; } });"
+        "} };"
+        "var INCIDENTS_NET = 'ghost-net';"
+        "var slots = []; for (var i = 0; i < 24; i++) slots.push({ count: 0, down: 0, bad_min: 0 });"
+        "var INCIDENTS_DATA = { status: 'ok', bucket_minutes: 60, nets: ['103', '888-5G'],"
+        "  days: [{ date: '2026-09-28', slots: slots }] };"
+        "renderIncidentsPanel();"
+        "var sel = byId['inc-net'] ? byId['inc-net']._html : '';"
+        "console.log(JSON.stringify({ sel: sel }));"
+    )
+    res = _run_node(_harness(["renderIncidentsPanel", "incClass", "pad2",
+                              "syncIncidentsButtons", "syncIncidentsNet"], body))
+    assert "incidents_net_all" in res["sel"], "первая опция — «Все сети»"
+    assert 'value="103"' in res["sel"] and 'value="888-5G"' in res["sel"], "сети из payload"
+    assert 'value="ghost-net" selected' in res["sel"], \
+        "выбранная сеть, которой нет в журнале окна, не теряется"
+
+
+def test_inc_class_weights_bad_time_over_transitions():
+    """bad_min доминирует: мёртвый час с 0 переходов — красный; флап без простоя — как раньше."""
+    body = (
+        "var INCIDENTS_BUCKET = 60;"
+        "var rows = ["
+        "  ['inc-crit', incClass({ count: 0, down: 0, bad_min: 40 })],"
+        "  ['inc-high', incClass({ count: 0, down: 0, bad_min: 20 })],"
+        "  ['inc-low', incClass({ count: 0, down: 0, bad_min: 0.5 })],"
+        "  ['inc-ok', incClass({ count: 0, down: 0, bad_min: 0 })],"
+        "  ['inc-low', incClass({ count: 2, down: 1, bad_min: 0 })],"
+        "  ['inc-crit', incClass({ count: 7, down: 3, bad_min: 0 })],"
+        "  ['inc-none', incClass(null)]"
+        "];"
+        "console.log(JSON.stringify({ rows: rows }));"
+    )
+    res = _run_node(_harness(["incClass"], body))
+    assert res["rows"] == [["inc-crit", "inc-crit"], ["inc-high", "inc-high"],
+                           ["inc-low", "inc-low"], ["inc-ok", "inc-ok"],
+                           ["inc-low", "inc-low"], ["inc-crit", "inc-crit"],
+                           ["inc-none", "inc-none"]]
