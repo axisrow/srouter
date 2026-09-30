@@ -53,7 +53,8 @@
       "https://www.youtube.com/",
       "https://www.netflix.com/",
       "https://www.gstatic.com/generate_204",
-      "https://www.baidu.com/"
+      "https://www.baidu.com/",
+      "https://api.z.ai/"
     ]
   },
   "network": {
