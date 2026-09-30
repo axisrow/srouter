@@ -1024,20 +1024,58 @@ def _read_status_events(max_lines=None, log_path=None):
         return []
 
 
-def _incident_counts(lines, days, now=None, bucket_minutes=60):
-    """Бакеты (локальная дата ISO, слот) → {count, down} за последние days дней.
+def _incident_nets(lines):
+    """Distinct сети из журнала (для UI-селектора календаря). Чистая функция, не бросает."""
+    nets = set()
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict):
+            net = event.get("net")
+            if isinstance(net, str) and net:
+                nets.add(net)
+    return sorted(nets)
+
+
+def _overlay_bad(buckets, frm, to, bucket_minutes):
+    """Разложить минуты интервала [frm, to) по слотам (bad_min); интервал может
+    пересекать границы слотов и дней. Чистая функция над dict, не бросает."""
+    cur = frm
+    while cur < to:
+        seg_end = min(to, cur.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1))
+        while cur < seg_end:
+            slot = (cur.hour * 60 + cur.minute) // bucket_minutes
+            slot_end = (cur.replace(hour=0, minute=0, second=0, microsecond=0)
+                        + timedelta(minutes=(slot + 1) * bucket_minutes))
+            nxt = min(seg_end, slot_end)
+            bucket = buckets.setdefault((cur.date().isoformat(), slot),
+                                        {"count": 0, "down": 0, "bad_min": 0.0})
+            bucket["bad_min"] += (nxt - cur).total_seconds() / 60.0
+            cur = nxt
+
+
+def _incident_counts(lines, days, now=None, bucket_minutes=60, net=None):
+    """Бакеты (локальная дата ISO, слот) → {count, down, bad_min} за последние days дней.
 
     Слот = (час*60 + минута) // bucket_minutes: 60 → почасовые бакеты (0..23),
     10 → 10-минутные (0..143). Инцидент = previous.status == "ok" и
     current.status in (degraded, down); переходы внутри эпизода (down→degraded) и
-    закрытие (→ok) не считаются. Битый JSON, legacy строки (previous/current не dict),
-    отсутствующий/битый timestamp, события вне окна — пропуск. Чистая функция, не бросает.
+    закрытие (→ok) не считаются. bad_min — минуты, проведённые watchdog'ом в
+    degraded/down ВНУТРИ слота: состояние переносится вперёд от события к событию
+    (перманентно мёртвая сеть даёт 0 переходов, но честные bad_min — #315), хвост —
+    до now, состояние до начала окна берётся из последнего события до start.
+    net: если задан — только события с этим net (строки без net — мимо; до PR #385
+    ключа не было, они видны только в режиме «все сети»). Битый JSON, legacy строки
+    (previous/current не dict), отсутствующий/битый timestamp — пропуск. Чистая
+    функция, не бросает.
     """
     now = now or datetime.now()
     if now.tzinfo is not None:
         now = now.astimezone().replace(tzinfo=None)  # бакеты в локальной шкале
     start = (now - timedelta(days=days - 1)).replace(hour=0, minute=0, second=0, microsecond=0)
-    buckets = {}
+    events = []
     for line in lines:
         try:
             event = json.loads(line)
@@ -1045,34 +1083,53 @@ def _incident_counts(lines, days, now=None, bucket_minutes=60):
             continue
         if not isinstance(event, dict):
             continue
+        if net is not None and event.get("net") != net:
+            continue
         prev, cur = event.get("previous"), event.get("current")
         if not (isinstance(prev, dict) and isinstance(cur, dict)):
             continue
-        if prev.get("status") != "ok" or cur.get("status") not in ("degraded", "down"):
-            continue
         raw = event.get("timestamp")
         try:
-            dt = datetime.fromisoformat(raw).astimezone().replace(tzinfo=None)
+            dt = datetime.fromisoformat(raw or "").astimezone().replace(tzinfo=None)
         except (ValueError, TypeError):
             continue
+        events.append((dt, prev.get("status"), cur.get("status")))
+    events.sort(key=lambda e: e[0])
+
+    buckets = {}
+    state, cursor = "ok", start
+    for dt, prev_status, cur_status in events:
         if dt < start:
+            if isinstance(cur_status, str):
+                state = cur_status  # состояние до окна: из последнего события до start
             continue
-        slot = (dt.hour * 60 + dt.minute) // bucket_minutes
-        key = (dt.date().isoformat(), slot)
-        bucket = buckets.setdefault(key, {"count": 0, "down": 0})
-        bucket["count"] += 1
-        if cur.get("status") == "down":
-            bucket["down"] += 1
+        if state in ("degraded", "down") and dt > cursor:
+            _overlay_bad(buckets, cursor, dt, bucket_minutes)
+        if isinstance(cur_status, str):
+            state = cur_status
+        cursor = dt
+        if prev_status == "ok" and cur_status in ("degraded", "down"):
+            slot = (dt.hour * 60 + dt.minute) // bucket_minutes
+            bucket = buckets.setdefault((dt.date().isoformat(), slot),
+                                        {"count": 0, "down": 0, "bad_min": 0.0})
+            bucket["count"] += 1
+            if cur_status == "down":
+                bucket["down"] += 1
+    if state in ("degraded", "down") and now > cursor:
+        _overlay_bad(buckets, cursor, now, bucket_minutes)
+    for b in buckets.values():
+        b["bad_min"] = round(b["bad_min"], 1)
     return buckets
 
 
-def _incidents_payload(days, now=None, bucket_minutes=60):
-    """Сетка days×(1440//bucket_minutes): {date, slots:[{count,down}|null×N]} — null =
-    бакет ещё не наступил. Дни в порядке «старые → новые» (лента слева направо,
-    как у status-страниц)."""
+def _incidents_payload(days, now=None, bucket_minutes=60, net=None):
+    """Сетка days×(1440//bucket_minutes): {date, slots:[{count,down,bad_min}|null×N]} —
+    null = бакет ещё не наступил. Плюс nets — distinct сети журнала (UI-селектор).
+    Дни в порядке «старые → новые» (лента слева направо, как у status-страниц)."""
     now = now or datetime.now()
     lines = _read_status_events()
-    buckets = _incident_counts(lines, days, now, bucket_minutes)
+    buckets = _incident_counts(lines, days, now, bucket_minutes, net=net)
+    nets = _incident_nets(lines)
     slots_per_day = 1440 // bucket_minutes
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     out = []
@@ -1084,16 +1141,17 @@ def _incidents_payload(days, now=None, bucket_minutes=60):
                 slots.append(None)
                 continue
             b = buckets.get((day.date().isoformat(), s))
-            slots.append({"count": b["count"], "down": b["down"]} if b
-                         else {"count": 0, "down": 0})
+            slots.append({"count": b["count"], "down": b["down"], "bad_min": b["bad_min"]} if b
+                         else {"count": 0, "down": 0, "bad_min": 0.0})
         out.append({"date": day.date().isoformat(), "slots": slots})
-    return {"status": "ok", "bucket_minutes": bucket_minutes, "days": out}
+    return {"status": "ok", "bucket_minutes": bucket_minutes, "nets": nets, "days": out}
 
 
 @app.get("/api/incidents")
 def api_incidents():
     """Календарь инцидентов watchdog за ?days= (1..90, default 30) с бакетом
-    ?bucket= (вайтлист {60, 10} минут, default 60).
+    ?bucket= (вайтлист {60, 10} минут, default 60) и фильтром сети ?net=
+    (пусто/absent = все сети; неизвестная сеть — пустая сетка, не 400).
 
     Observe-only, GET (без _MUTATION_LOCK). Fail-soft: сбой чтения → 200 status=warn
     (probe-канон), не 500.
@@ -1118,8 +1176,9 @@ def api_incidents():
         if bucket not in _INCIDENTS_BUCKETS:
             return jsonify({"status": "warn",
                             "error": f"bucket must be one of {_INCIDENTS_BUCKETS}"}), 400
+    net = (request.args.get("net") or "").strip() or None
     try:
-        payload = _incidents_payload(days, bucket_minutes=bucket)
+        payload = _incidents_payload(days, bucket_minutes=bucket, net=net)
     except (OSError, ValueError, TypeError, KeyError) as exc:
         return jsonify({"status": "warn", "error": str(exc) or exc.__class__.__name__})
     return jsonify(payload)
