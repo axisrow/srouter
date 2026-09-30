@@ -458,6 +458,29 @@ env), нужен `git -c http.https://github.com.proxy=`. `gh` снимаетс�
 `srouter doctor` показывает этот чек (`gh/git direct`) с подсказкой обеих команд, когда git-proxy
 включён — info-only, не роняет вердикт.
 
+**Тумблер `srouter git-proxy` (2026-09-30):** управление всеми слоями git-прокси одной командой —
+не руками в каждом репо:
+
+```bash
+srouter git-proxy status            # эффективный вердикт по ВСЕМ слоям (local urlmatch > global
+                                    # urlmatch > глобальные http.proxy/https.proxy > env)
+srouter git-proxy enable [--force]  # включить managed SOCKS5 xray (чужое значение — с --force)
+srouter git-proxy disable           # снять managed-ключ
+srouter git-proxy disable --full    # + снять бесхозные ГЛОБАЛЬНЫЕ http.proxy/https.proxy
+                                    # (чужие значения — только с --full --force)
+```
+
+Прецедент 2026-09-30: doctor показывал «github идёт напрямую», пока бесхозный глобальный
+`http.proxy = 8118` реально проксировал git, а локальные `proxy = ""` в `.git/config` отдельных
+репо молча глушили глобальный ключ. Теперь `status` вычисляет ЭФФЕКТИВНОЕ значение лестницы git
+и называет слой-источник; `doctor` (чек `gh/git direct`) использует тот же композер. Смена порта —
+в одном месте (`dashboard_common`, #155), затем `enable --force` переписывает ключ.
+
+Оговорка об эмпирике: «github TCP напрямую открыт» — не константа. 2026-09-29/30 в окнах GFW
+прямой `github.com` был TCP-чёрной дырой с cellular-hotspot и wifi «103» (20.205.243.166 не
+отвечал на SYN), при этом путь через туннель давал 200 за ~0.7 c, а `api.github.com` оставался
+прямодоступным. Прямой путь — вероятностный fallback, не гарантия; в GFW-окнах живёт туннель.
+
 ## PF-изоляция доменов (опционально)
 
 **Цель:** пакеты к Proxy-доменам (`api.anthropic.com`, `console.anthropic.com`, `claude.ai`) физически
@@ -909,6 +932,31 @@ when the accelerator is alive, but it makes `git` **VPS-dependent**: `env -u` do
 (it's git-config, not env) — use `git -c http.https://github.com.proxy=`. `gh` is cleared with
 `env -u` (both env cases). `srouter doctor` surfaces this check (`gh/git direct`) with both commands
 as a hint when the git proxy is enabled — info-only, it does not lower the verdict.
+
+**The `srouter git-proxy` toggle (2026-09-30):** manage all git-proxy layers with one command
+instead of per-repo hand edits:
+
+```bash
+srouter git-proxy status            # effective verdict across ALL layers (local urlmatch >
+                                    # global urlmatch > global http.proxy/https.proxy > env)
+srouter git-proxy enable [--force]  # enable managed SOCKS5 xray (foreign value needs --force)
+srouter git-proxy disable           # remove the managed key
+srouter git-proxy disable --full    # + remove stray GLOBAL http.proxy/https.proxy
+                                    # (foreign values only with --full --force)
+```
+
+Case study 2026-09-30: doctor reported "github goes direct" while a stray global
+`http.proxy = 8118` was actually proxying git, and per-repo `proxy = ""` overrides in
+`.git/config` silently muted the global key. `status` now computes the EFFECTIVE value of git's
+precedence ladder and names the source layer; `doctor` (the `gh/git direct` check) uses the same
+composer. Port changes happen in one place (`dashboard_common`, #155), then `enable --force`
+rewrites the key.
+
+Empirical caveat: "github TCP is directly reachable" is not a constant. On 2026-09-29/30, during
+GFW windows, direct `github.com` was a TCP black hole from a cellular hotspot and the "103" wifi
+(20.205.243.166 dropped SYN), while the tunnel path returned 200 in ~0.7 s and `api.github.com`
+stayed directly reachable. Treat the direct path as a probabilistic fallback, not a guarantee;
+during GFW windows the tunnel is what works.
 
 ## PF domain isolation (optional)
 

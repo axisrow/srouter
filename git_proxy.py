@@ -337,6 +337,146 @@ def status():
             "multi": r["multi"], "key": KEY, "state": state}
 
 
+# Privoxy-URL для классификации бесхозных глобальных ключей (purge_stray). Fallback-хардкод —
+# та же причина, что у _PROXY: модуль не должен падать в среде без srouter_config.
+try:
+    from dashboard_common import HTTP_PROXY_URL as _HTTP_PROXY_URL  # http://127.0.0.1:8118
+except SystemExit:
+    _HTTP_PROXY_URL = "http://127.0.0.1:8118"
+
+
+def local_override(repo=".", timeout=4):
+    """Локальный urlmatch-override KEY в .git/config репо repo. {present, values, multi, unknown}.
+
+    `git -C <repo> config --local ...` — scope local, cwd-независимо (CLI в репо пользователя,
+    тесты в tmp-репо). absent: rc=1 («ключа нет») и rc=128 с явным «inside/not a git repository»
+    в stderr («слоя нет» — не сбой чтения; сообщение форсируется в английский через LC_ALL=C —
+    git локализуем). Прочий rc (битый config, permission denied) — unknown=True (fail-closed,
+    как в _get_all; code-review #386: 128 без узнаваемого «вне репо» = нечитаемый конфиг).
+
+    Пустое значение (values=[""]) — валидный ОСОЗНАННЫЙ direct в этом репо; present=True,
+    эффективный прокси пуст (побеждает любой глобальный слой — приоритет git).
+    """
+    # LC_ALL=C: сообщение об «вне репо» матчится по stderr, а git локализуем (verify 2026-09-30:
+    # русский git печатает «--local можно использовать только внутри git репозитория»).
+    r = sys_probe.run([GIT, "-C", str(repo), "config", "--local", "--get-all", "-z", KEY],
+                      timeout=timeout, env=dict(os.environ, LC_ALL="C", LANG="C"))
+    if r.get("timeout"):
+        return {"present": False, "values": [], "multi": False, "unknown": True}
+    rc = r.get("rc")
+    # rc=128 — не только «вне репо»: git отдаёт 128 и на фатальных ошибках (битый config,
+    # permission denied). Fail-closed (code-review #386): absent только при явном
+    # «inside/not a git repository/not in a git dir» в stderr; прочий 128 — unknown.
+    if rc == 1:
+        return {"present": False, "values": [], "multi": False, "unknown": False}
+    err = r.get("err") or ""
+    if rc == 128 and ("inside a git repositor" in err or "not a git repositor" in err
+                      or "not in a git dir" in err):
+        return {"present": False, "values": [], "multi": False, "unknown": False}
+    if rc != 0:
+        return {"present": False, "values": [], "multi": False, "unknown": True}
+    out = r.get("out") or ""
+    values = out.split("\x00")[:-1] if out else [""]
+    return {"present": True, "values": values, "multi": len(values) > 1, "unknown": False}
+
+
+def stray_global(timeout=4):
+    """Бесхозные ГЛОБАЛЬНЫЕ generic-ключи http.proxy/https.proxy (все хосты, все репо).
+
+    {http: <get_all>, https: <get_all>} — сырые _get_all-дикты. Их srouter не пишет (ключ
+    другой), но они РЕАЛЬНО проксируют git (приоритет git: urlmatch > generic > env) — 2026-09-30
+    именно они давали «git идёт через privoxy, а doctor говорит напрямую». Читаются, не мутятся;
+    снятие — purge_stray().
+    """
+    return {"http": _get_all("http.proxy", timeout=timeout),
+            "https": _get_all("https.proxy", timeout=timeout)}
+
+
+def purge_stray(force=False, timeout=5):
+    """Снять бесхозные глобальные http.proxy/https.proxy. {ok, purged, refused, err?}.
+
+    Значения, РАВНЫЕ нашему privoxy _HTTP_PROXY_URL — снимаем без force (распознанный слой
+    собственной инфраструктуры). ЧУЖИЕ значения (корпоративный прокси, multi-value со смесью)
+    — отказ БЕЗ мутации со списком значений, require force=True (контракт #307: чужая
+    настройка уничтожается только осознанным действием). Отсутствующий ключ — идемпотентный
+    skip. Read-after-write verify на каждом снятии (_unset_all). Под mutation-lock — как
+    enable/disable (issue #234 finding 2).
+    """
+    with _mutation_lock() as lock_acquired:
+        if not lock_acquired:
+            return {"ok": False, "err": "cross-process lock unavailable — refusing unsynchronized mutation",
+                    "purged": {}, "refused": {}}
+        purged, refused = {}, {}
+        for key in ("https.proxy", "http.proxy"):
+            st = _get_all(key, timeout=timeout)
+            if st["unknown"]:
+                refused[key] = {"err": "git config --get-all failed (non-absent rc)"}
+                continue
+            if not st["present"]:
+                continue  # идемпотентный skip
+            if any(v != _HTTP_PROXY_URL for v in st["values"]) and not force:
+                refused[key] = {"err": "foreign value — require force", "values": st["values"]}
+                continue
+            if not _unset_all(key, timeout=timeout)["ok"]:
+                refused[key] = {"err": "unset-all verify failed", "values": st["values"]}
+                continue
+            purged[key] = st["values"]
+        return {"ok": not refused, "purged": purged, "refused": refused}
+
+
+def effective_proxy(repo=".", env=None, timeout=4):
+    """ЭФФЕКТИВНЫЙ прокси git для https://github.com — вся лестница слоёв. {proxy, layer, detail}.
+
+    Приоритет как у git (verify 2026-09-30: urlmatch-ключ побеждает generic, generic — env):
+      1. local-urlmatch   — .git/config РЕПО repo (пустое значение = осознанный direct, proxy="");
+      2. global-urlmatch  — KEY в ~/.gitconfig (managed socks / foreign — по status());
+      3. global-generic   — https.proxy, затем http.proxy (все хосты, бесхозный слой);
+      4. env              — HTTPS_PROXY/https_proxy/HTTP_PROXY/http_proxy (git/curl honoring env);
+      direct              — ничего не задано.
+    Не найдено ничего читаемого при сбое чтения какого-то слоя → layer="unknown" (fail-closed:
+    не выдаём «direct» поверх непрочитанного конфига — канон detector-must-be-function).
+    detail — человекочитаемо (источник для CLI/doctor). НЕ бросает.
+    """
+    def _unknown(reason):
+        return {"proxy": "", "layer": "unknown", "detail": reason}
+
+    lo = local_override(repo=repo, timeout=timeout)
+    if lo["unknown"]:
+        return _unknown("local .git/config unreadable")
+    if lo["present"]:
+        # last-wins (code-review #386): git при multi-value одного ключа берёт ПОСЛЕДНЕЕ.
+        proxy = lo["values"][-1] if lo["values"] else ""
+        return {"proxy": proxy, "layer": "local-urlmatch",
+                "detail": "локальный override .git/config этого репо"}
+
+    st = status()
+    if not isinstance(st, dict) or st.get("state") == "unknown":
+        return _unknown("global gitconfig unreadable")
+    if st.get("present"):
+        # last-wins: status()["proxy"] — первое значение (контракт PR #223), git берёт последнее.
+        proxy = (st.get("values") or [st.get("proxy") or ""])[-1]
+        return {"proxy": proxy, "layer": "global-urlmatch",
+                "state": st.get("state"),
+                "detail": f"urlmatch-ключ {KEY} (state={st.get('state')})"}
+
+    strays = stray_global(timeout=timeout)
+    for name, rec in (("https.proxy", strays["https"]), ("http.proxy", strays["http"])):
+        if rec["unknown"]:
+            return _unknown(f"global {name} unreadable")
+        if rec["present"]:
+            # last-wins (code-review #386)
+            return {"proxy": rec["values"][-1] if rec["values"] else "", "layer": "global-generic",
+                    "detail": f"бесхозный глобальный {name}"}
+
+    src = os.environ if env is None else env
+    for var in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
+        val = src.get(var) if hasattr(src, "get") else None
+        if val:
+            return {"proxy": val, "layer": "env", "detail": f"переменная окружения {var}"}
+
+    return {"proxy": "", "layer": "direct", "detail": "ни один слой прокси не задан"}
+
+
 def _backup_state():
     """Текущий backup (список чужих значений) в _BACKUP_KEY. {present, values, unknown}."""
     return _get_all(_BACKUP_KEY)

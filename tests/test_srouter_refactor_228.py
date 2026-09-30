@@ -115,7 +115,7 @@ class TestParserSurface:
         assert top == {
             "install", "uninstall", "start", "stop", "restart",
             "status", "doctor", "sync", "system-proxy", "routing", "privoxy",
-            "netprobe",
+            "netprobe", "git-proxy",
         }
 
     def test_nested_subcommand_paths_preserved(self, surface):
@@ -128,6 +128,9 @@ class TestParserSurface:
             ("system-proxy", "status"),
             ("system-proxy", "repair"),
             ("system-proxy", "restore"),
+            ("git-proxy", "status"),
+            ("git-proxy", "enable"),
+            ("git-proxy", "disable"),
             ("privoxy", "status"),
             ("privoxy", "protect"),
             ("privoxy", "start"),
