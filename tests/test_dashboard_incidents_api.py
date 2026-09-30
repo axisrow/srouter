@@ -11,6 +11,7 @@ import pytest
 
 import dashboard
 import dashboard_routes
+import metrics_store
 
 
 def _get(path):
@@ -23,9 +24,22 @@ def _local_iso(dt):
     return dt.astimezone().isoformat()
 
 
+def _epoch(dt):
+    """ts-epoch для метрик-строк (datetime.fromtimestamp возвращает naive local)."""
+    return dt.astimezone().timestamp()
+
+
 def _lines(monkeypatch, lines):
     monkeypatch.setattr(dashboard_routes, "_read_status_events",
                         lambda max_lines=None, log_path=None: list(lines))
+
+
+def _metrics_lines(monkeypatch, tmp_path, rows):
+    """Живой формат metrics.jsonl (health.py пишет ts+net в каждой строке, PR #385)."""
+    log = tmp_path / "metrics.jsonl"
+    log.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n",
+                   encoding="utf-8")
+    monkeypatch.setattr(metrics_store, "METRICS_LOG", log)
 
 
 # ---------------- агрегатор: что считается инцидентом ----------------
@@ -147,8 +161,9 @@ def test_read_status_events_reads_tail(monkeypatch, tmp_path):
 # ---------------- роут ----------------
 
 @pytest.fixture(autouse=True)
-def _no_real_incidents_log(monkeypatch, tmp_path):
+def _no_real_logs(monkeypatch, tmp_path):
     monkeypatch.setattr(dashboard_routes, "_INCIDENTS_LOG", tmp_path / "absent.jsonl")
+    monkeypatch.setattr(metrics_store, "METRICS_LOG", tmp_path / "absent-metrics.jsonl")
 
 
 def test_incidents_route_ok(monkeypatch):
@@ -280,6 +295,9 @@ def test_incident_counts_returns_known_from():
     _, known_from = dashboard_routes._incident_counts(
         [_net_ev("103", start - timedelta(minutes=5))], days=30, now=now, net="103")
     assert known_from == start, "событие до окна: состояние известно с начала окна"
+    _, known_from = dashboard_routes._incident_counts(
+        [_net_ev("103", now + timedelta(days=2))], days=30, now=now, net="103")
+    assert known_from == now, "событие «из будущего» (skew часов) не делает всю сетку серой"
 
 
 # ---------------- bad_min: время в плохом состоянии, а не только переходы ----------------
@@ -327,10 +345,12 @@ def test_bad_min_events_before_window_set_initial_state():
     assert buckets[(day, 0)]["count"] == 0, "сам переход вне окна инцидентом не считается"
 
 
-def test_incidents_payload_nets_list_and_bad_min_shape(monkeypatch):
+def test_incidents_payload_nets_list_and_bad_min_shape(monkeypatch, tmp_path):
     now = datetime(2026, 9, 28, 15, 0)
     _lines(monkeypatch, [_net_ev("888-5G", now - timedelta(minutes=30)),
                          _net_ev("103", now - timedelta(minutes=20))])
+    _metrics_lines(monkeypatch, tmp_path,
+                   [{"ts": _epoch(now - timedelta(minutes=15)), "net": "103"}])
     payload = dashboard_routes._incidents_payload(1, now=now, net="103")
     assert payload["nets"] == ["103", "888-5G"], "отсортированный список сетей из журнала"
     today = payload["days"][-1]
@@ -338,9 +358,12 @@ def test_incidents_payload_nets_list_and_bad_min_shape(monkeypatch):
         "слоты несут bad_min наряду с count/down (эпизод 14:40→now)"
 
 
-def test_incidents_route_net_param_fail_soft(monkeypatch):
+def test_incidents_route_net_param_fail_soft(monkeypatch, tmp_path):
     now = datetime.now()
     _lines(monkeypatch, [_net_ev("103", now - timedelta(minutes=30))])
+    _metrics_lines(monkeypatch, tmp_path,
+                   [{"ts": _epoch(now - timedelta(minutes=30)), "net": "103"},   # слот перехода
+                    {"ts": _epoch(now - timedelta(minutes=10)), "net": "103"}])
     r = _get("/api/incidents?net=103")
     assert r.status_code == 200
     data = r.get_json()
@@ -374,13 +397,59 @@ def test_payload_net_filter_foreign_events_do_not_known_slots(monkeypatch):
     _lines(monkeypatch, [_net_ev("888-5G", now - timedelta(minutes=30))])
     payload = dashboard_routes._incidents_payload(1, now=now, net="103")
     assert all(s is None for s in payload["days"][-1]["slots"]), \
-        "события чужой сети не делают слоты 103 известными — вся сетка без данных"
+        "нет heartbeats 103 и переходов 103 — сетка без данных (чужая сеть не считается)"
 
 
-def test_payload_pre_window_event_known_from_window_start(monkeypatch):
+def test_payload_pre_window_event_known_from_window_start(monkeypatch, tmp_path):
     now = datetime(2026, 9, 28, 1, 0)
     _lines(monkeypatch, [_net_ev("103", datetime(2026, 9, 27, 23, 50))])
+    _metrics_lines(monkeypatch, tmp_path,
+                   [{"ts": _epoch(now - timedelta(minutes=30)), "net": "103"}])
     payload = dashboard_routes._incidents_payload(1, now=now, net="103")
     today = payload["days"][-1]
     assert today["slots"][0] is not None and today["slots"][0]["bad_min"] == 60.0, \
-        "событие до окна: состояние известно с начала окна — нулей-заглушек нет"
+        "событие до окна + покрытие: состояние известно с начала окна — нулей-заглушек нет"
+
+
+# ---------------- известность net-режима: покрытие heartbeats'ами метрик ----------------
+
+def test_heartbeat_slots_net_filter_and_slot_mapping(monkeypatch, tmp_path):
+    """metrics.jsonl — строка каждый цикл с net (PR #385): честный первоисточник
+    «watchdog мерил ЭТУ сеть в момент T». Переходы молчат на стабильной сети и
+    не различают «сеть ок» от «сеть не мерялась»."""
+    now = datetime(2026, 9, 30, 15, 0)
+    _metrics_lines(monkeypatch, tmp_path, [
+        {"ts": _epoch(datetime(2026, 9, 30, 13, 10)), "net": "888-5G"},
+        {"ts": _epoch(datetime(2026, 9, 30, 13, 50)), "net": "103"},
+        {"ts": _epoch(datetime(2026, 9, 30, 2, 0)), "net": "103"},     # ночь — только 103
+        {"ts": _epoch(datetime(2026, 9, 30, 9, 0))},                   # без net (до PR #385)
+        {"timestamp": "мусор", "net": "888-5G"},                        # без ts
+        "не-json",
+        {"ts": "не-число", "net": "888-5G"},
+    ])
+    day = now.date().isoformat()
+    covered = dashboard_routes._heartbeat_slots("888-5G", 1, now, 60)
+    assert covered == {(day, 13)}, "888-5G покрыт только слотом 13:xx"
+    covered_103 = dashboard_routes._heartbeat_slots("103", 1, now, 60)
+    assert covered_103 == {(day, 2), (day, 13)}, "103: ночь и 13:xx; строка без net сеть не покрывает"
+
+
+def test_heartbeat_slots_fail_soft_missing_log(monkeypatch, tmp_path):
+    monkeypatch.setattr(metrics_store, "METRICS_LOG", tmp_path / "absent.jsonl")
+    assert dashboard_routes._heartbeat_slots(
+        "103", 1, datetime(2026, 9, 30, 15, 0), 60) == set()
+
+
+def test_payload_net_mode_gates_on_heartbeat_coverage(monkeypatch, tmp_path):
+    """КЛЮЧЕВОЙ кейс пользователя: ночь ноут стоял на 103 — слоты 888-5G серые,
+    хотя переход 888 был (перенос состояния не рисуется там, где сеть не мерялась)."""
+    now = datetime(2026, 9, 30, 15, 0)
+    _lines(monkeypatch, [_net_ev("888-5G", datetime(2026, 9, 30, 0, 10))])  # ok→down в 00:10
+    _metrics_lines(monkeypatch, tmp_path,
+                   [{"ts": _epoch(datetime(2026, 9, 30, 13, 5)), "net": "888-5G"}])
+    payload = dashboard_routes._incidents_payload(1, now=now, net="888-5G")
+    slots = payload["days"][-1]["slots"]
+    assert slots[0] is None, "00:xx: переход 888 есть, но watchdog мерял 103 — серый"
+    assert slots[13] == {"count": 0, "down": 0, "bad_min": 60.0}, \
+        "13:xx: покрытие есть; down от перехода 00:10 перенесён в покрытый слот"
+    assert all(s is None for s in slots[14:]), "после конца покрытия — серые"
