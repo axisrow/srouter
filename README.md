@@ -407,6 +407,32 @@ srouter uninstall      # полный откат к дефолту:
 #   split-route до VPS, Claude Code/git-прокси, Codex SOCKS5-wrappers + env + PATH.
 ```
 
+## Ручное переключение активного узла (hybrid-adopt)
+
+На hybrid-adopt машине (`POST /api/node/select/<name>` отвечает `409`: select регенерирует
+конфиг с нуля и сносит managed-whitelist, #136/#313) узел переключают **вручную**. Процедура:
+
+1. В живом конфиге `/opt/homebrew/etc/xray/config.json` править два поля outbound `reality-out`:
+   `address` и `port` (пример A/B 2026-09-30: `85.136.181.198:443` → `78.47.183.125:8443`).
+   Программные мутации берут `local_state._routing_config_lock`; руками — править, когда не идут
+   apply/мутации дашборда.
+2. В `srouter.local.json` выставить `active_node.name` = целевой узел (он должен быть
+   `enabled: true`) — консистентность с #200-гардом (`compare_endpoint_with_xray`):
+   `endpoint_host`/`route_ip` узла уже совпадают с новым address.
+3. `brew services restart xray` (та же константа, что `node_selector.XRAY_RESTART_CMD`).
+4. Verify: `curl -x http://127.0.0.1:8118 https://api.ip.sb/ip` → exit-IP нового узла
+   (api.ip.sb не в routing-списке, поэтому через основной socks он идёт direct — проверять
+   именно через 8118 с доменами из списка нельзя). Откат симметричен.
+
+Куда переключаться — подсказывает вкладка «Прокси»: бейдж «рекомендация»
+(`/api/nodes/ranking` → `node_selector.recommendation`, порог `SWITCH_MARGIN=0.05`) замеряет
+все `enabled`-узлы параллельно (ping/loss/throughput через пер-узловые probe-порты). Неактивному
+узлу нужен probe-инбаунд в живом конфиге (`probe-<имя>` на порту `probe.socks_port` +
+outbound `probe-out-<имя>` + routing-правило по `inboundTag`) — на adopt-машине пару вписывают
+руками по образцу `gen_xray_config._probe_inbound`/`_vless_outbound` (без этого узел в
+рекомендации не участвует). Автопереключения нет — policy locked: observe → manual →
+автоматизация отдельным follow-up.
+
 ## gh / git: прямой доступ, не через прокси (#199)
 
 `gh` и `git` к github.com **запускайте с прямым доступом** — это **VPS-независимый** dev-workflow:
@@ -881,6 +907,32 @@ srouter uninstall      # full rollback to defaults:
 #   (networksetup ... Empty), removes the LaunchAgent, watchdog, ppp-hook,
 #   split-route to the VPS, Claude Code/git proxy, Codex SOCKS5-wrappers + env + PATH.
 ```
+
+## Manual active-node switching (hybrid-adopt)
+
+On a hybrid-adopt machine (`POST /api/node/select/<name>` answers `409`: select regenerates the
+config from scratch and destroys the managed whitelist, #136/#313) nodes are switched **manually**:
+
+1. In the live `/opt/homebrew/etc/xray/config.json`, edit two fields of the `reality-out`
+   outbound: `address` and `port` (A/B example 2026-09-30: `85.136.181.198:443` →
+   `78.47.183.125:8443`). Programmatic mutations hold `local_state._routing_config_lock`;
+   by hand — edit while no dashboard apply/mutations are running.
+2. In `srouter.local.json`, set `active_node.name` to the target node (must be `enabled: true`)
+   — keeps the #200 endpoint-sync guard (`compare_endpoint_with_xray`) green: the node's
+   `endpoint_host`/`route_ip` already match the new address.
+3. `brew services restart xray` (same constant as `node_selector.XRAY_RESTART_CMD`).
+4. Verify: `curl -x http://127.0.0.1:8118 https://api.ip.sb/ip` → the new node's exit IP
+   (api.ip.sb is not in the routing list, so via the main socks it goes direct — verify through
+   8118 specifically). Rollback is symmetric.
+
+Where to switch: the "Proxy" tab badge «рекомендация» (`/api/nodes/ranking` →
+`node_selector.recommendation`, `SWITCH_MARGIN=0.05`) probes all `enabled` nodes in parallel
+(ping/loss/throughput via per-node probe ports). A non-active node needs a probe inbound in the
+live config (`probe-<name>` on `probe.socks_port` + outbound `probe-out-<name>` + an
+`inboundTag` routing rule) — on adopt machines the pair is hand-written following
+`gen_xray_config._probe_inbound`/`_vless_outbound` (without it the node is invisible to the
+recommendation). No auto-switching — policy locked: observe → manual → automation in a separate
+follow-up.
 
 ## gh / git: direct access, not via proxy (#199)
 
