@@ -1057,7 +1057,8 @@ def _overlay_bad(buckets, frm, to, bucket_minutes):
 
 
 def _incident_counts(lines, days, now=None, bucket_minutes=60, net=None):
-    """Бакеты (локальная дата ISO, слот) → {count, down, bad_min} за последние days дней.
+    """(бакеты, known_from) за последние days дней. Бакеты: (локальная дата ISO, слот)
+    → {count, down, bad_min}.
 
     Слот = (час*60 + минута) // bucket_minutes: 60 → почасовые бакеты (0..23),
     10 → 10-минутные (0..143). Инцидент = previous.status == "ok" и
@@ -1066,6 +1067,10 @@ def _incident_counts(lines, days, now=None, bucket_minutes=60, net=None):
     degraded/down ВНУТРИ слота: состояние переносится вперёд от события к событию
     (перманентно мёртвая сеть даёт 0 переходов, но честные bad_min — #315), хвост —
     до now, состояние до начала окна берётся из последнего события до start.
+    known_from — момент, с которого состояние потока известно: start, если есть
+    событие ≤ start; иначе первое событие; None, если событий нет вообще (журнал
+    хранит только переходы — тишина ДО первого события означает «данных нет»,
+    а не «всё хорошо»; payload рисует такие слоты серыми).
     net: если задан — только события с этим net (строки без net — мимо; до PR #385
     ключа не было, они видны только в режиме «все сети»). Битый JSON, legacy строки
     (previous/current не dict), отсутствующий/битый timestamp — пропуск. Чистая
@@ -1119,16 +1124,23 @@ def _incident_counts(lines, days, now=None, bucket_minutes=60, net=None):
         _overlay_bad(buckets, cursor, now, bucket_minutes)
     for b in buckets.values():
         b["bad_min"] = round(b["bad_min"], 1)
-    return buckets
+    if not events:
+        known_from = None
+    elif events[0][0] <= start:
+        known_from = start  # состояние до окна известно из последнего события до start
+    else:
+        known_from = events[0][0]
+    return buckets, known_from
 
 
 def _incidents_payload(days, now=None, bucket_minutes=60, net=None):
     """Сетка days×(1440//bucket_minutes): {date, slots:[{count,down,bad_min}|null×N]} —
-    null = бакет ещё не наступил. Плюс nets — distinct сети журнала (UI-селектор).
+    null = слот ещё не наступил ИЛИ данных нет (до первого события журнала/сети —
+    серая ячейка, не зелёная). Плюс nets — distinct сети журнала (UI-селектор).
     Дни в порядке «старые → новые» (лента слева направо, как у status-страниц)."""
     now = now or datetime.now()
     lines = _read_status_events()
-    buckets = _incident_counts(lines, days, now, bucket_minutes, net=net)
+    buckets, known_from = _incident_counts(lines, days, now, bucket_minutes, net=net)
     nets = _incident_nets(lines)
     slots_per_day = 1440 // bucket_minutes
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -1137,7 +1149,11 @@ def _incidents_payload(days, now=None, bucket_minutes=60, net=None):
         day = today_start - timedelta(days=days - 1 - i)
         slots = []
         for s in range(slots_per_day):
-            if day + timedelta(minutes=s * bucket_minutes) > now:
+            slot_start = day + timedelta(minutes=s * bucket_minutes)
+            slot_end = slot_start + timedelta(minutes=bucket_minutes)
+            # будущее (start > now — текущий слот рисуем: в нём count и частичный bad_min)
+            # или данных ещё нет (слот целиком до первого события журнала/сети)
+            if slot_start > now or known_from is None or slot_end <= known_from:
                 slots.append(None)
                 continue
             b = buckets.get((day.date().isoformat(), s))

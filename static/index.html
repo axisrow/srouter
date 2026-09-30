@@ -72,7 +72,7 @@
     .inc-low { background:var(--bs-warning); }
     .inc-high { background:#e07b00; }
     .inc-crit { background:var(--bs-danger); }
-    .inc-none { background:var(--bs-secondary-color); opacity:.25; }
+    .inc-none { background:var(--bs-secondary-color); opacity:.55; }
   </style>
 </head>
 <body>
@@ -1972,7 +1972,7 @@
     }
 
     function incClass(h) {
-      if (!h) return 'inc-none';           // слот ещё не наступил
+      if (!h) return 'inc-none';           // слот ещё не наступил ИЛИ нет данных (до первого события)
       // bad_min (время в degraded/down) важнее числа переходов: перманентно мёртвая
       // сеть даёт 0-1 перехода на слот, но целые bad-минуты (#315).
       var bad = typeof h.bad_min === 'number' ? h.bad_min : 0;
