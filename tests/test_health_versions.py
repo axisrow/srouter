@@ -246,6 +246,10 @@ def _machine_state_monkey(monkeypatch):
                         lambda *a, **kw: {"status": "ok", "detail": "mock: GFW не режет"})
     monkeypatch.setattr(health, "_direct_first_check",
                         lambda: {"status": "ok", "detail": "mock: direct-first reachable"})
+    # Инцидент 2026-10-01: _no_proxy_direct_check делает реальный прямой curl per-host NO_PROXY —
+    # тот же класс, что GFW/direct-first выше (canon ⊆ versions, гвард test_machine_state_mock_guard).
+    monkeypatch.setattr(health, "_no_proxy_direct_check",
+                        lambda: {"status": "ok", "detail": "mock: NO_PROXY хосты напрямую ок"})
     # #271: канон (tests/test_health.py::_all_up_monkey) расширен полным покрытием real probes
     # check_all() — дублируем сюда (гвард test_machine_state_mock_guard.py требует canon ⊆ versions).
     # Тесты этого файла, которым нужен конкретный статус этих чеков, переопределяют мок ПОСЛЕ

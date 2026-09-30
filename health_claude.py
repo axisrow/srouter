@@ -26,7 +26,8 @@ __all__ = [
     "_is_claude_code_comm", "_claude_code_pids", "_claude_proxy_probe",
     "_find_claude_binary", "_has_expected_api_401", "_has_api_retry",
     "_claude_transport_once", "_configured_claude_proxy", "_claude_transport_probe",
-    "_proxy_env_consistency",
+    "_proxy_env_consistency", "_no_proxy_direct_check",
+    "NO_PROXY_MAX_CANDIDATES", "NO_PROXY_PROBE_CONNECT_TIMEOUT", "NO_PROXY_PROBE_MAX_TIME",
     "CLAUDE_TRANSPORT_TIMEOUT", "CLAUDE_API_BASE_URL", "CLAUDE_DUMMY_API_KEY",
     "CONTROL_PROBE_TIMEOUT",
 ]
@@ -411,6 +412,118 @@ def _proxy_env_consistency():
                    "Фикс: 'srouter install' (enable ставит ALL_PROXY=\"\"), разово: "
                    "export ALL_PROXY= all_proxy="),
     }
+
+
+# Инцидент 2026-10-01 (agy login): '.googleapis.com' в env NO_PROXY (settings.json) отправлял
+# процессы CC-сессий на oauth2.googleapis.com напрямую (GFW dial-timeout). Бюджет doctor-прогона:
+# connect_timeout=2/max_time=4 на хост + кап NO_PROXY_MAX_CANDIDATES — worst case ~полминуты,
+# терпимо для doctor-пути (он уже платит CLAUDE_TRANSPORT_TIMEOUT=20s).
+NO_PROXY_MAX_CANDIDATES = 5
+NO_PROXY_PROBE_CONNECT_TIMEOUT = 2
+NO_PROXY_PROBE_MAX_TIME = 4
+
+
+def _no_proxy_direct_check():
+    """Хосты NO_PROXY (settings.json env) при активном прокси доступны напрямую? {status, detail}.
+
+    Инцидент 2026-10-01: '.googleapis.com' в env NO_PROXY → agy login из CC-сессии ходил на
+    oauth2.googleapis.com мимо privoxy и умирал (dial tcp i/o timeout, GFW). Источник — settings.json
+    env-блок, НЕ os.environ (канон #337: файловый env перезаписывает exec-env при старте CC —
+    детям достаётся именно он). Loopback / BUILTIN z.ai (zai-direct-no-proxy) / provider-хост —
+    by design direct, не проверяются. Остальное — кандидаты: контроль (GFW_CONTROL_DOMAIN,
+    канонически не GFW-target) подтверждает наличие прямой сети, затем per-host
+    sys_probe.direct_probe. Инвариант — «прямой путь хоста мёртв при живом контроле», а НЕ
+    «GFW банит» (no-diagnosis-without-evidence: живой захват инцидента дал connection-failed
+    RST, не timeout — оба вида смерти ломают детей CC одинаково): reachable=False (timeout
+    ИЛИ connection-failed) → warn с kind в detail; upstream-error (5xx = сервер ответил) →
+    прямой канал жив, не warn. Не бросает (probe-канон).
+    """
+    try:
+        import claude_proxy
+        st = claude_proxy.status()
+    except ImportError as exc:
+        _log.debug("claude_proxy недоступен: %s — NO_PROXY не проверить", exc)
+        return {"status": "unknown", "detail": f"claude_proxy недоступен: {exc}"}
+    state = st.get("state")
+    if state == _contract.UNKNOWN:
+        return {"status": "unknown",
+                "detail": "settings.json нечитаем — NO_PROXY не проверить (issue #307)"}
+    if state == _contract.FOREIGN:
+        return {"status": "unknown",
+                "detail": "чужой HTTPS_PROXY (#307) — env вне контракта srouter, не оценивается"}
+    if not st.get("enabled"):
+        return {"status": "ok", "detail": "CC-прокси выключен — NO_PROXY не действует"}
+    try:
+        return _no_proxy_candidates_verdict(st, claude_proxy)
+    except Exception as exc:  # noqa: BLE001 — probe-канон: любой сбой = unknown, не исключение
+        _log.debug("NO_PROXY direct-check сбой: %s", exc)
+        return {"status": "unknown", "detail": f"NO_PROXY direct-check сбой: {exc}"}
+
+
+def _no_proxy_candidates_verdict(st, claude_proxy):
+    """Классификация хостов NO_PROXY + per-host пробы (внутренняя, вызывает сеть). Не бросает
+    наверх — обёрнута в _no_proxy_direct_check; сами проба-вызовы sys_probe не бросают."""
+    import ipaddress
+
+    import local_state
+    from direct_first import BUILTIN_DIRECT_DOMAINS
+    from health_probes import GFW_CONTROL_DOMAIN
+
+    provider = claude_proxy._base_url_hosts(claude_proxy._load())
+    ignore = {"localhost"} | set(BUILTIN_DIRECT_DOMAINS)
+    if provider:
+        ignore.add(provider)
+
+    candidates, seen, truncated = [], set(), False
+    for raw in (st.get("no_proxy") or "").split(","):
+        host = raw.strip().lower().lstrip(".")
+        if not host or host in ignore or host in seen:
+            continue
+        try:  # IP-нотация (::1, 127.0.0.1) — loopback не кандидат; домен валится в ValueError
+            if ipaddress.ip_address(host).is_loopback:
+                continue
+        except ValueError:
+            pass
+        if not local_state._is_valid_host(host):
+            continue
+        if len(candidates) >= NO_PROXY_MAX_CANDIDATES:
+            truncated = True
+            break
+        seen.add(host)
+        candidates.append(host)
+
+    if not candidates:
+        return {"status": "ok",
+                "detail": "NO_PROXY (settings.json env) без посторонних хостов — проверять нечего"}
+    ctrl = sys_probe.direct_probe(GFW_CONTROL_DOMAIN, connect_timeout=NO_PROXY_PROBE_CONNECT_TIMEOUT,
+                                  max_time=NO_PROXY_PROBE_MAX_TIME)
+    if not ctrl.get("reachable"):
+        return {"status": "unknown",
+                "detail": (f"контрольный домен {GFW_CONTROL_DOMAIN} напрямую не отвечает "
+                           f"({ctrl.get('kind')}) — прямой сети нет, достижимость NO_PROXY-хостов "
+                           f"не проверить (первичная причина выше в каскаде)")}
+    dead, answered = [], []
+    for host in candidates:
+        r = sys_probe.direct_probe(host, connect_timeout=NO_PROXY_PROBE_CONNECT_TIMEOUT,
+                                   max_time=NO_PROXY_PROBE_MAX_TIME)
+        if r.get("reachable"):
+            answered.append(host)
+        else:
+            dead.append(f"{host} ({r.get('kind')})")
+    if truncated:
+        # ponytail: усечение молчало бы о непроверенных хостах — detail называет срез явно
+        cap_note = f"; проверено первые {NO_PROXY_MAX_CANDIDATES} хостов NO_PROXY"
+    else:
+        cap_note = ""
+    if not dead:
+        return {"status": "ok",
+                "detail": f"хосты NO_PROXY напрямую reachable: {', '.join(answered)}" + cap_note}
+    detail = (f"NO_PROXY (env settings.json) при активном прокси: {', '.join(dead)} — напрямую "
+              f"недоступен при живом контроле {GFW_CONTROL_DOMAIN}. Процессы, запущенные из "
+              f"CC-сессий, ходят туда мимо privoxy {st.get('proxy', '')} и умирают "
+              f"(инцидент 2026-10-01: agy login, i/o timeout). Убери хост из env.NO_PROXY "
+              f"в ~/.claude/settings.json")
+    return {"status": "warn", "detail": detail + cap_note}
 
 
 # Control-проба (HTTP bridge) запускается только когда сконфигурированный SOCKS уже упал —
