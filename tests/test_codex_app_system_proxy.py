@@ -129,6 +129,8 @@ def test_check_all_wires_chromium_system_proxy_as_doctor_driver(monkeypatch):
                         lambda: {"status": "info", "detail": "skip"})
     monkeypatch.setattr(health, "_direct_first_check",
                         lambda: {"status": "info", "detail": "skip"})
+    monkeypatch.setattr(health, "_network_known_check",
+                        lambda: {"status": "ok", "detail": "mock: сеть известна"})
     result = health.check_all(active_claude=True)
     check = next(c for c in result["checks"] if "Chromium" in c["name"])
     assert check["ok"] is False

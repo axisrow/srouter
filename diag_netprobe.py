@@ -285,6 +285,42 @@ def learn_net(name):
 _GW_HINTED = set()  # gw-метки, подсказка для которых уже напечатана (не спамим каждый тик)
 
 
+def current_net_status():
+    """Структурный статус текущей сети: {label, known, source} | None (нет сети).
+
+    Источник правды по известности — здесь, а не сниффингом префикса gw: в
+    consumer'е (канон loose-validator-recurring-leak): смена формата fallback-метки
+    не должна молча инвертировать known. known=False — сеть НЕ обучена в netname-мапе,
+    в т.ч. читаемый, но необученный SSID (терминал с Location Services видит SSID
+    новой сети — это всё ещё «неизвестная сеть» для метрик, иначе doctor и watchdog
+    расходятся: ok в терминале против gw:-метки под launchd, #385).
+    source: "ssid" | "map" | "gw". Fail-soft — не бросает. 3 subprocess на вызов.
+    """
+    try:
+        ssid_name = read_ssid()
+    except Exception:  # noqa: BLE001 — fail-soft резолвер (#384): сбой SSID-ветки не убивает netname
+        ssid_name = None
+    if isinstance(ssid_name, str) and ssid_name.strip():
+        ssid_name = ssid_name.strip()
+        return {"label": ssid_name, "known": ssid_name in _load_nets(), "source": "ssid"}
+    try:
+        gateway, _ = _physical_gateway()
+        gateway_mac = _gateway_mac(gateway)
+        name = _net_name(gateway=gateway, gateway_mac=gateway_mac)
+    except Exception:  # noqa: BLE001 — то же: любой сбой отпечатка деградирует в None, не бросает
+        return None
+    if name:
+        return {"label": name, "known": True, "source": "map"}
+    if gateway:
+        label = f"gw:{gateway}:{gateway_mac or '?'}"
+        if label not in _GW_HINTED:
+            _GW_HINTED.add(label)
+            print(f"net: сеть не распознана ({label}); обучить: "
+                  f"python3 diag_netprobe.py netname <имя>", file=sys.stderr, flush=True)
+        return {"label": label, "known": False, "source": "gw"}
+    return None
+
+
 def current_net():
     """Метка текущей сети для замеров (#384): сырой SSID → netname из мапы
     (gateway+MAC, как в probe()) → `gw:<ip>:<mac>` для необученной сети → None.
@@ -294,28 +330,8 @@ def current_net():
     Один вызов = 3 subprocess — вызывающий кэширует границей тика (health
     зовёт раз на записывающий тик, не на событие).
     """
-    try:
-        ssid_name = read_ssid()
-    except Exception:  # noqa: BLE001 — fail-soft резолвер (#384): сбой SSID-ветки не убивает netname
-        ssid_name = None
-    if isinstance(ssid_name, str) and ssid_name.strip():
-        return ssid_name.strip()
-    try:
-        gateway, _ = _physical_gateway()
-        gateway_mac = _gateway_mac(gateway)
-        name = _net_name(gateway=gateway, gateway_mac=gateway_mac)
-    except Exception:  # noqa: BLE001 — то же: любой сбой отпечатка деградирует в None, не бросает
-        return None
-    if name:
-        return name
-    if gateway:
-        label = f"gw:{gateway}:{gateway_mac or '?'}"
-        if label not in _GW_HINTED:
-            _GW_HINTED.add(label)
-            print(f"net: сеть не распознана ({label}); обучить: "
-                  f"python3 diag_netprobe.py netname <имя>", file=sys.stderr, flush=True)
-        return label
-    return None
+    st = current_net_status()
+    return st["label"] if st else None
 
 
 def _canary_tunnel_events(events):

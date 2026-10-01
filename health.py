@@ -228,6 +228,22 @@ def _tunnel_parameter_note(now=None):
         return None
 
 
+def _network_known_check():
+    """Известна ли текущая сеть в netname-мапе (SSID launchd скрывает — резолв по MAC шлюза).
+
+    ok = обученное имя сети; warn = НОВАЯ необученная сеть + команда обучения;
+    unknown = сети нет вообще (первичная причина уже в net_check). Известность —
+    структурный флаг diag_netprobe.current_net_status(), не парсинг метки. Не бросает.
+    """
+    st = diag_netprobe.current_net_status()
+    if st is None:
+        return {"status": "unknown", "detail": "нет сети"}
+    if not st["known"]:
+        return {"status": "warn",
+                "detail": f"НОВАЯ сеть {st['label']} — обучи: python3 diag_netprobe.py netname <имя>"}
+    return {"status": "ok", "detail": st["label"]}
+
+
 def check_all(*, active_claude=False):
     """Все проверки стека. {status: ok|degraded|down, checks: [{name, ok, detail?, info?}]}.
 
@@ -276,6 +292,17 @@ def check_all(*, active_claude=False):
     if net["up"]:
         net_check["info"] = True  # сеть есть — не driver (как endpoint-override)
     checks.append(net_check)
+    # Неизвестная сеть (SSID launchd всегда <redacted>): current_net_status() резолвит по MAC
+    # шлюза из netname-мапы; сеть не обучена → НОВАЯ необученная. info-only ВСЕГДА: неизвестная
+    # сеть — не сбой стека (канон #329 «легитимная конфигурация»), но метрики инцидентов идут
+    # под безымянной gw:-меткой. gate под active_claude (doctor-only): резолвер = 3 subprocess
+    # (arp/ipconfig), не для лёгкого /health/watchdog — тот же паттерн, что GFW/direct-first.
+    if active_claude:
+        nk = _network_known_check()
+        if nk["status"] != "unknown":
+            nk_check = {"name": "известность сети (netname-мапа)",
+                        "ok": nk["status"] == "ok", "info": True, "detail": nk["detail"]}
+            checks.append(nk_check)
     # #205: DNS-резолв — ВТОРОЙ чек каскада (после «нет сети» #203, ПЕРЕД VPS-probe #196). Эпик #201
     # ситуация 4: сломанный DNS (упал dnsmasq/resolver) → _upstream_vps_reachable ложно «VPS мёртв»
     # (port_open сам резолвит hostname → gaierror → unreachable). _dns_up ПЕРЕД VPS-probe перехватывает:
