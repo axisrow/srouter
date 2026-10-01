@@ -250,6 +250,9 @@ def _machine_state_monkey(monkeypatch):
     # тот же класс, что GFW/direct-first выше (canon ⊆ versions, гвард test_machine_state_mock_guard).
     monkeypatch.setattr(health, "_no_proxy_direct_check",
                         lambda: {"status": "ok", "detail": "mock: NO_PROXY хосты напрямую ок"})
+    # Неизвестная сеть: тот же класс (canon ⊆ versions, гвард test_machine_state_mock_guard).
+    monkeypatch.setattr(health, "_network_known_check",
+                        lambda: {"status": "ok", "detail": "mock: сеть известна"})
     # #271: канон (tests/test_health.py::_all_up_monkey) расширен полным покрытием real probes
     # check_all() — дублируем сюда (гвард test_machine_state_mock_guard.py требует canon ⊆ versions).
     # Тесты этого файла, которым нужен конкретный статус этих чеков, переопределяют мок ПОСЛЕ

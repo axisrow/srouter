@@ -137,6 +137,11 @@ def _all_up_monkey(monkeypatch, *, probe_status="ok", probe_detail="runtime: к�
     # test_health_no_proxy_direct.py переопределяют мок ПОСЛЕ этого вызова (late-binding).
     monkeypatch.setattr(health, "_no_proxy_direct_check",
                         lambda: {"status": "ok", "detail": "mock: NO_PROXY хосты напрямую ок"})
+    # Неизвестная сеть: _network_known_check → diag_netprobe.current_net() делает реальный
+    # arp/ipconfig (3 subprocess) — мокаем известную сеть, тесты network-known переопределяют
+    # ПОСЛЕ этого вызова (late-binding, паттерн GFW/direct-first выше).
+    monkeypatch.setattr(health, "_network_known_check",
+                        lambda: {"status": "ok", "detail": "mock: сеть известна"})
     # #271: остальные проб check_all(), которые дёргают реальные системные API (route/ifconfig,
     # launchctl print, dscl+ps, git config, файлы settings/xray/лог) без промежуточного слоя,
     # уже замоканного выше — Codex adversarial review на PR #268 показал, что гвард
@@ -755,6 +760,47 @@ def test_check_all_has_claude_proxy_check(monkeypatch):
     result = health.check_all()
     names = [c["name"] for c in result["checks"]]
     assert any("claude" in n.lower() and "proxy" in n.lower() for n in names)
+
+
+def test_network_known_check_known_net(monkeypatch):
+    """MAC шлюза в netname-мапе → ok, info-only, detail = имя сети."""
+    monkeypatch.setattr(health.diag_netprobe, "current_net", lambda: "888-5G")
+    chk = health._network_known_check()
+    assert chk["status"] == "ok"
+    assert chk["detail"] == "888-5G"
+
+
+def test_network_known_check_unknown_net_gives_learn_command(monkeypatch):
+    """Необученная сеть (gw:<ip>:<mac>-метка) → warn-подобный info-чек с командой обучения.
+
+    SSID launchd скрывает (<redacted>) — «куда я подключен» резолвится по MAC шлюза;
+    MAC нет в мапе → новая сеть, doctor должен это сказать и дать CLI-команду.
+    """
+    monkeypatch.setattr(health.diag_netprobe, "current_net",
+                        lambda: "gw:192.168.64.254:80:5:88:42:21:64")
+    chk = health._network_known_check()
+    assert chk["status"] == "warn"
+    assert "netname" in chk["detail"], "detail обязан содержать команду обучения"
+    assert "gw:192.168.64.254" in chk["detail"]
+
+
+def test_network_known_check_no_network(monkeypatch):
+    """Нет сети вообще → unknown (не предмет этого чека — покрыто net_check)."""
+    monkeypatch.setattr(health.diag_netprobe, "current_net", lambda: None)
+    chk = health._network_known_check()
+    assert chk["status"] == "unknown"
+
+
+def test_check_all_has_network_known_check_info_only(monkeypatch):
+    """check_all включает network-known чек; unknown-сеть НЕ роняет вердикт (info-only)."""
+    _all_up_monkey(monkeypatch)
+    # late-binding: настоящий резолвер, необученная сеть
+    monkeypatch.setattr(health, "_network_known_check",
+                        lambda: {"status": "warn", "detail": "НОВАЯ сеть gw:1.2.3.4:aa:bb"})
+    result = health.check_all()
+    assert result["status"] == "ok", "неизвестная сеть — info-only, не роняет вердикт"
+    nk = [c for c in result["checks"] if "network known" in c["name"]][0]
+    assert nk.get("info") is True and nk["ok"] is False
 
 
 def test_check_all_down_when_everything_dead(monkeypatch):
