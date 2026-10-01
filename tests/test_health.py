@@ -5635,18 +5635,24 @@ def _mock_state(monkeypatch, probes):
 def test_metrics_probe_options_defaults(monkeypatch):
     import local_state
     _mock_state(monkeypatch, {})
+    defaults = local_state._DEFAULT_STATE["probes"]
     opts = health._metrics_probe_options()
     assert opts == {"enabled": True, "interval_sec": 60, "retention_days": 7,
-                    "metrics_targets": local_state._DEFAULT_STATE["probes"]["metrics_targets"]}
+                    "metrics_targets": defaults["metrics_targets"],
+                    "metrics_direct_targets": defaults["metrics_direct_targets"],
+                    "metrics_bulk_target": defaults["metrics_bulk_target"]}
 
 
 def test_metrics_probe_options_respects_config(monkeypatch):
     import local_state
     _mock_state(monkeypatch, {"metrics_enabled": False, "metrics_interval_sec": 300,
                               "metrics_retention_days": 3})
+    defaults = local_state._DEFAULT_STATE["probes"]
     opts = health._metrics_probe_options()
     assert opts == {"enabled": False, "interval_sec": 300, "retention_days": 3,
-                    "metrics_targets": local_state._DEFAULT_STATE["probes"]["metrics_targets"]}
+                    "metrics_targets": defaults["metrics_targets"],
+                    "metrics_direct_targets": defaults["metrics_direct_targets"],
+                    "metrics_bulk_target": defaults["metrics_bulk_target"]}
 
 
 def test_metrics_probe_options_clamps_garbage(monkeypatch):
@@ -5654,6 +5660,24 @@ def test_metrics_probe_options_clamps_garbage(monkeypatch):
     opts = health._metrics_probe_options()
     assert opts["interval_sec"] == 20      # чаще watchdog-тика (~20с) бессмысленно
     assert opts["retention_days"] == 1
+
+
+def test_metrics_bulk_target_strict_validator(monkeypatch):
+    """Ревью #397: мусорная строка в metrics_bulk_target — НЕ принимается (дал бы curl
+    rc 3 и мёртвый bulk-класс каждую минуту), откатывается в дефолт; валидный URL
+    с query (__down?bytes=) сохраняется как есть."""
+    import local_state
+    defaults = local_state._DEFAULT_STATE["probes"]
+    _mock_state(monkeypatch, {"metrics_bulk_target": "не url"})
+    assert health._metrics_probe_options()["metrics_bulk_target"] == \
+        defaults["metrics_bulk_target"]
+    _mock_state(monkeypatch, {"metrics_bulk_target": "ftp://x/y"})
+    assert health._metrics_probe_options()["metrics_bulk_target"] == \
+        defaults["metrics_bulk_target"]
+    _mock_state(monkeypatch, {"metrics_bulk_target":
+                              "https://speed.cloudflare.com/__down?bytes=262144"})
+    assert health._metrics_probe_options()["metrics_bulk_target"] == \
+        "https://speed.cloudflare.com/__down?bytes=262144"
 
 
 # ============================ _record_watchdog_metrics ============================
@@ -5668,6 +5692,12 @@ def _metrics_env(monkeypatch, tmp_path, probes=None):
     # (ipconfig/route/arp) — медленно и machine-dependent (канон: немоканная
     # проба = чинить изоляцию). Net-тесты перекрывают мок своим setattr.
     monkeypatch.setattr(health.diag_netprobe, "current_net", lambda: "TestNet")
+    # Классы direct/bulk (#396) мокаются: живые = сетевой трафик в юнит-тесте
+    # (канон: немоканная проба = медленно и machine-dependent). Класс-специфичные
+    # тесты перекрывают эти моки своими setattr.
+    monkeypatch.setattr(health, "_direct_up",
+                        lambda extra_targets=None: (True, "HTTP 200", []))
+    monkeypatch.setattr(health, "_bulk_probe", lambda url=None: None)
     # legacy-блок lifecycle не нужен: _record_watchdog_lifecycle закрыт autouse-фикстурой
     _ = local_state
 

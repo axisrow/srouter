@@ -90,9 +90,10 @@ _DEFAULT_STATE = {
         "metrics_interval_sec": 60,
         "metrics_retention_days": 7,
         # Мульти-таргет проба (2026-09-29): сравнение сайтов между собой. Зарубежные —
-        # через туннель (маршрут решает xray-whitelist), baidu — мимо whitelist → direct
-        # (эталон domestica). Канарейки решения — TUNNEL_TARGETS (health_probes), не этот
-        # список: вендор-блок одной цели не должен читать «туннель упал».
+        # через туннель (маршрут решает xray-whitelist). Канарейки решения — TUNNEL_TARGETS
+        # (health_probes), не этот список: вендор-блок одной цели не должен читать
+        # «туннель упал». #396: baidu из этого списка УБРАН — domestic через туннель меряет
+        # VPS→baidu, не локальный интернет; он переехал в metrics_direct_targets.
         "metrics_targets": [
             "https://api.anthropic.com/",
             "https://chatgpt.com/",
@@ -101,8 +102,18 @@ _DEFAULT_STATE = {
             "https://www.youtube.com/",
             "https://www.netflix.com/",
             "https://www.gstatic.com/generate_204",
-            "https://www.baidu.com/",
         ],
+        # #396: классы проб. direct — обычные сайты НАПРЯМУЮ (env без proxy-vars):
+        # baidu = эталон domestica, github = прямой (открыт из Китая, #206) — пара
+        # direct/tunnel по одному хосту = A/B оверхеда туннеля.
+        "metrics_direct_targets": [
+            "https://www.baidu.com/",
+            "https://github.com/",
+        ],
+        # bulk — объёмная передача через туннель: ловит reset/stall посреди загрузки
+        # (класс Forge/gh), невидимый handshake-пробам. Тот же проверенный эндпоинт,
+        # что throughput_targets выше.
+        "metrics_bulk_target": "https://speed.cloudflare.com/__down?bytes=262144",
     },
     "network": {"gateway": "", "vpn_server": "", "vpn_exit_ip": "", "channels": {}},
     "traffic_guard": {"mode": "off", "domains": {}},

@@ -18,12 +18,16 @@
   отсутствующий/битый файл и кривые строки -> пусто/None, не исключение.
 - Формат события (одна строка JSONL, ключи стабильны):
     {"timestamp": iso, "ts": epoch, "target": host|None, "code": str|None,
-     "status": ok|timeout|connection-failed|upstream-error|bad-code|no-response|down,
+     "status": ok|timeout|connection-failed|upstream-error|bad-code|no-response|down|
+               reset|stalled,
+     "kind": direct|tunnel|bulk,          # #396; строки без ключа читаются как tunnel
      "connect_ms": int|None, "tls_ms": int|None, "ttfb_ms": int|None, "total_ms": int|None,
+     "bytes_dl": int|None, "kibs": float|None,   # только bulk (size/speed_download)
      "rc": int|None, "err": str|None}
     rc/err (#315 п.5) — exit-код и stderr той же curl-пробы: сигнатуры отказов #301
     (exit 56≈8ms — xray мёртв; 35≈2s — узел отказал; 28≈4s — узел висит) видны в JSONL
-    ретроспективно. err — одна строка, ≤200 символов.
+    ретроспективно. err — одна строка, ≤200 символов. reset/stalled (#396) — bulk-класс:
+    обрыв/замирание передачи (rc 56/35/52/18; rc 28 при bytes_dl>0).
 """
 import json
 import logging
@@ -55,14 +59,15 @@ METRICS_CANARY_TARGET = "api.anthropic.com"
 # события старше retention или он дорос до max_bytes (atomic rewrite).
 # Калибровка мульти-таргета (PR #378): 9 событий/мин × ~233 Б ≈ 21 МиБ за 7 суток —
 # старые 8 МиБ держали горизонт ~2.7 сут, заявленный retention_days=7 становился враньём.
-RETENTION_MAX_BYTES = 32 * 1024 * 1024
+# #396: +3 события/мин (2 direct + 1 bulk с bytes_dl/kibs) ≈ 34 МиБ за 7 суток → лимит 48.
+RETENTION_MAX_BYTES = 48 * 1024 * 1024
 RETENTION_CHECK_INTERVAL_SEC = 3600
 
 # Читаем только хвост (bounded) через hot_routes._read_tail: файл после ротации ≤ 32 МиБ,
 # но defensive-лимит на случай внешне раздутого файла. Свои значения, не hot_routes:
-# у hot_routes свой лог и свой ритм записи (1 событие/тик), а здесь 9/мин — 90k строк
-# и 24 МиБ держат те же 7 суток, что 20k/4 МиБ держали до мульти-таргета.
-_READ_MAX_BYTES = 24 * 1024 * 1024
+# у hot_routes свой лог и свой ритм записи (1 событие/тик), а здесь 12/мин (#396) —
+# 120k строк и 32 МиБ держат те же 7 суток, что 20k/4 МиБ держали до мульти-таргета.
+_READ_MAX_BYTES = 32 * 1024 * 1024
 _READ_MAX_LINES = 100_000
 
 # Окно/пороги детектора деградации.
@@ -77,7 +82,27 @@ _RETENTION_MAX_DAYS = 90
 _EVENT_STATUSES = (
     "ok", "timeout", "connection-failed", "upstream-error",
     "bad-code", "no-response", "down",
+    # #396 bulk-класс: reset = обрыв передачи (curl rc 56/35/52/18 — класс Forge/gh),
+    # stalled = байты перестали течь при живом сокете (rc 28 при bytes_dl > 0,
+    # ловится --speed-limit/--speed-time). Флап-гейт и failure_rate трактуют их как фейл.
+    "reset", "stalled",
 )
+
+# Классы трафика пробы (#396): tunnel = зарубежное через прокси-стек (как всегда),
+# direct = обычные сайты НАПРЯМУЮ без прокси (локальный интернет), bulk = объёмная
+# передача для ловли обрывов/залипаний посреди передачи. Легаси-события без ключа
+# = tunnel (точка чтения — event_kind(), единственная).
+METRIC_KINDS = ("direct", "tunnel", "bulk")
+DEFAULT_METRIC_KIND = "tunnel"
+
+
+def event_kind(event):
+    """kind события журнала; легаси/мусор → tunnel. Единственная точка чтения kind:
+    правило «нет ключа = tunnel» закодировано один раз (канон loose-validator)."""
+    if not isinstance(event, dict):
+        return DEFAULT_METRIC_KIND
+    kind = event.get("kind")
+    return kind if kind in METRIC_KINDS else DEFAULT_METRIC_KIND
 
 
 def _now(now=None):
@@ -141,20 +166,39 @@ def build_event(timing, now=None, net=None):
         # bounded, иначе деградация сама раздувает файл метрик).
         err = " | ".join(line.strip() for line in err.splitlines() if line.strip())[:200]
     net = net.strip() if isinstance(net, str) and net.strip() else None
+    kind = raw.get("kind")
+    if kind not in METRIC_KINDS:
+        kind = DEFAULT_METRIC_KIND
     return {
         "timestamp": datetime.fromtimestamp(ts).astimezone().isoformat(),
         "ts": ts,
         "target": target,
         "code": str(code) if code is not None else None,
         "status": status,
+        "kind": kind,
         "connect_ms": _safe_ms(raw.get("connect_ms")),
         "tls_ms": _safe_ms(raw.get("tls_ms")),
         "ttfb_ms": _safe_ms(raw.get("ttfb_ms")),
         "total_ms": _safe_ms(raw.get("total_ms")),
+        # bulk-класс (#396): size_download/speed_download curl-пробы. У direct/tunnel
+        # оба None; нормализация как _safe_ms — мусор/отрицательные → None.
+        "bytes_dl": _safe_ms(raw.get("bytes_dl")),
+        "kibs": _safe_kibs(raw.get("kibs")),
         "rc": rc,
         "err": err,
         "net": net,
     }
+
+
+def _safe_kibs(value):
+    """float KB/s ≥ 0 для bulk-события; мусор → None (defensive как _safe_ms)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        kibs = round(float(value), 1)
+    except (OverflowError, ValueError):
+        return None
+    return kibs if kibs >= 0 else None
 
 
 def append_timing_event(event, log_path=None):
@@ -216,8 +260,9 @@ def read_timing_events(hours=None, max_lines=None, log_path=None, now=None):
         if ts < cutoff:
             continue
         event["ts"] = ts
-        for key in ("connect_ms", "tls_ms", "ttfb_ms", "total_ms"):
+        for key in ("connect_ms", "tls_ms", "ttfb_ms", "total_ms", "bytes_dl"):
             event[key] = _safe_ms(event.get(key))
+        event["kibs"] = _safe_kibs(event.get("kibs"))
         events.append(event)
     return events
 

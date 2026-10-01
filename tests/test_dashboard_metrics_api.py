@@ -33,6 +33,13 @@ def _no_real_proxy_errors(monkeypatch, tmp_path):
                       "total": 0, "errors": 0, "error_rate": None, "by_code": {}})
 
 
+@pytest.fixture(autouse=True)
+def _no_real_attribution(monkeypatch):
+    """Не читать реальный sidecar вердикта этой машины; тесты атрибуции мокают поверх."""
+    monkeypatch.setattr(dashboard_routes.health, "cached_attribution",
+                        lambda **kw: None)
+
+
 def _get(path):
     return dashboard.app.test_client().get(path)
 
@@ -180,3 +187,41 @@ def test_metrics_tunnel_payload_has_targets_and_canary_summary(monkeypatch):
     assert targets["github.com"]["ok_rate_1h"] == 0.0
     assert data["latest"]["failure_rate"] == 0.0, \
         "top-level summary — канареечная серия: фейлы github в неё не попадают"
+
+
+# ============================ классы проб + атрибуция (#396) ============================
+
+def test_metrics_target_rows_split_by_kind():
+    """github через туннель и напрямую — 2 ряда: A/B оверхеда туннеля виден в UI."""
+    events = [
+        _event("github.com", "ok", 60, kind="tunnel"),
+        _event("github.com", "connection-failed", 120, kind="tunnel"),
+        _event("github.com", "ok", 180, kind="direct"),
+        _event("github.com", "ok", 240, kind="direct"),
+    ]
+    rows = dashboard_routes._metrics_target_rows(events, now=_NOW)
+    by_kind = {r["kind"]: r for r in rows if r["target"] == "github.com"}
+    assert set(by_kind) == {"tunnel", "direct"}
+    assert by_kind["direct"]["ok_rate_1h"] == 1.0
+    assert by_kind["tunnel"]["ok_rate_1h"] == 0.5
+
+
+def test_metrics_payload_carries_attribution(monkeypatch):
+    """cached_attribution() пробрасывается в payload; при stale (None) поле null."""
+    _mock_events(monkeypatch, [_event("api.anthropic.com", "ok", 60)])
+    monkeypatch.setattr(dashboard_routes.health, "cached_attribution",
+                        lambda **kw: {"verdict": "ok", "culprit": "", "detail": ""})
+    data = _get("/api/metrics/tunnel").get_json()
+    assert data["attribution"]["verdict"] == "ok"
+
+
+def test_metrics_tunnel_trend_ignores_non_tunnel_kinds(monkeypatch):
+    """РЕГРЕСС #396: bulk-reset по хосту канарейки не портит top-level summary/tr trend."""
+    events = [_event("api.anthropic.com", "ok", 60 * i) for i in range(4)]
+    events += [_event("api.anthropic.com", "reset", 90, kind="bulk",
+                      bytes_dl=1024, kibs=10.0) for _ in range(4)]
+    _mock_events(monkeypatch, events)
+    data = _get("/api/metrics/tunnel").get_json()
+    assert data["latest"]["failure_rate"] == 0.0, \
+        "top-level summary — только tunnel-класс: bulk-reset в неё не попадает"
+    assert all(e.get("kind") in (None, "tunnel") for e in data["series"])
