@@ -180,6 +180,9 @@ def _passive_health(monkeypatch):
                         lambda: {"status": "info", "detail": "mock"})
     monkeypatch.setattr(health, "_gfw_domain_check",
                         lambda *a, **kw: {"status": "ok", "detail": "mock: GFW не режет"})
+    # известность сети: реальный резолвер = arp/ipconfig subprocess (#252, канон _all_up_monkey)
+    monkeypatch.setattr(health, "_network_known_check",
+                        lambda: {"status": "ok", "detail": "mock: сеть известна"})
     monkeypatch.setattr(health, "_direct_first_check",
                         lambda: {"status": "ok", "detail": "mock: direct-first reachable"})
     import local_state

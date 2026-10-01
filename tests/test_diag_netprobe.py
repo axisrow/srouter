@@ -265,3 +265,36 @@ def test_current_net_gw_hint_printed_once(monkeypatch, tmp_path, capsys):
     assert diag_netprobe.current_net() == "gw:10.0.0.1:?"
     assert diag_netprobe.current_net() == "gw:10.0.0.1:?"
     assert capsys.readouterr().err.count("netname") == 1, "подсказка одноразовая, не спам"
+
+
+# ============================ current_net_status — структурная известность ============================
+
+def test_current_net_status_known_flags_per_source(monkeypatch, tmp_path):
+    """known — структурный флаг, не парсинг метки (канон loose-validator):
+    map → known; gw → unknown; читаемый, но НЕобученный SSID → unknown (#385-дивергенция)."""
+    monkeypatch.setattr(diag_netprobe, "NETS_MAP", tmp_path / "nets.json")
+    (tmp_path / "nets.json").write_text(json.dumps(
+        {"888-5G": {"gateway": "192.168.1.1", "gateway_mac": "ac:c4:a9:ff:e0:a0"}}),
+        encoding="utf-8")
+    # 1) обученный SSID
+    monkeypatch.setattr(diag_netprobe, "read_ssid", lambda: "888-5G")
+    assert diag_netprobe.current_net_status() == {"label": "888-5G", "known": True, "source": "ssid"}
+    # 2) необученный, но читаемый SSID — НЕ ложный ok
+    monkeypatch.setattr(diag_netprobe, "read_ssid", lambda: "NewCafe")
+    st = diag_netprobe.current_net_status()
+    assert st["known"] is False and st["label"] == "NewCafe"
+    # 3) map-ветка
+    monkeypatch.setattr(diag_netprobe, "read_ssid", lambda: None)
+    monkeypatch.setattr(diag_netprobe, "_physical_gateway", lambda: ("192.168.1.1", "en0"))
+    monkeypatch.setattr(diag_netprobe, "_gateway_mac", lambda ip: "ac:c4:a9:ff:e0:a0")
+    st = diag_netprobe.current_net_status()
+    assert st == {"label": "888-5G", "known": True, "source": "map"}
+    # 4) gw-ветка
+    monkeypatch.setattr(diag_netprobe, "_physical_gateway", lambda: ("10.0.0.1", "en0"))
+    monkeypatch.setattr(diag_netprobe, "_gateway_mac", lambda ip: "aa:bb")
+    diag_netprobe._GW_HINTED.clear()
+    st = diag_netprobe.current_net_status()
+    assert st["known"] is False and st["source"] == "gw"
+    # 5) нет сети
+    monkeypatch.setattr(diag_netprobe, "_physical_gateway", lambda: (None, None))
+    assert diag_netprobe.current_net_status() is None
