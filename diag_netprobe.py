@@ -341,6 +341,7 @@ def _canary_tunnel_events(events):
     Чистая функция, не бросает."""
     return [e for e in events
             if isinstance(e, dict)
+            and metrics_store.event_kind(e) == "tunnel"  # #396: direct того же хоста — не туннельное окно
             and e.get("target") in (None, metrics_store.METRICS_CANARY_TARGET)]
 
 

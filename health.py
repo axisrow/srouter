@@ -31,6 +31,7 @@ import socket  # noqa: F401 — re-export для monkeypatch health.socket.getad
 import subprocess
 import sys as _sys
 import time  # noqa: F401 — re-export для monkeypatch health.time.sleep (health_codenv._codenv_unloaded_is_persistent)
+import urllib.parse  # _bulk_target_or: строгий отбор URL bulk-цели (ревью #397)
 
 import local_state  # noqa: F401 — re-export для monkeypatch health.local_state.* (health_probes/health_endpoint)
 import diag_netprobe  # атрибуция деградации (leg_snapshots/diagnose_degradation) — top-level безопасен
@@ -151,7 +152,7 @@ def _tunnel_window_stats(now=None, log_path=None):
         # гейт должен видеть ту же серию, что и проба решения.
         # #396 kind-guard (защита в глубину): reset/stalled bulk-класса и direct-события
         # не раздувает failure_rate флап-гейта, даже если их target совпадёт с канарейкой —
-        # класс решает event_kind, не хост (регресс-тест test_probe_classes_wiring.py).
+        # класс решает event_kind, не хост (регресс-тест tests/test_probe_classes.py).
         events = [e for e in events
                   if not isinstance(e, dict)
                   or (metrics_store.event_kind(e) == "tunnel"
@@ -220,7 +221,8 @@ def _tunnel_parameter_note(now=None):
         # атрибуции деградации туннеля — тот же фильтр, что у flap-гейта.
         events = [e for e in metrics_store.read_timing_events(now=now)
                   if not isinstance(e, dict)
-                  or e.get("target") in (None, metrics_store.METRICS_CANARY_TARGET)]
+                  or (metrics_store.event_kind(e) == "tunnel"  # #396: direct-события того же хоста — не туннельная деградация
+                      and e.get("target") in (None, metrics_store.METRICS_CANARY_TARGET))]
         summary = metrics_store.summarize(events)
         legs = diag_netprobe.leg_snapshots(now=now)
         diag = diag_netprobe.diagnose_degradation(summary, legs)
@@ -815,9 +817,17 @@ def _metrics_probe_options(state_path=None):
 
 
 def _bulk_target_or(raw, fallback):
-    """URL bulk-цели или fallback; непустая строка/None (defensive, как normalize_http_targets)."""
-    if isinstance(raw, str) and raw.strip():
-        return raw.strip()
+    """URL bulk-цели или fallback. Строгий отбор (канон loose-validator): схема http(s)
+    + hostname — мусорная строка дала бы curl rc 3 и «мёртвый» bulk-класс каждую минуту.
+    Правило то же, что local_state.normalize_http_targets (схема+host), без ре-нормализации
+    пути (?bytes= должен выжить)."""
+    if isinstance(raw, str):
+        try:
+            parts = urllib.parse.urlsplit(raw.strip())
+        except ValueError:
+            parts = None
+        if parts is not None and parts.scheme in ("http", "https") and parts.hostname:
+            return raw.strip()
     return fallback if isinstance(fallback, str) and fallback.strip() else None
 
 
@@ -900,27 +910,42 @@ def _record_watchdog_metrics(result):
 
         # #396 классы direct/bulk: тот же записывающий тик, та же net-метка. Каждый класс
         # в своём try/except — сбой одной пробы не отменяет запись остальных (fail-soft,
-        # как сам _record_watchdog_metrics). Пробы ДОБАВЛЯЮТСЯ к уже сделанному сетевому
-        # трафику тика: +2 HEAD (direct, ≤8с параллельно) + 1 bulk GET (≤15с+2 grace).
+        # как сам _record_watchdog_metrics). Оба класса В ПАРАЛЛЕЛЬНОМ пуле (ревью #397):
+        # последовательно это +27с к тику под flock при блэкауте — пуши задерживаются,
+        # соседние 20с-тики пропускаются по LOCK_NB; параллельно худший случай +17с.
+        direct_exc = bulk_exc = None
+        direct_timings = bulk_timing = None
         try:
-            _direct_ok, _direct_detail, direct_timings = _direct_up(
-                extra_targets=opts.get("metrics_direct_targets") or None)
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                fut_d = pool.submit(
+                    _direct_up, extra_targets=opts.get("metrics_direct_targets") or None)
+                fut_b = pool.submit(
+                    _bulk_probe, url=opts.get("metrics_bulk_target") or None)
+                try:
+                    _, _, direct_timings = fut_d.result()
+                except (OSError, ValueError, TypeError) as exc:
+                    direct_exc = exc
+                try:
+                    bulk_timing = fut_b.result()
+                except (OSError, ValueError, TypeError) as exc:
+                    bulk_exc = exc
+        except (OSError, ValueError, TypeError, RuntimeError) as exc:
+            bulk_exc = exc  # пул недоступен — классы пропущены, тик продолжает работу
+        if direct_exc is not None:
+            _log.debug("direct-probe metrics failed: %s — класс пропущен", direct_exc)
+        else:
             for entry in direct_timings or []:
                 if isinstance(entry, dict):
                     metrics_store.append_timing_event(
                         metrics_store.build_event(entry, now=now, net=net))
-        except (OSError, ValueError, TypeError) as exc:
-            _log.debug("direct-probe metrics failed: %s — класс пропущен", exc)
-        try:
-            bulk_timing = _bulk_probe(
-                url=opts.get("metrics_bulk_target") or None)
+        if bulk_exc is not None:
+            _log.debug("bulk-probe metrics failed: %s — класс пропущен", bulk_exc)
+        elif bulk_timing:
             # falsy = проба не состоялась (мок/деградация) — мусорное unknown-событие
             # в туннельный класс не пишем.
-            if bulk_timing:
-                metrics_store.append_timing_event(
-                    metrics_store.build_event(bulk_timing, now=now, net=net))
-        except (OSError, ValueError, TypeError) as exc:
-            _log.debug("bulk-probe metrics failed: %s — класс пропущен", exc)
+            metrics_store.append_timing_event(
+                metrics_store.build_event(bulk_timing, now=now, net=net))
 
         if now - _state_float(state, "last_rotate") >= metrics_store.RETENTION_CHECK_INTERVAL_SEC:
             metrics_store.rotate_metrics_log(retention_days=opts["retention_days"])
@@ -950,7 +975,6 @@ def _record_watchdog_metrics(result):
 ATTRIB_WINDOW_SEC = 600
 ATTRIB_MIN_SAMPLES = 4
 ATTRIB_RATE_BAD = 0.5
-ATTRIB_CLASS_ALIVE = 0.8
 
 
 def _attribution_from_events(events, now=None):
@@ -979,13 +1003,21 @@ def _attribution_from_events(events, now=None):
     def _rates(kinds):
         sel = [e for e in win if metrics_store.event_kind(e) in kinds]
         ok_n = sum(1 for e in sel if e.get("status") == "ok")
-        to_n = sum(1 for e in sel if e.get("status") in ("timeout", "no-response"))
+        # «Молчание» = классический timeout ИЛИ curl rc 28 (его же --max-time убил
+        # процесс до kill'а sys_probe → статус connection-failed с кодом 000 — ревью
+        # #397: живой стенд accept-и-молчит дал именно connection-failed/rc28; статус
+        # timeout в туннельном классе в проде почти не возникает).
+        to_n = sum(1 for e in sel
+                   if e.get("status") in ("timeout", "no-response")
+                   or (e.get("status") == "connection-failed" and e.get("rc") == 28))
         return ok_n, len(sel), to_n
 
     d_ok, d_n, _ = _rates(("direct",))
     t_ok, t_n, t_to = _rates(("tunnel",))
+    # bulk-«не донёс»: обрыв/стоп байтов/не стартовало при живых handshake. Порог 2:
+    # одиночный транзиентный rc — шум, вердикт он не разворачивает (как и прочие rate-правила).
     bulk_bad = sum(1 for e in win if metrics_store.event_kind(e) == "bulk"
-                   and e.get("status") in ("reset", "stalled"))
+                   and e.get("status") in ("reset", "stalled", "timeout"))
     dir_rate = d_ok / d_n if d_n else None
     tun_rate = t_ok / t_n if t_n else None
     tun_to_rate = t_to / t_n if t_n else None
@@ -1027,9 +1059,9 @@ def _attribution_from_events(events, now=None):
             tgt, ok_n, n = min(bad, key=lambda x: x[1] / x[2])
             verdict, culprit = "site", tgt
             detail = f"{tgt}: ok {ok_n}/{n} за 1ч при живых классах"
-        elif bulk_bad:
+        elif bulk_bad >= 2:
             verdict, culprit = "channel", "потери посреди передачи"
-            detail = f"bulk reset/stalled ×{bulk_bad} за 10м при живых handshake"
+            detail = f"bulk reset/stalled/timeout ×{bulk_bad} за 10м при живых handshake"
         else:
             detail = f"прямые {d_ok}/{d_n}, туннель {t_ok}/{t_n} за 10м"
     return {"verdict": verdict, "culprit": culprit, "detail": detail,
@@ -1115,7 +1147,9 @@ def _print_report(result):
     # (provider / chain-wedge / tunnel / site / channel), свежестью ≤5м. unknown/нет
     # данных → строка не печатается (fail-open, не гадаем).
     attr = cached_attribution()
-    if isinstance(attr, dict) and attr.get("verdict") not in (None, "unknown"):
+    # ok тоже молчим: строка «что тормозит: ok» читается как оксюморон (ревью #397);
+    # зелёный ok виден в UI-панели, doctor резервирует строку под проблему.
+    if isinstance(attr, dict) and attr.get("verdict") not in (None, "unknown", "ok"):
         _v, _c, _d = attr.get("verdict"), attr.get("culprit") or "", attr.get("detail") or ""
         line = f"\nЧто тормозит: {_v}" + (f" — {_c}" if _c else "") + (f" ({_d})" if _d else "")
         print(line)

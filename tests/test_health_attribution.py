@@ -49,24 +49,38 @@ def test_attribution_direct_down_says_provider():
 
 
 def test_attribution_tunnel_timeouts_with_direct_ok_says_wedge():
-    """direct жив, туннель молчит (timeout/no-response) — сигнатура застрявшего стека."""
+    """direct жив, туннель молчит — сигнатура застрявшего стека. ПРОД-shape (ревью #397):
+    curl убивается собственным --max-time раньше kill'а sys_probe → статус
+    connection-failed c rc 28 и кодом 000, НЕ литеральный "timeout"."""
     out = _events(tunnel=(2, 8), direct=(10, 0))
     for e in out:
         if e["kind"] == "tunnel" and e["status"] != "ok":
-            e["status"] = "timeout"
+            e["status"] = "connection-failed"
             e["rc"] = 28
+            e["code"] = "000"
     attr = health._attribution_from_events(out, now=NOW)
     assert attr["verdict"] == "chain-wedge"
     assert attr["chain_wedge"] is True
     assert "privoxy" in attr["detail"] or "рестарт" in attr["detail"]
 
 
+def test_attribution_classic_timeout_status_still_counts_as_silence():
+    """Литеральный timeout/no-response (легаси-путь) тоже считается «молчанием»."""
+    out = _events(tunnel=(2, 8), direct=(10, 0))
+    for e in out:
+        if e["kind"] == "tunnel" and e["status"] != "ok":
+            e["status"] = "timeout"
+    assert health._attribution_from_events(out, now=NOW)["verdict"] == "chain-wedge"
+
+
 def test_attribution_tunnel_resets_with_direct_ok_says_tunnel():
-    """direct жив, туннель рвётся соединениями (000/connection-failed) — VPS/DPI."""
+    """direct жив, туннель рвётся соединениями (rc 7 — быстрый отказ) — VPS/DPI,
+    НЕ залипание: rc≠28 не считается молчанием (дискриминатор P1-фикса #397)."""
     out = _events(tunnel=(2, 8), direct=(10, 0))
     for e in out:
         if e["kind"] == "tunnel" and e["status"] != "ok":
             e["status"] = "connection-failed"
+            e["rc"] = 7
             e["code"] = "000"
     attr = health._attribution_from_events(out, now=NOW)
     assert attr["verdict"] == "tunnel"

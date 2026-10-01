@@ -5662,6 +5662,24 @@ def test_metrics_probe_options_clamps_garbage(monkeypatch):
     assert opts["retention_days"] == 1
 
 
+def test_metrics_bulk_target_strict_validator(monkeypatch):
+    """Ревью #397: мусорная строка в metrics_bulk_target — НЕ принимается (дал бы curl
+    rc 3 и мёртвый bulk-класс каждую минуту), откатывается в дефолт; валидный URL
+    с query (__down?bytes=) сохраняется как есть."""
+    import local_state
+    defaults = local_state._DEFAULT_STATE["probes"]
+    _mock_state(monkeypatch, {"metrics_bulk_target": "не url"})
+    assert health._metrics_probe_options()["metrics_bulk_target"] == \
+        defaults["metrics_bulk_target"]
+    _mock_state(monkeypatch, {"metrics_bulk_target": "ftp://x/y"})
+    assert health._metrics_probe_options()["metrics_bulk_target"] == \
+        defaults["metrics_bulk_target"]
+    _mock_state(monkeypatch, {"metrics_bulk_target":
+                              "https://speed.cloudflare.com/__down?bytes=262144"})
+    assert health._metrics_probe_options()["metrics_bulk_target"] == \
+        "https://speed.cloudflare.com/__down?bytes=262144"
+
+
 # ============================ _record_watchdog_metrics ============================
 
 def _metrics_env(monkeypatch, tmp_path, probes=None):

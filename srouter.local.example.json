@@ -53,9 +53,13 @@
       "https://www.youtube.com/",
       "https://www.netflix.com/",
       "https://www.gstatic.com/generate_204",
-      "https://www.baidu.com/",
       "https://api.z.ai/"
-    ]
+    ],
+    "metrics_direct_targets": [
+      "https://www.baidu.com/",
+      "https://github.com/"
+    ],
+    "metrics_bulk_target": "https://speed.cloudflare.com/__down?bytes=262144"
   },
   "network": {
     "gateway": "192.0.2.1",

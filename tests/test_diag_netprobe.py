@@ -182,13 +182,15 @@ def test_canary_tunnel_events_keeps_canary_and_legacy_only():
         {"target": "www.netflix.com", "status": "ok", "ts": 2.0},
         {"target": None, "status": "down", "ts": 3.0},
         {"ts": 4.0, "status": "ok"},                 # без ключа target = legacy
+        {"target": "api.anthropic.com", "status": "ok", "ts": 5.0, "kind": "direct"},
         "мусор-строка",
         42,
     ]
     out = diag_netprobe._canary_tunnel_events(events)
     targets = [e.get("target") for e in out]
     assert targets == ["api.anthropic.com", None, None], \
-        "вендор-цели вырезаны, канарейка и legacy-события остались"
+        "вендор-цели и direct-класс того же хоста (#396 A/B) вырезаны; " \
+        "канарейка и legacy-события остались"
 
 
 def test_blackout_windows_ignore_foreign_targets(monkeypatch, tmp_path):
