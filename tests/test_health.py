@@ -132,6 +132,11 @@ def _all_up_monkey(monkeypatch, *, probe_status="ok", probe_detail="runtime: к�
                         lambda *a, **kw: {"status": "ok", "detail": "mock: GFW не режет"})
     monkeypatch.setattr(health, "_direct_first_check",
                         lambda: {"status": "ok", "detail": "mock: direct-first reachable"})
+    # Инцидент 2026-10-01 (agy login): _no_proxy_direct_check (active_claude-путь) делает реальный
+    # прямой curl per-host NO_PROXY — тот же класс, что GFW/direct-first моки выше (#252): тесты
+    # test_health_no_proxy_direct.py переопределяют мок ПОСЛЕ этого вызова (late-binding).
+    monkeypatch.setattr(health, "_no_proxy_direct_check",
+                        lambda: {"status": "ok", "detail": "mock: NO_PROXY хосты напрямую ок"})
     # #271: остальные проб check_all(), которые дёргают реальные системные API (route/ifconfig,
     # launchctl print, dscl+ps, git config, файлы settings/xray/лог) без промежуточного слоя,
     # уже замоканного выше — Codex adversarial review на PR #268 показал, что гвард

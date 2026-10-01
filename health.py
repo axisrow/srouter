@@ -562,6 +562,17 @@ def check_all(*, active_claude=False):
         df_check = {"name": "direct-first (NO_PROXY reachable)",
                     "ok": df["status"] == "ok", "info": True, "detail": df["detail"]}
         checks.append(df_check)
+        # Инцидент 2026-10-01 (agy login): '.googleapis.com' в env NO_PROXY (settings.json) →
+        # процессы CC-сессий ходили на oauth2.googleapis.com напрямую и умирали по GFW. Хост в
+        # NO_PROXY, недоступный напрямую при активном прокси, — warn-driver (ломает ДЕТЕЙ CC,
+        # сам канал жив); unknown (нет прямой сети/битый settings) — info-only. gate под
+        # active_claude (doctor-only): per-host прямой curl, не для лёгкого /health/watchdog.
+        npd = _no_proxy_direct_check()
+        npd_check = {"name": "NO_PROXY direct-reachable (settings.json env)",
+                     "ok": npd["status"] == "ok", "detail": npd["detail"]}
+        if npd["status"] == "unknown":
+            npd_check["info"] = True
+        checks.append(npd_check)
     drivers = [c for c in checks if not c.get("info")]
     all_ok = all(c["ok"] for c in drivers)
     any_ok = any(c["ok"] for c in drivers)
