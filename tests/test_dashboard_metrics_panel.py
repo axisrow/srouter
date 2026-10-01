@@ -24,7 +24,8 @@ var _KEYS = {
   metrics_trend_stable: 'стабильно', metrics_trend_degraded: 'деградация',
   metrics_trend_insufficient: 'мало данных',
   metrics_baseline_hour: 'тот же час прошлых дней',
-  metrics_baseline_trail: '2–24 ч назад', metrics_baseline_none: 'базы ещё нет'
+  metrics_baseline_trail: '2–24 ч назад', metrics_baseline_none: 'базы ещё нет',
+  metrics_attrib: 'что тормозит:', metrics_targets_kind: 'класс'
 };
 var I18N = { ru: _KEYS, en: _KEYS };
 function t(key) {
@@ -132,3 +133,59 @@ def test_metrics_targets_escapes_host_html():
                            "ok_rate_24h": 1.0, "tls_ms": 1, "ttfb_ms": 1, "last_status": "ok"}])
     assert "<script>" not in html
     assert "&lt;script&gt;" in html
+
+
+# ============================ атрибуция «что тормозит» + классы (#396) ============================
+
+def _attr_call(payload):
+    return _call("attributionHtml", [json.dumps(payload, ensure_ascii=False)])
+
+
+def test_attribution_hidden_when_null_or_unknown():
+    """Fail-open: нет кэша или выборка мала — строка не рендерится, UI не гадает."""
+    assert _attr_call(None) == ""
+    assert _attr_call({"verdict": "unknown", "culprit": None, "detail": "мало"}) == ""
+
+
+def test_attribution_ok_renders_green_with_detail():
+    html = _attr_call({"verdict": "ok", "culprit": None,
+                       "detail": "прямые 10/10, туннель 9/10 за 10м"})
+    assert "text-success" in html
+    assert "что тормозит:" in html
+    assert "прямые 10/10" in html
+
+
+def test_attribution_problem_renders_red_with_culprit():
+    html = _attr_call({"verdict": "chain-wedge",
+                       "culprit": "залипание прокси-стека (privoxy/xray)",
+                       "detail": "via-proxy молчит при живом direct"})
+    assert "text-danger" in html
+    assert "залипание прокси-стека" in html and "via-proxy молчит" in html
+    assert "рестарт" not in html.split("via-proxy")[0], "кульпит первым — это заголовок строки"
+
+
+def test_attribution_site_renders_warning():
+    html = _attr_call({"verdict": "site", "culprit": "netflix.com", "detail": "ok 1/7 за 1ч"})
+    assert "text-warning" in html and "netflix.com" in html
+
+
+def test_attribution_escapes_server_text():
+    """Поле culprit идёт из sidecar-state — экранируем на всякий случай (fail-safe UI)."""
+    html = _attr_call({"verdict": "site", "culprit": "<img onerror=x>", "detail": ""})
+    assert "<img" not in html
+    assert "&lt;img" in html
+
+
+def test_metrics_targets_kind_column_class_vs_direct():
+    """#396: колонка «класс» различает tunnel/direct; легаси-ряд без kind = tunnel."""
+    html = _targets_call([
+        {"target": "github.com", "kind": "tunnel", "ok_rate_1h": 0.5, "ok_rate_24h": 0.9,
+         "tls_ms": None, "ttfb_ms": None, "last_status": "ok"},
+        {"target": "github.com", "kind": "direct", "ok_rate_1h": 1.0, "ok_rate_24h": 1.0,
+         "tls_ms": 30, "ttfb_ms": 10, "last_status": "ok"},
+        {"target": "legacy.example", "ok_rate_1h": 1.0, "ok_rate_24h": 1.0,
+         "tls_ms": 1, "ttfb_ms": 1, "last_status": "ok"},
+    ])
+    assert "класс" in html
+    assert html.count(">github.com<") == 2, "одна цель, два класса — два ряда"
+    assert ">direct<" in html and ">tunnel<" in html

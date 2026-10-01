@@ -1698,13 +1698,19 @@ def test_sync_endpoint_writes_to_active_node_not_disabled(tmp_path):
 # ============================ metrics_targets: мульти-таргет проба (2026-09-29) ============================
 
 def test_default_state_has_metrics_targets():
-    """Дефолтный список целей metrics-пробы: зарубежные сайты пользователя + китайский
-    эталон (baidu идёт мимо whitelist → direct — сравнение «туннель vs domestica»)."""
-    targets = local_state._DEFAULT_STATE["probes"]["metrics_targets"]
-    assert isinstance(targets, list) and len(targets) >= 8
+    """Дефолтный список целей metrics-пробы: только зарубежные (через туннель).
+    #396: baidu уехал в metrics_direct_targets — domestic в tunnel-классе мерял
+    не то (прокси-стек вместо локальной сети)."""
+    probes = local_state._DEFAULT_STATE["probes"]
+    targets = probes["metrics_targets"]
+    assert isinstance(targets, list) and len(targets) >= 7
     assert all(isinstance(u, str) and u.startswith("https://") for u in targets)
-    assert any("baidu" in u for u in targets), "китайский сайт-эталон в дефолте"
+    assert all("baidu" not in u for u in targets), "domestic — только в direct-классе"
     assert any("anthropic" in u for u in targets), "канареечная серия остаётся в списке"
+    direct = probes["metrics_direct_targets"]
+    assert any("baidu" in u for u in direct), "китайский эталон меряется напрямую"
+    assert any("github" in u for u in direct), "github в обоих классах — A/B оверхеда туннеля"
+    assert "cloudflare" in probes["metrics_bulk_target"], "bulk — объёмная передача через туннель"
 
 
 def test_normalize_http_targets_drops_junk_keeps_order():

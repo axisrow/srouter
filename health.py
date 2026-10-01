@@ -149,9 +149,13 @@ def _tunnel_window_stats(now=None, log_path=None):
         # Мульти-таргет (2026-09-29): гейт считает только канарейку (+legacy None-события).
         # Фейл вендора (netflix) — не «туннель флапает»: OR-семантика пробы решает это,
         # гейт должен видеть ту же серию, что и проба решения.
+        # #396 kind-guard (защита в глубину): reset/stalled bulk-класса и direct-события
+        # не раздувает failure_rate флап-гейта, даже если их target совпадёт с канарейкой —
+        # класс решает event_kind, не хост (регресс-тест test_probe_classes_wiring.py).
         events = [e for e in events
                   if not isinstance(e, dict)
-                  or e.get("target") in (None, metrics_store.METRICS_CANARY_TARGET)]
+                  or (metrics_store.event_kind(e) == "tunnel"
+                      and e.get("target") in (None, metrics_store.METRICS_CANARY_TARGET))]
         now_ts = metrics_store._now(now)
         window = []
         for event in events:
@@ -802,7 +806,19 @@ def _metrics_probe_options(state_path=None):
         # local_state (один источник с reachability_targets); мусор → дефолт схемы.
         "metrics_targets": local_state.normalize_http_targets(
             raw.get("metrics_targets"), defaults.get("metrics_targets", [])),
+        # #396: классы проб — direct (мимо прокси) и bulk (объёмная передача).
+        "metrics_direct_targets": local_state.normalize_http_targets(
+            raw.get("metrics_direct_targets"), defaults.get("metrics_direct_targets", [])),
+        "metrics_bulk_target": _bulk_target_or(
+            raw.get("metrics_bulk_target"), defaults.get("metrics_bulk_target")),
     }
+
+
+def _bulk_target_or(raw, fallback):
+    """URL bulk-цели или fallback; непустая строка/None (defensive, как normalize_http_targets)."""
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return fallback if isinstance(fallback, str) and fallback.strip() else None
 
 
 def _read_watchdog_state(path):
@@ -882,6 +898,30 @@ def _record_watchdog_metrics(result):
                     now=now, net=net)
             metrics_store.append_timing_event(event)
 
+        # #396 классы direct/bulk: тот же записывающий тик, та же net-метка. Каждый класс
+        # в своём try/except — сбой одной пробы не отменяет запись остальных (fail-soft,
+        # как сам _record_watchdog_metrics). Пробы ДОБАВЛЯЮТСЯ к уже сделанному сетевому
+        # трафику тика: +2 HEAD (direct, ≤8с параллельно) + 1 bulk GET (≤15с+2 grace).
+        try:
+            _direct_ok, _direct_detail, direct_timings = _direct_up(
+                extra_targets=opts.get("metrics_direct_targets") or None)
+            for entry in direct_timings or []:
+                if isinstance(entry, dict):
+                    metrics_store.append_timing_event(
+                        metrics_store.build_event(entry, now=now, net=net))
+        except (OSError, ValueError, TypeError) as exc:
+            _log.debug("direct-probe metrics failed: %s — класс пропущен", exc)
+        try:
+            bulk_timing = _bulk_probe(
+                url=opts.get("metrics_bulk_target") or None)
+            # falsy = проба не состоялась (мок/деградация) — мусорное unknown-событие
+            # в туннельный класс не пишем.
+            if bulk_timing:
+                metrics_store.append_timing_event(
+                    metrics_store.build_event(bulk_timing, now=now, net=net))
+        except (OSError, ValueError, TypeError) as exc:
+            _log.debug("bulk-probe metrics failed: %s — класс пропущен", exc)
+
         if now - _state_float(state, "last_rotate") >= metrics_store.RETENTION_CHECK_INTERVAL_SEC:
             metrics_store.rotate_metrics_log(retention_days=opts["retention_days"])
             # PR-4 #339 (D2): тот же hourly-гейт крутит и watchdog-журналы (при
@@ -891,8 +931,149 @@ def _record_watchdog_metrics(result):
 
         state["last_write"] = now
         _write_watchdog_state(WATCHDOG_METRICS_STATE, state)
+        # #396 вердикт «что тормозит» — на том же write-тике: события уже в журнале,
+        # снапшот читает хвост и кладёт verdict в sidecar (Flask читает cached_attribution).
+        _attribution_snapshot(now=now)
     except (OSError, ValueError, TypeError, KeyError) as exc:
         _log.debug("watchdog metrics recording failed: %s — метрики пропущены", exc)
+
+
+# ============================ #396: атрибуция «что тормозит» ============================
+# Пользовательская боль (issue #396): «всё работает, а дашборд красный» — вердикт по
+# разовым handshake-пробам шумит, а реальные классы отказов (обрыв/залипание передачи,
+# локальный интернет) не измерялись вовсе. Вердикт строится по ОКНУ 10 минут (разовый
+# фейл rate не двигает) из трёх классов событий metrics.jsonl:
+#   direct-down → провайдер; direct-ok + tunnel-молчание (rc 28) → залипание прокси-стека;
+#   direct-ok + tunnel-обрывы → туннель/VPS/DPI; живые классы + мёртвая цель → сайт;
+#   живые handshake + bulk reset/stall → потери посреди передачи. Fail-open: мало выборки
+# → unknown (UI молчит, не гадает). Observe-only: ремедиация — текст в detail, вручную.
+ATTRIB_WINDOW_SEC = 600
+ATTRIB_MIN_SAMPLES = 4
+ATTRIB_RATE_BAD = 0.5
+ATTRIB_CLASS_ALIVE = 0.8
+
+
+def _attribution_from_events(events, now=None):
+    """Чистый вердикт «что тормозит» из событий metrics.jsonl (#396). Не бросает.
+
+    Возвращает {verdict: ok|provider|chain-wedge|tunnel|site|channel|unknown,
+                culprit, detail, chain_wedge: bool, rates: {...}, samples: {...},
+                computed_ts}. Правила — по первому совпавшему (порядок = приоритет
+                атрибуции: провайдер объясняет всё, поэтому проверяется первым).
+    """
+    now_ts = metrics_store._now(now)
+    win, hour = [], []
+    for e in events or []:
+        if not isinstance(e, dict):
+            continue
+        try:
+            age = now_ts - float(e.get("ts") or 0)
+        except (TypeError, ValueError):
+            continue
+        if age < 0 or age > 3600:
+            continue
+        hour.append(e)
+        if age <= ATTRIB_WINDOW_SEC:
+            win.append(e)
+
+    def _rates(kinds):
+        sel = [e for e in win if metrics_store.event_kind(e) in kinds]
+        ok_n = sum(1 for e in sel if e.get("status") == "ok")
+        to_n = sum(1 for e in sel if e.get("status") in ("timeout", "no-response"))
+        return ok_n, len(sel), to_n
+
+    d_ok, d_n, _ = _rates(("direct",))
+    t_ok, t_n, t_to = _rates(("tunnel",))
+    bulk_bad = sum(1 for e in win if metrics_store.event_kind(e) == "bulk"
+                   and e.get("status") in ("reset", "stalled"))
+    dir_rate = d_ok / d_n if d_n else None
+    tun_rate = t_ok / t_n if t_n else None
+    tun_to_rate = t_to / t_n if t_n else None
+
+    verdict, culprit, detail = "ok", None, None
+    if (t_n + d_n) < ATTRIB_MIN_SAMPLES:
+        verdict, detail = "unknown", f"выборка окна < {ATTRIB_MIN_SAMPLES} (fail-open)"
+    elif d_n >= ATTRIB_MIN_SAMPLES and dir_rate is not None and dir_rate < ATTRIB_RATE_BAD:
+        verdict, culprit = "provider", "локальная сеть/провайдер"
+        detail = f"прямые сайты {d_ok}/{d_n} за 10м"
+    elif tun_rate is not None and tun_rate < ATTRIB_RATE_BAD:
+        if (d_n >= ATTRIB_MIN_SAMPLES and dir_rate is not None
+                and dir_rate >= ATTRIB_RATE_BAD
+                and tun_to_rate is not None and tun_to_rate >= ATTRIB_RATE_BAD):
+            verdict, culprit = "chain-wedge", "залипание прокси-стека (privoxy/xray)"
+            detail = (f"via-proxy молчит (timeout {t_to}/{t_n} за 10м) при живом direct "
+                      f"({d_ok}/{d_n}); форензика: srouter privoxy status / launchctl print, "
+                      f"затем рестарт privoxy/xray руками")
+        else:
+            verdict, culprit = "tunnel", "туннель/VPS/DPI"
+            detail = f"туннель ok {t_ok}/{t_n} за 10м"
+            if d_n < ATTRIB_MIN_SAMPLES:
+                detail += "; прямая проба ещё набирает выборку — провайдер не исключён"
+    else:
+        per_target = {}
+        for e in hour:
+            if metrics_store.event_kind(e) != "tunnel":
+                continue
+            tgt = e.get("target")
+            if not tgt:
+                continue
+            acc = per_target.setdefault(tgt, [0, 0])
+            acc[1] += 1
+            if e.get("status") == "ok":
+                acc[0] += 1
+        bad = [(t, ok, n) for t, (ok, n) in per_target.items()
+               if n >= 3 and ok / n < ATTRIB_RATE_BAD]
+        if bad:
+            tgt, ok_n, n = min(bad, key=lambda x: x[1] / x[2])
+            verdict, culprit = "site", tgt
+            detail = f"{tgt}: ok {ok_n}/{n} за 1ч при живых классах"
+        elif bulk_bad:
+            verdict, culprit = "channel", "потери посреди передачи"
+            detail = f"bulk reset/stalled ×{bulk_bad} за 10м при живых handshake"
+        else:
+            detail = f"прямые {d_ok}/{d_n}, туннель {t_ok}/{t_n} за 10м"
+    return {"verdict": verdict, "culprit": culprit, "detail": detail,
+            "chain_wedge": verdict == "chain-wedge",
+            "rates": {"direct": dir_rate, "tunnel": tun_rate,
+                      "tunnel_timeout": tun_to_rate},
+            "samples": {"direct": d_n, "tunnel": t_n, "bulk_bad": bulk_bad},
+            "computed_ts": now_ts}
+
+
+def _attribution_snapshot(now=None, log_path=None, state_path=None):
+    """Посчитать вердикт по хвосту metrics.jsonl и положить в sidecar-state (write-тик).
+
+    Хвост bounded (тот же паттерн, что _tunnel_window_stats: строк с запасом на цели).
+    Best-effort: сбой → None, state не трогаем. Не бросает.
+    """
+    try:
+        max_lines = 240 * (1 + len(_metrics_probe_options()["metrics_targets"]))
+        events = metrics_store.read_timing_events(
+            hours=1, max_lines=max_lines, log_path=log_path, now=now)
+        attr = _attribution_from_events(events, now=now)
+        state = _read_watchdog_state(state_path or WATCHDOG_METRICS_STATE)
+        state["attribution"] = attr
+        if _write_watchdog_state(state_path or WATCHDOG_METRICS_STATE, state):
+            return attr
+        return None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def cached_attribution(max_age_sec=300, state_path=None, now=None):
+    """Вердикт атрибуции из sidecar-state для Flask/doctor. None = нет/устарел (UI молчит)."""
+    try:
+        attr = _read_watchdog_state(state_path or WATCHDOG_METRICS_STATE).get("attribution")
+        if not isinstance(attr, dict):
+            return None
+        ts = attr.get("computed_ts")
+        if not isinstance(ts, (int, float)):
+            return None
+        if metrics_store._now(now) - float(ts) > max_age_sec:
+            return None
+        return attr
+    except (OSError, ValueError, TypeError):
+        return None
 
 
 def _rotate_watchdog_journals():
@@ -930,6 +1111,14 @@ def _print_report(result):
             mark = "⚠️" if c.get("info") else "❌"
         detail = f" ({c['detail']})" if c.get("detail") else ""
         print(f"  {mark} {c['name']}{detail}")
+    # #396 ответ на первый взгляд: «что тормозит» — класс-вердикт из окна 10м
+    # (provider / chain-wedge / tunnel / site / channel), свежестью ≤5м. unknown/нет
+    # данных → строка не печатается (fail-open, не гадаем).
+    attr = cached_attribution()
+    if isinstance(attr, dict) and attr.get("verdict") not in (None, "unknown"):
+        _v, _c, _d = attr.get("verdict"), attr.get("culprit") or "", attr.get("detail") or ""
+        line = f"\nЧто тормозит: {_v}" + (f" — {_c}" if _c else "") + (f" ({_d})" if _d else "")
+        print(line)
     if result["status"] != "ok":
         print("\nЧто проверить:")
         failed_names = " ".join(c["name"] for c in result["checks"] if not c["ok"] and not c.get("info"))
@@ -1343,6 +1532,14 @@ def _cmd_watchdog_locked(result):
     tun_driver = any(c.get("id") == "tunnel" and not c["ok"] and not c.get("info")
                      for c in result["checks"])
     segment_note = _tunnel_parameter_note() if tun_driver else None
+    # #396: класс-вердикт приоритетнее легаси netprobe-заметки — он разделяет
+    # провайдер/залип стека/туннель/сайт/потери, а считается бесплатно на том же
+    # write-тике (sidecar). unknown/ok/нет данных → легаси-заметка (fail-open).
+    _attr = cached_attribution()
+    if (tun_driver and isinstance(_attr, dict)
+            and _attr.get("verdict") not in (None, "unknown", "ok")):
+        segment_note = (f"{_attr['verdict']}: {_attr.get('culprit')} — {_attr.get('detail')}"
+                        )[:_SEGMENT_NOTE_MAX]
     # M для счётчика «N из M проверок» — все driver-чеки пробы (не только упавшие).
     driver_total = sum(1 for c in result["checks"] if not c.get("info"))
 

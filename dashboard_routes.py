@@ -862,6 +862,7 @@ def _metrics_empty_payload(hours, opts):
         "status": "no-data", "hours": hours,
         "interval_sec": opts["interval_sec"], "retention_days": opts["retention_days"],
         "enabled": opts["enabled"], "last_event_at": None, "series": [], "targets": [],
+        "attribution": None,
         "latest": summary["latest"], "baseline": summary["baseline"],
         "ratio": summary["ratio"], "trend": summary["trend"],
         "proxy_errors": proxy_errors._empty_payload("disabled", 1),
@@ -876,6 +877,8 @@ def _metrics_target_rows(events, now=None):
     не порождают. Смешивать цели нельзя — быстрый сайт разбавил бы деградацию
     медленного (зеркало бага одноканальности)."""
     now_ts = time.time() if now is None else now
+    # #396: группировка (kind, target) — github даёт 2 ряда (direct vs tunnel),
+    # это и есть A/B оверхеда туннеля; смешивать классы нельзя.
     by_target = {}
     for e in events:
         if not isinstance(e, dict):
@@ -883,10 +886,11 @@ def _metrics_target_rows(events, now=None):
         target = e.get("target")
         if not isinstance(target, str) or not target:
             continue
-        by_target.setdefault(target, []).append(e)
+        by_target.setdefault((metrics_store.event_kind(e), target), []).append(e)
     rows = []
-    for target in sorted(by_target):
-        evs = by_target[target]
+    for key in sorted(by_target):
+        kind, target = key
+        evs = by_target[key]
 
         def _ages(items):
             out = []
@@ -912,6 +916,7 @@ def _metrics_target_rows(events, now=None):
             last = evs[-1]
         rows.append({
             "target": target,
+            "kind": kind,
             "ok_rate_1h": _rate(3600.0),
             "ok_rate_24h": _rate(86400.0),
             "tls_ms": metrics_store._median([e.get("tls_ms") for e in ok_24h]),
@@ -932,13 +937,16 @@ def _metrics_payload(hours):
         # probe_hot_routes при enabled=false: лог/кэш не трогаются вообще).
         payload["status"] = "disabled"
         return payload
+    payload["attribution"] = health.cached_attribution()
     events = metrics_store.read_timing_events(hours=None)  # весь retention для baseline
     if events:
         # Legacy top-level summary — ТОЛЬКО канареечная серия (+None): деградация
         # одного вендора (netflix) не должна читать trend=degraded для туннеля.
+        # #396 kind-гард: direct/bulk-события в тренд и флап-статистику не подхватываются.
         canary_events = [e for e in events
                          if not isinstance(e, dict)
-                         or e.get("target") in (None, metrics_store.METRICS_CANARY_TARGET)]
+                         or (metrics_store.event_kind(e) == "tunnel"
+                             and e.get("target") in (None, metrics_store.METRICS_CANARY_TARGET))]
         summary = metrics_store.summarize(canary_events)
         now = time.time()
         window_events = [e for e in canary_events if e.get("ts", 0) >= now - hours * 3600.0]

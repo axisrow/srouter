@@ -42,6 +42,9 @@ __all__ = [
     "GFW_PROBE_DOMAINS", "GFW_CONTROL_DOMAIN", "_direct_domain_probe", "_gfw_domain_check",
     "_direct_first_check", "TUNNEL_TARGETS", "VENDOR_OUTAGE_MARKER",
     "_tunnel_target_up", "_tunnel_up",
+    # #396 классы проб: direct (мимо прокси) + bulk (объёмная передача)
+    "_no_proxy_env", "DIRECT_PROBE_URLS", "_direct_up", "_bulk_probe", "_bulk_status",
+    "_BULK_DEFAULT_URL", "_url_host",
     "_route_default_interface", "_inet_interface", "_network_interface_up",
     "DNS_PROBE_HOST", "_resolve_host", "_dns_up",
     "VPS_TCP_PROBE_TIMEOUT", "_vps_endpoint", "_upstream_vps_reachable",
@@ -672,14 +675,29 @@ def _timing_from_tokens(tokens, url, kind, rc=None, err=None):
     }
 
 
-def _tunnel_target_up(url, head=False):
-    """Один таргет через прокси: (ok, detail, kind, timing). Живой = сервер ответил
-    HTTP < 500 (sys_probe.tunnel_code_up). 000/timeout/5xx — не жив. Не бросает.
+def _no_proxy_env():
+    """env БЕЗ proxy-переменных (паттерн probe_manager.direct_probe, оба регистра) —
+    для прямых проб #396: обычные сайты меряются БЕЗ прокси-стека."""
+    env = os.environ.copy()
+    for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+                "http_proxy", "https_proxy", "all_proxy", "no_proxy"):
+        env.pop(key, None)
+    return env
+
+
+def _tunnel_target_up(url, head=False, via_proxy=True):
+    """Один таргет через прокси (via_proxy=True, дефолт) или МИМО прокси (#396 direct):
+    (ok, detail, kind, timing). Живой = сервер ответил HTTP < 500 (sys_probe.tunnel_code_up).
+    000/timeout/5xx — не жив. Не бросает.
 
     kind — структурный дискриминатор провала (канон loose-validator-recurring-leak: не парсим
     его из detail-строки). Один из: ok | timeout | no-response | connection-failed | bad-code |
     upstream-error. #207: upstream-error = HTTP 5xx (сервер ответил через туннель → канал жив,
     но сам вендор лежит); прочие = curl не достучался (сеть/VPS).
+
+    via_proxy=False (#396): curl без `-x` и с env без proxy-переменных (_no_proxy_env) —
+    прямой ход: класс «локальный интернет» обязан меряться без прокси-стека, иначе
+    деградация туннеля/VPS читалась бы как «сеть плохая».
 
     head=True (-I) — для измерительных целей мульти-таргетной пробы: тело ответа не качаем
     (корни github/netflix — сотни КБ каждую минуту), фазы connect/tls/ttfb сохраняют смысл
@@ -693,10 +711,15 @@ def _tunnel_target_up(url, head=False):
     cmd = [CURL, "-sS", "-o", "/dev/null"]
     if head:
         cmd.append("-I")
-    cmd += ["-x", _PROXY,
-            "--connect-timeout", "4", "--max-time", "8",
+    if via_proxy:
+        cmd.append("-x")
+        cmd.append(_PROXY)
+    cmd += ["--connect-timeout", "4", "--max-time", "8",
             "-w", _TIMING_WRITE_FORMAT, url]
-    r = sys_probe.run(cmd, timeout=10)
+    if via_proxy:
+        r = sys_probe.run(cmd, timeout=10)
+    else:
+        r = sys_probe.run(cmd, timeout=10, env=_no_proxy_env())
     if r.get("timeout"):
         # timing-минимум, не None (#315 round 2 / Codex P2-4): rc/err причины доступны
         # даже когда процесс убит до вывода -w — timeout-класс не терял бы err в metrics.
@@ -805,6 +828,127 @@ def _tunnel_up(extra_targets=None):
     if len(details) > 1 and len(set(details)) == 1:
         return False, f"{details[0]} (оба таргета)", False, timings
     return False, "; ".join(details), False, timings
+
+
+# ============================ #396: классы проб direct/bulk ============================
+# Дыра #396: все события metrics.jsonl шли через прокси-стек — «локальный интернет» не
+# измерялся, а обрывы/залипания посреди ПЕРЕДАЧИ (gh весь день, Forge на скачивании
+# компоненты: TLS-reset; privoxy 8118 принял, апстрим молчит без таймаута) не видел ни
+# один класс: handshake-проба 4с обрыва передачи не видит в принципе.
+
+DIRECT_PROBE_URLS = ("https://www.baidu.com/", "https://github.com/")
+
+# Объёмная проба: 256 КиБ с cloudflare speed (тот же проверенный эндпоинт, что
+# probes.throughput_targets в local_state — не заводим новый). --speed-limit/--speed-time —
+# нативная ловушка stall: <2 КиБ/с в течение 8с → curl сам рвёт с rc 28 (bytes_dl > 0).
+_BULK_DEFAULT_URL = "https://speed.cloudflare.com/__down?bytes=262144"
+_BULK_EXPECTED_BYTES = 262144
+_BULK_WRITE_FORMAT = _TIMING_WRITE_FORMAT + " %{size_download} %{speed_download}"
+_BULK_RESET_RCS = (56, 35, 52, 18)  # #301: 56=recv-reset посреди передачи, 18=partial
+
+
+def _bulk_status(rc, code, bytes_dl, expected_bytes):
+    """Чистый маппинг исхода bulk-пробы → статус события (не бросает).
+
+    ok = rc 0 + HTTP < 500 + скачано ≥90% ожидаемого (недокачанное «ok» — обрыв без
+    явного rc, не здоровье). upstream-error = 5xx (вендор/CDN ответил — канал жив).
+    reset = rc 56/35/52/18 (обрыв передачи — класс Forge/gh). stalled = rc 28 при
+    bytes_dl > 0 (байты перестали течь при живом сокете). timeout = rc 28 при 0 байт
+    (не стартовало — в т.ч. залипший privoxy, класс «принял и молчит»).
+    """
+    try:
+        rc = int(rc)
+    except (TypeError, ValueError):
+        return "connection-failed"
+    if rc == 0:
+        try:
+            code_int = int(code)
+        except (TypeError, ValueError):
+            return "connection-failed"
+        if not sys_probe.tunnel_code_up(code_int):
+            return "upstream-error"
+        try:
+            if expected_bytes and isinstance(bytes_dl, int) and bytes_dl < 0.9 * expected_bytes:
+                return "connection-failed"
+        except (TypeError, ValueError):
+            pass
+        return "ok"
+    if rc in _BULK_RESET_RCS:
+        return "reset"
+    if rc == 28:
+        return "stalled" if isinstance(bytes_dl, int) and bytes_dl > 0 else "timeout"
+    return "connection-failed"
+
+
+def _bulk_probe(url=None, expected_bytes=None):
+    """Объёмная проба туннеля (#396): скачать ~256 КиБ через прокси, поймать обрыв/залипание.
+
+    Отвечает на класс отказов, невидимый handshake-пробам: reset посреди передачи
+    (rc 56, Forge/gh) и stall (байты перестали течь — privoxy принял, апстрим молчит).
+    Ловушка stall нативная (curl --speed-limit/--speed-time), без своего reader-цикла.
+
+    timing-dict с kind="bulk", bytes_dl, kibs (KB/s, speed_download/1024). Не бросает.
+    """
+    url = url or _BULK_DEFAULT_URL
+    expected = expected_bytes or _BULK_EXPECTED_BYTES
+    cmd = [CURL, "-sS", "-o", "/dev/null",
+           "-x", _PROXY,
+           "--connect-timeout", "4", "--max-time", "15",
+           "--speed-limit", "2048", "--speed-time", "8",
+           "-w", _BULK_WRITE_FORMAT, url]
+    r = sys_probe.run(cmd, timeout=17)
+    host = _url_host(url)
+    if r.get("timeout"):
+        # убит sys_probe до вывода -w: bytes не знает никто → фиксируем сам факт
+        return {"target": host, "code": "000", "status": "timeout", "kind": "bulk",
+                "connect_ms": None, "tls_ms": None, "ttfb_ms": None, "total_ms": None,
+                "bytes_dl": None, "kibs": None, "rc": r.get("rc"), "err": r.get("err")}
+    tokens = (r.get("out") or "").strip().split()
+    code = tokens[0] if tokens else "000"
+    try:
+        bytes_dl = int(tokens[5])
+    except (IndexError, TypeError, ValueError):
+        bytes_dl = None
+    try:
+        speed = float(tokens[6])
+    except (IndexError, TypeError, ValueError):
+        speed = None
+    try:
+        rc = int(r.get("rc"))
+    except (TypeError, ValueError):
+        rc = None
+    status = _bulk_status(rc, code, bytes_dl, expected)
+    timing = _timing_from_tokens(tokens, url, status, rc=r.get("rc"), err=r.get("err"))
+    timing["kind"] = "bulk"
+    timing["bytes_dl"] = bytes_dl
+    timing["kibs"] = round(speed / 1024.0, 1) if speed is not None else None
+    return timing
+
+
+def _direct_up(extra_targets=None):
+    """Локальный интернет жив? curl МИМО прокси (env без proxy-vars, #396) к DIRECT_PROBE_URLS.
+
+    ok = ЛЮБАЯ цель ответила HTTP < 500 (OR-семантика канареек _tunnel_up: провал одной
+    GFW-нервной цели не читается «интернета нет» — это видно per-target в таблице).
+    extra_targets — замена дефолта (probes.metrics_direct_targets из local.json).
+    Возвращает (ok, detail, timings); каждый timing с kind="direct" (метка класса —
+    единственный дискриминатор для consumer'ов, не хост). Не бросает.
+    """
+    urls = [str(u) for u in (extra_targets or DIRECT_PROBE_URLS)]
+    if not urls:
+        return False, "no direct targets", None
+    with ThreadPoolExecutor(max_workers=min(len(urls), 8)) as pool:
+        results = list(pool.map(
+            lambda u: _tunnel_target_up(u, head=True, via_proxy=False), urls))
+    timings = []
+    for (_, _, _, timing) in results:
+        if isinstance(timing, dict):
+            timing["kind"] = "direct"
+        timings.append(timing)
+    oks = [(ok, detail) for (ok, detail, _, _) in results]
+    if any(ok for ok, _ in oks):
+        return True, next(detail for ok, detail in oks if ok), timings
+    return False, "; ".join(detail for _, detail in oks), timings
 
 
 # ============================ #203: активный сетевой интерфейс/маршрут (нет сети vs VPS мёртв) ============================

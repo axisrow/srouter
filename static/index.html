@@ -398,7 +398,9 @@
         metrics_targets_site: "site",
         metrics_targets_ok1h: "ok 1h",
         metrics_targets_ok24h: "ok 24h",
-        metrics_targets_last: "last"
+        metrics_targets_last: "last",
+        metrics_targets_kind: "class",
+        metrics_attrib: "what's slow:"
       },
       ru: {
         brand: "Tunnel Dashboard", theme_title: "Тема", theme_auto: "Авто",
@@ -534,7 +536,9 @@
         metrics_targets_site: "сайт",
         metrics_targets_ok1h: "ok 1ч",
         metrics_targets_ok24h: "ok 24ч",
-        metrics_targets_last: "последний"
+        metrics_targets_last: "последний",
+        metrics_targets_kind: "класс",
+        metrics_attrib: "что тормозит:"
       },
       zh: {
         brand: "隧道仪表盘", theme_title: "主题", theme_auto: "自动",
@@ -668,7 +672,9 @@
         metrics_targets_site: "站点",
         metrics_targets_ok1h: "ok 1小时",
         metrics_targets_ok24h: "ok 24小时",
-        metrics_targets_last: "最近"
+        metrics_targets_last: "最近",
+        metrics_targets_kind: "类型",
+        metrics_attrib: "什么在拖慢："
       }
     };
 
@@ -1871,7 +1877,8 @@
 
       box.innerHTML =
         '<div class="node-metrics">' + rows + '</div>' +
-        spark + note + trendLine + '<hr class="my-2">' + errorsHtml +
+        spark + note + trendLine + attributionHtml(d.attribution) +
+        '<hr class="my-2">' + errorsHtml +
         metricsTargetsSectionHtml(d.targets || []);
 
       if (badge) {
@@ -1879,6 +1886,16 @@
         badge.className = 'badge ops ' + tb.cls;
         badge.textContent = t(tb.key);
       }
+    }
+
+    // ---- Вердикт «что тормозит» (#396): server-side attribution, unknown/null → молчим ----
+    function attributionHtml(a) {
+      if (!a || a.verdict === 'unknown') return '';
+      var cls = a.verdict === 'ok' ? 'text-success'
+        : (a.verdict === 'site' ? 'text-warning' : 'text-danger');
+      var text = [a.culprit, a.detail].filter(Boolean).join(' — ');
+      return '<div class="sub ' + cls + '"><strong>' + esc(t('metrics_attrib')) + '</strong> ' +
+        esc(text) + '</div>';
     }
 
     // ---- Сравнение сайтов (мульти-таргет проба): таблица per-target из /api/metrics/tunnel ----
@@ -1890,6 +1907,7 @@
       var rows = targets.map(function (r) {
         return '<tr>' +
           '<td class="ops">' + esc(r.target) + '</td>' +
+          '<td class="ops">' + esc(r.kind || 'tunnel') + '</td>' +
           '<td>' + esc(pct(r.ok_rate_1h)) + '</td>' +
           '<td>' + esc(pct(r.ok_rate_24h)) + '</td>' +
           '<td>' + esc(r.tls_ms == null ? '—' : r.tls_ms) + '</td>' +
@@ -1901,6 +1919,7 @@
         '<div class="table-responsive"><table class="table table-sm table-borderless mb-0 ops">' +
         '<thead><tr>' +
         '<th>' + esc(t('metrics_targets_site')) + '</th>' +
+        '<th>' + esc(t('metrics_targets_kind')) + '</th>' +
         '<th>' + esc(t('metrics_targets_ok1h')) + '</th>' +
         '<th>' + esc(t('metrics_targets_ok24h')) + '</th>' +
         '<th>' + esc(t('metrics_phase_tls')) + '</th>' +

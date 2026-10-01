@@ -23,6 +23,83 @@ def _event(ts, total_ms=200, status="ok", connect_ms=1, tls_ms=50, ttfb_ms=100):
             "ttfb_ms": ttfb_ms, "total_ms": total_ms}
 
 
+# ============================ build_event: kind-классы (#396) ============================
+
+def test_build_event_defaults_kind_tunnel_when_missing():
+    """Легаси timing без kind → "kind":"tunnel" (обратно-совместимость: старые события
+    и старые моки — это tunnel-класс, читается одинаково на записи и на чтении)."""
+    ev = metrics_store.build_event({"status": "ok", "total_ms": 100})
+    assert ev["kind"] == "tunnel"
+    assert ev["bytes_dl"] is None and ev["kibs"] is None
+
+
+def test_build_event_preserves_direct_and_bulk_kinds():
+    assert metrics_store.build_event(
+        {"status": "ok", "kind": "direct"})["kind"] == "direct"
+    assert metrics_store.build_event(
+        {"status": "ok", "kind": "bulk"})["kind"] == "bulk"
+
+
+def test_build_event_garbage_kind_becomes_tunnel():
+    assert metrics_store.build_event({"status": "ok", "kind": 42})["kind"] == "tunnel"
+    assert metrics_store.build_event({"status": "ok", "kind": "wireless"})["kind"] == "tunnel"
+
+
+def test_build_event_normalizes_bulk_fields():
+    """bytes_dl int≥0 (негатив клампится в 0 — канон _safe_ms); kibs float≥0; мусор → None."""
+    ev = metrics_store.build_event(
+        {"status": "ok", "kind": "bulk", "bytes_dl": 262144, "kibs": 512.4})
+    assert ev["bytes_dl"] == 262144
+    assert ev["kibs"] == 512.4
+    ev = metrics_store.build_event(
+        {"status": "reset", "kind": "bulk", "bytes_dl": -5, "kibs": "много"})
+    assert ev["bytes_dl"] == 0
+    assert ev["kibs"] is None
+
+
+def test_build_event_accepts_reset_and_stalled_statuses():
+    """Новые статусы bulk-класса не переписываются в down (валидация _EVENT_STATUSES)."""
+    assert metrics_store.build_event({"status": "reset"})["status"] == "reset"
+    assert metrics_store.build_event({"status": "stalled"})["status"] == "stalled"
+
+
+def test_event_kind_legacy_row_without_key_reads_as_tunnel():
+    """Единственная точка чтения kind: строка журнала без ключа = tunnel (#396)."""
+    assert metrics_store.event_kind({"target": "x"}) == "tunnel"
+    assert metrics_store.event_kind({"kind": "bulk"}) == "bulk"
+    assert metrics_store.event_kind({"kind": "мусор"}) == "tunnel"
+    assert metrics_store.event_kind("не-dict") == "tunnel"
+
+
+def test_summarize_counts_reset_and_stalled_as_failures():
+    """reset/stalled в окне = фейлы для failure_rate (flap-гейт обязан их видеть)."""
+    now = 1_000_000.0
+    events = [
+        metrics_store.build_event(
+            {"status": s, "kind": "bulk", "total_ms": 300}, now=now - 60)
+        for s in ("reset", "stalled", "ok", "ok", "ok", "ok")
+    ]
+    for e, ts in zip(events, [now - 60] * 6):
+        e["ts"] = ts
+    res = metrics_store.summarize(events, now=now)
+    assert res["latest"]["failure_rate"] == pytest.approx(round(2 / 6, 3))
+    assert res["latest"]["samples"] == 6
+
+
+def test_read_timing_events_normalizes_bulk_fields(tmp_path):
+    """Round-trip: bulk-поля читаются из журнала с той же нормализацией."""
+    now = 1_000_000.0
+    path = tmp_path / "m.jsonl"
+    ev = metrics_store.build_event(
+        {"status": "ok", "kind": "bulk", "total_ms": 900, "bytes_dl": 262144,
+         "kibs": 300.5}, now=now)
+    metrics_store.append_timing_event(ev, log_path=path)
+    events = metrics_store.read_timing_events(hours=1, log_path=path, now=now + 10)
+    assert events[0]["kind"] == "bulk"
+    assert events[0]["bytes_dl"] == 262144
+    assert events[0]["kibs"] == 300.5
+
+
 # ============================ build_event ============================
 
 def test_build_event_normalizes_timing_dict():
