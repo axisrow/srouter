@@ -469,19 +469,28 @@ def _no_proxy_candidates_verdict(st, claude_proxy):
     from direct_first import BUILTIN_DIRECT_DOMAINS
     from health_probes import GFW_CONTROL_DOMAIN
 
-    provider = claude_proxy._base_url_hosts(claude_proxy._load())
+    raw_settings = claude_proxy._load()
+    provider = claude_proxy._base_url_hosts(raw_settings)
     ignore = {"localhost"} | set(BUILTIN_DIRECT_DOMAINS)
     if provider:
         ignore.add(provider)
 
+    # Обе variant (NO_PROXY + no_proxy), как enable() у claude_proxy: рассинхрон не ускользает
+    # от проверки, а детям curl-стек видит обе (review #392 finding 2). Нет env-блока — st.
+    env = raw_settings.get("env") if isinstance(raw_settings, dict) else None
+    if isinstance(env, dict):
+        no_proxy = claude_proxy._merge_no_proxy(env.get("NO_PROXY", ""), env.get("no_proxy", ""))
+    else:
+        no_proxy = st.get("no_proxy") or ""
+
     candidates, seen, truncated = [], set(), False
-    for raw in (st.get("no_proxy") or "").split(","):
+    for raw in no_proxy.split(","):
         host = raw.strip().lower().lstrip(".")
         if not host or host in ignore or host in seen:
             continue
-        try:  # IP-нотация (::1, 127.0.0.1) — loopback не кандидат; домен валится в ValueError
-            if ipaddress.ip_address(host).is_loopback:
-                continue
+        try:  # IP-литерал — скип целиком (loopback включно): HTTP-проба по bare-IP без SNI
+            ipaddress.ip_address(host)  # даёт ложный connection-failed (review #392 finding 1)
+            continue
         except ValueError:
             pass
         if not local_state._is_valid_host(host):

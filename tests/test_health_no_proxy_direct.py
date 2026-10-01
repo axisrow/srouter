@@ -33,9 +33,12 @@ def _status(**over):
 
 
 def _mock_claude_proxy(monkeypatch, status, provider_host="api.z.ai"):
+    """Симметрия реальности: env-блок из _load() несёт ту же NO_PROXY, что и status()
+    (status читает её оттуда же); тесты рассинхрона переопределяют _load отдельно."""
     monkeypatch.setattr(claude_proxy, "status", lambda: status)
-    monkeypatch.setattr(claude_proxy, "_load",
-                        lambda: {"env": {"ANTHROPIC_BASE_URL": f"https://{provider_host}/"}})
+    monkeypatch.setattr(claude_proxy, "_load", lambda: {
+        "env": {"ANTHROPIC_BASE_URL": f"https://{provider_host}/",
+                "NO_PROXY": status.get("no_proxy", "")}})
     monkeypatch.setattr(claude_proxy, "_base_url_hosts", lambda data: provider_host)
 
 
@@ -152,6 +155,36 @@ def test_fail_soft_when_claude_proxy_import_broken(monkeypatch):
     r = health._no_proxy_direct_check()
     assert r["status"] == "unknown"
     assert "claude_proxy" in r["detail"]
+
+
+def test_ip_literals_skipped(monkeypatch):
+    """IP-литералы (LAN/VPS-адреса в NO_PROXY) — не кандидаты: HTTP-проба по bare-IP без SNI
+    даёт ложный connection-failed (review #392 finding 1). Loopback покрывается тем же."""
+    _mock_claude_proxy(monkeypatch, _status(
+        no_proxy="localhost,127.0.0.1,::1,192.168.1.10,85.136.181.198,example.com"))
+    calls = _mock_direct_probe(monkeypatch, default={"reachable": True, "kind": "ok"})
+    r = health._no_proxy_direct_check()
+    probed = {h for h, _, _ in calls}
+    assert "192.168.1.10" not in probed and "85.136.181.198" not in probed
+    assert "example.com" in probed, "домены по-прежнему пробуются"
+    assert r["status"] == "ok", "IP в NO_PROXY не дают ложный warn (проба только example.com)"
+
+
+def test_both_no_proxy_variants_merged(monkeypatch):
+    """Рассинхронные NO_PROXY/no_proxy в settings.json: хост из затенённой variant (её видит
+    curl-стек детей) тоже проверяется — merge обеих variant, как enable() (review #392 finding 2)."""
+    _mock_claude_proxy(monkeypatch, _status(no_proxy="localhost,z.ai,visible.example.com"))
+    # _load (мок в _mock_claude_proxy) отдаёт env только с no_proxy-key — расширяем рассинхроном:
+    monkeypatch.setattr(claude_proxy, "_load", lambda: {
+        "env": {"ANTHROPIC_BASE_URL": "https://api.z.ai/",
+                "NO_PROXY": "hidden.example.com"}})
+    _mock_direct_probe(monkeypatch, results={
+        "hidden.example.com": {"reachable": False, "kind": "timeout"},
+        GFW_CONTROL_DOMAIN: {"reachable": True, "kind": "ok"},
+    }, default={"reachable": True, "kind": "ok"})
+    r = health._no_proxy_direct_check()
+    assert r["status"] == "warn", "хост из NO_PROXY-variant, скрытой от status(), не ускользает"
+    assert "hidden.example.com" in r["detail"]
 
 
 def test_leading_dot_dedupe(monkeypatch):
