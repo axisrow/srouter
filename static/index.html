@@ -1903,13 +1903,17 @@
     // внешние хелперы экстрактор не тянет).
     function metricsTargetsSectionHtml(targets) {
       if (!targets || !targets.length) return '';
-      function pct(v) { return (v == null) ? '—' : Math.round(v * 100) + '%'; }
+      // ok-rate на малой выборке (< 10 замеров) рисуем «—»: 3 ok-замера не «100%».
+      // legacy payload без samples рисуется по-старому.
+      function pct(v, n) {
+        return (v == null || (n != null && n < 10)) ? '—' : Math.round(v * 100) + '%';
+      }
       var rows = targets.map(function (r) {
         return '<tr>' +
           '<td class="ops">' + esc(r.target) + '</td>' +
           '<td class="ops">' + esc(r.kind || 'tunnel') + '</td>' +
-          '<td>' + esc(pct(r.ok_rate_1h)) + '</td>' +
-          '<td>' + esc(pct(r.ok_rate_24h)) + '</td>' +
+          '<td>' + esc(pct(r.ok_rate_1h, r.samples)) + '</td>' +
+          '<td>' + esc(pct(r.ok_rate_24h, r.samples)) + '</td>' +
           '<td>' + esc(r.tls_ms == null ? '—' : r.tls_ms) + '</td>' +
           '<td>' + esc(r.ttfb_ms == null ? '—' : r.ttfb_ms) + '</td>' +
           '<td class="ops">' + esc(r.last_status || '—') + '</td>' +
