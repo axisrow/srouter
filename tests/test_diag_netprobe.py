@@ -244,6 +244,37 @@ def test_current_net_none_without_any_source(monkeypatch, tmp_path):
     assert diag_netprobe.current_net() is None
 
 
+def test_net_name_mac_match_beats_gateway_ip_match(tmp_path, monkeypatch):
+    """Специфичность отпечатка глобальна, а не по порядку dict: MAC-матч любой записи
+    бьёт IP-матч более ранней записи без MAC. Роумер (кейс 888-5G): чужой роутер с тем же
+    LAN-IP (192.168.x.1 — самый частый класс) не должен перебить железный MAC-матч."""
+    monkeypatch.setattr(diag_netprobe, "NETS_MAP", tmp_path / "nets.json")
+    (tmp_path / "nets.json").write_text(json.dumps({
+        "weak-first": {"gateway": "192.168.3.1"},
+        "strong-second": {"gateway": "10.9.9.9", "gateway_mac": "aa:bb:cc:dd:ee:01"},
+    }), encoding="utf-8")
+    name = diag_netprobe._net_name(dns=(), gateway="192.168.3.1",
+                                   gateway_mac="aa:bb:cc:dd:ee:01")
+    assert name == "strong-second"
+
+
+def test_net_name_dns_only_match_is_dead(tmp_path, monkeypatch):
+    """DNS — операторный отпечаток (совпадает между роутером и hotspot'ом, кейс 888-5G);
+    learn_net с #375 пишет gateway+mac всегда → legacy DNS-only ветка только врёт
+    (старый resolv.conf в переходном окне роуминга). Матча по DNS больше нет: нет
+    шлюза = нет сети (None), чужой шлюз не матчится по DNS оператора."""
+    monkeypatch.setattr(diag_netprobe, "NETS_MAP", tmp_path / "nets.json")
+    (tmp_path / "nets.json").write_text(json.dumps({
+        "legacy-dns-only": {"dns": ["192.168.3.1"]},
+    }), encoding="utf-8")
+    # переходное окно: default route флапнул, resolv.conf ещё старый
+    assert diag_netprobe._net_name(dns=("192.168.3.1",), gateway=None,
+                                   gateway_mac=None) is None
+    # живая чужая сеть с DNS оператора — тоже не «legacy-dns-only»
+    assert diag_netprobe._net_name(dns=("192.168.3.1",), gateway="172.20.10.1",
+                                   gateway_mac="ae:df:a1:f0:2d:64") is None
+
+
 def test_current_net_never_raises(monkeypatch, tmp_path):
     """Fail-soft контракт (#384): сбой любого источника — валидный результат, не исключение
     (резолвер зовётся из watchdog-тика, forensic-писатель ронять нельзя)."""
