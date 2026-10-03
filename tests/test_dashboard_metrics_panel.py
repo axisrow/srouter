@@ -127,6 +127,23 @@ def test_metrics_targets_empty_payload_renders_nothing():
     assert _targets_call(None) == ""
 
 
+def test_metrics_targets_low_sample_rate_hidden():
+    """#397-followup: ok-rate на малой выборке (samples < 10) — не «100%», а «—».
+    3 ok-замера за сутки не дают права писать 100%; legacy payload без samples
+    рисуется по-старому (percent виден)."""
+    html = _targets_call([
+        {"target": "api.z.ai", "kind": "direct", "ok_rate_1h": 1.0, "ok_rate_24h": 1.0,
+         "samples": 3, "tls_ms": 28, "ttfb_ms": 74, "last_status": "ok"},
+        {"target": "chatgpt.com", "kind": "tunnel", "ok_rate_1h": 1.0, "ok_rate_24h": 1.0,
+         "samples": 4400, "tls_ms": 700, "ttfb_ms": 900, "last_status": "ok"},
+    ])
+    assert html.count("100%") == 2, html
+    assert _targets_call([
+        {"target": "legacy.example", "ok_rate_1h": 1.0, "ok_rate_24h": 1.0,
+         "tls_ms": 1, "ttfb_ms": 1, "last_status": "ok"},
+    ]).count("100%") == 2
+
+
 def test_metrics_targets_escapes_host_html():
     """target из state (не доверенный) экранируется — без HTML-инъекции в панель."""
     html = _targets_call([{"target": "<script>alert(1)</script>", "ok_rate_1h": 1.0,
