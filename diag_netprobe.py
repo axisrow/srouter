@@ -229,25 +229,23 @@ def _load_nets():
 
 
 def _net_name(dns=None, gateway=None, gateway_mac=None):
-    """Имя сети по отпечатку; None — не матчился. Приоритет специфичности, для
-    каждой записи: MAC шлюза (совпал = кандидат, другой = блок записи — DNS не
-    спасает, кейс «hotspot как 888-5G»), затем gateway (старые записи без MAC),
-    затем legacy DNS-пересечение (записи без gateway). Не бросает."""
-    current_dns = set(dns if dns is not None else _dns_servers())
-    for name, info in _load_nets().items():
-        info = info or {}
-        rec_mac = info.get("gateway_mac")
-        rec_gw = info.get("gateway")
-        if rec_mac:
-            if gateway_mac and rec_mac.lower() == gateway_mac.lower():
+    """Имя сети по отпечатку; None — не матчился. Специфичность ГЛОБАЛЬНА, а не по
+    порядку dict: сначала все MAC-матчи (железный дискриминатор), потом IP-матчи
+    (записи без MAC). Роумер-кейс: чужой роутер с тем же LAN-IP не перебивает
+    MAC-матч более поздней записи. DNS-пересечения больше нет: операторный DNS
+    совпадает между сетями (кейс «hotspot как 888-5G»), а learn_net с #375 пишет
+    gateway+mac всегда — legacy-записи переобучить (`netname <имя>`). Не бросает."""
+    nets = _load_nets()
+    if gateway_mac:
+        for name, info in nets.items():
+            rec_mac = (info or {}).get("gateway_mac")
+            if rec_mac and rec_mac.lower() == gateway_mac.lower():
                 return name
-            continue
-        if rec_gw:
-            if gateway and rec_gw == gateway:
+    if gateway:
+        for name, info in nets.items():
+            rec_gw = (info or {}).get("gateway")
+            if rec_gw and not (info or {}).get("gateway_mac") and rec_gw == gateway:
                 return name
-            continue
-        if current_dns and current_dns & set(info.get("dns") or []):
-            return name
     return None
 
 
