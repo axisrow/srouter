@@ -1410,6 +1410,9 @@ def _read_watchdog_prev_state():
         return {
             "status": status if isinstance(status, str) else "",
             "failed": _canon_names(parsed.get("failed")),
+            # gated — вырезанный флап-гейтом состав (диагноз 2026-10-04): живёт через
+            # эпизод, recovery-событие несёт previous.gated. Legacy без ключа → None.
+            "gated": _canon_names(parsed.get("gated")),
             # notified_failed — последний УВЕДОМЛЁННЫЙ состав (Codex P1-1 round 2): при
             # подавлении cooldown'ом НЕ продвигается, чтобы событие не терялось навсегда.
             "notified_failed": _canon_names(parsed.get("notified_failed")),
@@ -1458,14 +1461,30 @@ def _append_watchdog_status_event(previous, current, reasons=None, segment=None)
                              if reasons and isinstance(reasons.get(name), str) and reasons[name]}
             if added_details:
                 diff["added_details"] = added_details
+        # Диагноз 2026-10-04: пустой gated не сериализуем (канон «нет ключа — старый
+        # reader не ломается», как net/segment); причины gated — отдельным ключом
+        # gated_details: previous/current несут только имена (дедуп по составу), reasons
+        # — деталь текущего тика с вердиктом гейта («N/M фейлов… ниже порога (флап)»).
+        prev_out = dict(previous) if isinstance(previous, dict) else previous
+        cur_out = dict(current) if isinstance(current, dict) else current
+        for side in (prev_out, cur_out):
+            if isinstance(side, dict) and not side.get("gated"):
+                side.pop("gated", None)
+        gated_details = {}
+        if isinstance(current, dict) and reasons:
+            for name in (current.get("gated") or []):
+                if isinstance(reasons.get(name), str) and reasons[name]:
+                    gated_details[name] = reasons[name]
         WATCHDOG_STATUS_LOG.parent.mkdir(parents=True, exist_ok=True)
         event = {
             "timestamp": datetime.now().astimezone().isoformat(),
-            "previous": previous,
-            "current": current,
+            "previous": prev_out,
+            "current": cur_out,
         }
         if diff is not None:
             event["diff"] = diff
+        if gated_details:
+            event["gated_details"] = gated_details
         if segment:
             event["segment"] = segment
         # #384: в какой сети случился переход (статус-события редки — цена резолвера
@@ -1537,6 +1556,11 @@ def _cmd_watchdog_locked(result):
     # гейт не меняет общий вердикт, только нотификации). Fail-open: нет данных окна →
     # состав как есть; vendor-outage (#207) гейту не подлежит.
     tun_check = next((c for c in result["checks"] if c.get("id") == "tunnel"), None)
+    # Диагноз 2026-10-04 (эпизод 14:51–15:08: 6 однотиковых флапов, все события с
+    # failed=[]): гейт вырезает туннель из notify-состава (пуши молчат — верно), но
+    # статус-событие теряло виновника. gated — вырезанный состав ИМЕНАМИ: детали
+    # («2/11 фейлов…») меняются каждый тик и сломали бы дедуп события.
+    gated = []
     if (tun_check is not None and not tun_check["ok"] and not tun_check.get("info")
             and tun_check.get("category") != "vendor-outage"):
         # #362 review (тред 4): stats кладёт _apply_tunnel_window_gate (одно чтение окна
@@ -1544,10 +1568,15 @@ def _cmd_watchdog_locked(result):
         stats = tun_check.get("window_stats")
         if (stats and stats["samples"] >= metrics_store.MIN_WINDOW_SAMPLES
                 and stats["rate"] < _tunnel_fail_rate_threshold()):
+            gated = [tun_check["name"]]
             failed = [name for name in failed if name != tun_check["name"]]
     prev = _read_watchdog_prev_state()
     prev_status = prev["status"] if prev else ""
     prev_failed = prev["failed"] if prev else None
+    # legacy-prev без ключа (до 2026-10-04) → [] (одноразовое лишнее событие при
+    # апгрейде допустимо; дальше дедуп симметричен по именам)
+    prev_gated = (prev.get("gated")
+                  if isinstance(prev, dict) and isinstance(prev.get("gated"), list) else [])
     # notified_failed — последний УВЕДОМЛЁННЫЙ состав (Codex P1-1): не продвигается при
     # подавленном cooldown'ом событии, иначе подавленная смена состава терялась бы навсегда.
     notified_failed = prev["notified_failed"] if prev else None
@@ -1581,8 +1610,9 @@ def _cmd_watchdog_locked(result):
     # даже когда звук затроттлен. Fresh-прогон (prev=None) — тихий baseline, как lifecycle.
     if prev is not None:
         _append_watchdog_status_event(
-            {"status": prev_status, "failed": prev_failed},
-            {"status": cur, "failed": failed}, reasons=reasons, segment=segment_note)
+            {"status": prev_status, "failed": prev_failed, "gated": prev_gated},
+            {"status": cur, "failed": failed, "gated": gated},
+            reasons=reasons, segment=segment_note)
 
     # Exact-state transitions (#109 + #133 C1 + #315 симметрия):
     # - «упал»: переход ok/degraded/fresh → down (громко, без троттлинга).
@@ -1703,6 +1733,9 @@ def _cmd_watchdog_locked(result):
         _write_watchdog_state(WATCHDOG_STATE, {
             "status": cur,
             "failed": failed,
+            # вырезанный гейтом состав (имена): переживает рестарты — recovery-событие
+            # эпизода несёт previous.gated, форензика восстанавливает эпизод целиком
+            "gated": gated,
             "notified_failed": (notified_failed if notified_failed is not None else fallback_notified)
             if cur != "ok" else [],
             "last_degraded_push": last_push,
