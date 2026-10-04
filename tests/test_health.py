@@ -6716,6 +6716,13 @@ def _gated_watchdog_tick(monkeypatch, tmp_path, *, prev_state, tunnel_ok,
     monkeypatch.setattr(health, "WATCHDOG_METRICS_STATE", tmp_path / "metrics.state.json")
     monkeypatch.setattr(health.metrics_store, "METRICS_LOG", tmp_path / "metrics.jsonl")
     monkeypatch.setattr(health.diag_netprobe, "current_net", lambda: None)
+    # изоляция от живых проб (канон unmocked-probe, #205/#251): свежий metrics-state
+    # проходит троттлинг → _record_watchdog_metrics звал бы РЕАЛЬНЫЕ _direct_up/_bulk_probe
+    # (enabled=False, short-circuit до interval_sec); сегмент-атрибуция и netprobe-заметка
+    # читают реальные сайдкары → None (тесты гейт-события их не ассертят).
+    monkeypatch.setattr(health, "_metrics_probe_options", lambda: {"enabled": False})
+    monkeypatch.setattr(health, "cached_attribution", lambda: None)
+    monkeypatch.setattr(health, "_tunnel_parameter_note", lambda: None)
     checks = [
         {"name": _TUNNEL_NAME, "id": "tunnel", "ok": tunnel_ok,
          "detail": tunnel_detail, "window_stats": window_stats},
@@ -6787,6 +6794,13 @@ def test_gated_same_composition_no_spam_despite_detail_changes(monkeypatch, tmp_
     monkeypatch.setattr(health, "WATCHDOG_METRICS_STATE", tmp_path / "metrics.state.json")
     monkeypatch.setattr(health.metrics_store, "METRICS_LOG", tmp_path / "metrics.jsonl")
     monkeypatch.setattr(health.diag_netprobe, "current_net", lambda: None)
+    # изоляция от живых проб (канон unmocked-probe, #205/#251): свежий metrics-state
+    # проходит троттлинг → _record_watchdog_metrics звал бы РЕАЛЬНЫЕ _direct_up/_bulk_probe
+    # (enabled=False, short-circuit до interval_sec); сегмент-атрибуция и netprobe-заметка
+    # читают реальные сайдкары → None (тесты гейт-события их не ассертят).
+    monkeypatch.setattr(health, "_metrics_probe_options", lambda: {"enabled": False})
+    monkeypatch.setattr(health, "cached_attribution", lambda: None)
+    monkeypatch.setattr(health, "_tunnel_parameter_note", lambda: None)
     monkeypatch.setattr(health, "check_all", lambda **kw: {
         "status": "degraded",
         "checks": [{"name": _TUNNEL_NAME, "id": "tunnel", "ok": False,
