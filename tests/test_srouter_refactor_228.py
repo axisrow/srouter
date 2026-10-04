@@ -117,6 +117,7 @@ class TestParserSurface:
             "install", "uninstall", "start", "stop", "restart",
             "status", "doctor", "sync", "system-proxy", "routing", "privoxy",
             "netprobe", "git-proxy", "go-proxy",
+            "mark",  # 2026-10-04: ручная отметка качества интернета → MARKS_LOG
         }
 
     def test_nested_subcommand_paths_preserved(self, surface):
