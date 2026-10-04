@@ -44,6 +44,11 @@ _log = logging.getLogger("srouter.metrics_store")
 # путь — module-level константа (мокается в тестах, как health.WATCHDOG_LIFECYCLE_LOG).
 METRICS_LOG = Path.home() / "Library" / "Logs" / "srouter-watchdog.metrics.jsonl"
 
+# Ручные отметки качества интернета (srouter mark, 2026-10-04): вердикт пользователя
+# good|ok|bad + комментарий + контекст сети на момент отметки. Тот же Writer/reader
+# контракт, что METRICS_LOG: module-level константа, мокается в тестах.
+MARKS_LOG = Path.home() / "Library" / "Logs" / "srouter-net-marks.jsonl"
+
 # Дефолты интервалов/хранения — публичный контракт (дублируются в local_state probes).
 DEFAULT_INTERVAL_SEC = 60
 DEFAULT_RETENTION_DAYS = 7

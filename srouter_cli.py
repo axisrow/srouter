@@ -23,11 +23,15 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from dataclasses import replace
+from datetime import datetime
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path  # noqa: F401 — публичный контракт srouter (мокается в тестах)
 
+import diag_netprobe  # mark: контекст сети на момент ручной отметки (fail-soft контракт)
 import local_state
+import metrics_store  # mark: append_timing_event + MARKS_LOG (владелец — модуль, тесты мокают его)
 from install_lib import (
     CHOICES,
     LAUNCHAGENT_LABEL,
@@ -662,6 +666,40 @@ def cmd_netprobe(args) -> int:
     return 2
 
 
+def cmd_mark(args) -> int:
+    """Ручная отметка качества интернета: srouter mark <good|ok|bad> [комментарий].
+
+    Субъективный вердикт пользователя в момент ощущения + контекст сети на момент
+    отметки (current_net_status: метка/известность/источник) → append в MARKS_LOG.
+    Цель — корреляция «ощущение × автометрики» вместо гадания (2026-10-04).
+    Семантика уровней (решение пользователя): глазного критерия «хорошо vs норм» нет —
+    good резервируется под будущую автоматическую разметку, вручную ставятся ok/bad.
+    append best-effort, но команда честная: неудача записи → stderr + exit 1.
+    """
+    comment = (args.comment or "").strip() or None
+    ts = time.time()
+    st = diag_netprobe.current_net_status()  # fail-soft контракт: сам не бросает
+    event = {
+        "timestamp": datetime.fromtimestamp(ts).astimezone().isoformat(),
+        "ts": ts,
+        "verdict": args.verdict,
+        "comment": comment,
+        "net": (st or {}).get("label"),
+        "net_known": bool((st or {}).get("known")),
+        "net_source": (st or {}).get("source"),
+    }
+    if not metrics_store.append_timing_event(event, log_path=metrics_store.MARKS_LOG):
+        print(f"Отметка НЕ записана: append в {metrics_store.MARKS_LOG} не удался.",
+              file=sys.stderr)
+        return 1
+    net_txt = event["net"] or "нет"
+    if st is not None and not st.get("known"):
+        net_txt += " (неизвестная сеть)"
+    suffix = f" (комментарий: {comment})" if comment else ""
+    print(f"Отметка записана: {args.verdict}{suffix} — сеть: {net_txt}")
+    return 0
+
+
 def cmd_doctor(args) -> int:
     """Проверить здоровье стека: порты + реальный туннель. Отчёт ✅/❌ + подсказки."""
     result = health.check_all(active_claude=True)
@@ -1290,6 +1328,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Запомнить текущую сеть под именем (обучение отпечатка DNS; один прогон на сеть).")
     sp_nn.add_argument("name", help="Имя сети (напр. 103 / 888-5G).")
     sp_nn.set_defaults(func=cmd_netprobe)
+
+    # mark (2026-10-04): ручная отметка качества интернета → JSONL (metrics_store.MARKS_LOG).
+    # Цель — корреляция субъективных ok/bad с автометриками; good — резерв под авторазметку.
+    p_mark = sub.add_parser(
+        "mark", help="Ручная отметка качества интернета (ok/bad + комментарий) в JSONL-лог.")
+    p_mark.add_argument(
+        "verdict", choices=("good", "ok", "bad"),
+        help="good — резерв под будущую авторазметку (глазного критерия «хорошо vs норм» "
+             "нет); вручную ставь ok или bad.")
+    p_mark.add_argument("comment", nargs="?", default=None,
+                        help="Свободный комментарий (напр. «видео лагает»).")
+    p_mark.set_defaults(func=cmd_mark)
 
     # routing (#136): управление routing-доменами production xray-config. Отдельная подкоманда —
     # свои sub-subcommands (add-domain/remove-domain/list). НЕ "route" (конфликт с split-route).

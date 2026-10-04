@@ -526,6 +526,18 @@ Mirror — дефолт по канону #199: Go-сборки живут пр�
 `~/bin/go` без маркера не перезаписываются без `--force` (#307-канон). Реальная проба 2026-09-30:
 `go mod download` свежего модуля после `enable` проходит, включая чистый env без прокси.
 
+## Ручная отметка качества интернета `srouter mark`
+
+```bash
+srouter mark ok                # «сейчас работает нормально»
+srouter mark bad "видео лагает"
+```
+
+Субъективный вердикт в момент ощущения + контекст сети (метка/известность) дописываются в
+`~/Library/Logs/srouter-net-marks.jsonl` — для последующей сверки с автометриками
+(watchdog-тики, netprobe-ноги). `good` — резерв под будущую автоматическую разметку
+(глазного критерия «хорошо vs норм» нет), вручную ставятся `ok`/`bad`.
+
 ## PF-изоляция доменов (опционально)
 
 **Цель:** пакеты к Proxy-доменам (`api.anthropic.com`, `console.anthropic.com`, `claude.ai`) физически
@@ -1048,6 +1060,18 @@ Mirror is the default per the #199 canon: Go builds survive a dead tunnel. A for
 or a marker-less `~/bin/go` is never overwritten without `--force` (#307 canon). Live check
 2026-09-30: `go mod download` of a fresh module passes after `enable`, including with a
 proxy-free environment.
+
+## Manual internet-quality mark `srouter mark`
+
+```bash
+srouter mark ok                # "works fine right now"
+srouter mark bad "video stutters"
+```
+
+A subjective verdict at the moment of feeling it, plus network context (label/knownness),
+is appended to `~/Library/Logs/srouter-net-marks.jsonl` for later correlation with the
+automatic metrics (watchdog ticks, netprobe legs). `good` is reserved for future automatic
+labeling (no eyeball criterion for "good vs ok" yet); manually use `ok`/`bad`.
 
 ## PF domain isolation (optional)
 
