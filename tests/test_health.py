@@ -6687,3 +6687,151 @@ def test_metrics_probe_options_metrics_targets_empty_falls_back_to_default(monke
     _metrics_env(monkeypatch, tmp_path, probes={"metrics_targets": ["nonsense"]})
     opts = health._metrics_probe_options()
     assert opts["metrics_targets"] == local_state._DEFAULT_STATE["probes"]["metrics_targets"]
+
+
+# ============================ gated-состав в статус-событии (диагноз 2026-10-04) ============================
+# #362 флап-гейт вырезает туннель из notify-состава failed (пуши молчат — верно), но
+# статус-событие писало {status: degraded, failed: []} — журнал и календарь не могли
+# ответить «кто флапнул и почему ниже порога». Эпидод 2026-10-04 14:51-15:08: 6
+# однотиковых флапов, все события с failed=[]. Фикс: событие несёт gated (имена) +
+# gated_details (причины), дедуп по именам (детали меняются каждый тик).
+
+_TUNNEL_NAME = "Туннель (curl canary)"
+
+
+def _gated_watchdog_tick(monkeypatch, tmp_path, *, prev_state, tunnel_ok,
+                         window_stats, tunnel_detail):
+    """Один cmd_watchdog-тик с туннель-чеком (id=tunnel) и window_stats на нём.
+
+    Изоляция: state/status-log в tmp; metrics-запись глушится перенаправлением
+    (чек с id=tunnel иначе доходит до живого METRICS_LOG — канон теста :6073);
+    current_net не зовём (3 subprocess на машинно-зависимом резолвере).
+    Возвращает путь статус-лога.
+    """
+    state_file = tmp_path / "watchdog.last"
+    state_file.write_text(json.dumps(prev_state, ensure_ascii=False))
+    status_log = tmp_path / "status.jsonl"
+    monkeypatch.setattr(health, "WATCHDOG_STATE", state_file)
+    monkeypatch.setattr(health, "WATCHDOG_STATUS_LOG", status_log)
+    monkeypatch.setattr(health, "WATCHDOG_METRICS_STATE", tmp_path / "metrics.state.json")
+    monkeypatch.setattr(health.metrics_store, "METRICS_LOG", tmp_path / "metrics.jsonl")
+    monkeypatch.setattr(health.diag_netprobe, "current_net", lambda: None)
+    checks = [
+        {"name": _TUNNEL_NAME, "id": "tunnel", "ok": tunnel_ok,
+         "detail": tunnel_detail, "window_stats": window_stats},
+        {"name": "privoxy", "ok": True},
+    ]
+    monkeypatch.setattr(health, "check_all", lambda **kw: {
+        "status": "ok" if tunnel_ok else "degraded", "checks": checks})
+    monkeypatch.setattr(health, "_notify", lambda msg, sound="Glass": None)
+    monkeypatch.setenv(_COOLDOWN_ENV, "0")
+    health.cmd_watchdog()
+    return status_log
+
+
+def _read_status_lines(status_log):
+    return [json.loads(line) for line in status_log.read_text(encoding="utf-8").splitlines()
+            if line.strip()]
+
+
+def test_gated_tunnel_status_event_carries_gated_and_details(monkeypatch, tmp_path):
+    """Туннель упал, окно ниже флап-порога → событие: failed=[] (пуш-состав честен),
+    но gated=[туннель] + gated_details с вердиктом гейта — журнал отвечает «кто и почему»."""
+    below_threshold = {"fails": 1, "samples": 10, "rate": 0.1}
+    log = _gated_watchdog_tick(
+        monkeypatch, tmp_path,
+        prev_state={"status": "ok", "failed": [], "last_degraded_push": 0.0},
+        tunnel_ok=False, window_stats=below_threshold,
+        tunnel_detail="10/10 фейлов за 15м ниже порога 50% (флап, наблюдаем)")
+    lines = _read_status_lines(log)
+    assert len(lines) == 1, "ok→degraded — одно событие"
+    cur = lines[0]["current"]
+    assert cur["status"] == "degraded"
+    assert cur["failed"] == [], "гейт вырезал туннель из notify-состава"
+    assert cur["gated"] == [_TUNNEL_NAME], "виновник деградации виден в журнале"
+    details = lines[0]["gated_details"]
+    assert _TUNNEL_NAME in details and "ниже порога" in details[_TUNNEL_NAME], \
+        "причина с вердиктом гейта («флап, ниже порога») в событии"
+
+
+def test_gated_episode_recovery_event_carries_prev_gated(monkeypatch, tmp_path):
+    """Выход из gated-эпизода: recovery-событие несёт previous.gated — эпизод
+    восстанавливается в форензике целиком (state пережил тики)."""
+    log = _gated_watchdog_tick(
+        monkeypatch, tmp_path,
+        prev_state={"status": "degraded", "failed": [], "gated": [_TUNNEL_NAME],
+                    "notified_failed": [], "last_degraded_push": 0.0},
+        tunnel_ok=True, window_stats=None, tunnel_detail="ok")
+    lines = _read_status_lines(log)
+    assert len(lines) == 1, "degraded→ok — одно событие"
+    assert lines[0]["previous"]["gated"] == [_TUNNEL_NAME], \
+        "предыдущее состояние помнит gated-состав эпизода"
+    assert lines[0]["previous"]["status"] == "degraded"
+    assert lines[0]["current"]["status"] == "ok"
+    assert "gated" not in lines[0]["current"], "пустой gated не сериализуется"
+
+
+def test_gated_same_composition_no_spam_despite_detail_changes(monkeypatch, tmp_path):
+    """Дедуп по ИМЕНАМ gated, не по деталям: цифры окна («2/11»→«3/11») в detail
+    меняются каждый тик — эпизод не должен сыпать событием на каждый тик."""
+    below = {"fails": 1, "samples": 10, "rate": 0.1}
+    prev = {"status": "ok", "failed": [], "last_degraded_push": 0.0}
+    _gated_watchdog_tick(monkeypatch, tmp_path, prev_state=prev, tunnel_ok=False,
+                         window_stats=below, tunnel_detail="1/10 фейлов за 15м ниже порога")
+    # второй тик: тот же degraded-эпизод, но state уже перезаписан первым тиком —
+    # prev для второго тика берём из файла (как в проде), деталь другая
+    state_file = tmp_path / "watchdog.last"
+    status_log = tmp_path / "status.jsonl"
+    monkeypatch.setattr(health, "WATCHDOG_STATE", state_file)
+    monkeypatch.setattr(health, "WATCHDOG_STATUS_LOG", status_log)
+    monkeypatch.setattr(health, "WATCHDOG_METRICS_STATE", tmp_path / "metrics.state.json")
+    monkeypatch.setattr(health.metrics_store, "METRICS_LOG", tmp_path / "metrics.jsonl")
+    monkeypatch.setattr(health.diag_netprobe, "current_net", lambda: None)
+    monkeypatch.setattr(health, "check_all", lambda **kw: {
+        "status": "degraded",
+        "checks": [{"name": _TUNNEL_NAME, "id": "tunnel", "ok": False,
+                    "detail": "2/11 фейлов за 15м ниже порога (другие цифры)",
+                    "window_stats": {"fails": 2, "samples": 11, "rate": 0.18}},
+                   {"name": "privoxy", "ok": True}]})
+    monkeypatch.setattr(health, "_notify", lambda msg, sound="Glass": None)
+    monkeypatch.setenv(_COOLDOWN_ENV, "0")
+    health.cmd_watchdog()
+    lines = _read_status_lines(status_log)
+    assert len(lines) == 1, "тот же gated-состав (по именам) — второго события нет"
+
+
+def test_gate_off_tunnel_stays_in_failed_no_gated_key(monkeypatch, tmp_path):
+    """Гейт неприменим (rate ≥ порога): туннель честно в failed, ключа gated в событии нет."""
+    log = _gated_watchdog_tick(
+        monkeypatch, tmp_path,
+        prev_state={"status": "ok", "failed": [], "last_degraded_push": 0.0},
+        tunnel_ok=False, window_stats={"fails": 9, "samples": 10, "rate": 0.9},
+        tunnel_detail="9/10 фейлов за 15м")
+    lines = _read_status_lines(log)
+    assert len(lines) == 1
+    cur = lines[0]["current"]
+    assert cur["failed"] == [_TUNNEL_NAME], "реальная деградация — туннель в notify-составе"
+    assert "gated" not in cur and "gated_details" not in lines[0], \
+        "гейт не срабатывал — служебных ключей нет (старые reader'ы не ломаются)"
+
+
+def test_status_event_without_tunnel_unchanged_shape(monkeypatch, tmp_path):
+    """Обычный переход без туннеля вообще: форма события байт-в-байт прежняя
+    (только status/failed + diff) — контракт для существующих consumer'ов."""
+    state_file = tmp_path / "watchdog.last"
+    state_file.write_text(json.dumps(
+        {"status": "ok", "failed": [], "last_degraded_push": 0.0}, ensure_ascii=False))
+    status_log = tmp_path / "status.jsonl"
+    monkeypatch.setattr(health, "WATCHDOG_STATE", state_file)
+    monkeypatch.setattr(health, "WATCHDOG_STATUS_LOG", status_log)
+    monkeypatch.setattr(health, "check_all", lambda **kw: {
+        "status": "degraded",
+        "checks": [{"name": "claude-proxy", "ok": False, "detail": "5xx"}]})
+    monkeypatch.setattr(health, "_notify", lambda msg, sound="Glass": None)
+    monkeypatch.setenv(_COOLDOWN_ENV, "0")
+    health.cmd_watchdog()
+    lines = _read_status_lines(status_log)
+    assert len(lines) == 1
+    assert lines[0]["current"] == {"status": "degraded", "failed": ["claude-proxy"]}, \
+        "без гейта ключа gated в событии нет — dict равен прежней схеме"
+    assert "gated_details" not in lines[0]

@@ -68,6 +68,28 @@ def test_incident_counts_only_ok_to_not_ok_transitions():
         "down→degraded и degraded→ok — не инциденты (эпизод продолжается/закрылся)"
 
 
+def test_incident_counts_tolerates_gated_keys():
+    """Диагноз 2026-10-04: события с gated/gated_details (флап-гейт туннеля) агрегатор
+    читает как прежде — только .status; служебные ключи не ломают календарь."""
+    now = datetime(2026, 10, 4, 15, 0)
+    lines = [
+        json.dumps({"timestamp": _local_iso(now - timedelta(minutes=5)),
+                    "previous": {"status": "ok", "failed": []},
+                    "current": {"status": "degraded", "failed": [],
+                                "gated": ["туннель"]},
+                    "gated_details": {"туннель": "1/10 фейлов за 15м ниже порога"}},
+                   ensure_ascii=False),
+        json.dumps({"timestamp": _local_iso(now - timedelta(minutes=2)),
+                    "previous": {"status": "degraded", "failed": [],
+                                 "gated": ["туннель"]},
+                    "current": {"status": "ok", "failed": []}}, ensure_ascii=False),
+    ]
+    buckets, _ = dashboard_routes._incident_counts(lines, days=30, now=now)
+    day = now.date().isoformat()
+    assert buckets[(day, 14)]["count"] == 1
+    assert buckets[(day, 14)]["down"] == 0
+
+
 def test_incident_counts_skips_garbage_and_out_of_window():
     now = datetime(2026, 9, 28, 15, 0)
     lines = [
