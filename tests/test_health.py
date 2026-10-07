@@ -110,6 +110,10 @@ def _all_up_monkey(monkeypatch, *, probe_status="ok", probe_detail="runtime: к�
     # Claude.app на dev-машине (даже через wrapper — с app-internal WS-утечкой) драйвил бы вердикт.
     monkeypatch.setattr(health, "_claude_app_proxy_check",
                         lambda: {"status": "unknown", "source": "n/a", "detail": "Claude.app не запущен (mock)"})
+    # Семейство ~/bin-wrapper'ов (fs-чек) — на dev-машине живые симлинки/unmarked дали бы
+    # warn и драйвили вердикт. Мокаем ok (файлы не предмет этих тестов).
+    monkeypatch.setattr(health, "_gui_wrappers_check",
+                        lambda: {"status": "ok", "source": "fs", "detail": "mock: семейство управляемо"})
     monkeypatch.setattr(health, "_desktop_proxy_check",
                         lambda: {"status": "unknown", "detail": "launchctl (mock)"})
     # #205: _dns_up дёргает _resolve_host (socket.getaddrinfo github.com) — мокаем резолв ok, иначе
@@ -533,6 +537,21 @@ def test_check_all_unknown_when_files_override_runtime_diverges(monkeypatch):
     assert "перезапусти CC" not in cp["detail"], "бессмысленный совет уходит из detail"
 
 
+def test_gui_wrappers_unknown_is_info_only(monkeypatch):
+    """Ревью #405: unknown gui-wrappers (app не установлен / источники недоступны) —
+    info-only, как соседние App-чеки: install сам откажется ставить wrapper без app,
+    вечный driver-degraded с невыполнимым рецептом недопустим (канон #362/#403)."""
+    _all_up_monkey(monkeypatch)
+    monkeypatch.setattr(health, "_gui_wrappers_check",
+                        lambda: {"status": "unknown", "source": "fs",
+                                 "detail": "app не установлен (mock)"})
+    result = health.check_all()
+    assert result["status"] == "ok", "unknown gui-wrappers не драйвит вердикт"
+    gw = [c for c in result["checks"] if "gui-wrappers" in c["name"]][0]
+    assert gw.get("info") is True, "unknown-check помечен info (не driver)"
+    assert gw["ok"] is False, "unknown — это не подтверждённое здоровье (fail-open)"
+
+
 # ============================ #337: per-PID атрибуция при override-гейте ============================
 # Дивергенция файлы-vs-runtime (класс #143): ФАЙЛЫ уже на z.ai-override (гейт #329 активен),
 # а exec-env живого PID (ps eww) выглядит иначе — стандартный endpoint, чужой хост или без
@@ -853,6 +872,10 @@ def test_check_all_down_when_everything_dead(monkeypatch):
     # Claude.app route-check (ps/lsof) — мокаем down по той же причине (machine-independence).
     monkeypatch.setattr(health, "_claude_app_proxy_check",
                         lambda: {"status": "down", "source": "runtime", "detail": "down"})
+    # Семейство wrapper'ов (fs) — мокаем warn (ok=False без any_ok): чек не бывает down,
+    # а ok-мок дал бы any_ok=True → degraded вместо down в «всё мертво»-тестах.
+    monkeypatch.setattr(health, "_gui_wrappers_check",
+                        lambda: {"status": "warn", "source": "fs", "detail": "mock"})
     # #250: _codenv_job_check тоже driver (не info на ok) — на машине с реально загруженным и
     # здоровым codenv LaunchAgent даёт живой ok → any_ok=True → degraded вместо down. Мокаем для
     # machine-independence (канон unmocked-probe-is-both-slow-and-machine-dependent).
@@ -1031,6 +1054,9 @@ def test_vps_unreachable_does_not_mask_down_into_degraded(monkeypatch):
                         lambda: {"status": "down", "source": "gui-env", "detail": "down"})
     monkeypatch.setattr(health, "_claude_app_proxy_check",
                         lambda: {"status": "down", "source": "runtime", "detail": "down"})
+    # Семейство wrapper'ов (fs) — мокаем warn (ok=False без any_ok), см. выше.
+    monkeypatch.setattr(health, "_gui_wrappers_check",
+                        lambda: {"status": "warn", "source": "fs", "detail": "mock"})
     _mock_active_node(monkeypatch, {"name": "vps-1", "endpoint_host": "198.51.100.7", "port": 443})
     _mock_vps_tcp(monkeypatch, reachable=False)
     # #205: VPS-driver гвард требует net["up"] and dns["up"] (gaierror ≠ VPS-смерть). Мокаем DNS-up,

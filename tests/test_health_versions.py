@@ -238,6 +238,9 @@ def _machine_state_monkey(monkeypatch):
     # (парность с _all_up_monkey гвардит test_machine_state_mock_guard, #267).
     monkeypatch.setattr(health, "_claude_app_proxy_check",
                         lambda: {"status": "unknown", "source": "n/a", "detail": "Claude.app не запущен (mock)"})
+    # Семейство ~/bin-wrapper'ов (fs-чек) — та же причина (парность #267).
+    monkeypatch.setattr(health, "_gui_wrappers_check",
+                        lambda: {"status": "ok", "source": "fs", "detail": "mock: семейство управляемо"})
     # #205: _dns_up → _resolve_host (реальный getaddrinfo github.com).
     monkeypatch.setattr(health, "_resolve_host", lambda host: True)
     # #204: _local_proxy_up → _service_running (реальный launchctl print).
