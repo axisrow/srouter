@@ -8,8 +8,10 @@ verify-dont-guess: один probe, не дублируем). Reachable → в NO
 через прокси. Resilience (srouter-critical-infra-24-7): смерть VPS не роняет direct-домены — z.ai
 всегда в NO_PROXY независимо от результата detect (BUILTIN_FALLBACK_NO_PROXY при любом сбое).
 
-Не бросает нигде (probe-канон) — health.py/srouter-codex-env.sh зовут это в периодическом re-check
-(codenv StartInterval=300) и в install-time; исключение здесь не должно ронять env-слой.
+Не бросает нигде (probe-канон) — исключение здесь не должно ронять env-слой. Продовых
+потребителей сейчас НЕТ: периодический вызов из codenv-агента снят вместе с ambient-посевом
+(контракт 2026-10-07 — NO_PROXY-плечо инертно без ambient-прокси); API сохранён как opt-in
+для будущего возврата NO_PROXY-детекта.
 """
 from __future__ import annotations
 

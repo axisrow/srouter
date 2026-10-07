@@ -9,8 +9,13 @@ setenv не ретроактивен и не снимает то, чего не 
 ALL_PROXY (#331/#340) и privoxy 8118 scheme-ключи, residual жил бы в gui-домене вечно.
 
 Тест гоняет скрипт с подставным launchctl (PATH-stub, записывает вызовы) — сеть и
-настоящий launchctl не трогаются; позитивный контроль (>=6 перехваченных вызовов)
-гарантирует, что ассерты не вакуумны при мёртвом перехвате.
+настоящий launchctl не трогаются; позитивный контроль (не меньше ключей чистки, чем в
+CODEX_LAUNCHCTL_UNSET_KEYS) гарантирует, что ассерты не вакуумны при мёртвом перехвате.
+
+Список чистки сверяется с codex_wrappers.CODEX_LAUNCHCTL_UNSET_KEYS (его же итерирует
+uninstall) — единый источник правды: скрипт и uninstall снимают РОВНО один и тот же набор
+(ревью #403: NO_PROXY/no_proxy тоже сеялись до контракта, exact-equality против
+шестиключевого списка запрещал их добавить).
 """
 
 import os
@@ -19,10 +24,12 @@ from pathlib import Path
 
 import pytest
 
+import codex_wrappers
+
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "launchagents" / "srouter-codex-env.sh"
 
-PROXY_KEYS = ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy"]
+UNSET_KEYS = set(codex_wrappers.CODEX_LAUNCHCTL_UNSET_KEYS)
 
 
 @pytest.fixture
@@ -36,7 +43,6 @@ def launchctl_log(tmp_path, monkeypatch):
     stub.chmod(0o755)
     monkeypatch.setenv("LAUNCHCTL_CALLS_LOG", str(log))
     monkeypatch.setenv("PATH", f"{stub_dir}{os.pathsep}{os.environ.get('PATH', '')}")
-    monkeypatch.setenv("SROUTER_PYTHON", "/usr/bin/expr")
     yield log
 
 
@@ -51,14 +57,15 @@ def _run_script():
 
 
 def test_contract_no_proxy_seeding_and_residual_cleanup(launchctl_log):
-    """Скрипт не ставит НИ ОДНОГО прокси-ключа и снимает все шесть (upper+lower, scheme+all)."""
+    """Скрипт не ставит НИ ОДНОГО прокси-ключа и снимает РОВНО CODEX_LAUNCHCTL_UNSET_KEYS
+    (scheme+all+NO_PROXY, оба регистра) — тот же набор, что uninstall."""
     r = _run_script()
     assert r.returncode == 0, f"скрипт упал: {r.stderr}"
 
     assert launchctl_log.exists(), "launchctl-stub ни разу не вызвался — перехват мёртв"
     calls = [line.split() for line in
              launchctl_log.read_text(encoding="utf-8").splitlines() if line.strip()]
-    assert len(calls) >= len(PROXY_KEYS), (
+    assert len(calls) >= len(UNSET_KEYS), (
         f"перехват неполный ({len(calls)} вызовов) — ассерты были бы вакуумными"
     )
 
@@ -68,8 +75,9 @@ def test_contract_no_proxy_seeding_and_residual_cleanup(launchctl_log):
         f"{setenv}"
     )
     unset_names = {c[1] for c in calls if c[:1] == ["unsetenv"] and len(c) > 1}
-    assert unset_names == set(PROXY_KEYS), (
-        f"residual-чистка неполна: не хватает {set(PROXY_KEYS) - unset_names}"
+    assert unset_names == UNSET_KEYS, (
+        f"residual-чистка разошлась с uninstall-списком: "
+        f"не хватает {UNSET_KEYS - unset_names}, лишние {unset_names - UNSET_KEYS}"
     )
 
 

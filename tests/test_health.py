@@ -4274,11 +4274,22 @@ def test_desktop_proxy_ok_when_http_in_all_keys(monkeypatch):
     assert "ALL_PROXY" in res["detail"]
 
 
-def test_desktop_proxy_unknown_when_no_launchctl(monkeypatch):
-    """launchctl пуст (ничего не задано) → unknown, не driver (как claude-proxy)."""
-    monkeypatch.setattr(health, "_read_proxy_sources", lambda: {"desktop_keys": {}})
+def test_desktop_proxy_ok_when_gui_domain_clean(monkeypatch):
+    """gui-домен чист и верифицируем → ok: ambient-прокси не сеется (контракт 2026-10-07),
+    пустой gui-env — здоровое состояние по умолчанию, а не «не смогли проверить»."""
+    monkeypatch.setattr(health, "_read_proxy_sources",
+                        lambda: {"desktop_keys": {}, "desktop_verifiable": True})
     res = health._desktop_proxy_check()
-    assert res["status"] == "unknown"
+    assert res["status"] == "ok", f"чистый gui-env = норма контракта → ok; got {res}"
+
+
+def test_desktop_proxy_unknown_when_gui_unverifiable(monkeypatch):
+    """launchctl print не ответил (desktop_verifiable=False) → unknown (fail-closed:
+    нечитаемый источник не выдаётся за «чисто»)."""
+    monkeypatch.setattr(health, "_read_proxy_sources",
+                        lambda: {"desktop_keys": {}, "desktop_verifiable": False})
+    res = health._desktop_proxy_check()
+    assert res["status"] == "unknown", f"неверифицируемый gui-env → unknown; got {res}"
 
 
 def test_desktop_proxy_down_shadows_socks5_even_with_http(monkeypatch):

@@ -2,8 +2,9 @@
 # srouter: codex-app-proxy wrapper (managed)
 #
 # ChatGPT/Codex.app (GUI из Dock/Spotlight) → Chromium через SOCKS5 (--proxy-server=socks5://127.0.0.1:10808),
-# минуя privoxy (портит WS-стриминг Codex). HTTP_PROXY env ставится srouter install глобально через
-# LaunchAgent com.srouter.codenv (launchctl setenv в GUI-домен) — здесь НЕ дублируется.
+# минуя privoxy (портит WS-стриминг Codex). Прокси задаёт ЭТОТ wrapper (--proxy-server):
+# env-прокси в gui-домен launchd не сеется (контракт 2026-10-07 — ambient-прокси не сеется ни
+# в один слой, агент com.srouter.codenv только вычищает residual-ключи).
 #
 # Запускать Codex.app ЧЕРЕЗ ЭТОТ WRAPPER, а не иконку Dock (Dock не передаёт --proxy-server).
 # Electron single-instance: сначала quit/pkill старого Codex, иначе аргументы уйдут в старый процесс.
@@ -43,10 +44,10 @@ sleep 1
 
 {
   print -r -- ""
-  print -r -- "[$(date '+%Y-%m-%dT%H:%M:%S%z')] Starting $APP_BUNDLE via $CHROMIUM_PROXY_URL (env from srouter install)"
+  print -r -- "[$(date '+%Y-%m-%dT%H:%M:%S%z')] Starting $APP_BUNDLE via $CHROMIUM_PROXY_URL (chromium --proxy-server via wrapper)"
 } >>"$LOG"
 
 open -na "$APP_BUNDLE" --args "--proxy-server=$CHROMIUM_PROXY_URL" "$@"
 
-print -r -- "Started $APP_BUNDLE through $CHROMIUM_PROXY_URL (env via srouter install LaunchAgent com.srouter.codenv)"
+print -r -- "Started $APP_BUNDLE through $CHROMIUM_PROXY_URL (Chromium --proxy-server задаёт wrapper; gui-домен без ambient-прокси — контракт 2026-10-07)"
 print -r -- "Log: $LOG"

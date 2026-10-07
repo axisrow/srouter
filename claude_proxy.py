@@ -41,12 +41,14 @@ except SystemExit:
 SETTINGS = Path.home() / ".claude" / "settings.json"
 # Claude Code/node уважают HTTPS_PROXY; HTTP_PROXY добавляем для полноты (HTTP-эндпоинты).
 ENV_KEYS = ("HTTPS_PROXY", "HTTP_PROXY")
-# Issue #331: launchctl gui-домен (srouter-codex-env.sh) ставит ALL_PROXY/all_proxy =
-# socks5h://127.0.0.1:10808 во ВСЕ GUI-процессы — в сессиях Claude Code это протекает в
-# pip/requests: urllib.request.getproxies_environment() подхватывает all_proxy, requests
-# select_proxy маппит 'all' на ВСЕ схемы → путь SOCKSProxyManager → TypeError
-# PoolKey key_proxy_ssl_context (при shadowing urllib3 поверх vendored). Для CC единственное
-# плечо = privoxy 8118, поэтому enable() НЕЙТРАЛИЗУЕТ all_proxy пустой строкой (не ставит
+# Issue #331 (ИСТОРИЯ): раньше launchctl gui-домен (srouter-codex-env.sh) ставил
+# ALL_PROXY/all_proxy = socks5h://127.0.0.1:10808 во ВСЕ GUI-процессы — в сессиях Claude Code
+# это протекало в pip/requests: urllib.request.getproxies_environment() подхватывает all_proxy,
+# requests select_proxy маппит 'all' на ВСЕ схемы → путь SOCKSProxyManager → TypeError
+# PoolKey key_proxy_ssl_context (при shadowing urllib3 поверх vendored). Сейчас gui-домен
+# чистится агентом (ambient не сеется, контракт 2026-10-07), но нейтрализация all_proxy
+# остаётся защитой от ЧУЖОГО/ручного all_proxy — поэтому enable() по-прежнему НЕЙТРАЛИЗУЕТ
+# all_proxy пустой строкой (не ставит
 # SOCKS!) — канон #199 «снять env-прокси ОБА регистра»: нейтрализация там, где задумана.
 # Чужое НЕпустое значение — FOREIGN (канон #307), перезапись только force с backup.
 NEUTRAL_PROXY_KEYS = ("ALL_PROXY", "all_proxy")

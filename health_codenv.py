@@ -82,11 +82,12 @@ def _read_proxy_sources():
     codenv-trust цепочки. verifiable=False (timeout/unknown domain) → desktop_keys пуст (fail-closed:
     не выдумываем значения из caller-context, лучше unknown, чем ложный ok/info).
 
-    Возвращает {desktop_keys: {KEY: value}, cli_proxy: str}. Не бросает (fail-soft: import claude_proxy
-    — local, сохраняет fail-soft границу health).
+    Возвращает {desktop_keys: {KEY: value}, desktop_verifiable: bool, cli_proxy: str}. Не бросает
+    (fail-soft: import claude_proxy — local, сохраняет fail-soft границу health).
     """
     gui = _health_facade._read_gui_proxy_env(keys_filter=LAUNCHCTL_PROXY_KEYS)
-    desktop_keys = gui.get("keys") or {} if gui.get("verifiable") else {}
+    verifiable = bool(gui.get("verifiable"))
+    desktop_keys = gui.get("keys") or {} if verifiable else {}
     try:
         import claude_proxy
         data = claude_proxy._load()
@@ -95,14 +96,16 @@ def _read_proxy_sources():
     except ImportError as exc:
         _log.debug("claude_proxy недоступен: %s — cli_proxy пуст", exc)
         cli_proxy = ""
-    return {"desktop_keys": desktop_keys, "cli_proxy": cli_proxy}
+    return {"desktop_keys": desktop_keys, "desktop_verifiable": verifiable, "cli_proxy": cli_proxy}
 
 
 def _codenv_managed(runner=None):
     """codenv LaunchAgent srouter-managed? Маркер в plist (provenance) И реально loaded в launchd.
 
-    Архитектурный конфликт #189/#127: codenv ставит SOCKS5 в gui-домен (нужно ChatGPT.app Rust
-    app-server), но тот же SOCKS5 ломает Claude Desktop App (#127). _desktop_proxy_check отличает
+    Исторический конфликт #189/#127: раньше codenv ставил SOCKS5 в gui-домен (нужен ChatGPT.app
+    Rust app-server), но тот же SOCKS5 ломал Claude Desktop App (#127). С контракта 2026-10-07
+    codenv ничего не сеет (только residual-чистка); проверка остаётся различать наш агент и
+    чужой посев. _desktop_proxy_check отличает
     «наш codenv» (намеренный tradeoff → info, не driver-шум) от «чужой корпоративный SOCKS5» (→ down).
 
     issue #192: маркер на диске один — НЕДОСТАТОЧЕН. Stale-plist сценарий: codenv когда-то стоял,
@@ -162,7 +165,8 @@ def _gui_socks_residual_check():
                   if urlparse(v).scheme.lower() in {"socks", "socks5", "socks5h"}}
     if not socks_keys:
         return {"status": "ok",
-                "detail": "gui-домен без socks-scheme — терминальное privoxy-плечо (#340), pip не затронут"}
+                "detail": "gui-домен без socks-scheme — ambient-прокси не сеется "
+                          "(контракт 2026-10-07), терминалы/pip не затронуты"}
     if not _codenv_managed():
         return {"status": "unknown",
                 "detail": (f"socks в gui-домене ({', '.join(sorted(socks_keys))}), но codenv не "
@@ -197,8 +201,16 @@ def _desktop_proxy_check():
     keys = src["desktop_keys"]
     cli_proxy = src.get("cli_proxy", "")
     if not keys:
+        # Контракт 2026-10-07: ambient-прокси в gui-домен НЕ сеется → пустой gui-env (когда
+        # источник верифицируем) — здоровое состояние по умолчанию, а не «не смогли проверить».
+        # Ревью #403: вечный unknown на норме контракта = шум, вытесняющий реальные инциденты.
+        if src.get("desktop_verifiable", True):
+            return {"status": "ok",
+                    "detail": "gui-домен без прокси-ключей — ambient-прокси не сеется "
+                              "(контракт 2026-10-07), Desktop App идёт напрямую"}
         return {"status": "unknown",
-                "detail": "launchctl proxy не задан — Desktop App идёт напрямую (ok для NO_PROXY-доменов, не защищён PF для остальных)"}
+                "detail": "launchctl print gui/<uid> не ответил — прокси-ключи gui-домена "
+                          "не верифицируемы (fail-closed: нечитаемый источник не выдаётся за «чисто»)"}
     # SOCKS-scheme в ЛЮБОМ ключе → down (Claude Code/Desktop App через SOCKS не умеют, #127).
     # urlparse по scheme, не подстрока — канон loose-validator (см. _tunnel_target_up в health_probes.py:
     # bad-code/upstream-error парсится структурно, не подстрокой).
@@ -249,7 +261,7 @@ _CODENV_SOCKS_URL = f"socks5h://127.0.0.1:{XRAY_PORT}"
 
 
 def _read_gui_proxy_env(runner=None, *, keys_filter=LAUNCHCTL_PROXY_KEYS):
-    """Прокси в launchd GUI-домене (где codenv ставит SOCKS5) — через `launchctl print gui/<uid>`.
+    """Прокси-ключи launchd GUI-домена (источник истины по gui-env) — через `launchctl print gui/<uid>`.
 
     launchctl getenv читает ТОЛЬКО caller-context (`Usage: getenv <key>` — НЕ принимает домен), молча
     игнорируя домен-аргумент → из SSH/cron/AO-shell даёт НЕ gui, а из GUI-терминала совпадает случайно.
@@ -583,8 +595,9 @@ def _codenv_job_check(runner=None, *, wait=_CODENV_RELOAD_SETTLE_WAIT):
                 вывод не распознан ИЛИ exit-код неизвестен. Никогда не бросает (probe-канон).
 
     down обязан быть DRIVER: 1419 падений в тишине — ровно то, что этот чек закрывает
-    (noisy-log-better-than-no-log). Без codenv Codex после ребута идёт напрямую за GFW —
-    утечка реального IP (fail-closed-proxy-down).
+    (noisy-log-better-than-no-log). Без codenv периодическая residual-чистка gui-домена не
+    выполняется: proxy-ключи, вписанные старыми установками или сторонним ПО, жили бы вечно
+    и молча заворачивали GUI/терминальный трафик в прокси-цепочку (наследие #340).
     """
     st = _codenv_job_state(runner=runner)
     if st["loaded"] is not True:
@@ -593,7 +606,7 @@ def _codenv_job_check(runner=None, *, wait=_CODENV_RELOAD_SETTLE_WAIT):
             # Но srouter-managed plist на диске ДОКАЗЫВАЕТ, что установка была: значит это не «не
             # ставили», а «поставили, и job выгружен/не забутстрапился». Зеркало осиротевшего job'а
             # (там job без plist, тут plist без job'а) — и ровно тот класс, что ловит issue #250:
-            # codenv сконфигурирован, но мёртв → после ребута Codex молча без SOCKS5.
+            # codenv сконфигурирован, но мёртв → после ребута residual-чистка gui-домена молча не выполняется.
             # Provenance-граница (#112): ЧУЖОЙ plist без маркера — не наша установка, молчим.
             # Окно reload — НЕ авария (cycle-review round 3, Codex): install пишет plist, затем
             # bootout → poll → bootstrap (install_plist._launchd_reload), и МЕЖДУ ними состояние
@@ -606,7 +619,8 @@ def _codenv_job_check(runner=None, *, wait=_CODENV_RELOAD_SETTLE_WAIT):
                         "detail": (f"codenv установлен, но НЕ загружен: srouter-managed plist на диске "
                                    f"({Path.home() / 'Library' / 'LaunchAgents' / f'{_CODENV_LABEL}.plist'}), "
                                    f"а job в launchd отсутствует — bootstrap не прошёл или job выгружен. "
-                                   f"Codex останется без SOCKS5 после ребута → прямой трафик за GFW. "
+                                   f"Периодическая residual-чистка gui-домена не выполняется "
+                                   f"(контракт 2026-10-07). "
                                    f"Лечение: srouter install (codenv) — перезагрузит LaunchAgent")}
             return {"status": "unknown",
                     "detail": f"codenv LaunchAgent {_CODENV_LABEL} не загружен в launchd "
@@ -622,7 +636,8 @@ def _codenv_job_check(runner=None, *, wait=_CODENV_RELOAD_SETTLE_WAIT):
         flap = " ФЛАП (падает при каждом запуске)" if (st["runs"] or 0) > 5 else ""
         return {"status": "down",
                 "detail": (f"codenv падает: last exit code = {exit_code} ({facts}).{flap} "
-                           f"Codex останется без SOCKS5 после ребута → прямой трафик за GFW."
+                           f"Периодическая residual-чистка gui-домена не выполняется "
+                           f"(контракт 2026-10-07: ambient-прокси не сеется, агент — только чистка)."
                            f"{cause} Лечение: srouter install (codenv)")}
     # 2. Осиротевший job: живёт в launchd, plist с диска удалён (bootout его не снял).
     plist = Path.home() / "Library" / "LaunchAgents" / f"{_CODENV_LABEL}.plist"
@@ -647,7 +662,8 @@ def _codenv_job_check(runner=None, *, wait=_CODENV_RELOAD_SETTLE_WAIT):
         if not Path(script).exists():
             return {"status": "down",
                     "detail": (f"codenv ProgramArguments указывает на несуществующий файл: {script} "
-                               f"({facts}) — следующий запуск даст exit 127, Codex без SOCKS5. "
+                               f"({facts}) — следующий запуск даст exit 127, residual-чистка "
+                               f"gui-домена не выполняется. "
                                f"Лечение: srouter install (codenv)")}
     # 4. Здоров — но только если exit-код ДОКАЗАННО 0. cycle-review PR #262 (Codex): `None` («нет
     # данных»: launchctl не напечатал поле или напечатал '(never exited)') раньше проваливался сюда,
@@ -663,7 +679,7 @@ def _codenv_job_check(runner=None, *, wait=_CODENV_RELOAD_SETTLE_WAIT):
 
 
 def _codex_app_proxy_check():
-    """ChatGPT.app (ЛЮБОЙ из двух независимых сетевых стеков) без прокси → down DRIVER (issue #189, #189-follow-up).
+    """ChatGPT.app (ЛЮБОЙ из двух независимых сетевых стеков) напрямую мимо туннеля → down DRIVER (issue #189, #189-follow-up).
 
     Эмпирика (verify, lsof per-process): ChatGPT.app = Electron/Chromium-обёртка + отдельный Rust
     app-server бинарник — ДВА независимых сетевых стека:
@@ -705,13 +721,16 @@ def _codex_app_proxy_check():
     (external/socks/privoxy) → чек остаётся unknown/idle для него, false-positive не возникает.
 
     Чек: (1) App-related PID активны (ps по _is_codex_app_comm, ЛЮБОЙ helper внутри .app/-бандла);
-    (2) gui-env через _read_gui_proxy_env; (3) реальный runtime-маршрут через _app_pids_route (lsof).
-      status="down"    — Rust app-server активен, gui-env пуст (codenv не загружен) — DRIVER
-                         (#362 п.3: только non-rust процессы при пустом gui-env — unknown,
-                         «не запущен» не деградация);
-      status="warn"    — App активен, gui-env только HTTP (privoxy рвёт WS #120) — DRIVER;
-      status="ok"      — App активен, gui-env SOCKS5 (codenv работает) — DRIVER;
-      status="unknown" — App не запущен ИЛИ gui-env не верифицируем — info-only (fail-closed).
+    (2) gui-env через _read_gui_proxy_env (контракт 2026-10-07: пустой gui-env — НОРМА, ambient
+    не сеется, «codenv не загружен» диагнозом не является); (3) реальный runtime-маршрут через
+    _app_pids_route (lsof) — verdict по факту маршрута, не по конфигу.
+      status="down"    — App-PID реально держат external-сокеты (прямой egress; GFW порвёт
+                         chatgpt.com) — независимо от gui-env. Рецепт — wrapper запуска App
+                         (env-прокси точечно), НЕ reinstall codenv (#403 review);
+      status="warn"    — маршрут через privoxy 8118 (рвёт long-lived WS #120);
+      status="ok"      — маршрут через SOCKS5 10808 (env задан точечно, wrapper);
+      status="unknown" — App не запущен, lsof недоступен/маршрут недоказуем (idle) — info-only
+                         (fail-closed). #362 п.3: «не запущен» — не деградация.
     App-PID здесь, НЕ в _codex_proxy_probe (TUI-чек исключил App-PID, чтобы не давать ложный mixed/down
     на нерелевантном PID — баг «❌ на VSCode PID 56748»).
     """
@@ -771,10 +790,40 @@ def _codex_app_proxy_check():
                                f"Rust app-server, для текущих процессов неприменим, деградацией не "
                                f"считается (#362). Если Chromium network-service течёт мимо прокси — "
                                f"см. отдельный system-proxy check.")}
-        return {"status": "down", "source": "gui-env",
-                "detail": (f"ChatGPT.app Rust app-server без прокси: launchctl gui-env пуст — codenv "
-                           f"не загружен/битый ({pid_hint}). WS к chatgpt.com рвётся (GFW). "
-                           f"Восстановить: srouter install (codenv)")}
+        # Контракт 2026-10-07: gui-env пуст — НОРМА (ambient-прокси не сеется), «codenv не
+        # загружен» больше не диагноз. Verdict — по фактическому маршруту App-PID (lsof):
+        # SOCKS5 → ok (env задан точечно wrapper'ом), privoxy → warn (#120), external → down
+        # (реально напрямую), недоказуемо → unknown (fail-closed). Ревью #403: вечный down с
+        # рецептом «srouter install» на здоровой машине — reinstall того же unset-only агента
+        # ничего не меняет и никогда не гасит DRIVER.
+        route = _app_pids_route(app_pids, app_kinds=app_kinds)
+        if route.get("verifiable"):
+            if route.get("socks"):
+                return {"status": "ok", "source": "runtime",
+                        "detail": (f"ChatGPT.app Rust app-server через SOCKS5 (lsof PID "
+                                   f"{','.join(sorted(route['socks']))} -> 10808; gui-env пуст — "
+                                   f"ambient-прокси не сеется (контракт 2026-10-07), env задан "
+                                   f"точечно, {pid_hint})")}
+            if route.get("privoxy"):
+                pv = ",".join(sorted(route["privoxy"]))
+                return {"status": "warn", "source": "runtime",
+                        "detail": (f"ChatGPT.app Rust app-server через privoxy {PRIVOXY_PORT} "
+                                   f"(PID {pv}), не SOCKS5 — long-lived WS порвётся (#120). "
+                                   f"gui-env пуст по контракту (ambient не сеется) — проверь "
+                                   f"wrapper запуска App (~/bin/codex-app-proxy)")}
+            if route.get("external"):
+                ext = ",".join(sorted(route["external"]))
+                return {"status": "down", "source": "runtime",
+                        "detail": (f"ChatGPT.app App-процесс(ы) НАПРЯМУЮ (PID {ext} держат "
+                                   f"external-сокеты; gui-env пуст — контракт 2026-10-07, "
+                                   f"ambient-прокси не сеется). chatgpt.com за GFW напрямую "
+                                   f"недоступен: запусти App через wrapper (~/bin/codex-app-proxy) "
+                                   f"— env-прокси точечно, {pid_hint}")}
+        return {"status": "unknown", "source": "gui-env",
+                "detail": (f"gui-env пуст — норма контракта 2026-10-07 (ambient-прокси не сеется); "
+                           f"«codenv не загружен» диагнозом не является. Маршрут App-PID не "
+                           f"доказан (idle/сбой lsof, {pid_hint}) — ручная проверка: "
+                           f"lsof -nP -p {','.join(app_pids)}")}
     socks_keys = {k: v for k, v in keys.items()
                   if urlparse(v).scheme.lower() in {"socks", "socks5", "socks5h"}}
     if socks_keys:
@@ -827,9 +876,9 @@ def _codex_app_proxy_check():
         return {"status": "ok", "source": "runtime",
                 "detail": (f"ChatGPT.app Rust app-server через SOCKS5 (lsof PID {','.join(sorted(route['socks']))} "
                            f"-> 10808, codenv gui-env: {found})")}
-    # gui-env задан, но без SOCKS5. #340: наш managed privoxy-формат — НОРМАЛЬНОЕ состояние
-    # установки (терминальное плечо), не «App на privoxy» — иначе нормальная установка вечно
-    # degraded (канон PR #135). App сегодня спавнится с санитизованным env без прокси (ps eww,
+    # gui-env задан, но без SOCKS5. privoxy-ключи в gui-домене = residual #340-эпохи
+    # (до-контрактный посев) — агент com.srouter.codenv вычистит их в ≤5 мин (контракт
+    # 2026-10-07: ambient не сеется). App спавнится с санитизованным env без прокси (ps eww,
     # #340) — gui-env до него не доходит; реальный маршрут App-PID ловит runtime-ветка выше
     # (lsof privoxy → warn #120). ok без runtime-доказательства не заявляем (fail-closed,
     # cycle-review #190) → unknown (info-only). ЧУЖОЙ http-прокси (не наш URL) → warn как раньше
@@ -863,14 +912,16 @@ def _codex_app_proxy_check():
                                    f"external-сокеты; managed privoxy gui-env #340, {pid_hint}) — "
                                    f"STALE App: перезапусти ChatGPT.app (Cmd+Q из Dock)")}
         return {"status": "unknown", "source": "gui-env",
-                "detail": (f"gui-env = managed privoxy-плечо #340 ({found}, {pid_hint}) — норма "
-                           f"установки, не «App на privoxy»: Rust app-server не наследует gui-env "
-                           f"(санитизованный spawn, #340). Маршрут App-PID не доказан (idle/сбой "
-                           f"lsof) — ручная проверка: lsof -nP -p {','.join(app_pids)}. "
+                "detail": (f"gui-env = privoxy-ключи #340-эпохи ({found}, {pid_hint}) — residual "
+                           f"до-контрактной установки, агент com.srouter.codenv вычистит в ≤5 мин "
+                           f"(контракт 2026-10-07: ambient не сеется). Маршрут App-PID не доказан "
+                           f"(idle/сбой lsof) — ручная проверка: lsof -nP -p {','.join(app_pids)}. "
                            f"SOCKS для CLI-codex — ~/bin/codex-srouter wrapper'ы точечно")}
     return {"status": "warn", "source": "gui-env",
             "detail": (f"ChatGPT.app Rust app-server через HTTP прокси без SOCKS5 ({found}, {pid_hint}) — "
-                       f"privoxy рвёт long-lived WS (#120). codenv должен ставить SOCKS5")}
+                       f"privoxy рвёт long-lived WS (#120). gui-env HTTP-прокси — residual/чужой "
+                       f"(ambient не сеется, контракт 2026-10-07): managed-агент вычистит в ≤5 мин; "
+                       f"для App — wrapper с точечным SOCKS5")}
 
 
 def _app_pids_route(app_pids, *, app_kinds=None):

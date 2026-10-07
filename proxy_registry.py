@@ -7,7 +7,8 @@
     git -> github    -> ~/.gitconfig
     Claude Code      -> ~/.claude/settings.json (env)
     VSCode/codex     -> <editor>/User/settings.json (http.proxy)
-    Codex App        -> launchctl setenv (gui-домен)
+    Codex App        -> gui-домен launchd: агент чистит residual, ambient не сеется (контракт
+                        2026-10-07); Chromium --proxy-server задаёт ~/bin/codex-app-proxy
 
 Пользователь не мог ответить на вопрос «какой прокси включён и работает ли вообще»: нужно
 было руками обойти пять конфигов, и даже это не сказало бы, доходит ли трафик.
@@ -170,7 +171,7 @@ CONSUMERS = (
         # #302: _desktop_proxy_check читает launchctl getenv — класс configured, не физика.
         health_fn=lambda: health._desktop_proxy_check(),
         evidence="config-only",
-        note="launchctl setenv (gui-домен)",
+        note="gui-домен launchd — агент чистит residual, ambient не сеется (контракт 2026-10-07)",
     ),
     ConsumerSpec(
         id="system", title="Система (macOS)", kind="system",

@@ -183,8 +183,8 @@ srouter install
 #   • настраивает прокси для Claude Code и git (github.com);
 #   • изолирует Codex тремя живыми путями + будущей fail-closed границей: SOCKS5-wrappers
 #     (~/bin/codex-srouter + codex-app-proxy, zsh-функция — CLI/Chromium-оболочка App),
-#     LaunchAgent com.srouter.codenv (#189/#190 — gui-SOCKS5 env для Rust app-server ChatGPT.app;
-#     setenv не ретроактивен — запущенный до install ChatGPT.app требует полного перезапуска Cmd+Q),
+#     LaunchAgent com.srouter.codenv (исторически #189/#190 — gui-SOCKS5 env; с контракта
+#     2026-10-07 — ТОЛЬКО residual-чистка gui-домена: ambient-прокси не сеется ни в один слой),
 #     scoped VSCode http.proxy (#185 — расширение openai.chatgpt; только если install обновил
 #     существующий settings.json редактора) — все три минуют privoxy, направляя Codex напрямую в xray;
 #     + PF kill-switch в ядре (#168) как будущая fail-closed граница (режет прямой TCP-выход codex на
@@ -317,7 +317,7 @@ Codex (CLI и App) нестабилен через privoxy (8118, HTTP-CONNECT) 
 worktree, чужой wrapper) оставляет codex под 501 — **вне PF**. Так что утверждение «обход wrapper'а
 нерелевантен» станет верным **только** когда codex принудительно запускается под 503 независимо от
 wrapper (например, launchd-служба, а не wrapper-команда). Значит **прямо сейчас** единственная живая
-защита от прямого выхода — wrappers + codenv + scoped VSCode env (слой 2). Полные детали — в разделе «🔒 PF codex-изоляция».
+защита от прямого выхода — wrappers + scoped VSCode env (слой 2; codenv с контракта 2026-10-07 — только residual-чистка gui-домена, прокси не сеет). Полные детали — в разделе «🔒 PF codex-изоляция».
 
 **2. SOCKS5-wrappers — defense-in-depth / best-effort переход.** Прокладки, которые выставляют
 codex'у env на SOCKS5, чтобы трафик шёл правильным путём *до того*, как PF его всё равно защитит.
@@ -339,18 +339,17 @@ binary/exec.LookPath), поэтому границей служит именно
   и подскажет `srouter system-proxy repair` (настраивает и включает SOCKS `127.0.0.1:10808` на
   активном network service, бэкапя чужой выключенный endpoint; отказывает без мутации, если там
   уже настроен чужой ВКЛЮЧЁННЫЙ прокси). `srouter system-proxy restore` возвращает бэкап.
-- **LaunchAgent `com.srouter.codenv` (восстановлен, #189/#190)** — глобальный env
-  (`socks5h://127.0.0.1:10808` + `NO_PROXY=localhost,127.0.0.1,::1`) в launchd gui-домен: агент
-  (RunAtLoad + StartInterval=300, переживает ребут) запускает скрипт `srouter-codex-env.sh`, который
-  делает `launchctl setenv` (сам по себе setenv ребут не переживает — поэтому периодический Refresh).
-  Нужен для **Rust app-server ChatGPT.app/Codex.app** (основной WS к `wss://chatgpt.com`): он не уважает
-  ни системный SOCKS (только Chromium-оболочка), ни `[network] proxy_url` (мёртв в codex 0.146) — только
-  env SOCKS5. **Claude Code не конфликтует** (#130 снят): CC CLI читает прокси из
-  `~/.claude/settings.json`, а не из launchd gui-env. ⚠️ **setenv не ретроактивен**: если ChatGPT.app уже
-  запущен на момент install, его Rust app-server останется с прямыми сокетами (stale) — полностью
-  перезапустите ChatGPT.app (Cmd+Q из Dock, не «закрыть окно»); `srouter doctor` детектит stale-App.
-  ⚠️ Побочный эффект: gui-SOCKS5 ломает **Claude Desktop App** (#127, не CC CLI) — `srouter doctor`
-  покажет; митигация отдельной историей.
+- **LaunchAgent `com.srouter.codenv` — residual-чистка gui-домена (контракт 2026-10-07)** —
+  ambient env-прокси в launchd gui-домен НЕ сеется (через туннель ходит только явно попросившее:
+  xray-правила, git per-host, per-tool wrappers, `curl -x`). Агент (RunAtLoad + StartInterval=300,
+  переживает ребут) запускает скрипт `srouter-codex-env.sh`, который каждые 5 минут СНИМАЕТ
+  proxy-ключи (scheme+all+NO_PROXY, оба регистра — `CODEX_LAUNCHCTL_UNSET_KEYS`): `launchctl setenv`
+  не ретроактивен и не снимает то, чего не ставит — residual старых посевов (#331/#340/#197) иначе
+  жил бы в gui-домене вечно. История: до 2026-10-07 агент сеял `socks5h://127.0.0.1:10808` (+privoxy
+  плечо #340) для **Rust app-server ChatGPT.app/Codex.app** — снято осознанно (ложные «прямые»
+  пробы диагностики, рестарт xray рвал TLS чужого трафика, privoxy-SPOF). **Claude Code не
+  конфликтует** (#130 снят): CC CLI читает прокси из `~/.claude/settings.json`, а не из launchd
+  gui-env — и с контракта не сеет туда ничего.
 - **VSCode `http.proxy` (scoped, #185)** — `socks5h://127.0.0.1:10808` в настройке VSCode/Cursor.
   **Комплементарен codenv**: расширение `openai.chatgpt` в Code/Cursor — отдельный клиент от ChatGPT.app;
   строит `HTTP_PROXY`/`HTTPS_PROXY` **в env порождаемого codex-процесса**, не трогая Claude Code.
@@ -376,7 +375,7 @@ binary/exec.LookPath), поэтому границей служит именно
 > wrapper'а `sudo -u`, а, например, launchd-службой), плюс доменная изоляция и TCP на en/ppp; пользователь
 > uid 503 уже создаётся install, #186.** env/wrapper обходятся PATH; PF сильнее — но лишь для процесса
 > под 503. Пока эта активация не завершена (follow-up — независимый запуск под 503),
-> единственная живая защита от прямого выхода — wrappers + codenv + scoped VSCode env (слой 2).
+> единственная живая защита от прямого выхода — wrappers + scoped VSCode env (слой 2; codenv — только residual-чистка, контракт 2026-10-07).
 
 > **Обход wrappers и статус изоляции.** Ранее wrapper был единственным слоем, и его обходы были
 > дырами: в AO worktree claude-code (Go) резолвит codex через Go `exec.LookPath`, который
@@ -394,7 +393,7 @@ binary/exec.LookPath), поэтому границей служит именно
 | Инструмент | Подключение |
 |---|---|
 | **Claude Code** | `HTTPS_PROXY=http://127.0.0.1:8118` в `~/.claude/settings.json` (privoxy HTTP; SOCKS5 CC не умеет) |
-| **Codex CLI/App** | **напрямую SOCKS5 в xray** (`socks5h://127.0.0.1:10808`) несколькими живыми путями, минуя privoxy: CLI-wrapper (env), СИСТЕМНЫЙ macOS SOCKS активного network service для Chromium-оболочки App (обычный запуск из Dock — `srouter doctor`/`srouter system-proxy repair` чинят выключенный/неверный SOCKS без переустановки), LaunchAgent `com.srouter.codenv` (gui-SOCKS5 env для Rust app-server ChatGPT.app, #189/#190; setenv не ретроактивен — запущенный до install ChatGPT.app перезапустите Cmd+Q), scoped VSCode `http.proxy` (расширение `openai.chatgpt`, #185; только если install обновил существующий settings.json); + **PF kill-switch в ядре** (#168) как будущая fail-closed граница (режет прямой TCP-выход codex на en0–en6/ppp0–ppp1, разрешая loopback SOCKS5 по TCP; пока дормантен — пользователь uid 503 уже создаётся install (#186), активируется после полной активации: запуск codex под uid 503 **независимо от wrapper'а** (не sudo -u в wrapper) + доменная изоляция + TCP на en/ppp, отдельный follow-up). privoxy портит WS-стриминг Codex (`Reconnecting`/`request timed out`); `[network] proxy_url` в `~/.codex/config.toml` мёртв в codex 0.146 (управляет execution-scoped sandbox-прокси для субпроцессов, не клиентом) — поэтому CLI-wrapper `~/bin/codex-srouter` (имя убирает коллизию wrapper↔real-binary #169) + системный SOCKS (App Chromium) + `com.srouter.codenv` (Rust app-server) + scoped VSCode `http.proxy` (расширение). `~/bin/codex-app-proxy` остаётся резервным ручным workaround'ом, не основным путём запуска App. См. раздел «Изоляция Codex». |
+| **Codex CLI/App** | **напрямую SOCKS5 в xray** (`socks5h://127.0.0.1:10808`) несколькими живыми путями, минуя privoxy: CLI-wrapper (env), СИСТЕМНЫЙ macOS SOCKS активного network service для Chromium-оболочки App (обычный запуск из Dock — `srouter doctor`/`srouter system-proxy repair` чинят выключенный/неверный SOCKS без переустановки), LaunchAgent `com.srouter.codenv` (residual-чистка gui-домена — контракт 2026-10-07: ambient-прокси не сеется; исторически #189/#190 — gui-SOCKS5 env для Rust app-server), scoped VSCode `http.proxy` (расширение `openai.chatgpt`, #185; только если install обновил существующий settings.json); + **PF kill-switch в ядре** (#168) как будущая fail-closed граница (режет прямой TCP-выход codex на en0–en6/ppp0–ppp1, разрешая loopback SOCKS5 по TCP; пока дормантен — пользователь uid 503 уже создаётся install (#186), активируется после полной активации: запуск codex под uid 503 **независимо от wrapper'а** (не sudo -u в wrapper) + доменная изоляция + TCP на en/ppp, отдельный follow-up). privoxy портит WS-стриминг Codex (`Reconnecting`/`request timed out`); `[network] proxy_url` в `~/.codex/config.toml` мёртв в codex 0.146 (управляет execution-scoped sandbox-прокси для субпроцессов, не клиентом) — поэтому CLI-wrapper `~/bin/codex-srouter` (имя убирает коллизию wrapper↔real-binary #169) + системный SOCKS (App Chromium) + scoped VSCode `http.proxy` (расширение). `~/bin/codex-app-proxy` остаётся резервным ручным workaround'ом, не основным путём запуска App. См. раздел «Изоляция Codex». |
 | **git / gh** | scoped git-прокси `http.https://github.com.proxy → socks5h://127.0.0.1:10808` (xray, `git_proxy.py`); gh работает **напрямую** через Go-стек (GFW не режет) → для VPS-независимости: `gh` через `env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy` (оба регистра), `git` через `git -c http.https://github.com.proxy=` (env -u НЕ трогает git-config) — см. раздел «gh / git: прямой доступ» |
 | **Браузер** | системный SOCKS5 `127.0.0.1:10808` (вайтлист разруливает сам) |
 
@@ -625,7 +624,7 @@ Doctor показывает состояние через чек `codex-isolatio
    интерфейсах.
 
 Пока эти ограничения не закрыты — единственная живая защита от прямого выхода codex остаётся
-SOCKS5-wrappers + codenv + scoped VSCode env (слой 2 выше). Снять вручную: `sudo pfctl -a "com.apple/srouter_isolate/codex" -F all`
+SOCKS5-wrappers + scoped VSCode env (слой 2 выше). Снять вручную: `sudo pfctl -a "com.apple/srouter_isolate/codex" -F all`
 (правила PF) и/или `sudo dscl . -delete /Users/_srouter_codex` (системный пользователь, если uninstall
 не удалил).
 
@@ -710,9 +709,9 @@ srouter install
 #   • configures proxy for Claude Code and git (github.com);
 #   • isolates Codex via three live paths plus a future fail-closed boundary: SOCKS5 wrappers
 #     (~/bin/codex-srouter + codex-app-proxy, zsh function — CLI / App Chromium shell), the
-#     com.srouter.codenv LaunchAgent (#189/#190 — gui-SOCKS5 env for ChatGPT.app's Rust app-server;
-#     setenv is non-retroactive — a ChatGPT.app already running before install needs a full Cmd+Q
-#     restart), and scoped VSCode http.proxy (#185 — the openai.chatgpt extension; only if install
+#     com.srouter.codenv LaunchAgent (historically #189/#190 — gui-SOCKS5 env; since the
+#     2026-10-07 contract it ONLY purges residual proxy keys from the gui-domain — ambient
+#     env-proxy is seeded in no layer), and scoped VSCode http.proxy (#185 — the openai.chatgpt extension; only if install
 #     updated an existing editor settings.json) — all three bypass privoxy, routing Codex straight to
 #     xray; + a PF kill-switch in the kernel (#168) as the future fail-closed boundary (cuts codex
 #     direct TCP egress on en0–en6/ppp0–ppp1, allowing TCP to loopback SOCKS5); install creates the
@@ -854,7 +853,7 @@ UID is assigned by the wrapper itself (`sudo -u`, follow-up), a wrapper bypass (
 `exec.LookPath` in an AO worktree, foreign wrapper) leaves codex under 501 — **outside PF**. So the
 claim "a wrapper bypass is irrelevant" becomes true **only** once codex is launched under 503
 independently of the wrapper (e.g. a launchd service, not a wrapper command). So **today** the single
-live guard against direct egress is the wrappers + codenv + scoped VSCode env (layer 2). Full details in the "🔒 PF codex
+live guard against direct egress is the wrappers + scoped VSCode env (layer 2; codenv only purges residuals since the 2026-10-07 contract, it seeds no proxy). Full details in the "🔒 PF codex
 isolation" section below.
 
 **2. SOCKS5 wrappers — defense-in-depth / best-effort transition.** Shims that set Codex's env to
@@ -877,18 +876,18 @@ optimization (they route traffic through the right channel without relying on th
   and points at `srouter system-proxy repair` (sets and enables SOCKS `127.0.0.1:10808` on the
   active network service, backing up a disabled foreign endpoint; refuses without mutating if an
   ENABLED foreign proxy is already there). `srouter system-proxy restore` reverts the backup.
-- **LaunchAgent `com.srouter.codenv` (restored, #189/#190)** — global env
-  (`socks5h://127.0.0.1:10808` + `NO_PROXY=localhost,127.0.0.1,::1`) into the launchd gui-domain: the
-  agent (RunAtLoad + StartInterval=300, survives reboot) runs `srouter-codex-env.sh`, which calls
-  `launchctl setenv` (setenv alone does not survive reboot — hence the periodic refresh). Required for
-  the **Rust app-server of ChatGPT.app/Codex.app** (the main WS to `wss://chatgpt.com`): it honors
-  neither system SOCKS (only the Chromium shell does) nor `[network] proxy_url` (dead in codex 0.146) —
-  only env SOCKS5. **Claude Code does not conflict** (#130 resolved): the CC CLI reads its proxy from
-  `~/.claude/settings.json`, not launchd gui-env. ⚠️ **setenv is not retroactive**: if ChatGPT.app is
-  already running at install time, its Rust app-server keeps its direct sockets (stale) — fully restart
-  ChatGPT.app (Cmd+Q from the Dock, not "close window"); `srouter doctor` detects a stale App. ⚠️ Side
-  effect: gui-SOCKS5 breaks the **Claude Desktop App** (#127, not the CC CLI) — `srouter doctor` will
-  show it; mitigation is a separate story.
+- **LaunchAgent `com.srouter.codenv` — gui-domain residual cleanup (2026-10-07 contract)** —
+  ambient env-proxy is NOT seeded into the launchd gui-domain (only explicitly opted-in traffic
+  goes through the tunnel: xray rules, git per-host, per-tool wrappers, `curl -x`). The agent
+  (RunAtLoad + StartInterval=300, survives reboot) runs `srouter-codex-env.sh`, which every 5
+  minutes UNSETS the proxy keys (scheme+all+NO_PROXY, both cases — `CODEX_LAUNCHCTL_UNSET_KEYS`):
+  `launchctl setenv` is not retroactive and does not remove what it did not set — residue of old
+  seedings (#331/#340/#197) would otherwise live in the gui-domain forever. History: before
+  2026-10-07 the agent seeded `socks5h://127.0.0.1:10808` (plus the privoxy shoulder, #340) for
+  the **Rust app-server of ChatGPT.app/Codex.app** — deliberately retired (false "direct" probes
+  in diagnostics, xray restarts tearing TLS of unrelated traffic, privoxy SPOF). **Claude Code
+  does not conflict** (#130 resolved): the CC CLI reads its proxy from `~/.claude/settings.json`,
+  not launchd gui-env — and seeds nothing there since the contract.
 - **VSCode `http.proxy` (scoped, #185)** — `socks5h://127.0.0.1:10808` in the VSCode/Cursor setting.
   **Complementary to codenv**: the `openai.chatgpt` extension in Code/Cursor is a separate client from
   ChatGPT.app; it builds `HTTP_PROXY`/`HTTPS_PROXY` **in the env of the spawned codex process**, leaving
@@ -915,7 +914,7 @@ lease, does not call `pfctl`, and does not verify codex actually runs under uid 
 > domain isolation and TCP on en/ppp; the uid 503 user is already created by install, #186.** env/wrappers
 > are bypassable via PATH; PF is stronger — but only for a process under 503. Until that activation lands
 > (follow-up — independent launch under 503), the only live guard against direct egress is the
-> wrappers + codenv + scoped VSCode env (layer 2).
+> wrappers + scoped VSCode env (layer 2; codenv only purges residuals — 2026-10-07 contract).
 
 > **Wrapper bypass and the isolation status.** Previously the wrapper was the only layer, so its
 > bypasses were holes: in an AO worktree, claude-code (Go) resolves `codex` via Go `exec.LookPath`,
@@ -1160,7 +1159,7 @@ surfaces the state via the `codex-isolation (PF kill-switch)` check.
    egress on the listed physical interfaces.
 
 Until these limitations are closed, the only live guard against direct codex egress stays the
-SOCKS5 wrappers + codenv + scoped VSCode env (layer 2 above). Remove manually: `sudo pfctl -a "com.apple/srouter_isolate/codex" -F all`
+SOCKS5 wrappers + scoped VSCode env (layer 2 above). Remove manually: `sudo pfctl -a "com.apple/srouter_isolate/codex" -F all`
 (PF rules) and/or `sudo dscl . -delete /Users/_srouter_codex` (system user, if uninstall did not
 remove it).
 
@@ -1170,7 +1169,7 @@ remove it).
 | Tool | Wiring |
 |---|---|
 | **Claude Code** | `HTTPS_PROXY=http://127.0.0.1:8118` in `~/.claude/settings.json` |
-| **Codex** | **straight to xray** (`socks5h://127.0.0.1:10808`) via several live paths that bypass privoxy: a CLI env wrapper, the SYSTEM macOS SOCKS proxy of the active network service for the App Chromium shell (normal Dock launch — `srouter doctor`/`srouter system-proxy repair` fix a disabled/wrong SOCKS endpoint without reinstalling), the `com.srouter.codenv` LaunchAgent (gui-SOCKS5 env for ChatGPT.app's Rust app-server, #189/#190; setenv is non-retroactive — restart an already-running ChatGPT.app with Cmd+Q), and scoped VSCode `http.proxy` (the `openai.chatgpt` extension, #185; only if install updated an existing settings.json); + **a PF kill-switch in the kernel** (#168) as the future fail-closed boundary (cuts codex direct TCP egress on en0–en6/ppp0–ppp1, allowing TCP to loopback SOCKS5; dormant today — the uid 503 user is already created by install (#186), and activation requires full activation: launching codex under uid 503 **independently of the wrapper** (not via wrapper sudo -u) + domain isolation + TCP on en/ppp, a separate follow-up). `[network] proxy_url` in `~/.codex/config.toml` is dead in codex 0.146 (it configures the execution-scoped sandbox proxy for spawned `codex` subprocesses, not the client) — hence the CLI wrapper + system SOCKS + codenv + VSCode http.proxy. `~/bin/codex-app-proxy` remains a manual fallback, not the primary launch path. See the "Codex isolation" section. |
+| **Codex** | **straight to xray** (`socks5h://127.0.0.1:10808`) via several live paths that bypass privoxy: a CLI env wrapper, the SYSTEM macOS SOCKS proxy of the active network service for the App Chromium shell (normal Dock launch — `srouter doctor`/`srouter system-proxy repair` fix a disabled/wrong SOCKS endpoint without reinstalling), the `com.srouter.codenv` LaunchAgent (gui-domain residual cleanup — 2026-10-07 contract: ambient proxy is seeded in no layer; historically #189/#190 gui-SOCKS5 env for ChatGPT.app's Rust app-server), and scoped VSCode `http.proxy` (the `openai.chatgpt` extension, #185; only if install updated an existing settings.json); + **a PF kill-switch in the kernel** (#168) as the future fail-closed boundary (cuts codex direct TCP egress on en0–en6/ppp0–ppp1, allowing TCP to loopback SOCKS5; dormant today — the uid 503 user is already created by install (#186), and activation requires full activation: launching codex under uid 503 **independently of the wrapper** (not via wrapper sudo -u) + domain isolation + TCP on en/ppp, a separate follow-up). `[network] proxy_url` in `~/.codex/config.toml` is dead in codex 0.146 (it configures the execution-scoped sandbox proxy for spawned `codex` subprocesses, not the client) — hence the CLI wrapper + system SOCKS + VSCode http.proxy. `~/bin/codex-app-proxy` remains a manual fallback, not the primary launch path. See the "Codex isolation" section. |
 | **git / gh** | scoped git proxy `http.https://github.com.proxy → socks5h://127.0.0.1:10808` (xray, `git_proxy.py`); gh works **direct** via its Go stack (GFW does not cut it) → for VPS-independence: `gh` with `env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy` (both cases), `git` with `git -c http.https://github.com.proxy=` (env -u does NOT touch git-config) — see "gh / git: direct access" |
 | **Browser** | system SOCKS5 `127.0.0.1:10808` |
 

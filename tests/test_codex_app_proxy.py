@@ -5,15 +5,16 @@ Rust-бинарником. Rust app-server (/Resources/codex, основной W
 системный SOCKS, берёт ТОЛЬКО env SOCKS5 из launchd gui-домена (codenv LaunchAgent). codenv снят/битый
 → env пуст → Rust app-server напрямую → GFW рвёт ('failed to connect... error_kind=TimedOut').
 
-Чек детектит: App-codex процессы активны (ps по /ChatGPT.app/.../codex) И launchctl gui-домен НЕ
-содержит SOCKS5 → status=down DRIVER с диагнозом «восстанови codenv (srouter install)». Когда App
-не запущен / gui-env не верифицируем → unknown (info-only, не роняет вердикт — fail-closed).
+Чек детектит фактический маршрут App-PID (lsof) — gui-env больше не источник прокси
+(контракт 2026-10-07: ambient не сеется, пустой gui-env — норма). Когда App не запущен /
+маршрут недоказуем → unknown (info-only, не роняет вердикт — fail-closed).
 
 Контракт _codex_app_proxy_check() → {status, source, detail}:
-  status="ok"      — App-codex активен И gui-env содержит SOCKS5 (codenv работает);
-  status="warn"    — App-codex активен, gui-env только HTTP (privoxy рвёт WS #120);
-  status="down"    — App-codex активен, gui-env пуст (codenv снят/битый) — DRIVER;
-  status="unknown" — App не запущен ИЛИ gui-env не верифицируем (info-only).
+  status="ok"      — App-PID идут через SOCKS5 10808 (env задан точечно, wrapper);
+  status="warn"    — маршрут через privoxy 8118 (рвёт long-lived WS #120);
+  status="down"    — App-PID реально держат external-сокеты (прямой egress, GFW порвёт
+                     chatgpt.com) — независимо от gui-env;
+  status="unknown" — App не запущен, lsof недоступен или маршрут недоказуем (idle).
 """
 import health
 
@@ -68,7 +69,9 @@ def _gui_env(keys):
     """Сырой текст блока environment из `launchctl print gui/<uid>` для заданных ключей.
 
     Обёрнут в 'environment = {' / '}' (как реально отдаёт launchctl print). Пустой keys → пустой env
-    (только обёртка), _read_gui_proxy_env вернёт verifiable=True, keys={} → down (codenv снят).
+    (только обёртка), _read_gui_proxy_env вернёт verifiable=True, keys={} → verdict по
+    фактическому маршруту App-PID (lsof): socks→ok, external→down, недоказуемо→unknown
+    (контракт 2026-10-07: ambient не сеется, пустой gui-env — норма).
     """
     inner = "".join(f"\t\t{k} => {v}\n" for k, v in (keys or {}).items())
     return f"\tenvironment = {{\n{inner}\t}}\n"
@@ -78,17 +81,44 @@ SOCKS5 = "socks5h://127.0.0.1:10808"
 PRIVOXY = "http://127.0.0.1:8118"
 
 
-def test_app_proxy_down_when_app_running_and_gui_env_empty(monkeypatch):
-    """App-codex активен + gui-env пуст → down DRIVER: codenv снят/битый, восстанови srouter install.
+def test_app_proxy_ok_when_gui_env_empty_but_route_socks(monkeypatch):
+    """gui-env пуст (контракт 2026-10-07: ambient не сеется — это НОРМА) + lsof SOCKS5 → ok.
 
-    Это и есть корень #189: ChatGPT.app Rust app-server без прокси → WS к chatgpt.com тайм-аутится.
-    """
+    Ревью #403: после отказа от посева пустой gui-env — стационарное состояние; прокси App
+    задаётся точечно (wrapper). Verdict — по фактическому маршруту App-PID, не по gui-env."""
     ps = f"60826 {APP_CODEX_COMM}\n"
-    monkeypatch.setattr(health.sys_probe, "run", _fake(ps, _gui_env({})))
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _fake(ps, _gui_env({}), lsof_out=_lsof_socks("60826")))
     res = health._codex_app_proxy_check()
-    assert res["status"] == "down", f"App активен + gui-env пуст → down (codenv снят); got {res}"
+    assert res["status"] == "ok", f"пустой gui-env (норма) + маршрут SOCKS5 → ok; got {res}"
+
+
+def test_app_proxy_down_when_gui_env_empty_and_route_direct(monkeypatch):
+    """gui-env пуст + lsof external → down (реально напрямую, GFW порвёт chatgpt.com).
+
+    Рецепт — wrapper запуска App (env-прокси точечно), НЕ «srouter install (codenv)»:
+    reinstall того же unset-only агента ничего не меняет (ревью #403)."""
+    ps = f"60826 {APP_CODEX_COMM}\n"
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _fake(ps, _gui_env({}), lsof_out=_lsof_external("60826")))
+    res = health._codex_app_proxy_check()
+    assert res["status"] == "down", f"маршрут напрямую → down; got {res}"
     detail = res["detail"].lower()
-    assert "codenv" in detail or "install" in detail, f"detail объясняет фикс (codenv/install); got {res}"
+    assert "wrapper" in detail, f"рецепт — wrapper (точечный env); got {res}"
+    assert "codenv не загружен" not in detail, f"«codenv не загружен» больше не диагноз; got {res}"
+
+
+def test_app_proxy_unknown_when_gui_env_empty_and_route_unprovable(monkeypatch):
+    """gui-env пуст + lsof недоступен → unknown (fail-closed), а не вечный down.
+
+    Пустой gui-env — норма контракта 2026-10-07: «codenv не загружен» перестал быть
+    диагнозом, down без runtime-доказательства = перманентный ложный DRIVER (ревью #403)."""
+    ps = f"60826 {APP_CODEX_COMM}\n"
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _fake(ps, _gui_env({}), lsof_timeout=True))
+    res = health._codex_app_proxy_check()
+    assert res["status"] == "unknown", \
+        f"пустой gui-env — норма, маршрут недоказуем → unknown; got {res}"
 
 
 def test_app_proxy_ok_when_app_running_and_gui_socks5(monkeypatch):

@@ -14,14 +14,17 @@
 # ALL_PROXY/all_proxy (#331/#340) и privoxy 8118 scheme-ключи — без явного unsetenv residual
 # жил бы в gui-домене вечно и молча заворачивал GUI/терминальный трафик в цепочку. Периодичность
 # агента (RunAtLoad + 300с) превращает чистку в инвариант: что бы ни вписало сторонее ПО в
-# gui-домен, в течение 5 минут схема-ключи прокси вычищены.
+# gui-домен, в течение 5 минут прокси-ключи вычищены. Список ключей = CODEX_LAUNCHCTL_UNSET_KEYS
+# (codex_wrappers.py) — тот же список итерирует uninstall; паритет гвардится
+# tests/test_codex_env_contract.py (ревью #403: NO_PROXY/no_proxy тоже сеялись до контракта —
+# динамический NO_PROXY #197, — и без unsetenv residual жил бы в gui-домене вечно).
 #
 # Динамический NO_PROXY (#197, direct_first.no_proxy_string) без ambient-прокси инертен —
 # посев снят вместе с serial-curl probe (он же — сотни секунд блокировки worst-case).
 # CLI-codex wrapper'ы (~/bin/codex-srouter) ходят через socks5h:10808 ТОЧЕЧНО (#120) —
 # от gui-домена не зависят, этот скрипт к ним не относится.
 FAIL=0
-for key in HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ALL_PROXY all_proxy; do
+for key in HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ALL_PROXY all_proxy NO_PROXY no_proxy; do
   launchctl unsetenv "$key" || FAIL=1
 done
 exit "$FAIL"

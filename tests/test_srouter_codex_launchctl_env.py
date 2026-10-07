@@ -115,7 +115,7 @@ def test_install_launchctl_env_writes_plist(monkeypatch, tmp_path):
     assert plist.exists(), "plist создан"
     plist_text = plist.read_text(encoding="utf-8")
     assert srouter.CODEX_ENV_MARKER in plist_text, "plist содержит srouter-маркер"
-    # Шаблон рендерит label + путь к скрипту setenv.
+    # Шаблон рендерит label + путь к скрипту residual-чистки.
     assert srouter.CODEX_ENV_LABEL in plist_text
     assert "srouter-codex-env.sh" in plist_text
     # bootstrap вызван (_launchd_reload).
@@ -569,8 +569,10 @@ def test_codenv_plist_comment_describes_cleanup_role():
     )
 
 
-# ============ issue #340: gui-домен раздаёт ТЕРМИНАЛЬНОЕ плечо (privoxy), не SOCKS ==========
-# Механизм #340 (подтверждён первоисточниками + живой машиной):
+# ============ issue #340 → контракт 2026-10-07: УСТАРЕЛО, оставлено как история ============
+# БАННЕР ОПИСЫВАЕТ СНЯТЫЙ КОНТРАКТ: «терминальное privoxy-плечо» (посев scheme-ключей в
+# gui-домен) отменён контрактом маршрутизации 2026-10-07 — ambient env-прокси не сеется ни в
+# один слой, codenv-агент теперь ТОЛЬКО residual-чистка. Эмпирика #340 сохраняет ценность:
 # 1. requests (vendored pip) и reqwest (Codex Rust app-server) выбирают scheme-ключ
 #    (HTTPS_PROXY) ПРЕДПОЧТИТЕЛЬНЕЕ ALL_PROXY (reqwest src/proxy.rs get_from_environment:
 #    «Overwritten by the more specific HTTP_PROXY»; requests.utils.select_proxy: scheme → all).
@@ -579,15 +581,13 @@ def test_codenv_plist_comment_describes_cleanup_role():
 #    избыточен для reqwest-потребителя.
 # 2. Живая эмпирика (2026-09-05, ps eww app-server PID): текущий Rust app-server ChatGPT.app
 #    (`codex app-server`) спавнится ChatGPT.app с САНИТИЗОВАННЫМ env БЕЗ прокси-переменных —
-#    launchctl gui-домен до него не доходит; июльская зависимость #189 (App читает gui-env)
-#    устарела. CLI-codex wrapper'ы ставят socks5h:10808 себе точечно (privoxy рвёт WS #120) —
-#    не тронуты.
-# Решение: gui-домен = ТЕРМИНАЛЬНОЕ плечо: scheme-ключи = privoxy (HTTP_PROXY_URL) — рабочий
-# прокси для pip/терминалов (fail-closed сохранён: privoxy→xray, прямого egress нет),
-# ALL_PROXY/all_proxy не ставятся и ЯВНО unsetenv (residual-чистка: setenv не ретроактивен,
-# старые socks-значения из предыдущей версии скрипта иначе живут в gui-домене вечно).
+#    launchctl gui-домен до него не доходит. CLI-codex wrapper'ы ставят socks5h:10808 себе
+#    точечно (privoxy рвёт WS #120) — не тронуты.
+# Текущее решение: scheme-ключи НЕ ставятся, чистятся ВСЕ 8 ключей (scheme+all+NO_PROXY, оба
+# регистра — CODEX_LAUNCHCTL_UNSET_KEYS): setenv не ретроактивен, residual старых посевов иначе
+# живёт в gui-домене вечно. Живой контракт — tests/test_codex_env_contract.py.
 def test_codenv_env_script_unsets_all_proxy_residual():
-    """Контракт 2026-10-07: скрипт каждый прогон снимает ВСЕ шесть прокси-ключей gui-домена
+    """Контракт 2026-10-07: скрипт каждый прогон снимает ВСЕ прокси-ключи gui-домена
     (scheme+all, оба регистра).
 
     launchctl setenv не ретроактивен и не снимает то, чего не ставит: старые версии скрипта
