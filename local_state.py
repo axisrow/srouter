@@ -410,6 +410,8 @@ _SUBMODULE_NAMES = {
     "ROUTING_MARKER": "local_state_routing",
     "DEFAULT_ROUTING_OUTBOUND": "local_state_routing",
     "routing_plan": "local_state_routing",
+    "routing_plan_ips": "local_state_routing",
+    "_normalize_ip_list": "local_state_routing",
     "_routing_find_managed_rule": "local_state_routing",
     "_routing_domains_hash": "local_state_routing",
     "routing_apply": "local_state_routing",
