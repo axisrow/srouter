@@ -537,6 +537,21 @@ def test_check_all_unknown_when_files_override_runtime_diverges(monkeypatch):
     assert "перезапусти CC" not in cp["detail"], "бессмысленный совет уходит из detail"
 
 
+def test_gui_wrappers_unknown_is_info_only(monkeypatch):
+    """Ревью #405: unknown gui-wrappers (app не установлен / источники недоступны) —
+    info-only, как соседние App-чеки: install сам откажется ставить wrapper без app,
+    вечный driver-degraded с невыполнимым рецептом недопустим (канон #362/#403)."""
+    _all_up_monkey(monkeypatch)
+    monkeypatch.setattr(health, "_gui_wrappers_check",
+                        lambda: {"status": "unknown", "source": "fs",
+                                 "detail": "app не установлен (mock)"})
+    result = health.check_all()
+    assert result["status"] == "ok", "unknown gui-wrappers не драйвит вердикт"
+    gw = [c for c in result["checks"] if "gui-wrappers" in c["name"]][0]
+    assert gw.get("info") is True, "unknown-check помечен info (не driver)"
+    assert gw["ok"] is False, "unknown — это не подтверждённое здоровье (fail-open)"
+
+
 # ============================ #337: per-PID атрибуция при override-гейте ============================
 # Дивергенция файлы-vs-runtime (класс #143): ФАЙЛЫ уже на z.ai-override (гейт #329 активен),
 # а exec-env живого PID (ps eww) выглядит иначе — стандартный endpoint, чужой хост или без

@@ -31,20 +31,9 @@ __all__ = [
     "_codenv_unloaded_is_persistent", "_codenv_job_check",
     "_codex_app_proxy_check", "_app_pids_route", "_codex_app_chromium_proxy_check",
     "_claude_app_proxy_check",
-    "_gui_wrappers_check", "_GUI_WRAPPER_FAMILY",
+    "_gui_wrappers_check",
     "_gui_socks_residual_check",
 ]
-
-# Семейство ~/bin-wrapper'ов srouter: file-evidence чек доктора (в дополнение к
-# route-evidence app-чекам). Локальная копия (name, marker) — прямой import codex_wrappers
-# в health_codenv создал бы цикл (codex_wrappers → health → health_codenv → codex_wrappers);
-# канон #340, паритет гвардится тестом test_family_parity_with_sources.
-_GUI_WRAPPER_FAMILY = (
-    ("codex-srouter", "# srouter: codex CLI wrapper (managed)"),
-    ("codex-app-proxy", "# srouter: codex-app-proxy wrapper (managed)"),
-    ("claude-app", "# srouter: claude-app wrapper (managed)"),
-)
-
 
 def _gui_wrappers_check():
     """Wrapper'ы семейства ~/bin вне управления srouter → warn (инцидент-класс 2026-10-07).
@@ -55,46 +44,93 @@ def _gui_wrappers_check():
     не трогаем» (#112), переезд/снос той репы убьёт их висячими симлинками (прецедент
     переезда репо был), и doctor молчал бы до первого течения App.
 
-    file-evidence по каждому члену _GUI_WRAPPER_FAMILY:
-      ok   — regular file, читается, несёт свой маркер, executable;
-      warn — конкретные проблемы с рецептом: отсутствует / симлинк (включая dangling —
-             цель снесена) / без маркера / не исполняется.
-    unknown здесь НЕ существует: fs-чек всегда даёт вердикт («не смогли прочитать» —
-    тоже проблема, не info).
+    file-evidence по каждому члену семейства:
+      ok      — regular file, читается, несёт «наш» маркер, executable;
+      warn    — конкретные проблемы с рецептом: симлинк (включая dangling) / не regular
+                file / без «нашего» маркера / не исполняется / отсутствует при
+                установленном app;
+      unknown — отсутствие при НЕустановленном app (install сам откажется ставить —
+                опционально) или недоступные источники чека; info-only, не driver
+                (ревью #405: вечный driver с невыполнимым рецептом = шум #362/#403).
+
+    «Наш» маркер — паритет с install (#112): текущий + state known_markers['wrappers']
+    (install мигрирует/удаляет их как свои) + claude legacy (CLAUDE_APP_LEGACY_MARKERS).
+    Импорты первоисточников — ленивые, внутри функции: codex_wrappers импортирует health
+    на верхнем уровне, top-level import здесь замкнул бы цикл (канон #340).
     """
-    problems = []
-    bin_dir = Path.home() / "bin"
-    for name, marker in _GUI_WRAPPER_FAMILY:
-        p = bin_dir / name
-        if p.is_symlink():
-            try:
-                target = os.readlink(p)
-            except OSError:
-                target = "?"
-            dangling = "" if os.path.exists(p) else " (ВИСЯЧИЙ — цель снесена)"
-            problems.append(f"{name}: симлинк на {target}{dangling} — вне управления srouter "
-                            f"(удали и запусти srouter install)")
-            continue
-        if not p.exists():
-            problems.append(f"{name}: отсутствует — запусти srouter install")
-            continue
+    try:
+        from claude_wrappers import (CLAUDE_APP_LEGACY_MARKERS, CLAUDE_APP_MARKER,
+                                     CLAUDE_APP_WRAPPER_NAME, _claude_app_bin)
+        from codex_wrappers import CODEX_WRAPPERS, _codex_bin_path
+        from install_lib import load_known_markers
+    except BaseException as exc:
+        # Import-цепочка может дать SystemExit (нет srouter_config — канон
+        # systemexit-breaks-except-exception): чек всегда даёт вердикт.
+        return {"status": "unknown", "source": "fs",
+                "detail": f"gui-wrappers: источники недоступны ({str(exc)[:60]})"}
+    family = ([(name, marker) for name, _, marker in CODEX_WRAPPERS]
+              + [(CLAUDE_APP_WRAPPER_NAME, CLAUDE_APP_MARKER)])
+
+    def ours_markers(name, marker):
+        known = load_known_markers(os.environ.get("SROUTER_STATE_PATH") or None,
+                                   "wrappers", [marker])
+        if name == CLAUDE_APP_WRAPPER_NAME:
+            known += [m for m in CLAUDE_APP_LEGACY_MARKERS if m not in known]
+        return known
+
+    def app_installed(name):
+        # Тот же гейт, что у install: без app/binary install отказывается ставить
+        # wrapper — его отсутствие опционально, «запусти install» не чинит (ревью #405).
+        if name == CLAUDE_APP_WRAPPER_NAME:
+            return Path(_claude_app_bin()).exists()
+        return bool(_codex_bin_path())
+
+    problems, optional_absent = [], []
+    for name, marker in family:
         try:
-            content = p.read_text(encoding="utf-8")
+            p = Path.home() / "bin" / name
+            if p.is_symlink():
+                try:
+                    target = os.readlink(p)
+                except OSError:
+                    target = "?"
+                dangling = "" if os.path.exists(p) else " (ВИСЯЧИЙ — цель снесена)"
+                problems.append(f"{name}: симлинк на {target}{dangling} — вне управления srouter "
+                                f"(удали и запусти srouter install)")
+                continue
+            if not p.exists():
+                if app_installed(name):
+                    problems.append(f"{name}: отсутствует — запусти srouter install")
+                else:
+                    optional_absent.append(
+                        f"{name}: отсутствует (app не установлен — wrapper опционален)")
+                continue
+            if not p.is_file():
+                # FIFO/socket/device: exists() True, но read_text() блокируется навсегда —
+                # вешал watchdog (StartInterval=20) + /health + doctor разом (ревью #405).
+                problems.append(f"{name}: не regular file — удали и запусти srouter install")
+                continue
+            with p.open("r", encoding="utf-8") as fh:
+                content = fh.read(1 << 20)  # wrapper — единицы KB; cap 1MB против безлимитного read (ревью #405)
+            if not any(m in content for m in ours_markers(name, marker)):
+                problems.append(f"{name}: без srouter-маркера — чужой, install его не трогает "
+                                f"(удали вручную и запусти srouter install)")
+                continue
+            if not os.access(p, os.X_OK):
+                problems.append(f"{name}: не исполняется — chmod +x или srouter install")
         except (OSError, ValueError, TypeError) as exc:
-            problems.append(f"{name}: не читается ({str(exc)[:40]}) — запусти srouter install")
-            continue
-        if marker not in content:
-            problems.append(f"{name}: без srouter-маркера — чужой, install его не трогает "
-                            f"(удали вручную и запусти srouter install)")
-            continue
-        if not os.access(p, os.X_OK):
-            problems.append(f"{name}: не исполняется — chmod +x или srouter install")
-    if not problems:
-        return {"status": "ok", "source": "fs",
-                "detail": ("Wrapper'ы семейства управляемы ("
-                           + ", ".join(n for n, _ in _GUI_WRAPPER_FAMILY) + ")")}
-    return {"status": "warn", "source": "fs",
-            "detail": "Wrapper'ы вне управления srouter: " + "; ".join(problems)}
+            # Внешний shell на весь wrapper (lstat/exists/read гонки и права) — контракт
+            # check_all «Не бросает» (health.py), как у соседних чеков (ревью #405).
+            problems.append(f"{name}: fs-ошибка ({str(exc)[:40]}) — запусти srouter install")
+    if problems:
+        return {"status": "warn", "source": "fs",
+                "detail": "Wrapper'ы вне управления srouter: "
+                          + "; ".join(problems + optional_absent)}
+    if optional_absent:
+        return {"status": "unknown", "source": "fs",
+                "detail": "Часть wrapper'ов отсутствует: " + "; ".join(optional_absent)}
+    return {"status": "ok", "source": "fs",
+            "detail": ("Wrapper'ы семейства управляемы (" + ", ".join(n for n, _ in family) + ")")}
 
 # Наш managed privoxy-формат gui-домена (#340): scheme-ключи = HTTP_PROXY_URL. try-import —
 # тот же fail-soft паттерн, что codex_wrappers (dashboard_common raise SystemExit без
