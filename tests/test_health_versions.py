@@ -234,6 +234,10 @@ def _machine_state_monkey(monkeypatch):
     # Chromium system-proxy check — та же причина, что и _codex_app_proxy_check выше.
     monkeypatch.setattr(health, "_codex_app_chromium_proxy_check",
                         lambda: {"status": "unknown", "source": "n/a", "detail": "NetworkService не активен (mock)"})
+    # Claude.app route-check (инцидент 2026-10-07) — та же причина: ps/lsof живой dev-машины
+    # (парность с _all_up_monkey гвардит test_machine_state_mock_guard, #267).
+    monkeypatch.setattr(health, "_claude_app_proxy_check",
+                        lambda: {"status": "unknown", "source": "n/a", "detail": "Claude.app не запущен (mock)"})
     # #205: _dns_up → _resolve_host (реальный getaddrinfo github.com).
     monkeypatch.setattr(health, "_resolve_host", lambda host: True)
     # #204: _local_proxy_up → _service_running (реальный launchctl print).

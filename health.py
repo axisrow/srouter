@@ -498,6 +498,19 @@ def check_all(*, active_claude=False):
     if acp["status"] == "unknown":
         acp_check["info"] = True
     checks.append(acp_check)
+    # Claude.app (чат + Dispatch, инцидент 2026-10-07): Electron/Chromium игнорирует env —
+    # нужен wrapper ~/bin/claude-app (env + --proxy-server). down (external) — DRIVER (GFW
+    # рвёт claude.ai); warn (SOCKS5 #127) — degraded; ok (privoxy 8118 — канон плечо);
+    # unknown (не запущен/idle/lsof-сбой) — info-only (#362, fail-closed). НЕ под
+    # active_claude gate — чек лёгкий (ps + lsof, тот же бюджет, что acp_check).
+    cap = _claude_app_proxy_check()
+    cap_check = {"name": "claude-app-proxy (Claude.app маршрут)",
+                 "ok": cap["status"] == "ok", "detail": cap["detail"]}
+    if cap["status"] == "unknown":
+        cap_check["info"] = True
+    elif cap["status"] == "warn":
+        cap_check["ok"] = False  # SOCKS5-плечо — degraded (#127), но не «всё мертво»
+    checks.append(cap_check)
     # codenv launchd-job (#250): job загружен, но падает (exit != 0) / осиротел (plist удалён) /
     # указывает на несуществующий путь → down DRIVER. Реальный инцидент: 1419 падений подряд в
     # тишине — doctor читал plist-артефакт, а не состояние job'а. Без codenv Codex после ребута

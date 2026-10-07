@@ -29,6 +29,7 @@ __all__ = [
     "_codenv_plist_is_managed", "_codenv_job_state", "_CODENV_RELOAD_SETTLE_WAIT",
     "_codenv_unloaded_is_persistent", "_codenv_job_check",
     "_codex_app_proxy_check", "_app_pids_route", "_codex_app_chromium_proxy_check",
+    "_claude_app_proxy_check",
     "_gui_socks_residual_check",
 ]
 
@@ -955,6 +956,85 @@ def _app_pids_route(app_pids, *, app_kinds=None):
                 external_by_kind.setdefault(kind, set()).add(pid)
     return {"external": external, "socks": socks, "privoxy": privoxy,
             "external_by_kind": external_by_kind, "verifiable": True}
+
+
+def _claude_app_proxy_check():
+    """Claude.app (чат + Dispatch) напрямую мимо туннеля → down DRIVER (инцидент 2026-10-07).
+
+    Эмпирия (ps eww + lsof, 2026-10-07): Claude.app = Electron/Chromium. Chromium-стек
+    ИГНОРИРУЕТ env HTTP(S)_PROXY (с сеяным env сокеты оставались прямыми) — нужен argv
+    --proxy-server (wrapper ~/bin/claude-app); env при этом работает для Node-стороны
+    main-процесса (sessions-bridge/axios). Плечо — HTTP privoxy (Claude-приложения на
+    SOCKS5 ломаются, #127), НЕ SOCKS. Приложение, перезапущенное из Dock мимо wrapper'а,
+    идёт напрямую → GFW рвёт TLS → ERR_CONNECTION_CLOSED («Не удалось подключиться к
+    Claude» / Dispatch «Не удалось создать сессию») — инцидент повторялся дважды за день,
+    doctor молчал (чек был только для ChatGPT.app).
+
+    Чек (route-evidence, канон _codex_app_proxy_check/#403 — verdict по фактическому
+    маршруту lsof, не по конфигу; App-PID = path-сегмент /Claude.app/ — helper'ы тоже):
+      status="ok"      — маршрут через privoxy (канон плечо, wrapper);
+      status="warn"    — маршрут через SOCKS5 10808 (#127);
+      status="down"    — external-сокеты (прямой egress; GFW порвёт claude.ai);
+      status="unknown" — App не запущен / lsof недоступен / idle без ESTABLISHED
+                         (fail-closed; «не запущен» — не деградация, #362).
+    """
+    r = sys_probe.run([PS, "-axo", "pid=,comm="], timeout=3)
+    if r.get("timeout"):
+        return {"status": "unknown", "source": "n/a", "detail": "timeout ps"}
+    app_pids = []
+    for line in (r.get("out") or "").splitlines():
+        parts = line.split(None, 1)
+        if len(parts) < 2:
+            continue
+        pid_s, comm = parts[0].strip(), parts[1].strip()
+        if pid_s.isdigit() and "/Claude.app/" in comm:
+            app_pids.append(pid_s)
+    if not app_pids:
+        return {"status": "unknown", "source": "n/a",
+                "detail": "Claude.app не запущен — проверять маршрут нечего"}
+    route = _app_pids_route(app_pids)
+    pid_hint = f"PID {','.join(app_pids)}"
+    if not route.get("verifiable"):
+        return {"status": "unknown", "source": "n/a",
+                "detail": (f"lsof недоступен — маршрут Claude.app недоказуем "
+                           f"(fail-closed; {pid_hint})")}
+    proxied = route.get("privoxy", set()) | route.get("socks", set())
+    if route.get("external") and not proxied:
+        # ТОЛЬКО external (ни одного proxied-сокета) = App запущен мимо wrapper'а целиком —
+        # инцидент-класс (весь webview/bridge за GFW).
+        ext = ",".join(sorted(route["external"]))
+        return {"status": "down", "source": "runtime",
+                "detail": (f"Claude.app НАПРЯМУЮ (PID {ext} держит external-сокеты; GFW порвёт "
+                           f"claude.ai → ERR_CONNECTION_CLOSED). Запускай через ~/bin/claude-app "
+                           f"(wrapper: env + --proxy-server; Chromium env игнорирует — эмпирия "
+                           f"2026-10-07; плечо privoxy {PRIVOXY_PORT} — #127). Перезапусти App "
+                           f"через wrapper")}
+    if route.get("external"):
+        # Mixed: основной трафик через прокси, но часть сокетов напрямую — известная
+        # app-internal утечка (remote-tools net.WebSocket игнорирует и env, и --proxy-server).
+        # НЕ down: App в целом проксирован (вечный down на рабочей машине = анти-паттерн
+        # ревью #403); warn держит утечку видимой до системного enforcement (PF follow-up).
+        ext = ",".join(sorted(route["external"]))
+        pv = ",".join(sorted(proxied))
+        return {"status": "warn", "source": "runtime",
+                "detail": (f"Claude.app проксирован через privoxy {PRIVOXY_PORT} (PID {pv}), "
+                           f"НО часть сокетов идёт напрямую (PID {ext} — app-internal "
+                           f"WebSocket, игнорирует и env, и --proxy-server). Лечится только "
+                           f"системным enforcement (PF fail-closed Anthropic-CIDR, follow-up)")}
+    if route.get("socks"):
+        sv = ",".join(sorted(route["socks"]))
+        return {"status": "warn", "source": "runtime",
+                "detail": (f"Claude.app через SOCKS5 10808 (PID {sv}) — Claude-приложения на "
+                           f"SOCKS5 ломаются (#127); лучше wrapper ~/bin/claude-app с privoxy "
+                           f"{PRIVOXY_PORT}")}
+    if route.get("privoxy"):
+        pv = ",".join(sorted(route["privoxy"]))
+        return {"status": "ok", "source": "runtime",
+                "detail": (f"Claude.app через privoxy {PRIVOXY_PORT} (PID {pv} — wrapper "
+                           f"~/bin/claude-app: env + --proxy-server для Chromium-стека)")}
+    return {"status": "unknown", "source": "runtime",
+            "detail": (f"Claude.app активен, прокси/external-сокеты не доказаны — idle "
+                       f"(переподключение; {pid_hint})")}
 
 
 # Chromium network-service подпроцесс ChatGPT.app/Codex.app — единственный сетевой стек
