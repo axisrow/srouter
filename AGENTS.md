@@ -55,3 +55,13 @@ Pull requests should describe the operational impact, list manual checks perform
 ## Security & Configuration Tips
 
 Never commit `srouter.local.json`, `srouter_config.py`, `.env*`, real diagnostic logs, API keys, IP addresses, local MCP config, generated server deploy bundles, rendered configs, or Reality keys. Update only committed examples/templates with safe placeholders.
+
+## Routing contract — strict whitelist (2026-10-07)
+
+**Only traffic that explicitly asks for the tunnel goes through it; everything else goes direct. No ambient env proxy is seeded into any layer.** Single source of the whitelist: `srouter.local.json` (`routing.active`/`routing.active_ips`).
+
+- xray managed rule (domains+ip → reality-out, catch-all direct) is mutated only via `srouter routing` (transactional `routing_apply`).
+- LaunchAgent `com.srouter.codenv` does NOT seed proxy vars (pre-2026-10-07 it seeded privoxy 8118, fail-closed "no direct egress" — deliberately retired): it only periodically `unsetenv`s residual proxy keys in the launchctl gui domain.
+- CC sessions carry no global `HTTPS_PROXY` (empty strings in `~/.claude/settings.json` + NO_PROXY loopback/z.ai/yandex).
+- Explicit tunnel consumers: git per-host config, `codex-srouter` wrapper (socks5h pointwise), `curl -x socks5h://127.0.0.1:10808`.
+- Contract test: `tests/test_codex_env_contract.py` (stub launchctl: zero setenv + all six unsetenv).

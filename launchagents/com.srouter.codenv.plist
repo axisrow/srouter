@@ -1,12 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- __SROUTER_CODENV_MARKER__ -->
-<!-- Codex global SOCKS5 env: launchctl setenv SOCKS5 в GUI-домен launchd (видят все GUI-приложения).
-     RunAtLoad (при входе/ребут) + каждые 5мин (переживает ребут — launchctl setenv сам по себе нет).
-     Скрипт srouter-codex-env.sh выставляет HTTP_PROXY/HTTPS_PROXY/ALL_PROXY=socks5h://127.0.0.1:10808
-     + NO_PROXY=localhost,127.0.0.1,::1,z.ai,.z.ai (loopback для Codex→moonbridge + z.ai напрямую
-     для moonbridge→api.z.ai — z.ai не за GFW, доступен при мёртвом VPS, issue #195).
-     Moonbridge = локальный Transform-прокси Codex.app (слушает loopback), ходит к api.z.ai как клиент.
-     Claude.app/ChatGPT.app на System Settings SOCKS — global env их не ломает. -->
+<!-- srouter: residual-чистка gui-домена launchd (контракт маршрутизации 2026-10-07: ambient
+     env-прокси не сеется ни в один слой). RunAtLoad (при входе/ребут) + каждые 5мин: скрипт
+     srouter-codex-env.sh снимает через launchctl unsetenv ВСЕ шесть прокси-ключей
+     (HTTP(S)_PROXY, ALL_PROXY, оба регистра) — setenv не ретроактивен и не снимает чужое,
+     поэтому periodic-чистка делает «в gui-домене нет ambient-прокси» инвариантом (residual
+     старых версий скрипта: socks5h ALL_PROXY и privoxy-http scheme-ключи, #331/#340).
+     Через туннель ходит только явно попросившее: xray-правила, git per-host, per-tool
+     wrappers (codex-srouter — socks5h точечно #120), curl -x. -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">

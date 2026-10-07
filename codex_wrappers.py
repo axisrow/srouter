@@ -36,10 +36,8 @@ from install_lib import (
 # srouter_config.py, а SystemExit не ловится Exception — fallback должен сработать и для него.
 try:
     from dashboard_common import SOCKS_PROXY_URL as _CODEX_PROXY_URL
-    from dashboard_common import HTTP_PROXY_URL as _GUI_HTTP_PROXY_URL
 except BaseException:
     _CODEX_PROXY_URL = "socks5h://127.0.0.1:10808"
-    _GUI_HTTP_PROXY_URL = "http://127.0.0.1:8118"
 # NO_PROXY для launchctl-gui env: loopback (Codex→moonbridge на loopback и локальные сервисы)
 # + z.ai,.z.ai (moonbridge→api.z.ai — внешний хост, доступен напрямую мимо SOCKS5/xray/VPS).
 # z.ai НЕ за GFW: при мёртвом VPS (#194) moonbridge-клиент обязан достучаться к api.z.ai напрямую,
@@ -53,19 +51,12 @@ CODEX_NO_PROXY = "localhost,127.0.0.1,::1,z.ai,.z.ai"
 CODEX_NO_PROXY_LOOPBACK = "localhost,127.0.0.1,::1"
 
 _log = logging.getLogger("srouter.codex_wrappers")
-# (env-key, value) — единый список для install/setenv-контракта gui-домена (issue #340).
-# scheme-ключи НЕСУТ privoxy (терминальное плечо #331): socks5h в HTTPS_PROXY/https_proxy делал
-# pip/requests достижимым для SOCKSProxyManager (requests.utils.select_proxy: scheme-ключ раньше
-# 'all') → TypeError PoolKey (#340); privoxy-http — рабочее прокси-плечо, fail-closed сохранён
-# (privoxy→xray, прямого egress нет). ALL_PROXY/all_proxy ИСКЛЮЧЕНЫ: reqwest (Codex Rust
-# app-server) тоже берёт scheme-ключ раньше 'all' (src/proxy.rs «Overwritten by the more
-# specific HTTP_PROXY») → 'all'-ключ в gui-домене избыточен для потребителя и ломает Python.
-# CLI-wrapper'ы (~/bin/codex-srouter) продолжают ставить себе socks5h:10808 ТОЧЕЧНО — privoxy
-# рвёт их WS (#120); gui-домен к ним не относится.
+# (env-key, value) SET-список для gui-домена УДАЛЁН (контракт маршрутизации 2026-10-07):
+# ambient env-прокси не сеется ни в один слой — через туннель ходит только явно попросившее
+# (xray-правила, git per-host, per-tool wrappers, curl -x). Роль LaunchAgent com.srouter.codenv —
+# residual-ЧИСТКА (unsetenv), см. launchagents/srouter-codex-env.sh. История: scheme-ключи несли
+# privoxy (терминальное плечо #331/#340; socks5h ломал pip через SOCKSProxyManager).
 # Значение нужно только для setenv; uninstall итерирует CODEX_LAUNCHCTL_UNSET_KEYS.
-CODEX_LAUNCHCTL_ENV = tuple((k, _GUI_HTTP_PROXY_URL) for k in
-                            ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")) \
-                      + (("NO_PROXY", CODEX_NO_PROXY), ("no_proxy", CODEX_NO_PROXY))
 # Список ключей ДЛЯ СНЯТИЯ (uninstall + residual-чистка): надмножество SET — включает
 # ALL_PROXY/all_proxy, которые старые версии codenv ставили в gui-домен (#331/#340). setenv не
 # ретроактивен и не снимает то, чего не ставит → «не ставить» ≠ «убрать»: без unsetenv residual
