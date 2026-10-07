@@ -166,6 +166,9 @@ def _passive_health(monkeypatch):
     # См. tests/test_health.py::_all_up_monkey для канона этих же моков.
     monkeypatch.setattr(health, "_codex_app_proxy_check",
                         lambda: {"status": "unknown", "source": "n/a", "detail": "App не запущен (mock)"})
+    # Ревью #404: новый чек #404 тоже дёргает ps/lsof — та же изоляция от живой машины.
+    monkeypatch.setattr(health, "_claude_app_proxy_check",
+                        lambda: {"status": "unknown", "source": "n/a", "detail": "Claude.app не запущен (mock)"})
     monkeypatch.setattr(health, "_desktop_proxy_check",
                         lambda: {"status": "unknown", "detail": "launchctl (mock)"})
     monkeypatch.setattr(health, "_resolve_host", lambda host: True)

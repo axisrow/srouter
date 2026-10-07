@@ -75,6 +75,54 @@ def test_app_bin_env_override(monkeypatch):
     assert claude_wrappers._claude_app_bin() == "/opt/Claude.app/Contents/MacOS/Claude"
 
 
+def test_default_app_bin_path_env_scrubbed(monkeypatch):
+    """Ревью #404 (канон ambient-env-poisons-env-parameterized-stubs, #265): тест дефолта
+    скраббит SROUTER_CLAUDE_APP_BIN — иначе на машине с экспортированным override он
+    ложнопало краснеет (env-параметризованная заглушка читает env в call-time)."""
+    monkeypatch.delenv("SROUTER_CLAUDE_APP_BIN", raising=False)
+    assert claude_wrappers._claude_app_bin().endswith(
+        "/Applications/Claude.app/Contents/MacOS/Claude")
+
+
+def test_template_has_shebang_first_line():
+    """Ревью #404 (CONFIRMED execve-эмпирика верификатором): shebang-less скрипт →
+    ENOEXEC-fallback на /bin/sh, где zsh-only `print` не существует (rc=127, ветка ошибки
+    теряется); не-shell запуск (launchd/subprocess list) падает Exec format error вовсе."""
+    root = Path(__file__).resolve().parent.parent
+    text = (root / "launchagents" / claude_wrappers.CLAUDE_APP_TEMPLATE).read_text(encoding="utf-8")
+    assert text.startswith("#!/bin/zsh"), "shebang первой строкой (маркер сдвигается на вторую)"
+
+
+def test_template_bypass_covers_zai_and_loopback_v6():
+    """Ревью #404: Chromium env игнорирует (посылка самого PR) — z.ai и ::1 обязаны быть
+    в argv bypass-list, иначе z.ai уезжает в туннель (нарушение zai-direct-no-proxy
+    ровно в половине стеков: Node — да, Chromium — нет)."""
+    root = Path(__file__).resolve().parent.parent
+    text = (root / "launchagents" / claude_wrappers.CLAUDE_APP_TEMPLATE).read_text(encoding="utf-8")
+    bypass = text.split("--proxy-bypass-list=", 1)[1].split('"', 2)[1]
+    for host in ("z.ai", ".z.ai", "::1"):
+        assert host in bypass, f"{host} отсутствует в bypass-list: {bypass}"
+
+
+def test_template_quits_running_instance():
+    """Ревью #404 (канон codex-app-proxy): quit+pkill перед запуском — без них второй запуск
+    при живом из Dock инстансе множит процессы/теряет аргументы, и рецепт доктора
+    «перезапусти через wrapper» не срабатывает без ручного Cmd+Q."""
+    root = Path(__file__).resolve().parent.parent
+    text = (root / "launchagents" / claude_wrappers.CLAUDE_APP_TEMPLATE).read_text(encoding="utf-8")
+    assert "osascript" in text, "graceful quit живого инстанса"
+    assert "pkill -x Claude" in text, "fallback-pkill главного процесса"
+
+
+def test_no_proxy_single_source():
+    """Ревью #404 (канон #155): NO_PROXY gui-wrapper'ов — единый источник в dashboard_common,
+    иначе эволюция z.ai-политики тихо разойдётся между codex и claude."""
+    import codex_wrappers
+    from dashboard_common import GUI_NO_PROXY
+    assert claude_wrappers.CLAUDE_NO_PROXY == GUI_NO_PROXY
+    assert codex_wrappers.CODEX_NO_PROXY == GUI_NO_PROXY
+
+
 def test_install_creates_wrapper(monkeypatch, tmp_path):
     home = _mock_home(monkeypatch, tmp_path)
     env = _env(tmp_path)

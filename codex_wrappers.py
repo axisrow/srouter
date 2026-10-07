@@ -35,15 +35,18 @@ from install_lib import (
 # except BaseException (не Exception): dashboard_common raise SystemExit при отсутствии
 # srouter_config.py, а SystemExit не ловится Exception — fallback должен сработать и для него.
 try:
-    from dashboard_common import SOCKS_PROXY_URL as _CODEX_PROXY_URL
+    from dashboard_common import SOCKS_PROXY_URL as _CODEX_PROXY_URL, GUI_NO_PROXY as _GUI_NO_PROXY
 except BaseException:
     _CODEX_PROXY_URL = "socks5h://127.0.0.1:10808"
+    _GUI_NO_PROXY = "localhost,127.0.0.1,::1,z.ai,.z.ai"
 # NO_PROXY для launchctl-gui env: loopback (Codex→moonbridge на loopback и локальные сервисы)
 # + z.ai,.z.ai (moonbridge→api.z.ai — внешний хост, доступен напрямую мимо SOCKS5/xray/VPS).
 # z.ai НЕ за GFW: при мёртвом VPS (#194) moonbridge-клиент обязан достучаться к api.z.ai напрямую,
 # иначе codex ломается. ОБА варианта: z.ai = точный хост, .z.ai = поддомены (api.z.ai и др.).
 # Канон: zai-direct-no-proxy, srouter-critical-infra-24-7 (VPS-смерть не валит z.ai-трафик).
-CODEX_NO_PROXY = "localhost,127.0.0.1,::1,z.ai,.z.ai"
+# Значение — единый источник dashboard_common.GUI_NO_PROXY (канон #155; ревью #404: байт-в-байт
+# дубликат в claude_wrappers тихо разошёлся бы при эволюции z.ai-политики).
+CODEX_NO_PROXY = _GUI_NO_PROXY
 # NO_PROXY для CLI-wrapper (~/bin/codex-srouter) — ТОЛЬКО loopback, БЕЗ z.ai. CLI-codex идёт через
 # SOCKS5 (managed путь, xray→VPS) — его NO_PROXY = санитизация унаследованного privoxy-окружения
 # (#96 core), НЕ provider-direct. z.ai-прямой-доступ релевантен moonbridge (GUI launchctl-gui выше),
