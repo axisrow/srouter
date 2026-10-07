@@ -511,6 +511,15 @@ def check_all(*, active_claude=False):
     elif cap["status"] == "warn":
         cap_check["ok"] = False  # SOCKS5-плечо — degraded (#127), но не «всё мертво»
     checks.append(cap_check)
+    # Семейство ~/bin-wrapper'ов (инцидент-класс 2026-10-07): file-evidence — симлинки в
+    # чужие репы / unmarked / отсутствующие ловятся здесь, ДО первого течения App.
+    # warn — degraded; unknown не существует (fs-чек всегда даёт вердикт).
+    gw = _gui_wrappers_check()
+    gw_check = {"name": "gui-wrappers (семейство ~/bin)",
+                "ok": gw["status"] == "ok", "detail": gw["detail"]}
+    if gw["status"] == "warn":
+        gw_check["ok"] = False
+    checks.append(gw_check)
     # codenv launchd-job (#250): job загружен, но падает (exit != 0) / осиротел (plist удалён) /
     # указывает на несуществующий путь → down DRIVER. Реальный инцидент: 1419 падений подряд в
     # тишине — doctor читал plist-артефакт, а не состояние job'а. Без codenv Codex после ребута

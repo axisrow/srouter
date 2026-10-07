@@ -30,8 +30,70 @@ __all__ = [
     "_codenv_unloaded_is_persistent", "_codenv_job_check",
     "_codex_app_proxy_check", "_app_pids_route", "_codex_app_chromium_proxy_check",
     "_claude_app_proxy_check",
+    "_gui_wrappers_check", "_GUI_WRAPPER_FAMILY",
     "_gui_socks_residual_check",
 ]
+
+# Семейство ~/bin-wrapper'ов srouter: file-evidence чек доктора (в дополнение к
+# route-evidence app-чекам). Локальная копия (name, marker) — прямой import codex_wrappers
+# в health_codenv создал бы цикл (codex_wrappers → health → health_codenv → codex_wrappers);
+# канон #340, паритет гвардится тестом test_family_parity_with_sources.
+_GUI_WRAPPER_FAMILY = (
+    ("codex-srouter", "# srouter: codex CLI wrapper (managed)"),
+    ("codex-app-proxy", "# srouter: codex-app-proxy wrapper (managed)"),
+    ("claude-app", "# srouter: claude-app wrapper (managed)"),
+)
+
+
+def _gui_wrappers_check():
+    """Wrapper'ы семейства ~/bin вне управления srouter → warn (инцидент-класс 2026-10-07).
+
+    Route-evidence app-чеков (см. выше) ловит «кто как ходит СЕЙЧАС», но не хрупкость
+    самого wrapper-файла: живой профиль машины — ~/bin/codex-* это СИМЛИНКИ на
+    agent-orchestrator/local/toolbox без srouter-маркера: install считает их «чужими —
+    не трогаем» (#112), переезд/снос той репы убьёт их висячими симлинками (прецедент
+    переезда репо был), и doctor молчал бы до первого течения App.
+
+    file-evidence по каждому члену _GUI_WRAPPER_FAMILY:
+      ok   — regular file, читается, несёт свой маркер, executable;
+      warn — конкретные проблемы с рецептом: отсутствует / симлинк (включая dangling —
+             цель снесена) / без маркера / не исполняется.
+    unknown здесь НЕ существует: fs-чек всегда даёт вердикт («не смогли прочитать» —
+    тоже проблема, не info).
+    """
+    problems = []
+    bin_dir = Path.home() / "bin"
+    for name, marker in _GUI_WRAPPER_FAMILY:
+        p = bin_dir / name
+        if p.is_symlink():
+            try:
+                target = os.readlink(p)
+            except OSError:
+                target = "?"
+            dangling = "" if os.path.exists(p) else " (ВИСЯЧИЙ — цель снесена)"
+            problems.append(f"{name}: симлинк на {target}{dangling} — вне управления srouter "
+                            f"(удали и запусти srouter install)")
+            continue
+        if not p.exists():
+            problems.append(f"{name}: отсутствует — запусти srouter install")
+            continue
+        try:
+            content = p.read_text(encoding="utf-8")
+        except (OSError, ValueError, TypeError) as exc:
+            problems.append(f"{name}: не читается ({str(exc)[:40]}) — запусти srouter install")
+            continue
+        if marker not in content:
+            problems.append(f"{name}: без srouter-маркера — чужой, install его не трогает "
+                            f"(удали вручную и запусти srouter install)")
+            continue
+        if not os.access(p, os.X_OK):
+            problems.append(f"{name}: не исполняется — chmod +x или srouter install")
+    if not problems:
+        return {"status": "ok", "source": "fs",
+                "detail": ("Wrapper'ы семейства управляемы ("
+                           + ", ".join(n for n, _ in _GUI_WRAPPER_FAMILY) + ")")}
+    return {"status": "warn", "source": "fs",
+            "detail": "Wrapper'ы вне управления srouter: " + "; ".join(problems)}
 
 # Наш managed privoxy-формат gui-домена (#340): scheme-ключи = HTTP_PROXY_URL. try-import —
 # тот же fail-soft паттерн, что codex_wrappers (dashboard_common raise SystemExit без
