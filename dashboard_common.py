@@ -69,6 +69,10 @@ HTTP_PROXY_URL = f"http://{PRIVOXY_ADDR[0]}:{PRIVOXY_ADDR[1]}"
 # socks5h:// = DNS резолвится прокси (важно за GFW); socks5:// — для Chromium --proxy-server (не понимает socks5h).
 SOCKS_PROXY_URL = f"socks5h://{XRAY_SOCKS_ADDR[0]}:{XRAY_SOCKS_ADDR[1]}"
 SOCKS_PROXY_URL_CHROMIUM = f"socks5://{XRAY_SOCKS_ADDR[0]}:{XRAY_SOCKS_ADDR[1]}"
+# NO_PROXY gui-wrapper'ов (codex GUI launchctl-канон zai-direct-no-proxy + claude-app):
+# loopback + z.ai,.z.ai — единый источник (канон #155; ревью #404: дубликат в двух
+# wrapper-модулях тихо разошёлся бы при эволюции z.ai-политики).
+GUI_NO_PROXY = "localhost,127.0.0.1,::1,z.ai,.z.ai"
 PROBE_SOCKS_HOST = "127.0.0.1"
 NODE_PROBE_TTL_SEC = 300
 
@@ -96,6 +100,7 @@ __all__ = [
     "HTTP_PROXY_URL",
     "SOCKS_PROXY_URL",
     "SOCKS_PROXY_URL_CHROMIUM",
+    "GUI_NO_PROXY",
     "PROBE_SOCKS_HOST",
     "NODE_PROBE_TTL_SEC",
     "_first",

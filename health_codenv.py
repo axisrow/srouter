@@ -8,6 +8,7 @@ health.py остаётся тонким фасадом: `from health_codenv impo
 from pathlib import Path
 import logging
 import os
+import re
 import time
 from urllib.parse import urlparse
 
@@ -29,6 +30,7 @@ __all__ = [
     "_codenv_plist_is_managed", "_codenv_job_state", "_CODENV_RELOAD_SETTLE_WAIT",
     "_codenv_unloaded_is_persistent", "_codenv_job_check",
     "_codex_app_proxy_check", "_app_pids_route", "_codex_app_chromium_proxy_check",
+    "_claude_app_proxy_check",
     "_gui_socks_residual_check",
 ]
 
@@ -924,21 +926,49 @@ def _codex_app_proxy_check():
                        f"для App — wrapper с точечным SOCKS5")}
 
 
+def _lsof_remote_host(line):
+    """Хост назначения из lsof-строки (IPv4 или [IPv6]); '' если не распарсили."""
+    m = re.search(r"->\s*(\[[^\]]+\]|[0-9A-Za-z.]+):", line)
+    return m.group(1) if m else ""
+
+
+def _is_private_peer(host):
+    """Локальное/приватное назначение ([::1], IPv6-ULA/link-local, rfc1918/link-local-v4) —
+    не GFW-путь (ревью #404: только-external down обязан считать только публичных пиров,
+    иначе ложный down на idle-сокетах локальных сервисов). Нераспарсенное → публичное
+    (fail-closed: сомнение трактуется в пользу down, не ok)."""
+    h = host.strip("[]").lower()
+    if not h:
+        return False
+    if ":" in h:  # IPv6
+        return h == "::1" or h.startswith("fe8") or h.startswith("fc") or h.startswith("fd")
+    parts = h.split(".")
+    if len(parts) != 4:
+        return False
+    a, b = parts[0], parts[1]
+    return ((a == "10") or (a == "192" and b == "168") or (a == "127")
+            or (a == "169" and b == "254")
+            or (a == "172" and b.isdigit() and 16 <= int(b) <= 31))
+
+
 def _app_pids_route(app_pids, *, app_kinds=None):
     """Runtime-маршрут App-PID по lsof-сокетам (как _codex_proxy_probe, но для App-PID).
 
     cycle-review #190 round 1/2: _codex_app_proxy_check не может полагаться только на gui-env (setenv
     не ретроактивен → stale App). lsof по App-PID классифицирует РЕАЛЬНЫЙ маршрут: external-ESTABLISHED
     (direct) / SOCKS5 10808 / privoxy 8118 (рвёт WS #120). ok требует positive SOCKS5 (round 2).
-    Возвращает {external, socks, privoxy: set(pids), external_by_kind, verifiable: bool}. timeout ИЛИ rc≠0 → verifiable=False
+    Ревью #404: non-loopback-назначения классифицируются — ПУБЛИЧНЫЕ пиры в `external`
+    (GFW-риск), приватные ([::1]/LAN/ULA) в `external_private` (не GFW-путь; вердикт down
+    по ним — ложный). Возвращает {external, external_private, socks, privoxy: set(pids),
+    external_by_kind, verifiable: bool}. timeout ИЛИ rc≠0 → verifiable=False
     (сбой lsof ≠ доказательство маршрута → fail-closed unknown, не ok).
     """
     lr = sys_probe.run([LSOF, "-nP", "-p", ",".join(app_pids)], timeout=3)
     if lr.get("timeout") or lr.get("rc") not in (0, None):
-        return {"external": set(), "socks": set(), "privoxy": set(),
+        return {"external": set(), "external_private": set(), "socks": set(), "privoxy": set(),
                 "external_by_kind": {}, "verifiable": False}
     external, socks, privoxy = set(), set(), set()
-    external_by_kind = {}
+    external_private, external_by_kind = set(), {}
     for line in (lr.get("out") or "").splitlines():
         if "TCP" not in line or "ESTABLISHED" not in line:
             continue
@@ -948,13 +978,108 @@ def _app_pids_route(app_pids, *, app_kinds=None):
             socks.add(pid)
         elif f"->127.0.0.1:{PRIVOXY_PORT}" in line:
             privoxy.add(pid)  # HTTP-прокси рвёт long-lived WS (#120)
-        elif "->127.0.0.1:" not in line:
-            external.add(pid)  # external ESTABLISHED — direct, без localhost-прокси
+        elif "->127.0.0.1:" in line:
+            pass  # другой localhost-порт — вне вердикта (как прежде)
+        elif _is_private_peer(_lsof_remote_host(line)):
+            external_private.add(pid)  # приватный пир — не GFW-путь (ревью #404)
+        else:
+            external.add(pid)  # публичный external ESTABLISHED — direct, без localhost-прокси
             kind = (app_kinds or {}).get(pid)
             if kind:
                 external_by_kind.setdefault(kind, set()).add(pid)
-    return {"external": external, "socks": socks, "privoxy": privoxy,
+    return {"external": external, "external_private": external_private,
+            "socks": socks, "privoxy": privoxy,
             "external_by_kind": external_by_kind, "verifiable": True}
+
+
+def _claude_app_proxy_check():
+    """Claude.app (чат + Dispatch) напрямую мимо туннеля → down DRIVER (инцидент 2026-10-07).
+
+    Эмпирия (ps eww + lsof, 2026-10-07): Claude.app = Electron/Chromium. Chromium-стек
+    ИГНОРИРУЕТ env HTTP(S)_PROXY (с сеяным env сокеты оставались прямыми) — нужен argv
+    --proxy-server (wrapper ~/bin/claude-app); env при этом работает для Node-стороны
+    main-процесса (sessions-bridge/axios). Плечо — HTTP privoxy (Claude-приложения на
+    SOCKS5 ломаются, #127), НЕ SOCKS. Приложение, перезапущенное из Dock мимо wrapper'а,
+    идёт напрямую → GFW рвёт TLS → ERR_CONNECTION_CLOSED («Не удалось подключиться к
+    Claude» / Dispatch «Не удалось создать сессию») — инцидент повторялся дважды за день,
+    doctor молчал (чек был только для ChatGPT.app).
+
+    Чек (route-evidence, канон _codex_app_proxy_check/#403 — verdict по фактическому
+    маршруту lsof, не по конфигу; App-PID = path-сегмент /Claude.app/ — helper'ы тоже):
+      status="ok"      — маршрут через privoxy (канон плечо, wrapper);
+      status="warn"    — маршрут через SOCKS5 10808 (#127);
+      status="down"    — external-сокеты (прямой egress; GFW порвёт claude.ai);
+      status="unknown" — App не запущен / lsof недоступен / idle без ESTABLISHED
+                         (fail-closed; «не запущен» — не деградация, #362).
+    """
+    r = sys_probe.run([PS, "-axo", "pid=,comm="], timeout=3)
+    if r.get("timeout"):
+        return {"status": "unknown", "source": "n/a", "detail": "timeout ps"}
+    app_pids = []
+    for line in (r.get("out") or "").splitlines():
+        parts = line.split(None, 1)
+        if len(parts) < 2:
+            continue
+        pid_s, comm = parts[0].strip(), parts[1].strip()
+        if pid_s.isdigit() and "/Claude.app/" in comm:
+            app_pids.append(pid_s)
+    if not app_pids:
+        return {"status": "unknown", "source": "n/a",
+                "detail": "Claude.app не запущен — проверять маршрут нечего"}
+    route = _app_pids_route(app_pids)
+    pid_hint = f"PID {','.join(app_pids)}"
+    if not route.get("verifiable"):
+        return {"status": "unknown", "source": "n/a",
+                "detail": (f"lsof недоступен — маршрут Claude.app недоказуем "
+                           f"(fail-closed; {pid_hint})")}
+    proxied = route.get("privoxy", set()) | route.get("socks", set())
+    public_ext = route.get("external", set())
+    if public_ext and not proxied:
+        # ТОЛЬКО публичный external (ни одного proxied-сокета) = App запущен мимо wrapper'а
+        # целиком — инцидент-класс (весь webview/bridge за GFW).
+        ext = ",".join(sorted(public_ext))
+        return {"status": "down", "source": "runtime",
+                "detail": (f"Claude.app НАПРЯМУЮ (PID {ext} держит external-сокеты; GFW порвёт "
+                           f"claude.ai → ERR_CONNECTION_CLOSED). Запускай через ~/bin/claude-app "
+                           f"(wrapper: env + --proxy-server; Chromium env игнорирует — эмпирия "
+                           f"2026-10-07; плечо privoxy {PRIVOXY_PORT} — #127). Перезапусти App "
+                           f"через wrapper")}
+    if public_ext:
+        # Mixed: основной трафик через прокси, но часть ПУБЛИЧНЫХ сокетов напрямую —
+        # известная app-internal утечка (remote-tools net.WebSocket игнорирует и env, и
+        # --proxy-server). НЕ driver: лечения у оператора нет до системного enforcement
+        # (PF fail-closed, follow-up) — вечный degraded на рабочей машине = анти-паттерн
+        # #403 и глушит /health 503-канал; info-only по прецеденту _codex_isolation_check
+        # (known_limitation в health.py). Detail называет ФАКТИЧЕСКОЕ плечо (ревью #404:
+        # «privoxy 8118» при socks-only миксе был ложным диагнозом).
+        shoulder = f"privoxy {PRIVOXY_PORT}" if route.get("privoxy") else "SOCKS5 10808"
+        ext = ",".join(sorted(public_ext))
+        pv = ",".join(sorted(proxied))
+        return {"status": "warn", "known_limitation": True, "source": "runtime",
+                "detail": (f"Claude.app частично проксирован (через {shoulder}; PID {pv}), "
+                           f"часть сокетов напрямую (PID {ext} — app-internal WebSocket, "
+                           f"игнорирует и env, и --proxy-server). Известная граница без "
+                           f"операторского лечения до системного enforcement (PF fail-closed "
+                           f"Anthropic-CIDR, follow-up) — info-only")}
+    if route.get("socks"):
+        sv = ",".join(sorted(route["socks"]))
+        return {"status": "warn", "source": "runtime",
+                "detail": (f"Claude.app через SOCKS5 10808 (PID {sv}) — Claude-приложения на "
+                           f"SOCKS5 ломаются (#127); лучше wrapper ~/bin/claude-app с privoxy "
+                           f"{PRIVOXY_PORT}")}
+    if route.get("privoxy"):
+        pv = ",".join(sorted(route["privoxy"]))
+        return {"status": "ok", "source": "runtime",
+                "detail": (f"Claude.app через privoxy {PRIVOXY_PORT} (PID {pv} — wrapper "
+                           f"~/bin/claude-app: env + --proxy-server для Chromium-стека)")}
+    if route.get("external_private"):
+        pv = ",".join(sorted(route["external_private"]))
+        return {"status": "unknown", "source": "runtime",
+                "detail": (f"Claude.app активен, но публичных/прокси-сокетов нет — только "
+                           f"локальные/приватные назначения (PID {pv}; не GFW-путь) — idle")}
+    return {"status": "unknown", "source": "runtime",
+            "detail": (f"Claude.app активен, прокси/external-сокеты не доказаны — idle "
+                       f"(переподключение; {pid_hint})")}
 
 
 # Chromium network-service подпроцесс ChatGPT.app/Codex.app — единственный сетевой стек

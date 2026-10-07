@@ -106,6 +106,10 @@ def _all_up_monkey(monkeypatch, *, probe_status="ok", probe_detail="runtime: к�
     # _codex_app_proxy_check выше: дёргает ps/lsof, живой ChatGPT.app на dev-машине драйвил бы вердикт.
     monkeypatch.setattr(health, "_codex_app_chromium_proxy_check",
                         lambda: {"status": "unknown", "source": "n/a", "detail": "NetworkService не активен (mock)"})
+    # Claude.app route-check (инцидент 2026-10-07) — та же причина: дёргает ps/lsof, живой
+    # Claude.app на dev-машине (даже через wrapper — с app-internal WS-утечкой) драйвил бы вердикт.
+    monkeypatch.setattr(health, "_claude_app_proxy_check",
+                        lambda: {"status": "unknown", "source": "n/a", "detail": "Claude.app не запущен (mock)"})
     monkeypatch.setattr(health, "_desktop_proxy_check",
                         lambda: {"status": "unknown", "detail": "launchctl (mock)"})
     # #205: _dns_up дёргает _resolve_host (socket.getaddrinfo github.com) — мокаем резолв ok, иначе
@@ -846,6 +850,9 @@ def test_check_all_down_when_everything_dead(monkeypatch):
     # с рабочим системным SOCKS5 → ok → any_ok=True → degraded вместо down).
     monkeypatch.setattr(health, "_codex_app_chromium_proxy_check",
                         lambda: {"status": "down", "source": "runtime", "detail": "down"})
+    # Claude.app route-check (ps/lsof) — мокаем down по той же причине (machine-independence).
+    monkeypatch.setattr(health, "_claude_app_proxy_check",
+                        lambda: {"status": "down", "source": "runtime", "detail": "down"})
     # #250: _codenv_job_check тоже driver (не info на ok) — на машине с реально загруженным и
     # здоровым codenv LaunchAgent даёт живой ok → any_ok=True → degraded вместо down. Мокаем для
     # machine-independence (канон unmocked-probe-is-both-slow-and-machine-dependent).
@@ -1022,6 +1029,8 @@ def test_vps_unreachable_does_not_mask_down_into_degraded(monkeypatch):
                         lambda: {"status": "down", "source": "runtime", "detail": "runtime"})
     monkeypatch.setattr(health, "_codex_app_proxy_check",
                         lambda: {"status": "down", "source": "gui-env", "detail": "down"})
+    monkeypatch.setattr(health, "_claude_app_proxy_check",
+                        lambda: {"status": "down", "source": "runtime", "detail": "down"})
     _mock_active_node(monkeypatch, {"name": "vps-1", "endpoint_host": "198.51.100.7", "port": 443})
     _mock_vps_tcp(monkeypatch, reachable=False)
     # #205: VPS-driver гвард требует net["up"] and dns["up"] (gaierror ≠ VPS-смерть). Мокаем DNS-up,

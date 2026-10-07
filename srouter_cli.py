@@ -123,6 +123,13 @@ from codex_wrappers import (
     _zshrc_path,  # noqa: F401 — публичный контракт srouter
 )
 
+# Claude.app wrapper (инцидент 2026-10-07): env + --proxy-server точечно, канон codex-wrappers.
+from claude_wrappers import (
+    CLAUDE_APP_MARKER,
+    _install_claude_app_wrapper,
+    _remove_claude_app_wrapper,
+)
+
 
 def _prompt_bool(label: str) -> bool:
     return input(f"{label} [y/N]: ").strip().lower() in {"y", "yes", "д", "да"}
@@ -266,6 +273,9 @@ def cmd_install(args) -> int:
         env_note = f"{codenv_note} VSCode: {vp_note}"
         path_note = _ensure_home_bin_in_path(env)
         codex_iso_note = _install_codex_isolation(env, runner)
+        # Claude.app wrapper (инцидент 2026-10-07): Chromium-стек Electron игнорирует env —
+        # нужен argv --proxy-server; без wrapper'а App из Dock идёт напрямую за GFW.
+        claude_note = _install_claude_app_wrapper(env)
         # Marker-migration table (issue #112 Часть 4): регистрируем текущие маркеры wrappers/zshrc/codenv
         # в state.known_markers. При будущей смене версии маркера old останется как legacy → следующий
         # install мигрирует old→current. Без регистрации install использует только current (safe fallback).
@@ -274,6 +284,7 @@ def cmd_install(args) -> int:
             _km_state_path = env.state_path
             for _entry in CODEX_WRAPPERS:
                 populate_known_markers(_km_state_path, "wrappers", [_entry[2]])
+            populate_known_markers(_km_state_path, "wrappers", [CLAUDE_APP_MARKER])
             populate_known_markers(_km_state_path, "zshrc_path", [ZSHRC_PATH_MARKER])
             populate_known_markers(_km_state_path, "zshrc_codex_func",
                                    [ZSHRC_CODEX_FUNC_MARKER_BEGIN, ZSHRC_CODEX_FUNC_MARKER_END])
@@ -290,6 +301,7 @@ def cmd_install(args) -> int:
               f"{env_note}\n"
               f"{path_note}\n"
               f"{codex_iso_note}\n"
+              f"{claude_note}\n"
               f"Дашборд: http://127.0.0.1:8787  (srouter status — проверить)")
         return 0
     blocked = ", ".join(result.get("blocked") or ["unknown"])
@@ -400,6 +412,8 @@ def cmd_uninstall(args) -> int:
     env_note = ". " + env_status["note"]
     path_note = ". " + _remove_home_bin_from_path()
     codex_iso_note = ". " + _remove_codex_isolation(env, runner)
+    # Claude.app wrapper — симметрично install (marker-gate: current ИЛИ legacy — наш).
+    claude_note = ". " + _remove_claude_app_wrapper()
 
     # env-cleanup fail-closed (issue #94 DEFECT A): мёртвый прокси остался в gui-домене → НЕ успех,
     # даже если всё остальное прошло. Раньше env_note просто конкатенировался в сообщение → fail-open
@@ -420,7 +434,8 @@ def cmd_uninstall(args) -> int:
           + codex_func_note
           + env_note
           + path_note
-          + codex_iso_note)
+          + codex_iso_note
+          + claude_note)
     # leftover per-имённо (issue #110): «частично» без деталей = новый обман. Оператор должен видеть,
     # КАКИЕ конфиги srouter ставил, но не откатил (следующий install авторазрешит их как reclaimable
     # с backup, либо потребует решения если они foreign).
