@@ -200,6 +200,8 @@ class TestParserSurface:
             ["system-proxy", "restore"],
             ["routing", "list", "--outbound", "reality-out"],
             ["routing", "add-domain", "example.com", "--adopt"],
+            ["routing", "add-ip", "78.47.183.125"],
+            ["routing", "remove-ip", "78.47.183.125", "1.2.3.4"],
             ["privoxy", "protect", "--strict"],
             ["privoxy", "audit", "report", "--limit", "10", "--json"],
             ["privoxy", "audit", "uninstall", "--purge-log"],
@@ -248,6 +250,33 @@ class TestDispatchContract:
                 assert hasattr(args, attr), (
                     f"cmd_routing читает {attr}, но парсер его не создаёт"
                 )
+
+    @pytest.mark.parametrize(
+        "subcmd,ip_action",
+        [("add-ip", "add"), ("remove-ip", "remove")],
+    )
+    def test_routing_ip_subcommands_dispatch_ips_to_apply(
+            self, parser, monkeypatch, tmp_path, subcmd, ip_action):
+        """add-ip/remove-ip идут в routing_apply через ips (доменный аргумент не участвует)."""
+        import local_state
+        seen = {}
+
+        def fake_apply(hosts, **kw):
+            seen["hosts"] = hosts
+            seen.update(kw)
+            return {"ok": True, "changed": True, "err": ""}
+
+        monkeypatch.setattr(local_state, "routing_apply", fake_apply)
+        args = parser.parse_args([
+            "routing", subcmd, "78.47.183.125", "1.2.3.4",
+            "--xray-config", str(tmp_path / "c.json"),
+            "--state", str(tmp_path / "s.json"),
+        ])
+        rc = args.func(args)
+        assert rc == 0
+        assert seen["hosts"] is None, "ip-подкоманда не должна трогать доменный состав"
+        assert seen["ips"] == ["78.47.183.125", "1.2.3.4"]
+        assert seen["ip_action"] == ip_action
 
 
 class TestCommandsAreNotStubs:

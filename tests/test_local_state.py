@@ -696,13 +696,16 @@ def test_load_state_missing_direct_domains_key_defaults_to_empty(tmp_path):
 # домены хранит в state (active+hash), two-phase apply (backup→validate→restart→promote). НЕ захватывает
 # весь foreign-конфиг. Эталон read-xray: sync_route_ip_from_xray; atomic-save: save_state.
 
-def _write_xray_routing_config(p, domains, outbound="reality-out", managed=False):
+def _write_xray_routing_config(p, domains, outbound="reality-out", managed=False, ips=None):
     """Минимальный xray-config с routing.rules[0]={outboundTag, domain} — как production.
 
     managed=True → правило помечено _srouter_managed (после adopt). Имитирует текущий foreign
-    production-конфиг (28 доменов, БЕЗ маркера) при managed=False.
+    production-конфиг (28 доменов, БЕЗ маркера) при managed=False. ips — ip-matchers правила
+    (xray: domain OR ip в одном rule).
     """
     rule = {"type": "field", "outboundTag": outbound, "domain": list(domains)}
+    if ips:
+        rule["ip"] = list(ips)
     if managed:
         rule["_srouter_managed"] = True
     p.write_text(json.dumps({
@@ -844,6 +847,190 @@ def test_routing_apply_idempotent_after_adopt(tmp_path):
     assert r["ok"] is True
     assert r["changed"] is False
     assert calls == []  # ничего не менялось → restart не нужен
+
+
+def _managed_state(p, domains, ips=None):
+    """state с routing-секцией, хеш которой соответствует текущему составу правила."""
+    rt = {"active": list(domains), "outbound": "reality-out",
+          "last_applied_hash": local_state._routing_domains_hash(domains, ips)}
+    if ips is not None:
+        rt["active_ips"] = list(ips)
+    _write(p, {"nodes": [], "routing": rt})
+
+
+def test_routing_apply_add_ip_extends_managed_rule(tmp_path):
+    """add-ip: ip вливается в ТО ЖЕ managed-правило (инвариант «ровно одно managed»),
+    state.active_ips + расширенный hash пишутся, xray перезапущен."""
+    xray_p = tmp_path / "xray-config.json"
+    state_p = tmp_path / "srouter.local.json"
+    _write_xray_routing_config(xray_p, BASELINE_DOMAINS, managed=True)
+    _managed_state(state_p, BASELINE_DOMAINS)
+    calls = []
+    r = local_state.routing_apply(
+        None, ips=["78.47.183.125"], action="add",
+        config_path=str(xray_p), state_path=state_p, runner=_ok_runner(calls),
+        port_checker=_port_checker_settle_then_up(),
+    )
+    assert r["ok"] is True, r
+    assert r["changed"] is True
+    cfg = json.loads(xray_p.read_text(encoding="utf-8"))
+    managed = [x for x in cfg["routing"]["rules"] if x.get("_srouter_managed") is True]
+    assert len(managed) == 1, "ip должен жить в существующем managed-правиле, не вторым"
+    assert managed[0]["ip"] == ["78.47.183.125"]
+    assert managed[0]["domain"] == BASELINE_DOMAINS
+    rt = json.loads(state_p.read_text(encoding="utf-8"))["routing"]
+    assert rt["active_ips"] == ["78.47.183.125"]
+    assert any("start" in c and "xray" in c for c in calls)
+
+
+def test_routing_apply_add_ip_idempotent(tmp_path):
+    """ip уже в правиле и в state → changed:False, restart не нужен."""
+    xray_p = tmp_path / "xray-config.json"
+    state_p = tmp_path / "srouter.local.json"
+    _write_xray_routing_config(xray_p, BASELINE_DOMAINS, managed=True, ips=["78.47.183.125"])
+    _managed_state(state_p, BASELINE_DOMAINS, ips=["78.47.183.125"])
+    calls = []
+    r = local_state.routing_apply(
+        None, ips=["78.47.183.125"], action="add",
+        config_path=str(xray_p), state_path=state_p, runner=_ok_runner(calls),
+        port_checker=_port_checker_settle_then_up(),
+    )
+    assert r["ok"] is True
+    assert r["changed"] is False
+    assert calls == []
+
+
+def test_routing_apply_remove_ip_last_pops_key(tmp_path):
+    """remove-ip последнего ip → ключ ip из правила убирается (каноническое правило без пустого ip)."""
+    xray_p = tmp_path / "xray-config.json"
+    state_p = tmp_path / "srouter.local.json"
+    _write_xray_routing_config(xray_p, BASELINE_DOMAINS, managed=True, ips=["78.47.183.125"])
+    _managed_state(state_p, BASELINE_DOMAINS, ips=["78.47.183.125"])
+    calls = []
+    r = local_state.routing_apply(
+        None, ips=["78.47.183.125"], ip_action="remove",
+        config_path=str(xray_p), state_path=state_p, runner=_ok_runner(calls),
+        port_checker=_port_checker_settle_then_up(),
+    )
+    assert r["ok"] is True, r
+    assert r["changed"] is True
+    cfg = json.loads(xray_p.read_text(encoding="utf-8"))
+    managed = [x for x in cfg["routing"]["rules"] if x.get("_srouter_managed") is True]
+    assert "ip" not in managed[0]
+    assert managed[0]["domain"] == BASELINE_DOMAINS
+    rt = json.loads(state_p.read_text(encoding="utf-8"))["routing"]
+    assert rt["active_ips"] == []
+
+
+def test_routing_apply_invalid_ip_refused(tmp_path):
+    """Невалидный ip (geoip:/мусор/999.x) → отказ ДО любых мутаций: конфаг и state не тронуты,
+    restart не звался (loose-validator = утечка, строгий ipaddress-парсер)."""
+    xray_p = tmp_path / "xray-config.json"
+    state_p = tmp_path / "srouter.local.json"
+    _write_xray_routing_config(xray_p, BASELINE_DOMAINS, managed=True)
+    _managed_state(state_p, BASELINE_DOMAINS)
+    calls = []
+    for bad in ("geoip:cn", "999.1.1.1", "example.com", "78.47.183.125/64"):
+        r = local_state.routing_apply(
+            None, ips=[bad], action="add",
+            config_path=str(xray_p), state_path=state_p, runner=_ok_runner(calls),
+            port_checker=_port_checker_settle_then_up(),
+        )
+        assert r["ok"] is False, bad
+        assert "invalid_ip" in r.get("err", "")
+    cfg = json.loads(xray_p.read_text(encoding="utf-8"))
+    managed = [x for x in cfg["routing"]["rules"] if x.get("_srouter_managed") is True]
+    assert "ip" not in managed[0]
+    assert calls == []  # ни одного restart
+
+
+def test_routing_hash_legacy_compat_no_ips(tmp_path):
+    """Миграция: state со старым domain-only hash + правило без ip → domain-apply проходит
+    без ложного drift. Золотые значения захардкожены (не вычисляются тестируемой функцией —
+    иначе мутация формулы сдвигает обе стороны синхронно и не ловится)."""
+    GOLDEN3 = "4634ea5cb882eb2c"  # sha256(sorted(BASELINE_DOMAINS), legacy-формула)
+    GOLDEN4 = "e15a890faa5a086e"  # то же + domain:telegram.org
+    xray_p = tmp_path / "xray-config.json"
+    state_p = tmp_path / "srouter.local.json"
+    _write_xray_routing_config(xray_p, BASELINE_DOMAINS, managed=True)
+    _write(state_p, {"nodes": [], "routing": {"active": BASELINE_DOMAINS,
+                                              "outbound": "reality-out",
+                                              "last_applied_hash": GOLDEN3}})
+    calls = []
+    r = local_state.routing_apply(
+        ["domain:telegram.org"], action="add",
+        config_path=str(xray_p), state_path=state_p, runner=_ok_runner(calls),
+        port_checker=_port_checker_settle_then_up(),
+    )
+    assert r["ok"] is True, r
+    rt = json.loads(state_p.read_text(encoding="utf-8"))["routing"]
+    assert "domain:telegram.org" in rt["active"]
+    # после apply без ip хеш остаётся в legacy-формуле (байт-в-байт)
+    assert rt["last_applied_hash"] == GOLDEN4
+
+
+def test_routing_apply_ip_drift_detected(tmp_path):
+    """После ip-apply внешняя правка ip-состава правила ловится drift-детектором (расширенный хеш)."""
+    xray_p = tmp_path / "xray-config.json"
+    state_p = tmp_path / "srouter.local.json"
+    _write_xray_routing_config(xray_p, BASELINE_DOMAINS, managed=True, ips=["78.47.183.125"])
+    _managed_state(state_p, BASELINE_DOMAINS, ips=["78.47.183.125"])
+    # руками меняем ip в конфиге мимо srouter
+    cfg = json.loads(xray_p.read_text(encoding="utf-8"))
+    cfg["routing"]["rules"][0]["ip"] = ["1.2.3.4"]
+    xray_p.write_text(json.dumps(cfg), encoding="utf-8")
+    calls = []
+    r = local_state.routing_apply(
+        ["domain:telegram.org"], action="add",
+        config_path=str(xray_p), state_path=state_p, runner=_ok_runner(calls),
+        port_checker=_port_checker_settle_then_up(),
+    )
+    assert r["ok"] is False
+    assert "drift" in r.get("err", "").lower()
+    assert calls == []
+
+
+def test_routing_apply_drift_catches_externally_added_ip(tmp_path):
+    """state со СТАРЫМ domain-only hash (до введения ip); в managed-правило руками вписали ip
+    мимо srouter → domain-apply отказывает по drift: внешнюю правку не затираем молча."""
+    xray_p = tmp_path / "xray-config.json"
+    state_p = tmp_path / "srouter.local.json"
+    _write_xray_routing_config(xray_p, BASELINE_DOMAINS, managed=True, ips=["78.47.183.125"])
+    # state помнит только домены — хеш старой формулой, ip-состав ему неизвестен
+    legacy_hash = local_state._routing_domains_hash(BASELINE_DOMAINS)
+    _write(state_p, {"nodes": [], "routing": {"active": BASELINE_DOMAINS,
+                                              "outbound": "reality-out",
+                                              "last_applied_hash": legacy_hash}})
+    calls = []
+    r = local_state.routing_apply(
+        ["domain:telegram.org"], action="add",
+        config_path=str(xray_p), state_path=state_p, runner=_ok_runner(calls),
+        port_checker=_port_checker_settle_then_up(),
+    )
+    assert r["ok"] is False
+    assert "drift" in r.get("err", "").lower()
+    assert calls == []
+
+
+def test_routing_apply_domain_and_ip_one_transaction(tmp_path):
+    """Домены и ip в одном вызове → одна транзакция, один restart, оба состава применены."""
+    xray_p = tmp_path / "xray-config.json"
+    state_p = tmp_path / "srouter.local.json"
+    _write_xray_routing_config(xray_p, BASELINE_DOMAINS, managed=True)
+    _managed_state(state_p, BASELINE_DOMAINS)
+    calls = []
+    r = local_state.routing_apply(
+        ["telegram.org"], ips=["78.47.183.125"], action="add",
+        config_path=str(xray_p), state_path=state_p, runner=_ok_runner(calls),
+        port_checker=_port_checker_settle_then_up(),
+    )
+    assert r["ok"] is True, r
+    cfg = json.loads(xray_p.read_text(encoding="utf-8"))
+    managed = [x for x in cfg["routing"]["rules"] if x.get("_srouter_managed") is True]
+    assert "domain:telegram.org" in managed[0]["domain"]
+    assert managed[0]["ip"] == ["78.47.183.125"]
+    starts = [c for c in calls if "start" in c and "xray" in c]
+    assert len(starts) == 1, "оба изменения — один restart"
 
 
 def test_routing_apply_hash_drift_refuses(tmp_path):

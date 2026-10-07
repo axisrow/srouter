@@ -73,17 +73,62 @@ def _routing_find_managed_rule(rules):
     return idxs[0] if idxs else -1
 
 
-def _routing_domains_hash(domains):
-    """Стабильный hash домен-списка для drift-detection (сортировка → не зависит от порядка)."""
+def _routing_domains_hash(domains, ips=None):
+    """Стабильный hash состава matchers для drift-detection (сортировка → не зависит от порядка).
+
+    ips=None/[] → вход байт-в-байт равен legacy-формуле (только домены): state без active_ips
+    проходит drift-проверку против старого хеша без пере-apply (миграция бесшовна)."""
     import hashlib
     ordered = "\n".join(sorted(domains))
+    if ips:
+        ordered += "\n--ips--\n" + "\n".join(sorted(ips))
     return hashlib.sha256(ordered.encode("utf-8")).hexdigest()[:16]
 
 
-def routing_apply(hosts, *, action="add", adopt=False, outbound=DEFAULT_ROUTING_OUTBOUND,
+def _validate_ips(ips):
+    """Строгий валидатор ip-matchers: IP или CIDR (v4/v6) через stdlib ipaddress.
+
+    geoip:-префиксы, хостнеймы и мусор отвергаются (loose-validator = утечка).
+    Возвращает строку ошибки 'invalid_ip:<v>' или None."""
+    import ipaddress
+    for v in ips or []:
+        try:
+            ipaddress.ip_network(str(v), strict=False)
+        except ValueError:
+            return f"invalid_ip:{v}"
+    return None
+
+
+def routing_plan_ips(current_ips, ips, action="add"):
+    """Построить новый ip-список правила: добавить/убрать ips. Чистая функция, без записи.
+
+    Валидация ip — на вызывающем (_validate_ips), здесь только списочная арифметика
+    (idempotent add: дубль игнорируется; remove — убрать совпадающие)."""
+    if not isinstance(current_ips, list):
+        current_ips = []
+    if not isinstance(ips, list):
+        ips = [ips] if isinstance(ips, str) else []
+    if action == "remove":
+        rm = set(ips)
+        return [i for i in current_ips if i not in rm]
+    out = list(current_ips)
+    for i in ips:
+        if i not in out:
+            out.append(i)
+    return out
+
+
+def routing_apply(hosts=None, *, action="add", ips=None, ip_action="add",
+                  adopt=False, outbound=DEFAULT_ROUTING_OUTBOUND,
                   config_path=None, state_path=None, runner=None,
                   port_checker=None):
-    """Применить изменение routing-доменов в production xray-config + restart xray (two-phase).
+    """Применить изменение routing-матчеров (домены и/или ip) production xray-config + restart xray.
+
+    Домены и ip живут в ОДНОМ managed-правиле (xray: domain OR ip) — инвариант
+    «ровно одно managed-правило» не нарушается. hosts/ips=None → соответствующий состав
+    не трогается; оба None → no-op. ip-состав хранится в state (routing.active_ips),
+    расширенный hash покрывает оба состава (legacy-совместим: без ip хеш = старому).
+    Валидация ip строгая (ipaddress), отказ — до любых мутаций.
 
     Hybrid adopt: foreign-config без маркера → требует adopt=True (захватить секцию). После adopt
     rule помечается _srouter_managed, домены + hash пишутся в state. Locate по маркеру, не по tag
@@ -99,6 +144,11 @@ def routing_apply(hosts, *, action="add", adopt=False, outbound=DEFAULT_ROUTING_
 
     Возвращает {ok, changed, err}. Не бросает (fail-soft как sync_route_ip_from_xray).
     """
+    # Строгая валидация ip ДО входа в транзакцию (fail-closed: невалидный ввод не должен
+    # даже открывать lockfile/читать конфиг — отказ без побочных эффектов).
+    err = _validate_ips(ips)
+    if err:
+        return {"ok": False, "changed": False, "err": err}
     # config_path=None (default) резолвится тут, а не в сигнатуре: local_state.XRAY_CONFIG_PATH
     # определён в local_state_xray, который facade собирает ПОСЛЕ этого модуля — default-параметр,
     # вычисляемый на момент импорта, поймал бы partially-initialized module (circular import).
@@ -120,7 +170,7 @@ def routing_apply(hosts, *, action="add", adopt=False, outbound=DEFAULT_ROUTING_
         with local_state._routing_config_lock(config_path):
             return _routing_apply_locked(
                 config_path, state_path, outbound, hosts, action, adopt, runner, port_checker,
-                install_lib,
+                install_lib, ips, ip_action,
             )
     except OSError:
         # lockfile не создался/не открылся — fail-closed: не мутируем config без сериализации.
@@ -128,7 +178,7 @@ def routing_apply(hosts, *, action="add", adopt=False, outbound=DEFAULT_ROUTING_
 
 
 def _routing_apply_locked(config_path, state_path, outbound, hosts, action, adopt, runner,
-                          port_checker, install_lib):
+                          port_checker, install_lib, ips=None, ip_action="add"):
     """Шаги 1..6 routing_apply под _routing_config_lock. Вынесено, чтобы lock держался от чтения
     config до завершения restart/recovery (включая все stale-snapshot-чувствительные шаги).
 
@@ -169,6 +219,7 @@ def _routing_apply_locked(config_path, state_path, outbound, hosts, action, adop
 
     rule = rules[idx]
     current_domains = list(rule.get("domain") or [])
+    current_ips = list(rule.get("ip") or [])
 
     # 2. читать state ОДИН раз здесь (readable проверяем всегда, drift — только когда есть с чем
     #    сравнивать). Битый существующий state-файл → fail-closed ДО любых мутаций конфига: не смеем
@@ -184,11 +235,12 @@ def _routing_apply_locked(config_path, state_path, outbound, hosts, action, adop
     if adopt is False or rule.get(ROUTING_MARKER) is True:
         rt = state.get("routing") if isinstance(state.get("routing"), dict) else {}
         stored_hash = rt.get("last_applied_hash")
-        if stored_hash and _routing_domains_hash(current_domains) != stored_hash:
+        if stored_hash and _routing_domains_hash(current_domains, current_ips) != stored_hash:
             return {"ok": False, "changed": False, "err": "hash_drift_config_changed_externally"}
 
     new_domains = routing_plan(current_domains, hosts, action=action)
-    if new_domains == current_domains:
+    new_ips = routing_plan_ips(current_ips, ips, action=ip_action)
+    if new_domains == current_domains and new_ips == current_ips:
         return {"ok": True, "changed": False, "err": ""}  # idempotent, restart не нужен
 
     # 3. backup (two-phase: восстановим при ошибке restart) — читаем СВЕЖИЙ config под lock.
@@ -204,6 +256,10 @@ def _routing_apply_locked(config_path, state_path, outbound, hosts, action, adop
     # 4. modify rule in-place copy + atomic write (tmp+fsync+replace — единый _atomic_write_text)
     new_rule = dict(rule)
     new_rule["domain"] = new_domains
+    if new_ips:
+        new_rule["ip"] = new_ips
+    else:
+        new_rule.pop("ip", None)  # пустой ip-состав = каноническое правило без ключа
     new_rule[ROUTING_MARKER] = True
     new_rules = list(rules)
     new_rules[idx] = new_rule
@@ -220,8 +276,9 @@ def _routing_apply_locked(config_path, state_path, outbound, hosts, action, adop
         if not isinstance(state.get("routing"), dict):
             state["routing"] = {}
         state["routing"]["active"] = new_domains
+        state["routing"]["active_ips"] = new_ips
         state["routing"]["outbound"] = outbound
-        state["routing"]["last_applied_hash"] = _routing_domains_hash(new_domains)
+        state["routing"]["last_applied_hash"] = _routing_domains_hash(new_domains, new_ips)
         state_write_ok = local_state.save_state(state, state_path) is not None
     except (OSError, ValueError, TypeError):
         # OSError: ошибки записи; ValueError: ошибки структуры; TypeError: ошибки типа данных

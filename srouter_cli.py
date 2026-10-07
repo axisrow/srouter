@@ -1118,35 +1118,47 @@ def cmd_routing(args) -> int:
         print(f"routing ({outbound}) {'[managed by srouter]' if managed else '[foreign]'}:")
         for d in domains:
             print(f"  {d}")
+        for i in _read_routing_ips(args.xray_config, outbound) or []:
+            print(f"  ip {i}")
         return 0
 
-    if subcmd not in ("add-domain", "remove-domain"):
+    if subcmd not in ("add-domain", "remove-domain", "add-ip", "remove-ip"):
         print(f"routing: неизвестная подкоманда {subcmd!r}", file=sys.stderr)
         return 2
 
-    host = args.host
-    action = "add" if subcmd == "add-domain" else "remove"
+    is_ip = subcmd in ("add-ip", "remove-ip")
+    action = "add" if subcmd in ("add-domain", "add-ip") else "remove"
     adopt = getattr(args, "adopt", False)
     if not adopt and not sys.stdin.isatty():
         # non-TTY без --adopt: не виснуть на промпте (канон cmd_install TTY-gate)
         pass  # routing_apply сам вернёт err=foreign_config_needs_adopt без adopt
     runner = make_privileged_runner(run)
-    r = local_state.routing_apply(
-        [host], action=action, adopt=adopt, outbound=outbound,
-        config_path=args.xray_config, state_path=state_path,
-        runner=runner, port_checker=port_open,
-    )
+    if is_ip:
+        # ip-matchers живут в том же managed-правиле, что и домены; доменный состав не трогается
+        label = ", ".join(args.ips)
+        r = local_state.routing_apply(
+            None, ips=list(args.ips), ip_action=action, adopt=adopt, outbound=outbound,
+            config_path=args.xray_config, state_path=state_path,
+            runner=runner, port_checker=port_open,
+        )
+    else:
+        label = args.host
+        r = local_state.routing_apply(
+            [args.host], action=action, adopt=adopt, outbound=outbound,
+            config_path=args.xray_config, state_path=state_path,
+            runner=runner, port_checker=port_open,
+        )
     if not r["ok"]:
-        print(f"routing {subcmd} {host}: {r.get('err', 'failed')}", file=sys.stderr)
+        print(f"routing {subcmd} {label}: {r.get('err', 'failed')}", file=sys.stderr)
         if r.get("err") == "foreign_config_needs_adopt":
             print("  (первый раз: добавь --adopt, чтобы srouter принял секцию reality-out "
                   "под управление — домены существующего rule сохранятся)", file=sys.stderr)
         return 2
     verb = "добавлен" if action == "add" else "убран"
     if r.get("changed"):
-        print(f"routing: {host} {verb}, xray перезапущен.")
+        print(f"routing: {label} {verb}, xray перезапущен.")
     else:
-        print(f"routing: {host} уже в нужном состоянии (no-op).")
+        print(f"routing: {label} уже в нужном состоянии (no-op).")
     return 0
 
 
@@ -1159,6 +1171,22 @@ def _read_routing_domains(config_path, outbound):
         for r in (data.get("routing") or {}).get("rules") or []:
             if isinstance(r, dict) and r.get("outboundTag") == outbound and isinstance(r.get("domain"), list):
                 return r["domain"]
+    except (OSError, json.JSONDecodeError, ValueError, TypeError, KeyError):
+        # JSON операции + словари → OSError, json.JSONDecodeError, ValueError, TypeError, KeyError
+        return None
+    return None
+
+
+def _read_routing_ips(config_path, outbound):
+    """Текущие ip[] того же rule (domain-состав без ip → пустой список; rule не найден → None)."""
+    try:
+        import json as _json
+        from pathlib import Path
+        data = _json.loads(Path(config_path).read_text(encoding="utf-8"))
+        for r in (data.get("routing") or {}).get("rules") or []:
+            if isinstance(r, dict) and r.get("outboundTag") == outbound and isinstance(r.get("domain"), list):
+                ips = r.get("ip")
+                return list(ips) if isinstance(ips, list) else []
     except (OSError, json.JSONDecodeError, ValueError, TypeError, KeyError):
         # JSON операции + словари → OSError, json.JSONDecodeError, ValueError, TypeError, KeyError
         return None
@@ -1345,12 +1373,14 @@ def build_parser() -> argparse.ArgumentParser:
     # свои sub-subcommands (add-domain/remove-domain/list). НЕ "route" (конфликт с split-route).
     p_route = sub.add_parser(
         "routing",
-        help="Управление routing-доменами xray (add-domain/remove-domain/list). #136.")
+        help="Управление routing-доменами/ip xray (add-domain/remove-domain/add-ip/remove-ip/list). #136.")
     p_route_sub = p_route.add_subparsers(dest="routing_subcommand", required=True)
     for sub_name, sub_help in (
         ("add-domain", "Добавить домен в проксируемые (первый раз — --adopt)."),
         ("remove-domain", "Убрать домен из проксируемых."),
-        ("list", "Показать текущие routing-домены (read-only)."),
+        ("add-ip", "Добавить ip/CIDR в то же managed-правило (напр. Hetzner-узел для ssh)."),
+        ("remove-ip", "Убрать ip/CIDR из managed-правила."),
+        ("list", "Показать текущие routing-домены и ip (read-only)."),
     ):
         sp = p_route_sub.add_parser(sub_name, help=sub_help)
         sp.add_argument("--outbound", default=None,
@@ -1363,6 +1393,10 @@ def build_parser() -> argparse.ArgumentParser:
             sp.add_argument("--adopt", action="store_true",
                             help="Принять секцию reality-out под управление (первый раз). "
                                  "Существующие домены сохраняются, добавляется маркер _srouter_managed.")
+        elif sub_name in ("add-ip", "remove-ip"):
+            sp.add_argument("ips", nargs="+", metavar="IP", help="IP или CIDR (напр. 78.47.183.125).")
+            sp.add_argument("--adopt", action="store_true",
+                            help="Принять секцию reality-out под управление (первый раз).")
         sp.set_defaults(func=cmd_routing)
 
     # privoxy (#122): статус read-only; любые мутации идут через root-owned helper и свежий sudo.
