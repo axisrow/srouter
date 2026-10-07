@@ -85,18 +85,39 @@ def _routing_domains_hash(domains, ips=None):
     return hashlib.sha256(ordered.encode("utf-8")).hexdigest()[:16]
 
 
-def _validate_ips(ips):
-    """Строгий валидатор ip-matchers: IP или CIDR (v4/v6) через stdlib ipaddress.
-
-    geoip:-префиксы, хостнеймы и мусор отвергаются (loose-validator = утечка).
-    Возвращает строку ошибки 'invalid_ip:<v>' или None."""
+def _normalize_ip(value):
+    """Каноническая форма ip-матчера: /32 и /128 → голый адрес, прочие CIDR — канонический
+    текст (host-bit «10.9.8.7/24» → «10.9.8.0/24»). /0 (match-all) и непарсящееся → None
+    (трактовка «/00» как 0.0.0.0/0 — тот же loose-validator класс, отказ до записи в конфиг).
+    Голый адрес хранится без префикса — байт-стабильно для существующих state/конфигов."""
     import ipaddress
-    for v in ips or []:
+    net = ipaddress.ip_network(str(value), strict=False)
+    if net.prefixlen == 0:
+        return None
+    if net.prefixlen == net.max_prefixlen:
+        return str(net.network_address)
+    return str(net)
+
+
+def _normalize_ip_list(values):
+    """Строгая канонизация ip-списка (вход routing_apply и чтение ip[] из конфига — ОДИН
+    валидатор, чтобы формы не расходились). values — list; элементы — только str.
+    Возвращает (канонический список, ""). При любом нарушении — (None, "invalid_ip…"):
+    fail-soft отказ вместо TypeError/чар-сплита (loose-validator = утечка)."""
+    if not isinstance(values, list):
+        return None, "invalid_ips_container"
+    out = []
+    for v in values:
+        if not isinstance(v, str):
+            return None, f"invalid_ip:{v}"
         try:
-            ipaddress.ip_network(str(v), strict=False)
+            canon = _normalize_ip(v)
         except ValueError:
-            return f"invalid_ip:{v}"
-    return None
+            return None, f"invalid_ip:{v}"
+        if canon is None:
+            return None, f"invalid_ip:{v}"
+        out.append(canon)
+    return out, ""
 
 
 def routing_plan_ips(current_ips, ips, action="add"):
@@ -144,11 +165,14 @@ def routing_apply(hosts=None, *, action="add", ips=None, ip_action="add",
 
     Возвращает {ok, changed, err}. Не бросает (fail-soft как sync_route_ip_from_xray).
     """
-    # Строгая валидация ip ДО входа в транзакцию (fail-closed: невалидный ввод не должен
-    # даже открывать lockfile/читать конфиг — отказ без побочных эффектов).
-    err = _validate_ips(ips)
-    if err:
-        return {"ok": False, "changed": False, "err": err}
+    # Строгая канонизация входа ДО входа в транзакцию (fail-closed: невалидный ввод не должен
+    # даже открывать lockfile/читать конфиг — отказ без побочных эффектов). Только list-of-str;
+    # ips=None → ip-состав не трогается.
+    norm_ips = None
+    if ips is not None:
+        norm_ips, err = _normalize_ip_list(ips)
+        if err:
+            return {"ok": False, "changed": False, "err": err}
     # config_path=None (default) резолвится тут, а не в сигнатуре: local_state.XRAY_CONFIG_PATH
     # определён в local_state_xray, который facade собирает ПОСЛЕ этого модуля — default-параметр,
     # вычисляемый на момент импорта, поймал бы partially-initialized module (circular import).
@@ -170,7 +194,7 @@ def routing_apply(hosts=None, *, action="add", ips=None, ip_action="add",
         with local_state._routing_config_lock(config_path):
             return _routing_apply_locked(
                 config_path, state_path, outbound, hosts, action, adopt, runner, port_checker,
-                install_lib, ips, ip_action,
+                install_lib, norm_ips, ip_action,
             )
     except OSError:
         # lockfile не создался/не открылся — fail-closed: не мутируем config без сериализации.
@@ -219,7 +243,18 @@ def _routing_apply_locked(config_path, state_path, outbound, hosts, action, adop
 
     rule = rules[idx]
     current_domains = list(rule.get("domain") or [])
-    current_ips = list(rule.get("ip") or [])
+    # ip[] читаем со сторожем: конфиг hand-managed (adopt-режим) — там может лежать скаляр
+    # или не-строки (int ipaddress парсит — путаница естественна). Без стража: sorted/join
+    # ловит TypeError вне fail-soft контракта, либо чар-сплит строки уходит в hash/конфиг.
+    raw_ip = rule.get("ip")
+    if raw_ip is None:
+        current_ips = []
+    elif isinstance(raw_ip, list):
+        current_ips, ip_err = _normalize_ip_list(raw_ip)
+        if ip_err:
+            return {"ok": False, "changed": False, "err": ip_err}
+    else:
+        return {"ok": False, "changed": False, "err": "invalid_ip_field:not_a_list"}
 
     # 2. читать state ОДИН раз здесь (readable проверяем всегда, drift — только когда есть с чем
     #    сравнивать). Битый существующий state-файл → fail-closed ДО любых мутаций конфига: не смеем

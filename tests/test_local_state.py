@@ -1033,6 +1033,139 @@ def test_routing_apply_domain_and_ip_one_transaction(tmp_path):
     assert len(starts) == 1, "оба изменения — один restart"
 
 
+def test_routing_apply_config_ip_field_malformed_refused(tmp_path):
+    """Рукописный конфиг с не-строками в ip[] (int парсится ipaddress'ом — путаница естественна):
+    fail-soft отказ invalid_ip, НЕ TypeError вне контракта, конфиг не тронут, restart не звался."""
+    xray_p = tmp_path / "xray-config.json"
+    state_p = tmp_path / "srouter.local.json"
+    _write_xray_routing_config(xray_p, BASELINE_DOMAINS, managed=True)
+    _managed_state(state_p, BASELINE_DOMAINS)
+    # руками портим ip-состав правила: голый int и None
+    cfg = json.loads(xray_p.read_text(encoding="utf-8"))
+    cfg["routing"]["rules"][0]["ip"] = [3232235777, None]
+    xray_p.write_text(json.dumps(cfg), encoding="utf-8")
+    calls = []
+    for op in (
+        {"ips": ["78.47.183.125"], "ip_action": "add"},
+        {"ips": None},
+    ):
+        kw = dict(config_path=str(xray_p), state_path=state_p, runner=_ok_runner(calls),
+                  port_checker=_port_checker_settle_then_up())
+        kw.update(op)
+        r = local_state.routing_apply(None, **kw)
+        assert r["ok"] is False, op
+        assert "invalid_ip" in r.get("err", ""), op
+    assert calls == []  # ни одного restart — отказ до мутаций
+
+
+def test_routing_apply_config_ip_scalar_refused(tmp_path):
+    """Скалярная строка в ip (опечатка уровня «кавычки забыли») — отказ invalid_ip_field,
+    а не чар-сплит «78.47...» на 13 однобуквенных матчеров (hash-яд/конфиг-мусор)."""
+    xray_p = tmp_path / "xray-config.json"
+    state_p = tmp_path / "srouter.local.json"
+    _write_xray_routing_config(xray_p, BASELINE_DOMAINS, managed=True)
+    _managed_state(state_p, BASELINE_DOMAINS)
+    cfg = json.loads(xray_p.read_text(encoding="utf-8"))
+    cfg["routing"]["rules"][0]["ip"] = "78.47.183.125"
+    xray_p.write_text(json.dumps(cfg), encoding="utf-8")
+    calls = []
+    r = local_state.routing_apply(
+        None, ips=["78.47.183.125"], ip_action="add",
+        config_path=str(xray_p), state_path=state_p, runner=_ok_runner(calls),
+        port_checker=_port_checker_settle_then_up(),
+    )
+    assert r["ok"] is False
+    assert "invalid_ip_field" in r.get("err", "")
+    assert calls == []
+
+
+def test_routing_apply_ips_container_shape_refused(tmp_path):
+    """Программный вызов с не-list контейнером (строка/кортеж) — отказ invalid_ips_container:
+    валидатор и планировщик не должны расходиться в принятых формах (per-char «валидация»
+    строки даёт бессмысленный invalid_ip:7; кортеж молча превращался в no-op)."""
+    xray_p = tmp_path / "xray-config.json"
+    state_p = tmp_path / "srouter.local.json"
+    _write_xray_routing_config(xray_p, BASELINE_DOMAINS, managed=True)
+    _managed_state(state_p, BASELINE_DOMAINS)
+    calls = []
+    for bad in ("78.47.183.125", ("1.2.3.4",)):
+        r = local_state.routing_apply(
+            None, ips=bad, ip_action="add",
+            config_path=str(xray_p), state_path=state_p, runner=_ok_runner(calls),
+            port_checker=_port_checker_settle_then_up(),
+        )
+        assert r["ok"] is False, bad
+        assert "invalid_ips_container" in r.get("err", ""), bad
+    assert calls == []
+
+
+def test_routing_apply_rejects_match_all_cidr(tmp_path):
+    """/0 (match-all) и его опечатки («/00» парсится как 0.0.0.0/0) — отказ: правка «завернуть
+    ВСЁ в прокси» не должна проходить одной командой; отказ и на входе, и в рукописном конфиге."""
+    xray_p = tmp_path / "xray-config.json"
+    state_p = tmp_path / "srouter.local.json"
+    _write_xray_routing_config(xray_p, BASELINE_DOMAINS, managed=True)
+    _managed_state(state_p, BASELINE_DOMAINS)
+    calls = []
+    for bad in ("0.0.0.0/0", "1.2.3.4/00", "::/0"):
+        r = local_state.routing_apply(
+            None, ips=[bad], ip_action="add",
+            config_path=str(xray_p), state_path=state_p, runner=_ok_runner(calls),
+            port_checker=_port_checker_settle_then_up(),
+        )
+        assert r["ok"] is False, bad
+        assert "invalid_ip" in r.get("err", ""), bad
+    # и в конфиге (руками вписали /00) → отказ до мутаций
+    cfg = json.loads(xray_p.read_text(encoding="utf-8"))
+    cfg["routing"]["rules"][0]["ip"] = ["10.0.0.0/00"]
+    xray_p.write_text(json.dumps(cfg), encoding="utf-8")
+    r = local_state.routing_apply(
+        ["domain:telegram.org"], action="add",
+        config_path=str(xray_p), state_path=state_p, runner=_ok_runner(calls),
+        port_checker=_port_checker_settle_then_up(),
+    )
+    assert r["ok"] is False
+    assert "invalid_ip" in r.get("err", "")
+    assert calls == []
+
+
+def test_routing_add_ip_canonicalizes_and_remove_symmetric(tmp_path):
+    """Канонизация: /32 хранится как голый адрес (host-bit /24 → сетевой CIDR), эквивалентные
+    написания невидимы друг для друга НЕ становятся: remove в другом написании находит матчер."""
+    xray_p = tmp_path / "xray-config.json"
+    state_p = tmp_path / "srouter.local.json"
+    _write_xray_routing_config(xray_p, BASELINE_DOMAINS, managed=True, ips=["78.47.183.125"])
+    _managed_state(state_p, BASELINE_DOMAINS, ips=["78.47.183.125"])
+    calls = []
+    # add в /32-написании → идемпотентно к голому 78.47.183.125 (no-op, не дубль)
+    r = local_state.routing_apply(
+        None, ips=["78.47.183.125/32"], ip_action="add",
+        config_path=str(xray_p), state_path=state_p, runner=_ok_runner(calls),
+        port_checker=_port_checker_settle_then_up(),
+    )
+    assert r["ok"] is True and r["changed"] is False, r
+    # host-bit /24 канонизуется в сетевой CIDR
+    r = local_state.routing_apply(
+        None, ips=["10.9.8.7/24"], ip_action="add",
+        config_path=str(xray_p), state_path=state_p, runner=_ok_runner(calls),
+        port_checker=_port_checker_settle_then_up(),
+    )
+    assert r["ok"] is True and r["changed"] is True, r
+    cfg = json.loads(xray_p.read_text(encoding="utf-8"))
+    managed = [x for x in cfg["routing"]["rules"] if x.get("_srouter_managed") is True]
+    assert managed[0]["ip"] == ["78.47.183.125", "10.9.8.0/24"], managed[0]["ip"]
+    # remove в эквивалентном написании находит и убирает
+    r = local_state.routing_apply(
+        None, ips=["10.9.8.100/24"], ip_action="remove",
+        config_path=str(xray_p), state_path=state_p, runner=_ok_runner(calls),
+        port_checker=_port_checker_settle_then_up(),
+    )
+    assert r["ok"] is True and r["changed"] is True, r
+    cfg = json.loads(xray_p.read_text(encoding="utf-8"))
+    managed = [x for x in cfg["routing"]["rules"] if x.get("_srouter_managed") is True]
+    assert managed[0]["ip"] == ["78.47.183.125"], managed[0]["ip"]
+
+
 def test_routing_apply_hash_drift_refuses(tmp_path):
     """Конфиг меняли руками после нашего apply (hash ≠ state) → refuse, не затереть чужие правки."""
     xray_p = tmp_path / "xray-config.json"
