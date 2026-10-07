@@ -509,7 +509,13 @@ def check_all(*, active_claude=False):
     if cap["status"] == "unknown":
         cap_check["info"] = True
     elif cap["status"] == "warn":
-        cap_check["ok"] = False  # SOCKS5-плечо — degraded (#127), но не «всё мертво»
+        if cap.get("known_limitation"):
+            # mixed (публичный external при рабочем прокси) — известная app-internal утечка
+            # без операторского лечения до PF follow-up: info-only (прецедент
+            # _codex_isolation_check), иначе вечный degraded глушит 503-канал (ревью #404).
+            cap_check["info"] = True
+        else:
+            cap_check["ok"] = False  # SOCKS5-плечо — degraded (#127), лечится wrapper'ом
     checks.append(cap_check)
     # codenv launchd-job (#250): job загружен, но падает (exit != 0) / осиротел (plist удалён) /
     # указывает на несуществующий путь → down DRIVER. Реальный инцидент: 1419 падений подряд в

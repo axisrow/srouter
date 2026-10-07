@@ -86,6 +86,35 @@ def test_down_when_route_direct(monkeypatch):
     assert "claude-app" in res["detail"].lower(), f"рецепт — wrapper ~/bin/claude-app; got {res}"
 
 
+def test_mixed_marks_known_limitation_and_names_shoulder(monkeypatch):
+    """Ревью #404 (CONFIRMED): mixed — известная граница без операторского лечения до PF
+    follow-up → info-only (прецедент _codex_isolation_check), иначе вечный degraded на
+    рабочей wrapper-машине (503 /health, #315-осцилляция). Плюс: detail называет
+    ФАКТИЧЕСКОЕ плечо — при socks-only миксе «privoxy 8118» был ложным диагнозом."""
+    ps = f"83907 {APP_CLAUDE_COMM}\n"
+    lsof = (_lsof_proxied("83912", "127.0.0.1:10808")
+            + "Claude 83907 axisrow 122u IPv4 0xABC 0t0 "
+              "TCP 10.1.0.73:56201->160.79.104.10:443 (ESTABLISHED)\n")
+    monkeypatch.setattr(health.sys_probe, "run", _fake(ps, lsof))
+    res = health._claude_app_proxy_check()
+    assert res["status"] == "warn", f"mixed → warn; got {res}"
+    assert res.get("known_limitation") is True, f"mixed = known limitation (info-only); got {res}"
+    assert "10808" in res["detail"], f"detail называет фактическое плечо (SOCKS5); got {res}"
+
+
+def test_external_private_dst_is_not_down(monkeypatch):
+    """Ревью #404 (CONFIRMED): [::1]/LAN назначения — не GFW-путь; down должен считать
+    только ПУБЛИЧНЫЕ external-сокеты, иначе ложный down на здоровой машине (idle-окно
+    webview + локальный [::1]-сокет = «Claude.app НАПРЯМУЮ» на ровном месте)."""
+    ps = f"83907 {APP_CLAUDE_COMM}\n"
+    lsof = ("Claude 83907 axisrow 130u IPv6 0xABC 0t0 "
+            "TCP [::1]:5000->[::1]:5001 (ESTABLISHED)\n")
+    monkeypatch.setattr(health.sys_probe, "run", _fake(ps, lsof))
+    res = health._claude_app_proxy_check()
+    assert res["status"] == "unknown", \
+        f"только приватные сокеты (нет proxied/public) → unknown, не down; got {res}"
+
+
 def test_unknown_when_lsof_timeout(monkeypatch):
     ps = f"83907 {APP_CLAUDE_COMM}\n"
     monkeypatch.setattr(health.sys_probe, "run", _fake(ps, lsof_timeout=True))

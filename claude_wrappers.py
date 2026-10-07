@@ -15,17 +15,19 @@ from pathlib import Path
 
 from install_lib import _write_text_atomic, load_known_markers
 
-# Плечо — единый источник правды (канон issue-155: порты/URL из dashboard_common).
+# Плечо + NO_PROXY — единые источники правды (канон issue-155; ревью #404: NO_PROXY был
+# байт-в-байт дубликатом CODEX_NO_PROXY — эволюция z.ai-политики разошлась бы тихо).
 # except BaseException: dashboard_common raise SystemExit при отсутствии srouter_config.py,
 # а SystemExit не ловится Exception — fallback обязан сработать и для него (канон codex_wrappers).
 try:
-    from dashboard_common import HTTP_PROXY_URL as _PROXY_URL
+    from dashboard_common import HTTP_PROXY_URL as _PROXY_URL, GUI_NO_PROXY as _GUI_NO_PROXY
 except BaseException:
     _PROXY_URL = "http://127.0.0.1:8118"
+    _GUI_NO_PROXY = "localhost,127.0.0.1,::1,z.ai,.z.ai"
 
 # NO_PROXY: loopback (локальные сервисы) + z.ai,.z.ai — z.ai НЕ за GFW, всегда напрямую
-# (канон zai-direct-no-proxy; две границы — две константы, route-scope-not-shared-validator).
-CLAUDE_NO_PROXY = "localhost,127.0.0.1,::1,z.ai,.z.ai"
+# (канон zai-direct-no-proxy). Публичное имя модуля, значение — из единого источника.
+CLAUDE_NO_PROXY = _GUI_NO_PROXY
 
 CLAUDE_APP_WRAPPER_NAME = "claude-app"
 # Маркер current-версии (идентифицирует «srouter-managed claude-app wrapper», не имя файла —
