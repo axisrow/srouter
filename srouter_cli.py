@@ -95,7 +95,6 @@ from codex_wrappers import (
     CODEX_CLI_WRAPPER_NAME,  # noqa: F401 — публичный контракт srouter
     CODEX_ENV_LABEL,  # noqa: F401 — публичный контракт srouter
     CODEX_ENV_MARKER,
-    CODEX_LAUNCHCTL_ENV,  # noqa: F401 — публичный контракт srouter
     CODEX_LAUNCHCTL_UNSET_KEYS,  # noqa: F401 — публичный контракт srouter
     CODEX_NO_PROXY,  # noqa: F401 — публичный контракт srouter
     CODEX_NO_PROXY_LOOPBACK,  # noqa: F401 — публичный контракт srouter
@@ -241,8 +240,11 @@ def cmd_install(args) -> int:
         # Rust-бинарником — ДВА стека. Chromium-оболочка уважает СИСТЕМНЫЙ SOCKS (scutil) — работает.
         # Rust app-server (/Resources/codex, основной WS к wss://chatgpt.com) НЕ уважает системный SOCKS,
         # берёт ТОЛЬКО env SOCKS5 → без env идёт напрямую → GFW рвёт (error_kind=TimedOut в logs_2.sqlite).
-        # config.toml [network] proxy_url МЁРТВ в codex 0.146. Единственный путь для Rust app-server =
-        # env SOCKS5 в launchd gui-домене → codenv (RunAtLoad + StartInterval=300, переживает ребут).
+        # config.toml [network] proxy_url МЁРТВ в codex 0.146. Исторически (до контракта
+        # 2026-10-07) единственный путь для Rust app-server = env SOCKS5 в launchd gui-домене →
+        # codenv (RunAtLoad + StartInterval=300, переживает ребут). Сейчас ambient-прокси в
+        # gui-домен не сеется (контракт: агент — только residual-чистка), прокси App задаётся
+        # точечно — ~/bin/codex-app-proxy (--proxy-server) / per-tool wrappers.
         # РАНЬШЕ (PR #187/#185) codenv деактивировали из-за #130 (CC SOCKS5-несовместимость), НО эмпирика
         # #189 опровергает конфликт: CC CLI читает прокси из ~/.claude/settings.json (claude_proxy.py),
         # НЕ из launchd gui-env → месяц коэкзиста CC+Codex это подтверждает (codenv был загружен весь месяц).

@@ -431,15 +431,17 @@ def _assert_shell_proxy_endpoints_follow_canonical(script_rel, expected_port_map
             )
 
 
-def test_launchagent_codex_env_follows_canonical_privoxy_port():
-    """srouter-codex-env.sh выставляет GUI env PROXY=privoxy (issue #340): scheme-ключи =
-    http://127.0.0.1:PRIVOXY_PORT — терминальное плечо (pip/requests), не socks5h (#331/#340:
-    socks в scheme-ключах gui-домена ломает pip — select_proxy берёт scheme-ключ раньше 'all').
-    Shell не импортирует Python — parity-гвард против dashboard_common.PRIVOXY_PORT."""
-    _assert_shell_proxy_endpoints_follow_canonical(
-        "launchagents/srouter-codex-env.sh",
-        {"PROXY": dashboard_common.PRIVOXY_PORT},
-    )
+def test_launchagent_codex_env_seeds_no_proxy_endpoints():
+    """Контракт маршрутизации 2026-10-07: srouter-codex-env.sh НЕ сеет прокси-плечи в gui-домен
+    (ambient env-прокси запрещён; прежний тест #340 требовал privoxy:PRIVOXY_PORT — контракт
+    сменился). Shell не импортирует Python — гвардим отсутствие ЛЮБЫХ endpoint-литералов."""
+    script = Path(__file__).resolve().parent.parent / "launchagents" / "srouter-codex-env.sh"
+    code = "\n".join(ln for ln in script.read_text(encoding="utf-8").splitlines()
+                     if not ln.lstrip().startswith("#"))
+    assert str(dashboard_common.PRIVOXY_PORT) not in code, \
+        f"privoxy-порт в скрипте = посев прокси-плеча (нарушение контракта): {code}"
+    assert "socks5h" not in code and "socks5" not in code, \
+        f"socks-плечо в скрипте = посев прокси (нарушение контракта): {code}"
 
 
 def test_launchagent_codex_app_wrapper_follows_canonical_socks_port():

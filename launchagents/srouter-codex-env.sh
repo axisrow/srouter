@@ -1,69 +1,30 @@
 #!/bin/sh
-# srouter: глобальный env для GUI-приложений через launchctl setenv (issue #340).
+# srouter: контракт маршрутизации 2026-10-07 — ambient env-прокси НЕ сеется ни в один слой.
 #
-# Запускается LaunchAgent com.srouter.codenv (RunAtLoad + каждые ~5мин, переживает ребут).
-# launchctl setenv кладёт переменные в caller-context (man launchctl). Этот скрипт запускается
-# launchd ВНУТРИ gui-домена → caller-context = gui → переменные попадают в gui-домен (видят все
-# GUI-приложения). Поэтому setenv ЗДЕСЬ — БЕЗ домена намеренно: `setenv gui/<uid> ...` даёт rc=64
-# (usage error) — доменный таргет setenv не принимает. Симметрия: uninstall (_remove_launchctl_env)
-# делает `unsetenv gui/<uid> <key>` с ЯВНЫМ доменом (он бежит из процесса cmd_uninstall, чей
-# caller-context может быть user/<uid> из SSH/cron — issue #94 DEFECT A).
+# Единый источник whitelist — srouter.local.json (routing.active/active_ips): через туннель
+# ходит только явно попросившее (xray-правила, srouter git-proxy, per-tool wrappers, curl -x),
+# всё остальное — напрямую. История: раньше этот скрипт ставил HTTP(S)_PROXY=privoxy 8118 в
+# gui-домен launchd (issue #340, fail-closed «нет прямого egress»; до того — socks5h:10808 во
+# всех ключах, ломавший pip/requests через SOCKSProxyManager, #331/#340). Контракт сменился
+# осознанно: ложные «прямые» пробы диагностики (sub-ms time_connect до удалённого хоста),
+# рестарт xray рвал TLS чужого не-туннельного трафика, privoxy — SPOF сессий.
 #
-# #331/#340: scheme-ключи (HTTP(S)_PROXY, оба регистра) = privoxy 8118 — ТЕРМИНАЛЬНОЕ плечо.
-# Раньше здесь стоял socks5h:10808 во ВСЕХ ключах, включая ALL_PROXY: каждый GUI-терминал
-# наследовал socks5h, requests/pip через select_proxy берут scheme-ключ РАНЬШЕ 'all' →
-# SOCKSProxyManager → TypeError PoolKey key_proxy_ssl_context на любом сетевом запросе (#340;
-# удаление одного ALL_PROXY не помогло бы — socks5h в HTTPS_PROXY ломает так же). privoxy-http —
-# рабочее прокси-плечо (privoxy→xray): pip в свежем терминале работает, прямой egress по-прежнему
-# отсутствует (fail-closed, канон fail-closed-proxy-down). ALL_PROXY/all_proxy БОЛЬШЕ НЕ СТАВЯТСЯ:
-# reqwest (Codex Rust app-server) тоже берёт scheme-ключ раньше 'all' (src/proxy.rs «Overwritten
-# by the more specific HTTP_PROXY») → 'all'-ключ избыточен для потребителя; текущий app-server
-# к тому же спавнится ChatGPT.app с санитизованным env без прокси-переменных (ps eww, #340) —
-# gui-домен до него не доходит. CLI-codex wrapper'ы (~/bin/codex-srouter) продолжают ходить через
-# socks5h:10808 ТОЧЕЧНО (privoxy рвёт их WS, #120) — этот скрипт к ним не относится.
+# Роль скрипта теперь — ГАРАНТИРОВАННАЯ чистка residual-ключей в gui-домене. launchctl setenv
+# не ретроактивен и не снимает то, чего не ставит: старые версии этого скрипта сеяли socks5h
+# ALL_PROXY/all_proxy (#331/#340) и privoxy 8118 scheme-ключи — без явного unsetenv residual
+# жил бы в gui-домене вечно и молча заворачивал GUI/терминальный трафик в цепочку. Периодичность
+# агента (RunAtLoad + 300с) превращает чистку в инвариант: что бы ни вписало сторонее ПО в
+# gui-домен, в течение 5 минут прокси-ключи вычищены. Список ключей = CODEX_LAUNCHCTL_UNSET_KEYS
+# (codex_wrappers.py) — тот же список итерирует uninstall; паритет гвардится
+# tests/test_codex_env_contract.py (ревью #403: NO_PROXY/no_proxy тоже сеялись до контракта —
+# динамический NO_PROXY #197, — и без unsetenv residual жил бы в gui-домене вечно).
 #
-# #197 direct-first: NO_PROXY динамический — direct_first.no_proxy_string() честным прямым
-# TLS-test'ом (мимо прокси) проверяет candidate-домены (z.ai BUILTIN + user direct_domains из
-# srouter.local.json), reachable → в NO_PROXY. Периодичность = этот же LaunchAgent (StartInterval
-# 300с) — отдельный re-check-агент не нужен, GFW-флап подхватывается на следующем прогоне.
-# Скрипт НЕ рендерится при install (запускается in-place из env.root/launchagents/, как
-# health.py у watchdog) — сам резолвит ROOT_DIR через dirname (родитель launchagents/ = env.root),
-# исключая класс багов «плейсхолдер не отрендерен» (PR #189 error 5 регрессия).
-# При сбое Python/detect (сеть недоступна на install, srouter_config.py отсутствует и т.д.) →
-# fallback на BUILTIN (z.ai всегда direct — канон zai-direct-no-proxy, srouter-critical-infra-24-7).
-#
-# ПОРЯДОК КРИТИЧЕН (#197 cycle-review, boot-race): PROXY-переменные + conservative fallback NO_PROXY
-# выставляются СРАЗУ, ДО блокирующего direct_first.no_proxy_string() probe. no_proxy_string() бьёт
-# serial curl per-domain (до MAX_CANDIDATE_DOMAINS × max_time ≈ сотни секунд worst-case); при
-# RunAtLoad на буте launchctl-env пуст — если бы PROXY ставился ПОСЛЕ probe, GUI-процессы,
-# стартующие в окне probe, унаследовали бы отсутствие прокси → прямой egress под GFW (утечка
-# реального IP). launchctl setenv не ретроактивен → уже запущенные не чинятся.
-# Инвариант fail-closed-proxy-down: окно без прокси = 0. probe нужен ТОЛЬКО для NO_PROXY (логически
-# независим от PROXY-vars) → сначала ставим прокси+безопасный NO_PROXY, потом уточняем NO_PROXY.
-ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-PYTHON_BIN="${SROUTER_PYTHON:-/usr/bin/python3}"
-PROXY="http://127.0.0.1:8118"
-FALLBACK_NO_PROXY="localhost,127.0.0.1,::1,z.ai,.z.ai"
-# Статус сбоев launchctl (#340 cycle-review): job-check читает last exit code — «проглотивший»
-# сбой скрипт (rc=0 при провале setenv/unsetenv) выглядит здоровым в launchd, пока gui-домен
-# остаётся с pip-ломающим плечом или вообще без прокси. Накапливаем и отдаём ненулевой exit.
+# Динамический NO_PROXY (#197, direct_first.no_proxy_string) без ambient-прокси инертен —
+# посев снят вместе с serial-curl probe (он же — сотни секунд блокировки worst-case).
+# CLI-codex wrapper'ы (~/bin/codex-srouter) ходят через socks5h:10808 ТОЧЕЧНО (#120) —
+# от gui-домена не зависят, этот скрипт к ним не относится.
 FAIL=0
-# 1) PROXY-переменные + conservative NO_PROXY — НЕМЕДЛЕННО (без сетевого ожидания), fail-closed.
-for key in HTTP_PROXY HTTPS_PROXY http_proxy https_proxy; do
-  launchctl setenv "$key" "$PROXY" || FAIL=1
+for key in HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ALL_PROXY all_proxy NO_PROXY no_proxy; do
+  launchctl unsetenv "$key" || FAIL=1
 done
-launchctl setenv NO_PROXY "$FALLBACK_NO_PROXY" || FAIL=1
-launchctl setenv no_proxy "$FALLBACK_NO_PROXY" || FAIL=1
-# 1b) residual-чистка #331/#340: старые версии этого скрипта ставили ALL_PROXY/all_proxy=socks5h
-#     в gui-домен; launchctl setenv не ретроактивен и не снимает то, чего не ставит → без явного
-#     unsetenv residual socks5h жил бы в gui-домене вечно и продолжал ломать pip/requests.
-launchctl unsetenv ALL_PROXY || FAIL=1
-launchctl unsetenv all_proxy || FAIL=1
-# 2) Динамический NO_PROXY — ПОСЛЕ (блокирующий probe). Обновляет ТОЛЬКО NO_PROXY; PROXY уже стоит.
-#    Пустой результат (Python/detect сбой) → оставляем conservative fallback, уже выставленный выше.
-NO_PROXY="$("$PYTHON_BIN" -c "import sys; sys.path.insert(0, '$ROOT_DIR'); import direct_first; print(direct_first.no_proxy_string())" 2>/dev/null)"
-if [ -n "$NO_PROXY" ]; then
-  launchctl setenv NO_PROXY "$NO_PROXY" || FAIL=1
-  launchctl setenv no_proxy "$NO_PROXY" || FAIL=1
-fi
 exit "$FAIL"

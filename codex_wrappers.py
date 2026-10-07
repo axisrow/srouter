@@ -36,10 +36,8 @@ from install_lib import (
 # srouter_config.py, а SystemExit не ловится Exception — fallback должен сработать и для него.
 try:
     from dashboard_common import SOCKS_PROXY_URL as _CODEX_PROXY_URL
-    from dashboard_common import HTTP_PROXY_URL as _GUI_HTTP_PROXY_URL
 except BaseException:
     _CODEX_PROXY_URL = "socks5h://127.0.0.1:10808"
-    _GUI_HTTP_PROXY_URL = "http://127.0.0.1:8118"
 # NO_PROXY для launchctl-gui env: loopback (Codex→moonbridge на loopback и локальные сервисы)
 # + z.ai,.z.ai (moonbridge→api.z.ai — внешний хост, доступен напрямую мимо SOCKS5/xray/VPS).
 # z.ai НЕ за GFW: при мёртвом VPS (#194) moonbridge-клиент обязан достучаться к api.z.ai напрямую,
@@ -53,23 +51,17 @@ CODEX_NO_PROXY = "localhost,127.0.0.1,::1,z.ai,.z.ai"
 CODEX_NO_PROXY_LOOPBACK = "localhost,127.0.0.1,::1"
 
 _log = logging.getLogger("srouter.codex_wrappers")
-# (env-key, value) — единый список для install/setenv-контракта gui-домена (issue #340).
-# scheme-ключи НЕСУТ privoxy (терминальное плечо #331): socks5h в HTTPS_PROXY/https_proxy делал
-# pip/requests достижимым для SOCKSProxyManager (requests.utils.select_proxy: scheme-ключ раньше
-# 'all') → TypeError PoolKey (#340); privoxy-http — рабочее прокси-плечо, fail-closed сохранён
-# (privoxy→xray, прямого egress нет). ALL_PROXY/all_proxy ИСКЛЮЧЕНЫ: reqwest (Codex Rust
-# app-server) тоже берёт scheme-ключ раньше 'all' (src/proxy.rs «Overwritten by the more
-# specific HTTP_PROXY») → 'all'-ключ в gui-домене избыточен для потребителя и ломает Python.
-# CLI-wrapper'ы (~/bin/codex-srouter) продолжают ставить себе socks5h:10808 ТОЧЕЧНО — privoxy
-# рвёт их WS (#120); gui-домен к ним не относится.
-# Значение нужно только для setenv; uninstall итерирует CODEX_LAUNCHCTL_UNSET_KEYS.
-CODEX_LAUNCHCTL_ENV = tuple((k, _GUI_HTTP_PROXY_URL) for k in
-                            ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")) \
-                      + (("NO_PROXY", CODEX_NO_PROXY), ("no_proxy", CODEX_NO_PROXY))
-# Список ключей ДЛЯ СНЯТИЯ (uninstall + residual-чистка): надмножество SET — включает
-# ALL_PROXY/all_proxy, которые старые версии codenv ставили в gui-домен (#331/#340). setenv не
-# ретроактивен и не снимает то, чего не ставит → «не ставить» ≠ «убрать»: без unsetenv residual
-# socks5h из старой установки жил бы в gui-домене вечно и продолжал ломать pip.
+# SET-список (env-key, value) для gui-домена УДАЛЁН (контракт маршрутизации 2026-10-07):
+# ambient env-прокси не сеется ни в один слой — через туннель ходит только явно попросившее
+# (xray-правила, git per-host, per-tool wrappers, curl -x). Роль LaunchAgent com.srouter.codenv —
+# residual-ЧИСТКА (unsetenv), см. launchagents/srouter-codex-env.sh. История: scheme-ключи несли
+# privoxy (терминальное плечо #331/#340; socks5h ломал pip через SOCKSProxyManager).
+# Список ключей ДЛЯ СНЯТИЯ (uninstall + residual-чистка, единый со скриптом — паритет гвардит
+# tests/test_codex_env_contract.py): scheme-ключи + ALL_PROXY/all_proxy, которые старые версии
+# codenv ставили в gui-домен (#331/#340), + NO_PROXY/no_proxy (динамический посев #197, снят
+# вместе с ambient). setenv не ретроактивен и не снимает то, чего не ставит → «не ставить» ≠
+# «убрать»: без unsetenv residual из старой установки жил бы в gui-домене вечно и продолжал
+# ломать pip.
 CODEX_LAUNCHCTL_UNSET_KEYS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
                               "http_proxy", "https_proxy", "all_proxy",
                               "NO_PROXY", "no_proxy")
@@ -88,7 +80,8 @@ CODEX_CLI_WRAPPER_NAME = CODEX_WRAPPERS[0][0]
 # Старое имя CLI-wrapper'а до rename (#169). Migration: srouter-managed ~/bin/codex (по маркеру) → удалить
 # при install/remove; чужой (без маркера) — не трогать (канон provenance issue-112-hybrid-uninstall).
 CODEX_CLI_WRAPPER_LEGACY_NAME = "codex"
-# LaunchAgent для глобального env: launchctl setenv SOCKS5 в GUI-домен (переживает ребут).
+# LaunchAgent residual-чистки gui-домена (контракт 2026-10-07: ambient-прокси не сеется,
+# агент только снимает proxy-ключи; переживает ребут).
 # Label = com.srouter.codenv → prefix CODENV для плейсхолдеров __SROUTER_CODENV_*__ в шаблоне plist.
 CODEX_ENV_LABEL = "com.srouter.codenv"
 CODEX_ENV_MARKER = "srouter-managed-codex-env-v1"
@@ -299,12 +292,12 @@ def _remove_codex_wrappers() -> str:
 
 
 def _install_launchctl_env(env, runner) -> str:
-    """Глобальный SOCKS5 env через LaunchAgent (RunAtLoad + launchctl setenv). Переживает ребут.
+    """Residual-чистка gui-домена через LaunchAgent — переживает ребут (контракт 2026-10-07).
 
-    launchctl setenv кладёт переменные в GUI-домен launchd → все GUI-приложения их видят. Но setenv
-    сам по себе не переживает ребут — LaunchAgent com.srouter.codenv (RunAtLoad + StartInterval=300)
-    вызывает скрипт srouter-codex-env.sh, который делает setenv при загрузке и каждые 5мин.
-    Эмпирически: Claude.app/ChatGPT.app на System Settings SOCKS, global env их не ломает.
+    LaunchAgent com.srouter.codenv (RunAtLoad + StartInterval=300) вызывает скрипт
+    srouter-codex-env.sh, который при загрузке и каждые 5 минут СНИМАЕТ proxy-ключи из
+    GUI-домена launchd (ambient env-прокси не сеется ни в один слой: через туннель ходит
+    только явно попросившее — xray-правила, git per-host, per-tool wrappers, curl -x).
 
     Через _install_generic_launchagent (как watchdog): marker-gate + atomic write + _launchd_reload
     (bootout→poll→bootstrap-retry, решает гонку занятого домена — PR #80).
@@ -312,8 +305,8 @@ def _install_launchctl_env(env, runner) -> str:
     issue #250 guard: plist рендерится из env.root. install, запущенный ИЗ эфемерного AO-worktree,
     зашивает в ПОСТОЯННЫЙ LaunchAgent путь, который скоро исчезнет — мина замедленного действия
     (реальный инцидент: worktree srouter-117 стёрт → /bin/sh не находит скрипт → exit 127 при каждом
-    из 1419 запусков, Codex молча без SOCKS5). Отказываемся ставить вовсе (fail-closed: явный отказ
-    при install лучше 1419 падений в тишине). Канон ao-worktree-vs-main-worktree-confusion.
+    из 1419 запусков, residual-чистка gui-домена молча не выполнялась). Отказываемся ставить вовсе
+    (fail-closed: явный отказ при install лучше 1419 падений в тишине). Канон ao-worktree-vs-main-worktree-confusion.
     """
     script_path = env.root / "launchagents" / "srouter-codex-env.sh"
     # health._in_ao_worktree — ЕДИНАЯ точка решения (тот же предикат, что детектит doctor):
@@ -325,8 +318,10 @@ def _install_launchctl_env(env, runner) -> str:
                 f"LaunchAgent постоянен, worktree — нет: после его удаления job упадёт с exit 127 "
                 f"(issue #250). Запусти srouter install из канонического репозитория.")
     try:
-        # Предупредить, если в GUI-домене уже есть ЧУЖОЙ прокси (корпоративный/ручной) — setenv
-        # скрипта его перезапишет без восстановления. Не блокируем, но WARN в статусе.
+        # Предупредить, если в GUI-домене уже есть ЧУЖОЙ прокси (корпоративный/ручной): по
+        # контракту 2026-10-07 агент НЕ перезаписывает его разово, а СННИМАЕТ каждые 5 минут
+        # без восстановления — recurring removal стороннего конфига, оператор обязан видеть.
+        # Не блокируем, но WARN в статусе.
         # issue #191 (эмпирически подтверждено): `getenv gui/<uid> HTTP_PROXY` МОЛЧА игнорирует домен
         # (Usage: getenv <key> — ровно один позиционный аргумент, второй отбрасывается) → val ВСЕГДА
         # пуст, WARN никогда не срабатывал. Единственный домен-осознанный источник — `launchctl print
@@ -334,8 +329,10 @@ def _install_launchctl_env(env, runner) -> str:
         warn = ""
         gui = health._read_gui_proxy_env(runner, keys_filter=("HTTP_PROXY",))
         val = gui.get("keys", {}).get("HTTP_PROXY", "")
-        if val and "127.0.0.1:10808" not in val:
-            warn = f" ВНИМАНИЕ: существующий GUI HTTP_PROXY={val[:40]} будет перезаписан (backup не делается)."
+        if val:
+            warn = (f" ВНИМАНИЕ: существующий GUI HTTP_PROXY={val[:40]} будет СНЯТ агентом каждые "
+                    f"5 минут без восстановления (контракт 2026-10-07: ambient-прокси в gui-домен "
+                    f"не сеется; backup не делается).")
         ok, err = _install_generic_launchagent(
             env, runner,
             template_name="com.srouter.codenv.plist",
@@ -344,8 +341,9 @@ def _install_launchctl_env(env, runner) -> str:
             script_path=env.root / "launchagents" / "srouter-codex-env.sh",
         )
         if ok:
-            return (f"Codex env: LaunchAgent {CODEX_ENV_LABEL} загружен (SOCKS5 в GUI-домен, "
-                    f"переживает ребут).{warn}")
+            return (f"Codex env: LaunchAgent {CODEX_ENV_LABEL} загружен (residual-чистка gui-домена "
+                    f"каждые 5 мин, ambient-прокси не сеется — контракт 2026-10-07; переживает "
+                    f"ребут).{warn}")
         if err.endswith("_foreign"):
             return f"Codex env: чужой LaunchAgent {CODEX_ENV_LABEL} — не трогаем."
         return f"Codex env: не установлен ({err})."
