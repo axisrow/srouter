@@ -227,6 +227,12 @@ def _machine_state_monkey(monkeypatch):
                         lambda: {"status": "ok", "detail": "стандартный"})
     monkeypatch.setattr(health, "_desktop_proxy_check",
                         lambda: {"status": "unknown", "detail": "нет launchctl"})
+    # Инцидент 2026-10-08 (зеркало канона test_health.py::_all_up_monkey): exit-чеки дёргают
+    # сеть/subprocess — мокаем ok, иначе живая машина драйвит вердикт.
+    monkeypatch.setattr(health, "_anthropic_exit_check",
+                        lambda: {"status": "ok", "detail": "mock: exit годен"})
+    monkeypatch.setattr(health, "_xray_config_freshness_check",
+                        lambda: {"status": "ok", "detail": "mock: конфиг не новее процесса"})
     # #189: _codex_app_proxy_check дёргает ps/launchctl gui-env — на dev-машине с живым
     # ChatGPT.app отдаёт не-info degraded и драйвит вердикт.
     monkeypatch.setattr(health, "_codex_app_proxy_check",

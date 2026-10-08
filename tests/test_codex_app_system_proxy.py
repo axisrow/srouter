@@ -131,6 +131,11 @@ def test_check_all_wires_chromium_system_proxy_as_doctor_driver(monkeypatch):
                         lambda: {"status": "info", "detail": "skip"})
     monkeypatch.setattr(health, "_network_known_check",
                         lambda: {"status": "ok", "detail": "mock: сеть известна"})
+    # #408: новые doctor-чеки дёргают реальный curl/pgrep — та же изоляция (#252 канон)
+    monkeypatch.setattr(health, "_anthropic_exit_check",
+                        lambda: {"status": "ok", "detail": "mock: 401"})
+    monkeypatch.setattr(health, "_xray_config_freshness_check",
+                        lambda: {"status": "ok", "detail": "mock: конфиг свежий"})
     result = health.check_all(active_claude=True)
     check = next(c for c in result["checks"] if "Chromium" in c["name"])
     assert check["ok"] is False

@@ -11,6 +11,7 @@ health.py остаётся тонким фасадом: `from health_probes impo
 import json
 import logging
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import socket
@@ -48,6 +49,9 @@ __all__ = [
     "_route_default_interface", "_inet_interface", "_network_interface_up",
     "DNS_PROBE_HOST", "_resolve_host", "_dns_up",
     "VPS_TCP_PROBE_TIMEOUT", "_vps_endpoint", "_upstream_vps_reachable",
+    # Инцидент 2026-10-08: годность exit'а для Anthropic (401 vs 403-регион vs cf-challenge)
+    # и свежесть конфига xray vs процесса (рестарт не применён — процесс по старым маршрутам).
+    "_anthropic_exit_check", "_xray_config_freshness_check",
 ]
 
 # Абсолютные пути: launchd/GUI PATH их не содержит (канон проекта).
@@ -764,6 +768,133 @@ def _url_host(url):
         return urlsplit(url).hostname
     except ValueError:
         return None
+
+
+_ANTHROPIC_EXIT_URL = "https://api.anthropic.com/v1/models"
+PGREP = "/usr/bin/pgrep"
+PS = "/bin/ps"
+# валидный статус-формат: отсеивает мусор «HTTP/200 …» в теле ответа
+_HTTP_STATUS_RE = re.compile(r"^HTTP/\d+(?:\.\d)?\s+\d{3}(?: |$)")
+
+
+def _anthropic_exit_check():
+    """Годность exit-выхода для Anthropic (инцидент 2026-10-08) — НЕ живость канала.
+
+    `tunnel_code_up` сознательно считает 403 «живым каналом» (канарейка), из-за чего
+    регион-блок читался как «туннель ok», а диагноз увёл на VPS. Здесь наоборот:
+    401 authentication_error (без ключа) = exit обслуживается API; 403 без cf-challenge =
+    Anthropic не обслуживает этот выход (регион/бан); заголовок `cf-mitigated: challenge` =
+    Cloudflare бот-челлендж — проба недостоверна (не регион, канал мог быть годен);
+    no-response/timeout/rc≠0 = unknown (живость канала скажут соседние чеки). rc-гейт
+    обязателен: CONNECT прокси успевает попасть в stdout и при мёртвом транспорте —
+    без гейта «200 established» читался бы как «exit годен» (401/403/5xx при полном
+    ответе дают rc=0, значит rc≠0 строго транспортный). Тело/заголовки
+    читаются (в отличие от `_tunnel_target_up`, у которого `-o /dev/null`). Не бросает.
+    """
+    cmd = [CURL, "-sS", "-i", "--connect-timeout", "4", "--max-time", "10",
+           "-x", _PROXY, _ANTHROPIC_EXIT_URL]
+    r = sys_probe.run(cmd, timeout=12)
+    if r.get("timeout"):
+        return {"status": "unknown", "detail": "probe timeout"}
+    if r.get("rc") not in (0, None):
+        return {"status": "unknown",
+                "detail": f"no-response (rc={r.get('rc')}, {(r.get('err') or '')[:60]})"}
+    out = r.get("out") or ""
+    # curl через http-прокси с -i выдаёт СНАЧАЛА ответ CONNECT самого прокси
+    # («HTTP/1.1 200 Connection established»), целевой ответ — последним блоком
+    # (живой захват 2026-10-08). Берём последний блок с ВАЛИДНЫМ статус-форматом,
+    # мусорные «HTTP/200 …» в теле не статусные.
+    lines = out.splitlines()
+    status_idx = [i for i, ln in enumerate(lines)
+                  if _HTTP_STATUS_RE.match(ln.upper())]
+    if not status_idx:
+        return {"status": "unknown",
+                "detail": f"no-response ({(r.get('err') or '')[:60]})"}
+    status_line = lines[status_idx[-1]]
+    code = next((t for t in status_line.split()[1:]
+                 if t.isdigit() and len(t) == 3), "")
+    after = lines[status_idx[-1] + 1:]
+    try:
+        blank = after.index("")
+    except ValueError:
+        blank = len(after)
+    headers_lf = "\n".join(after[:blank]).lower()
+    body = "\n".join(after[blank + 1:])
+    if not code:
+        return {"status": "unknown",
+                "detail": f"no-response ({(r.get('err') or '')[:60]})"}
+    if "cf-mitigated: challenge" in headers_lf:
+        return {"status": "warn",
+                "detail": "Cloudflare bot-challenge — проба недостоверна (не регион)"}
+    if code == "401":
+        return {"status": "ok",
+                "detail": "exit годен (401 authentication_error — API обслуживает выход)"}
+    if code == "403":
+        return {"status": "warn",
+                "detail": f"Anthropic не обслуживает exit (регион/бан): HTTP 403 {body[:80]}"}
+    if code.startswith("5"):
+        return {"status": "warn",
+                "detail": f"upstream 5xx (HTTP {code}) — вендор, не маршрут"}
+    return {"status": "ok", "detail": f"exit годен (HTTP {code})"}
+
+
+def _etime_to_seconds(text):
+    """ps -o etime= → секунды (формат [[dd-]hh:]mm:ss); None если не распознано. Не бросает.
+
+    etime выбран вместо lstart= осознанно: lstart локале-зависим («ср 7 окт 13:45»),
+    etime — фиксированный цифровой формат.
+    """
+    try:
+        raw = (text or "").strip()
+        if not raw:
+            return None
+        days = 0
+        if "-" in raw:
+            days_part, _, raw = raw.partition("-")
+            days = int(days_part)
+        parts = [int(p) for p in raw.split(":")]
+        if len(parts) == 2:
+            hours, minutes, seconds = 0, parts[0], parts[1]
+        elif len(parts) == 3:
+            hours, minutes, seconds = parts
+        else:
+            return None
+        return days * 86400 + hours * 3600 + minutes * 60 + seconds
+    except (ValueError, AttributeError):
+        return None
+
+
+def _xray_config_freshness_check():
+    """Конфиг xray новее процесса = рестарт не применён (инцидент 2026-10-08: whitelist
+    с claude.ai лежал на диске, боевой процесс гонял всё по старому конфигу в direct;
+    никто этого не видел). mtime config vs возраст процесса (etime, не lstart — локаль).
+    warn-чек, не driver: живость канала — пробы портов/туннеля. Не бросает.
+    """
+    try:
+        # NB: sync-чек читает замороженную health._XRAY_CONFIG_PATH, здесь — живой
+        # local_state_xray.XRAY_CONFIG_PATH; в проде равны, но патч-поинты разные
+        cfg_mtime = Path(local_state_xray.XRAY_CONFIG_PATH).stat().st_mtime
+    except OSError as exc:
+        return {"status": "unknown", "detail": f"конфиг недоступен: {exc}"}
+    r = sys_probe.run([PGREP, "-x", "xray"], timeout=5)
+    pids = [p for p in (r.get("out") or "").split() if p.isdigit()]
+    if not pids:
+        return {"status": "unknown", "detail": "процесс xray не найден"}
+    now = time.time()
+    worst_secs = None  # самый СТАРЫЙ процесс: если конфиг новее даже его — точно не применён
+    for pid in pids:
+        rp = sys_probe.run([PS, "-p", pid, "-o", "etime="], timeout=5)
+        secs = _etime_to_seconds(rp.get("out"))
+        if secs is not None and (worst_secs is None or secs > worst_secs):
+            worst_secs = secs
+    if worst_secs is None:
+        return {"status": "unknown", "detail": "etime не распознан"}
+    if cfg_mtime > now - worst_secs:
+        delta_min = max(1, int((cfg_mtime - (now - worst_secs)) // 60))
+        return {"status": "warn",
+                "detail": f"конфиг xray новее процесса (~{delta_min} мин) — рестарт не применён: "
+                          "маршруты на диске ≠ маршруты в работающем процессе"}
+    return {"status": "ok", "detail": "конфиг не новее процесса (рестарт применён)"}
 
 
 def _tunnel_up(extra_targets=None):

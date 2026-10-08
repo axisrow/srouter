@@ -250,6 +250,10 @@ def test_check_all_includes_backup_slots_check(monkeypatch, tmp_path):
         return {"status": "warn", "detail": "state_backup_missing: /x", "findings": ["x"]}
 
     monkeypatch.setattr(health, "_backup_slots_probe", fake_probe)
+    # #408: freshness-чек дёргает pgrep/ps без gate — изоляция от живой машины (#252);
+    # anthropic-exit под active_claude=False не вызывается, мок не нужен
+    monkeypatch.setattr(health, "_xray_config_freshness_check",
+                        lambda: {"status": "ok", "detail": "mock: конфиг свежий"})
 
     result = health.check_all(active_claude=False)
 
