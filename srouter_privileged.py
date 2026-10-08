@@ -38,8 +38,8 @@ def _env_from_args(args) -> InstallEnv:
     if getattr(args, "launchagents_dir", None):
         env.launchagent_dir = Path(args.launchagents_dir)
     # Python, из которого запущена команда srouter — в нём гарантированно стоит flask (зависимость
-    # пакета srouter). /usr/bin/python3 (default в install_lib) — системный Python Apple, flask'а нет,
-    # демон крашнется с ModuleNotFoundError. Приоритет: --python флаг (для sudo) → SROUTER_PYTHON env → sys.executable.
+    # пакета srouter). from_env теперь дефолтит так же (инцидент 2026-10-08), здесь остаётся
+    # приоритет: --python флаг (для sudo) → SROUTER_PYTHON env → sys.executable.
     env.python_bin = getattr(args, "python", None) or os.environ.get("SROUTER_PYTHON") or sys.executable
     return env
 
