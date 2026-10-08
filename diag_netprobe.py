@@ -21,11 +21,14 @@ read_timing_events) и local_state_nodes (активный узел — перв
 import json
 import os
 import re
+import shlex
+import shutil
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
 
+import hot_routes  # bounded tail журналов: подсчёт/миграция net-меток (#395)
 import metrics_store
 from sys_probe import run
 
@@ -262,13 +265,80 @@ def _physical_gateway():
     return gateway, iface
 
 
+def _gw_label(gateway, gateway_mac):
+    """Fallback-метка необученной сети (формат значим: под ним живёт история журналов, #395)."""
+    return f"gw:{gateway}:{gateway_mac or '?'}"
+
+
+def _journal_paths():
+    """Пути журналов с net-меткой: (metrics, marks, netprobe, status | None).
+
+    net-метку пишут ЧЕТЫРЕ журнала: metrics.jsonl (watchdog), marks (`srouter mark`),
+    netprobe.jsonl (probe()) и status.jsonl (watchdog-переходы) — счёт и миграция
+    обязаны покрывать все (#395-ревью: иначе ручные отметки остаются под gw-меткой).
+    status — lazy import: health импортирует diag_netprobe на top-level, прямой импорт
+    дал бы цикл. Fail-soft: нет health — мигрируем/считаем без status.
+    """
+    status_path = None
+    try:
+        import health  # lazy — см. выше
+        status_path = Path(health.WATCHDOG_STATUS_LOG)
+    except Exception:  # noqa: BLE001 — fail-soft (канон модуля)
+        pass
+    return (Path(metrics_store.METRICS_LOG), Path(metrics_store.MARKS_LOG),
+            NETPROBE_LOG, status_path)
+
+
+def count_events_under_label(label):
+    """#395 observe: сколько событий во ВСЕХ net-журналах записано под меткой label.
+
+    Bounded-чтение (retention-хвост metrics, tail 200k строк/64МБ остальные). Не бросает.
+    """
+    total = 0
+    metrics_path, marks_path, netprobe_path, status_path = _journal_paths()
+    try:
+        for event in metrics_store.read_timing_events(log_path=metrics_path):
+            if event.get("net") == label:
+                total += 1
+    except Exception:  # noqa: BLE001 — счётчик не должен ронять learn_net
+        pass
+    for tail_path in (marks_path, netprobe_path, status_path):
+        if tail_path is None:
+            continue
+        try:
+            for line in hot_routes._read_tail(tail_path, max_lines=200_000,
+                                              max_bytes=64 * 1024 * 1024):
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    event = json.loads(stripped)
+                except ValueError:
+                    continue
+                if isinstance(event, dict) and event.get("net") == label:
+                    total += 1
+        except Exception:  # noqa: BLE001 — то же
+            pass
+    return total
+
+
+def _legacy_labels(gateway, gateway_mac):
+    """Legacy-метки сети до обучения: точная gw:ip:mac и, при известном mac, «?»-вариант —
+    тики с холодным ARP писали без mac (_gateway_mac fail-soft → None), и без «?»-варианта
+    часть истории молча оставалась бы под старой меткой (#395-ревью)."""
+    if gateway_mac:
+        return (_gw_label(gateway, gateway_mac), _gw_label(gateway, None))
+    return (_gw_label(gateway, None),)
+
+
 def learn_net(name):
     """Запомнить текущую сеть под именем (обучение: один прогон на сеть, без прав)."""
     dns = list(_dns_servers())
     gateway, iface = _physical_gateway()
+    gateway_mac = _gateway_mac(gateway)
     nets = _load_nets()
     nets[name] = {"dns": dns, "gateway": gateway, "iface": iface,
-                  "gateway_mac": _gateway_mac(gateway)}
+                  "gateway_mac": gateway_mac}
     try:
         from local_state import _atomic_write_text  # канон atomic-save (tmp+fsync+rename) #139
         if not _atomic_write_text(NETS_MAP, json.dumps(
@@ -278,6 +348,100 @@ def learn_net(name):
         print(f"netname: не удалось сохранить мапу ({exc})")
         return
     print(f"netname: сеть {name!r} запомнена (dns={dns}, gateway={gateway}, iface={iface})")
+    # #395 observe: история до обучения осталась под legacy-метками — считаем и подсказываем
+    # ручной шаг (policy: автоматическая миграция данных — отдельный follow-up).
+    if gateway:
+        labels = _legacy_labels(gateway, gateway_mac)
+        legacy = sum(count_events_under_label(lbl) for lbl in labels)
+        if legacy:
+            print(f"netname: внимание: {legacy} событий в журналах записано под "
+                  f"{' / '.join(labels)} — фильтр по сети (календарь, ?incnet=) их не "
+                  f"покажет. Разовая миграция: "
+                  f"python3 diag_netprobe.py netname-migrate {shlex.quote(name)}")
+
+
+def _rewrite_net_labels(path, old_labels, new_name, stamp):
+    """Переименовать net∈old_labels → new_name в журнале path (#395).
+
+    Бэкап byte-exact ДО записи (канон rollback-byte-exact); чужие метки и битые строки
+    остаются как есть (forensics-ценность журнала не пересериализуется). Без совпадений
+    файл не трогается вовсе; отсутствующий файл — тихий no-op (норма, как у count-пути);
+    недекодируемый файл — err, не исключение (контракт «Не бросает»). Принятая гонка:
+    события между чтением и os.replace теряются (окно мс, цена 1-2 telemetry-события;
+    разовый ручной инструмент). Возвращает (changed, backup|None, err|None). Не бросает.
+    """
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return 0, None, None
+    except (OSError, UnicodeDecodeError) as exc:
+        return 0, None, str(exc)
+    labels = tuple(old_labels)
+    out = []
+    changed = 0
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            out.append(line)
+            continue
+        try:
+            event = json.loads(stripped)
+        except ValueError:
+            out.append(line)
+            continue
+        if isinstance(event, dict) and event.get("net") in labels:
+            event["net"] = new_name
+            out.append(json.dumps(event, ensure_ascii=False, sort_keys=True))
+            changed += 1
+        else:
+            out.append(line)
+    if not changed:
+        return 0, None, None
+    backup = path.with_name(f"{path.name}.pre-netname-migrate-{stamp}")
+    try:
+        shutil.copy2(path, backup)  # сырьё для отката, байт-в-байт
+    except OSError as exc:
+        return 0, None, f"бэкап не создан: {exc}"
+    try:
+        from local_state import _atomic_write_text  # канон atomic-save (tmp+fsync+rename) #139
+        if not _atomic_write_text(path, "".join(line + "\n" for line in out)):
+            return 0, None, "atomic write не прошёл — файл не тронут"
+    except OSError as exc:
+        return 0, None, str(exc)
+    return changed, backup, None
+
+
+def migrate_net_labels(name, from_label=None):
+    """#395, ручной разовый шаг: история сети под legacy-метками → имя (все net-журналы).
+
+    from_label — явный источник вместо derived-меток: переобучение под новым именем
+    оставляет историю под старым ИМЕНЕМ, которое из мапы уже не достать.
+    """
+    entry = _load_nets().get(name)
+    if not isinstance(entry, dict) or not entry.get("gateway"):
+        print(f"netname-migrate: сеть {name!r} не найдена в мапе (сначала: netname {name})")
+        return
+    if from_label:
+        labels = (from_label,)
+    else:
+        labels = _legacy_labels(entry.get("gateway"), entry.get("gateway_mac"))
+    metrics_path, marks_path, netprobe_path, status_path = _journal_paths()
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    total = 0
+    for path in (metrics_path, marks_path, netprobe_path, status_path):
+        if path is None:
+            continue
+        changed, backup, err = _rewrite_net_labels(path, labels, name, stamp)
+        if err:
+            print(f"netname-migrate: {path.name}: {err}")
+            continue
+        if changed:
+            total += changed
+            print(f"netname-migrate: {path.name}: {changed} событий "
+                  f"{' / '.join(labels)} → {name!r} (бэкап: {backup})")
+    if total == 0:
+        print(f"netname-migrate: событий под {' / '.join(labels)} не найдено — "
+              "мигрировать нечего")
 
 
 _GW_HINTED = set()  # gw-метки, подсказка для которых уже напечатана (не спамим каждый тик)
@@ -310,7 +474,7 @@ def current_net_status():
     if name:
         return {"label": name, "known": True, "source": "map"}
     if gateway:
-        label = f"gw:{gateway}:{gateway_mac or '?'}"
+        label = _gw_label(gateway, gateway_mac)
         if label not in _GW_HINTED:
             _GW_HINTED.add(label)
             print(f"net: сеть не распознана ({label}); обучить: "
@@ -609,6 +773,15 @@ if __name__ == "__main__":
                 print("usage: diag_netprobe.py netname <имя сети>")
         except Exception as exc:  # noqa: BLE001 — ручные режимы не должны падать (канон fail-soft)
             print(f"netname failed: {exc}")
+    elif mode == "netname-migrate":
+        try:
+            if len(sys.argv) > 2:
+                from_label = sys.argv[3] if len(sys.argv) > 3 else None
+                migrate_net_labels(sys.argv[2], from_label=from_label)
+            else:
+                print("usage: diag_netprobe.py netname-migrate <имя сети> [from-метка]")
+        except Exception as exc:  # noqa: BLE001 — ручные режимы не должны падать (канон fail-soft)
+            print(f"netname-migrate failed: {exc}")
     elif mode in ("report", "ssid"):
         try:
             (report if mode == "report" else ssid)()
