@@ -389,9 +389,13 @@ def test_probe_ignores_non_cc_processes(monkeypatch):
 _ZAI_OVERRIDE_CFG = {"base_url": "https://api.z.ai/api/anthropic",
                      "no_proxy": "localhost,127.0.0.1,::1,z.ai,.z.ai,storage.googleapis.com",
                      "source": "shell"}
-# external ESTABLISHED, похожий на утечку (не localhost) — ровно то, что probe видит при z.ai.
+# external ESTABLISHED (не localhost, НЕ в ANTHROPIC_SUBNETS) — ровно то, что probe видит при
+# легитимном z.ai direct-first (192.0.2.7 — TEST-NET, заведомо не Anthropic). Был peer
+# 160.79.104.10 — сочинённый мок консервировал допущение «lsof не различает endpoint от
+# утечки»; живой захват 2026-10-09 (claude-desktop, секция ниже) показал, что различает:
+# пир в ANTHROPIC_SUBNETS — доказанная утечка, а не unknown.
 _EXTERNAL_LEAK_LINE = ("claude 12345 axisrow 7u IPv4 ... TCP "
-                       "192.168.1.5:51234->160.79.104.10:443 (ESTABLISHED)\n")
+                       "192.168.1.5:51234->192.0.2.7:443 (ESTABLISHED)\n")
 
 
 def _ps_lsof_fake(ps_out, lsof_out, eww_out=""):
@@ -655,7 +659,7 @@ def test_probe_unknown_when_override_pid_env_unreadable(monkeypatch):
 def test_probe_override_mixed_divergence_and_by_design(monkeypatch):
     """#337: mixed external — дивергентный PID 111 не драйвит down, by-design 222 не маскирует."""
     lsof_out = (
-        "claude 111 axisrow 7u IPv4 ... TCP 192.168.1.5:51235->160.79.104.10:443 (ESTABLISHED)\n"
+        "claude 111 axisrow 7u IPv4 ... TCP 192.168.1.5:51235->192.0.2.8:443 (ESTABLISHED)\n"
         "claude 222 axisrow 7u IPv4 ... TCP 192.168.1.5:51236->104.18.7.113:443 (ESTABLISHED)\n"
     )
     monkeypatch.setattr(health.sys_probe, "run",
@@ -6048,6 +6052,129 @@ def test_watchdog_no_push_when_claude_proxy_override_only(monkeypatch, tmp_path)
     monkeypatch.setattr(health, "_notify", lambda msg, sound="Glass": notified.append((msg, sound)))
     health.cmd_watchdog()
     assert notified == [], "override-гейт: claude-proxy observe — деградации нет, пуша нет"
+
+
+# ---------- 2026-10-09: peer-IP в ANTHROPIC_SUBNETS при override = доказанная утечка ----------
+# Живой инцидент (lsof-захват 2026-10-09, PID обезличен): встроенный в Claude.desktop
+# claude-code (CLAUDE_CODE_ENTRYPOINT=claude-desktop) не наследует HTTPS_PROXY и держит
+# ESTABLISHED к 160.79.104.10 / [2607:6bc0::10] напрямую. Файловский z.ai override
+# (#329/#337) глушил пробу в unknown «неверифицируемо» — утечка была невидима doctor'у и
+# watchdog'у. Пир в собственных подсетях Anthropic (канон isolate_firewall.ANTHROPIC_SUBNETS)
+# не может быть «прямым ходом к provider-endpoint», пока provider не anthropic-хост:
+# атрибуция доказуема по назначению соединения, без exec-env.
+
+_DESKTOP_CC_COMM = ("/Users/me/Library/Application Support/Claude/claude-code/"
+                    "2.1.293/8433d0d9cd0d/claude.app/Contents/MacOS/claude")
+_DESKTOP_CC_LEAK_V4 = ("claude 24680 axisrow 9u IPv4 0xc97029cb986319d 0t0 TCP "
+                       "10.1.0.73:61854->160.79.104.10:443 (ESTABLISHED)\n")
+_DESKTOP_CC_LEAK_V6 = ("claude 24680 axisrow 14u IPv6 0x4a76974dffcf182 0t0 TCP "
+                       "[2409:8a55:f151:76e4:6c0d:f825:316:e418]:53491->"
+                       "[2607:6bc0::10]:443 (ESTABLISHED)\n")
+# provider-endpoint сам Anthropic (platform.claude.com в NO_PROXY): прямой пир BY DESIGN.
+_ANTHROPIC_PROVIDER_CFG = {"base_url": "https://platform.claude.com",
+                           "no_proxy": "platform.claude.com", "source": "shell"}
+
+
+def test_peer_ip_of_parses_v4_v6_and_garbage():
+    """Детектор peer-IP: IPv4, IPv6 (скобки+порт), мусор → None."""
+    assert health._peer_ip_of("claude 1 u 9u IPv4 0x0 0t0 TCP "
+                              "10.1.0.73:61854->160.79.104.10:443 (ESTABLISHED)") \
+        == "160.79.104.10"
+    assert health._peer_ip_of("claude 1 u 14u IPv6 0x0 0t0 TCP "
+                              "[2409:8a55::1]:53491->[2607:6bc0::10]:443 (ESTABLISHED)") \
+        == "2607:6bc0::10"
+    assert health._peer_ip_of("claude 1 u 9u IPv4 0x0 0t0 UDP *:*") is None
+    assert health._peer_ip_of("garbage") is None
+
+
+def test_peer_in_anthropic_subnets_and_provider_host():
+    """Членство по подсетям (оба семейства, канон isolate_firewall) + суффиксы провайдера."""
+    assert health._peer_in_anthropic_subnets("160.79.104.10") is True
+    assert health._peer_in_anthropic_subnets("160.79.111.254") is True  # край /21
+    assert health._peer_in_anthropic_subnets("2607:6bc0::10") is True
+    assert health._peer_in_anthropic_subnets("192.0.2.7") is False
+    assert health._peer_in_anthropic_subnets("160.79.112.1") is False  # сразу за /21
+    assert health._peer_in_anthropic_subnets("nonsense") is False
+    assert health._is_anthropic_provider_host("api.anthropic.com") is True
+    assert health._is_anthropic_provider_host("platform.claude.com") is True
+    assert health._is_anthropic_provider_host("claude.ai") is True
+    assert health._is_anthropic_provider_host("notanthropic.com") is False  # lookalike #131
+    assert health._is_anthropic_provider_host("api.z.ai") is False
+    assert health._is_anthropic_provider_host("") is False
+
+
+def test_probe_down_when_override_peer_in_anthropic_subnets_v4(monkeypatch):
+    """2026-10-09 RED: z.ai-override в файлах + exec-env PID «стандартный», но peer
+    160.79.104.10 → down, не unknown: атрибуция по peer-IP доказуема без exec-env."""
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _ps_lsof_fake(f"24680 {_DESKTOP_CC_COMM}\n", _DESKTOP_CC_LEAK_V4))
+    monkeypatch.setattr(health, "_read_endpoint_config", lambda: _ZAI_OVERRIDE_CFG)
+    _override_runtime_mocks(
+        monkeypatch,
+        per_pid={"24680": {"ANTHROPIC_BASE_URL": "https://api.anthropic.com"}},
+        readable={"24680"})
+    res = health._claude_proxy_probe()
+    assert res["status"] == "down", \
+        f"пир в ANTHROPIC_SUBNETS — доказанная утечка, не «неверифицируемо»: {res['detail']!r}"
+    assert "160.79.104.10" in res["detail"], "peer-IP остаётся в detail как форензика"
+    assert "24680" in res["detail"], "PID утёкшего процесса остаётся в detail"
+    assert not res.get("overridden"), "доказанная утечка не гейтится #362 в observe"
+
+
+def test_probe_down_when_override_peer_in_anthropic_subnets_v6(monkeypatch):
+    """Оба семейства (канон isolate_firewall: без v6 строгая фаза бесполезна): IPv6-пир
+    2607:6bc0::10 при z.ai-override → down."""
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _ps_lsof_fake(f"24680 {_DESKTOP_CC_COMM}\n", _DESKTOP_CC_LEAK_V6))
+    monkeypatch.setattr(health, "_read_endpoint_config", lambda: _ZAI_OVERRIDE_CFG)
+    _override_runtime_mocks(monkeypatch, per_pid={}, readable=set())
+    res = health._claude_proxy_probe()
+    assert res["status"] == "down", \
+        f"IPv6-пир в ANTHROPIC_SUBNETS — доказанная утечка: {res['detail']!r}"
+    assert "2607:6bc0::10" in res["detail"]
+    assert not res.get("overridden")
+
+
+def test_probe_unknown_kept_when_override_peer_not_anthropic(monkeypatch):
+    """Гвард #329: external-пир НЕ в ANTHROPIC_SUBNETS при override → unknown как раньше
+    (прямое соединение к provider-endpoint намеренно/неверифицируемо), не down."""
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _ps_lsof_fake(f"12345 {CLI_COMM}\n", _EXTERNAL_LEAK_LINE))
+    monkeypatch.setattr(health, "_read_endpoint_config", lambda: _ZAI_OVERRIDE_CFG)
+    _override_runtime_mocks(monkeypatch, per_pid={}, readable=set())
+    res = health._claude_proxy_probe()
+    assert res["status"] == "unknown", "не-Anthropic пир не доказывает утечку"
+    assert res.get("overridden") is True
+
+
+def test_probe_override_anthropic_provider_host_keeps_unknown(monkeypatch):
+    """Гвард от ложного down: provider-endpoint сам anthropic-хост (platform.claude.com в
+    NO_PROXY) — прямой пир к Anthropic BY DESIGN, остаётся unknown/overridden."""
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _ps_lsof_fake(f"12345 {CLI_COMM}\n", _DESKTOP_CC_LEAK_V4))
+    monkeypatch.setattr(health, "_read_endpoint_config", lambda: _ANTHROPIC_PROVIDER_CFG)
+    _override_runtime_mocks(monkeypatch, per_pid={}, readable=set())
+    res = health._claude_proxy_probe()
+    assert res["status"] == "unknown", "anthropic-provider direct-first — не утечка"
+    assert res.get("overridden") is True
+
+
+def test_check_all_anthropic_peer_leak_is_driver_not_observe(monkeypatch):
+    """Интеграция 2026-10-09: доказанная утечка при files-override — driver, не observe:
+    чек не info, вердикт деградирует (гейт #362 прячет только unknown/flagged)."""
+    _all_up_monkey(monkeypatch)
+    monkeypatch.setattr(health, "_claude_proxy_probe", _REAL_CLAUDE_PROXY_PROBE)
+    monkeypatch.setattr(health.sys_probe, "run",
+                        _ps_lsof_fake(f"24680 {_DESKTOP_CC_COMM}\n", _DESKTOP_CC_LEAK_V4))
+    monkeypatch.setattr(health, "_read_endpoint_config", lambda: _ZAI_OVERRIDE_CFG)
+    _override_runtime_mocks(
+        monkeypatch,
+        per_pid={"24680": {"ANTHROPIC_BASE_URL": "https://api.anthropic.com"}},
+        readable={"24680"})
+    result = health.check_all()
+    cp = next(c for c in result["checks"] if "claude-proxy" in c["name"])
+    assert cp.get("info") is not True, "доказанная утечка не гейтится в observe"
+    assert result["status"] == "degraded", "утечка к Anthropic — driver вердикта"
 
 
 # ---------- #362 п.2: туннель — цифры окна в причине + per-driver флап-гейт ----------
