@@ -116,6 +116,12 @@ def _all_up_monkey(monkeypatch, *, probe_status="ok", probe_detail="runtime: к�
                         lambda: {"status": "ok", "source": "fs", "detail": "mock: семейство управляемо"})
     monkeypatch.setattr(health, "_desktop_proxy_check",
                         lambda: {"status": "unknown", "detail": "launchctl (mock)"})
+    # Инцидент 2026-10-08: оба exit-чека дёргают сеть/subprocess (curl api.anthropic.com,
+    # pgrep/ps) — на dev-машине драйвили бы вердикт живым состоянием. Мокаем ok.
+    monkeypatch.setattr(health, "_anthropic_exit_check",
+                        lambda: {"status": "ok", "detail": "mock: exit годен"})
+    monkeypatch.setattr(health, "_xray_config_freshness_check",
+                        lambda: {"status": "ok", "detail": "mock: конфиг не новее процесса"})
     # #205: _dns_up дёргает _resolve_host (socket.getaddrinfo github.com) — мокаем резолв ok, иначе
     # реальный DNS dev-машины (особенно в sandbox без сети) драйвит DNS-чек недетерминированно и
     # ломает старые #196/#203 тесты (DNS-down стал бы driver). #205-тесты переопределяют своим _mock_dns.

@@ -340,6 +340,23 @@ def check_all(*, active_claude=False):
         vps_check["ok"] = False
         vps_check["info"] = False
     checks.append(vps_check)
+    # Инцидент 2026-10-08: `tunnel_code_up` сознательно считает 403 «живым каналом», из-за
+    # чего регион-блок exit'а читался как «туннель ok», а диагноз увёл на VPS. Годность
+    # выхода для Anthropic — отдельный info-only чек (401 = exit годен; 403 = регион/бан;
+    # cf-mitigated: challenge = проба недостоверна). unknown не печатаем — живость канала
+    # уже сказали туннель/порты. gate под active_claude: сетевой curl (как GFW per-domain).
+    if active_claude:
+        ax = _anthropic_exit_check()
+        if ax["status"] != "unknown":
+            checks.append({"name": "anthropic-exit (годность выхода для API)",
+                           "ok": ax["status"] == "ok", "info": True, "detail": ax["detail"]})
+    # Свежесть конфига xray vs процесса (2 дешёвых локальных subprocess, без сети — без gate):
+    # конфиг новее процесса = рестарт не применён, боевой процесс живёт по старым маршрутам
+    # (инцидент 2026-10-08: whitelist на диске, процесс гонял всё direct — никто не видел).
+    fr = _xray_config_freshness_check()
+    if fr["status"] != "unknown":
+        checks.append({"name": "xray-config-freshness (конфиг vs процесс)",
+                       "ok": fr["status"] == "ok", "info": True, "detail": fr["detail"]})
     # #204: локальный прокси (privoxy/xray) service-status — различение «локальный прокси упал»
     # (#201 ситуация 3) от «VPS мёртв» (#194) / «туннель сломан». _port_up чеки выше (privoxy/xray)
     # уже driver по TCP-listen; этот чек добавляет ЯВНЫЙ signal (зомби: port-open + service
