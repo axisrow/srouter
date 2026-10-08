@@ -38,6 +38,7 @@ import diag_netprobe  # атрибуция деградации (leg_snapshots/d
 import metrics_store
 import privoxy_system
 import sys_probe
+import hot_routes  # bounded tail err-лога для диагноза crash-loop'а (_dashboard_check)
 
 # Watchdog-launchagent запускает этот файл напрямую (`<python> health.py watchdog`, см.
 # launchagents/com.srouter.watchdog.plist) — тогда исполняющийся модуль регистрируется в
@@ -53,7 +54,8 @@ import sys_probe
 # инициализацию с нуля.
 _sys.modules.setdefault("health", _sys.modules[__name__])
 
-from health_constants import _PROXY, DASHBOARD_PORT, PRIVOXY_PORT, XRAY_PORT  # noqa: F401 re-export
+from health_constants import (_PROXY, DASHBOARD_ERR_LOG, DASHBOARD_PORT,  # noqa: F401 re-export
+                              PRIVOXY_PORT, XRAY_PORT)
 from health_probes import *  # noqa: F401,F403 re-export — probes/сеть/туннель/VPS (канон #158)
 from health_claude import *  # noqa: F401,F403 re-export — Claude Code detection (канон #158)
 from health_codex import *  # noqa: F401,F403 re-export — Codex detection/binaries/isolation (канон #158)
@@ -250,6 +252,27 @@ def _network_known_check():
     return {"status": "ok", "detail": st["label"]}
 
 
+def _dashboard_check():
+    """Порт дашборда + диагноз crash-loop'а по сигнатуре err.log (инцидент 2026-10-08).
+
+    Порт мёртв, а хвост err.log содержит ModuleNotFoundError → демон запущен питоном
+    без зависимостей пакета (классика: plist отрендерен /usr/bin/python3 без flask
+    при ./install.sh apply) — detail даёт ремонт (SROUTER_PYTHON / переустановка).
+    Другая причина или лога нет — чек прежнего вида, без detail (не выдумываем диагноз,
+    канон no-diagnosis-without-evidence). Не бросает (hot_routes._read_tail fail-soft).
+    """
+    chk = {"name": f"dashboard ({DASHBOARD_PORT})", "ok": _port_up(DASHBOARD_PORT)}
+    if chk["ok"]:
+        return chk
+    text = "\n".join(hot_routes._read_tail(DASHBOARD_ERR_LOG, max_lines=40, max_bytes=8192))
+    hit = re.search(r"No module named '([^']+)'", text)
+    if hit:
+        chk["detail"] = (f"демон crash-loop: python в plist без модуля '{hit.group(1)}' — "
+                         "ремонт: SROUTER_PYTHON=<python с зависимостями> "
+                         "srouter install (или переустановить пакет)")
+    return chk
+
+
 def check_all(*, active_claude=False):
     """Все проверки стека. {status: ok|degraded|down, checks: [{name, ok, detail?, info?}]}.
 
@@ -260,7 +283,7 @@ def check_all(*, active_claude=False):
     checks = []
     checks.append({"name": f"privoxy ({PRIVOXY_PORT})", "ok": _port_up(PRIVOXY_PORT)})
     checks.append({"name": f"xray ({XRAY_PORT})", "ok": _port_up(XRAY_PORT)})
-    checks.append({"name": f"dashboard ({DASHBOARD_PORT})", "ok": _port_up(DASHBOARD_PORT)})
+    checks.append(_dashboard_check())
     tun_ok, tun_detail, tun_vendor_outage, tun_timings = _tunnel_up(
         extra_targets=_metrics_probe_options()["metrics_targets"])
     # #207: vendor outage (оба вендора HTTP 5xx = канал жив, вендоры лежат) структурно помечаем

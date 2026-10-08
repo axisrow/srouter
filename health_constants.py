@@ -8,6 +8,8 @@ PRIVOXY_PORT/XRAY_PORT — общий слой здесь, а не делега�
 модуль не падал в среде без srouter_config (как git_proxy/claude_proxy).
 """
 import logging
+import os
+from pathlib import Path
 
 _log = logging.getLogger("srouter.health")
 
@@ -30,3 +32,10 @@ except (ImportError, SystemExit) as exc:  # noqa: BLE001 — намеренно 
     XRAY_PORT = 10808  # canonical-fallback-port
 
 DASHBOARD_PORT = 8787
+
+# Err-лог демона — источник диагноза crash-loop'а (_dashboard_check, инцидент 2026-10-08:
+# порт мёртв + ModuleNotFoundError в хвосте = plist отрендерен питоном без flask).
+# SROUTER_LOG_DIR — тот же override, что резолвит install_config.InstallEnv.from_env.
+DASHBOARD_ERR_LOG = Path(
+    os.environ.get("SROUTER_LOG_DIR", str(Path.home() / "Library" / "Logs"))
+) / "srouter-dashboard.err.log"

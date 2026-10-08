@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -132,7 +133,11 @@ class InstallEnv:
     prefix: Path = Path("/opt/homebrew")
     state_path: Path = ROOT / "srouter.local.json"
     launchagent_dir: Path = Path.home() / "Library" / "LaunchAgents"
-    python_bin: str = "/usr/bin/python3"
+    # python_bin — питон, которым демон будет запущен launchd: в нём обязаны быть
+    # зависимости пакета (flask). Голый InstallEnv() в проде не конструируется — все
+    # пути через from_env (дефолт sys.executable, инцидент 2026-10-08: CrashLoop
+    # ModuleNotFoundError, когда apply отрендерил plist Apple-python'ом без flask).
+    python_bin: str = sys.executable
     log_out: Path = Path.home() / "Library/Logs/srouter-dashboard.out.log"
     log_err: Path = Path.home() / "Library/Logs/srouter-dashboard.err.log"
     now: str = ""
@@ -145,7 +150,10 @@ class InstallEnv:
             prefix=Path(prefix or os.environ.get("SROUTER_PREFIX", "/opt/homebrew")),
             state_path=Path(state_path or os.environ.get("SROUTER_STATE_PATH", ROOT / "srouter.local.json")),
             launchagent_dir=Path(os.environ.get("SROUTER_LAUNCHAGENTS_DIR", Path.home() / "Library" / "LaunchAgents")),
-            python_bin=os.environ.get("SROUTER_PYTHON", "/usr/bin/python3"),
+            # Приоритет как в srouter_privileged._env_from_args: SROUTER_PYTHON →
+            # sys.executable. /usr/bin/python3 (Apple, без flask) запрещён как дефолт —
+            # инцидент 2026-10-08: plist им рендерился → демон CrashLoop ModuleNotFoundError.
+            python_bin=os.environ.get("SROUTER_PYTHON") or sys.executable,
             log_out=log_dir / "srouter-dashboard.out.log",
             log_err=log_dir / "srouter-dashboard.err.log",
             now=os.environ.get("SROUTER_NOW", "") or _now(),

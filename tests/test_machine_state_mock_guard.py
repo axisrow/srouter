@@ -112,6 +112,9 @@ _SAFE_WITHOUT_DIRECT_MOCK = {
     "_metrics_probe_options",  # мульти-таргет 2026-09-29: читает local.json (fail-soft, без
     # subprocess, свои ошибки гасит внутри → дефолты). Результат только параметризует список
     # целей _tunnel_up (который в check_all-тестах всё равно замокан) — на вердикт не влияет.
+    "_dashboard_check",  # 2026-10-08: единственный syscall — _port_up (мокан в _all_up_monkey);
+    # err-лог читается ТОЛЬКО в ветке ok=False (через hot_routes._read_tail, fail-soft), в
+    # all-up сценарии рано выходит — machine-dependent чтения не происходит.
 }
 
 
