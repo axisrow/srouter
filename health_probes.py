@@ -11,6 +11,7 @@ health.py остаётся тонким фасадом: `from health_probes impo
 import json
 import logging
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import socket
@@ -772,6 +773,8 @@ def _url_host(url):
 _ANTHROPIC_EXIT_URL = "https://api.anthropic.com/v1/models"
 PGREP = "/usr/bin/pgrep"
 PS = "/bin/ps"
+# валидный статус-формат: отсеивает мусор «HTTP/200 …» в теле ответа
+_HTTP_STATUS_RE = re.compile(r"^HTTP/\d+(?:\.\d)?\s+\d{3}(?: |$)")
 
 
 def _anthropic_exit_check():
@@ -782,7 +785,10 @@ def _anthropic_exit_check():
     401 authentication_error (без ключа) = exit обслуживается API; 403 без cf-challenge =
     Anthropic не обслуживает этот выход (регион/бан); заголовок `cf-mitigated: challenge` =
     Cloudflare бот-челлендж — проба недостоверна (не регион, канал мог быть годен);
-    no-response/timeout = unknown (живость канала скажут соседние чеки). Тело/заголовки
+    no-response/timeout/rc≠0 = unknown (живость канала скажут соседние чеки). rc-гейт
+    обязателен: CONNECT прокси успевает попасть в stdout и при мёртвом транспорте —
+    без гейта «200 established» читался бы как «exit годен» (401/403/5xx при полном
+    ответе дают rc=0, значит rc≠0 строго транспортный). Тело/заголовки
     читаются (в отличие от `_tunnel_target_up`, у которого `-o /dev/null`). Не бросает.
     """
     cmd = [CURL, "-sS", "-i", "--connect-timeout", "4", "--max-time", "10",
@@ -790,12 +796,17 @@ def _anthropic_exit_check():
     r = sys_probe.run(cmd, timeout=12)
     if r.get("timeout"):
         return {"status": "unknown", "detail": "probe timeout"}
+    if r.get("rc") not in (0, None):
+        return {"status": "unknown",
+                "detail": f"no-response (rc={r.get('rc')}, {(r.get('err') or '')[:60]})"}
     out = r.get("out") or ""
     # curl через http-прокси с -i выдаёт СНАЧАЛА ответ CONNECT самого прокси
     # («HTTP/1.1 200 Connection established»), целевой ответ — последним блоком
-    # (живой захват 2026-10-08). Берём последний HTTP-блок, а не первый.
+    # (живой захват 2026-10-08). Берём последний блок с ВАЛИДНЫМ статус-форматом,
+    # мусорные «HTTP/200 …» в теле не статусные.
     lines = out.splitlines()
-    status_idx = [i for i, ln in enumerate(lines) if ln.upper().startswith("HTTP/")]
+    status_idx = [i for i, ln in enumerate(lines)
+                  if _HTTP_STATUS_RE.match(ln.upper())]
     if not status_idx:
         return {"status": "unknown",
                 "detail": f"no-response ({(r.get('err') or '')[:60]})"}
@@ -860,6 +871,8 @@ def _xray_config_freshness_check():
     warn-чек, не driver: живость канала — пробы портов/туннеля. Не бросает.
     """
     try:
+        # NB: sync-чек читает замороженную health._XRAY_CONFIG_PATH, здесь — живой
+        # local_state_xray.XRAY_CONFIG_PATH; в проде равны, но патч-поинты разные
         cfg_mtime = Path(local_state_xray.XRAY_CONFIG_PATH).stat().st_mtime
     except OSError as exc:
         return {"status": "unknown", "detail": f"конфиг недоступен: {exc}"}

@@ -125,6 +125,32 @@ def test_anthropic_exit_no_response_is_unknown(monkeypatch):
     assert health_probes._anthropic_exit_check()["status"] == "unknown"
 
 
+def test_anthropic_exit_transport_death_after_connect_is_unknown(monkeypatch):
+    """CONNECT прокси успел («200 established» в stdout), транспорт умер после
+    (curl exit 56/35/28 — RST внутри туннеля, смерть relay). Единственный HTTP-блок —
+    преамбула: без rc-гейта это читалось как «exit годен (HTTP 200)» — класс лжи
+    инцидента-2026-10-08. rc≠0 строго транспортный: 401/403/5xx при полном ответе дают rc=0."""
+    _mock_run(monkeypatch, out="HTTP/1.1 200 Connection established\r\n\r\n", rc=56)
+    chk = health_probes._anthropic_exit_check()
+    assert chk["status"] == "unknown", f"мёртвый транспорт не «годен»: {chk}"
+
+
+def test_anthropic_exit_garbage_http_line_in_body_is_not_status(monkeypatch):
+    """Мусорная «HTTP/200 mid-stream» в теле — не статус-формат: не должна стать
+    статусной строкой (иначе 403 деградирует в unknown по пустому коду)."""
+    live = ("HTTP/1.1 200 Connection established\r\n"
+            "\r\n"
+            "HTTP/2 403\r\n"
+            "content-type: application/json\r\n"
+            "\r\n"
+            "HTTP/200 mid-stream garbage\n"
+            '{"type":"error","error":{"type":"not_allowed_error"}}')
+    _mock_run(monkeypatch, out=live)
+    chk = health_probes._anthropic_exit_check()
+    assert chk["status"] == "warn", f"403 обязан классифицироваться: {chk}"
+    assert "не обслуживает" in chk["detail"]
+
+
 def test_anthropic_exit_5xx_is_warn_upstream(monkeypatch):
     live = "HTTP/2 502\r\ncontent-type: text/html\r\n\r\nbad gateway"
     _mock_run(monkeypatch, out=live)
@@ -181,6 +207,30 @@ def test_freshness_unparseable_etime_is_unknown(monkeypatch, tmp_path):
     monkeypatch.setattr(local_state_xray, "XRAY_CONFIG_PATH", str(cfg))
     _mock_xray_procs(monkeypatch, etime="garbage")
     assert health_probes._xray_config_freshness_check()["status"] == "unknown"
+
+
+def test_freshness_multiple_pids_uses_oldest(monkeypatch, tmp_path):
+    """Несколько xray-процессов (прецедент orphan-второго #330): warn определяется
+    СТАРЕЙШИМ etime, а не первым попавшимся pid (мутант «взять pids[0]» обязан умирать)."""
+    import os
+    cfg = tmp_path / "config.json"
+    cfg.write_text("{}", encoding="utf-8")
+    old = time.time() - 3600  # mtime час назад
+    os.utime(cfg, (old, old))
+    monkeypatch.setattr(local_state_xray, "XRAY_CONFIG_PATH", str(cfg))
+
+    def fake(cmd, timeout, **kw):
+        if cmd[0] == health_probes.PGREP:
+            return {"rc": 0, "out": "111\n222\n", "err": "", "timeout": False}
+        if cmd[0] == health_probes.PS:
+            et = "00:01:00" if cmd[2] == "111" else "02:00:00"  # 222 — старейший
+            return {"rc": 0, "out": et, "err": "", "timeout": False}
+        raise AssertionError(f"неожиданная команда {cmd}")
+
+    monkeypatch.setattr(health_probes.sys_probe, "run", fake)
+    chk = health_probes._xray_config_freshness_check()
+    assert chk["status"] == "warn", (
+        f"конфиг (1ч) новее старейшего процесса (2ч) → рестарт не применён: {chk}")
 
 
 # ---------- интеграция check_all ----------

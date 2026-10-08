@@ -171,6 +171,11 @@ def _passive_health(monkeypatch):
                         lambda: {"status": "unknown", "source": "n/a", "detail": "Claude.app не запущен (mock)"})
     monkeypatch.setattr(health, "_desktop_proxy_check",
                         lambda: {"status": "unknown", "detail": "launchctl (mock)"})
+    # #408: новые doctor-чеки дёргают реальный curl/pgrep — та же изоляция (#252 канон)
+    monkeypatch.setattr(health, "_anthropic_exit_check",
+                        lambda: {"status": "ok", "detail": "mock: 401"})
+    monkeypatch.setattr(health, "_xray_config_freshness_check",
+                        lambda: {"status": "ok", "detail": "mock: конфиг свежий"})
     monkeypatch.setattr(health, "_resolve_host", lambda host: True)
     monkeypatch.setattr(health, "_service_running", lambda label, domain=None: "running")
     monkeypatch.setattr(health, "_installed_versions_check",
