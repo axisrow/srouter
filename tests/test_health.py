@@ -850,8 +850,9 @@ def test_check_all_light_path_skips_network_known(monkeypatch):
     assert result["status"] == "ok"
 
 
-def test_check_all_down_when_everything_dead(monkeypatch):
+def test_check_all_down_when_everything_dead(monkeypatch, tmp_path):
     """Всё мертво → down (не degraded, не ok)."""
+    monkeypatch.setattr(health, "DASHBOARD_ERR_LOG", tmp_path / "absent.err.log")
     monkeypatch.setattr(health, "_port_up", lambda port: False)
     monkeypatch.setattr(health, "_tunnel_up", lambda *a, **k: (False, "connection-failed", False, None))
     monkeypatch.setattr(health, "_claude_proxy_probe",
@@ -1037,12 +1038,13 @@ def test_vps_placeholder_detector_matches_canonical(monkeypatch):
             f"{host!r} — НЕ TEST-NET placeholder, health не должен звать его warn"
 
 
-def test_vps_unreachable_does_not_mask_down_into_degraded(monkeypatch):
+def test_vps_unreachable_does_not_mask_down_into_degraded(monkeypatch, tmp_path):
     """REGRESSION-гвард #194: VPS-unreachable при «всё мертво» НЕ превращает down в degraded.
 
     Защита от будущей регрессии: если кто-то сделает VPS-чек driver-ok=True (или info) при
     unreachable — проверка упадёт. status обязан остаться down, VPS-чек — driver ok=False.
     """
+    monkeypatch.setattr(health, "DASHBOARD_ERR_LOG", tmp_path / "absent.err.log")
     monkeypatch.setattr(health, "_port_up", lambda port: False)
     monkeypatch.setattr(health, "_tunnel_up", lambda *a, **k: (False, "connection-failed", False, None))
     monkeypatch.setattr(health, "_claude_proxy_probe",
@@ -1622,10 +1624,11 @@ def test_check_all_surfaces_registration_mode_facet_as_info(monkeypatch):
 # Интеграция в check_all: DRIVER когда туннель fail (проблема в локальном прокси, VPS жив/н/д).
 # Туннель ok → info (картина, не driver — порты уже driver через _port_up чеки выше).
 
-def test_local_proxy_driver_down_when_tunnel_fail_and_port_closed(monkeypatch):
+def test_local_proxy_driver_down_when_tunnel_fail_and_port_closed(monkeypatch, tmp_path):
     """ДЫРА #204: туннель fail + локальный прокси down (port closed) → driver. Раньше туннель-fail
     без причины. Теперь _local_proxy_up объясняет: «локальный прокси упал — restart»."""
     _all_up_monkey(monkeypatch)  # порты/claude/codex/app/desktop — ok/info, не роняют
+    monkeypatch.setattr(health, "DASHBOARD_ERR_LOG", tmp_path / "absent.err.log")
     monkeypatch.setattr(health, "_tunnel_up", lambda *a, **k: (False, "connection-failed", False, None))
     # VPS жив (info-only, не маскирует локальный прокси) — различение от ситуации #2 (#194):
     _mock_active_node(monkeypatch, {"name": "vps-1", "endpoint_host": "198.51.100.7", "port": 443})

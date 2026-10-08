@@ -252,24 +252,39 @@ def _network_known_check():
     return {"status": "ok", "detail": st["label"]}
 
 
+_CRASHLOG_FRESH_SEC = 900  # crash-loop KeepAlive переписывает err.log каждые ~10с; 15 мин — щедрый коридор
+
+
 def _dashboard_check():
     """Порт дашборда + диагноз crash-loop'а по сигнатуре err.log (инцидент 2026-10-08).
 
-    Порт мёртв, а хвост err.log содержит ModuleNotFoundError → демон запущен питоном
-    без зависимостей пакета (классика: plist отрендерен /usr/bin/python3 без flask
-    при ./install.sh apply) — detail даёт ремонт (SROUTER_PYTHON / переустановка).
-    Другая причина или лога нет — чек прежнего вида, без detail (не выдумываем диагноз,
-    канон no-diagnosis-without-evidence). Не бросает (hot_routes._read_tail fail-soft).
+    Порт мёртв, а хвост err.log содержит СВЕЖИЙ ModuleNotFoundError → демон запущен
+    питоном без зависимостей пакета (классика: plist отрендерен /usr/bin/python3 без
+    flask) — detail даёт ремонт (SROUTER_PYTHON / переустановку) и давность записи.
+    Свежесть обязательна: launchd дописывает в StandardErrorPath годами (не ротирует
+    ни stop, ни выгрузка plist) — старая сигнатура (осознанный stop с хвостом давнего
+    инцидента) не evidence, иначе ложный диагноз утекает в форензику watchdog (#401).
+    Crash-loop перезаписывает лог на каждой KeepAlive-попытке → true positive всегда
+    свежий. Другая причина или лога нет — чек прежнего вида, без detail (не выдумываем
+    диагноз, канон no-diagnosis-without-evidence). Не бросает (hot_routes._read_tail
+    fail-soft).
     """
     chk = {"name": f"dashboard ({DASHBOARD_PORT})", "ok": _port_up(DASHBOARD_PORT)}
     if chk["ok"]:
         return chk
     text = "\n".join(hot_routes._read_tail(DASHBOARD_ERR_LOG, max_lines=40, max_bytes=8192))
     hit = re.search(r"No module named '([^']+)'", text)
-    if hit:
-        chk["detail"] = (f"демон crash-loop: python в plist без модуля '{hit.group(1)}' — "
-                         "ремонт: SROUTER_PYTHON=<python с зависимостями> "
-                         "srouter install (или переустановить пакет)")
+    if not hit:
+        return chk
+    try:
+        age_sec = max(0, int(time.time() - DASHBOARD_ERR_LOG.stat().st_mtime))
+    except OSError:
+        return chk
+    if age_sec > _CRASHLOG_FRESH_SEC:
+        return chk
+    chk["detail"] = (f"демон crash-loop: python в plist без модуля '{hit.group(1)}' "
+                     f"(запись {age_sec} сек назад) — ремонт: SROUTER_PYTHON=<python "
+                     "с зависимостями> srouter install (или переустановить пакет)")
     return chk
 
 

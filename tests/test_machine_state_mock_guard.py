@@ -114,7 +114,10 @@ _SAFE_WITHOUT_DIRECT_MOCK = {
     # целей _tunnel_up (который в check_all-тестах всё равно замокан) — на вердикт не влияет.
     "_dashboard_check",  # 2026-10-08: единственный syscall — _port_up (мокан в _all_up_monkey);
     # err-лог читается ТОЛЬКО в ветке ok=False (через hot_routes._read_tail, fail-soft), в
-    # all-up сценарии рано выходит — machine-dependent чтения не происходит.
+    # all-up сценарии рано выходит. Честная оговорка: в down-path тестах чтение РЕАЛЬНОГО
+    # err.log происходит (и может подставить detail на dev-машине с хвостом инцидента), но
+    # ни один тест не ассертит dashboard-чек по detail/форме — вердикт ok=False
+    # детерминирован. Тест, чувствительный к detail — замокай явно и убери из allowlist.
 }
 
 
