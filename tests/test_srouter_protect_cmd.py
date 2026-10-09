@@ -18,8 +18,9 @@ import srouter_cli
 
 
 def _args(action="on", state=None):
-    """args как argparse отдаёт для `srouter protect <action> [--state]`."""
-    return SimpleNamespace(protect_action=action, state=state)
+    """args как argparse отдаёт для `srouter protect <action> [--state]` (canonical
+    ставит set_defaults парсера; алиасы — те же parser-объекты, см. build_parser)."""
+    return SimpleNamespace(protect_action=action, canonical=action, state=state)
 
 
 def _stub_isolate(monkeypatch, *, enable=None, disable=None, probe=None):
@@ -58,6 +59,7 @@ def _stub_lease(monkeypatch, *, lease=None):
         load_active_isolate=lambda path=None: lease,
         save_active_isolate=save_active_isolate,
         clear_active_isolate=clear_active_isolate,
+        preflight_state_write=lambda path=None: True,
     ))
     return calls
 
@@ -78,7 +80,6 @@ def test_protect_on_enables_strict_and_persists_lease(monkeypatch, capsys):
     saved = lease_calls["save"][0]
     assert saved["phase"] == "strict"
     assert str(saved["token"]) == "777"
-    assert saved["enabled"] is True
 
 
 def test_protect_on_refuses_when_lease_active_without_pf_call(monkeypatch, capsys):
@@ -114,6 +115,21 @@ def test_protect_on_missing_token_refuses(monkeypatch, capsys):
     assert rc == 1
     assert lease_calls["save"] == []
     assert calls["enable"] == 1
+
+
+def test_protect_on_preflight_fail_refuses_before_pf(monkeypatch, capsys):
+    """preflight_state_write False → отказ rc 1 ДО pfctl (гейт #68 как в /api/isolate/enable):
+    GUI-пароль и pf-ref не сжигаются."""
+    calls = _stub_isolate(monkeypatch)
+    lease_calls = _stub_lease(monkeypatch)
+    monkeypatch.setattr(srouter_cli.local_state, "preflight_state_write",
+                        lambda path=None: False)
+    rc = srouter_cli.cmd_protect(_args("on"))
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "недоступен на запись" in out
+    assert calls["enable"] == 0, "pf-ref не создаётся до доказанного save-пути"
+    assert lease_calls["save"] == []
 
 
 def test_protect_on_save_rollback(monkeypatch, capsys):
@@ -173,14 +189,21 @@ _STRICT_PROBE = {"status": "warn", "phase": "strict", "domains": [], "ips": {},
 
 
 def test_protect_status_strict_is_normal_steady_state(monkeypatch, capsys):
-    """status при phase=strict → «ВКЛ» как норма (probe-warn бут-семантики не протекает)."""
-    _stub_isolate(monkeypatch, probe=lambda state_path=None: dict(_STRICT_PROBE))
-    _stub_lease(monkeypatch)
+    """status при phase=strict → «ВКЛ» как норма (probe-warn бут-семантики не протекает);
+    --state пробрасывается в probe (status работает с тем же state, что on/off)."""
+    seen = {}
+
+    def probe(state_path=None):
+        seen["state_path"] = state_path
+        return dict(_STRICT_PROBE)
+
+    _stub_isolate(monkeypatch, probe=probe)
     rc = srouter_cli.cmd_protect(_args("status"))
     out = capsys.readouterr().out
     assert rc == 0
     assert "ВКЛ" in out
     assert "warn" not in out
+    assert seen["state_path"] is None, "дефолтный --state доходит до probe"
 
 
 def test_protect_status_working(monkeypatch, capsys):
@@ -189,7 +212,6 @@ def test_protect_status_working(monkeypatch, capsys):
              "ips": {"api.anthropic.com": ["160.79.104.10"]}, "unresolved": [],
              "ports": [80, 443], "applied_at": 1234}
     _stub_isolate(monkeypatch, probe=lambda state_path=None: probe)
-    _stub_lease(monkeypatch)
     rc = srouter_cli.cmd_protect(_args("status"))
     out = capsys.readouterr().out
     assert rc == 0
@@ -200,7 +222,6 @@ def test_protect_status_working(monkeypatch, capsys):
 def test_protect_status_down_exit_1(monkeypatch, capsys):
     _stub_isolate(monkeypatch, probe=lambda state_path=None: {"status": "down",
                                                               "phase": "none"})
-    _stub_lease(monkeypatch)
     rc = srouter_cli.cmd_protect(_args("status"))
     out = capsys.readouterr().out
     assert rc == 1
@@ -211,7 +232,6 @@ def test_protect_status_unknown_exit_2(monkeypatch, capsys):
     _stub_isolate(monkeypatch, probe=lambda state_path=None: {"status": "unknown",
                                                               "phase": "none",
                                                               "error": "битый state"})
-    _stub_lease(monkeypatch)
     rc = srouter_cli.cmd_protect(_args("status"))
     captured = capsys.readouterr()
     assert rc == 2
@@ -230,10 +250,14 @@ def test_protect_parser_wires_func_and_accepts_aliases():
 
 
 def test_protect_alias_enable_maps_to_on(monkeypatch, capsys):
-    """Алиас enable ведёт себя как on (включает и пишет lease)."""
+    """Алиас enable через НАСТОЯЩИЙ парсер ведёт себя как on: aliases= — тот же
+    parser-объект, canonical из set_defaults подменяет typed-спеллинг алиаса."""
+    # build_parser ДО стаба local_state: дефолты парсера читают реальный модуль.
+    args = srouter_cli.build_parser().parse_args(["protect", "enable"])
     calls = _stub_isolate(monkeypatch)
     lease_calls = _stub_lease(monkeypatch)
-    rc = srouter_cli.cmd_protect(_args("enable"))
+    assert args.canonical == "on"
+    rc = srouter_cli.cmd_protect(args)
     assert rc == 0
     assert calls["enable"] == 1
     assert len(lease_calls["save"]) == 1

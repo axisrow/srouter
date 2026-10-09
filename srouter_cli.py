@@ -881,8 +881,9 @@ def cmd_protect(args) -> int:
     режима strict это норма, рендерим как steady-state. Слово «isolate» отвергнуто
     пользователем как сложное (2026-10-09); aliases enable/disable/вкл/выкл.
     """
-    action = getattr(args, "protect_action", "status")
-    action = {"enable": "on", "disable": "off", "вкл": "on", "выкл": "off"}.get(action, action)
+    # canonical ставит set_defaults парсера (алиасы add_parser aliases= — те же
+    # parser-объекты): истина алиасов в одном месте, dict-нормализация не нужна.
+    action = getattr(args, "canonical", None) or getattr(args, "protect_action", "status")
     state = getattr(args, "state", None)
 
     if action == "on":
@@ -891,6 +892,12 @@ def cmd_protect(args) -> int:
             print(f"protect: защита уже включена (phase={lease.get('phase')}, "
                   f"с {lease.get('applied_at')}). Сначала: srouter protect off")
             return 1
+        # Preflight writability (#68): доказать atomic-write путь ДО pf enable-ref —
+        # тот же гейт, что у роута /api/isolate/enable (dashboard_routes:625), иначе
+        # сожжём GUI-пароль и pf-ref и только потом узнаем про неписабельный state.
+        if not local_state.preflight_state_write(state):
+            print("protect: отказ — state недоступен на запись, pf-ref не создаю.")
+            return 1
         r = isolate_firewall.enable_strict()
         if r.get("cancelled"):
             print("protect: включение отменено — пароль не введён.")
@@ -898,12 +905,11 @@ def cmd_protect(args) -> int:
         if r.get("timeout"):
             print("protect: не удалось включить: timeout pfctl.", file=sys.stderr)
             return 2
-        if not r.get("ok") or not r.get("token"):
-            # ok без token — ref-течь (isolate_firewall сам помечает ok=False).
-            print(f"protect: не включён ({r.get('err') or 'нет release-token'}).")
+        if not r.get("ok"):
+            # enable_strict сам помечает ok=False при отсутствующем token (ref-течь).
+            print(f"protect: не включён ({r.get('err')}).")
             return 1
-        entry = {"enabled": True, "domains": [], "ips": {}, "unresolved": [],
-                 "ports": [80, 443], "token": r["token"],
+        entry = {"domains": [], "ports": [80, 443], "token": r["token"],
                  "applied_at": int(time.time()), "phase": "strict"}
         if local_state.save_active_isolate(entry, state) is None:
             # Зеркало rollback'а роута /api/isolate/enable (dashboard_routes:646-651):
@@ -938,16 +944,17 @@ def cmd_protect(args) -> int:
         return 0
 
     if action == "status":
-        p = isolate_firewall.probe_isolation()
+        p = isolate_firewall.probe_isolation(state_path=state)
         if p.get("status") == "unknown":
             print(f"protect: статус нечитаем ({p.get('error')}).", file=sys.stderr)
             return 2
         if p.get("phase") == "strict":
             print("Защита: ВКЛ (строгий режим — подсети Anthropic отрезаны напрямую, "
                   f"с {p.get('applied_at')}).")
-            print("  Агенты авто-режима (isolate/escape) не загружены: снимается только "
-                  "вручную — srouter protect off; аварийно: "
-                  "sudo pfctl -a com.apple/srouter_isolate -F all")
+            print("  Статус — по lease (без pfctl): защита действует, пока не снята. "
+                  "Если загружены авто-агенты isolate/escape, strict мог быть снят ими "
+                  "уже — проверка ядра: sudo pfctl -s Anchors. Ручное снятие: "
+                  "srouter protect off; аварийно: sudo pfctl -a com.apple/srouter_isolate -F all")
             return 0
         if p.get("phase") == "working":
             n = sum(len(v) for v in (p.get("ips") or {}).values())
@@ -1453,18 +1460,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Вкл/выкл PF-изоляции Anthropic: protect on | off | status "
              "(алиасы enable/disable/вкл/выкл).")
     p_pr_sub = p_protect.add_subparsers(dest="protect_action", required=True)
-    for sub_name, sub_help in (
-        ("on", "Включить (строгий режим: подсети Anthropic; спросит пароль админа)."),
-        ("off", "Выключить: снять якорь PF и lease."),
-        ("status", "Человеческий статус защиты."),
-        ("enable", "Алиас on."),
-        ("disable", "Алиас off."),
-        ("вкл", "Алиас on."),
-        ("выкл", "Алиас off."),
+    for sub_name, aliases, sub_help in (
+        ("on", ("enable", "вкл"),
+         "Включить (строгий режим: подсети Anthropic; спросит пароль админа)."),
+        ("off", ("disable", "выкл"), "Выключить: снять якорь PF и lease."),
+        ("status", (), "Человеческий статус защиты."),
     ):
-        sp = p_pr_sub.add_parser(sub_name, help=sub_help)
+        sp = p_pr_sub.add_parser(sub_name, aliases=aliases, help=sub_help)
         sp.add_argument("--state", default=None, help="Путь к srouter.local.json.")
-        sp.set_defaults(func=cmd_protect)
+        sp.set_defaults(func=cmd_protect, canonical=sub_name)
 
     # netprobe (кампания деградации туннеля 2026-09): LaunchAgent ping'ует участки сети
     # (gateway/domestica/VPS мимо туннеля) раз в 60с; report — корреляция блэкаутов туннеля

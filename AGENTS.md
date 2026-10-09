@@ -68,5 +68,5 @@ Never commit `srouter.local.json`, `srouter_config.py`, `.env*`, real diagnostic
 
 ## Manual PF isolation of Anthropic
 
-`srouter protect on|off|status` (aliases enable/disable/вкл/выкл) — strict mode: subnets `160.79.104.0/21` + `2607:6bc0::/32` are dropped on direct egress interfaces en*/ppp* (ports 80/443). The lease lives in `runtime.active_isolate` with `phase: "strict"` — the same key the dashboard card reads (single state contour); repeated `on` with a live lease refuses BEFORE any pfctl call (each `enable_strict` grabs a new `pfctl -E` ref).
+`srouter protect on|off|status` (aliases enable/disable/вкл/выкл) — strict mode: subnets `160.79.104.0/21` + `2607:6bc0::/32` are dropped on direct egress interfaces en*/ppp* (ports 80/443). The lease lives in `runtime.active_isolate` with `phase: "strict"` — the same key the dashboard card reads (single state contour); repeated `on` with a live lease refuses BEFORE any pfctl call (each `enable_strict` grabs a new `pfctl -E` ref), and `on` runs the same `preflight_state_write` gate as the dashboard route before creating a pf ref. `status` reads the lease only (state-only, no pfctl): if the boot agents (`com.srouter.isolate` / `-escape`) are loaded, the escape hatch may have disabled strict already — verify the kernel side with `sudo pfctl -s Anchors`.
 
