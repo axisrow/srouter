@@ -143,11 +143,15 @@ def _claude_proxy_probe():
     Важно (#127): ESTABLISHED к 10808 доказывает только TCP до SOCKS listener, но не SOCKS
     handshake и не доставку запроса к API. Поэтому 10808 без active real-CLI probe никогда не
     получает ok. External socket остаётся доказательством direct leak — КРОМЕ трёх случаев:
-    endpoint-override в NO_PROXY (прямой ход к endpoint намеренно, lsof endpoint-слеп), external
+    endpoint-override в NO_PROXY (прямой ход к endpoint намеренно), external
     у PID с нечитаемым env (sandbox/чужой UID — HTTPS_PROXY неприменим/непроверяем, атрибуция
     невозможна) и дивергенции exec-env PID от файловского override при активном гейте (дока CC:
     settings.json env перезаписывает exec-env при старте, маршрут по exec-env неверифицируем,
     #337). Все три деградируют в unknown, не down (parity с endpoint-пробой).
+    Карв-аут первого случая (2026-10-09, инцидент claude-desktop): lsof НЕ endpoint-слеп по
+    назначению соединения — peer-IP из lsof-строки в ANTHROPIC_SUBNETS при override и
+    не-anthropic override-хосте = доказанная утечка → down (пир нельзя объяснить прямым ходом
+    к endpoint другого провайдера). Остальные override-пиры — unknown как раньше.
     """
     r = sys_probe.run([PS, "-axo", "pid=,comm="], timeout=3)
     if r.get("timeout"):
