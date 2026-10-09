@@ -60,6 +60,7 @@ from sys_probe import run
 import claude_proxy  # вкл/откл HTTPS_PROXY для Claude Code (~/.claude/settings.json)
 import git_proxy  # issue #130: вкл/откл SOCKS5 github-proxy в ~/.gitconfig (xray 10808)
 import go_proxy  # 2026-09-30: тумблер Go-модулей в обход GFW (goproxy.cn-зеркало / wrapper-туннель)
+import isolate_firewall  # protect: вкл/откл PF-изоляции Anthropic (strict-подсети, 2026-10-09)
 import vscode_proxy  # issue #185: scoped SOCKS5 для codex-расширения через VSCode http.proxy
 import health  # doctor-проверки стека
 import privoxy_audit  # пассивный root-owned аудит lifecycle-команд Privoxy (#122)
@@ -867,6 +868,97 @@ def cmd_go_proxy(args) -> int:
     return 2
 
 
+def cmd_protect(args) -> int:
+    """on|off|status — человековые вкл/выкл PF-изоляции Anthropic (строгий режим).
+
+    on = enable_strict + lease phase="strict" в runtime.active_isolate: дашборд-карточка
+    (/api/isolate) читает ТОТ ЖЕ ключ — без persist она врала бы «выключено» при работающем
+    PF (канон «два контура противоречат» #341). Повторный on при живом lease — отказ БЕЗ
+    pfctl-вызова: enable_strict не идемпотентна (каждый вызов = новый pfctl -E ref).
+    off — disable_strict(token из lease) + clear; без lease disable всё равно зовётся
+    (fail-safe: lease мог потеряться, якорь PF — нет). status — probe_isolation (state-only);
+    probe красит strict как warn по бут-семантике («промежуточная фаза») — для ручного
+    режима strict это норма, рендерим как steady-state. Слово «isolate» отвергнуто
+    пользователем как сложное (2026-10-09); aliases enable/disable/вкл/выкл.
+    """
+    action = getattr(args, "protect_action", "status")
+    action = {"enable": "on", "disable": "off", "вкл": "on", "выкл": "off"}.get(action, action)
+    state = getattr(args, "state", None)
+
+    if action == "on":
+        lease = local_state.load_active_isolate(state)
+        if lease is not None:
+            print(f"protect: защита уже включена (phase={lease.get('phase')}, "
+                  f"с {lease.get('applied_at')}). Сначала: srouter protect off")
+            return 1
+        r = isolate_firewall.enable_strict()
+        if r.get("cancelled"):
+            print("protect: включение отменено — пароль не введён.")
+            return 1
+        if r.get("timeout"):
+            print("protect: не удалось включить: timeout pfctl.", file=sys.stderr)
+            return 2
+        if not r.get("ok") or not r.get("token"):
+            # ok без token — ref-течь (isolate_firewall сам помечает ok=False).
+            print(f"protect: не включён ({r.get('err') or 'нет release-token'}).")
+            return 1
+        entry = {"enabled": True, "domains": [], "ips": {}, "unresolved": [],
+                 "ports": [80, 443], "token": r["token"],
+                 "applied_at": int(time.time()), "phase": "strict"}
+        if local_state.save_active_isolate(entry, state) is None:
+            # Зеркало rollback'а роута /api/isolate/enable (dashboard_routes:646-651):
+            # PF включён, но контур состояния не записан — снимать, а не оставлять
+            # «включено-невидимо».
+            isolate_firewall.disable_strict(r["token"])
+            print("protect: PF включён, но lease не записан — откатил "
+                  "(state недоступен на запись?).", file=sys.stderr)
+            return 2
+        print("Защита включена: Anthropic отрезан от прямого доступа "
+              "(строгий режим: подсети 160.79.104.0/21, 2607:6bc0::/32; порты 80/443). "
+              "Снять: srouter protect off")
+        return 0
+
+    if action == "off":
+        lease = local_state.load_active_isolate(state)
+        r = isolate_firewall.disable_strict(lease.get("token") if lease else None)
+        if r.get("cancelled"):
+            print("protect: выключение отменено — пароль не введён.")
+            return 1
+        if r.get("timeout"):
+            print("protect: не удалось снять: timeout pfctl.", file=sys.stderr)
+            return 2
+        if not r.get("ok"):
+            print(f"protect: не снята ({r.get('err')}).")
+            return 1
+        if lease:
+            local_state.clear_active_isolate(state)
+            print("Защита снята.")
+        else:
+            print("Защита и так была выключена (lease нет; якорь PF сброшен на всякий случай).")
+        return 0
+
+    if action == "status":
+        p = isolate_firewall.probe_isolation()
+        if p.get("status") == "unknown":
+            print(f"protect: статус нечитаем ({p.get('error')}).", file=sys.stderr)
+            return 2
+        if p.get("phase") == "strict":
+            print("Защита: ВКЛ (строгий режим — подсети Anthropic отрезаны напрямую, "
+                  f"с {p.get('applied_at')}).")
+            print("  Агенты авто-режима (isolate/escape) не загружены: снимается только "
+                  "вручную — srouter protect off; аварийно: "
+                  "sudo pfctl -a com.apple/srouter_isolate -F all")
+            return 0
+        if p.get("phase") == "working":
+            n = sum(len(v) for v in (p.get("ips") or {}).values())
+            print(f"Защита: ВКЛ (режим доменов: {n} IP, порты {p.get('ports')}). "
+                  "Управление: карточка дашборда / srouter protect off")
+            return 0
+        print("Защита: ВЫКЛ — Anthropic может ходить напрямую. Включить: srouter protect on")
+        return 1
+    return 2
+
+
 def cmd_sync(args) -> int:
     """Синхронизировать endpoint активного узла из РАБОЧЕГО xray config в srouter.local.json (#200).
 
@@ -1352,6 +1444,27 @@ def build_parser() -> argparse.ArgumentParser:
             sp.add_argument("--force", action="store_true",
                             help="Снять и ЧУЖИЕ значения (снятое печатается).")
         sp.set_defaults(func=cmd_go_proxy)
+
+    # protect (2026-10-09): человековые вкл/выкл PF-изоляции Anthropic (strict-подсети).
+    # Слово «isolate» отвергнуто пользователем; lease phase="strict" совместим с
+    # дашборд-карточкой (один ключ runtime.active_isolate — один контур, канон #341).
+    p_protect = sub.add_parser(
+        "protect",
+        help="Вкл/выкл PF-изоляции Anthropic: protect on | off | status "
+             "(алиасы enable/disable/вкл/выкл).")
+    p_pr_sub = p_protect.add_subparsers(dest="protect_action", required=True)
+    for sub_name, sub_help in (
+        ("on", "Включить (строгий режим: подсети Anthropic; спросит пароль админа)."),
+        ("off", "Выключить: снять якорь PF и lease."),
+        ("status", "Человеческий статус защиты."),
+        ("enable", "Алиас on."),
+        ("disable", "Алиас off."),
+        ("вкл", "Алиас on."),
+        ("выкл", "Алиас off."),
+    ):
+        sp = p_pr_sub.add_parser(sub_name, help=sub_help)
+        sp.add_argument("--state", default=None, help="Путь к srouter.local.json.")
+        sp.set_defaults(func=cmd_protect)
 
     # netprobe (кампания деградации туннеля 2026-09): LaunchAgent ping'ует участки сети
     # (gateway/domestica/VPS мимо туннеля) раз в 60с; report — корреляция блэкаутов туннеля
