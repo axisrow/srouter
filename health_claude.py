@@ -6,6 +6,7 @@ health.py остаётся тонким фасадом: `from health_claude impo
 `health` module продолжают работать без изменений.
 """
 from pathlib import Path
+import ipaddress
 import json
 import logging
 import os
@@ -17,6 +18,11 @@ import sys_probe
 import proxy_config_contract as _contract
 from health_constants import _PROXY, PRIVOXY_PORT, XRAY_PORT
 
+try:
+    from isolate_firewall import ANTHROPIC_SUBNETS  # канон подсетей Anthropic (PF strict-фаза)
+except ImportError:  # частичная установка — канон остаётся в isolate_firewall (паттерн claude_proxy._PROXY)
+    ANTHROPIC_SUBNETS = ("160.79.104.0/21", "2607:6bc0::/32")
+
 import health as _health_facade  # noqa: E402 — резолвит intra-module вызовы через health для monkeypatch (канон #158)
 
 _log = logging.getLogger("srouter.health")
@@ -27,6 +33,7 @@ __all__ = [
     "_find_claude_binary", "_has_expected_api_401", "_has_api_retry",
     "_claude_transport_once", "_configured_claude_proxy", "_claude_transport_probe",
     "_proxy_env_consistency", "_no_proxy_direct_check",
+    "_peer_ip_of", "_peer_in_anthropic_subnets", "_is_anthropic_provider_host",
     "NO_PROXY_MAX_CANDIDATES", "NO_PROXY_PROBE_CONNECT_TIMEOUT", "NO_PROXY_PROBE_MAX_TIME",
     "CLAUDE_TRANSPORT_TIMEOUT", "CLAUDE_API_BASE_URL", "CLAUDE_DUMMY_API_KEY",
     "CONTROL_PROBE_TIMEOUT",
@@ -64,6 +71,49 @@ def _is_claude_code_comm(comm):
     return "/claude/versions/" in comm
 
 
+_ANTHROPIC_PROVIDER_SUFFIXES = ("anthropic.com", "claude.ai", "claude.com")
+
+
+def _is_anthropic_provider_host(host):
+    """Override-host сам Anthropic (api.anthropic.com/platform.claude.com/claude.ai)?
+    Тогда прямой пир в ANTHROPIC_SUBNETS — BY DESIGN (provider direct-first), не утечка.
+    exact или поддомен; lookalike ('notanthropic.com') не цепляется (урок #131)."""
+    h = (host or "").lower().rstrip(".")
+    return any(h == s or h.endswith("." + s) for s in _ANTHROPIC_PROVIDER_SUFFIXES)
+
+
+def _peer_ip_of(line):
+    """Peer-IP из lsof-строки '... TCP local->peer (STATE)' (-nP: всегда литерал). None если нет.
+
+    IPv6 со скобками: '[2607:6bc0::10]:443' → rsplit по последнему ':' отделяет порт, strip('[]')
+    снимает скобки. Доказуемая атрибуция назначения соединения (2026-10-09) — сильнее exec-env.
+    """
+    try:
+        pair = line.split("TCP", 1)[1].split("(", 1)[0].strip()
+        peer = pair.split("->", 1)[1].rsplit(":", 1)[0].strip("[]")
+        return str(ipaddress.ip_address(peer))
+    except (IndexError, ValueError):
+        return None
+
+
+def _peer_in_anthropic_subnets(peer):
+    """Пир в собственных подсетях Anthropic (канон isolate_firewall.ANTHROPIC_SUBNETS)?
+
+    Fail-soft: нераспарсиваемая подсеть/адрес → False (семантика пробы не меняется).
+    """
+    try:
+        addr = ipaddress.ip_address(peer)
+    except ValueError:
+        return False
+    for subnet in ANTHROPIC_SUBNETS:
+        try:
+            if addr in ipaddress.ip_network(subnet):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
 def _claude_code_pids():
     """CC PID'ы через `ps -axo pid=,comm=` (#143 — общий источник для runtime env-чека).
 
@@ -93,11 +143,15 @@ def _claude_proxy_probe():
     Важно (#127): ESTABLISHED к 10808 доказывает только TCP до SOCKS listener, но не SOCKS
     handshake и не доставку запроса к API. Поэтому 10808 без active real-CLI probe никогда не
     получает ok. External socket остаётся доказательством direct leak — КРОМЕ трёх случаев:
-    endpoint-override в NO_PROXY (прямой ход к endpoint намеренно, lsof endpoint-слеп), external
+    endpoint-override в NO_PROXY (прямой ход к endpoint намеренно), external
     у PID с нечитаемым env (sandbox/чужой UID — HTTPS_PROXY неприменим/непроверяем, атрибуция
     невозможна) и дивергенции exec-env PID от файловского override при активном гейте (дока CC:
     settings.json env перезаписывает exec-env при старте, маршрут по exec-env неверифицируем,
     #337). Все три деградируют в unknown, не down (parity с endpoint-пробой).
+    Карв-аут первого случая (2026-10-09, инцидент claude-desktop): lsof НЕ endpoint-слеп по
+    назначению соединения — peer-IP из lsof-строки в ANTHROPIC_SUBNETS при override и
+    не-anthropic override-хосте = доказанная утечка → down (пир нельзя объяснить прямым ходом
+    к endpoint другого провайдера). Остальные override-пиры — unknown как раньше.
     """
     r = sys_probe.run([PS, "-axo", "pid=,comm="], timeout=3)
     if r.get("timeout"):
@@ -118,6 +172,7 @@ def _claude_proxy_probe():
     if lr.get("timeout"):
         return {"status": "unknown", "source": "n/a", "detail": "timeout lsof"}
     proxy_pids, socks_pids, external_pids = set(), set(), set()
+    external_peers = {}  # pid -> {peer-IP}: назначение соединения (атрибуция 2026-10-09)
     for line in (lr.get("out") or "").splitlines():
         if "TCP" not in line or "ESTABLISHED" not in line:
             continue
@@ -131,6 +186,9 @@ def _claude_proxy_probe():
             # external ESTABLISHED (не localhost) — похоже на «CC идёт напрямую, мимо прокси»;
             # финальное решение — после #329-гейта и env-атрибуции ниже.
             external_pids.add(pid)
+            peer = _peer_ip_of(line)
+            if peer:
+                external_peers.setdefault(pid, set()).add(peer)
 
     # #329: endpoint-override в NO_PROXY — CC ходит к endpoint напрямую BY DESIGN
     # (канон zai-direct-no-proxy). lsof отдаёт numeric IP без hostname: прямое соединение к
@@ -141,7 +199,29 @@ def _claude_proxy_probe():
     if ov["overridden"]:
         detail = (f"endpoint override {ov['base_url']} в NO_PROXY — прямое соединение CC "
                   f"намеренно (direct-first); claude-proxy проба при override неприменима "
-                  f"(lsof не различает endpoint и утечку)")
+                  f"(lsof не различает endpoint и утечку — кроме пиров в ANTHROPIC_SUBNETS, "
+                  f"см. ниже)")
+        # 2026-10-09 (инцидент claude-desktop): lsof отдаёт не только факт external, но и
+        # НАЗНАЧЕНИЕ соединения. Пир в собственных подсетях Anthropic не объясняется
+        # files-override другого провайдера (пир ≠ endpoint) — атрибуция доказуема без
+        # exec-env. down БЕЗ флага overridden: гейт #362 прячет в observe только
+        # unknown/flagged, доказанная утечка должна драйвить вердикт и пуш.
+        if external_pids and not _is_anthropic_provider_host(ov.get("host", "")):
+            anth_pids = {p for p in external_pids
+                         if any(_peer_in_anthropic_subnets(ip)
+                                for ip in external_peers.get(p, ()))}
+            if anth_pids:
+                peers_note = "; ".join(
+                    f"PID {p} (peer {', '.join(sorted(external_peers.get(p, ())))})"
+                    for p in sorted(anth_pids))
+                return {"status": "down", "source": "runtime",
+                        "detail": (f"runtime: Claude Code идёт НАПРЯМУЮ к Anthropic "
+                                   f"(peer в ANTHROPIC_SUBNETS) — нарушение fail-closed. "
+                                   f"{peers_note}; endpoint-override "
+                                   f"{ov['base_url']} в NO_PROXY не объясняет этот пир "
+                                   f"(провайдер не anthropic-хост): процесс не применил "
+                                   f"HTTPS_PROXY. Проверь env обёртки запуска "
+                                   f"(ожидается http://127.0.0.1:8118)")}
         if external_pids:
             # #337: exec-env PID (ps eww) выглядит иначе, чем файлы (класс #143: живой CC
             # запущен раньше / без раздачи override при рождении). Но дока CC: settings.json
