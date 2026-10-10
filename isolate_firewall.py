@@ -116,6 +116,14 @@ CODEX_USER_REALNAME = "srouter codex"             # RealName (Системные
 CODEX_USER_SHELL = "/usr/bin/false"               # не-login (эталон nobody)
 CODEX_USER_HOME = "/var/empty"                    # без HOME (эталон nobody)
 DSCL = "/usr/bin/dscl"                            # абсолютный путь (shell-safe, канон _admin_run)
+# Удаление записи пользователя — ТОЛЬКО через sysadminctl (canon verify 2026-10-10): policy-
+# прослойка macOS (accountPolicyData) отказывает сырому `dscl . -delete` даже под root
+# (eDSPermissionError -14120); sysadminctl — поддерживаемый API. usage: -deleteUser <name>
+# [-secure || -keepHome], НО: вызов без флагов — дефолт deleteUser home НЕ трогает
+# (стирает только -secure; -keepHome дублирует дефолт и на macOS 26 отклонён
+# «not available on this system» — живой запуск 2026-10-10). home записи /var/empty
+# (drwxr-xr-x root:sys) — системный путь, остаётся на месте.
+SYSADMINCTL = "/usr/sbin/sysadminctl"             # абсолютный путь (канон _admin_run)
 # Sub-anchor: codex-ruleset грузится ВНЕ родительского anchor, чтобы доменная
 # enable_isolation/disable_isolation (через -f - / -F all) НЕ перетирали его (zero cross-cutting).
 # man pf.conf: anchors вкладываются через '/'. Родительский ruleset обязан содержать
@@ -623,7 +631,15 @@ def probe_codex_user():
         r = sys_probe.run([DSCL, ".", "-read", f"/Users/{name}", "UniqueID", "PrimaryGroupID"],
                           timeout=5)
         if r.get("timeout") or r.get("rc") != 0:
-            return {"provisioned": False, "uid": None, "name": None, "gid": None}
+            err = r.get("err") or ""
+            # missing = определённо нет записи: dscl-нотфаунд (rc 56 + eDSRecordNotFound)
+            # ИЛИ бинаря dscl нет вовсе (rc=None + FileNotFoundError — probe_manager.run
+            # глотает OSError сам, не бросает; Linux/CI, acceptance 2026-10-10).
+            missing = ((not r.get("timeout")) and r.get("rc") == 56
+                       and "eDSRecordNotFound" in err) or \
+                      (r.get("rc") is None and err.startswith("FileNotFoundError"))
+            return {"provisioned": False, "uid": None, "name": None, "gid": None,
+                    "missing": missing, "error": None if missing else (err or "dscl read failed")}
         found_uid = None
         found_gid = None
         for line in (r.get("out") or "").splitlines():
@@ -634,9 +650,10 @@ def probe_codex_user():
                 found_gid = line.split(":", 1)[1].strip()
         provisioned = (found_uid == uid)
         return {"provisioned": provisioned,
-                "uid": found_uid if provisioned else None,
+                "uid": found_uid,
                 "name": name if provisioned else None,
-                "gid": found_gid if provisioned else None}
+                "gid": found_gid if provisioned else None,
+                "error": None if found_uid else "UniqueID отсутствует"}
     except Exception as exc:  # noqa: BLE001 — fail-closed контракт, см. модульный docstring
         # fail-closed: любая ошибка чтения dscl = not provisioned (не предполагаем успех)
         logger.warning("probe_codex_user failed to read user: %s", exc)
@@ -688,6 +705,8 @@ def provision_codex_user():
         if existing.get("provisioned"):
             return {"ok": True, "cancelled": False, "rc": 0, "out": "",
                     "err": "already provisioned", "timeout": False}
+        if existing.get("error"):
+            return _reject(f"не удалось проверить codex-user: {existing['error']}")
         # fail-closed: UID занят другим пользователем → не перезаписывать.
         if _uid_in_use(CODEX_USER):
             return {**_reject(f"UID {CODEX_USER} занят другим пользователем — provisioning отменён"),
@@ -716,21 +735,33 @@ def provision_codex_user():
 def deprovision_codex_user():
     """Идемпотентное удаление _srouter_codex через osascript admin-мост.
 
-    probe_codex_user() → если не provisioned → no-op ok. Иначе одна osascript-инвокация:
-    dscl . -delete /Users/_srouter_codex (record delete — вся запись). Идемпотентно:
+    Подтверждённо отсутствующая запись → no-op ok. Ошибка чтения/чужой UID → отказ.
+    Иначе одна osascript-инвокация с последующей проверкой отсутствия:
+    sysadminctl -deleteUser _srouter_codex (не dscl: policy-прослойка macOS
+    отказывает dscl на accountPolicyData-записях — eDSPermissionError инцидент
+    2026-10-10; без флагов — дефолт home не трогает, /var/empty остаётся).
+    Идемпотентно:
     на гонку (delete кем-то между probe и delete) — repeatable. Возвращает dict _isolate_result.
     Не бросает: при сбое ok=False.
     """
     try:
         existing = probe_codex_user()
-        if not existing.get("provisioned"):
+        if existing.get("missing"):
             return {"ok": True, "cancelled": False, "rc": 0, "out": "",
                     "err": "not provisioned", "timeout": False}
+        if not existing.get("provisioned"):
+            return _reject(f"codex-user не удалён: {existing.get('error') or 'UID не совпадает'}")
         name = _valid_user_name(CODEX_USER_NAME)
         if not name:
             return _reject("константа codex-user name невалидна")
-        shell_cmd = f"{DSCL} . -delete /Users/{name}"
-        return _admin_run(shell_cmd)
+        shell_cmd = f"{SYSADMINCTL} -deleteUser {name}"
+        deleted = _admin_run(shell_cmd)
+        if not deleted.get("ok"):
+            return deleted
+        after = probe_codex_user()
+        if not after.get("missing"):
+            return _reject(f"codex-user не подтверждённо удалён: {after.get('error') or 'запись ещё существует'}")
+        return deleted
     except Exception as exc:  # noqa: BLE001 — fail-closed контракт, см. модульный docstring
         logger.error("deprovision_codex_user failed: %s", exc)
         return _reject(f"deprovision_codex_user failed: {exc}")

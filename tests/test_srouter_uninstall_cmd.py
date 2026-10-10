@@ -26,7 +26,7 @@ def _args(**over):
     return SimpleNamespace(**base)
 
 
-def _stub_cmd_uninstall_internals(monkeypatch, *, env_ok, leftover=None, tty=True):
+def _stub_cmd_uninstall_internals(monkeypatch, *, env_ok, leftover=None, tty=True, actions=None):
     """Застенить все внешние сайд-эффекты cmd_uninstall, КРОМЕ _remove_launchctl_env.
 
     env_ok управляет возвратом _remove_launchctl_env (тестируемая связка). leftover (issue #110
@@ -48,7 +48,8 @@ def _stub_cmd_uninstall_internals(monkeypatch, *, env_ok, leftover=None, tty=Tru
     monkeypatch.setattr(srouter_cli, "format_uninstall_plan", lambda p: "")
     monkeypatch.setattr(srouter.sys, "stdin", SimpleNamespace(isatty=lambda: tty))
     monkeypatch.setattr(srouter_cli, "apply_uninstall",
-                        lambda **k: {"ok": True, "blocked": [], "leftover": leftover or []})
+                        lambda **k: {"ok": True, "blocked": [], "leftover": leftover or [],
+                                     "actions": actions or []})
     monkeypatch.setattr(srouter_cli, "_remove_active_split_route", lambda *a, **k: 0)
     monkeypatch.setattr(srouter_cli, "claude_proxy",
                         SimpleNamespace(disable=lambda: {"ok": True}))
@@ -64,6 +65,9 @@ def _stub_cmd_uninstall_internals(monkeypatch, *, env_ok, leftover=None, tty=Tru
         # issue #97: лезет в реальный ~/.zshrc (_zshrc_path = Path.home()/.zshrc, не замокан).
         monkeypatch.setattr(srouter_cli, "_remove_codex_zsh_function", lambda: "")
     monkeypatch.setattr(srouter_cli, "_remove_home_bin_from_path", lambda: "")
+    monkeypatch.setattr(srouter_cli, "_remove_codex_isolation",
+                        lambda *a: {"ok": True, "note": "Codex PF: mock."})
+    monkeypatch.setattr(srouter_cli, "_remove_claude_app_wrapper", lambda: "")
     # ЕДИНСТВЕННЫЙ варьируемый параметр: статус env-cleanup.
     monkeypatch.setattr(srouter_cli, "_remove_launchctl_env",
                         lambda runner: {"ok": env_ok, "note": "Codex env: mock."})
@@ -91,6 +95,34 @@ def test_cmd_uninstall_returns_zero_when_env_removed(monkeypatch):
     rc = srouter.cmd_uninstall(_args())
 
     assert rc == 0, f"env снят → rc=0, получил {rc}"
+
+
+def test_cmd_uninstall_reports_user_cleanup_failure(monkeypatch, capsys):
+    _stub_cmd_uninstall_internals(monkeypatch, env_ok=True)
+    monkeypatch.setattr(srouter_cli, "_remove_codex_isolation", lambda *a: {
+        "ok": False, "note": "пользователь не удалён: eDSPermissionError"})
+    assert srouter.cmd_uninstall(_args()) == 2
+    output = capsys.readouterr()
+    assert "Откат выполнен частично" in output.out
+    assert "eDSPermissionError" in output.err
+    assert "LaunchAgent: без изменений" in output.out
+    assert "LaunchAgent удалён" not in output.out
+
+
+def test_cmd_uninstall_reports_changed_categories(monkeypatch, capsys):
+    """Позитивная ветка честного итога: actions с changed=True → «LaunchAgent: изменено».
+
+    Ревью #415: стаб apply_uninstall без ключа actions не покрывал позитивную ветку —
+    регрессия к статичному «без изменений» пережила бы сюиту. Мутационные инверсии:
+    статичная строка валит первый ассерт, всегда-«изменено» валит негативный ассерт.
+    """
+    _stub_cmd_uninstall_internals(monkeypatch, env_ok=True,
+                                  actions=[{"category": "launchagent", "changed": True}])
+
+    assert srouter.cmd_uninstall(_args()) == 0
+    out = capsys.readouterr().out
+    assert "LaunchAgent: изменено" in out
+    assert "LaunchAgent: без изменений" not in out
 
 
 # ============================ -y/--yes минует TTY-gate (issue #106) ============================

@@ -705,8 +705,8 @@ def _install_codex_isolation(env, runner) -> str:
         return f"Codex PF-изоляция: сбой ({str(exc)[:80]})."
 
 
-def _remove_codex_isolation(env, runner) -> str:
-    """Best-effort: снять codex-изоляцию при uninstall (flush sub-anchor + release token) +
+def _remove_codex_isolation(env, runner) -> dict:
+    """Снять codex-изоляцию при uninstall (flush sub-anchor + release token) +
     deprovision _srouter_codex (uid 503). Идемпотентно.
 
     state очищается ТОЛЬКО при подтверждённом disable (r.ok) — иначе leaked pfctl -E enable-ref
@@ -724,8 +724,8 @@ def _remove_codex_isolation(env, runner) -> str:
             local_state.clear_active_codex_isolate(path=state_path)
             deprov = isolate_firewall.deprovision_codex_user()  # best-effort, идемпотентно
             deprov_note = "" if deprov.get("ok") else f" пользователь не удалён ({deprov.get('err', '')});"
-            return f"Codex PF-изоляция: снята.{deprov_note}"
-        return f"Codex PF-изоляция: частично ({r.get('err', '')})."  # state сохранён — retry возможен
+            return {"ok": bool(deprov.get("ok")), "note": f"Codex PF-изоляция: снята.{deprov_note}"}
+        return {"ok": False, "note": f"Codex PF-изоляция: частично ({r.get('err', '')})."}
     except (OSError, ValueError, TypeError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
         # isolate_firewall subprocess + state операции → OSError, subprocess исключения
-        return f"Codex PF-изоляция: не снята ({str(exc)[:80]})."
+        return {"ok": False, "note": f"Codex PF-изоляция: не снята ({str(exc)[:80]})."}

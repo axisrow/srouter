@@ -412,7 +412,8 @@ def cmd_uninstall(args) -> int:
     env_status = _remove_launchctl_env(runner)
     env_note = ". " + env_status["note"]
     path_note = ". " + _remove_home_bin_from_path()
-    codex_iso_note = ". " + _remove_codex_isolation(env, runner)
+    codex_iso_status = _remove_codex_isolation(env, runner)
+    codex_iso_note = ". " + codex_iso_status["note"]
     # Claude.app wrapper — симметрично install (marker-gate: current ИЛИ legacy — наш).
     claude_note = ". " + _remove_claude_app_wrapper()
 
@@ -424,10 +425,14 @@ def cmd_uninstall(args) -> int:
     # git всё ещё указывает на мёртвый 127.0.0.1:10808 (xray уже остановлен apply_uninstall).
     # Шапка сообщения зависит от итога: «Откат завершён» только при подтверждённо снятом env И
     # git-proxy И без leftover (issue #110 Дефект 1), иначе «Откат выполнен частично» — rc=2.
-    full_ok = env_status["ok"] and gp.get("ok", False) and not partial_configs
+    full_ok = env_status["ok"] and gp.get("ok", False) and not partial_configs and codex_iso_status["ok"]
     headline = "Откат завершён" if full_ok else "Откат выполнен частично"
-    print(f"{headline}: brew-сервисы остановлены, конфиги восстановлены/оставлены, "
-          "DNS сброшен, LaunchAgent удалён"
+    changed = {action["category"] for action in result.get("actions", []) if action.get("changed")}
+    categories_note = ", ".join(
+        f"{label}: {'изменено' if category in changed else 'без изменений'}"
+        for category, label in (("services", "сервисы"), ("configs", "конфиги"),
+                                ("dns", "DNS"), ("launchagent", "LaunchAgent")))
+    print(f"{headline}: {categories_note}"
           + (". split-route удалён." if route_rc == 0 else ", split-route не удалён — см. выше.")
           + cp_note
           + ppp_note
@@ -454,6 +459,9 @@ def cmd_uninstall(args) -> int:
               f"{gp.get('err', 'unknown')}", file=sys.stderr)
         return 2
     if partial_configs:
+        return 2
+    if not codex_iso_status["ok"]:
+        print(f"uninstall завершён с ошибкой: {codex_iso_status['note']}", file=sys.stderr)
         return 2
     return 0
 
@@ -1591,4 +1599,3 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     return args.func(args)
-

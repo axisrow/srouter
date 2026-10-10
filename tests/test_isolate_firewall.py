@@ -27,6 +27,8 @@ import shutil
 import subprocess
 import unittest
 
+import pytest
+
 import dashboard_common
 import isolate_firewall
 import local_state
@@ -340,24 +342,30 @@ def test_provision_codex_user_failclosed_when_uid_taken(monkeypatch):
     assert not create_called["v"], "dscl create НЕ зовётся при занятом UID (fail-closed до выполнения)"
 
 
-def test_deprovision_codex_user_calls_dscl_delete(monkeypatch):
-    """deprovision шлёт osascript с dscl -delete /Users/_srouter_codex."""
-    monkeypatch.setattr(isolate_firewall, "probe_codex_user",
-                        lambda: {"provisioned": True, "uid": "503", "name": "_srouter_codex", "gid": "503"})
+def test_deprovision_codex_user_calls_sysadminctl_delete(monkeypatch):
+    """deprovision шлёт osascript с sysadminctl -deleteUser (не dscl — policy-прослойка
+    macOS 26 отказывает dscl на записях с accountPolicyData: eDSPermissionError инцидент
+    2026-10-10). БЕЗ флагов: дефолт deleteUser home НЕ трогает (-secure стирает, -keepHome
+    лишь дублирует дефолт и на macOS 26 отклонён «not available on this system» — живой
+    запуск 2026-10-10), а home записи /var/empty — системный путь."""
+    probes = iter([{"provisioned": True, "uid": "503"}, {"provisioned": False, "missing": True}])
+    monkeypatch.setattr(isolate_firewall, "probe_codex_user", lambda: next(probes))
     captured = []
     monkeypatch.setattr(isolate_firewall.sys_probe, "run",
                         lambda cmd, timeout=None: captured.append(cmd) or {"rc": 0, "out": "", "err": "", "timeout": False})
     r = isolate_firewall.deprovision_codex_user()
     assert r["ok"], r
     shell_text = " ".join(part for argv in captured for part in argv).replace('\\"', '"')
-    assert "dscl" in shell_text and "-delete" in shell_text, shell_text
-    assert "/Users/_srouter_codex" in shell_text, shell_text
+    assert "/usr/sbin/sysadminctl" in shell_text and "-deleteUser" in shell_text, shell_text
+    assert "_srouter_codex" in shell_text, shell_text
+    assert "-keepHome" not in shell_text, "флаг отклонён macOS 26 и дублирует дефолт: " + shell_text
+    assert "dscl" not in shell_text, "delete через dscl запрещён (eDSPermissionError): " + shell_text
 
 
 def test_deprovision_codex_user_idempotent_when_not_provisioned(monkeypatch):
     """Не provisioned → no-op ok, osascript delete НЕ зовётся."""
     monkeypatch.setattr(isolate_firewall, "probe_codex_user",
-                        lambda: {"provisioned": False, "uid": None, "name": None, "gid": None})
+                        lambda: {"provisioned": False, "uid": None, "name": None, "gid": None, "missing": True})
     called = {"v": False}
     monkeypatch.setattr(isolate_firewall.sys_probe, "run",
                         lambda cmd, timeout=None: called.update(v=True) or {"rc": 0, "out": "", "err": "", "timeout": False})
@@ -381,6 +389,55 @@ def test_probe_codex_user_down_when_record_missing(monkeypatch):
                         _spy_run([], rc=56, err="eDSRecordNotFound"))
     r = isolate_firewall.probe_codex_user()
     assert r["provisioned"] is False, r
+    assert r["missing"] is True
+
+
+@pytest.mark.parametrize("probe", [
+    {"provisioned": False, "error": "eDSPermissionError"},
+    {"provisioned": False, "uid": "504"},
+])
+def test_deprovision_refuses_unreadable_or_foreign_record(monkeypatch, probe):
+    monkeypatch.setattr(isolate_firewall, "probe_codex_user", lambda: probe)
+    monkeypatch.setattr(isolate_firewall, "_admin_run", lambda cmd: pytest.fail("delete called"))
+    assert isolate_firewall.deprovision_codex_user()["ok"] is False
+
+
+def test_deprovision_checks_record_after_delete(monkeypatch):
+    monkeypatch.setattr(isolate_firewall, "probe_codex_user", lambda: {"provisioned": True})
+    monkeypatch.setattr(isolate_firewall, "_admin_run", lambda cmd: {"ok": True})
+    assert isolate_firewall.deprovision_codex_user()["ok"] is False
+
+
+def test_deprovision_reports_delete_permission_error(monkeypatch):
+    monkeypatch.setattr(isolate_firewall, "probe_codex_user", lambda: {"provisioned": True})
+    monkeypatch.setattr(isolate_firewall, "_admin_run", lambda cmd: {
+        "ok": False, "err": "eDSPermissionError"})
+    assert isolate_firewall.deprovision_codex_user()["err"] == "eDSPermissionError"
+
+
+def test_probe_read_failure_is_not_missing(monkeypatch):
+    monkeypatch.setattr(isolate_firewall.sys_probe, "run", _spy_run([], rc=40, err="eDSPermissionError"))
+    result = isolate_firewall.probe_codex_user()
+    assert not result["missing"]
+    assert result["error"] == "eDSPermissionError"
+
+
+def test_probe_codex_user_missing_when_dscl_binary_absent(monkeypatch):
+    """Linux/CI: бинаря dscl нет → sys_probe.run НЕ бросает, возвращает rc=None +
+    err='FileNotFoundError: …' (probe_manager.run глотает OSError, канон докстринга)
+    → запись определённо отсутствует (missing=True), а не «нечитаемо» — иначе
+    deprovision отказывает и uninstall на без-dscl средах даёт rc=2 leftover
+    (acceptance 2026-10-10, живой CI-лог)."""
+    monkeypatch.setattr(isolate_firewall.sys_probe, "run",
+                        lambda cmd, timeout=None: {"rc": None, "out": "",
+                                                   "err": "FileNotFoundError: [Errno 2] No such file or directory: '/usr/bin/dscl'",
+                                                   "timeout": False})
+    r = isolate_firewall.probe_codex_user()
+    assert r["missing"] is True, r
+    assert r["provisioned"] is False, r
+    monkeypatch.setattr(isolate_firewall, "_admin_run",
+                        lambda cmd: pytest.fail("delete called"))
+    assert isolate_firewall.deprovision_codex_user()["ok"] is True
 
 
 def test_probe_codex_user_rejects_wrong_uid(monkeypatch):
