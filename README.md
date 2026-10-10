@@ -197,6 +197,12 @@ srouter status         # проверить, что демон работает 
 srouter doctor         # диагностика: порты + туннель + Claude-proxy (✅/❌)
 srouter sync           # импорт endpoint из рабочего xray в local.json (рассинхрон placeholder, #200)
 
+# PF-изоляция Anthropic (строгий режим: подсети 160.79.104.0/21 + 2607:6bc0::/32 режутся
+# напрямую на en*/ppp*, порты 80/443; пароль админа спросит GUI-диалог):
+srouter protect on      # включить: Anthropic больше не может ходить напрямую (fail-closed)
+srouter protect off     # выключить
+srouter protect status  # человеческий статус (алиасы: enable/disable/вкл/выкл)
+
 # Управление демоном дашборда (стек не трогается):
 srouter start          # запустить демон (если LaunchAgent уже установлен)
 srouter stop           # остановить демон (plist сохранён)
