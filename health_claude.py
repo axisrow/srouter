@@ -381,6 +381,12 @@ def _claude_transport_once(proxy, timeout=CLAUDE_TRANSPORT_TIMEOUT):
         "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
         "http_proxy", "https_proxy", "all_proxy", "no_proxy",
         "ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
+        # Модель-override из env сессии течёт в пробу: claude стартует с чужой моделью,
+        # API отвечает 403/unknown-model ДО auth → rc=1 вместо ожидаемого 401
+        # (инцидент 2026-10-11: чек ложно down на машине с glm-override).
+        "ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_SMALL_FAST_MODEL",
+        "CLAUDE_CODE_SUBAGENT_MODEL",
     )
     with tempfile.TemporaryDirectory(prefix="srouter-claude-probe-") as temp_home:
         config_dir = Path(temp_home) / ".claude"
@@ -428,6 +434,11 @@ def _claude_transport_once(proxy, timeout=CLAUDE_TRANSPORT_TIMEOUT):
         error = (run_result.get("err") or "Claude Code launch failed").splitlines()[0][:160]
     else:
         error = f"Claude Code exited rc={run_result.get('rc')} before any API response"
+        # Первая строка stderr — иначе диагностика вслепую (инцидент 2026-10-11:
+        # «rc=1» без причины, реальный ответ CLI видно только вручную).
+        first_err = (run_result.get("err") or "").strip().splitlines()
+        if first_err:
+            error += f": {first_err[0][:160]}"
     detail = error
     if run_result.get("timeout"):
         detail += " before any API response"
