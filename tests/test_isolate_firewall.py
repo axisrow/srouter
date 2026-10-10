@@ -420,6 +420,23 @@ def test_probe_read_failure_is_not_missing(monkeypatch):
     assert result["error"] == "eDSPermissionError"
 
 
+def test_probe_codex_user_missing_when_dscl_binary_absent(monkeypatch):
+    """Linux/CI: бинаря dscl нет → запись определённо отсутствует (missing=True), а не
+    «нечитаемо» — иначе deprovision отказывает и uninstall на без-dscl средах даёт
+    rc=2 leftover (acceptance 2026-10-10: FileNotFoundError '/usr/bin/dscl')."""
+
+    def _raise(cmd, timeout=None):
+        raise FileNotFoundError(2, "No such file or directory", "/usr/bin/dscl")
+
+    monkeypatch.setattr(isolate_firewall.sys_probe, "run", _raise)
+    r = isolate_firewall.probe_codex_user()
+    assert r["missing"] is True, r
+    assert r["provisioned"] is False, r
+    monkeypatch.setattr(isolate_firewall, "_admin_run",
+                        lambda cmd: pytest.fail("delete called"))
+    assert isolate_firewall.deprovision_codex_user()["ok"] is True
+
+
 def test_probe_codex_user_rejects_wrong_uid(monkeypatch):
     """Имя существует, но UniqueID != 503 → provisioned=False (fail-closed, не «почти»)."""
     monkeypatch.setattr(isolate_firewall.sys_probe, "run", _spy_run([],

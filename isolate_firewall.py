@@ -645,6 +645,12 @@ def probe_codex_user():
                 "name": name if provisioned else None,
                 "gid": found_gid if provisioned else None,
                 "error": None if found_uid else "UniqueID отсутствует"}
+    except FileNotFoundError as exc:
+        # dscl отсутствует (Linux/CI): записи определённо нет — missing, а не «нечитаемо»
+        # (иначе deprovision отказывает → uninstall rc=2 на без-dscl средах, acceptance 2026-10-10)
+        logger.warning("probe_codex_user: dscl недоступен (%s) — запись отсутствует", exc)
+        return {"provisioned": False, "uid": None, "name": None, "gid": None,
+                "missing": True, "error": None}
     except Exception as exc:  # noqa: BLE001 — fail-closed контракт, см. модульный docstring
         # fail-closed: любая ошибка чтения dscl = not provisioned (не предполагаем успех)
         logger.warning("probe_codex_user failed to read user: %s", exc)
