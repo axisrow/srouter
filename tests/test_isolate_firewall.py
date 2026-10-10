@@ -421,14 +421,15 @@ def test_probe_read_failure_is_not_missing(monkeypatch):
 
 
 def test_probe_codex_user_missing_when_dscl_binary_absent(monkeypatch):
-    """Linux/CI: бинаря dscl нет → запись определённо отсутствует (missing=True), а не
-    «нечитаемо» — иначе deprovision отказывает и uninstall на без-dscl средах даёт
-    rc=2 leftover (acceptance 2026-10-10: FileNotFoundError '/usr/bin/dscl')."""
-
-    def _raise(cmd, timeout=None):
-        raise FileNotFoundError(2, "No such file or directory", "/usr/bin/dscl")
-
-    monkeypatch.setattr(isolate_firewall.sys_probe, "run", _raise)
+    """Linux/CI: бинаря dscl нет → sys_probe.run НЕ бросает, возвращает rc=None +
+    err='FileNotFoundError: …' (probe_manager.run глотает OSError, канон докстринга)
+    → запись определённо отсутствует (missing=True), а не «нечитаемо» — иначе
+    deprovision отказывает и uninstall на без-dscl средах даёт rc=2 leftover
+    (acceptance 2026-10-10, живой CI-лог)."""
+    monkeypatch.setattr(isolate_firewall.sys_probe, "run",
+                        lambda cmd, timeout=None: {"rc": None, "out": "",
+                                                   "err": "FileNotFoundError: [Errno 2] No such file or directory: '/usr/bin/dscl'",
+                                                   "timeout": False})
     r = isolate_firewall.probe_codex_user()
     assert r["missing"] is True, r
     assert r["provisioned"] is False, r

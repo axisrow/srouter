@@ -628,9 +628,15 @@ def probe_codex_user():
         r = sys_probe.run([DSCL, ".", "-read", f"/Users/{name}", "UniqueID", "PrimaryGroupID"],
                           timeout=5)
         if r.get("timeout") or r.get("rc") != 0:
-            missing = not r.get("timeout") and r.get("rc") == 56 and "eDSRecordNotFound" in (r.get("err") or "")
+            err = r.get("err") or ""
+            # missing = определённо нет записи: dscl-нотфаунд (rc 56 + eDSRecordNotFound)
+            # ИЛИ бинаря dscl нет вовсе (rc=None + FileNotFoundError — probe_manager.run
+            # глотает OSError сам, не бросает; Linux/CI, acceptance 2026-10-10).
+            missing = ((not r.get("timeout")) and r.get("rc") == 56
+                       and "eDSRecordNotFound" in err) or \
+                      (r.get("rc") is None and err.startswith("FileNotFoundError"))
             return {"provisioned": False, "uid": None, "name": None, "gid": None,
-                    "missing": missing, "error": None if missing else (r.get("err") or "dscl read failed")}
+                    "missing": missing, "error": None if missing else (err or "dscl read failed")}
         found_uid = None
         found_gid = None
         for line in (r.get("out") or "").splitlines():
@@ -645,12 +651,6 @@ def probe_codex_user():
                 "name": name if provisioned else None,
                 "gid": found_gid if provisioned else None,
                 "error": None if found_uid else "UniqueID отсутствует"}
-    except FileNotFoundError as exc:
-        # dscl отсутствует (Linux/CI): записи определённо нет — missing, а не «нечитаемо»
-        # (иначе deprovision отказывает → uninstall rc=2 на без-dscl средах, acceptance 2026-10-10)
-        logger.warning("probe_codex_user: dscl недоступен (%s) — запись отсутствует", exc)
-        return {"provisioned": False, "uid": None, "name": None, "gid": None,
-                "missing": True, "error": None}
     except Exception as exc:  # noqa: BLE001 — fail-closed контракт, см. модульный docstring
         # fail-closed: любая ошибка чтения dscl = not provisioned (не предполагаем успех)
         logger.warning("probe_codex_user failed to read user: %s", exc)
