@@ -762,10 +762,6 @@ def deprovision_codex_user():
         if not after.get("missing"):
             return _reject(f"codex-user не подтверждённо удалён: {after.get('error') or 'запись ещё существует'}")
         return deleted
-        after = probe_codex_user()
-        if not after.get("missing"):
-            return _reject(f"codex-user не подтверждённо удалён: {after.get('error') or 'запись ещё существует'}")
-        return deleted
     except Exception as exc:  # noqa: BLE001 — fail-closed контракт, см. модульный docstring
         logger.error("deprovision_codex_user failed: %s", exc)
         return _reject(f"deprovision_codex_user failed: {exc}")
