@@ -119,7 +119,10 @@ DSCL = "/usr/bin/dscl"                            # абсолютный пут�
 # Удаление записи пользователя — ТОЛЬКО через sysadminctl (canon verify 2026-10-10): policy-
 # прослойка macOS (accountPolicyData) отказывает сырому `dscl . -delete` даже под root
 # (eDSPermissionError -14120); sysadminctl — поддерживаемый API. usage: -deleteUser <name>
-# [-secure || -keepHome]. -keepHome обязателен: home записи /var/empty — системный путь.
+# [-secure || -keepHome], НО: вызов без флагов — дефолт deleteUser home НЕ трогает
+# (стирает только -secure; -keepHome дублирует дефолт и на macOS 26 отклонён
+# «not available on this system» — живой запуск 2026-10-10). home записи /var/empty
+# (drwxr-xr-x root:sys) — системный путь, остаётся на месте.
 SYSADMINCTL = "/usr/sbin/sysadminctl"             # абсолютный путь (канон _admin_run)
 # Sub-anchor: codex-ruleset грузится ВНЕ родительского anchor, чтобы доменная
 # enable_isolation/disable_isolation (через -f - / -F all) НЕ перетирали его (zero cross-cutting).
@@ -734,8 +737,9 @@ def deprovision_codex_user():
 
     Подтверждённо отсутствующая запись → no-op ok. Ошибка чтения/чужой UID → отказ.
     Иначе одна osascript-инвокация с последующей проверкой отсутствия:
-    sysadminctl -deleteUser _srouter_codex -keepHome (не dscl: policy-прослойка macOS
-    отказывает dscl на accountPolicyData-записях — eDSPermissionError инцидент 2026-10-10).
+    sysadminctl -deleteUser _srouter_codex (не dscl: policy-прослойка macOS
+    отказывает dscl на accountPolicyData-записях — eDSPermissionError инцидент
+    2026-10-10; без флагов — дефолт home не трогает, /var/empty остаётся).
     Идемпотентно:
     на гонку (delete кем-то между probe и delete) — repeatable. Возвращает dict _isolate_result.
     Не бросает: при сбое ok=False.
@@ -750,7 +754,7 @@ def deprovision_codex_user():
         name = _valid_user_name(CODEX_USER_NAME)
         if not name:
             return _reject("константа codex-user name невалидна")
-        shell_cmd = f"{SYSADMINCTL} -deleteUser {name} -keepHome"
+        shell_cmd = f"{SYSADMINCTL} -deleteUser {name}"
         deleted = _admin_run(shell_cmd)
         if not deleted.get("ok"):
             return deleted

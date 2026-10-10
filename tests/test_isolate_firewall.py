@@ -345,7 +345,9 @@ def test_provision_codex_user_failclosed_when_uid_taken(monkeypatch):
 def test_deprovision_codex_user_calls_sysadminctl_delete(monkeypatch):
     """deprovision шлёт osascript с sysadminctl -deleteUser (не dscl — policy-прослойка
     macOS 26 отказывает dscl на записях с accountPolicyData: eDSPermissionError инцидент
-    2026-10-10); -keepHome — home записи /var/empty, системный путь сносить нельзя."""
+    2026-10-10). БЕЗ флагов: дефолт deleteUser home НЕ трогает (-secure стирает, -keepHome
+    лишь дублирует дефолт и на macOS 26 отклонён «not available on this system» — живой
+    запуск 2026-10-10), а home записи /var/empty — системный путь."""
     probes = iter([{"provisioned": True, "uid": "503"}, {"provisioned": False, "missing": True}])
     monkeypatch.setattr(isolate_firewall, "probe_codex_user", lambda: next(probes))
     captured = []
@@ -356,7 +358,7 @@ def test_deprovision_codex_user_calls_sysadminctl_delete(monkeypatch):
     shell_text = " ".join(part for argv in captured for part in argv).replace('\\"', '"')
     assert "/usr/sbin/sysadminctl" in shell_text and "-deleteUser" in shell_text, shell_text
     assert "_srouter_codex" in shell_text, shell_text
-    assert "-keepHome" in shell_text, shell_text
+    assert "-keepHome" not in shell_text, "флаг отклонён macOS 26 и дублирует дефолт: " + shell_text
     assert "dscl" not in shell_text, "delete через dscl запрещён (eDSPermissionError): " + shell_text
 
 
