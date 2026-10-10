@@ -906,8 +906,17 @@ def cmd_protect(args) -> int:
             print("protect: не удалось включить: timeout pfctl.", file=sys.stderr)
             return 2
         if not r.get("ok"):
-            # enable_strict сам помечает ok=False при отсутствующем token (ref-течь).
-            print(f"protect: не включён ({r.get('err')}).")
+            # ok=False с token: pfctl -E прошёл, а загрузка anchor упала — enable-ref
+            # жив; откатываем (то же зеркало, что save-rollback ниже; роут
+            # /api/isolate/enable держит token через cleanup-lease — CLI проще снять).
+            tok = r.get("token")
+            if tok:
+                isolate_firewall.disable_strict(tok)
+                print(f"protect: не включён ({r.get('err')}) — pf-ref откатил.",
+                      file=sys.stderr)
+            else:
+                # enable_strict сам помечает ok=False при отсутствующем token (ref-течь).
+                print(f"protect: не включён ({r.get('err')}).")
             return 1
         entry = {"domains": [], "ports": [80, 443], "token": r["token"],
                  "applied_at": int(time.time()), "phase": "strict"}
@@ -937,7 +946,14 @@ def cmd_protect(args) -> int:
             print(f"protect: не снята ({r.get('err')}).")
             return 1
         if lease:
-            local_state.clear_active_isolate(state)
+            if not local_state.clear_active_isolate(state):
+                # #341: якорь снят, lease остался — статус и карточка врали бы «ВКЛ»,
+                # повторный on отказывал бы «уже включена» при выключенной защите.
+                print("protect: якорь PF снят, но lease не удалён из state "
+                      "(state нечитаем/неписабел). Повторите: srouter protect off "
+                      "(идемпотентно); затем сверьте: srouter protect status",
+                      file=sys.stderr)
+                return 2
             print("Защита снята.")
         else:
             print("Защита и так была выключена (lease нет; якорь PF сброшен на всякий случай).")
@@ -1464,7 +1480,8 @@ def build_parser() -> argparse.ArgumentParser:
         ("on", ("enable", "вкл"),
          "Включить (строгий режим: подсети Anthropic; спросит пароль админа)."),
         ("off", ("disable", "выкл"), "Выключить: снять якорь PF и lease."),
-        ("status", (), "Человеческий статус защиты."),
+        ("status", (), "Человеческий статус защиты (rc: 0 — включена, "
+                       "1 — выключена, 2 — статус нечитаем)."),
     ):
         sp = p_pr_sub.add_parser(sub_name, aliases=aliases, help=sub_help)
         sp.add_argument("--state", default=None, help="Путь к srouter.local.json.")

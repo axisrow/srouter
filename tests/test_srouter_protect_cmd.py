@@ -117,6 +117,23 @@ def test_protect_on_missing_token_refuses(monkeypatch, capsys):
     assert calls["enable"] == 1
 
 
+def test_protect_on_not_ok_with_token_rolls_back_ref(monkeypatch, capsys):
+    """ok=False с непустым token («pfctl -E прошёл, загрузка anchor упала») →
+    disable_strict(token) — живой enable-ref не бросаем (зеркало cleanup-пути
+    роута /api/isolate/enable, dashboard_routes:655-661), rc 1, lease не пишется."""
+    calls = _stub_isolate(monkeypatch, enable={"ok": False, "cancelled": False,
+                                               "timeout": False, "token": "888",
+                                               "err": "anchor load failed"})
+    lease_calls = _stub_lease(monkeypatch)
+    rc = srouter_cli.cmd_protect(_args("on"))
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert calls["disable"] == ["888"], "живой pf-ref обязан откатываться, а не теряться"
+    assert lease_calls["save"] == []
+    assert "не включён" in captured.err
+    assert "откатил" in captured.err, "откат pf-ref не должен быть молчаливым"
+
+
 def test_protect_on_preflight_fail_refuses_before_pf(monkeypatch, capsys):
     """preflight_state_write False → отказ rc 1 ДО pfctl (гейт #68 как в /api/isolate/enable):
     GUI-пароль и pf-ref не сжигаются."""
@@ -168,6 +185,26 @@ def test_protect_off_disables_and_clears(monkeypatch, capsys):
     assert rc == 0
     assert "снята" in out
     assert calls["disable"] == ["42"], "token из lease идёт в pfctl -X"
+    assert lease_calls["clear"] == 1
+
+
+def test_protect_off_clear_failure_reports_rc2(monkeypatch, capsys):
+    """clear не удался (state нечитаем/неписабел) → rc 2, stderr с советом повторить off:
+    якорь уже снят, но оставшийся lease врёт «ВКЛ» карточке /api/isolate и protect status
+    (конфликт контуров #341) и заблокирует повторный on («уже включена»)."""
+    calls = _stub_isolate(monkeypatch)
+    lease_calls = _stub_lease(monkeypatch, lease={"phase": "strict", "token": "42",
+                                                  "domains": [], "ports": [80, 443]})
+    def clear_fail(path=None):
+        lease_calls["clear"] += 1  # считаем и при подмене: clear обязан быть вызван
+        return False
+
+    monkeypatch.setattr(srouter_cli.local_state, "clear_active_isolate", clear_fail)
+    rc = srouter_cli.cmd_protect(_args("off"))
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert "повторите" in captured.err.lower()
+    assert calls["disable"] == ["42"], "якорь снимается до clear, token из lease"
     assert lease_calls["clear"] == 1
 
 
