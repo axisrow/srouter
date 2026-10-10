@@ -618,6 +618,16 @@ def check_all(*, active_claude=False):
     gh_check = {"name": "gh/git direct (github env -u)",
                 "ok": gh["status"] == "ok", "info": True, "detail": gh["detail"]}
     checks.append(gh_check)
+    # Инцидент 2026-10-10: пропажа urlmatch-ключа github-proxy + env HTTPS_PROXY перехватили
+    # git в privoxy — push умер вместе с privoxy, а doctor молчал (gh/git direct — info-only).
+    # Этот чек — driver (НЕ info при down): самовольное переключение маршрута git = сломанный
+    # push, fail-closed (GFW режет прямой LibreSSL-TLS к github, verify #199).
+    gpr = _git_proxy_route_check()
+    gpr_check = {"name": "git github-proxy (socks5h xray)",
+                 "ok": gpr["status"] == "ok", "detail": gpr["detail"]}
+    if gpr["status"] != "down":
+        gpr_check["info"] = True
+    checks.append(gpr_check)
     # Установленные codex/claude-code binary на диске (#145): инвентаризация, info-only ВСЕГДА
     # (несколько версий — ранний сигнал конфликта #135, не сбой стека). unknown (ничего не установлено)
     # тоже info — не роняет вердикт. Doctor показывает картину, не угадывает.
@@ -1247,13 +1257,13 @@ def _print_report(result):
             # Не «VPS мёртв» и не «локальный прокси» — подключи интернет. Чинить первым.
             print("  • сеть: нет активного сетевого интерфейса/маршрута — подключи интернет (Wi-Fi/eth).")
             print("    Это НЕ «VPS мёртв» и НЕ «локальный прокси упал» — сначала восстановь сеть.")
-        if "privoxy" in failed_names:
+        if f"privoxy ({PRIVOXY_PORT})" in failed_names:
             if privoxy_system.protection_present():
                 print("  • Privoxy защищён: выполни `srouter privoxy status`, затем вручную "
                       "`srouter privoxy restart` (потребуется подтверждение)")
             else:
                 print("  • privoxy: brew services restart privoxy  (или srouter install)")
-        if "xray" in failed_names:
+        if f"xray ({XRAY_PORT})" in failed_names:
             print("  • xray: brew services restart xray  (или srouter install)")
         if "туннель" in failed_names:
             # #207: vendor outage (оба вендора 5xx, канал/узел/VPS живы) → совет ждать вендора,
@@ -1266,6 +1276,8 @@ def _print_report(result):
                       "инфраструктура).")
                 print("    Проверь статусные страницы (status.anthropic.com / status.openai.com), "
                       "подожди восстановления. Узел и локальный прокси трогать не нужно.")
+            elif f"privoxy ({PRIVOXY_PORT})" in failed_names:
+                print("  • туннель: сначала восстанови privoxy — порт HTTP bridge закрыт")
             else:
                 print("  • туннель: проверь узел (srouter status / дашборд nodes), возможно узел недоступен")
             # Атрибуция «почему тормозит» (Wi-Fi/провайдер/транзит/VPS/DPI): ручной
@@ -1298,11 +1310,6 @@ def _print_report(result):
                   f"«локальный прокси» (GFW избирательно блокирует по TLS, контрольный домен отвечает).")
             print("    Решение: гони режущийся домен через прокси/VPS (gh: env -u снимает scoped git-proxy; "
                   "git: git -c http.https://github.com.proxy=).")
-        if "локальный прокси" in failed_names:
-            # #204: privoxy/xray service-status down (крах/зомби). VPS жив → проблема локальная.
-            print("  • локальный прокси упал (privoxy/xray): brew services restart privoxy xray")
-            if privoxy_system.protection_present():
-                print("    (protected-mode: srouter privoxy restart вместо brew)")
         if "dashboard" in failed_names:
             print("  • дашборд: srouter restart")
         if "claude-proxy" in failed_names:

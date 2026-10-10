@@ -279,6 +279,8 @@ def _machine_state_monkey(monkeypatch):
                         lambda: {"status": "unknown", "detail": "mock: VSCode не установлен"})
     monkeypatch.setattr(health, "_github_direct_check",
                         lambda: {"status": "ok", "detail": "mock: github direct"})
+    monkeypatch.setattr(health, "_git_proxy_route_check",
+                        lambda: {"status": "ok", "detail": "mock: git github-proxy managed"})
     monkeypatch.setattr(health, "_runtime_model_override_check",
                         lambda: {"status": "ok", "detail": "mock: без override"})
     monkeypatch.setattr(health, "_installed_versions_check",

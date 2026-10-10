@@ -9,10 +9,13 @@ from pathlib import Path
 import logging
 from urllib.parse import urlparse
 
+import git_proxy  # git github-proxy: managed SOCKS5 xray в ~/.gitconfig (#130, инцидент 2026-10-10)
+
 _log = logging.getLogger("srouter.health")
 
 # star-import re-export (канон star-import-reexport-contract) — см. health_probes.py докстринг __all__.
-__all__ = ["_vscode_proxy_check", "GH_DIRECT_HINT", "_github_direct_check"]
+__all__ = ["_vscode_proxy_check", "GH_DIRECT_HINT", "_github_direct_check",
+           "_git_proxy_route_check"]
 
 # ============================ #185: scoped SOCKS5 для codex через VSCode http.proxy ============================
 
@@ -176,3 +179,42 @@ def _github_direct_check():
     return {"status": "warn",
             "detail": f"git→github идёт через ENV-прокси ({proxy}; {eff.get('detail')}) — снимается "
                       f"env -u. " + GH_DIRECT_HINT}
+
+
+# ============================ инцидент 2026-10-10: самовольное переключение git-маршрута ============================
+
+
+def _git_proxy_route_check():
+    """git→github обязан ездить managed SOCKS5 xray; env-fallthrough/foreign/direct — down (driver).
+
+    Инцидент 2026-10-10: глобальный urlmatch-ключ http.https://github.com.proxy исчез из
+    ~/.gitconfig, env HTTPS_PROXY=http://127.0.0.1:8118 молча перехватил git → push поехал через
+    privoxy и умер вместе с ним. `gh/git direct` (_github_direct_check) — info-only «подсказка» и
+    на переключение не краснеет; этот чек — driver (канон fail-closed: git-push без туннеля мёртв —
+    GFW режет LibreSSL-TLS, verify #199). Источник правды — git_proxy.effective_proxy (лестница
+    слоёв). Fail-soft: не бросает.
+    """
+    eff = git_proxy.effective_proxy()
+    if not isinstance(eff, dict):
+        return {"status": "unknown", "detail": "git-proxy: effective_proxy вернул не-dict"}
+    layer, proxy = eff.get("layer"), eff.get("proxy", "")
+    if layer == "unknown":
+        return {"status": "unknown",
+                "detail": f"git-proxy: {eff.get('detail') or 'конфиг нечитаем'}"}
+    if layer == "env":
+        return {"status": "down",
+                "detail": (f"git→github уехал в env-слой ({proxy}) — мимо xray-туннеля: ключ "
+                           f"{git_proxy.KEY} отсутствует/сбит, а env HTTPS_PROXY перехватывает "
+                           f"маршрут. push умрёт вместе с privoxy. "
+                           f"Чинить: srouter git-proxy enable")}
+    if layer == "direct":
+        return {"status": "down",
+                "detail": ("git→github идёт НАПРЯМУЮ (ни ключа, ни env) — GFW режет TLS, "
+                           "push умрёт. Чинить: srouter git-proxy enable")}
+    if proxy == git_proxy._PROXY:
+        return {"status": "ok",
+                "detail": f"git→github через managed {git_proxy._PROXY} (слой {layer})"}
+    return {"status": "down",
+            "detail": (f"git→github через ЧУЖОЙ proxy {proxy or '(пусто)'} (слой {layer}) — "
+                       f"самовольное переключение. "
+                       f"Чинить: srouter git-proxy enable --force")}

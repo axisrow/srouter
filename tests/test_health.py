@@ -176,6 +176,8 @@ def _all_up_monkey(monkeypatch, *, probe_status="ok", probe_detail="runtime: к�
                         lambda: {"status": "unknown", "detail": "mock: VSCode не установлен"})
     monkeypatch.setattr(health, "_github_direct_check",
                         lambda: {"status": "ok", "detail": "mock: github direct"})
+    monkeypatch.setattr(health, "_git_proxy_route_check",
+                        lambda: {"status": "ok", "detail": "mock: git github-proxy managed"})
     monkeypatch.setattr(health, "_runtime_model_override_check",
                         lambda: {"status": "ok", "detail": "mock: без override"})
     monkeypatch.setattr(health, "_installed_versions_check",
@@ -1274,6 +1276,15 @@ def test_local_proxy_ok_when_ports_up_and_services_running(monkeypatch):
     monkeypatch.setattr(health, "_service_running", lambda label, domain=None: "running")
     result = health._local_proxy_up()
     assert result["status"] == "ok", "порты up + сервисы running → ok"
+
+
+def test_local_proxy_restart_hint_names_only_broken_service(monkeypatch):
+    monkeypatch.setattr(health, "_port_up", lambda port: port == health.XRAY_PORT)
+    monkeypatch.setattr(health, "_service_running", lambda label, domain=None: "running")
+    monkeypatch.setattr(health.privoxy_system, "protection_present", lambda: False)
+    detail = health._local_proxy_up()["detail"]
+    assert "Restart: brew services restart privoxy" in detail
+    assert "restart xray" not in detail
 
 
 def test_local_proxy_warns_when_xray_logs_not_persisted(monkeypatch, tmp_path):
@@ -2781,6 +2792,20 @@ def test_print_report_driver_marks_unchanged(capsys):
     assert _MARK_OK in privoxy_line, f"driver ok = ✅, got: {privoxy_line}"
     assert _MARK_FAIL in codex_line, f"driver fail = ❌, got: {codex_line}"
     assert _MARK_WARN not in out, f"driver-чеки не жёлтые, got:\n{out}"
+
+
+def test_print_report_privoxy_failure_does_not_advise_xray_restart(monkeypatch, capsys):
+    monkeypatch.setattr(health.privoxy_system, "protection_present", lambda: False)
+    health._print_report({"status": "degraded", "checks": [
+        {"name": f"privoxy ({health.PRIVOXY_PORT})", "ok": False},
+        {"name": f"xray ({health.XRAY_PORT})", "ok": True},
+        {"name": "туннель (api.anthropic.com через прокси)", "ok": False},
+        {"name": "локальный прокси (privoxy/xray service-status)", "ok": False},
+    ]})
+    advice = capsys.readouterr().out.split("Что проверить:", 1)[1]
+    assert "restart privoxy" in advice
+    assert "restart xray" not in advice
+    assert "проверь узел" not in advice
 
 
 def test_print_report_healthy_stack_has_no_warning_noise(capsys):
@@ -6175,6 +6200,19 @@ def test_check_all_anthropic_peer_leak_is_driver_not_observe(monkeypatch):
     cp = next(c for c in result["checks"] if "claude-proxy" in c["name"])
     assert cp.get("info") is not True, "доказанная утечка не гейтится в observe"
     assert result["status"] == "degraded", "утечка к Anthropic — driver вердикта"
+
+
+def test_check_all_git_route_down_is_driver(monkeypatch):
+    """Инцидент 2026-10-10: git github-proxy down (env-fallthrough) — чек driver (не info),
+    вердикт деградирует. Раньше маршрут git был невидим (info-only gh/git direct)."""
+    _all_up_monkey(monkeypatch)
+    monkeypatch.setattr(health, "_git_proxy_route_check",
+                        lambda: {"status": "down", "detail": "git→github уехал в env-слой"})
+    result = health.check_all()
+    chk = next(c for c in result["checks"] if c["name"].startswith("git github-proxy"))
+    assert chk["ok"] is False
+    assert not chk.get("info"), "самовольное переключение маршрута git — driver, не observe"
+    assert result["status"] == "degraded"
 
 
 # ---------- #362 п.2: туннель — цифры окна в причине + per-driver флап-гейт ----------
