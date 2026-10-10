@@ -396,8 +396,11 @@ def _local_proxy_up():
             # port open, но launchctl не ответил → НЕ зомби (fail-closed), помечаем для observability.
             unverified.append(name)
     if problems:
-        restart_hint = "brew services restart privoxy xray" if not privoxy_system.protection_present() \
-            else "srouter privoxy restart (protected-mode)"
+        broken = [name for name in ("privoxy", "xray")
+                  if any(problem.startswith(name + " ") for problem in problems)]
+        restart_hint = "; ".join(
+            "srouter privoxy restart (protected-mode)" if name == "privoxy" and privoxy_system.protection_present()
+            else f"brew services restart {name}" for name in broken)
         if facets:
             # #341 (cycle-review): mixed-failure (например xray крах при живой brew-privoxy) —
             # facets вычислены, но не должны теряться, а restart-подсказка не должна вести к

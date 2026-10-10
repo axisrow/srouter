@@ -64,6 +64,9 @@ def _stub_cmd_uninstall_internals(monkeypatch, *, env_ok, leftover=None, tty=Tru
         # issue #97: лезет в реальный ~/.zshrc (_zshrc_path = Path.home()/.zshrc, не замокан).
         monkeypatch.setattr(srouter_cli, "_remove_codex_zsh_function", lambda: "")
     monkeypatch.setattr(srouter_cli, "_remove_home_bin_from_path", lambda: "")
+    monkeypatch.setattr(srouter_cli, "_remove_codex_isolation",
+                        lambda *a: {"ok": True, "note": "Codex PF: mock."})
+    monkeypatch.setattr(srouter_cli, "_remove_claude_app_wrapper", lambda: "")
     # ЕДИНСТВЕННЫЙ варьируемый параметр: статус env-cleanup.
     monkeypatch.setattr(srouter_cli, "_remove_launchctl_env",
                         lambda runner: {"ok": env_ok, "note": "Codex env: mock."})
@@ -91,6 +94,18 @@ def test_cmd_uninstall_returns_zero_when_env_removed(monkeypatch):
     rc = srouter.cmd_uninstall(_args())
 
     assert rc == 0, f"env снят → rc=0, получил {rc}"
+
+
+def test_cmd_uninstall_reports_user_cleanup_failure(monkeypatch, capsys):
+    _stub_cmd_uninstall_internals(monkeypatch, env_ok=True)
+    monkeypatch.setattr(srouter_cli, "_remove_codex_isolation", lambda *a: {
+        "ok": False, "note": "пользователь не удалён: eDSPermissionError"})
+    assert srouter.cmd_uninstall(_args()) == 2
+    output = capsys.readouterr()
+    assert "Откат выполнен частично" in output.out
+    assert "eDSPermissionError" in output.err
+    assert "LaunchAgent: без изменений" in output.out
+    assert "LaunchAgent удалён" not in output.out
 
 
 # ============================ -y/--yes минует TTY-gate (issue #106) ============================

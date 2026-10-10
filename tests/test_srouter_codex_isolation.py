@@ -14,6 +14,13 @@ state = генератор/контракт, отражающий реально
 import isolate_firewall
 import local_state
 import srouter
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def stub_user_lifecycle(monkeypatch):
+    monkeypatch.setattr(isolate_firewall, "provision_codex_user", lambda: {"ok": True})
+    monkeypatch.setattr(isolate_firewall, "deprovision_codex_user", lambda: {"ok": True})
 
 # Оригинальные функции (до любых monkeypatch) — srouter.local_state и local_state это один модуль,
 # патч srouter.local_state.X виден и как local_state.X → рекурсия. Захватываем оригиналы заранее.
@@ -70,7 +77,8 @@ def test_remove_codex_keeps_state_on_disable_failure(monkeypatch, tmp_path):
     assert not cleared["called"], (
         "при disable failure state НЕ очищать (иначе leaked enable-ref без возможности release); "
         f"note={note!r}")
-    assert "частично" in note or "не снята" in note, f"note сообщает partial: {note!r}"
+    assert not note["ok"]
+    assert "частично" in note["note"] or "не снята" in note["note"], f"note сообщает partial: {note!r}"
     # lease уцелел — можно повторить disable
     assert _LS_LOAD(path=state_path) is not None
 
@@ -87,7 +95,7 @@ def test_remove_codex_clears_state_on_disable_success(monkeypatch, tmp_path):
                         lambda token=None: {"ok": True, "err": ""})
 
     note = srouter._remove_codex_isolation(env=None, runner=None)
-    assert "снята" in note, note
+    assert "снята" in note["note"], note
     assert _LS_LOAD(path=state_path) is None
 
 
@@ -180,8 +188,8 @@ def test_remove_codex_does_not_deprovision_on_disable_failure(monkeypatch, tmp_p
         "при disable failure deprovision НЕ зовётся (правила ещё живы → пользователь нужен)")
 
 
-def test_remove_codex_deprovision_failure_kept_best_effort(monkeypatch, tmp_path):
-    """deprovision best-effort: сбой НЕ роняет uninstall-результат (правила уже сняты, user остался)."""
+def test_remove_codex_deprovision_failure_reports_partial(monkeypatch, tmp_path):
+    """Отказ удаления пользователя возвращает partial, хотя PF уже снят."""
     state_path = str(tmp_path / "s.json")
     _LS_SAVE({"token": "9", "applied_at": 1}, path=state_path)
     monkeypatch.setattr(srouter.local_state, "load_active_codex_isolate",
@@ -194,5 +202,6 @@ def test_remove_codex_deprovision_failure_kept_best_effort(monkeypatch, tmp_path
                         lambda: {"ok": False, "err": "dscl cancel", "rc": -128})
 
     note = srouter._remove_codex_isolation(env=None, runner=None)
-    assert isinstance(note, str), "deprovision failure best-effort, uninstall не бросает"
+    assert note["ok"] is False
+    assert "пользователь не удалён" in note["note"]
     assert _LS_LOAD(path=state_path) is None, "lease очищен при успешном disable (не завязан на deprovision)"
