@@ -683,6 +683,19 @@ def check_all(*, active_claude=False):
         if gfw["status"] == "gfw":
             gfw_check["category"] = "gfw"
         checks.append(gfw_check)
+        # #418: туннель-доставка — GFW-канарейка (github) ЧЕРЕЗ прокси. Канарейки _tunnel_up
+        # (anthropic/openai) доступны и напрямую → их 403-«жив» не различает «выход через VPS»
+        # от «xray шлёт всё direct» (инцидент 2026-10-11: adopted-конфиг терял whitelist —
+        # доктор зеленел при полностью обойдённом туннеле). github напрямую резан (gfw-чек выше)
+        # → живость через прокси доказывает доставку, смерть при живых канарейках — driver.
+        # Каскад: мёртвый tun_ok уже driver → доставка info (не дублируем причину).
+        td = _tunnel_delivery_check(gfw.get("status"))
+        td_check = {"name": "туннель-доставка (github через прокси)",
+                    "ok": td["status"] == "ok", "detail": td["detail"], "info": True}
+        if td["status"] == "down" and tun_ok:
+            td_check["ok"] = False
+            td_check["info"] = False
+        checks.append(td_check)
         # #197 direct-first: какие candidate-домены (z.ai BUILTIN + user direct_domains) идут
         # напрямую (NO_PROXY) — переживают смерть VPS. info-only ВСЕГДА (как GFW-чек выше) — картина,
         # не сбой стека. gate под active_claude (doctor-only): direct_first.detect() делает прямой
