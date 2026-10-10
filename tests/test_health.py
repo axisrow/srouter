@@ -131,6 +131,13 @@ def _all_up_monkey(monkeypatch, *, probe_status="ok", probe_detail="runtime: к�
     # драйвит вердикт недетерминированно. В этих тестах VPS-чек НЕ предмет проверки → info-заглушка.
     import local_state
     monkeypatch.setattr(local_state, "active_node", lambda path=None: {})
+    # #416: VPS-probe читает endpoint рабочего xray config (compare_endpoint_with_xray) —
+    # мокаем absent (fallback на active_node-мок выше), иначе реальный
+    # /opt/homebrew/etc/xray/config.json dev-машины драйвит probe-target недетерминированно.
+    monkeypatch.setattr(local_state, "compare_endpoint_with_xray",
+                        lambda state_path=None, xray_config_path=None: {
+                            "synced": True, "local": "", "xray": "",
+                            "placeholder": False, "xray_status": "absent"})
     # #204: _local_proxy_up дёргает launchctl print (через _service_running) — мокаем running=True,
     # иначе реальный launchd на dev-машине (protected/brew-mode, живой/мёртвый privoxy/xray)
     # драйвит вердикт недетерминированно. _port_up уже мокаем True выше → ok по контракту.
@@ -927,6 +934,21 @@ def _mock_active_node(monkeypatch, node):
     monkeypatch.setattr(local_state, "active_node", lambda path=None: node)
 
 
+def _mock_xray_config_endpoint(monkeypatch, status, address=""):
+    """#416: подменить endpoint РАБОЧЕГО xray config для VPS-probe.
+
+    status = xray_status из compare_endpoint_with_xray: ok (address задан) / absent /
+    unreadable / no_active. Без мока probe читал бы реальный
+    /opt/homebrew/etc/xray/config.json dev-машины → target недетерминирован
+    (канон unmocked-probe-is-both-slow-and-machine-dependent).
+    """
+    import local_state
+    monkeypatch.setattr(local_state, "compare_endpoint_with_xray",
+                        lambda state_path=None, xray_config_path=None: {
+                            "synced": status == "absent", "local": "", "xray": address,
+                            "placeholder": False, "xray_status": status})
+
+
 def _mock_vps_tcp(monkeypatch, reachable):
     """Подменить прямой TCP-probe до VPS endpoint (минуя прокси). reachable=True/False."""
     monkeypatch.setattr(health.sys_probe, "port_open", lambda host, port, timeout=1.0: reachable)
@@ -991,6 +1013,65 @@ def test_vps_no_active_node_is_info_only(monkeypatch):
     assert result["status"] == "ok", "нет узла → не роняет вердикт"
     vps = [c for c in result["checks"] if "vps" in c["name"].lower() and "upstream" in c["name"].lower()][0]
     assert vps.get("info") is True, "нет узла → info-only"
+
+
+def test_vps_probe_targets_xray_config_endpoint_over_local_json(monkeypatch):
+    """#416: рассинхрон local.json ↔ рабочий xray config → probe бьёт в endpoint КОНФИГА.
+
+    Инцидент 2026-10-11: local.json держит 85.136.x, рабочий xray config — 78.47.x (de-1):
+    старый probe зеленил «VPS жив» для local.json-endpoint, хотя туннель реально ходит на
+    config-address → различение «VPS мёртв» vs «локальный прокси упал» доказывало не то.
+    Настройки движка (рабочий xray config) — приоритет; local.json — fallback.
+    """
+    probed = []
+
+    def _capture(host, port, timeout=1.0):
+        probed.append((host, port))
+        return True
+
+    _all_up_monkey(monkeypatch)
+    _mock_active_node(monkeypatch, {"name": "old-node", "endpoint_host": "198.51.100.7", "port": 443})
+    _mock_xray_config_endpoint(monkeypatch, "ok", address="198.51.100.99")
+    monkeypatch.setattr(health.sys_probe, "port_open", _capture)
+    vps = health._upstream_vps_reachable()
+    assert vps["status"] == "ok"
+    assert probed == [("198.51.100.99", 443)], \
+        "probe бьёт в address из рабочего xray config (настройки движка), не из local.json"
+    assert "xray" in vps["detail"].lower(), "detail называет источник endpoint (рабочий xray config)"
+
+
+def test_vps_probe_falls_back_to_local_json_when_xray_config_absent(monkeypatch):
+    """#416: xray config absent (fresh install) → fallback на local.json (прежнее поведение)."""
+    probed = []
+
+    def _capture(host, port, timeout=1.0):
+        probed.append((host, port))
+        return True
+
+    _all_up_monkey(monkeypatch)
+    _mock_active_node(monkeypatch, {"name": "vps-1", "endpoint_host": "198.51.100.7", "port": 443})
+    _mock_xray_config_endpoint(monkeypatch, "absent")
+    monkeypatch.setattr(health.sys_probe, "port_open", _capture)
+    vps = health._upstream_vps_reachable()
+    assert vps["status"] == "ok"
+    assert probed == [("198.51.100.7", 443)], "config absent → probe по endpoint из local.json"
+
+
+def test_vps_probe_config_endpoint_when_no_local_node_port_default_443(monkeypatch):
+    """#416: узла в local.json нет, config держит address → probe по config:443 (порт из node/дефолт)."""
+    probed = []
+
+    def _capture(host, port, timeout=1.0):
+        probed.append((host, port))
+        return False
+
+    _all_up_monkey(monkeypatch)
+    _mock_active_node(monkeypatch, {})  # нет активного узла
+    _mock_xray_config_endpoint(monkeypatch, "ok", address="198.51.100.99")
+    monkeypatch.setattr(health.sys_probe, "port_open", _capture)
+    vps = health._upstream_vps_reachable()
+    assert vps["status"] == "down", "config-endpoint недоступен → down (не info: узел-то есть в config)"
+    assert probed == [("198.51.100.99", 443)], "нет узла + config ok → probe config-address:443"
 
 
 def test_vps_placeholder_testnet_203_0_113_is_warn(monkeypatch):

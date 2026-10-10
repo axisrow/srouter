@@ -1266,8 +1266,14 @@ def _upstream_vps_reachable(node=None):
 
     _tunnel_up() бьёт через прокси к API-таргетам → connection-failed без различения «VPS мёртв»
     vs «локальный прокси (privoxy/xray) упал». Этот чек = socket.create_connection (TCP) до
-    active_node().endpoint_host:port напрямую, минуя прокси (sys_probe.port_open). Канон:
+    endpoint:port напрямую, минуя прокси (sys_probe.port_open). Канон:
     verify-don't-guess — прямая причина, не догадка (эталон sys_probe #35).
+
+    #416: target = address активного outbound'а РАБОЧЕГО xray config (настройки движка — то,
+    что xray реально использует), local.json active_node — fallback (config absent/unreadable/
+    no_active). При рассинхроне (#200) probe по local.json-endpoint доказывал не то: туннель
+    ходит по config-address (инцидент 2026-10-11). Явный node = target вызывающего — config
+    его не перекрывает. Порт берётся из node (default 443): reader config'а port не отдаёт.
 
     Возвращает {status, detail}:
       ok   — TCP-connect успешен (VPS жив);
@@ -1276,13 +1282,27 @@ def _upstream_vps_reachable(node=None):
       info — нет активного узла / нет endpoint_host.
     Не бросает (probe-канон).
     """
-    if node is None:
+    explicit = node is not None
+    if not explicit:
         try:
             node = local_state.active_node() or {}
         except (OSError, ValueError, TypeError, KeyError) as exc:
             _log.debug("active_node() недоступен (%s) — VPS-probe неприменим", exc)
             node = {}
     host, port = _vps_endpoint(node)
+    src = "local.json"
+    if not explicit:
+        # compare_endpoint_with_xray сам резолвит тег активного outbound'а (adopt #136), fail-soft.
+        try:
+            cmp = local_state.compare_endpoint_with_xray()
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            _log.debug("compare_endpoint_with_xray недоступен (%s) — endpoint из local.json", exc)
+            cmp = {}
+        if cmp.get("xray_status") == "ok" and cmp.get("xray"):
+            host = cmp["xray"]
+            src = "рабочий xray config"
+            if not isinstance(port, int) or not (1 <= port <= 65535):
+                port = 443  # ponytail: port из node (config-reader не отдаёт port), рассинхрон порта не доказан
     if host is None:
         return {"status": "info",
                 "detail": "нет активного узла / endpoint_host (VPS-probe неприменим)"}
@@ -1300,7 +1320,8 @@ def _upstream_vps_reachable(node=None):
         reachable = False
     if reachable:
         return {"status": "ok",
-                "detail": f"VPS reachable: TCP-коннект до {host}:{port} (VPS жив)"}
+                "detail": f"VPS reachable: TCP-коннект до {host}:{port} "
+                          f"(endpoint из {src}; VPS жив)"}
     return {"status": "down",
             "detail": f"VPS недоступен: TCP timeout/refused до {host}:{port} "
-                      f"(VPS мёртв? заплачен/запущен?)"}
+                      f"(endpoint из {src}; VPS мёртв? заплачен/запущен?)"}

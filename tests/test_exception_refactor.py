@@ -157,6 +157,12 @@ class TestHealthExceptions:
             raise OSError("state file corrupt")
 
         monkeypatch.setattr(health.local_state, "active_node", boom)
+        # #416: изолировать от рабочего xray config dev-машины (иначе compare вернул бы
+        # реальный address → probe пошёл бы в реальную сеть вместо info).
+        monkeypatch.setattr(health.local_state, "compare_endpoint_with_xray",
+                            lambda state_path=None, xray_config_path=None: {
+                                "synced": True, "local": "", "xray": "",
+                                "placeholder": False, "xray_status": "absent"})
         result = health._upstream_vps_reachable(node=None)
         assert result["status"] == "info"
 
