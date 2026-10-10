@@ -42,7 +42,7 @@ __all__ = [
     "_user_launchagent_plist", "_local_proxy_boot_persistence",
     "GFW_PROBE_DOMAINS", "GFW_CONTROL_DOMAIN", "_direct_domain_probe", "_gfw_domain_check",
     "_direct_first_check", "TUNNEL_TARGETS", "VENDOR_OUTAGE_MARKER",
-    "_tunnel_target_up", "_tunnel_up",
+    "_tunnel_target_up", "_tunnel_up", "_tunnel_delivery_check",
     # #396 классы проб: direct (мимо прокси) + bulk (объёмная передача)
     "_no_proxy_env", "DIRECT_PROBE_URLS", "_direct_up", "_bulk_probe", "_bulk_status",
     "_BULK_DEFAULT_URL", "_url_host",
@@ -962,6 +962,50 @@ def _tunnel_up(extra_targets=None):
     if len(details) > 1 and len(set(details)) == 1:
         return False, f"{details[0]} (оба таргета)", False, timings
     return False, "; ".join(details), False, timings
+
+
+# ============================ #418: туннель-доставка (GFW-канарейка через прокси) ============================
+# Инцидент 2026-10-11: adopted-конфиг xray терял whitelist→reality-out, всё уходило direct,
+# а доктор зеленел: канарейки _tunnel_up (api.anthropic.com) доступны и НАПРЯМУЮ — их 403
+# region-блок читался tunnel_code_up как «живой канал» (туннель ok 18/64 за 10м). Дискриминатор
+# класса «туннель не используется»: домен, гарантированно мёртвый напрямую (github.com — резку
+# подтверждает GFW per-domain), через прокси. Жив → туннель доставляет. Мёртв при подтверждённой
+# резке и живых канарейках → «туннель не доставляет» (обход whitelist/смерть Reality) — driver.
+_TUNNEL_DELIVERY_URL = "https://github.com/"
+
+
+def _tunnel_delivery_check(gfw_status):
+    """GFW-канарейка github через прокси — доказательство, что туннель ДЕЙСТВИТЕЛЬНО доставляет.
+
+    Канарейки _tunnel_up ходят на домены, доступные и напрямую (anthropic/openai) — их ответ
+    не различает «выход через VPS» от «xray шлёт direct» (#418). github.com напрямую резан
+    GFW (подтверждение — _gfw_domain_check, статус "gfw") → его живость ЧЕРЕЗ прокси возможна
+    только через туннель. Вызов _tunnel_target_up через фасад — канон
+    moving-caller-inverts-mock-ownership.
+
+    gfw_status — статус GFW per-domain пробы ("gfw" = github режется напрямую; прочее — резка
+    не подтверждена, дискриминатор несостоятелен).
+
+    Возвращает {status, detail}:
+      ok   — github через прокси жив (туннель доставляет);
+      down — github через прокси мёртв ПРИ подтверждённой GFW-резке (туннель не доставляет);
+      info — резка не подтверждена (github напрямую открыт / контроль недоступен — не различить).
+    Не бросает (probe-канон).
+    """
+    ok, detail, kind, _timing = _health_facade._tunnel_target_up(_TUNNEL_DELIVERY_URL, head=True)
+    if ok:
+        return {"status": "ok",
+                "detail": "туннель доставляет: github.com через прокси жив "
+                          "(напрямую резан GFW — жив только через туннель)"}
+    if gfw_status == "gfw":
+        return {"status": "down",
+                "detail": f"туннель не доставляет: github.com через прокси мёртв ({kind}), "
+                          f"при этом напрямую резан GFW — трафик туннеля не идёт "
+                          f"(обход whitelist/смерть Reality); канарейкам на direct-доступных "
+                          f"доменах верить нельзя"}
+    return {"status": "info",
+            "detail": f"github.com через прокси недоступен ({kind}), но GFW-резка напрямую "
+                      f"не подтверждена — не дискриминирует (github сам лежит / direct открыт)"}
 
 
 # ============================ #396: классы проб direct/bulk ============================

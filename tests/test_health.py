@@ -7150,3 +7150,76 @@ def test_status_event_without_tunnel_unchanged_shape(monkeypatch, tmp_path):
     assert lines[0]["current"] == {"status": "degraded", "failed": ["claude-proxy"]}, \
         "без гейта ключа gated в событии нет — dict равен прежней схеме"
     assert "gated_details" not in lines[0]
+
+
+# ============================ #418: туннель-доставка (GFW-канарейка github через прокси) ============================
+# Инцидент 2026-10-11: рабочий xray терял whitelist→reality-out (adopted-конфиг после ручной
+# правки) и гнал ВСЁ direct — а доктор зеленел: канарейки туннеля (api.anthropic.com) доступны
+# и напрямую, их 403-region читался tunnel_code_up как «живой канал» (туннель ok 18/64),
+# xray-config-freshness сравнивает только mtime. Дискриминатор: домен, гарантированно мёртвый
+# напрямую (github.com — резку подтверждает GFW per-domain), через прокси. Жив через прокси →
+# туннель действительно доставляет. Мёртв при подтверждённой резке и живых канарейках →
+# «туннель не доставляет» — driver (сегодняшний кейс); иначе info (github сам лежит / direct открыт).
+def _mock_gfw_status(monkeypatch, status):
+    monkeypatch.setattr(health, "_gfw_domain_check",
+                        lambda *a, **kw: {"status": status, "detail": f"mock gfw {status}"})
+
+
+def _mock_proxy_github(monkeypatch, ok, kind="connection-failed"):
+    monkeypatch.setattr(health, "_tunnel_target_up",
+                        lambda url, head=False, via_proxy=True:
+                        (ok, "HTTP 200" if ok else kind, "ok" if ok else kind, None))
+
+
+def test_tunnel_delivery_driver_down_when_gfw_dead_via_proxy(monkeypatch):
+    """#418: канарейки «живы», GFW-резка github подтверждена, github через прокси мёртв →
+    «туннель не доставляет» = driver-down (не info). Сегодняшний кейс: доктор зеленел при
+    полностью обойдённом туннеле."""
+    _all_up_monkey(monkeypatch)
+    _mock_gfw_status(monkeypatch, "gfw")
+    _mock_proxy_github(monkeypatch, ok=False)
+    result = health.check_all(active_claude=True)
+    td = next((c for c in result["checks"] if "доставка" in c["name"]), None)
+    assert td is not None, "check_all(active_claude=True) содержит чек туннель-доставка"
+    assert td["ok"] is False, "github мёртв через прокси при GFW-резке → driver (ok=False)"
+    assert not td.get("info"), "driver при живых канарейках — не info"
+    assert result["status"] in ("degraded", "down"), "туннель не доставляет → не ok"
+
+
+def test_tunnel_delivery_ok_info_when_delivered(monkeypatch):
+    """#418: github через прокси жив при GFW-резке → туннель доставляет; info-only, не роняет."""
+    _all_up_monkey(monkeypatch)
+    _mock_gfw_status(monkeypatch, "gfw")
+    _mock_proxy_github(monkeypatch, ok=True)
+    result = health.check_all(active_claude=True)
+    td = next((c for c in result["checks"] if "доставка" in c["name"]), None)
+    assert td is not None
+    assert td["ok"] is True, "github жив через прокси при резке → туннель доставляет"
+    assert td.get("info") is True, "доставка — картина, не driver"
+    assert result["status"] == "ok"
+
+
+def test_tunnel_delivery_info_when_gfw_not_confirmed(monkeypatch):
+    """#418: github через прокси мёртв, но GFW-резка НЕ подтверждена (direct github открыт) →
+    не дискриминирует (github сам лежит) → info-only, не роняет вердикт."""
+    _all_up_monkey(monkeypatch)
+    _mock_gfw_status(monkeypatch, "ok")
+    _mock_proxy_github(monkeypatch, ok=False)
+    result = health.check_all(active_claude=True)
+    td = next((c for c in result["checks"] if "доставка" in c["name"]), None)
+    assert td is not None
+    assert td.get("info") is True, "без подтверждённой резки фейл github не дискриминирует"
+    assert result["status"] == "ok"
+
+
+def test_tunnel_delivery_info_when_tunnel_already_down(monkeypatch):
+    """#418: канарейки сами мертвы → туннель-чек уже driver; дубль не нужен (info)."""
+    _all_up_monkey(monkeypatch)
+    monkeypatch.setattr(health, "_tunnel_up",
+                        lambda *a, **k: (False, "connection-failed", False, None))
+    _mock_gfw_status(monkeypatch, "gfw")
+    _mock_proxy_github(monkeypatch, ok=False)
+    result = health.check_all(active_claude=True)
+    td = next((c for c in result["checks"] if "доставка" in c["name"]), None)
+    assert td is not None
+    assert td.get("info") is True, "туннель уже driver — доставка info (не дублируем)"
