@@ -696,6 +696,12 @@ def check_all(*, active_claude=False):
             td_check["ok"] = False
             td_check["info"] = False
         checks.append(td_check)
+        # github-direct (эксперимент 2026-10-11): куда сейчас ходит github — info-only
+        # картина (read-only чтение конфига, дёшево — как xray-config-freshness, без gate).
+        gd = _github_direct_check()
+        if gd["status"] != "unknown":
+            checks.append({"name": "github-direct (путь github)", "ok": True, "info": True,
+                           "detail": gd["detail"]})
         # #197 direct-first: какие candidate-домены (z.ai BUILTIN + user direct_domains) идут
         # напрямую (NO_PROXY) — переживают смерть VPS. info-only ВСЕГДА (как GFW-чек выше) — картина,
         # не сбой стека. gate под active_claude (doctor-only): direct_first.detect() делает прямой
