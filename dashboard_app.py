@@ -24,6 +24,7 @@ from dashboard_network import (
     probe_ping,
     probe_route_to_vps,
     probe_services,
+    probe_speedtest,
     probe_tunnel,
     probe_vpn,
 )
@@ -108,6 +109,7 @@ def gather_status(only=None):
         "tunnel": probe_tunnel,
         "exit_ip": lambda: probe_exit_ip(route_ip=active_route_ip),
         "vpn": probe_vpn,
+        "speedtest": probe_speedtest,
         "route": lambda: probe_route_to_vps(route_ip=active_route_ip),
         "direct": probe_direct,
         "traffic_guard": probe_traffic_guard,

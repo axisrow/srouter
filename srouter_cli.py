@@ -32,6 +32,7 @@ from pathlib import Path  # noqa: F401 — публичный контракт s
 import diag_netprobe  # mark: контекст сети на момент ручной отметки (fail-soft контракт)
 import local_state
 import metrics_store  # mark: append_timing_event + MARKS_LOG (владелец — модуль, тесты мокают его)
+import speedtest_store  # speedtest: журнал ручных замеров скорости (владелец — модуль)
 import node_selector  # node use: two-phase active-node apply (canonical/adopt-surgical)
 from install_lib import (
     CHOICES,
@@ -724,6 +725,80 @@ def cmd_mark(args) -> int:
         net_txt += " (неизвестная сеть)"
     suffix = f" (комментарий: {comment})" if comment else ""
     print(f"Отметка записана: {args.verdict}{suffix} — сеть: {net_txt}")
+    return 0
+
+
+def cmd_speedtest(args) -> int:
+    """Ручной замер скорости (Ookla speedtest CLI) с записью в журнал (2026-10-12).
+
+    Метки записи — сеть (diag_netprobe.current_net_status: SSID → netname по MAC
+    шлюза → gw) и VPN (из собственной выдачи speedtest: interface.isVpn/name, isp,
+    externalIp — то, ЧЕРЕЗ ЧТО реально шёл замер). Только ручной запуск, никаких
+    расписаний (политика roadmap: observe/manual first, автоматизация — follow-up).
+    --list N — последние записи таблицей, без запуска замера.
+    """
+    if getattr(args, "list", None) is not None:  # 0 — заданное значение, не «флага нет»
+        return _speedtest_list(args.list)
+    cmd = [speedtest_store.speedtest_bin(), "--accept-license", "--accept-gdpr", "-f", "json"]
+    if getattr(args, "iface", None):
+        cmd += ["-I", args.iface]
+    res = run(cmd, 240)
+    err = (res.get("err") or "").strip()
+    if res.get("timeout"):
+        print("speedtest: таймаут 240с — замер не завершился, запись не пишется.",
+              file=sys.stderr)
+        return 2
+    if res.get("rc") != 0:
+        if err:
+            print(err, file=sys.stderr)
+        print(f"speedtest: замер не удался (rc={res.get('rc')}) — запись не пишется.",
+              file=sys.stderr)
+        return res.get("rc") or 2
+    try:
+        data = json.loads((res.get("out") or "").strip())
+    except ValueError:
+        print("speedtest: выдача не JSON (ожидался -f json) — запись не пишется.",
+              file=sys.stderr)
+        return 2
+    st = diag_netprobe.current_net_status()  # fail-soft контракт: сам не бросает
+    record = speedtest_store.build_record(data, st)
+    if not speedtest_store.append_result(record):
+        print(f"speedtest: append в {speedtest_store.SPEEDTEST_LOG} не удался.",
+              file=sys.stderr)
+        return 1
+    net_txt = record.get("net") or "нет"
+    if st is not None and not st.get("known"):
+        net_txt += " (неизвестная сеть)"
+    vpn_txt = (f"VPN {record.get('isp')}" if record.get("vpn") else "без VPN")
+    print(f"Замер записан: ↓ {record.get('download_mbps')} Мбит/с, "
+          f"↑ {record.get('upload_mbps')} Мбит/с, пинг {record.get('ping_ms')} мс — "
+          f"сеть: {net_txt}, {vpn_txt} ({record.get('iface')})")
+    if record.get("result_url"):
+        print(f"Результат: {record['result_url']}")
+    return 0
+
+
+def _speedtest_list(limit) -> int:
+    """Таблица последних замеров (newest-first) из журнала speedtest_store."""
+    recs = speedtest_store.read_results(limit=limit)
+    if not recs:
+        print(f"Записей нет ({speedtest_store.SPEEDTEST_LOG}).")
+        return 0
+    print(f"Последние замеры ({speedtest_store.SPEEDTEST_LOG}):")
+    print(f"{'время':<17} {'сеть':<18} {'VPN':<24} {'↓ Мбит/с':>9} {'↑ Мбит/с':>9} {'пинг мс':>8}")
+    for r in recs:
+        try:
+            when = datetime.fromtimestamp(float(r.get("ts"))).strftime("%Y-%m-%d %H:%M")
+        except (TypeError, ValueError, OSError, OverflowError):
+            when = "?"
+        net = str(r.get("net") or "?")[:18]
+        vpn = (r.get("isp") or "VPN") if r.get("vpn") else "—"
+        dl = r.get("download_mbps")
+        ul = r.get("upload_mbps")
+        ping = r.get("ping_ms")
+        print(f"{when:<17} {net:<18} {str(vpn)[:24]:<24} "
+              f"{dl if dl is not None else '?':>9} {ul if ul is not None else '?':>9} "
+              f"{ping if ping is not None else '?':>8}")
     return 0
 
 
@@ -1680,6 +1755,19 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--xray-config", default=local_state.XRAY_CONFIG_PATH,
                         help="Путь к production xray-config.json.")
         sp.set_defaults(func=cmd_github_direct)
+
+    # speedtest (2026-10-12): ручной замер скорости с записью в журнал
+    # (~/Library/Logs/srouter-speedtest.jsonl), метки записи — сеть + VPN.
+    # Автозамеров нет: только рука (политика roadmap: observe/manual first).
+    p_st = sub.add_parser(
+        "speedtest",
+        help="Ручной замер скорости (Ookla CLI): ↓/↑/пинг с метками сеть+VPN в журнал. "
+             "--list N — последние замеры.")
+    p_st.add_argument("--list", nargs="?", const=10, type=int, default=None, metavar="N",
+                      help="Показать последние N замеров (по умолчанию 10), без запуска.")
+    p_st.add_argument("--iface", default=None, metavar="IFACE",
+                      help="Привязать замер к интерфейсу (как -I у speedtest, напр. ppp0).")
+    p_st.set_defaults(func=cmd_speedtest)
 
     # privoxy (#122): статус read-only; любые мутации идут через root-owned helper и свежий sudo.
     p_privoxy = sub.add_parser("privoxy", help="Защищённый system-режим Privoxy.")
