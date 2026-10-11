@@ -120,6 +120,7 @@ from srouter_cli import (  # noqa: F401 — намеренный re-export пу�
     cmd_doctor,
     cmd_go_proxy,
     cmd_install,
+    cmd_node,
     cmd_privoxy,
     cmd_restart,
     cmd_routing,

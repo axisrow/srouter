@@ -32,6 +32,7 @@ from pathlib import Path  # noqa: F401 — публичный контракт s
 import diag_netprobe  # mark: контекст сети на момент ручной отметки (fail-soft контракт)
 import local_state
 import metrics_store  # mark: append_timing_event + MARKS_LOG (владелец — модуль, тесты мокают его)
+import node_selector  # node use: two-phase active-node apply (canonical/adopt-surgical)
 from install_lib import (
     CHOICES,
     LAUNCHAGENT_LABEL,
@@ -1302,6 +1303,57 @@ def cmd_routing(args) -> int:
     return 0
 
 
+def cmd_node(args):
+    """Переключить активный узел. Единый источник правды — srouter.local.json active_node.
+
+    canonical-машина → node_selector.select_node (full regen); adopt-машина (guard #379)
+    → select_node_surgical (только outbound целевого тега, whitelist-правило не трогаем —
+    инцидент 2026-10-11: ручная хирургия конфига автоматизирована).
+    """
+    state_path = getattr(args, "state", None)
+    config_path = getattr(args, "xray_config", None) or local_state.XRAY_CONFIG_PATH
+    name = args.name
+    enabled = {n.get("name") for n in local_state.enabled_nodes(path=state_path)}
+    if name not in enabled:
+        known = ", ".join(sorted(n for n in enabled if n)) or "нет"
+        print(f"node use {name}: узел не найден или disabled (enabled: {known})",
+              file=sys.stderr)
+        return 2
+    runner = make_privileged_runner(run)
+    result = node_selector.select_node(
+        name, enabled_names=enabled, runner=runner, state_path=state_path,
+        config_path=config_path)
+    if result.get("step") == "adopt-mode":
+        # #379: полный regen на adopt-машине стёр бы ручной whitelist — surgical-путь.
+        result = node_selector.select_node_surgical(
+            name, enabled_names=enabled, runner=runner, state_path=state_path,
+            config_path=config_path, port_checker=port_open)
+    if result.get("ok"):
+        if result.get("changed"):
+            target = result.get("to") or result.get("active") or name
+            prev = result.get("from")
+            if prev:
+                print(f"node use: активный узел {prev} → {target}, xray перезапущен.")
+            else:
+                print(f"node use: активный узел → {target}, xray перезапущен.")
+            ria = result.get("route_ip_apply")
+            if isinstance(ria, dict) and not ria.get("ok"):
+                print(f"  предупреждение: IP узла в routing-правило не добавлен "
+                      f"({ria.get('err')})", file=sys.stderr)
+        else:
+            print(f"node use: узел {name} уже активен (no-op).")
+        return 0
+    err = result.get("err") or result.get("error") or result.get("step") or "failed"
+    print(f"node use {name}: отказ на шаге «{result.get('step')}»: {err}", file=sys.stderr)
+    if err == "placeholder_reality":
+        print("  (узел содержит placeholder Reality-параметры — обнови узел в "
+              "srouter.local.json реальными ключами)", file=sys.stderr)
+    if result.get("step") == "restart":
+        print("  (конфиг откачен к предыдущему, xray перезапущен старым конфигом)",
+              file=sys.stderr)
+    return 2
+
+
 def _read_routing_domains(config_path, outbound):
     """Текущие domain[] rule с outboundTag=outbound. None если rule не найден/битый."""
     try:
@@ -1557,6 +1609,19 @@ def build_parser() -> argparse.ArgumentParser:
             sp.add_argument("--adopt", action="store_true",
                             help="Принять секцию reality-out под управление (первый раз).")
         sp.set_defaults(func=cmd_routing)
+
+    # node (инцидент 2026-10-11): смена активного узла одной командой. canonical →
+    # select_node (full regen), adopt (#379-guard) → select_node_surgical (только outbound).
+    p_node = sub.add_parser(
+        "node", help="Активный узел: use <имя> — переключить (canonical/adopt-surgical).")
+    p_node_sub = p_node.add_subparsers(dest="node_subcommand", required=True)
+    sp = p_node_sub.add_parser(
+        "use", help="Сделать узел активным: state — источник правды, конфиг приводится к нему.")
+    sp.add_argument("name", help="Имя узла из srouter.local.json (напр. sg-1).")
+    sp.add_argument("--state", default=None, help="Путь к srouter.local.json.")
+    sp.add_argument("--xray-config", default=local_state.XRAY_CONFIG_PATH,
+                    help="Путь к production xray-config.json.")
+    sp.set_defaults(func=cmd_node)
 
     # privoxy (#122): статус read-only; любые мутации идут через root-owned helper и свежий sudo.
     p_privoxy = sub.add_parser("privoxy", help="Защищённый system-режим Privoxy.")

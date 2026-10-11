@@ -1,9 +1,11 @@
 import copy
 import importlib
 import json
+import os
 import subprocess
 import sys
 import types
+from pathlib import Path
 
 import pytest
 
@@ -1286,3 +1288,436 @@ def test_ensure_split_route_gateway_signal_overrides_prefix(monkeypatch, tmp_pat
     r = node_selector.ensure_split_route(state_path=state_path)
     add_calls = [c for c in calls if any("add" in str(a) and "-host" in str(a) for a in c[0])]
     assert add_calls == [], f"gw==GATEWAY = split активен независимо от iface, calls={calls}"
+
+
+# ============================ select_node_surgical (adopt-машины) ============================
+# Инцидент 2026-10-11: смена узла на adopt-машине = ручная хирургия конфига (transplant
+# outbound из бэкапа). select_node (#379) здесь отказывает — полный regen стирает managed
+# whitelist. select_node_surgical = автоматизация канона из node_selector.py:534-539:
+# заменить ТОЛЬКО outbound с тегом _routing_outbound_tag(state) из state-узла, под
+# _routing_config_lock, byte-exact backup/rollback, whitelist-правило не трогать.
+_REAL_REALITY = {
+    "public_key": "jqBR10rLsliEYSmgkQKgmEpmfzxRw5qFTqFOiHmfFj8",
+    "short_id": "001d1b228d252fde",
+    "sni": "www.163.com",
+    "dest": "www.163.com:443",
+    "flow": "xtls-rprx-vision",
+}
+_HK_UUID = "b65556fa-fb37-481d-a317-a4d4f0db2402"
+
+
+def _surgical_state(active="sg-1", hk_enabled=True):
+    state = _state(active=active, hk_enabled=hk_enabled)
+    for n in state["nodes"]:
+        n["reality"] = dict(_REAL_REALITY)
+    state["nodes"][1]["uuid"] = _HK_UUID
+    return state
+
+
+def _surgical_config(active_address="203.0.113.10", tag="reality-out"):
+    return {
+        "srouter": {"marker": "srouter-managed", "managed": True},
+        "inbounds": [{"tag": "socks-in", "port": 10808, "protocol": "socks"}],
+        "outbounds": [
+            {"tag": tag, "protocol": "vless",
+             "settings": {"vnext": [{"address": active_address, "port": 443,
+                                     "users": [{"id": "old-uuid", "encryption": "none",
+                                                "flow": "xtls-rprx-vision"}]}]},
+             "streamSettings": {"network": "tcp", "security": "reality",
+                                "realitySettings": {"serverName": "www.163.com",
+                                                    "publicKey": "old-pk", "shortId": "aa",
+                                                    "fingerprint": "chrome", "spiderX": "/"}},
+             "srouter": {"node": "old"}},
+            {"tag": "direct", "protocol": "freedom", "settings": {}},
+        ],
+        "routing": {"domainStrategy": "AsIs", "rules": [
+            {"type": "field", "outboundTag": tag, "_srouter_managed": True,
+             "domain": ["domain:github.com", "domain:youtube.com"],
+             "ip": ["203.0.113.99"]},
+            {"type": "field", "outboundTag": "direct", "network": "tcp,udp"},
+        ]},
+    }
+
+
+def _surgical_state_with_routing(state, config):
+    """state + routing-секция с актуальным last_applied_hash (иначе пост-routing_apply
+    откажет по drift — fixture повторяет живую машину)."""
+    from local_state_routing import _routing_domains_hash
+    rule = config["routing"]["rules"][0]
+    state["routing"] = {
+        "outbound": rule["outboundTag"],
+        "active": list(rule["domain"]),
+        "active_ips": list(rule["ip"]),
+        "last_applied_hash": _routing_domains_hash(rule["domain"], rule["ip"]),
+    }
+    return state
+
+
+def _ok_runner(calls):
+    def _run(cmd, timeout):
+        calls.append((cmd, timeout))
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+    return _run
+
+
+def _port_checker_settle_then_up():
+    """Лента под контракт _restart_component: каждый рестарт ест 2 вызова (свободен → поднят)."""
+    import itertools
+    tape = itertools.cycle([False, True])
+
+    def _check(host, port, timeout=0.5):
+        return next(tape)
+    return _check
+
+
+def test_surgical_select_replaces_outbound_and_commits(tmp_path):
+    import node_selector
+
+    state_path = tmp_path / "srouter.local.json"
+    config = _surgical_config()
+    _write_state(state_path, _surgical_state_with_routing(_surgical_state(), config))
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+    rule_before = json.loads(config_path.read_text(encoding="utf-8"))["routing"]["rules"][0]
+    calls = []
+
+    out = node_selector.select_node_surgical(
+        "hk-1", enabled_names={"sg-1", "hk-1"}, runner=_ok_runner(calls),
+        state_path=state_path, config_path=config_path,
+        port_checker=_port_checker_settle_then_up())
+
+    assert out["ok"] is True, out
+    assert out["changed"] is True
+    assert out["step"] == "done"
+    assert out["from"] == "sg-1" and out["to"] == "hk-1"
+    cfg = json.loads(config_path.read_text(encoding="utf-8"))
+    ob = [o for o in cfg["outbounds"] if o["tag"] == "reality-out"][0]
+    assert ob["settings"]["vnext"][0]["address"] == "203.0.113.20", \
+        "outbound переехал на route_ip нового узла"
+    assert ob["settings"]["vnext"][0]["users"][0]["id"] == _HK_UUID
+    assert ob["streamSettings"]["realitySettings"]["publicKey"] == _REAL_REALITY["public_key"]
+    rule_after = cfg["routing"]["rules"][0]
+    assert rule_after["domain"] == rule_before["domain"], "whitelist-домены не тронуты"
+    assert rule_after["_srouter_managed"] is True, "маркер цел"
+    assert "203.0.113.20" in rule_after["ip"], "IP нового узла добавлен в правило"
+    assert _active_state(state_path) == {"name": "hk-1", "pending": None}
+    assert any("stop" in c[0] and "xray" in c[0] for c in calls), "рестарт зван"
+
+
+def test_surgical_select_rollback_on_restart_failure(tmp_path, monkeypatch):
+    import install_lib
+    import node_selector
+
+    state_path = tmp_path / "srouter.local.json"
+    config = _surgical_config()
+    _write_state(state_path, _surgical_state_with_routing(_surgical_state(), config))
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+    before = config_path.read_bytes()
+    restart_calls = []
+
+    def fake_restart(name, runner, *, port_checker=None):
+        restart_calls.append(name)
+        if len(restart_calls) == 1:
+            return {"rc": 1, "out": "", "err": "xray_port_not_up", "timeout": False}
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+
+    monkeypatch.setattr(install_lib, "_restart_component", fake_restart)
+
+    out = node_selector.select_node_surgical(
+        "hk-1", enabled_names={"sg-1", "hk-1"}, runner=_ok_runner([]),
+        state_path=state_path, config_path=config_path, port_checker=None)
+
+    assert out["ok"] is False
+    assert out["step"] == "restart"
+    assert out["err"].startswith("restart_failed:"), out
+    assert config_path.read_bytes() == before, "конфиг откачен byte-exact"
+    assert _active_state(state_path) == {"name": "sg-1", "pending": None}, \
+        "pending сброшен, активный прежний"
+    assert len(restart_calls) == 2, "recovery-рестарт старым конфигом зван"
+
+
+def test_surgical_select_refuses_placeholder_reality_before_mutation(tmp_path):
+    import node_selector
+
+    state_path = tmp_path / "srouter.local.json"
+    state = _surgical_state()
+    for n in state["nodes"]:
+        n["reality"] = dict(n["reality"], public_key="PLACEHOLDER")
+    config = _surgical_config()
+    _write_state(state_path, _surgical_state_with_routing(state, config))
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(_surgical_config(), ensure_ascii=False), encoding="utf-8")
+    before = state_path.read_bytes()
+    calls = []
+
+    out = node_selector.select_node_surgical(
+        "hk-1", enabled_names={"sg-1", "hk-1"}, runner=_ok_runner(calls),
+        state_path=state_path, config_path=config_path)
+
+    assert out["ok"] is False
+    assert out["err"] == "placeholder_reality", out
+    assert state_path.read_bytes() == before
+    assert calls == [], "до мутаций — ни одного runner-вызова"
+
+
+def test_surgical_select_refuses_unknown_or_disabled_node(tmp_path):
+    import node_selector
+
+    state_path = tmp_path / "srouter.local.json"
+    _write_state(state_path, _surgical_state(hk_enabled=False))
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(_surgical_config(), ensure_ascii=False), encoding="utf-8")
+    before = state_path.read_bytes()
+    calls = []
+
+    out_disabled = node_selector.select_node_surgical(
+        "hk-1", enabled_names={"hk-1"}, runner=_ok_runner(calls),
+        state_path=state_path, config_path=config_path)
+    out_unknown = node_selector.select_node_surgical(
+        "zz-9", enabled_names={"sg-1"}, runner=_ok_runner(calls),
+        state_path=state_path, config_path=config_path)
+
+    assert out_disabled["ok"] is False and out_disabled["err"] == "node_disabled"
+    assert out_unknown["ok"] is False and out_unknown["err"] == "node_not_found"
+    assert state_path.read_bytes() == before
+    assert calls == []
+
+
+def test_surgical_select_idempotent_noop_skips_restart(tmp_path):
+    import node_selector
+
+    state_path = tmp_path / "srouter.local.json"
+    state = _surgical_state(active="hk-1")
+    config = _surgical_config(active_address="203.0.113.20")
+    state = _surgical_state_with_routing(state, config)
+    _write_state(state_path, state)
+    # Конфиг = точный рендер state-узла (источник правды) — только тогда честный no-op.
+    hk = local_state.get_node("hk-1", path=state_path)
+    config["outbounds"][0] = gen_xray_config._vless_outbound(
+        hk, "reality-out", state_path=state_path)
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+    before_state = state_path.read_bytes()
+    before_config = config_path.read_bytes()
+    calls = []
+
+    out = node_selector.select_node_surgical(
+        "hk-1", enabled_names={"sg-1", "hk-1"}, runner=_ok_runner(calls),
+        state_path=state_path, config_path=config_path)
+
+    assert out["ok"] is True and out["changed"] is False and out["step"] == "noop"
+    assert state_path.read_bytes() == before_state, "gate до begin — state не тронут"
+    assert config_path.read_bytes() == before_config
+    assert calls == [], "no-op — рестарт не зван"
+
+
+def test_surgical_select_refuses_without_managed_marker(tmp_path):
+    import node_selector
+
+    state_path = tmp_path / "srouter.local.json"
+    _write_state(state_path, _surgical_state_with_routing(_surgical_state(), _surgical_config()))
+    config_path = tmp_path / "config.json"
+    cfg = {
+        "outbounds": [{
+            "tag": "reality-out", "protocol": "vless",
+            "settings": {"vnext": [{
+                "address": "203.0.113.10", "port": 443,
+                "users": [{"id": "u"}],
+            }]},
+        }],
+        "routing": {"rules": [{
+            "type": "field", "outboundTag": "reality-out",
+            "domain": ["domain:github.com"],
+        }]},
+    }
+    config_path.write_text(json.dumps(cfg), encoding="utf-8")
+    before = state_path.read_bytes()
+    calls = []
+
+    out = node_selector.select_node_surgical(
+        "hk-1", enabled_names={"sg-1", "hk-1"}, runner=_ok_runner(calls),
+        state_path=state_path, config_path=config_path)
+
+    assert out["ok"] is False
+    assert out["step"] == "adopt-mode", out
+    assert out["err"] == "no_managed_marker"
+    assert state_path.read_bytes() == before
+    assert calls == []
+
+
+def test_surgical_select_route_ip_apply_failure_is_warning(tmp_path, monkeypatch):
+    import local_state
+    import node_selector
+
+    state_path = tmp_path / "srouter.local.json"
+    config = _surgical_config()
+    _write_state(state_path, _surgical_state_with_routing(_surgical_state(), config))
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(local_state, "routing_apply",
+                        lambda *a, **k: {"ok": False, "err": "state_write_failed"})
+
+    out = node_selector.select_node_surgical(
+        "hk-1", enabled_names={"sg-1", "hk-1"}, runner=_ok_runner([]),
+        state_path=state_path, config_path=config_path,
+        port_checker=_port_checker_settle_then_up())
+
+    assert out["ok"] is True, "переключение уже применено — провал post-apply не валим"
+    assert out.get("route_ip_apply", {}).get("ok") is False, "провал приложен как предупреждение"
+
+
+def test_surgical_select_write_failure_no_restart_no_commit(tmp_path, monkeypatch):
+    """Провал записи нового конфига (_atomic_write_text -> False, ENOSPC-канон) — рестарт
+    и commit не начинаются: pending сброшен, конфиг byte-exact старый, ok=False (#review)."""
+    import install_lib
+    import node_selector
+
+    state_path = tmp_path / "srouter.local.json"
+    config = _surgical_config()
+    _write_state(state_path, _surgical_state_with_routing(_surgical_state(), config))
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+    before = config_path.read_bytes()
+    restart_calls = []
+
+    def fake_restart(name, runner, *, port_checker=None):
+        restart_calls.append(name)
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+
+    real_write = local_state._atomic_write_text
+
+    def enospc_config_write(path, text):
+        if path == config_path:
+            return False  # production-файл остаётся нетронутым (канон _atomic_write_text)
+        return real_write(path, text)
+
+    monkeypatch.setattr(install_lib, "_restart_component", fake_restart)
+    monkeypatch.setattr(local_state, "_atomic_write_text", enospc_config_write)
+
+    out = node_selector.select_node_surgical(
+        "hk-1", enabled_names={"sg-1", "hk-1"}, runner=_ok_runner([]),
+        state_path=state_path, config_path=config_path,
+        port_checker=_port_checker_settle_then_up())
+
+    assert out["ok"] is False, out
+    assert out["step"] == "config" and out["err"] == "config_write_failed", out
+    assert config_path.read_bytes() == before, "конфиг byte-exact старый"
+    assert restart_calls == [], "старым конфигом не рестартуем"
+    assert _active_state(state_path) == {"name": "sg-1", "pending": None}, \
+        "commit не зван, pending сброшен"
+
+
+def test_surgical_select_rollback_write_failure_reported(tmp_path, monkeypatch):
+    """Провал rollback-записи (_atomic_write_text -> False) не маскируется под успех:
+    err содержит rollback_failed_config_kept_new, changed=True — конфиг остался новым."""
+    import install_lib
+    import node_selector
+
+    state_path = tmp_path / "srouter.local.json"
+    config = _surgical_config()
+    _write_state(state_path, _surgical_state_with_routing(_surgical_state(), config))
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+    original_text = config_path.read_text(encoding="utf-8")
+    restart_calls = []
+
+    def fake_restart(name, runner, *, port_checker=None):
+        restart_calls.append(name)
+        if len(restart_calls) == 1:
+            return {"rc": 1, "out": "", "err": "xray_port_not_up", "timeout": False}
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+
+    real_write = local_state._atomic_write_text
+
+    def enospc_rollback_write(path, text):
+        if path == config_path and text == original_text:
+            return False  # откат не удался
+        return real_write(path, text)
+
+    monkeypatch.setattr(install_lib, "_restart_component", fake_restart)
+    monkeypatch.setattr(local_state, "_atomic_write_text", enospc_rollback_write)
+
+    out = node_selector.select_node_surgical(
+        "hk-1", enabled_names={"sg-1", "hk-1"}, runner=_ok_runner([]),
+        state_path=state_path, config_path=config_path, port_checker=None)
+
+    assert out["ok"] is False and out["step"] == "restart", out
+    assert "rollback_failed_config_kept_new" in out["err"], out
+    assert out["changed"] is True, "конфиг остался новым — changed честный"
+    ob = json.loads(config_path.read_text(encoding="utf-8"))["outbounds"][0]
+    assert ob["settings"]["vnext"][0]["address"] == "203.0.113.20", "откат не удался"
+    assert _active_state(state_path) == {"name": "sg-1", "pending": None}
+
+
+def test_surgical_select_holds_lock_through_restart_and_rollback(tmp_path, monkeypatch):
+    """Лок держится через рестарт и recovery-рестарт rollback (канон #139): внутри
+    fake_restart чужой flock LOCK_NB на lockfile получает BlockingIOError."""
+    import fcntl
+    import install_lib
+    import node_selector
+
+    state_path = tmp_path / "srouter.local.json"
+    config = _surgical_config()
+    _write_state(state_path, _surgical_state_with_routing(_surgical_state(), config))
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+    lock_path = Path(str(config_path) + ".lock")
+    lock_seen = []
+
+    def fake_restart(name, runner, *, port_checker=None):
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                lock_seen.append(False)  # лок не держится — окно lost-update
+            except BlockingIOError:
+                lock_seen.append(True)  # транзакция держит лок
+        finally:
+            os.close(fd)
+        if len(lock_seen) == 1:
+            return {"rc": 1, "out": "", "err": "xray_port_not_up", "timeout": False}
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+
+    monkeypatch.setattr(install_lib, "_restart_component", fake_restart)
+
+    out = node_selector.select_node_surgical(
+        "hk-1", enabled_names={"sg-1", "hk-1"}, runner=_ok_runner([]),
+        state_path=state_path, config_path=config_path, port_checker=None)
+
+    assert out["ok"] is False and out["step"] == "restart", out
+    assert lock_seen == [True, True], \
+        "лок держится и при основном рестарте, и при recovery-рестарте"
+    assert config_path.read_bytes() == json.dumps(
+        config, ensure_ascii=False).encode("utf-8"), "конфиг откачен"
+    assert _active_state(state_path) == {"name": "sg-1", "pending": None}
+
+
+def test_surgical_select_converges_rotated_credentials_same_address(tmp_path):
+    """Ротация uuid/publicKey/short_id при том же address (пере-провижининг, кейс de-1):
+    гейт не отдает no-op — outbound приводится к рендеру state-источника правды."""
+    import node_selector
+
+    state_path = tmp_path / "srouter.local.json"
+    state = _surgical_state(active="hk-1")
+    config = _surgical_config(active_address="203.0.113.20")  # тот же address, старые креды
+    _write_state(state_path, _surgical_state_with_routing(state, config))
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+    calls = []
+
+    out = node_selector.select_node_surgical(
+        "hk-1", enabled_names={"sg-1", "hk-1"}, runner=_ok_runner(calls),
+        state_path=state_path, config_path=config_path,
+        port_checker=_port_checker_settle_then_up())
+
+    assert out["ok"] is True, out
+    assert out["changed"] is True and out["step"] == "done", out
+    ob = [o for o in json.loads(config_path.read_text(encoding="utf-8"))["outbounds"]
+          if o["tag"] == "reality-out"][0]
+    assert ob["settings"]["vnext"][0]["users"][0]["id"] == _HK_UUID, "uuid сконвергировал"
+    assert ob["streamSettings"]["realitySettings"]["publicKey"] == _REAL_REALITY["public_key"]
+    assert ob["streamSettings"]["realitySettings"]["shortId"] == _REAL_REALITY["short_id"]
+    assert any("stop" in c[0] and "xray" in c[0] for c in calls), "рестарт зван"
+    assert _active_state(state_path) == {"name": "hk-1", "pending": None}
