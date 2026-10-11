@@ -118,6 +118,18 @@ def test_list_prints_recent_records(tmp_path, monkeypatch, capsys):
     assert "0.66" in out and "5.0" in out
 
 
+def test_list_zero_is_value_not_absent_flag(tmp_path, monkeypatch, capsys):
+    # --list 0: 0 — заданное значение (nargs="?"), не «флага нет»: таблица,
+    # а не молчаливый полный замер на 240с (review #424).
+    log = _setup(monkeypatch, tmp_path, SPEEDTEST_OUT)
+    speedtest_store.append_result(_rec(1.0, "office", 5.0), log_path=log)
+    rc = srouter_cli.cmd_speedtest(_args(list_=0))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Последние замеры" in out
+    assert len(speedtest_store.read_results(log_path=log)) == 1  # замер не запускался
+
+
 def test_list_empty_log_says_no_records(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(speedtest_store, "SPEEDTEST_LOG", tmp_path / "nope.jsonl")
     rc = srouter_cli.cmd_speedtest(_args(list_=10))

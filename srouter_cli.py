@@ -737,7 +737,7 @@ def cmd_speedtest(args) -> int:
     расписаний (политика roadmap: observe/manual first, автоматизация — follow-up).
     --list N — последние записи таблицей, без запуска замера.
     """
-    if getattr(args, "list", None):
+    if getattr(args, "list", None) is not None:  # 0 — заданное значение, не «флага нет»
         return _speedtest_list(args.list)
     cmd = [speedtest_store.speedtest_bin(), "--accept-license", "--accept-gdpr", "-f", "json"]
     if getattr(args, "iface", None):
