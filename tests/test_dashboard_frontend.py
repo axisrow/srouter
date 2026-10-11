@@ -326,7 +326,10 @@ def test_static_cards_carry_data_tab_and_tabbar_exists():
 # только запрошенное. Наборы light/TAB_HEAVY проверяем ТОЧНЫМ множеством, чтобы
 # нельзя было молча протащить тяжёлую пробу в light (и наоборот).
 
-_LIGHT_KEYS = {"services", "vpn", "route", "traffic_guard", "hot_routes", "isolate", "ifaces"}
+_LIGHT_KEYS = {"services", "vpn", "route", "traffic_guard", "hot_routes", "isolate", "ifaces",
+               # speedtest (2026-10-12): чтение хвоста локального JSONL — не сетевая проба;
+               # карточка на History (heavy у вкладки пуст), без light она вечно «нет замеров»
+               "speedtest"}
 _TAB_HEAVY_KEYS = {
     "overview": {"tunnel", "direct", "ping", "ips", "geo_distance"},
     "proxy": {"connectivity"},

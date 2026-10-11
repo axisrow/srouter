@@ -2390,7 +2390,7 @@
     }
     function statusQuery(tab, wave) {
       // Чистый шов для тестов: only-параметр волны для вкладки.
-      var LIGHT = 'services,vpn,route,traffic_guard,hot_routes,isolate,ifaces';
+      var LIGHT = 'services,vpn,route,traffic_guard,hot_routes,isolate,ifaces,speedtest';
       return 'only=' + (wave === 'heavy' ? tabHeavy(tab) : LIGHT);
     }
     function curTab() {
