@@ -8,8 +8,11 @@ from __future__ import annotations
 
 import copy
 import ipaddress
+import json
 import subprocess
 import threading
+
+from pathlib import Path
 
 import gen_xray_config
 import local_state
@@ -617,6 +620,159 @@ def _select_node_locked(name, *, enabled_names, runner=None, state_path=None, co
             if not rollback.get("ok"):
                 return _rollback_failed(previous, "internal", rollback, error=str(exc))
         return {"ok": False, "active": previous, "step": "internal", "error": str(exc)}
+
+
+# ============================ surgical select (adopt-машины, инцидент 2026-10-11) ============================
+def select_node_surgical(name, *, enabled_names=None, runner=None, state_path=None,
+                         config_path=XRAY_CONFIG_PATH, port_checker=None):
+    """Adopt-машина: заменить ТОЛЬКО outbound с тегом _routing_outbound_tag(state) целиком
+    из state-узла (gen_xray_config._vless_outbound), managed-правило (whitelist) не трогать.
+
+    Автоматизация канона «на adopt-машине узел переключают вручную — address/port в
+    reality-out под _routing_config_lock + рестарт xray» (комментарий у adopt-guard #379:
+    полный regen write_config стёр бы ручной whitelist). Транзакция как routing_apply:
+    flock от чтения до конца рестарта, byte-exact backup, atomic write
+    (_atomic_write_text), rollback + recovery-рестарт при любой неудаче. Placeholder-
+    reality узла (public_key/uuid "PLACEHOLDER" — класс sg-1 из state) = отказ ДО мутаций
+    (санитайзеры _vless_outbound такое пропускают — мёртвый Reality). После commit —
+    пост-шаг: IP нового узла в managed-правило через routing_apply (её idempotent-gate
+    гасит лишний рестарт; провал — только предупреждение result["route_ip_apply"]:
+    переключение уже применено и закоммичено).
+
+    Возвращает {ok, changed, step, from, to, err?, route_ip_apply?}. Никогда не бросает.
+    """
+    runner = runner or _default_runner
+    previous = None
+    begun = False
+    backup_text = None
+    try:
+        previous = _active_name(state_path)
+        # --- валидации ДО любых мутаций (fail-closed, как adopt-guard #379) ---
+        node = local_state.get_node(name, path=state_path)
+        if not node:
+            return {"ok": False, "changed": False, "step": "node", "err": "node_not_found",
+                    "from": previous, "to": previous}
+        if node.get("enabled") is not True or (enabled_names is not None and name not in enabled_names):
+            return {"ok": False, "changed": False, "step": "node", "err": "node_disabled",
+                    "from": previous, "to": previous}
+        tag = local_state_xray._routing_outbound_tag(state_path)
+        if tag == "active":
+            # state без routing-секции — тег неизвестен (fail-open окно #379: знание,
+            # что это adopt-машина, не подтверждено).
+            return {"ok": False, "changed": False, "step": "adopt-mode",
+                    "err": "no_routing_outbound_tag", "from": previous, "to": previous}
+        if not local_state_routing.routing_has_managed_marker(config_path):
+            return {"ok": False, "changed": False, "step": "adopt-mode",
+                    "err": "no_managed_marker", "from": previous, "to": previous}
+        reality = node.get("reality") if isinstance(node.get("reality"), dict) else {}
+        pk = str(reality.get("public_key") or "").strip()
+        uuid = str(node.get("uuid") or "").strip()
+        sni = str(reality.get("sni") or "").strip()
+        if (not pk or pk.upper() == "PLACEHOLDER" or not uuid
+                or uuid.upper() == "PLACEHOLDER" or not sni):
+            return {"ok": False, "changed": False, "step": "validate",
+                    "err": "placeholder_reality", "from": previous, "to": previous}
+        new_addr = local_state.resolve_route_ip(node, path=state_path)
+
+        # Lazy (circular-import канон routing_apply) и ДО lock-блока: top-level except
+        # обязан иметь рабочие хелперы при любом месте исключения.
+        import install_lib
+
+        def _failed(res):
+            return bool(res.get("timeout")) or res.get("rc") != 0
+
+        def _rollback_locked_config():
+            """byte-exact конфиг + clear_pending + recovery-рестарт старым конфигом."""
+            rb = {"config": True, "pending": True, "restart": True}
+            try:
+                local_state._atomic_write_text(config_path, backup_text)
+            except OSError:
+                rb["config"] = False
+            try:
+                local_state.clear_pending(path=state_path)
+            except (OSError, ValueError):
+                rb["pending"] = False
+            try:
+                bad = _failed(install_lib._restart_component(
+                    "xray", runner, port_checker=port_checker))
+            except Exception:  # noqa: BLE001 — runner инжектируемый (canon routing_apply)
+                bad = True
+            rb["restart"] = not bad
+            return rb
+
+        try:
+            with local_state._routing_config_lock(config_path):
+                raw = Path(config_path).read_text(encoding="utf-8")
+                data = json.loads(raw)
+                if not isinstance(data, dict) or not isinstance(data.get("outbounds"), list):
+                    return {"ok": False, "changed": False, "step": "config",
+                            "err": "config_unreadable", "from": previous, "to": previous}
+                idxs = [i for i, o in enumerate(data["outbounds"])
+                        if isinstance(o, dict) and o.get("tag") == tag]
+                if len(idxs) != 1:
+                    return {"ok": False, "changed": False, "step": "config",
+                            "err": f"expected_one_{tag}_outbound", "from": previous,
+                            "to": previous}
+                # Idempotent-gate ДО begin: состояние не мутируем, рестарт не зван.
+                cur_addr = ((data["outbounds"][idxs[0]].get("settings") or {})
+                            .get("vnext") or [{}])[0].get("address")
+                if _active_name(state_path) == name and cur_addr == new_addr:
+                    return {"ok": True, "changed": False, "step": "noop",
+                            "from": previous, "to": name}
+                backup_text = raw  # byte-exact снимок (канон rollback)
+                begun = True
+                local_state.begin_active_node_change(name, path=state_path)
+                rendered = gen_xray_config._vless_outbound(node, tag, state_path=state_path)
+                if not isinstance(rendered, dict) or not rendered:
+                    raise ValueError("rendered outbound is empty")
+                data["outbounds"][idxs[0]] = rendered
+                local_state._atomic_write_text(
+                    config_path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+        except OSError as exc:
+            # lockfile не создался/не открылся — fail-closed без сериализации (как routing_apply).
+            return {"ok": False, "changed": False, "step": "lock",
+                    "err": f"config_lock_failed:{exc}", "from": previous, "to": previous}
+
+        # --- рестарт ВНЕ json-правки, но решение о rollback по его исходу ---
+        try:
+            restart = install_lib._restart_component("xray", runner, port_checker=port_checker)
+        except Exception as exc:  # noqa: BLE001 — runner инжектируемый, тип не под контролем
+            restart = {"rc": 1, "out": "", "err": f"restart_exception:{exc}", "timeout": False}
+        if _failed(restart):
+            rb = _rollback_locked_config()
+            err = f"restart_failed:{restart.get('err') or restart.get('rc')}"
+            if not rb["config"]:
+                err += "; rollback_failed_config_kept_new"
+            elif not rb["pending"] or not rb["restart"]:
+                err += "; rollback_partial"
+            return {"ok": False, "changed": not rb["config"], "step": "restart",
+                    "err": err, "from": previous, "to": previous}
+        local_state.commit_active_node_change(name, path=state_path)
+        if _active_name(state_path) != name:
+            rb = _rollback_locked_config()
+            return {"ok": False, "changed": not rb["config"], "step": "commit",
+                    "err": "active_node_was_not_committed", "from": previous, "to": previous}
+
+        # --- пост-шаг ВНЕ flock: IP нового узла в managed-правило (idempotent) ---
+        result = {"ok": True, "changed": True, "step": "done", "from": previous, "to": name}
+        try:
+            route_res = local_state.routing_apply(
+                None, ips=[new_addr], ip_action="add", config_path=config_path,
+                state_path=state_path, runner=runner, port_checker=port_checker)
+        except Exception as exc:  # noqa: BLE001 — никогда не валим применённый переключатель
+            route_res = {"ok": False, "err": f"route_apply_exception:{exc}"}
+        if isinstance(route_res, dict) and not route_res.get("ok"):
+            result["route_ip_apply"] = route_res
+        return result
+    except Exception as exc:  # noqa: BLE001 — top-level never-throws (канон select_node #159)
+        if begun and backup_text is not None:
+            rb = _rollback_locked_config()
+            if not rb["config"]:
+                return {"ok": False, "changed": True, "step": "rollback_failed",
+                        "err": f"internal:{exc}; rollback_failed_config_kept_new",
+                        "from": previous, "to": previous}
+        return {"ok": False, "changed": False, "step": "internal", "err": str(exc),
+                "from": previous, "to": previous}
 
 
 # ============================ ensure_split_route (Часть C — «пофигу VPN») ============================
