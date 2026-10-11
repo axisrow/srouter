@@ -16,16 +16,16 @@ ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "diag-tunnel-matrix.sh"
 
 
-def _run(script_args, curl_behavior, tmp_path, state=None):
+def _run(script_args, curl_behavior, tmp_path, state=None, speed="500000Bps"):
     """Запустить скрипт с fake curl; curl_behavior — 'selective'|'all_dead'|'all_ok'."""
     if curl_behavior == "all_dead":
         body = 'exit 28\n'
     elif curl_behavior == "all_ok":
-        body = 'printf "200/0.1s"\nexit 0\n'
+        body = 'printf "200/0.1s/%s"\nexit 0\n' % speed
     else:  # selective: github/anthropic живы, youtube/gstatic мертвы (матрица 10-11)
         body = (
             'case "$*" in *youtube.com*|*gstatic.com*) exit 28;; esac\n'
-            'printf "200/0.1s"\nexit 0\n'
+            'printf "200/0.1s/%s"\nexit 0\n' % speed
         )
     fake = tmp_path / "fake_curl.sh"
     fake.write_text("#!/usr/bin/env bash\n" + body, encoding="utf-8")
@@ -76,6 +76,15 @@ def test_all_ok_produce_alive_verdict(tmp_path):
     assert "всё живо" in result.stdout
 
 
+def test_low_speed_of_live_targets_is_bandwidth_window_verdict(tmp_path):
+    """10-11: DPI-окно душит туннель по скорости (~10 Bps) — «живые» ответы крошечные,
+    матрица обязана звать это битрейт-окном, а не цель-селективностью (сервер чист)."""
+    result = _run(["1"], "selective", tmp_path, speed="100Bps")
+    assert result.returncode == 0, result.stderr
+    assert "битрейт-окно" in result.stdout
+    assert "цель-селективно" not in result.stdout.split("Вердикт:")[-1]
+
+
 def test_curl_target_is_socks_proxy_from_state(tmp_path):
     """Цель curl — socks5h порт активного узла из local.json (канон #366)."""
     capture = tmp_path / "curl.args"
@@ -83,7 +92,7 @@ def test_curl_target_is_socks_proxy_from_state(tmp_path):
     fake.write_text(
         "#!/usr/bin/env bash\n"
         'printf \'%s\\n\' "$@" >> "$SROUTER_CURL_CAPTURE"\n'
-        'printf "200/0.1s"\nexit 0\n',
+        'printf "200/0.1s/500000Bps"\nexit 0\n',
         encoding="utf-8",
     )
     fake.chmod(0o755)

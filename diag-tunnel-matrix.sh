@@ -60,17 +60,21 @@ fi
 echo "Матрица туннеля: $SOCKS, раундов: $ROUNDS @ $(date '+%Y-%m-%d %H:%M:%S')"
 
 # probe <host>: первый цифрой код ответа (2xx-4xx = хост ответил, путь жив),
-# при обрыве/таймауте — FAIL(rc). rc ловим отдельно: при провале curl -w печатает
-# частичный write-out ('000/...'), склеивать его с FAIL нельзя (канон #82).
+# затем время и СКОРОСТЬ. Скорость обязательна: в DPI-окно туннель не рвётся, а
+# душится до ~10 КБ/с — крошечные ответы (301/404/204) выглядят «живыми», и без
+# колонки скорости матрица путает битрейт-окно с цель-селективностью (10-11).
+# rc ловим отдельно: при провале curl -w печатает частичный write-out ('000/...'),
+# склеивать его с FAIL нельзя (канон #82).
 probe() {
   local out
   out=$("$CURL_BIN" -x "$SOCKS" -s -o /dev/null --max-time 12 \
-        -w "%{http_code}/%{time_total}s" "https://$1/" 2>/dev/null)
+        -w "%{http_code}/%{time_total}s/%{speed_download}Bps" "https://$1/" 2>/dev/null)
   local rc=$?
   if [ $rc -ne 0 ]; then echo "FAIL($rc)"; else echo "$out"; fi
 }
 
 declare -a DEAD=()
+max_speed=0
 for h in "${TARGETS[@]}"; do
   row=""
   ok=0
@@ -81,6 +85,9 @@ for h in "${TARGETS[@]}"; do
   done
   if [ "$ok" -eq "$ROUNDS" ]; then
     verdict="жив"
+    sp="${v##*/}"; sp="${sp%Bps}"
+    case "$sp" in *[!0-9]*|"") sp=0;; esac
+    [ "$sp" -gt "$max_speed" ] && max_speed=$sp
   elif [ "$ok" -eq 0 ]; then
     verdict="МЁРТВ"; DEAD+=("$h")
   else
@@ -92,10 +99,13 @@ done
 echo
 if [ "${#DEAD[@]}" -eq "${#TARGETS[@]}" ]; then
   echo "Вердикт: всё мёртво — туннель/узел целиком (не цель-селективно)."
+elif [ "$max_speed" -lt 50000 ]; then
+  echo "Вердикт: битрейт-окно — хосты отвечают, но скорость задушена (макс ${max_speed} Bps)."
+  echo "Крошечные ответы пролезают, большие нет: «мёртвый» сайт — просто медленный. Ждать окно."
 elif [ "${#DEAD[@]}" -eq 0 ]; then
-  echo "Вердикт: всё живо."
+  echo "Вердикт: всё живо (скорость до ${max_speed} Bps)."
 else
   dead_list="$(printf '%s ' "${DEAD[@]}")"
-  echo "Вердикт: цель-селективно (туннель жив) — мертвы: $dead_list."
-  echo "Мёртвая цель недостижима С УЗЛА (DNS/блок на VPS) — чинится на сервере узла."
+  echo "Вердикт: цель-селективно (туннель жив, скорость ${max_speed} Bps) — мертвы: $dead_list."
+  echo "Живые цели быстрые → дело не в битрейте: мёртвая цель недостижима с узла или по пути."
 fi
