@@ -45,6 +45,10 @@ _REAL_NETWORK_INTERFACE_UP = health._network_interface_up
 # _all_up_monkey; им нужна РЕАЛЬНАЯ _codex_isolation_check, не глобальная заглушка.
 _REAL_CODEX_ISOLATION_CHECK = health._codex_isolation_check
 
+# #418: аналогично — delivery-тесты (test_tunnel_delivery_*) мокают _tunnel_target_up +
+# _gfw_domain_check и хотят РЕАЛЬНУЮ _tunnel_delivery_check поверх заглушки _all_up_monkey.
+_REAL_TUNNEL_DELIVERY_CHECK = health._tunnel_delivery_check
+
 # #329: аналогично — check_all-интеграционный тест override-гейта хочет РЕАЛЬНУЮ _claude_proxy_probe
 # (ps/lsof через мок sys_probe.run), а не заглушку из _all_up_monkey.
 _REAL_CLAUDE_PROXY_PROBE = health._claude_proxy_probe
@@ -142,6 +146,11 @@ def _all_up_monkey(monkeypatch, *, probe_status="ok", probe_detail="runtime: к�
     # иначе реальный launchd на dev-машине (protected/brew-mode, живой/мёртвый privoxy/xray)
     # драйвит вердикт недетерминированно. _port_up уже мокаем True выше → ok по контракту.
     monkeypatch.setattr(health, "_service_running", lambda label, domain=None: "running")
+    # #418: туннель-доставка — GFW-канарейка github ЧЕРЕЗ прокси (реальный curl) — мокаем ok,
+    # иначе живой прокси-стек dev-машины драйвит вердикт. Delivery-тесты восстанавливают
+    # реальную функцию ПОСЛЕ этого вызова (_REAL_TUNNEL_DELIVERY_CHECK, late-binding).
+    monkeypatch.setattr(health, "_tunnel_delivery_check",
+                        lambda *a, **kw: {"status": "ok", "detail": "mock: туннель доставляет"})
     # #252 perf: _gfw_domain_check/_direct_first_check (active_claude-путь) делают РЕАЛЬНЫЙ прямой
     # curl (env -u) к github.com/z.ai через sys_probe.direct_probe — без мока каждый
     # check_all(active_claude=True) в сьюте платит секунды сетевого I/O (cProfile: ~4.4s + ~1.6s
@@ -6516,6 +6525,10 @@ def _tunnel_note_harness(monkeypatch, tmp_path, note):
         return note
 
     monkeypatch.setattr(health, "_tunnel_parameter_note", fake_note)
+    # #396: класс-вердикт (cached_attribution) перезаписывает легаси-заметку, когда вердикт
+    # содержательный. На dev-машине он читает живой sidecar («tunnel… ok 18/64») и тест
+    # становился machine-dependent — глушим до «нет данных» (легаси-ветка, предмет теста).
+    monkeypatch.setattr(health, "cached_attribution", lambda *a, **k: None)
     return notified, calls
 
 
@@ -7169,6 +7182,9 @@ def _mock_proxy_github(monkeypatch, ok, kind="connection-failed"):
     monkeypatch.setattr(health, "_tunnel_target_up",
                         lambda url, head=False, via_proxy=True:
                         (ok, "HTTP 200" if ok else kind, "ok" if ok else kind, None))
+    # Восстановить РЕАЛЬНУЮ delivery-функцию поверх заглушки _all_up_monkey (#418):
+    # эти тесты проверяют её логику через check_all, мокая только её syscall-примитивы.
+    monkeypatch.setattr(health, "_tunnel_delivery_check", _REAL_TUNNEL_DELIVERY_CHECK)
 
 
 def test_tunnel_delivery_driver_down_when_gfw_dead_via_proxy(monkeypatch):

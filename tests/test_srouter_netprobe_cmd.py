@@ -178,15 +178,18 @@ def test_dns_servers_missing_file(tmp_path):
     assert diag_netprobe._dns_servers(tmp_path / "absent.conf") == ()
 
 
-def test_net_name_matches_by_dns_intersection(monkeypatch, tmp_path):
+def test_net_name_dns_only_records_never_match(monkeypatch, tmp_path):
+    """#375: DNS-пересечение удалено (операторный DNS совпадает между сетями, кейс
+    «hotspot как 888-5G») — legacy-запись только с dns[] не матчится вовсе
+    (переобучить: `netname <имя>`); сопоставление — gateway_mac, потом gateway."""
     nets = tmp_path / "nets.json"
     nets.write_text(json.dumps({
         "103": {"dns": ["192.168.3.1", "fe80::52f7:edff:fe36:9923%en0"]},
         "888-5G": {"dns": ["211.136.192.6", "120.196.165.24"]},
     }), encoding="utf-8")
     monkeypatch.setattr(diag_netprobe, "NETS_MAP", nets)
-    assert diag_netprobe._net_name(("120.196.165.24",)) == "888-5G"
-    assert diag_netprobe._net_name(("192.168.3.1",)) == "103"
+    assert diag_netprobe._net_name(dns=("120.196.165.24",)) is None
+    assert diag_netprobe._net_name(dns=("192.168.3.1",)) is None
 
 
 def test_net_name_none_without_match_or_map(monkeypatch, tmp_path):
