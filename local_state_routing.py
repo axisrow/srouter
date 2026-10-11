@@ -386,3 +386,160 @@ def _routing_apply_locked(config_path, state_path, outbound, hosts, action, adop
                     "err": f"restart_failed:{res.get('err', 'unknown')}{note}{recovery_err}"}
 
     return {"ok": True, "changed": True, "err": ""}
+
+
+# ============================ github-direct: три списка (эксперимент 2026-10-11) ============================
+# Инцидент: туннель флапает окнами → github умирает → агенты крутят настройки вручную.
+# github — единственный сайт с двумя путями: туннель жив → туннель, мёртв → напрямую.
+# Claude — только туннель (никогда не флипается, контракт «Anthropic никогда напрямую»);
+# остальные сайты — только туннель, не участвуют. Команда: srouter github-direct on|off|status.
+GITHUB_RULE_MARKER = "_srouter_github"
+STRICT_RULE_MARKER = "_srouter_strict"
+_GITHUB_SUFFIXES = ("github.com", "githubusercontent.com", "githubassets.com", "ghcr.io", "github.io")
+_ANTHROPIC_SUFFIXES = ("anthropic.com", "claude.ai", "claude.com", "claudeusercontent.com")
+
+
+def _domain_family(entry):
+    """strict (Claude) | github | general — по голому домену записи (префиксы снимаются)."""
+    bare = str(entry).strip().lower()
+    for prefix in ("domain:", "full:", "ext:"):
+        if bare.startswith(prefix):
+            bare = bare[len(prefix):]
+            break
+    bare = bare.split("/")[0]
+    for suffixes, family in ((_ANTHROPIC_SUFFIXES, "strict"), (_GITHUB_SUFFIXES, "github")):
+        for s in suffixes:
+            if bare == s or bare.endswith("." + s):
+                return family
+    return "general"
+
+
+def _rule_index_by_marker(rules, marker):
+    """Индекс единственного rule с marker=true; -1 нет, -2 несколько (как managed-поиск)."""
+    idxs = [i for i, r in enumerate(rules) if isinstance(r, dict) and r.get(marker) is True]
+    if len(idxs) > 1:
+        return -2
+    return idxs[0] if idxs else -1
+
+
+def github_direct_status(config_path=None):
+    """Read-only: {ok, split, direct} — куда сейчас ходит github. Не бросает."""
+    config_path = config_path or local_state.XRAY_CONFIG_PATH
+    try:
+        data = json.loads(Path(config_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {"ok": False, "err": "config_unreadable"}
+    routing = data.get("routing") if isinstance(data, dict) else None
+    rules = routing.get("rules") if isinstance(routing, dict) else None
+    if not isinstance(rules, list):
+        return {"ok": False, "err": "no_routing_rules"}
+    idx = _rule_index_by_marker(rules, GITHUB_RULE_MARKER)
+    if idx == -1:
+        return {"ok": True, "split": False, "direct": False}
+    return {"ok": True, "split": True,
+            "direct": rules[idx].get("outboundTag") == "direct"}
+
+
+def github_direct(action, *, config_path=None, state_path=None, runner=None,
+                  port_checker=None, outbound=None):
+    """Переключить путь github: on — напрямую (туннель мёртв), off — обратно в туннель.
+
+    Первое применение делит managed-правило на три: strict (_srouter_strict, Claude —
+    только туннель), github (_srouter_github — флипается) и managed (остальные — только
+    туннель). Транзакция по канону routing_apply: flock → byte-exact backup → atomic
+    write → state-hash под rest-состав (иначе следующий routing_apply умрёт по drift) →
+    restart → rollback (конфиг и state byte-exact + recovery-рестарт) при провале.
+    Idempotent: уже в нужном состоянии → changed=False без рестарта. Не бросает.
+    """
+    if action not in ("on", "off"):
+        return {"ok": False, "changed": False, "err": "bad_action"}
+    config_path = config_path or local_state.XRAY_CONFIG_PATH
+    import local_state_xray  # lazy — тег туннеля резолвим на adopt-машине из state
+    outbound = outbound or local_state_xray._routing_outbound_tag(state_path)
+    try:
+        with local_state._routing_config_lock(config_path):
+            return _github_direct_locked(
+                action, config_path, state_path, runner, port_checker, outbound)
+    except OSError:
+        return {"ok": False, "changed": False, "err": "config_lock_failed"}
+
+
+def _github_direct_locked(action, config_path, state_path, runner, port_checker, outbound):
+    target = "direct" if action == "on" else outbound
+    import install_lib  # lazy, как routing_apply (circular-import канон)
+
+    try:
+        raw = Path(config_path).read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except (OSError, ValueError, TypeError):
+        return {"ok": False, "changed": False, "err": "config_unreadable"}
+    routing = data.get("routing") if isinstance(data, dict) else None
+    rules = routing.get("rules") if isinstance(routing, dict) else None
+    if not isinstance(rules, list) or not rules:
+        return {"ok": False, "changed": False, "err": "no_routing_rules"}
+    m_idx = _routing_find_managed_rule(rules)
+    if m_idx == -1:
+        return {"ok": False, "changed": False, "err": "adopt_needed"}
+    if m_idx == -2:
+        return {"ok": False, "changed": False, "err": "ambiguous_managed_rules"}
+
+    g_idx = _rule_index_by_marker(rules, GITHUB_RULE_MARKER)
+    migration = g_idx == -1
+    m_rule = rules[m_idx]
+    if migration:
+        parts = {"strict": [], "github": [], "general": []}
+        for d in m_rule.get("domain") or []:
+            parts[_domain_family(d)].append(d)
+        if not parts["github"]:
+            return {"ok": False, "changed": False, "err": "no_github_domains"}
+        insert_at = m_idx
+        if parts["strict"]:
+            rules.insert(insert_at, {"type": "field", "outboundTag": outbound,
+                                     "domain": parts["strict"], STRICT_RULE_MARKER: True})
+            insert_at += 1
+            m_idx += 1
+        rules.insert(insert_at, {"type": "field", "outboundTag": outbound,
+                                 "domain": parts["github"], GITHUB_RULE_MARKER: True})
+        m_idx += 1
+        m_rule["domain"] = parts["general"]
+        g_idx = insert_at
+
+    g_rule = rules[g_idx]
+    if not migration and g_rule.get("outboundTag") == target:
+        return {"ok": True, "changed": False, "step": "noop"}
+
+    backup_text = raw
+    state_backup = None
+    if migration and state_path and Path(state_path).exists():
+        try:
+            state_backup = Path(state_path).read_text(encoding="utf-8")
+        except OSError:
+            state_backup = None
+    g_rule["outboundTag"] = target
+    local_state._atomic_write_text(
+        config_path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+    if migration and state_path:
+        # hash под НОВЫЙ rest-состав managed-правила — иначе следующий routing_apply умрёт по drift.
+        st, readable = local_state._load_state_checked(state_path)
+        if readable and isinstance(st, dict):
+            st.setdefault("routing", {})["last_applied_hash"] = _routing_domains_hash(
+                m_rule.get("domain") or [], m_rule.get("ip") or [])
+            local_state._atomic_write_text(
+                state_path, json.dumps(st, ensure_ascii=False, indent=2) + "\n")
+
+    try:
+        restart = install_lib._restart_component("xray", runner, port_checker=port_checker)
+    except Exception as exc:  # noqa: BLE001 — runner инжектируемый, тип не под контролем
+        restart = {"rc": 1, "out": "", "err": f"restart_exception:{exc}", "timeout": False}
+    if restart.get("timeout") or restart.get("rc") != 0:
+        local_state._atomic_write_text(config_path, backup_text)
+        if migration and state_path and state_backup is not None:
+            local_state._atomic_write_text(state_path, state_backup)
+        try:
+            install_lib._restart_component("xray", runner, port_checker=port_checker)
+        except Exception:  # noqa: BLE001 — recovery любой ценой тише основного отказа
+            pass
+        return {"ok": False, "changed": False, "step": "restart",
+                "err": f"restart_failed:{restart.get('err') or restart.get('rc')}"}
+    return {"ok": True, "changed": True, "step": "done", "direct": target == "direct",
+            "migrated": migration}

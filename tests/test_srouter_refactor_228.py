@@ -57,6 +57,7 @@ COMMAND_FUNCS = [
     "cmd_privoxy",
     "cmd_routing",
     "cmd_node",
+    "cmd_github_direct",
     "cmd_go_proxy",
 ]
 
@@ -121,6 +122,7 @@ class TestParserSurface:
             "mark",  # 2026-10-04: ручная отметка качества интернета → MARKS_LOG
             "protect",  # 2026-10-09: вкл/выкл PF-изоляции Anthropic (on/off/status + алиасы)
             "node",  # 2026-10-11: смена активного узла (use; canonical/adopt-surgical)
+            "github-direct",  # 2026-10-11: путь github (on/off/status; три списка)
         }
 
     def test_nested_subcommand_paths_preserved(self, surface):
@@ -131,6 +133,9 @@ class TestParserSurface:
             ("routing", "remove-domain"),
             ("routing", "list"),
             ("node", "use"),
+            ("github-direct", "on"),
+            ("github-direct", "off"),
+            ("github-direct", "status"),
             ("system-proxy", "status"),
             ("system-proxy", "repair"),
             ("system-proxy", "restore"),
@@ -181,6 +186,8 @@ class TestParserSurface:
             (("node", "use"), "name"),
             (("node", "use"), "state"),
             (("node", "use"), "xray_config"),
+            (("github-direct", "on"), "state"),
+            (("github-direct", "on"), "xray_config"),
             (("privoxy", "protect"), "strict"),
             (("privoxy", "protect"), "prefix"),
             (("privoxy", "audit", "report"), "limit"),
@@ -239,6 +246,8 @@ class TestDispatchContract:
             (["sync"], "cmd_sync"),
             (["routing", "list"], "cmd_routing"),
             (["node", "use", "sg-1"], "cmd_node"),
+            (["github-direct", "on"], "cmd_github_direct"),
+            (["github-direct", "status"], "cmd_github_direct"),
             (["privoxy", "status"], "cmd_privoxy"),
             (["privoxy", "audit", "status"], "cmd_privoxy"),
             (["go-proxy", "status"], "cmd_go_proxy"),

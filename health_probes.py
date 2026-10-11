@@ -19,6 +19,7 @@ import subprocess
 import time
 
 import local_state
+import local_state_routing
 import local_state_xray
 import privoxy_system
 import sys_probe
@@ -42,7 +43,7 @@ __all__ = [
     "_user_launchagent_plist", "_local_proxy_boot_persistence",
     "GFW_PROBE_DOMAINS", "GFW_CONTROL_DOMAIN", "_direct_domain_probe", "_gfw_domain_check",
     "_direct_first_check", "TUNNEL_TARGETS", "VENDOR_OUTAGE_MARKER",
-    "_tunnel_target_up", "_tunnel_up", "_tunnel_delivery_check",
+    "_tunnel_target_up", "_tunnel_up", "_tunnel_delivery_check", "_github_direct_check",
     # #396 классы проб: direct (мимо прокси) + bulk (объёмная передача)
     "_no_proxy_env", "DIRECT_PROBE_URLS", "_direct_up", "_bulk_probe", "_bulk_status",
     "_BULK_DEFAULT_URL", "_url_host",
@@ -1009,6 +1010,25 @@ def _tunnel_delivery_check(gfw_status):
 
 
 # ============================ #396: классы проб direct/bulk ============================
+def _github_direct_check():
+    """Куда сейчас ходит github (github-direct on/off) — картина для doctor, info-only.
+
+    Read-only чтение рабочего конфига (github_direct_status). unknown = конфиг не читается
+    или разделение ещё не выполнено (команда `srouter github-direct on` не звалась).
+    Не бросает (probe-канон).
+    """
+    st = local_state_routing.github_direct_status()
+    if not st.get("ok"):
+        return {"status": "unknown", "detail": "github-direct: конфиг не читается"}
+    if not st.get("split"):
+        return {"status": "unknown",
+                "detail": "github-direct: разделение не выполнено (запусти `srouter github-direct on`)"}
+    path = "напрямую (режим on)" if st.get("direct") else "через туннель (режим off)"
+    return {"status": "info", "direct": bool(st.get("direct")),
+            "detail": f"github ходит {path}"}
+
+
+
 # Дыра #396: все события metrics.jsonl шли через прокси-стек — «локальный интернет» не
 # измерялся, а обрывы/залипания посреди ПЕРЕДАЧИ (gh весь день, Forge на скачивании
 # компоненты: TLS-reset; privoxy 8118 принял, апстрим молчит без таймаута) не видел ни

@@ -151,6 +151,10 @@ def _all_up_monkey(monkeypatch, *, probe_status="ok", probe_detail="runtime: к�
     # реальную функцию ПОСЛЕ этого вызова (_REAL_TUNNEL_DELIVERY_CHECK, late-binding).
     monkeypatch.setattr(health, "_tunnel_delivery_check",
                         lambda *a, **kw: {"status": "ok", "detail": "mock: туннель доставляет"})
+    # github-direct (эксперимент 2026-10-11): read-only конфига — мокаем unknown (чек не
+    # добавляется), gh-тесты переопределяют ПОСЛЕ этого вызова (late-binding).
+    monkeypatch.setattr(health, "_github_direct_check",
+                        lambda *a, **kw: {"status": "unknown", "detail": "mock: github-direct"})
     # #252 perf: _gfw_domain_check/_direct_first_check (active_claude-путь) делают РЕАЛЬНЫЙ прямой
     # curl (env -u) к github.com/z.ai через sys_probe.direct_probe — без мока каждый
     # check_all(active_claude=True) в сьюте платит секунды сетевого I/O (cProfile: ~4.4s + ~1.6s
