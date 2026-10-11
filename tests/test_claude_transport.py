@@ -49,6 +49,58 @@ def test_real_cli_401_proves_transport_and_environment_is_isolated(monkeypatch):
         assert seen["env"][key] == HTTP_PROXY
 
 
+MODEL_OVERRIDE_KEYS = (
+    "ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_SMALL_FAST_MODEL",
+    "CLAUDE_CODE_SUBAGENT_MODEL",
+)
+
+
+def test_probe_env_strips_model_overrides(monkeypatch):
+    """Модель-override из env сессии не должен течь в пробу (инцидент 2026-10-11).
+
+    clean_keys чистил только proxy/ключи: claude стартовал с чужой моделью
+    (glm-5.3-flash из env CC-сессии) → api.anthropic.com отвечал 403 на незнакомую
+    модель ДО auth → rc=1 вместо ожидаемого 401 → чек ложно down.
+    """
+    for key in MODEL_OVERRIDE_KEYS:
+        monkeypatch.setenv(key, "glm-5.3-flash")
+    monkeypatch.setattr(health, "_find_claude_binary", lambda: "/fake/claude")
+    seen = {}
+
+    def fake_run(cmd, timeout, *, env=None):
+        seen.update({"cmd": cmd, "timeout": timeout, "env": env})
+        payload = {"type": "result", "is_error": True, "api_error_status": 401,
+                   "terminal_reason": "api_error"}
+        return _result(out=json.dumps(payload))
+
+    monkeypatch.setattr(health.sys_probe, "run", fake_run)
+    result = health._claude_transport_once(HTTP_PROXY)
+    assert result["status"] == "ok"
+    for key in MODEL_OVERRIDE_KEYS:
+        assert key not in seen["env"], f"{key} не должен течь в env пробы"
+
+
+def test_rc_failure_detail_carries_stderr_line(monkeypatch):
+    """rc!=None без API-ответа → detail содержит первую строку stderr.
+
+    Иначе диагностика вслепую: инцидент 2026-10-11 — «exited rc=1» без причины,
+    реальный ответ ([claude-code:unrecognized_model]) видно только вручную.
+    """
+    monkeypatch.setattr(health, "_find_claude_binary", lambda: "/fake/claude")
+
+    def fake_run(cmd, timeout, *, env=None):
+        return _result(rc=1, err="[claude-code:unrecognized_model] unknown model boom\nsecond line")
+
+    monkeypatch.setattr(health.sys_probe, "run", fake_run)
+    result = health._claude_transport_once(HTTP_PROXY)
+    assert result["status"] == "down"
+    assert "rc=1" in result["detail"]
+    assert "unrecognized_model" in result["detail"], \
+        "detail обязан нести первую строку stderr (усечённую)"
+    assert "second line" not in result["detail"], "только первая строка, не весь stderr"
+
+
 def test_unsupported_proxy_protocol_is_preserved(monkeypatch):
     monkeypatch.setattr(health, "_find_claude_binary", lambda: "/fake/claude")
     raw = "API Error: Unable to connect to API (UnsupportedProxyProtocol)"
