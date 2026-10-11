@@ -253,10 +253,20 @@ def _machine_state_monkey(monkeypatch):
     monkeypatch.setattr(health, "_service_running", lambda label, domain=None: "running")
     # #194: _upstream_vps_reachable читает реальный srouter.local.json + бьёт по VPS.
     monkeypatch.setattr(local_state, "active_node", lambda path=None: {})
+    # #416: VPS-probe читает endpoint рабочего xray config (compare_endpoint_with_xray) —
+    # тот же класс, что active_node выше (гвард #267: канонический список обязан быть подмножеством).
+    monkeypatch.setattr(local_state, "compare_endpoint_with_xray",
+                        lambda state_path=None, xray_config_path=None: {
+                            "synced": True, "local": "", "xray": "",
+                            "placeholder": False, "xray_status": "absent"})
     # #252 perf: GFW/direct-first (active_claude-путь) делают РЕАЛЬНЫЙ прямой curl к
     # github.com/z.ai — секунды сетевого I/O на каждый check_all(active_claude=True).
     monkeypatch.setattr(health, "_gfw_domain_check",
                         lambda *a, **kw: {"status": "ok", "detail": "mock: GFW не режет"})
+    # #418: туннель-доставка — GFW-канарейка github ЧЕРЕЗ прокси (реальный curl) — тот же
+    # класс, что GFW/direct-first (гвард #267: канонический список обязан быть подмножеством).
+    monkeypatch.setattr(health, "_tunnel_delivery_check",
+                        lambda *a, **kw: {"status": "ok", "detail": "mock: туннель доставляет"})
     monkeypatch.setattr(health, "_direct_first_check",
                         lambda: {"status": "ok", "detail": "mock: direct-first reachable"})
     # Инцидент 2026-10-01: _no_proxy_direct_check делает реальный прямой curl per-host NO_PROXY —
