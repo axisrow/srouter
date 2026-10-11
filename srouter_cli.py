@@ -1354,6 +1354,47 @@ def cmd_node(args):
     return 2
 
 
+def cmd_github_direct(args):
+    """Путь github: on — напрямую (туннель мёртв), off — обратно в туннель, status — что сейчас.
+
+    github — единственный сайт с двумя путями (эксперимент 2026-10-11); Claude — только
+    туннель, остальные — только туннель (см. local_state_routing.github_direct).
+    """
+    action = getattr(args, "github_direct_action", None)
+    state_path = getattr(args, "state", None)
+    config_path = getattr(args, "xray_config", None) or local_state.XRAY_CONFIG_PATH
+    if action == "status":
+        st = local_state.github_direct_status(config_path=config_path)
+        if not st.get("ok"):
+            print(f"github-direct: {st.get('err', 'failed')}", file=sys.stderr)
+            return 2
+        if not st.get("split"):
+            print("github-direct: разделение не выполнено — запусти `srouter github-direct on`")
+            return 0
+        path = "напрямую" if st.get("direct") else "через туннель"
+        print(f"github-direct: github ходит {path}")
+        return 0
+    runner = make_privileged_runner(run)
+    result = local_state.github_direct(
+        action, config_path=config_path, state_path=state_path,
+        runner=runner, port_checker=port_open)
+    if not result.get("ok"):
+        print(f"github-direct {action}: отказ "
+              f"({result.get('step', '—')}): {result.get('err', 'failed')}", file=sys.stderr)
+        if result.get("step") == "restart":
+            print("  (конфиг откачен к предыдущему, xray перезапущен старым конфигом)",
+                  file=sys.stderr)
+        return 2
+    if not result.get("changed"):
+        print(f"github-direct: github уже {'напрямую' if action == 'on' else 'через туннель'} (no-op).")
+        return 0
+    if action == "on":
+        print("github-direct: github ходит напрямую (туннель мёртв — верни `off`, когда оживёт).")
+    else:
+        print("github-direct: github снова через туннель.")
+    return 0
+
+
 def _read_routing_domains(config_path, outbound):
     """Текущие domain[] rule с outboundTag=outbound. None если rule не найден/битый."""
     try:
@@ -1622,6 +1663,23 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--xray-config", default=local_state.XRAY_CONFIG_PATH,
                     help="Путь к production xray-config.json.")
     sp.set_defaults(func=cmd_node)
+
+    # github-direct (эксперимент 2026-10-11): github — единственный сайт с двумя путями
+    # (туннель/напрямую). Claude и остальные — только туннель, командой не затрагиваются.
+    p_gd = sub.add_parser(
+        "github-direct",
+        help="Путь github: on — напрямую (туннель мёртв), off — в туннель, status — что сейчас.")
+    p_gd_sub = p_gd.add_subparsers(dest="github_direct_action", required=True)
+    for gd_name, gd_help in (
+        ("on", "Пустить github напрямую (туннель мёртв)."),
+        ("off", "Вернуть github в туннель."),
+        ("status", "Показать текущий путь github."),
+    ):
+        sp = p_gd_sub.add_parser(gd_name, help=gd_help)
+        sp.add_argument("--state", default=None, help="Путь к srouter.local.json.")
+        sp.add_argument("--xray-config", default=local_state.XRAY_CONFIG_PATH,
+                        help="Путь к production xray-config.json.")
+        sp.set_defaults(func=cmd_github_direct)
 
     # privoxy (#122): статус read-only; любые мутации идут через root-owned helper и свежий sudo.
     p_privoxy = sub.add_parser("privoxy", help="Защищённый system-режим Privoxy.")

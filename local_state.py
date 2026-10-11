@@ -417,6 +417,10 @@ _SUBMODULE_NAMES = {
     "routing_apply": "local_state_routing",
     "_routing_apply_locked": "local_state_routing",
     "routing_has_managed_marker": "local_state_routing",
+    # --- github-direct (три списка, эксперимент 2026-10-11) ---
+    "github_direct": "local_state_routing",
+    "github_direct_status": "local_state_routing",
+    "GITHUB_RULE_MARKER": "local_state_routing",
 }
 
 

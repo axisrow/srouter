@@ -3,6 +3,11 @@ import os
 from pathlib import Path
 
 import local_state
+import local_state_routing
+
+
+def _write_state(p, state):
+    p.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
 
 
 def test_host_regex_accepts_valid():
@@ -2055,3 +2060,191 @@ def test_normalize_http_targets_empty_falls_back_to_filtered_default():
     assert local_state.normalize_http_targets("мусор", fallback) == ["https://a.com/"]
     # и fallback целиком мусорный → пустой список (не падаем)
     assert local_state.normalize_http_targets([], ["nope"]) == []
+
+
+# ============================ github-direct: три списка (эксперимент, 2026-10-11) ============================
+# Инцидент: туннель флапает окнами → github умирает → агенты крутят настройки.
+# github — единственный сайт с двумя путями (туннель/напрямую); Claude — только туннель
+# (никогда не флипается); остальные — только туннель, не трогаем.
+_GH_GITHUB = ["domain:github.com", "domain:githubusercontent.com", "domain:ghcr.io"]
+_GH_ANTHROPIC = ["domain:anthropic.com", "domain:claude.ai"]
+_GH_OTHER = ["domain:youtube.com", "domain:openai.com"]
+
+
+def _gh_state(domains, ips=None):
+    """state с актуальным hash под ДО-разделения состав (как на живой машине)."""
+    from local_state_routing import _routing_domains_hash
+    return {"schema_version": 1,
+            "routing": {"outbound": "reality-out", "active": list(domains),
+                        "active_ips": list(ips or []),
+                        "last_applied_hash": _routing_domains_hash(domains, ips)}}
+
+
+def test_github_direct_on_splits_rules_and_flips(tmp_path):
+    from local_state_routing import _routing_domains_hash
+
+    domains = _GH_ANTHROPIC + _GH_GITHUB + _GH_OTHER
+    cfg_p = tmp_path / "config.json"
+    _write_xray_routing_config(cfg_p, domains, managed=True, ips=["203.0.113.9"])
+    state_p = tmp_path / "srouter.local.json"
+    _write_state(state_p, _gh_state(domains, ["203.0.113.9"]))
+    calls = []
+
+    out = local_state_routing.github_direct(
+        "on", config_path=cfg_p, state_path=state_p, runner=_ok_runner(calls),
+        port_checker=_port_checker_settle_then_up())
+
+    assert out["ok"] is True, out
+    assert out["changed"] is True
+    rules = json.loads(cfg_p.read_text(encoding="utf-8"))["routing"]["rules"]
+    strict = [r for r in rules if r.get("_srouter_strict")]
+    github = [r for r in rules if r.get("_srouter_github")]
+    managed = [r for r in rules if r.get("_srouter_managed")]
+    assert len(strict) == 1 and len(github) == 1 and len(managed) == 1
+    assert set(strict[0]["domain"]) == set(_GH_ANTHROPIC), "Claude — в strict"
+    assert strict[0]["outboundTag"] == "reality-out", "Claude — никогда не флипается"
+    assert set(github[0]["domain"]) == set(_GH_GITHUB)
+    assert github[0]["outboundTag"] == "direct", "on → github напрямую"
+    assert set(managed[0]["domain"]) == set(_GH_OTHER), "остальные — не тронуты"
+    assert managed[0]["outboundTag"] == "reality-out"
+    idx = [rules.index(r) for r in (strict[0], github[0], managed[0])]
+    assert idx == sorted(idx), "strict и github раньше managed"
+    assert managed[0]["ip"] == ["203.0.113.9"], "ip-матчеры остаются в managed"
+    assert any("xray" in " ".join(c) for c in calls), "рестарт зван"
+    # state-hash обновлён под rest-состав → следующий routing_apply не умрёт по drift
+    st = json.loads(state_p.read_text(encoding="utf-8"))
+    assert st["routing"]["last_applied_hash"] == _routing_domains_hash(
+        sorted(_GH_OTHER), ["203.0.113.9"])
+
+
+def test_github_direct_off_returns_github_to_tunnel(tmp_path):
+    domains = _GH_ANTHROPIC + _GH_GITHUB + _GH_OTHER
+    cfg_p = tmp_path / "config.json"
+    _write_xray_routing_config(cfg_p, domains, managed=True)
+    state_p = tmp_path / "srouter.local.json"
+    _write_state(state_p, _gh_state(domains))
+    calls = []
+    local_state_routing.github_direct(
+        "on", config_path=cfg_p, state_path=state_p, runner=_ok_runner(calls),
+        port_checker=_port_checker_settle_then_up())
+
+    out = local_state_routing.github_direct(
+        "off", config_path=cfg_p, state_path=state_p, runner=_ok_runner(calls),
+        port_checker=_port_checker_settle_then_up())
+
+    assert out["ok"] is True and out["changed"] is True
+    rules = json.loads(cfg_p.read_text(encoding="utf-8"))["routing"]["rules"]
+    github = [r for r in rules if r.get("_srouter_github")][0]
+    assert github["outboundTag"] == "reality-out", "off → github снова в туннель"
+    strict = [r for r in rules if r.get("_srouter_strict")][0]
+    assert strict["outboundTag"] == "reality-out", "strict не флипается ни при каком action"
+
+
+def test_github_direct_status_readonly(tmp_path):
+    domains = _GH_ANTHROPIC + _GH_GITHUB + _GH_OTHER
+    cfg_p = tmp_path / "config.json"
+    _write_xray_routing_config(cfg_p, domains, managed=True)
+    before = cfg_p.read_bytes()
+
+    pre = local_state_routing.github_direct_status(config_path=cfg_p)
+    assert pre == {"ok": True, "split": False, "direct": False}
+    local_state_routing.github_direct(
+        "on", config_path=cfg_p, state_path=tmp_path / "srouter.local.json",
+        runner=_ok_runner([]), port_checker=_port_checker_settle_then_up())
+    on = local_state_routing.github_direct_status(config_path=cfg_p)
+
+    assert on == {"ok": True, "split": True, "direct": True}
+    assert cfg_p.read_bytes() != before
+    status_again = local_state_routing.github_direct_status(config_path=cfg_p)
+    assert status_again == on, "status — read-only, состояние не меняет"
+
+
+def test_github_direct_on_twice_is_noop_without_restart(tmp_path):
+    domains = _GH_GITHUB + _GH_OTHER
+    cfg_p = tmp_path / "config.json"
+    _write_xray_routing_config(cfg_p, domains, managed=True)
+    state_p = tmp_path / "srouter.local.json"
+    _write_state(state_p, _gh_state(domains))
+    local_state_routing.github_direct(
+        "on", config_path=cfg_p, state_path=state_p, runner=_ok_runner([]),
+        port_checker=_port_checker_settle_then_up())
+    before = cfg_p.read_bytes()
+    calls = []
+
+    out = local_state_routing.github_direct(
+        "on", config_path=cfg_p, state_path=state_p, runner=_ok_runner(calls),
+        port_checker=_port_checker_settle_then_up())
+
+    assert out["ok"] is True and out["changed"] is False, out
+    assert cfg_p.read_bytes() == before
+    assert calls == [], "no-op — рестарт не зван"
+
+
+def test_github_direct_rollback_on_restart_failure(tmp_path, monkeypatch):
+    import install_lib
+
+    domains = _GH_ANTHROPIC + _GH_GITHUB + _GH_OTHER
+    cfg_p = tmp_path / "config.json"
+    _write_xray_routing_config(cfg_p, domains, managed=True, ips=["203.0.113.9"])
+    state_p = tmp_path / "srouter.local.json"
+    _write_state(state_p, _gh_state(domains, ["203.0.113.9"]))
+    before_cfg = cfg_p.read_bytes()
+    restart_calls = []
+
+    def fake_restart(name, runner, *, port_checker=None):
+        restart_calls.append(name)
+        if len(restart_calls) == 1:
+            return {"rc": 1, "out": "", "err": "xray_port_not_up", "timeout": False}
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+
+    monkeypatch.setattr(install_lib, "_restart_component", fake_restart)
+
+    out = local_state_routing.github_direct(
+        "on", config_path=cfg_p, state_path=state_p, runner=_ok_runner([]),
+        port_checker=None)
+
+    assert out["ok"] is False
+    assert out["step"] == "restart"
+    assert out["err"].startswith("restart_failed:"), out
+    assert cfg_p.read_bytes() == before_cfg, "конфиг откачен byte-exact"
+    assert len(restart_calls) == 2, "recovery-рестарт старым конфигом зван"
+
+
+def test_github_direct_refuses_without_managed_rule(tmp_path):
+    cfg_p = tmp_path / "config.json"
+    _write_xray_routing_config(cfg_p, _GH_GITHUB + _GH_OTHER, managed=False)
+    before = cfg_p.read_bytes()
+    calls = []
+
+    out = local_state_routing.github_direct(
+        "on", config_path=cfg_p, state_path=tmp_path / "srouter.local.json",
+        runner=_ok_runner(calls), port_checker=None)
+
+    assert out["ok"] is False
+    assert out["err"] == "adopt_needed", out
+    assert cfg_p.read_bytes() == before
+    assert calls == []
+
+
+def test_routing_apply_after_github_direct_has_no_drift(tmp_path):
+    """Split обновляет state-hash под rest-состав → следующий add-domain уходит в
+    managed-правило без hash_drift отказа."""
+    domains = _GH_ANTHROPIC + _GH_GITHUB + _GH_OTHER
+    cfg_p = tmp_path / "config.json"
+    _write_xray_routing_config(cfg_p, domains, managed=True)
+    state_p = tmp_path / "srouter.local.json"
+    _write_state(state_p, _gh_state(domains))
+    local_state_routing.github_direct(
+        "on", config_path=cfg_p, state_path=state_p, runner=_ok_runner([]),
+        port_checker=_port_checker_settle_then_up())
+    calls = []
+
+    out = local_state_routing.routing_apply(
+        ["domain:new.example"], action="add", adopt=False, outbound="reality-out",
+        config_path=cfg_p, state_path=state_p, runner=_ok_runner(calls),
+        port_checker=_port_checker_settle_then_up())
+
+    assert out["ok"] is True, out
+    rules = json.loads(cfg_p.read_text(encoding="utf-8"))["routing"]["rules"]
+    managed = [r for r in rules if r.get("_srouter_managed")][0]
+    assert "domain:new.example" in managed["domain"], "новый домен — в managed-правило"
