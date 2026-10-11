@@ -682,12 +682,13 @@ def select_node_surgical(name, *, enabled_names=None, runner=None, state_path=No
             return bool(res.get("timeout")) or res.get("rc") != 0
 
         def _rollback_locked_config():
-            """byte-exact конфиг + clear_pending + recovery-рестарт старым конфигом."""
+            """byte-exact конфиг + clear_pending + recovery-рестарт старым конфигом.
+
+            Зовётся ТОЛЬКО под _routing_config_lock (суффикс _locked, канон routing_apply):
+            flock повторно не берём — новый fd на тот же файл самодедлочится."""
             rb = {"config": True, "pending": True, "restart": True}
-            try:
-                local_state._atomic_write_text(config_path, backup_text)
-            except OSError:
-                rb["config"] = False
+            # _atomic_write_text не бросает: False = ENOSPC/IO, конфиг остался новым.
+            rb["config"] = bool(local_state._atomic_write_text(config_path, backup_text))
             try:
                 local_state.clear_pending(path=state_path)
             except (OSError, ValueError):
@@ -702,56 +703,81 @@ def select_node_surgical(name, *, enabled_names=None, runner=None, state_path=No
 
         try:
             with local_state._routing_config_lock(config_path):
-                raw = Path(config_path).read_text(encoding="utf-8")
-                data = json.loads(raw)
-                if not isinstance(data, dict) or not isinstance(data.get("outbounds"), list):
-                    return {"ok": False, "changed": False, "step": "config",
-                            "err": "config_unreadable", "from": previous, "to": previous}
-                idxs = [i for i, o in enumerate(data["outbounds"])
-                        if isinstance(o, dict) and o.get("tag") == tag]
-                if len(idxs) != 1:
-                    return {"ok": False, "changed": False, "step": "config",
-                            "err": f"expected_one_{tag}_outbound", "from": previous,
-                            "to": previous}
-                # Idempotent-gate ДО begin: состояние не мутируем, рестарт не зван.
-                cur_addr = ((data["outbounds"][idxs[0]].get("settings") or {})
-                            .get("vnext") or [{}])[0].get("address")
-                if _active_name(state_path) == name and cur_addr == new_addr:
-                    return {"ok": True, "changed": False, "step": "noop",
-                            "from": previous, "to": name}
-                backup_text = raw  # byte-exact снимок (канон rollback)
-                begun = True
-                local_state.begin_active_node_change(name, path=state_path)
-                rendered = gen_xray_config._vless_outbound(node, tag, state_path=state_path)
-                if not isinstance(rendered, dict) or not rendered:
-                    raise ValueError("rendered outbound is empty")
-                data["outbounds"][idxs[0]] = rendered
-                local_state._atomic_write_text(
-                    config_path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+                # ВСЯ транзакция (чтение → гейт → write → рестарт → commit) под локом —
+                # канон #139: lock намеренно держится через рестарт; rollback тоже внутри.
+                try:
+                    raw = Path(config_path).read_text(encoding="utf-8")
+                    data = json.loads(raw)
+                    if not isinstance(data, dict) or not isinstance(data.get("outbounds"), list):
+                        return {"ok": False, "changed": False, "step": "config",
+                                "err": "config_unreadable", "from": previous, "to": previous}
+                    idxs = [i for i, o in enumerate(data["outbounds"])
+                            if isinstance(o, dict) and o.get("tag") == tag]
+                    if len(idxs) != 1:
+                        return {"ok": False, "changed": False, "step": "config",
+                                "err": f"expected_one_{tag}_outbound", "from": previous,
+                                "to": previous}
+                    # Рендер ДО idempotent-gate: сравниваем outbound ЦЕЛИКОМ с рендером
+                    # state-источника правды — ротация uuid/publicKey/short_id при том же
+                    # address (пере-провижининг) обязана конвергировать, а не отдать
+                    # no-op с мёртвыми кредами в живом конфиге.
+                    rendered = gen_xray_config._vless_outbound(node, tag, state_path=state_path)
+                    if not isinstance(rendered, dict) or not rendered:
+                        raise ValueError("rendered outbound is empty")
+                    if _active_name(state_path) == name and data["outbounds"][idxs[0]] == rendered:
+                        return {"ok": True, "changed": False, "step": "noop",
+                                "from": previous, "to": name}
+                    backup_text = raw  # byte-exact снимок (канон rollback)
+                    begun = True
+                    local_state.begin_active_node_change(name, path=state_path)
+                    data["outbounds"][idxs[0]] = rendered
+                    if not local_state._atomic_write_text(
+                            config_path,
+                            json.dumps(data, ensure_ascii=False, indent=2) + "\n"):
+                        # False = ENOSPC/IO, production-файл нетронут: рестарт/commit
+                        # не начинаем, pending сбрасываем (rollback записи не требует).
+                        local_state.clear_pending(path=state_path)
+                        return {"ok": False, "changed": False, "step": "config",
+                                "err": "config_write_failed", "from": previous, "to": previous}
+                    # --- рестарт ПОД локом (канон #139: stale-snapshot окно закрыто) ---
+                    try:
+                        restart = install_lib._restart_component(
+                            "xray", runner, port_checker=port_checker)
+                    except Exception as exc:  # noqa: BLE001 — runner инжектируемый
+                        restart = {"rc": 1, "out": "",
+                                   "err": f"restart_exception:{exc}", "timeout": False}
+                    if _failed(restart):
+                        rb = _rollback_locked_config()
+                        err = f"restart_failed:{restart.get('err') or restart.get('rc')}"
+                        if not rb["config"]:
+                            err += "; rollback_failed_config_kept_new"
+                        elif not rb["pending"] or not rb["restart"]:
+                            err += "; rollback_partial"
+                        return {"ok": False, "changed": not rb["config"], "step": "restart",
+                                "err": err, "from": previous, "to": previous}
+                    local_state.commit_active_node_change(name, path=state_path)
+                    if _active_name(state_path) != name:
+                        rb = _rollback_locked_config()
+                        return {"ok": False, "changed": not rb["config"], "step": "commit",
+                                "err": "active_node_was_not_committed",
+                                "from": previous, "to": previous}
+                except OSError as exc:
+                    # IO внутри транзакции (state-запись begin/commit): rollback ПОД локом,
+                    # наружу — structured-ответ, не OSError.
+                    if not begun:
+                        return {"ok": False, "changed": False, "step": "config",
+                                "err": f"transaction_io:{exc}", "from": previous, "to": previous}
+                    rb = _rollback_locked_config()
+                    if not rb["config"]:
+                        return {"ok": False, "changed": True, "step": "rollback_failed",
+                                "err": f"transaction_io:{exc}; rollback_failed_config_kept_new",
+                                "from": previous, "to": previous}
+                    return {"ok": False, "changed": not rb["config"], "step": "transaction",
+                            "err": f"transaction_io:{exc}", "from": previous, "to": previous}
         except OSError as exc:
             # lockfile не создался/не открылся — fail-closed без сериализации (как routing_apply).
             return {"ok": False, "changed": False, "step": "lock",
                     "err": f"config_lock_failed:{exc}", "from": previous, "to": previous}
-
-        # --- рестарт ВНЕ json-правки, но решение о rollback по его исходу ---
-        try:
-            restart = install_lib._restart_component("xray", runner, port_checker=port_checker)
-        except Exception as exc:  # noqa: BLE001 — runner инжектируемый, тип не под контролем
-            restart = {"rc": 1, "out": "", "err": f"restart_exception:{exc}", "timeout": False}
-        if _failed(restart):
-            rb = _rollback_locked_config()
-            err = f"restart_failed:{restart.get('err') or restart.get('rc')}"
-            if not rb["config"]:
-                err += "; rollback_failed_config_kept_new"
-            elif not rb["pending"] or not rb["restart"]:
-                err += "; rollback_partial"
-            return {"ok": False, "changed": not rb["config"], "step": "restart",
-                    "err": err, "from": previous, "to": previous}
-        local_state.commit_active_node_change(name, path=state_path)
-        if _active_name(state_path) != name:
-            rb = _rollback_locked_config()
-            return {"ok": False, "changed": not rb["config"], "step": "commit",
-                    "err": "active_node_was_not_committed", "from": previous, "to": previous}
 
         # --- пост-шаг ВНЕ flock: IP нового узла в managed-правило (idempotent) ---
         result = {"ok": True, "changed": True, "step": "done", "from": previous, "to": name}
@@ -766,7 +792,13 @@ def select_node_surgical(name, *, enabled_names=None, runner=None, state_path=No
         return result
     except Exception as exc:  # noqa: BLE001 — top-level never-throws (канон select_node #159)
         if begun and backup_text is not None:
-            rb = _rollback_locked_config()
+            try:
+                # последняя линия обороны снаружи лока — берём его сами (rollback-запись
+                # без лока = lost-update окно против параллельного routing_apply).
+                with local_state._routing_config_lock(config_path):
+                    rb = _rollback_locked_config()
+            except OSError:
+                rb = {"config": False, "pending": True, "restart": True}
             if not rb["config"]:
                 return {"ok": False, "changed": True, "step": "rollback_failed",
                         "err": f"internal:{exc}; rollback_failed_config_kept_new",
