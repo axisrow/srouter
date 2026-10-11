@@ -255,6 +255,19 @@
     </div>
   </div>
 
+  <!-- Замеры скорости: журнал ручных `srouter speedtest` (~/Library/Logs/srouter-speedtest.jsonl).
+       Метки каждой записи — сеть (SSID/netname/gw) и VPN (интерфейс+ISP из выдачи speedtest).
+       Данные едут в /api/status (probe_speedtest), отдельного фетча и POST-роута нет. -->
+  <div class="card mt-3" data-tab="history">
+    <div class="card-header d-flex align-items-center flex-wrap gap-2">
+      <i class="bi bi-speedometer2 me-2"></i>
+      <span data-i18n="speedtest_title">Speed tests (manual)</span>
+    </div>
+    <div class="card-body">
+      <div id="speedtest-panel"></div>
+    </div>
+  </div>
+
   <div class="toast-container position-fixed bottom-0 end-0 p-3"></div>
 
   <script src="/static/bootstrap.bundle.min.js"></script>
@@ -375,6 +388,8 @@
         metrics_title: "Tunnel quality (trend)",
         tab_overview: "Overview", tab_proxy: "Proxy", tab_history: "History", tab_diag: "Diagnostics",
         incidents_title: "Incidents — 30 days",
+        speedtest_title: "Speed tests (manual)", speedtest_none: "No measurements yet — run: srouter speedtest",
+        st_time: "time", st_net: "network", st_vpn: "VPN", st_down: "↓ Mbit/s", st_up: "↑ Mbit/s", st_ping: "ping ms",
         incidents_bucket_hour: "Hourly",
         incidents_bucket_10m: "10 min",
         incidents_tooltip: "incidents: {0} · {1}",
@@ -513,6 +528,8 @@
         metrics_title: "Качество туннеля (тренд)",
         tab_overview: "Обзор", tab_proxy: "Прокси", tab_history: "История", tab_diag: "Диагностика",
         incidents_title: "Инциденты — 30 дней",
+        speedtest_title: "Замеры скорости (вручную)", speedtest_none: "Замеров пока нет — запусти: srouter speedtest",
+        st_time: "время", st_net: "сеть", st_vpn: "VPN", st_down: "↓ Мбит/с", st_up: "↑ Мбит/с", st_ping: "пинг мс",
         incidents_bucket_hour: "По часам",
         incidents_bucket_10m: "По 10 минут",
         incidents_tooltip: "инцидентов: {0} · {1}",
@@ -649,6 +666,8 @@
         metrics_title: "隧道质量（趋势）",
         tab_overview: "概览", tab_proxy: "代理", tab_history: "历史", tab_diag: "诊断",
         incidents_title: "事件 — 30 天",
+        speedtest_title: "测速（手动）", speedtest_none: "暂无测速记录 — 运行: srouter speedtest",
+        st_time: "时间", st_net: "网络", st_vpn: "VPN", st_down: "↓ Mbit/s", st_up: "↑ Mbit/s", st_ping: "延迟 ms",
         incidents_bucket_hour: "按小时",
         incidents_bucket_10m: "按 10 分钟",
         incidents_tooltip: "事件数：{0} · {1}",
@@ -2050,10 +2069,50 @@
 
     function pad2(n) { return (n < 10 ? '0' : '') + n; }
 
+    // ---- Замеры скорости (srouter speedtest): таблица последних записей журнала.
+    // Данные уже в /api/status (probe_speedtest) — отдельного фетча нет, панель
+    // перерисовывается на каждом render(d). Запуск замера — только CLI (рука). ----
+    function stWhen(ts) {
+      var dt = new Date((typeof ts === 'number' ? ts : 0) * 1000);
+      if (isNaN(dt.getTime())) return '?';
+      function p(n) { return (n < 10 ? '0' : '') + n; }
+      return p(dt.getMonth() + 1) + '-' + p(dt.getDate()) + ' ' + p(dt.getHours()) + ':' + p(dt.getMinutes());
+    }
+
+    function renderSpeedtestPanel(st) {
+      var el = document.getElementById('speedtest-panel');
+      if (!el) return;
+      var recs = (st && Array.isArray(st.recent)) ? st.recent : [];
+      if (!recs.length) {
+        el.innerHTML = '<div class="text-body-secondary small">' + esc(t('speedtest_none')) + '</div>';
+        return;
+      }
+      var rows = recs.map(function (r) {
+        var vpnCell = r.vpn
+          ? esc(r.isp || 'VPN') + ' <span class="text-body-secondary">(' + esc(r.iface || '?') + ')</span>'
+          : '—';
+        return '<tr>' +
+          '<td>' + esc(stWhen(r.ts)) + '</td>' +
+          '<td>' + esc(r.net || '?') + '</td>' +
+          '<td>' + vpnCell + '</td>' +
+          '<td class="text-end">' + esc(r.download_mbps != null ? r.download_mbps : '—') + '</td>' +
+          '<td class="text-end">' + esc(r.upload_mbps != null ? r.upload_mbps : '—') + '</td>' +
+          '<td class="text-end">' + esc(r.ping_ms != null ? r.ping_ms : '—') + '</td>' +
+          '</tr>';
+      });
+      el.innerHTML = '<div class="table-responsive"><table class="table table-sm align-middle mb-0">' +
+        '<thead><tr>' +
+        '<th>' + esc(t('st_time')) + '</th><th>' + esc(t('st_net')) + '</th><th>' + esc(t('st_vpn')) + '</th>' +
+        '<th class="text-end">' + esc(t('st_down')) + '</th><th class="text-end">' + esc(t('st_up')) + '</th>' +
+        '<th class="text-end">' + esc(t('st_ping')) + '</th>' +
+        '</tr></thead><tbody>' + rows.join('') + '</tbody></table></div>';
+    }
+
     function render(d, ranking) {
       LAST_STATUS = d;
       LAST_RANKING = ranking || {};
       FETCH_FAILED = false;
+      renderSpeedtestPanel(d.speedtest);
       var tun = d.tunnel || {};
       var an = tun.anthropic || {}, oa = tun.openai || {};
       pushHistory('anthropic', an.ms);

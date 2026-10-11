@@ -4,6 +4,8 @@ import os
 import tempfile
 
 import sys_probe
+
+import speedtest_store  # probe_speedtest: чтение журнала ручных замеров скорости
 from dashboard_common import (
     BREW,
     CURL,
@@ -34,6 +36,7 @@ __all__ = [
     "_parse_ping_stats",
     "_ping_avg",
     "probe_ping",
+    "probe_speedtest",
 ]
 
 
@@ -264,3 +267,13 @@ def probe_ping(route_ip=None):
     st = _ping_status(vps_ms, vps_loss)
     return {"vps_ms": vps_ms, "vps_loss": vps_loss, "vpn_ms": vpn_ms,
             "vpn_loss": vpn_loss, "status": st}
+
+
+def probe_speedtest():
+    """Ручные замеры скорости (srouter speedtest, 2026-10-12): последняя запись +
+    хвост журнала для карточки. Журнал пишет CLI, probe только читает. Fail-soft:
+    нет файла/пусто → unknown (канон #329: нет данных ≠ down), не бросает."""
+    recs = speedtest_store.read_results(limit=10)
+    if not recs:
+        return {"status": "unknown", "last": None, "recent": []}
+    return {"status": "ok", "last": recs[0], "recent": recs}

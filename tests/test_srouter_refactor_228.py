@@ -123,6 +123,7 @@ class TestParserSurface:
             "protect",  # 2026-10-09: вкл/выкл PF-изоляции Anthropic (on/off/status + алиасы)
             "node",  # 2026-10-11: смена активного узла (use; canonical/adopt-surgical)
             "github-direct",  # 2026-10-11: путь github (on/off/status; три списка)
+            "speedtest",  # 2026-10-12: ручной замер скорости (журнал сеть+VPN, --list)
         }
 
     def test_nested_subcommand_paths_preserved(self, surface):
