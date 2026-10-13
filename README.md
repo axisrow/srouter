@@ -316,7 +316,7 @@ Codex (CLI и App) нестабилен через privoxy (8118, HTTP-CONNECT) 
 (`sudo -u _srouter_codex` в wrapper — отдельный follow-up, пока codex бежит под 501 и PF-правило его
 **не видит**: правило матчит только `user 503`), (б) включённая доменная PF-изоляция (без её родительской
 директивы `anchor "codex"` sub-anchor не вычисляется), (в) трафик по TCP через `en0`–`en6`/`ppp0`–`ppp1`/`ipsec0`–`ipsec2`
-(`utun`-туннели намеренно исключены — блок убил бы прокси; высшие `en*`/`ppp*` и UDP не покрыты).
+(`utun`-туннели намеренно исключены — блок убил бы прокси; высшие `en*`/`ppp*`/`ipsec*` и UDP не покрыты).
 
 **Важно про обход wrapper'а:** PF защищает **только процесс под UID 503**. Пока назначение этого UID
 идёт через сам wrapper (`sudo -u`, follow-up), обход wrapper'а (прямой binary, Go `exec.LookPath` в AO
@@ -625,7 +625,7 @@ Doctor показывает состояние через чек `codex-isolatio
    wildcard-anchors не спускаются рекурсивно — без доменной изоляции sub-anchor **не вычисляется
    вовсе**, даже если ruleset загружен (см. комментарий в `isolate_firewall.py`).
 4. **Трафик по TCP через `en0`–`en6`/`ppp0`–`ppp1`/`ipsec0`–`ipsec2`.** Это **не замкнутый инвариант на все интерфейсы**:
-   `utun`-туннели намеренно исключены (блок убил бы сам прокси), а высшие `en*`/`ppp*` и **любой UDP**
+   `utun`-туннели намеренно исключены (блок убил бы сам прокси), а высшие `en*`/`ppp*`/`ipsec*` и **любой UDP**
    правилом не покрыты. Реальная площадь блокировки — TCP-выход на перечисленных физических
    интерфейсах.
 
@@ -852,7 +852,7 @@ interfaces are not covered. This is a stronger boundary than wrappers, **but not
 rule does **not** see it — the rule matches only `user 503`), (b) domain PF isolation enabled (without
 its parent directive `anchor "codex"` the sub-anchor is never evaluated), (c) traffic over TCP on
 `en0`–`en6`/`ppp0`–`ppp1`/`ipsec0`–`ipsec2` (`utun` tunnels are intentionally excluded — a block would kill the proxy;
-higher `en*`/`ppp*` and UDP are not covered).
+higher `en*`/`ppp*`/`ipsec*` and UDP are not covered).
 
 **Important about wrapper bypass:** PF protects **only a process running under UID 503**. While that
 UID is assigned by the wrapper itself (`sudo -u`, follow-up), a wrapper bypass (direct binary, Go
@@ -1161,7 +1161,7 @@ surfaces the state via the `codex-isolation (PF kill-switch)` check.
    evaluated at all**, even if its ruleset is loaded (see the comment in `isolate_firewall.py`).
 4. **Traffic over TCP on `en0`–`en6`/`ppp0`–`ppp1`/`ipsec0`–`ipsec2`.** This is **not a closed invariant across all
    interfaces**: `utun` tunnels are intentionally excluded (a block would kill the proxy itself), and
-   higher-numbered `en*`/`ppp*` plus **any UDP** are not covered. The real block surface is the TCP
+   higher-numbered `en*`/`ppp*`/`ipsec*` plus **any UDP** are not covered. The real block surface is the TCP
    egress on the listed physical interfaces.
 
 Until these limitations are closed, the only live guard against direct codex egress stays the
