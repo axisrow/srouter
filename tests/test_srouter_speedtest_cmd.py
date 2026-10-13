@@ -3,6 +3,7 @@ SROUTER_CURL), net-контекст мокается на владельце (di
 (monkeypatch speedtest_store.SPEEDTEST_LOG: module-level константа, читается на вызове).
 """
 import json
+import unicodedata
 from types import SimpleNamespace
 
 import diag_netprobe
@@ -116,6 +117,35 @@ def test_list_prints_recent_records(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "home-5G" in out and "office" in out
     assert "0.66" in out and "5.0" in out
+
+
+def test_list_columns_aligned_for_wide_net_names(tmp_path, monkeypatch, capsys):
+    # CJK-имя сети (云栖壁8-3) рендерится в терминале двойной шириной: колонки
+    # обязаны выравниваться по display-width, а не по len() — иначе числовые
+    # колонки плывут построчно и не образуют вертикали (найдено глазами 2026-10-14).
+    log = tmp_path / "speedtest.jsonl"
+    monkeypatch.setattr(speedtest_store, "SPEEDTEST_LOG", log)
+    speedtest_store.append_result(_rec(1.0, "office", 5.0), log_path=log)
+    speedtest_store.append_result(_rec(2.0, "云栖壁8-3", 0.66), log_path=log)
+    rc = srouter_cli.cmd_speedtest(_args(list_=10))
+    assert rc == 0
+    lines = capsys.readouterr().out.splitlines()
+    data = [ln for ln in lines if ("5.0" in ln) or ("0.66" in ln)]
+    assert len(data) == 2
+    ascii_line = next(ln for ln in data if "5.0" in ln)
+    cjk_line = next(ln for ln in data if "0.66" in ln)
+
+    def dw(s):
+        return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in s)
+
+    def col_end(line, token):
+        return dw(line[:line.index(token) + len(token)])
+
+    # download-колонка правая: правый край чисел совпадает в обеих строках данных
+    # (колонка right-aligned) и с правым краем заголовка «↓ Мбит/с»
+    assert col_end(ascii_line, "5.0") == col_end(cjk_line, "0.66")
+    header = lines[1]
+    assert col_end(ascii_line, "5.0") == col_end(header, "↓ Мбит/с")
 
 
 def test_list_zero_is_value_not_absent_flag(tmp_path, monkeypatch, capsys):

@@ -24,6 +24,7 @@ import argparse
 import json
 import sys
 import time
+import unicodedata
 from dataclasses import replace
 from datetime import datetime
 from importlib.metadata import PackageNotFoundError, version
@@ -778,6 +779,18 @@ def cmd_speedtest(args) -> int:
     return 0
 
 
+def _dw(s: str) -> int:
+    """Display-width строки в терминале: CJK/fullwidth-глифы занимают 2 ячейки.
+
+    Паддинг по len() рвёт колонки таблиц на сетях с CJK-названиями (云栖壁8-3).
+    """
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in s)
+
+
+def _dw_ljust(s: str, width: int) -> str:
+    return s + " " * max(0, width - _dw(s))
+
+
 def _speedtest_list(limit) -> int:
     """Таблица последних замеров (newest-first) из журнала speedtest_store."""
     recs = speedtest_store.read_results(limit=limit)
@@ -796,7 +809,7 @@ def _speedtest_list(limit) -> int:
         dl = r.get("download_mbps")
         ul = r.get("upload_mbps")
         ping = r.get("ping_ms")
-        print(f"{when:<17} {net:<18} {str(vpn)[:24]:<24} "
+        print(f"{when:<17} {_dw_ljust(net, 18)} {_dw_ljust(str(vpn)[:24], 24)} "
               f"{dl if dl is not None else '?':>9} {ul if ul is not None else '?':>9} "
               f"{ping if ping is not None else '?':>8}")
     return 0
