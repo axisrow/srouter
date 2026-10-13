@@ -843,8 +843,9 @@ def cmd_git_proxy(args) -> int:
               + (f"{lo['values']}" if lo["present"] else "нет"))
         print(f"  2. global urlmatch {git_proxy.KEY}: "
               + (f"{st.get('values')} (state={st.get('state')})" if st.get("present") else "нет"))
-        for name, rec in (("https.proxy", sg["https"]), ("http.proxy", sg["http"])):
-            print(f"  3. глобальный {name}: "
+        for i, (name, rec) in enumerate(
+                (("https.proxy", sg["https"]), ("http.proxy", sg["http"])), start=3):
+            print(f"  {i}. глобальный {name}: "
                   + (f"{rec['values']}" if rec["present"] else "нет"))
         eff = git_proxy.effective_proxy()
         if not isinstance(eff, dict) or not eff.get("layer") or eff.get("layer") == "unknown":
