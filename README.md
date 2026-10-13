@@ -191,7 +191,7 @@ srouter install
 #     en0–en6/ppp0–ppp1/ipsec0–2, разрешая loopback SOCKS5 по TCP); install создаёт пользователя uid 503 (#186),
 #     но правила пока дормантны — активируются после полной активации (запуск codex под uid 503
 #     НЕЗАВИСИМО от wrapper'а (не sudo -u в wrapper, а напр. launchd-служба) + доменная изоляция + TCP
-#     на en/ppp, отдельный follow-up);
+#     на en/ppp/ipsec, отдельный follow-up);
 #   • показывает план и спрашивает подтверждение.
 srouter status         # проверить, что демон работает (http://127.0.0.1:8787)
 srouter doctor         # диагностика: порты + туннель + Claude-proxy (✅/❌)
@@ -378,7 +378,7 @@ binary/exec.LookPath), поэтому границей служит именно
 > Профиль `openai-http` с `supports_websockets=false` даёт 401 с ChatGPT-подпиской. Поэтому — SOCKS5
 > напрямую, единый рабочий путь. **Гарантию блокировки прямого TCP-выхода codex на en0–en6/ppp0–ppp1/ipsec0–2
 > даст PF kill-switch — но только когда codex запущен под uid 503 независимо от wrapper'а (не командой
-> wrapper'а `sudo -u`, а, например, launchd-службой), плюс доменная изоляция и TCP на en/ppp; пользователь
+> wrapper'а `sudo -u`, а, например, launchd-службой), плюс доменная изоляция и TCP на en/ppp/ipsec; пользователь
 > uid 503 уже создаётся install, #186.** env/wrapper обходятся PATH; PF сильнее — но лишь для процесса
 > под 503. Пока эта активация не завершена (follow-up — независимый запуск под 503),
 > единственная живая защита от прямого выхода — wrappers + scoped VSCode env (слой 2; codenv — только residual-чистка, контракт 2026-10-07).
@@ -917,7 +917,7 @@ lease, does not call `pfctl`, and does not verify codex actually runs under uid 
 > SOCKS5 directly, the one working path. **The guarantee of blocking codex direct TCP egress on
 > en0–en6/ppp0–ppp1/ipsec0–2 will come from the PF kill-switch — but only once codex is launched under uid 503
 > independently of the wrapper (not via the wrapper's own `sudo -u` — e.g. a launchd service), plus
-> domain isolation and TCP on en/ppp; the uid 503 user is already created by install, #186.** env/wrappers
+> domain isolation and TCP on en/ppp/ipsec; the uid 503 user is already created by install, #186.** env/wrappers
 > are bypassable via PATH; PF is stronger — but only for a process under 503. Until that activation lands
 > (follow-up — independent launch under 503), the only live guard against direct egress is the
 > wrappers + scoped VSCode env (layer 2; codenv only purges residuals — 2026-10-07 contract).
