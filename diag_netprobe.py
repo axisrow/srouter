@@ -746,10 +746,15 @@ def report():
     for e in legs:
         by_leg.setdefault(e.get("leg"), []).append(e)
     stats_by_leg = {leg: _leg_stats(by_leg.get(leg, []), windows) for leg in LEGS}
-    print(f"\n{'участок':<10} внутри окон (±2м)                      | вне окон")
+    # Ширина inside-колонки — по самой широкой строке (заголовок и все bucket'ы):
+    # _fmt_bucket часто длиннее 43 символов, фиксированное поле рвало вертикаль «|».
+    inside_header = "внутри окон (±2м)"
+    inside_w = max([len(inside_header)]
+                   + [len(_fmt_bucket(stats_by_leg[leg]["inside"])) for leg in LEGS])
+    print(f"\n{'участок':<10} {inside_header:<{inside_w}} | вне окон")
     for leg in LEGS:
         s = stats_by_leg[leg]
-        print(f"{leg:<10} {_fmt_bucket(s['inside']):<43} | {_fmt_bucket(s['outside'])}")
+        print(f"{leg:<10} {_fmt_bucket(s['inside']):<{inside_w}} | {_fmt_bucket(s['outside'])}")
     inside_loss = _packet_loss(stats_by_leg["vps"]["inside"])
     outside_loss = _packet_loss(stats_by_leg["vps"]["outside"])
     print("\nВердикт по VPS-участку:")

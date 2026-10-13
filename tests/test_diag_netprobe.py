@@ -171,6 +171,36 @@ def test_report_prints_segment_line(tmp_path, capsys, monkeypatch):
     assert "транзит" in out or "неопределим" in out
 
 
+def test_report_table_separator_aligned(tmp_path, capsys, monkeypatch):
+    # Разделитель «|» между «внутри окон» и «вне окон» обязан стоять на одной
+    # позиции в заголовке и во всех строках участков — иначе таблица рваная
+    # (найдено глазами: srouter netprobe report, 2026-10-14: | на 51/55/58/58).
+    now = 1_000_000.0
+    tunnel = [{"ts": now - 600 - i * 30, "status": "ok", "connect_ms": 10, "tls_ms": 30,
+               "ttfb_ms": 40, "total_ms": 100} for i in range(5)]
+    tunnel += [{"ts": now - 300 - i * 30, "status": "down", "connect_ms": 10, "tls_ms": 30,
+                "ttfb_ms": 40, "total_ms": 100} for i in range(3)]
+    tunnel += [{"ts": now - i * 30, "status": "ok", "connect_ms": 10, "tls_ms": 30,
+                "ttfb_ms": 40, "total_ms": 100} for i in range(5)]
+    legs = []
+    for leg, rtt in (("gateway", 5), ("domestic", 220), ("vps", 25)):
+        legs += [_leg_row(now - 300, leg, recv=3, avg_ms=rtt) for _ in range(2)]        # внутри окна
+        legs += [_leg_row(now - 30 * 3600, leg, recv=2, avg_ms=rtt) for _ in range(3)]  # вне окна
+    # длинный inside-bucket (>43 символов: 60 раундов, 33.3% потерь) — как в живом
+    # журнале; фиксированная ширина поля его не вмещала и двигала «|» построчно
+    legs += [_leg_row(now - 300, "domestic", recv=2, avg_ms=220) for _ in range(60)]
+
+    def fake_read(hours=None, max_lines=None, log_path=None, now=None):
+        return list(tunnel) if log_path == metrics_store.METRICS_LOG else list(legs)
+
+    monkeypatch.setattr(metrics_store, "read_timing_events", fake_read)
+    diag_netprobe.report()
+    out = capsys.readouterr().out
+    table_lines = [ln for ln in out.splitlines() if "|" in ln]
+    assert len(table_lines) == 4  # заголовок + 3 участка
+    assert len({ln.index("|") for ln in table_lines}) == 1
+
+
 # ============================ мульти-таргет: корреляция по канарейке (2026-09-29) ============================
 # Metrics-JSONL теперь мульти-таргетный: вендор-события (netflix/github) не должны
 # участвовать ни в окнах блэкаутов туннеля, ни в diagnose_degradation — корреляция
