@@ -88,6 +88,23 @@ def test_codex_ruleset_block_direct_ifaces_user_uid():
         assert iface in rs, f"{iface} отсутствует в ruleset"
 
 
+# ============================ DIRECT_IFACES покрывает ipsec-VPN (инцидент 2026-10-13) ============================
+def test_direct_ifaces_cover_ipsec_vpn():
+    """ipsec* (системный IPSec VPN) — реальный прямой egress, режется как en*/ppp*.
+
+    Инцидент 2026-10-13: Mac на корпоративном IPSec-VPN (ipsec0), route до
+    api.anthropic.com (160.79.104.10) ведёт через ipsec0 — Claude Desktop держал
+    ~10 живых коннектов к Anthropic при «защите ВКЛ»: lease считался активным,
+    а правила strict/working/codex резали только en*/ppp*. utun остаётся исключён
+    (документированное решение — туннели xray/WireGuard/IPv6), ipsec0 — НЕ прокси-туннель:
+    это штатный системный VPN с прямым выходом наружу.
+    """
+    for iface in ("ipsec0", "ipsec1", "ipsec2"):
+        assert iface in isolate_firewall.DIRECT_IFACES, iface
+    rs = isolate_firewall._strict_ruleset()
+    assert " ipsec0" in rs, rs
+
+
 def test_codex_ruleset_uses_canonical_socks_port():
     """port = str(XRAY_SOCKS_PORT) = '10808' — единый источник (issue #155)."""
     assert isolate_firewall.SOCKS5_PORT == str(dashboard_common.XRAY_SOCKS_PORT)
