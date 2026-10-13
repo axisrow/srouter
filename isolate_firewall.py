@@ -70,10 +70,14 @@ ANCHOR = "com.apple/srouter_isolate"
 STRICT_TABLE = "srouter_cloudfront_subnets"
 TABLE = "srouter_proxy_ips"
 
-# Интерфейсы, где режем прямой путь: физические en* и PPP-VPN ppp*.
+# Интерфейсы, где режем прямой путь: физические en*, PPP-VPN ppp* и системный IPSec-VPN ipsec*.
+# ipsec* — это штатный системный VPN с ПРЯМЫМ выходом наружу (инцидент 2026-10-13: Mac на
+# корпоративном IPSec-VPN, route до api.anthropic.com вёл через ipsec0, Claude Desktop ходил
+# напрямую при «защите ВКЛ») — поэтому режется как en*/ppp*.
 # utun НЕ включаем — это туннели (xray/WireGuard/IPv6), их блок убил бы прокси.
 # lo0 не включаем — loopback (privoxy→xray локально).
-DIRECT_IFACES = ("en0", "en1", "en2", "en3", "en4", "en5", "en6", "ppp0", "ppp1")
+DIRECT_IFACES = ("en0", "en1", "en2", "en3", "en4", "en5", "en6", "ppp0", "ppp1",
+                 "ipsec0", "ipsec1", "ipsec2")
 
 # Подсети Anthropic для strict-фазы (страховка при буте, до dig). Это собственные
 # подсети Anthropic, PBC (не широкие CloudFront) — узко, минимум побочных эффектов.
