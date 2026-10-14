@@ -791,6 +791,23 @@ def _dw_ljust(s: str, width: int) -> str:
     return s + " " * max(0, width - _dw(s))
 
 
+def _dw_truncate(s: str, width: int) -> str:
+    """Обрезка по display-width: режем на глифе, пересекающем границу.
+
+    [:N] по кодпоинтам CJK-имя из ≥10 глифов не режет (кодпоинтов ≤ N), а его
+    display-width > N — колонка шире поля и следующий _dw_ljust не паддит (review #426).
+    """
+    out = []
+    w = 0
+    for c in s:
+        cw = 2 if unicodedata.east_asian_width(c) in "WF" else 1
+        if w + cw > width:
+            break
+        out.append(c)
+        w += cw
+    return "".join(out)
+
+
 def _speedtest_list(limit) -> int:
     """Таблица последних замеров (newest-first) из журнала speedtest_store."""
     recs = speedtest_store.read_results(limit=limit)
@@ -804,12 +821,12 @@ def _speedtest_list(limit) -> int:
             when = datetime.fromtimestamp(float(r.get("ts"))).strftime("%Y-%m-%d %H:%M")
         except (TypeError, ValueError, OSError, OverflowError):
             when = "?"
-        net = str(r.get("net") or "?")[:18]
+        net = _dw_truncate(str(r.get("net") or "?"), 18)
         vpn = (r.get("isp") or "VPN") if r.get("vpn") else "—"
         dl = r.get("download_mbps")
         ul = r.get("upload_mbps")
         ping = r.get("ping_ms")
-        print(f"{when:<17} {_dw_ljust(net, 18)} {_dw_ljust(str(vpn)[:24], 24)} "
+        print(f"{when:<17} {_dw_ljust(net, 18)} {_dw_ljust(_dw_truncate(str(vpn), 24), 24)} "
               f"{dl if dl is not None else '?':>9} {ul if ul is not None else '?':>9} "
               f"{ping if ping is not None else '?':>8}")
     return 0
