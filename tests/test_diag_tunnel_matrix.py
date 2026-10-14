@@ -78,11 +78,71 @@ def test_all_ok_produce_alive_verdict(tmp_path):
 
 def test_low_speed_of_live_targets_is_bandwidth_window_verdict(tmp_path):
     """10-11: DPI-окно душит туннель по скорости (~10 Bps) — «живые» ответы крошечные,
-    матрица обязана звать это битрейт-окном, а не цель-селективностью (сервер чист)."""
-    result = _run(["1"], "selective", tmp_path, speed="100Bps")
+    матрица обязана звать это битрейт-окном, а не цель-селективностью (сервер чист).
+    #428: битрейт-окно — ТОЛЬКО когда ВСЕ цели отвечали: душение = медленные ответы,
+    FAIL(28) (ни одного ответа) — недоступность цели, это цель-селективная смерть."""
+    result = _run(["1"], "all_ok", tmp_path, speed="100Bps")
     assert result.returncode == 0, result.stderr
     assert "битрейт-окно" in result.stdout
     assert "цель-селективно" not in result.stdout.split("Вердикт:")[-1]
+
+
+def test_dead_target_is_not_reported_as_bandwidth_window(tmp_path):
+    """#428, прогон 2026-10-14 11:44: github МЁРТВ (FAIL×2), живые цели медленные (911Bps) —
+    вердикт обязан быть «цель-селективно — мертвы: …», а не «битрейт-окно: хосты отвечают»
+    (мёртвая цель НЕ отвечала ни в одном раунде, «ждать окно» — ложный совет)."""
+    result = _run(["1"], "selective", tmp_path, speed="911Bps")
+    assert result.returncode == 0, result.stderr
+    verdict = result.stdout.split("Вердикт:")[-1]
+    assert "цель-селективно" in verdict, f"мёртвая цель = цель-селективно, got: {verdict}"
+    assert "битрейт-окно" not in verdict, f"FAIL(28) ≠ душение, got: {verdict}"
+    assert "youtube.com" in verdict  # мёртвая цель названа в вердикте
+    # честность второй строки: живые цели МЕДЛЕННЫЕ — нельзя печатать «Живые цели быстрые»
+    assert "Живые цели быстрые" not in result.stdout
+
+
+def test_fast_round_of_flapping_target_counts_toward_max_speed(tmp_path):
+    """#428, прогон 2026-10-14 09:42: флап-цель github (FAIL → 200/124462Bps) — скорость
+    успешного раунда ЛЮБОЙ цели участвует в max_speed; иначе вердикт считал «макс 1099 Bps»
+    по одним «жив»-целям и звал битрейт-окном ситуацию, где большие ответы пролезали быстро."""
+    count = tmp_path / "round.count"
+    fake = tmp_path / "fake_curl.sh"
+    fake.write_text(
+        "#!/usr/bin/env bash\n"
+        'case "$*" in *github.com*)\n'
+        '  n=$(cat "$SROUTER_FAKE_COUNT" 2>/dev/null || echo 0)\n'
+        '  n=$((n+1)); printf "%s" "$n" > "$SROUTER_FAKE_COUNT"\n'
+        '  if [ "$n" -eq 1 ]; then exit 28; fi\n'
+        '  printf "200/4.6s/124462Bps"; exit 0;;\n'
+        "esac\n"
+        'printf "200/1.4s/1099Bps"; exit 0\n',
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+    state_path = tmp_path / "srouter.local.json"
+    state_path.write_text(
+        '{"nodes": [{"name": "sg-1", "enabled": true,'
+        ' "probe": {"socks_port": 11080}}]}',
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env.update({
+        "SROUTER_CURL": str(fake),
+        "SROUTER_STATE_PATH": str(state_path),
+        "SROUTER_PYTHON": sys.executable,
+        "SROUTER_FAKE_COUNT": str(count),
+    })
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "2"], capture_output=True, env=env, text=True, timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "цель-селективно" in result.stdout, result.stdout
+    assert "124462" in result.stdout, \
+        f"быстрый раунд флап-цели обязан попасть в max_speed вердикта, got: {result.stdout}"
+    # дискриминатор «скорость учтена ВЕРДИКТОМ»: при игноре быстрого раунда max_speed=1099
+    # (только «жив»-цели) и печаталась бы «Живые цели медленные», а не быстрые
+    assert "Живые цели быстрые" in result.stdout, result.stdout
+    assert "битрейт-окно" not in result.stdout
 
 
 def test_curl_target_is_socks_proxy_from_state(tmp_path):
