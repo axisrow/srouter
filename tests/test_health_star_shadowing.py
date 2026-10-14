@@ -9,11 +9,18 @@ health.py собирает фасад звёздными ре-экспортам
 star-cascade-verify-runtime-not-ast: каскад живёт в порядке импортов фасада.
 """
 import importlib
+import re
+from pathlib import Path
 
+import health
 import pytest
 
-HEALTH_MODULES = ("health_probes", "health_claude", "health_codex", "health_codenv",
-                  "health_devworkflow", "health_endpoint", "health_backups")
+# Один источник правды (канон #155): список выводится из star-import'ов самого фасада
+# (review PR #430) — новый модуль в health.py автоматически попадает под гвард,
+# ручной список не заводим (иначе гвард сам держит второй дублирующийся перечень).
+HEALTH_MODULES = tuple(re.findall(r"^from (health_\w+) import \*",
+                                  Path(health.__file__).read_text(encoding="utf-8"), re.M))
+assert HEALTH_MODULES, "гвард не нашёл ни одного star-import health_* в health.py"
 
 
 @pytest.mark.parametrize("mod_name", HEALTH_MODULES)
