@@ -10,6 +10,7 @@ enable/disable — managed-ключ, disable --full — плюс бесхозн�
 """
 import argparse
 import os
+import re
 import subprocess
 
 import pytest
@@ -68,6 +69,16 @@ def test_status_lists_layers(real_git_home, capsys):
     # все три слоя названы, даже когда пусты (truthful-таблица, а не только вердикт)
     assert "urlmatch" in out
     assert "http.proxy" in out
+
+
+def test_status_layer_numbers_unique(real_git_home, capsys):
+    # Оба generic-слоя (https.proxy/http.proxy) печатались как «3.» — глазами
+    # это опечатка нумерации, а не «уровень с двумя ключами» (2026-10-14).
+    rc = srouter_cli.cmd_git_proxy(_ns("status"))
+    out = capsys.readouterr().out
+    assert rc == 0
+    nums = [int(m) for m in re.findall(r"^  (\d+)\.", out, re.MULTILINE)]
+    assert nums == [1, 2, 3, 4], out
 
 
 # ============================ enable ============================

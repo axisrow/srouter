@@ -1,6 +1,7 @@
 """Connectivity/channel helpers dashboard без импорта Flask/dashboard."""
 
 import logging
+import os
 import re
 import shlex
 
@@ -248,9 +249,17 @@ def _exit_ip_via_iface(iface):
     default-маршрут ОС. Так можно увидеть реальный выход КАЖДОГО канала (VPN vs прямой),
     не отключая VPN и не меняя маршруты. Аналог _exit_ip из dashboard_geo, но с iface
     и без прокси (нас интересует сам интерфейс, а не цепочка privoxy→xray).
+
+    Прокси-env обязан быть снят (обоих регистров, канон probe_manager.direct_probe/#298):
+    при ambient HTTPS_PROXY curl с --interface en0 коннектится к 127.0.0.1:8118 с bind
+    на en0 → refused → ложное «нет выхода» на живом интернете.
     """
+    env = os.environ.copy()
+    for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+                "http_proxy", "https_proxy", "all_proxy", "no_proxy"):
+        env.pop(key, None)
     r = sys_probe.run([CURL, "-sS", "--interface", iface, "--connect-timeout", "4",
-                       "--max-time", "8", "https://api.ip.sb/ip"], timeout=10)
+                       "--max-time", "8", "https://api.ip.sb/ip"], timeout=10, env=env)
     ip = r["out"].strip() if not r["timeout"] else ""
     return ip if (ip and len(ip) <= 45 and (":" in ip or ip.count(".") == 3)) else ""
 

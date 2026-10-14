@@ -129,6 +129,36 @@ Ethernet Address: 12:34:56:78:90:ab
     assert out["status"] == "down"
 
 
+def test_exit_ip_via_iface_scrubs_ambient_proxy_env(monkeypatch):
+    # Докстринг: «без прокси (нас интересует сам интерфейс, а не цепочка)» — но
+    # probe наследовала ambient env: curl --interface en0 при HTTPS_PROXY=8118
+    # коннектится к 127.0.0.1 с bind на en0 → refused → карточка «нет выхода»
+    # на живом интернете (найдено глазами на копии дашборда 2026-10-14).
+    # Канон — unset proxy-vars обоих регистров (probe_manager.direct_probe, #298).
+    dashboard = _fresh_dashboard(monkeypatch)
+    conn = sys.modules["dashboard_connectivity"]
+    for var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+                "http_proxy", "https_proxy", "all_proxy", "no_proxy"):
+        monkeypatch.setenv(var, "http://127.0.0.1:8118")
+    seen = {}
+
+    def fake_run(cmd, timeout, env=None):
+        if cmd[0] == dashboard.CURL:
+            seen["env"] = env
+            return {"rc": 0, "out": "203.0.113.7\n", "err": "", "timeout": False}
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(sys_probe, "run", fake_run)
+
+    ip = conn._exit_ip_via_iface("en0")
+
+    assert ip == "203.0.113.7"
+    assert seen["env"] is not None
+    for var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+                "http_proxy", "https_proxy", "all_proxy", "no_proxy"):
+        assert var not in seen["env"]
+
+
 def test_probe_direct_reachability_empty_output_is_unknown(monkeypatch):
     dashboard = _fresh_dashboard(monkeypatch)
 
