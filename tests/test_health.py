@@ -49,6 +49,10 @@ _REAL_CODEX_ISOLATION_CHECK = health._codex_isolation_check
 # _gfw_domain_check и хотят РЕАЛЬНУЮ _tunnel_delivery_check поверх заглушки _all_up_monkey.
 _REAL_TUNNEL_DELIVERY_CHECK = health._tunnel_delivery_check
 
+# #427: аналогично — github-direct тесты хотят РЕАЛЬНУЮ split-проверку поверх заглушки
+# _all_up_monkey; её зависимость (local_state_routing.github_direct_status) мокается по месту.
+_REAL_GITHUB_DIRECT_SPLIT_CHECK = health._github_direct_split_check
+
 # #329: аналогично — check_all-интеграционный тест override-гейта хочет РЕАЛЬНУЮ _claude_proxy_probe
 # (ps/lsof через мок sys_probe.run), а не заглушку из _all_up_monkey.
 _REAL_CLAUDE_PROXY_PROBE = health._claude_proxy_probe
@@ -153,7 +157,9 @@ def _all_up_monkey(monkeypatch, *, probe_status="ok", probe_detail="runtime: к�
                         lambda *a, **kw: {"status": "ok", "detail": "mock: туннель доставляет"})
     # github-direct (эксперимент 2026-10-11): read-only конфига — мокаем unknown (чек не
     # добавляется), gh-тесты переопределяют ПОСЛЕ этого вызова (late-binding).
-    monkeypatch.setattr(health, "_github_direct_check",
+    # #427: у split-проверки СВОЁ имя (_github_direct_split_check, health_probes) — не путать
+    # с _github_direct_check (#199, devworkflow, строка «gh/git direct») ниже.
+    monkeypatch.setattr(health, "_github_direct_split_check",
                         lambda *a, **kw: {"status": "unknown", "detail": "mock: github-direct"})
     # #252 perf: _gfw_domain_check/_direct_first_check (active_claude-путь) делают РЕАЛЬНЫЙ прямой
     # curl (env -u) к github.com/z.ai через sys_probe.direct_probe — без мока каждый
@@ -7243,3 +7249,48 @@ def test_tunnel_delivery_info_when_tunnel_already_down(monkeypatch):
     td = next((c for c in result["checks"] if "доставка" in c["name"]), None)
     assert td is not None
     assert td.get("info") is True, "туннель уже driver — доставка info (не дублируем)"
+
+
+# ===== #427: «github-direct (путь github)» показывает РЕАЛЬНЫЙ путь, а не текст чужого чека =====
+# Шэдоуинг star-import: health_devworkflow._github_direct_check (#199, слои git-proxy) перетирал
+# health_probes._github_direct_check (#423, split-состояние) — оба вызова check_all звали одну
+# функцию, doctor печатал простыню GH_DIRECT_HINT дважды и никогда не показывал путь github.
+
+def test_github_direct_line_shows_split_path_not_foreign_hint(monkeypatch):
+    """#427: строка «github-direct (путь github)» зовёт split-проверку (health_probes).
+
+    Мокаем ЗАВИСИМОСТЬ split-функции (local_state_routing.github_direct_status), а НЕ
+    шэдоуенное имя health._github_direct_check — до фикса оба вызова check_all резолвят
+    ОДИН глобал, и мок на нём держит тест зелёным на баге (канон
+    moving-caller-inverts-mock-ownership). Строка обязана показать путь github
+    («напрямую/через туннель»), а не текст «gh/git direct» про слои git-proxy.
+    """
+    import local_state_routing
+    _all_up_monkey(monkeypatch)
+    monkeypatch.setattr(local_state_routing, "github_direct_status",
+                        lambda *a, **kw: {"ok": True, "split": True, "direct": True})
+    # late-binding: снимаем заглушку _all_up_monkey, зовём РЕАЛЬНУЮ split-проверку —
+    # интеграция «check_all зовёт нужную функцию, та читает свою зависимость».
+    monkeypatch.setattr(health, "_github_direct_split_check",
+                        lambda *a, **kw: _REAL_GITHUB_DIRECT_SPLIT_CHECK())
+    result = health.check_all(active_claude=True)
+    gd = _check_by_name(result, "github-direct (путь github)")
+    assert "github ходит напрямую (режим on)" in (gd.get("detail") or ""), \
+        f"#427: doctor показывает текст чужого чека вместо пути github: {gd}"
+
+
+def test_github_direct_line_absent_when_split_not_done(monkeypatch):
+    """#427: без split строка «github-direct (путь github)» НЕ печатается (unknown → skip),
+    а не «✅ … git github-proxy ВКЛЮЧЁН» от чужой функции."""
+    import local_state_routing
+    _all_up_monkey(monkeypatch)
+    monkeypatch.setattr(local_state_routing, "github_direct_status",
+                        lambda *a, **kw: {"ok": True, "split": False})
+    # late-binding: РЕАЛЬНАЯ split-проверка (не заглушка _all_up_monkey) — гейт
+    # «unknown → строка не добавляется» проверяем на настоящей функции.
+    monkeypatch.setattr(health, "_github_direct_split_check",
+                        lambda *a, **kw: _REAL_GITHUB_DIRECT_SPLIT_CHECK())
+    result = health.check_all(active_claude=True)
+    stray = [c["name"] for c in result["checks"] if "github-direct" in c["name"]]
+    assert not stray, \
+        f"#427: split не делался — строки быть не должно, got: {stray}"
