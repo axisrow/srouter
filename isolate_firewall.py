@@ -737,10 +737,10 @@ def provision_codex_user():
 
 
 def deprovision_codex_user():
-    """Идемпотентное удаление _srouter_codex через osascript admin-мост.
+    """Идемпотентное удаление _srouter_codex через штатный диалог sysadminctl.
 
     Подтверждённо отсутствующая запись → no-op ok. Ошибка чтения/чужой UID → отказ.
-    Иначе одна osascript-инвокация с последующей проверкой отсутствия:
+    Иначе интерактивный вызов с последующей проверкой отсутствия:
     sysadminctl -deleteUser _srouter_codex (не dscl: policy-прослойка macOS
     отказывает dscl на accountPolicyData-записях — eDSPermissionError инцидент
     2026-10-10; без флагов — дефолт home не трогает, /var/empty остаётся).
@@ -758,13 +758,17 @@ def deprovision_codex_user():
         name = _valid_user_name(CODEX_USER_NAME)
         if not name:
             return _reject("константа codex-user name невалидна")
-        shell_cmd = f"{SYSADMINCTL} -deleteUser {name}"
-        deleted = _admin_run(shell_cmd)
+        # Native authorization + first-use TCC can require two dialogs; allow time for both.
+        deleted = _isolate_result(sys_probe.run(
+            [SYSADMINCTL, "interactive", "-deleteUser", name], timeout=180))
+        after = probe_codex_user()
+        if after.get("missing"):
+            return {**deleted, "ok": True, "rc": 0, "cancelled": False, "timeout": False, "err": ""}
         if not deleted.get("ok"):
             return deleted
-        after = probe_codex_user()
         if not after.get("missing"):
-            return _reject(f"codex-user не подтверждённо удалён: {after.get('error') or 'запись ещё существует'}")
+            return {**deleted, "ok": False, "err": "codex-user не подтверждённо удалён: "
+                    + (after.get("error") or deleted.get("err") or "запись ещё существует")}
         return deleted
     except Exception as exc:  # noqa: BLE001 — fail-closed контракт, см. модульный docstring
         logger.error("deprovision_codex_user failed: %s", exc)

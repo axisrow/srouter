@@ -18,7 +18,9 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def stub_user_lifecycle(monkeypatch):
+def stub_user_lifecycle(monkeypatch, tmp_path):
+    monkeypatch.setattr(local_state, "_DEFAULT_PATH", tmp_path / "s.json")
+    monkeypatch.setattr(isolate_firewall, "probe_codex_user", lambda: {"missing": True})
     monkeypatch.setattr(isolate_firewall, "provision_codex_user", lambda: {"ok": True})
     monkeypatch.setattr(isolate_firewall, "deprovision_codex_user", lambda: {"ok": True})
 
@@ -27,6 +29,12 @@ def stub_user_lifecycle(monkeypatch):
 _LS_LOAD = local_state.load_active_codex_isolate
 _LS_SAVE = local_state.save_active_codex_isolate
 _LS_CLEAR = local_state.clear_active_codex_isolate
+
+
+def _owned_user(state_path):
+    state = local_state.load_state(path=state_path)
+    state.setdefault("detected_environment", {})["codex_user_restore"] = {"created": True}
+    assert local_state.save_state(state, path=state_path) is not None
 
 
 def test_install_codex_reuses_existing_lease_token(monkeypatch, tmp_path):
@@ -126,8 +134,8 @@ def test_install_codex_provisions_user_before_enable(monkeypatch, tmp_path):
         f"provision обязан идти ДО enable (UID готов к моменту загрузки правил); порядок={order}")
 
 
-def test_install_codex_provision_failure_does_not_crash_install(monkeypatch, tmp_path):
-    """provision best-effort: сбой НЕ валит install — enable всё ещё зовётся, note упоминает ошибку."""
+def test_install_codex_provision_failure_does_not_enable_pf(monkeypatch, tmp_path):
+    """Без готового пользователя PF не включается; install получает строку с причиной."""
     state_path = str(tmp_path / "s.json")
     monkeypatch.setattr(srouter.local_state, "load_active_codex_isolate",
                         lambda path=None: _LS_LOAD(path=state_path) or {})
@@ -145,14 +153,16 @@ def test_install_codex_provision_failure_does_not_crash_install(monkeypatch, tmp
     monkeypatch.setattr(isolate_firewall, "enable_codex_isolation", fake_enable)
 
     note = srouter._install_codex_isolation(env=None, runner=None)
-    assert enable_called["v"], "provision failure НЕ должен валить install (best-effort, как codex-шаги)"
+    assert not enable_called["v"]
     assert isinstance(note, str), "install возвращает строку-статус, не бросает"
+    assert "не включена" in note
 
 
 def test_remove_codex_deprovisions_after_successful_disable(monkeypatch, tmp_path):
     """uninstall: deprovision_codex_user вызывается ПОСЛЕ успешного disable + clear."""
     state_path = str(tmp_path / "s.json")
     _LS_SAVE({"token": "9", "applied_at": 1}, path=state_path)
+    _owned_user(state_path)
     monkeypatch.setattr(srouter.local_state, "load_active_codex_isolate",
                         lambda path=None: _LS_LOAD(path=state_path) or {})
     monkeypatch.setattr(srouter.local_state, "clear_active_codex_isolate",
@@ -168,6 +178,7 @@ def test_remove_codex_deprovisions_after_successful_disable(monkeypatch, tmp_pat
     srouter._remove_codex_isolation(env=None, runner=None)
     assert order == ["disable", "clear", "deprovision"], (
         f"deprovision ПОСЛЕ disable+clear; порядок={order}")
+    assert "codex_user_restore" not in local_state.load_state(path=state_path)["detected_environment"]
 
 
 def test_remove_codex_does_not_deprovision_on_disable_failure(monkeypatch, tmp_path):
@@ -192,6 +203,7 @@ def test_remove_codex_deprovision_failure_reports_partial(monkeypatch, tmp_path)
     """Отказ удаления пользователя возвращает partial, хотя PF уже снят."""
     state_path = str(tmp_path / "s.json")
     _LS_SAVE({"token": "9", "applied_at": 1}, path=state_path)
+    _owned_user(state_path)
     monkeypatch.setattr(srouter.local_state, "load_active_codex_isolate",
                         lambda path=None: _LS_LOAD(path=state_path) or {})
     monkeypatch.setattr(srouter.local_state, "clear_active_codex_isolate",
@@ -205,3 +217,25 @@ def test_remove_codex_deprovision_failure_reports_partial(monkeypatch, tmp_path)
     assert note["ok"] is False
     assert "пользователь не удалён" in note["note"]
     assert _LS_LOAD(path=state_path) is None, "lease очищен при успешном disable (не завязан на deprovision)"
+
+
+def test_remove_codex_preserves_preexisting_user(monkeypatch, tmp_path):
+    state = {"detected_environment": {"codex_user_restore": {"created": False}}}
+    local_state.save_state(state)
+    monkeypatch.setattr(isolate_firewall, "disable_codex_isolation", lambda **k: {"ok": True})
+    monkeypatch.setattr(isolate_firewall, "deprovision_codex_user", lambda: pytest.fail("preexisting user"))
+    assert srouter._remove_codex_isolation(None, None)["ok"]
+    assert "codex_user_restore" not in local_state.load_state()["detected_environment"]
+
+
+def test_remove_codex_keeps_invalid_lease_without_touching_pf(monkeypatch):
+    local_state.save_state({"runtime": {"active_codex_isolate": {"token": "invalid"}}})
+    monkeypatch.setattr(isolate_firewall, "disable_codex_isolation", lambda **k: pytest.fail("invalid lease"))
+    assert not srouter._remove_codex_isolation(None, None)["ok"]
+    assert local_state.load_state()["runtime"]["active_codex_isolate"]["token"] == "invalid"
+
+
+def test_clean_uninstall_does_not_create_state(monkeypatch):
+    monkeypatch.setattr(isolate_firewall, "disable_codex_isolation", lambda **k: {"ok": True})
+    assert srouter._remove_codex_isolation(None, None)["ok"]
+    assert not local_state._DEFAULT_PATH.exists()

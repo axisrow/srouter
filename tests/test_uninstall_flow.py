@@ -13,11 +13,18 @@ class FakeRunner:
     def __init__(self, responses=None):
         self.responses = responses or {}
         self.calls = []
+        self.dns = {}
 
     def __call__(self, cmd, timeout):
         self.calls.append(list(cmd))
         if tuple(cmd) in self.responses:
             return self.responses[tuple(cmd)]
+        if cmd[0] == install_lib.NETWORKSETUP and cmd[1] == "-getdnsservers":
+            servers = self.dns.get(cmd[2], [])
+            return {"rc": 0, "out": "\n".join(servers) if servers else "There aren't any DNS Servers set on Wi-Fi.\n",
+                    "err": "", "timeout": False}
+        if cmd[0] == install_lib.NETWORKSETUP and cmd[1] == "-setdnsservers":
+            self.dns[cmd[2]] = [] if cmd[3:] == ["Empty"] else cmd[3:]
         # `launchctl print <domain>/<label>` по умолчанию → rc=113 (service-not-found = НЕ загружен):
         # в чистом install/uninstall-окружении реальный агент никто не поднимал. Иначе default rc=0
         # читался бы как «загружен» → poll _launchd_unload крутил бы полный settle (домен-осознанная

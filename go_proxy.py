@@ -86,8 +86,10 @@ def wrapper_layer(path=None):
     wrapper = Path(path) if path else WRAPPER_PATH
     try:
         text = wrapper.read_text(encoding="utf-8")
-    except OSError:
+    except FileNotFoundError:
         return {"present": False, "managed": False, "target": None}
+    except (OSError, UnicodeError):
+        return {"present": True, "managed": False, "target": None}
     lines = text.splitlines()
     managed = bool(lines) and lines[0].strip() == WRAPPER_MARKER  # whole-line канон
     target = None
@@ -167,7 +169,7 @@ def enable(mode="mirror", force=False):
         return {"ok": True, "mode": "tunnel", "wrapper": str(WRAPPER_PATH), "target": real}
 
 
-def disable(full=False, force=False):
+def disable(full=False, force=False, *, owned_only=False):
     """Выключить: снять wrapper (если managed); full → снять managed mirror-GOPROXY.
     Снятые значения возвращаются в removed[] для ручного восстановления (канон git-proxy)."""
     removed = []
@@ -175,7 +177,9 @@ def disable(full=False, force=False):
     with _mutation_lock():
         w = wrapper_layer()
         if w["present"]:
-            if not w["managed"] and not force:
+            if not w["managed"] and not force and owned_only:
+                pass
+            elif not w["managed"] and not force:
                 errors.append(f"чужой {WRAPPER_PATH} (без маркера) — нужен --force (#307)")
             else:
                 removed.append(f"wrapper {WRAPPER_PATH} (target={w['target']})")
@@ -196,7 +200,9 @@ def disable(full=False, force=False):
                 else:
                     removed.append(f"GOPROXY={MIRROR_GOPROXY} (go env -u)")
             elif cur["state"] == "foreign":
-                if not force:
+                if owned_only and not force:
+                    pass
+                elif not force:
                     errors.append(f"чужой GOPROXY={cur['value']!r} — нужен --force (#307)")
                 else:
                     r = _run_go(["env", "-u", "GOPROXY"])

@@ -27,6 +27,7 @@ save_active_isolate, ...) это увидят. Если бы caller и callee ф
 """
 import json
 import os
+import tempfile
 import re
 import socket  # noqa: F401 — re-export surface: local_state.socket патчится тестами (canon
                 # star-import-reexport-contract), реальный resolve_route_ip теперь в
@@ -207,22 +208,34 @@ def _load_state_checked(path=None):
 
 
 def save_state(state, path=None):
-    """Атомарная запись (temp + rename). Возвращает state при успехе, None при ошибке. Не бросает."""
+    """Atomic, private state; root hooks preserve the existing user's ownership."""
     p = Path(path) if path else _DEFAULT_PATH
-    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp = None
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
-        with open(tmp, "w", encoding="utf-8") as f:
+        try:
+            previous = p.stat()
+        except FileNotFoundError:
+            previous = None
+        fd, name = tempfile.mkstemp(prefix=p.name + ".", suffix=".tmp", dir=p.parent)
+        tmp = Path(name)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            if previous is not None:
+                os.fchmod(f.fileno(), previous.st_mode & 0o600)
+                current = os.fstat(f.fileno())
+                if (current.st_uid, current.st_gid) != (previous.st_uid, previous.st_gid):
+                    os.fchown(f.fileno(), previous.st_uid, previous.st_gid)
             json.dump(state, f, ensure_ascii=False, indent=2)
             f.flush()
             os.fsync(f.fileno())
-        tmp.replace(p)  # atomic rename
+        tmp.replace(p)
         _fsync_parent_dir(p)
     except (OSError, TypeError, ValueError):
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
+        if tmp is not None:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
         return None
     return state
 

@@ -294,7 +294,7 @@ def test_ensure_home_bin_rotates_zshrc_generations(monkeypatch, tmp_path):
     assert stale[2].exists() and stale[3].exists()
 
 
-def test_apply_uninstall_purges_user_backups_dir(tmp_path, monkeypatch):
+def test_apply_uninstall_preserves_user_backups_by_default(tmp_path, monkeypatch):
     from test_uninstall_flow import FakeRunner as UninstallRunner, _write_state
 
     env = _env(tmp_path)
@@ -310,4 +310,4 @@ def test_apply_uninstall_purges_user_backups_dir(tmp_path, monkeypatch):
     )
 
     assert result["ok"] is True
-    assert not backups_dir.exists(), "секреты бэкапов не переживают uninstall (v2 §1)"
+    assert backups_dir.exists(), "удаление бэкапов требует отдельного --purge"

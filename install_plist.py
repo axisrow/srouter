@@ -313,6 +313,8 @@ def _unload_launchagent(item, runner):
     if state is not False:
         # ещё загружен (True) ИЛИ неизвестно/list-timeout (None): НЕ unlink. Fail-safe: оставить plist.
         return {"ok": False, "blocked": "launchagent_unload_failed"}
+    if item.get("keep_plist"):
+        return {"ok": True, "changed": True}
     try:
         path.unlink(missing_ok=True)
     except OSError:

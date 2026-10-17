@@ -360,7 +360,7 @@ def test_provision_codex_user_failclosed_when_uid_taken(monkeypatch):
 
 
 def test_deprovision_codex_user_calls_sysadminctl_delete(monkeypatch):
-    """deprovision шлёт osascript с sysadminctl -deleteUser (не dscl — policy-прослойка
+    """deprovision вызывает штатный диалог sysadminctl (не dscl — policy-прослойка
     macOS 26 отказывает dscl на записях с accountPolicyData: eDSPermissionError инцидент
     2026-10-10). БЕЗ флагов: дефолт deleteUser home НЕ трогает (-secure стирает, -keepHome
     лишь дублирует дефолт и на macOS 26 отклонён «not available on this system» — живой
@@ -368,13 +368,17 @@ def test_deprovision_codex_user_calls_sysadminctl_delete(monkeypatch):
     probes = iter([{"provisioned": True, "uid": "503"}, {"provisioned": False, "missing": True}])
     monkeypatch.setattr(isolate_firewall, "probe_codex_user", lambda: next(probes))
     captured = []
-    monkeypatch.setattr(isolate_firewall.sys_probe, "run",
-                        lambda cmd, timeout=None: captured.append(cmd) or {"rc": 0, "out": "", "err": "", "timeout": False})
+    def native_run(cmd, timeout=None):
+        assert timeout == 180
+        captured.append(cmd)
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+    monkeypatch.setattr(isolate_firewall.sys_probe, "run", native_run)
     r = isolate_firewall.deprovision_codex_user()
     assert r["ok"], r
     shell_text = " ".join(part for argv in captured for part in argv).replace('\\"', '"')
     assert "/usr/sbin/sysadminctl" in shell_text and "-deleteUser" in shell_text, shell_text
-    assert "_srouter_codex" in shell_text, shell_text
+    assert "interactive" in shell_text, "sysadminctl требует аутентификацию администратора, одного root недостаточно"
+    assert captured == [["/usr/sbin/sysadminctl", "interactive", "-deleteUser", "_srouter_codex"]]
     assert "-keepHome" not in shell_text, "флаг отклонён macOS 26 и дублирует дефолт: " + shell_text
     assert "dscl" not in shell_text, "delete через dscl запрещён (eDSPermissionError): " + shell_text
 
@@ -415,20 +419,20 @@ def test_probe_codex_user_down_when_record_missing(monkeypatch):
 ])
 def test_deprovision_refuses_unreadable_or_foreign_record(monkeypatch, probe):
     monkeypatch.setattr(isolate_firewall, "probe_codex_user", lambda: probe)
-    monkeypatch.setattr(isolate_firewall, "_admin_run", lambda cmd: pytest.fail("delete called"))
+    monkeypatch.setattr(isolate_firewall.sys_probe, "run", lambda cmd, timeout: pytest.fail("delete called"))
     assert isolate_firewall.deprovision_codex_user()["ok"] is False
 
 
 def test_deprovision_checks_record_after_delete(monkeypatch):
     monkeypatch.setattr(isolate_firewall, "probe_codex_user", lambda: {"provisioned": True})
-    monkeypatch.setattr(isolate_firewall, "_admin_run", lambda cmd: {"ok": True})
+    monkeypatch.setattr(isolate_firewall.sys_probe, "run", lambda cmd, timeout: {"rc": 0})
     assert isolate_firewall.deprovision_codex_user()["ok"] is False
 
 
 def test_deprovision_reports_delete_permission_error(monkeypatch):
     monkeypatch.setattr(isolate_firewall, "probe_codex_user", lambda: {"provisioned": True})
-    monkeypatch.setattr(isolate_firewall, "_admin_run", lambda cmd: {
-        "ok": False, "err": "eDSPermissionError"})
+    monkeypatch.setattr(isolate_firewall.sys_probe, "run", lambda cmd, timeout: {
+        "rc": 1, "err": "eDSPermissionError"})
     assert isolate_firewall.deprovision_codex_user()["err"] == "eDSPermissionError"
 
 
@@ -591,3 +595,13 @@ def test_enable_isolation_surfaces_resolution_errors(monkeypatch, tmp_path):
     assert r["unresolved"] == ["api.anthropic.com"], r
     assert r.get("resolution_errors", {}).get("api.anthropic.com"), \
         f"ошибки резолва проглочены вызывающим: {r}"
+
+
+@pytest.mark.parametrize('missing', [True, False])
+def test_deprovision_checks_actual_absence_even_after_sysadminctl_timeout(monkeypatch, missing):
+    probes = iter([{'provisioned': True}, {'missing': missing, 'error': None if missing else 'read failed'}])
+    monkeypatch.setattr(isolate_firewall, 'probe_codex_user', lambda: next(probes))
+    monkeypatch.setattr(isolate_firewall.sys_probe, 'run', lambda cmd, timeout: {'rc': None, 'timeout': True, 'err': 'timeout'})
+    result = isolate_firewall.deprovision_codex_user()
+    assert result['ok'] is missing
+    assert result['timeout'] is (not missing)

@@ -51,7 +51,9 @@ def _stub_cmd_install_internals(monkeypatch, *, apply_ok=True, tty=True):
     `_install_codex_zsh_function` обязательно: без мока она падает в try/except на env.now mock'а,
     и тест проходит СЛУЧАЙНО (маскируя вызов) — хрупкость, ломающаяся при любом изменении stub'а.
     """
-    monkeypatch.setattr(srouter_cli, "_env_from_args", lambda args: SimpleNamespace(root=Path(".")))
+    monkeypatch.setattr(srouter_cli, "_env_from_args", lambda args: SimpleNamespace(root=Path("."), state_path=Path("/private/tmp/srouter-unit-state-unused.json")))
+    monkeypatch.setattr(srouter_cli, "_tracked_install", lambda env, paths, action, **kw: action())
+    monkeypatch.setattr(srouter_cli, "_install_claude_app_wrapper", lambda env: "")
     monkeypatch.setattr(srouter_cli, "make_privileged_runner", lambda *a, **k: (lambda cmd, t: {"rc": 0}))
     # plan без конфликтов → блок :527 (conflicts) пустой → доходим до gate :544.
     monkeypatch.setattr(srouter_cli, "build_plan", lambda **k: {"components": {}})

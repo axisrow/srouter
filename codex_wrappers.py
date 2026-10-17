@@ -279,16 +279,19 @@ def _remove_one_wrapper(wrapper_path: Path, marker: str) -> str:
         return f"Codex {wrapper_path.name}: не удалён ({str(exc)[:60]})."
 
 
-def _remove_codex_wrappers() -> str:
+def _remove_codex_wrappers(*, skip_paths=()) -> str:
     """Удалить wrappers (если srouter-managed). Цикл по CODEX_WRAPPERS, единый разделитель с install.
 
     Issue #169 rename-migration: также подчищаем устаревший srouter-managed ~/bin/codex от прежней
     установки (до rename) — leftover иначе даёт «призрак» wrapper'а после деинсталляции. Чужой
     ~/bin/codex (без маркера) — не трогаем (fail-closed provenance #112)."""
+    skip_paths = {str(Path(path).absolute()) for path in skip_paths}
     parts = [_remove_one_wrapper(_codex_wrapper_path(name), marker)
-             for name, _, marker in CODEX_WRAPPERS]
+             for name, _, marker in CODEX_WRAPPERS
+             if str(_codex_wrapper_path(name).absolute()) not in skip_paths]
     cli_marker = CODEX_WRAPPERS[0][2]
-    migration_note = _migrate_legacy_codex_cli_wrapper(cli_marker, action="remove")
+    migration_note = (_migrate_legacy_codex_cli_wrapper(cli_marker, action="remove")
+                      if str(_codex_wrapper_path(CODEX_CLI_WRAPPER_LEGACY_NAME).absolute()) not in skip_paths else "")
     if migration_note:
         parts.append(migration_note)
     return "\n".join(parts)
@@ -330,12 +333,21 @@ def _install_launchctl_env(env, runner) -> str:
         # пуст, WARN никогда не срабатывал. Единственный домен-осознанный источник — `launchctl print
         # gui/<uid>` (health._read_gui_proxy_env, тот же паттерн, что doctor-чеки #189).
         warn = ""
-        gui = health._read_gui_proxy_env(runner, keys_filter=("HTTP_PROXY",))
+        gui = health._read_gui_proxy_env(runner, keys_filter=CODEX_LAUNCHCTL_UNSET_KEYS)
+        if not gui.get("verifiable"):
+            return "Codex env: не установлен — исходное GUI-окружение не прочитано."
+        state, readable = local_state.load_state_checked(path=env.state_path)
+        if not readable:
+            return "Codex env: не установлен — state нечитаем."
+        detected = state.setdefault("detected_environment", {})
+        if "launchctl_env_restore" not in detected:
+            detected["launchctl_env_restore"] = gui.get("keys", {})
+            if local_state.save_state(state, path=env.state_path) is None:
+                return "Codex env: не установлен — исходное окружение не сохранено."
         val = gui.get("keys", {}).get("HTTP_PROXY", "")
         if val:
             warn = (f" ВНИМАНИЕ: существующий GUI HTTP_PROXY={val[:40]} будет СНЯТ агентом каждые "
-                    f"5 минут без восстановления (контракт 2026-10-07: ambient-прокси в gui-домен "
-                    f"не сеется; backup не делается).")
+                    f"5 минут; исходное окружение сохранено для uninstall.")
         ok, err = _install_generic_launchagent(
             env, runner,
             template_name="com.srouter.codenv.plist",
@@ -355,7 +367,40 @@ def _install_launchctl_env(env, runner) -> str:
         return f"Codex env: не установлен ({str(exc)[:80]})."
 
 
-def _remove_launchctl_env(runner) -> dict:
+def _restore_saved_launchctl_env(env, runner, plist_path):
+    state, readable = local_state.load_state_checked(path=env.state_path)
+    if not readable:
+        return {"ok": False, "note": "Codex env: state нечитаем."}
+    detected = state.get("detected_environment") or {}
+    if "launchctl_env_restore" not in detected:
+        return None
+    previous = detected["launchctl_env_restore"]
+    if not isinstance(previous, dict) or any(k not in CODEX_LAUNCHCTL_UNSET_KEYS or not isinstance(v, str) for k, v in previous.items()):
+        return {"ok": False, "note": "Codex env: backup невалиден."}
+    if _launchd_unload(_launchd_domain(), CODEX_ENV_LABEL, runner=runner)["state"] is not False:
+        return {"ok": False, "note": "Codex env: не подтверждена выгрузка агента."}
+    current = health._read_gui_proxy_env(runner, keys_filter=CODEX_LAUNCHCTL_UNSET_KEYS)
+    if not current.get("verifiable"):
+        return {"ok": False, "note": "Codex env: GUI-окружение не прочитано."}
+    keys = current.get("keys", {})
+    if any(k in keys and keys[k] != value for k, value in previous.items()):
+        return {"ok": False, "note": "Codex env: поздняя чужая правка сохранена; backup оставлен."}
+    for key, value in previous.items():
+        if key not in keys:
+            result = runner([LAUNCHCTL, "asuser", str(os.getuid()), LAUNCHCTL, "setenv", key, value], 5)
+            if result.get("timeout") or result.get("rc") != 0:
+                return {"ok": False, "note": "Codex env: не восстановлен " + key}
+    after = health._read_gui_proxy_env(runner, keys_filter=CODEX_LAUNCHCTL_UNSET_KEYS)
+    if not after.get("verifiable") or any(after.get("keys", {}).get(k) != value for k, value in previous.items()):
+        return {"ok": False, "note": "Codex env: восстановление не подтверждено."}
+    plist_path.unlink(missing_ok=True)
+    detected.pop("launchctl_env_restore")
+    if local_state.save_state(state, path=env.state_path) is None:
+        return {"ok": False, "note": "Codex env: восстановлен, но state не сохранён."}
+    return {"ok": True, "note": "Codex env: исходное GUI-окружение восстановлено."}
+
+
+def _remove_launchctl_env(runner, env=None) -> dict:
     """Выгрузить LaunchAgent env + снять переменные из GUI-домена + удалить plist.
 
     Возвращает {ok: bool, note: str}. ok=False пробрасывается в ненулевой rc cmd_uninstall — это
@@ -378,8 +423,13 @@ def _remove_launchctl_env(runner) -> dict:
     Любой ключ, оставшийся в gui-домене → ok=False (fail-closed).
     """
     try:
-        plist_path = Path.home() / "Library" / "LaunchAgents" / f"{CODEX_ENV_LABEL}.plist"
+        plist_path = ((env.launchagent_dir if env is not None else Path.home() / "Library" / "LaunchAgents")
+                      / f"{CODEX_ENV_LABEL}.plist")
         if not plist_path.exists():
+            if env is not None:
+                saved = _restore_saved_launchctl_env(env, runner, plist_path)
+                if saved is not None:
+                    return saved
             return {"ok": True, "note": "Codex env: не был установлен."}
         if CODEX_ENV_MARKER not in plist_path.read_text(encoding="utf-8"):
             return {"ok": True, "note": f"Codex env: чужой LaunchAgent {CODEX_ENV_LABEL} — не трогаем."}
@@ -397,6 +447,10 @@ def _remove_launchctl_env(runner) -> dict:
             # Агент потенциально жив в gui-домене → env активен. ok=False: cmd_uninstall не должен
             # рапортовать полный успех, пока env-прокси не подтверждённо снят (fail-closed).
             return {"ok": False, "note": note}
+        if env is not None:
+            saved = _restore_saved_launchctl_env(env, runner, plist_path)
+            if saved is not None:
+                return saved
         # Снять переменные ИЗ gui-домена явно и верифицировать.
         #
         # issue #191 (эмпирически подтверждено на реальной машине, не гипотеза): `launchctl unsetenv/
@@ -680,22 +734,44 @@ def _install_codex_isolation(env, runner) -> str:
     PF kill-switch — настоящая fail-closed граница codex (epic #166, issue #168/#186): блокирует
     прямой выход UID 503 в ядре, разрешает только loopback SOCKS5 10808. Правила (user 503) матчат
     трафик ТОЛЬКО когда системный пользователь с этим UID существует → provisioning создаёт его
-    ДО загрузки правил (UID готов к моменту apply → правила активны сразу, без окна «валидны но
-    не матчат»). Best-effort (как остальные codex-шаги) — сбой provisioning НЕ валит install.
+    ДО загрузки правил. Сбой provisioning оставляет install работоспособным, но PF не включается.
     Known-limitation (follow-up): запуск codex под uid 503 (sudo -u в wrapper) — отдельный PR.
     """
     try:
         import isolate_firewall
         state_path = getattr(env, "state_path", None) if env is not None else None
+        state, readable = local_state.load_state_checked(path=state_path)
+        if not readable:
+            return "Codex PF-изоляция: state нечитаем."
+        raw_lease = (state.get("runtime") or {}).get("active_codex_isolate")
+        if raw_lease is not None and not local_state._valid_active_codex_isolate(raw_lease):
+            return "Codex PF-изоляция: lease повреждён; проверьте PF вручную."
+        detected = state.setdefault("detected_environment", {})
+        if "codex_user_restore" not in detected:
+            previous_user = isolate_firewall.probe_codex_user()
+            if not (previous_user.get("missing") or previous_user.get("provisioned")):
+                return "Codex PF-изоляция: исходная запись пользователя не прочитана."
+            detected["codex_user_restore"] = {"created": bool(previous_user.get("missing"))}
+            if local_state.save_state(state, path=state_path) is None:
+                return "Codex PF-изоляция: исходная запись пользователя не сохранена."
+        original = detected["codex_user_restore"]
+        if not isinstance(original, dict) or type(original.get("created")) is not bool:
+            return "Codex PF-изоляция: происхождение пользователя повреждено."
         # 1) Provisioning UID 503 ДО enable (канон fail-closed: правила активны сразу после загрузки).
         prov = isolate_firewall.provision_codex_user()
         prov_note = "" if prov.get("ok") else f" provisioning не удался ({prov.get('err', 'unknown')});"
+        if not prov.get("ok"):
+            return "Codex PF-изоляция: не включена;" + prov_note
         # 2) Переиспользуем существующий token из lease (как CLI enable-codex, isolate_firewall.py:534),
         #    иначе re-install каждый раз зовёт pfctl -E → копит leaked enable-ref'ы (cycle-review cycle 1).
         lease = local_state.load_active_codex_isolate(path=state_path) or {}
         r = isolate_firewall.enable_codex_isolation(token=lease.get("token"))
         if r.get("ok"):
-            local_state.save_active_codex_isolate({"token": r.get("token"), "applied_at": None}, path=state_path)
+            saved = local_state.save_active_codex_isolate({"token": r.get("token"), "applied_at": None}, path=state_path)
+            if saved is None:
+                if not lease:
+                    isolate_firewall.disable_codex_isolation(token=r.get("token"))
+                return "Codex PF-изоляция: lease не сохранён."
             return ("Codex PF-изоляция: sub-anchor загружен + _srouter_codex (uid 503) создан "
                     f"(kill-switch активен).{prov_note} "
                     "Запуск codex под uid 503 (sudo -u) — follow-up.")
@@ -718,13 +794,36 @@ def _remove_codex_isolation(env, runner) -> dict:
     try:
         import isolate_firewall
         state_path = getattr(env, "state_path", None) if env is not None else None
+        state, readable = local_state.load_state_checked(path=state_path)
+        if not readable:
+            return {"ok": False, "note": "Codex PF: state нечитаем."}
+        raw_lease = (state.get("runtime") or {}).get("active_codex_isolate")
+        if raw_lease is not None and not local_state._valid_active_codex_isolate(raw_lease):
+            return {"ok": False, "note": "Codex PF: lease повреждён; оставлен для ручного разбора."}
         lease = local_state.load_active_codex_isolate(path=state_path) or {}
         r = isolate_firewall.disable_codex_isolation(token=lease.get("token"))
         if r.get("ok"):
-            local_state.clear_active_codex_isolate(path=state_path)
-            deprov = isolate_firewall.deprovision_codex_user()  # best-effort, идемпотентно
-            deprov_note = "" if deprov.get("ok") else f" пользователь не удалён ({deprov.get('err', '')});"
-            return {"ok": bool(deprov.get("ok")), "note": f"Codex PF-изоляция: снята.{deprov_note}"}
+            if lease and not local_state.clear_active_codex_isolate(path=state_path):
+                return {"ok": False, "note": "Codex PF: правила сняты, но lease не очищен."}
+            state, readable = local_state.load_state_checked(path=state_path)
+            if not readable:
+                return {"ok": False, "note": "Codex PF: state нечитаем."}
+            original = state.get("detected_environment", {}).get("codex_user_restore")
+            if original is None:
+                user = isolate_firewall.probe_codex_user()
+                return {"ok": bool(user.get("missing")), "note": "Codex PF: снята; пользователь отсутствует." if user.get("missing") else
+                        "Codex PF: снята; происхождение пользователя неизвестно, запись сохранена."}
+            if not isinstance(original, dict) or type(original.get("created")) is not bool:
+                return {"ok": False, "note": "Codex PF: снята; происхождение пользователя повреждено."}
+            if original["created"]:
+                deprov = isolate_firewall.deprovision_codex_user()
+                if not deprov.get("ok"):
+                    return {"ok": False, "note": f"Codex PF: снята; пользователь не удалён ({deprov.get('err', '')})."}
+            state["detected_environment"].pop("codex_user_restore")
+            if local_state.save_state(state, path=state_path) is None:
+                return {"ok": False, "note": "Codex PF: снята; история пользователя не очищена."}
+            return {"ok": True, "note": "Codex PF: снята; пользователь удалён." if original["created"] else
+                    "Codex PF: снята; прежний пользователь сохранён."}
         return {"ok": False, "note": f"Codex PF-изоляция: частично ({r.get('err', '')})."}
     except (OSError, ValueError, TypeError, subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
         # isolate_firewall subprocess + state операции → OSError, subprocess исключения
