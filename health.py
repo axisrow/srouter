@@ -698,7 +698,10 @@ def check_all(*, active_claude=False):
         checks.append(td_check)
         # github-direct (эксперимент 2026-10-11): куда сейчас ходит github — info-only
         # картина (read-only чтение конфига, дёшево — как xray-config-freshness, без gate).
-        gd = _github_direct_check()
+        # #427: имя _github_direct_split_check — раньше это был health_probes._github_direct_check,
+        # и health_devworkflow (импорт ниже) перетирал биндинг: строка показывала текст чека
+        # «gh/git direct» вместо пути github. Гвард — tests/test_health_star_shadowing.py.
+        gd = _github_direct_split_check()
         if gd["status"] != "unknown":
             checks.append({"name": "github-direct (путь github)", "ok": True, "info": True,
                            "detail": gd["detail"]})

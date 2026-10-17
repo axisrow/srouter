@@ -43,7 +43,7 @@ __all__ = [
     "_user_launchagent_plist", "_local_proxy_boot_persistence",
     "GFW_PROBE_DOMAINS", "GFW_CONTROL_DOMAIN", "_direct_domain_probe", "_gfw_domain_check",
     "_direct_first_check", "TUNNEL_TARGETS", "VENDOR_OUTAGE_MARKER",
-    "_tunnel_target_up", "_tunnel_up", "_tunnel_delivery_check", "_github_direct_check",
+    "_tunnel_target_up", "_tunnel_up", "_tunnel_delivery_check", "_github_direct_split_check",
     # #396 классы проб: direct (мимо прокси) + bulk (объёмная передача)
     "_no_proxy_env", "DIRECT_PROBE_URLS", "_direct_up", "_bulk_probe", "_bulk_status",
     "_BULK_DEFAULT_URL", "_url_host",
@@ -1010,8 +1010,13 @@ def _tunnel_delivery_check(gfw_status):
 
 
 # ============================ #396: классы проб direct/bulk ============================
-def _github_direct_check():
+def _github_direct_split_check():
     """Куда сейчас ходит github (github-direct on/off) — картина для doctor, info-only.
+
+    Имя с суффиксом _split_ (#427): в health.py два star-import'а (health_probes, потом
+    health_devworkflow) — прежнее имя _github_direct_check было и здесь, и в
+    health_devworkflow, и последний импорт перетирал ЭТУ функцию: строка doctor
+    «github-direct (путь github)» печатала текст чужого чека (#199), а не путь github.
 
     Read-only чтение рабочего конфига (github_direct_status). unknown = конфиг не читается
     или разделение ещё не выполнено (команда `srouter github-direct on` не звалась).
