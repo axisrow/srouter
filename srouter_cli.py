@@ -499,6 +499,8 @@ def cmd_uninstall(args, *, runner=None) -> int:
         print("uninstall остановлен: " + ", ".join(result.get("blocked") or ["unknown"])
               + ("; " + result["error"] if result.get("error") else ""), file=sys.stderr)
         return 2
+    for note in result.get("warnings") or []:
+        print("uninstall: " + note, file=sys.stderr)
 
     errors = list(optional.get("errors") or [])
     if not optional.get("ok") and not errors:

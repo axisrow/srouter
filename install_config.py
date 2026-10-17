@@ -888,6 +888,12 @@ def _apply_dns(env, plan, runner):
         if current not in (previous["servers"], ["127.0.0.1"]):
             return {"rc": 1, "out": "", "err": "dns_changed_externally", "timeout": False}
     else:
+        # Симметрично legacy-ветке _restore_dns (dns_original_unknown): единственный-DNS-127.0.0.1
+        # без lease — след нашего же сеттинга при потерянном state (reinstall), а не исходный DNS.
+        # Запись его как «оригинала» дала бы uninstall с report ok, молча оставляющий систему
+        # на мёртвом loopback после сноса dnsmasq.
+        if current == ["127.0.0.1"]:
+            return {"rc": 1, "out": "", "err": "dns_original_unknown: сохраните DNS вручную", "timeout": False}
         leases[service] = {"servers": current}
     # Original DNS must be durable before networksetup, including an interrupted install.
     if local_state.save_state(state, path=env.state_path) is None:

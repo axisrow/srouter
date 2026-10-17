@@ -14,6 +14,8 @@ class DNSRunner(FakeRunner):
         self.servers = list(servers)
         self.fail_read = False
         self.fail_write = False
+        self.services: list | None = None
+        self.fail_services = False
 
     def __call__(self, cmd, timeout):
         result = super().__call__(cmd, timeout)
@@ -27,6 +29,12 @@ class DNSRunner(FakeRunner):
                     result["rc"] = 1
                 else:
                     self.servers = [] if cmd[3:] == ["Empty"] else cmd[3:]
+            elif cmd[1] == "-listallnetworkservices":
+                if self.fail_services:
+                    result.update(rc=1)
+                elif self.services is not None:
+                    result["out"] = ("An asterisk (*) denotes that a network service is disabled.\n"
+                                     + "\n".join(self.services) + "\n")
         return result
 
 
@@ -76,6 +84,61 @@ def test_dns_external_edit_preserved_and_reported(dns_env):
     result = install_lib.apply_uninstall(env=dns_env, confirmations={"dns": True}, runner=runner)
     assert not result["ok"]
     assert runner.servers == ["9.9.9.9"]
+
+
+def _with_lease(dns_env):
+    runner = DNSRunner(["223.5.5.5"])
+    plan = {"network": {"channels": {"wifi_service": "Wi-Fi"}}}
+    assert install_config._apply_dns(dns_env, plan, runner)["rc"] == 0
+    return runner
+
+
+def test_dns_gone_service_releases_lease_with_warning(dns_env):
+    # Сервис исчез (переименование/удаление интерфейса): DNS-сеттинг умер вместе с ним —
+    # восстанавливать нечего; uninstall не должен навсегда падать dns_read_failed.
+    runner = _with_lease(dns_env)
+    runner.fail_read = True
+    runner.services = ["Thunderbolt Bridge"]
+    runner.calls = []
+    result = install_lib.apply_uninstall(env=dns_env, confirmations={"dns": True}, runner=runner)
+    assert result["ok"], result
+    assert not any("-setdnsservers" in cmd for cmd in runner.calls)
+    assert any("Wi-Fi" in note for note in result.get("warnings") or []), result
+    state = install_config.local_state.load_state(path=dns_env.state_path)
+    assert "Wi-Fi" not in state["network"]["dns_restore"]
+
+
+def test_dns_read_failure_with_live_service_still_blocks(dns_env):
+    runner = _with_lease(dns_env)
+    runner.fail_read = True
+    runner.services = ["Wi-Fi"]
+    result = install_lib.apply_uninstall(env=dns_env, confirmations={"dns": True}, runner=runner)
+    assert not result["ok"]
+    assert result["error"] == "dns_read_failed"
+    # restore заблокирован: DNS остался на srouter-сеттинге, чужое не тронуто.
+    assert runner.servers == ["127.0.0.1"]
+
+
+def test_dns_read_failure_with_unreadable_service_list_blocks(dns_env):
+    # Сам -listallnetworkservices нечитаем — «сервиса нет» недоказуемо, fail-closed.
+    runner = _with_lease(dns_env)
+    runner.fail_read = True
+    runner.fail_services = True
+    result = install_lib.apply_uninstall(env=dns_env, confirmations={"dns": True}, runner=runner)
+    assert not result["ok"]
+    assert result["error"] == "dns_read_failed"
+
+
+def test_apply_dns_refuses_loopback_without_lease(dns_env):
+    # State потерян при активном srouter-DNS: 127.0.0.1 — не «исходный DNS», его запись
+    # как оригинала оставила бы uninstall молча на мёртвом loopback. Симметрично legacy-ветке.
+    runner = DNSRunner(["127.0.0.1"])
+    result = install_config._apply_dns(dns_env, {"network": {"channels": {"wifi_service": "Wi-Fi"}}}, runner)
+    assert result["rc"] != 0
+    assert "dns_original_unknown" in result["err"]
+    assert not any("-setdnsservers" in cmd for cmd in runner.calls)
+    state = install_config.local_state.load_state(path=dns_env.state_path)
+    assert not state.get("network", {}).get("dns_restore")
 
 
 def test_services_stop_before_restoring_config(tmp_path):

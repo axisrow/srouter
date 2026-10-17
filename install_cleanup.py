@@ -603,6 +603,18 @@ def remove_installed_dependencies(env, runner=run):
     return {"ok": True, "removed": removed, "kept": kept}
 
 
+def _dns_service_gone(service, runner):
+    """True только когда живой -listallnetworkservices точно не содержит сервиса.
+    Любой сбой/таймаут самого списка, как и пустой ответ — False: «сервиса нет»
+    недоказуемо, блокируем как transient-сбой (fail-closed)."""
+    result = runner([NETWORKSETUP, "-listallnetworkservices"], 4)
+    if result.get("timeout") or result.get("rc") != 0:
+        return False
+    names = {line.strip().lstrip("*").strip() for line in (result.get("out") or "").splitlines()}
+    names.discard("")
+    return bool(names) and service not in names
+
+
 def _restore_dns(plan, runner):
     network = plan.get("network") or {}
     leases = network.get("dns_restore") or {}
@@ -623,6 +635,7 @@ def _restore_dns(plan, runner):
         if current is None or "127.0.0.1" in current:
             return {"rc": 1, "err": "dns_original_unknown: сохраните DNS вручную; backup отсутствует"}
         return {"rc": 0, "err": "DNS изменён извне; сохранён"}
+    gone = []
     for service, lease in leases.items():
         previous = lease.get("servers") if isinstance(lease, dict) else None
         if not isinstance(previous, list):
@@ -633,6 +646,13 @@ def _restore_dns(plan, runner):
         except (ValueError, TypeError):
             return {"rc": 1, "err": "dns_backup_invalid"}
         current = _read_dns_servers(service, runner)
+        if current is None and _dns_service_gone(service, runner):
+            # Сервис исчез (переименование, удаление интерфейса, смена Wi-Fi-железа):
+            # DNS-сеттинг умер вместе с ним — восстанавливать нечего, это не «поздняя
+            # чужая правка». Снимаем lease с предупреждением: иначе uninstall навсегда
+            # rc 2 (dns_read_failed) без флага обхода.
+            gone.append(service)
+            continue
         if current is None:
             return {"rc": 1, "err": "dns_read_failed"}
         if current != previous:
@@ -643,7 +663,9 @@ def _restore_dns(plan, runner):
                 return restored
             if _read_dns_servers(service, runner) != previous:
                 return {"rc": 1, "err": "dns_restore_verify_failed"}
-    return {"rc": 0, "out": "", "err": "", "restored": list(leases)}
+    return {"rc": 0, "out": "", "err": ("dns_service_gone: " + ", ".join(gone)
+                                        + "; DNS-настройка исчезла вместе с сервисом" if gone else ""),
+            "restored": list(leases)}
 
 
 def stop_uninstall_agents(env, runner=run, *, plan=None):
@@ -671,6 +693,7 @@ def apply_uninstall(env=None, *, confirmations=None, runner=run):
         return {"ok": False, "blocked": ["state_unreadable"], "actions": [], "plan": plan}
 
     actions = []
+    warnings = []
     components = []
     # leftover (issue #110 Дефект 1): stale-managed компоненты — srouter СТАВИЛ (item['managed']=True из
     # state), НО состояние неопределённое: не restorable (нет backup) И маркер пропал (marker_present=False).
@@ -780,11 +803,15 @@ def apply_uninstall(env=None, *, confirmations=None, runner=run):
             error = _record_state_effect(env, clear_dns)
             if error:
                 return {"ok": False, "blocked": [error], "actions": actions, "plan": plan}
+        if restored.get("err"):
+            # rc=0 + err — предупреждение оператору (gone-сервис, legacy «изменён извне»):
+            # не блокирует откат, но обязано дойти до вывода.
+            warnings.append(restored["err"])
         if not restored.get("err"):
             actions.append({"category": "dns", "component": "networksetup", "changed": True})
 
 
-    return {"ok": True, "blocked": [], "actions": actions, "components": components,
+    return {"ok": True, "blocked": [], "warnings": warnings, "actions": actions, "components": components,
             "leftover": leftover, "plan": plan}
 
 
