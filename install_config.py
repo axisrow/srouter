@@ -9,9 +9,11 @@ InstallEnv (env-переменные → runtime paths), маркер-детек
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -21,18 +23,21 @@ from pathlib import Path
 import backup_lib  # канон-примитивы бэкапов (PR-1 #339): create_backup/discover/stamp
 import gen_xray_config
 import local_state
+import install_restore
 import privoxy_system
 from sys_probe import BREW_COMPONENTS
 from sys_probe import parse_brew_services as _parse_brew_services
 from sys_probe import port_open, run
 
 from install_plist import (
+    LAUNCHCTL,
     LAUNCHAGENT_LABEL,
     LAUNCHAGENT_FILE,
     _has_launchagent_marker,
     _install_launchagent,
     _launchagent_template_path,
     _write_text_atomic,
+    _LAUNCHCTL_SERVICE_NOT_FOUND,
 )
 
 
@@ -558,7 +563,11 @@ def _record_state_effect(env, mutate):
     state, readable = local_state.load_state_checked(path=env.state_path)
     if not readable:
         return "state_unreadable"
-    mutate(state)
+    try:
+        mutate(state)
+    except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+        _log.warning("state update failed: %s", exc)
+        return "state_update_failed"
     if local_state.save_state(state, path=env.state_path) is None:
         return "state_write_failed"
     return ""
@@ -605,6 +614,7 @@ def _record_backup_intent(env, name, config_path, backup):
         entry = dict(prev)  # merge: если prev уже нёс management (idempotent/reclaimable) — не сносим его
         entry["config_path"] = str(config_path)
         entry["backup"] = str(backup)
+        entry["backup_metadata"] = install_restore.file_metadata(Path(config_path))
         detected[name] = entry
         state["detected_environment"] = detected
 
@@ -699,6 +709,89 @@ def _ensure_package(name, runner):
     return installed.get("rc") == 0
 
 
+def _package_names(result):
+    if result.get("timeout") or result.get("rc") != 0:
+        return None
+    names = (result.get("out") or "").split()
+    if not all(re.fullmatch(r"[a-z0-9][a-z0-9@+_.-]*(?:/[a-z0-9][a-z0-9@+_.-]*){0,2}", name) for name in names):
+        return None
+    return names
+
+
+def _record_package_intent(env, name, runner):
+    error = _recover_package_inventory(env, runner)
+    if error:
+        return error
+    before = _package_names(runner([BREW, "list", "--formula"], 30))
+    if before is None:
+        return "package_inventory_failed"
+    def mutate(state):
+        packages = state.setdefault("detected_environment", {}).setdefault("packages", {"owned": []})
+        packages["pending"] = {"name": name, "before": before}
+    return _record_state_effect(env, mutate)
+
+
+def _record_package_result(env, name, runner):
+    state, readable = local_state.load_state_checked(path=env.state_path)
+    if not readable:
+        return "state_unreadable"
+    packages = state.get("detected_environment", {}).get("packages", {})
+    if not isinstance(packages, dict):
+        return "package_ownership_invalid"
+    pending = packages.get("pending") or {}
+    if (not isinstance(pending, dict) or pending.get("name") != name
+            or not isinstance(pending.get("before"), list)
+            or any(not isinstance(value, str) for value in pending["before"])
+            or _package_names({"rc": 0, "out": "\n".join(pending["before"])}) is None):
+        return "package_intent_missing"
+    after = _package_names(runner([BREW, "list", "--formula"], 30))
+    dependencies = _package_names(runner([BREW, "deps", "--installed", name], 30))
+    if after is None or dependencies is None:
+        return "package_inventory_failed"
+    added = set(after) - set(pending["before"])
+    owned = packages.get("owned", [])
+    if (not isinstance(owned, list) or any(not isinstance(value, str) for value in owned)
+            or _package_names({"rc": 0, "out": "\n".join(owned)}) is None):
+        return "package_ownership_invalid"
+    owned = list(owned)
+    for dependency in [*dependencies, name]:
+        if dependency in added and dependency not in owned:
+            owned.append(dependency)
+    packages["owned"] = owned
+    packages.pop("pending", None)
+    return "" if local_state.save_state(state, path=env.state_path) is not None else "state_write_failed"
+
+
+def _recover_package_inventory(env, runner):
+    state, readable = local_state.load_state_checked(path=env.state_path)
+    if not readable:
+        return "state_unreadable"
+    packages = state.get("detected_environment", {}).get("packages", {})
+    if not isinstance(packages, dict):
+        return "package_ownership_invalid"
+    intent = packages.get("pending")
+    if intent is None:
+        return ""
+    if not isinstance(intent, dict) or intent.get("name") not in COMPONENTS:
+        return "package_intent_invalid"
+    return _record_package_result(env, intent["name"], runner)
+
+
+def owned_packages(env, runner):
+    """Вернуть доказанное владение пакетами, включая результат прерванного brew install."""
+    error = _recover_package_inventory(env, runner)
+    if error:
+        return {"ok": False, "err": error}
+    state, readable = local_state.load_state_checked(path=env.state_path)
+    if not readable:
+        return {"ok": False, "err": "state_unreadable"}
+    owned = state.get("detected_environment", {}).get("packages", {}).get("owned", [])
+    if (not isinstance(owned, list) or any(not isinstance(name, str) for name in owned)
+            or _package_names({"rc": 0, "out": "\n".join(owned)}) is None):
+        return {"ok": False, "err": "package_ownership_invalid"}
+    return {"ok": True, "owned": owned}
+
+
 def _restart_component(name, runner, *, port_checker=port_open):
     """Рестарт brew-сервиса без гонки за порт: stop → poll освобождения порта → start → poll поднятия.
 
@@ -758,11 +851,51 @@ def _restart_component(name, runner, *, port_checker=port_open):
     return {"rc": 0, "out": "", "err": "", "timeout": False}
 
 
+def _read_dns_servers(service, runner):
+    result = runner([NETWORKSETUP, "-getdnsservers", service], 10)
+    if result.get("timeout") or result.get("rc") != 0:
+        return None
+    text = (result.get("out") or "").strip()
+    if text.startswith("There aren't any DNS Servers set on "):
+        return []
+    servers = text.splitlines()
+    try:
+        if not servers:
+            return None
+        for server in servers:
+            ipaddress.ip_address(server)
+    except ValueError:
+        return None
+    return servers
+
+
 def _apply_dns(env, plan, runner):
     service = plan.get("network", {}).get("channels", {}).get("wifi_service") or ""
     if not service:
         return {"rc": 0, "out": "", "err": "wifi service not found", "timeout": False}
-    return runner([NETWORKSETUP, "-setdnsservers", service, "127.0.0.1"], 20)
+    current = _read_dns_servers(service, runner)
+    if current is None:
+        return {"rc": 1, "out": "", "err": "dns_read_failed", "timeout": False}
+    state, readable = local_state.load_state_checked(path=env.state_path)
+    if not readable:
+        return {"rc": 1, "out": "", "err": "state_unreadable", "timeout": False}
+    network = state.setdefault("network", {})
+    leases = network.setdefault("dns_restore", {})
+    previous = leases.get(service)
+    if previous is not None:
+        if not isinstance(previous, dict) or not isinstance(previous.get("servers"), list):
+            return {"rc": 1, "out": "", "err": "dns_backup_invalid", "timeout": False}
+        if current not in (previous["servers"], ["127.0.0.1"]):
+            return {"rc": 1, "out": "", "err": "dns_changed_externally", "timeout": False}
+    else:
+        leases[service] = {"servers": current}
+    # Original DNS must be durable before networksetup, including an interrupted install.
+    if local_state.save_state(state, path=env.state_path) is None:
+        return {"rc": 1, "out": "", "err": "state_write_failed", "timeout": False}
+    applied = runner([NETWORKSETUP, "-setdnsservers", service, "127.0.0.1"], 20)
+    if not applied.get("timeout") and applied.get("rc") == 0 and _read_dns_servers(service, runner) != ["127.0.0.1"]:
+        return {"rc": 1, "out": "", "err": "dns_verify_failed", "timeout": False}
+    return applied
 
 
 def _management_for(mode, item, *, provenance=None):
@@ -822,9 +955,15 @@ def _applied_component_entry(prev, item, mode, backup, *, now):
     if mode == "managed" and not backup and _is_managed_entry(prev) and carried_backup:
         provenance = _provenance_of(prev) or "overwrote"
     entry = _management_for(mode, item, provenance=provenance)
+    if isinstance(prev.get("service_restore"), dict) and prev["service_restore"].get("config_path") == item.get("config_path"):
+        entry["service_restore"] = prev["service_restore"]
+        if "brew_paths_restore" in prev:
+            entry["brew_paths_restore"] = prev["brew_paths_restore"]
     backup_ref = backup or carried_backup
     if backup_ref:
         entry["backup"] = backup_ref
+        if prev_same_path and isinstance(prev.get("backup_metadata"), dict):
+            entry["backup_metadata"] = prev["backup_metadata"]
     # cycle-review PR #290 (Codex + /review, независимо): created_at — нижняя граница возраста
     # backup'а, который discover_backups вправе засчитать за «доказательство overwrite ЭТОГО
     # install». Без неё retained backup (сохраняется НАМЕРЕННО, user_data_retained) от давно
@@ -871,6 +1010,11 @@ def _record_network_channels(env, network):
         merged = state.get("network") if isinstance(state.get("network"), dict) else {}
         merged.update(network or {})
         state["network"] = merged
+        runtime = state.setdefault("runtime", {})
+        if "split_routes" not in runtime:
+            detected = state.get("detected_environment") or {}
+            runtime["split_routes_legacy"] = any(_is_managed_entry(entry) for entry in detected.values() if isinstance(entry, dict))
+            runtime["split_routes"] = {}
 
     return _record_state_effect(env, mutate)
 
@@ -889,6 +1033,71 @@ def _record_component_applied(env, name, item, mode, backup):
         detected[name] = _applied_component_entry(prev, item, mode, backup, now=env.now)
         state["detected_environment"] = detected
 
+    return _record_state_effect(env, mutate)
+
+
+def _dnsmasq_service_status(runner):
+    for prefix in ("sh.brew.", "homebrew.mxcl."):
+        result = runner([LAUNCHCTL, "print", "system/" + prefix + "dnsmasq"], 5)
+        if not result.get("timeout") and result.get("rc") == 0:
+            return "started" if re.search(r"^\s*state = running\s*$", result.get("out") or "", re.M) else "unknown"
+        if result.get("timeout") or result.get("rc") != _LAUNCHCTL_SERVICE_NOT_FOUND:
+            return "unknown"
+    return "none"
+
+
+def _record_service_original(env, name, item, runner=run):
+    def mutate(state):
+        detected = state.setdefault("detected_environment", {})
+        entry = detected.get(name) if isinstance(detected.get(name), dict) else {}
+        detected[name] = entry
+        original = entry.get("service_restore")
+        if original and original.get("config_path") == item["config_path"]:
+            return
+        # A managed legacy install cannot tell us what ran before its first installation.
+        same_path = entry.get("config_path") == item["config_path"]
+        status = "unknown" if same_path and _is_managed_entry(entry) else item.get("service", "unknown")
+        if name == "dnsmasq" and status != "unknown":
+            status = _dnsmasq_service_status(runner)
+        entry["service_restore"] = {"status": status, "config_path": item["config_path"], "phase": "pending",
+                                    "config_existed": Path(item["config_path"]).exists(), "captured_at": env.now}
+    return _record_state_effect(env, mutate)
+
+
+def _brew_service_path_allowed(env, path):
+    if not isinstance(path, (str, Path)) or not str(path):
+        return False
+    try:
+        relative = Path(path).absolute().relative_to(env.prefix.absolute())
+    except ValueError:
+        return False
+    return ".." not in relative.parts and (relative.parts[:2] == ("Cellar", "dnsmasq") or
+            relative.parts in (("opt", "dnsmasq"), ("var", "homebrew", "linked", "dnsmasq")))
+
+
+def _record_brew_service_paths(env, name):
+    if name != "dnsmasq":
+        return ""
+    def mutate(state):
+        entry = state["detected_environment"][name]
+        if "brew_paths_restore" in entry:
+            if (not isinstance(entry["brew_paths_restore"], list)
+                    or any(not isinstance(record, dict) or not _brew_service_path_allowed(env, record.get("path"))
+                           for record in entry["brew_paths_restore"])):
+                raise ValueError("brew_paths_invalid")
+            return
+        cellar = env.prefix / "Cellar" / name
+        paths = [cellar, *cellar.rglob("*"), env.prefix / "opt" / name,
+                 env.prefix / "var/homebrew/linked" / name]
+        original = []
+        for path in paths:
+            try:
+                info = path.lstat()
+            except FileNotFoundError:
+                continue
+            original.append({"path": str(path.absolute()), "uid": info.st_uid, "gid": info.st_gid,
+                             "mode": info.st_mode & 0o7777, "inode": info.st_ino})
+        entry["brew_paths_restore"] = original
     return _record_state_effect(env, mutate)
 
 
@@ -1006,14 +1215,27 @@ def apply_install(env=None, *, confirm=False, choices=None, runner=run, port_che
             actions.append({"component": name, "mode": mode, "changed": False})
             continue
 
-        if not _ensure_package(name, runner):
-            return {"ok": False, "blocked": [f"{name}_install_failed"], "actions": actions, "plan": plan}
+        original_error = _record_service_original(env, name, item, runner)
+        if original_error:
+            return {"ok": False, "blocked": [original_error], "actions": actions, "plan": plan}
+        package_error = _record_package_intent(env, name, runner)
+        if package_error:
+            return {"ok": False, "blocked": [package_error], "actions": actions, "plan": plan}
+        installed = _ensure_package(name, runner)
+        package_error = _record_package_result(env, name, runner)
+        if not installed or package_error:
+            return {"ok": False, "blocked": ([f"{name}_install_failed"] if not installed else [])
+                    + ([package_error] if package_error else []), "actions": actions, "plan": plan}
+        ownership_error = _record_brew_service_paths(env, name)
+        if ownership_error:
+            return {"ok": False, "blocked": [ownership_error], "actions": actions, "plan": plan}
         config_path = Path(item["config_path"])
         # backup при overwrite ИЛИ reclaimable (issue #110 Дефект 2). reclaimable = «свой старый»
         # (state.managed=True, маркер пропал) — ВСЕГДА backup перед перезаписью (канон fail-closed):
         # если state устарел и под «своим старым» оказался чужой конфиг, он сохранится в .srouter-backup-*.
         # Без этого (раньше backup только при choice=='overwrite') reclaimable перезаписался бы без бэкапа.
-        needs_backup = config_path.exists() and (choices.get(name) == "overwrite" or item.get("reclaimable"))
+        needs_backup = config_path.exists() and (
+            (choices.get(name) == "overwrite" and not _has_marker(config_path)) or item.get("reclaimable"))
         if needs_backup:
             backup = _backup(config_path, env)
             if not backup:
@@ -1082,7 +1304,10 @@ def apply_install(env=None, *, confirm=False, choices=None, runner=run, port_che
         # неприкосновенны (fail-closed), сбой чистки install не роняет (best-effort).
         rotation = _rotate_component_backups(env, config_path)
         if name == "dnsmasq":
-            _apply_dns(env, plan, runner)
+            dns = _apply_dns(env, plan, runner)
+            if dns.get("timeout") or dns.get("rc") != 0:
+                return {"ok": False, "blocked": ["dns_apply_failed"], "error": dns.get("err"),
+                        "actions": actions, "plan": plan}
         action = {"component": name, "mode": mode, "changed": True}
         # noisy-log-better-than-no-log (review #350): best-effort-ротация не роняет install,
         # но её сбой/пропуск обязан быть виден СРАЗУ — в actions и логе, а не только спустя
@@ -1310,11 +1535,16 @@ def component_facts(name, env, entry, *, config_path=None):
     adopted = _is_adopted_entry(entry)
     restored = _is_restored_entry(entry)
     provenance = _provenance_of(entry)
+    original = entry.get("service_restore") if isinstance(entry.get("service_restore"), dict) else {}
+    created_before_write = (original.get("config_path") == str(path) and original.get("config_existed") is False)
+    if created_before_write and provenance is None:
+        provenance = "created"
     discovered = discover_backups(path)
     # not_before (cycle-review этого PR): для created-конфига entry несёт created_at — момент, раньше
     # которого валидных backup'ов для ЭТОГО config_path быть не может. Отсекает retained-relic от
     # предыдущего install→uninstall цикла, не давая ему выдать себя за «единственного» кандидата.
-    not_before = _parse_backup_stamp_or_none(entry.get("created_at")) if provenance == "created" else None
+    not_before = (_parse_backup_stamp_or_none(entry.get("created_at") or original.get("captured_at"))
+                  if provenance == "created" else None)
     backup, ambiguous = _resolve_backup(entry, discovered, not_before=not_before, config_path=path)
 
     facts = {
@@ -1371,7 +1601,7 @@ def component_facts(name, env, entry, *, config_path=None):
         # (P1-3/F1): диск — доказательство, state — лишь память о нём.
         facts["recovery"] = "restore" if managed else "orphaned_backup"
         return facts
-    if managed and provenance == "created":
+    if (managed or created_before_write) and provenance == "created":
         facts["recovery"] = "remove"
         return facts
     if managed and entry.get("backup"):

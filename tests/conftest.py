@@ -162,6 +162,8 @@ def _block_osascript_admin(monkeypatch):
         if is_osascript:
             # osascript с admin — возвращаем success no-op (тест не должен звать GUI).
             return mock.Mock(returncode=0, stdout="", stderr="")
+        if isinstance(cmd, list) and cmd and str(cmd[0]) == "/usr/sbin/sysadminctl":
+            return mock.Mock(returncode=77, stdout="", stderr="sysadminctl blocked by pytest guard")
         if is_sudo:
             # Новый protected-Privoxy path спрашивает пароль через sudo. Ни один unit/CI-тест не
             # имеет права трогать живой system-domain; конкретные тесты подменяют runner явно.

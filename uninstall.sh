@@ -42,10 +42,15 @@ case "$mode" in
     cat <<'EOF'
 Usage:
   ./uninstall.sh plan
-  ./uninstall.sh apply [--restore-configs] [--stop-services] [--restore-dns] [--unload-launchagent]
+  ./uninstall.sh apply [-y] [--purge] [--remove-deps]
 
-Без category-флагов apply спросит интерактивное подтверждение по каждой категории.
-User-data по умолчанию не удаляются: srouter.local.json, deploy/key bundles, backups.
+Перед изменениями apply отдельно спрашивает об удалении данных и зависимостей,
+показывает итоговый план и просит подтверждение. -y сохраняет данные и зависимости.
+--purge удаляет данные только после успешного отката; --remove-deps — только пакеты,
+которые установил srouter и которые не нужны другим программам.
+
+Для прежнего выборочного отката доступны --restore-configs, --stop-services,
+--restore-dns, --unload-launchagent; их нельзя совмещать с --purge/--remove-deps.
 EOF
     ;;
   *)

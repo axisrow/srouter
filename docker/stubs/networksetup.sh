@@ -12,6 +12,7 @@
 #   -getdnsservers <svc>        → rc=0, "There aren't any DNS Servers set on Wi-Fi." (как на macOS).
 #   прочее                      → rc=0 (fail-soft).
 sub="$1"
+dns_state="$HOME/.srouter-acceptance-dns"
 case "$sub" in
   -listallnetworkservices)
     echo "An asterisk (*) denotes that a network service is disabled."
@@ -23,10 +24,20 @@ case "$sub" in
     exit 0
     ;;
   -setdnsservers)
+    shift 2
+    if [ "$1" = Empty ]; then
+      rm -f "$dns_state"
+    else
+      printf '%s\n' "$@" > "$dns_state"
+    fi
     exit 0
     ;;
   -getdnsservers)
-    echo "There aren't any DNS Servers set on Wi-Fi."
+    if [ -f "$dns_state" ]; then
+      cat "$dns_state"
+    else
+      echo "There aren't any DNS Servers set on Wi-Fi."
+    fi
     exit 0
     ;;
   *)

@@ -46,6 +46,14 @@ def _stub_cmd_uninstall_internals(monkeypatch, *, env_ok, leftover=None, tty=Tru
     monkeypatch.setattr(srouter_cli, "make_privileged_runner", lambda *a, **k: (lambda cmd, t: {"rc": 0}))
     monkeypatch.setattr(srouter_cli, "build_uninstall_plan", lambda **k: {"state_readable": True})
     monkeypatch.setattr(srouter_cli, "format_uninstall_plan", lambda p: "")
+    monkeypatch.setattr(srouter_cli, "stop_uninstall_agents", lambda *a, **k: {"ok": True, "actions": []})
+    monkeypatch.setattr(srouter_cli, "_remove_optional_features", lambda *a: {"ok": True, "errors": []})
+    monkeypatch.setattr(srouter_cli, "_restore_user_files", lambda *a: {"ok": True, "handled": [], "fallback": [], "blocked": [], "errors": []})
+    monkeypatch.setattr(srouter_cli, "_remaining_user_artifacts", lambda *a: [])
+    monkeypatch.setattr(srouter_cli.install_restore, "finish_file_restore", lambda *a: None)
+    monkeypatch.setattr(srouter_cli, "purge_user_data", lambda *a: {"ok": True})
+    monkeypatch.setattr(srouter_cli, "purge_system_data", lambda *a: {"ok": True})
+    monkeypatch.setattr(srouter_cli, "remove_installed_dependencies", lambda *a: {"ok": True})
     monkeypatch.setattr(srouter.sys, "stdin", SimpleNamespace(isatty=lambda: tty))
     monkeypatch.setattr(srouter_cli, "apply_uninstall",
                         lambda **k: {"ok": True, "blocked": [], "leftover": leftover or [],
@@ -70,7 +78,7 @@ def _stub_cmd_uninstall_internals(monkeypatch, *, env_ok, leftover=None, tty=Tru
     monkeypatch.setattr(srouter_cli, "_remove_claude_app_wrapper", lambda: "")
     # ЕДИНСТВЕННЫЙ варьируемый параметр: статус env-cleanup.
     monkeypatch.setattr(srouter_cli, "_remove_launchctl_env",
-                        lambda runner: {"ok": env_ok, "note": "Codex env: mock."})
+                        lambda runner, env=None: {"ok": env_ok, "note": "Codex env: mock."})
 
 
 def test_cmd_uninstall_returns_nonzero_when_env_not_removed(monkeypatch, capsys):

@@ -250,11 +250,10 @@ def test_backup_state_write_failure_blocks_before_touching_target(tmp_path, monk
     """
     env, config_path = _foreign_privoxy(tmp_path)
     original_save = install_config.local_state.save_state
-    calls = {"n": 0}
-
     def failing_nth_save(state, **kwargs):
-        calls["n"] += 1
-        if calls["n"] >= fail_on:  # 1 — channels, 2 — backup-intent, 3 — эффект privoxy
+        entry = state.get("detected_environment", {}).get("privoxy") or {}
+        effect = entry.get("management", {}).get("managed")
+        if entry.get("backup") and (fail_on == 2 or effect):
             return None
         return original_save(state, **kwargs)
 
@@ -1073,6 +1072,7 @@ def test_uninstall_resets_dns_for_orphaned_backup_dnsmasq(tmp_path, monkeypatch)
     )
 
     uninstall_runner = _WifiAwareRunner()
+    uninstall_runner.dns = dict(runner.dns)
     result = install_lib.apply_uninstall(
         env=env, confirmations={"configs": True, "services": True, "dns": True},
         runner=uninstall_runner)
@@ -1210,6 +1210,7 @@ def test_cold_start_crash_after_apply_dns_leaves_dns_broken_reported_ok(tmp_path
     assert state_after_crash.get("network", {}).get("channels", {}).get("wifi_service") == "Wi-Fi"
 
     uninstall_runner = _WifiAwareRunner()
+    uninstall_runner.dns = dict(runner.dns)
     result = install_lib.apply_uninstall(
         env=env, confirmations={"configs": True, "services": True, "dns": True},
         runner=uninstall_runner)
@@ -1316,11 +1317,9 @@ def test_component_effect_state_write_failure_blocks_apply(tmp_path, monkeypatch
     """Fail-closed: отказ записи эффекта компонента прерывает apply (симметрично _record_backup_intent)."""
     env, _config_path = _foreign_privoxy(tmp_path)
     original_save = install_config.local_state.save_state
-    calls = {"n": 0}
-
     def failing_third_save(state, **kwargs):
-        calls["n"] += 1
-        if calls["n"] >= 3:  # 1 — channels, 2 — backup-intent, 3 — эффект privoxy
+        entry = state.get("detected_environment", {}).get("privoxy") or {}
+        if entry.get("management", {}).get("managed"):
             return None
         return original_save(state, **kwargs)
 

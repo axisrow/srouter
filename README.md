@@ -406,11 +406,22 @@ binary/exec.LookPath), поэтому границей служит именно
 ## Откат
 
 ```bash
-srouter uninstall      # полный откат к дефолту:
-#   останавливает brew-сервисы, восстанавливает чужие конфиги из бэкапов,
-#   сбрасывает DNS (networksetup ... Empty), удаляет LaunchAgent, watchdog, ppp-hook,
-#   split-route до VPS, Claude Code/git-прокси, Codex SOCKS5-wrappers + env + PATH.
+srouter uninstall      # выбор данных и зависимостей, затем общий план и подтверждение
+srouter uninstall -y   # вернуть исходные настройки; сохранить данные и зависимости
+srouter uninstall -y --purge --remove-deps  # явно удалить также данные и свои зависимости
 ```
+
+Сначала выгружаются собственные агенты и останавливаются сервисы, затем возвращаются
+исходные файлы, DNS и прежнее состояние сервисов. Удаляются только доказанно свои
+маршруты, PF-правила и интеграции. История первой установки сохраняется при reinstall;
+файлы восстанавливаются с прежними правами, владельцами, ACL и extended attributes.
+
+`--purge` удаляет данные srouter только после полного успешного отката. `--remove-deps`
+удаляет только записанные как установленные srouter формулы; общие и ранее установленные
+пакеты сохраняются, Homebrew autoremove отключён. При конфликте или сбое возвращается
+ненулевой код, state и бэкапы остаются для повтора. Старую установку без истории нельзя
+достоверно вернуть к неизвестным настройкам: они не заменяются выдуманными дефолтами.
+`./uninstall.sh apply` использует тот же полный путь. [Приёмка в macOS VM](tests/macos/README.md).
 
 ## Ручное переключение активного узла (hybrid-adopt)
 
@@ -631,7 +642,7 @@ Doctor показывает состояние через чек `codex-isolatio
 
 Пока эти ограничения не закрыты — единственная живая защита от прямого выхода codex остаётся
 SOCKS5-wrappers + scoped VSCode env (слой 2 выше). Снять вручную: `sudo pfctl -a "com.apple/srouter_isolate/codex" -F all`
-(правила PF) и/или `sudo dscl . -delete /Users/_srouter_codex` (системный пользователь, если uninstall
+(правила PF) и/или `/usr/sbin/sysadminctl interactive -deleteUser _srouter_codex` (системный пользователь, если uninstall
 не удалил).
 
 
@@ -938,11 +949,22 @@ lease, does not call `pfctl`, and does not verify codex actually runs under uid 
 ## Rollback
 
 ```bash
-srouter uninstall      # full rollback to defaults:
-#   stops brew services, restores foreign configs from backups, resets DNS
-#   (networksetup ... Empty), removes the LaunchAgent, watchdog, ppp-hook,
-#   split-route to the VPS, Claude Code/git proxy, Codex SOCKS5-wrappers + env + PATH.
+srouter uninstall      # choose data/dependencies, review the plan, then confirm
+srouter uninstall -y   # restore original settings; retain data and dependencies
+srouter uninstall -y --purge --remove-deps  # explicitly remove data and owned dependencies
 ```
+
+Own agents and services stop before files and settings change. Original DNS, files,
+service state, permissions, owners, ACLs and extended attributes are restored from
+the first installation's history, which survives reinstall. Only owned routes, PF
+rules and integrations are removed.
+
+`--purge` deletes srouter data only after a successful rollback. `--remove-deps`
+removes recorded owned formulae while preserving preexisting/shared packages and
+disabling Homebrew autoremove. Conflicts or failures return a nonzero status and
+retain state/backups for retry. Legacy installations without history cannot recover
+unknown originals; uninstall does not invent defaults. `./uninstall.sh apply` uses
+the same full flow. [macOS VM acceptance procedure](tests/macos/README.md).
 
 ## Manual active-node switching (hybrid-adopt)
 
@@ -1166,7 +1188,7 @@ surfaces the state via the `codex-isolation (PF kill-switch)` check.
 
 Until these limitations are closed, the only live guard against direct codex egress stays the
 SOCKS5 wrappers + scoped VSCode env (layer 2 above). Remove manually: `sudo pfctl -a "com.apple/srouter_isolate/codex" -F all`
-(PF rules) and/or `sudo dscl . -delete /Users/_srouter_codex` (system user, if uninstall did not
+(PF rules) and/or `/usr/sbin/sysadminctl interactive -deleteUser _srouter_codex` (system user, if uninstall did not
 remove it).
 
 

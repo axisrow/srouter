@@ -247,7 +247,7 @@ def enable(force=False):
     return {"ok": True, "err": "", "paths": changed}
 
 
-def disable():
+def disable(*, skip_paths=()):
     """Убрать KEY из settings.json, ТОЛЬКО если val == PROXY (чужой не трогаем). {ok, err}. Идемпотентно.
 
     fail-closed provenance (#112): корпоративный/ручной http.proxy ≠ PROXY → оставляем на месте.
@@ -257,6 +257,8 @@ def disable():
     при упавшей _save() он остаётся единственной копией чужого значения.
     """
     for path in SETTINGS_PATHS:
+        if str(path.absolute()) in skip_paths:
+            continue
         data = _load(path)
         if not isinstance(data, dict):
             continue  # missing/invalid — не наше, не трогаем (no mutation, ok)

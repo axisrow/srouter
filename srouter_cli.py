@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 import unicodedata
@@ -32,6 +33,7 @@ from pathlib import Path  # noqa: F401 — публичный контракт s
 
 import diag_netprobe  # mark: контекст сети на момент ручной отметки (fail-soft контракт)
 import local_state
+import install_restore
 import metrics_store  # mark: append_timing_event + MARKS_LOG (владелец — модуль, тесты мокают его)
 import speedtest_store  # speedtest: журнал ручных замеров скорости (владелец — модуль)
 import node_selector  # node use: two-phase active-node apply (canonical/adopt-surgical)
@@ -59,6 +61,7 @@ from install_lib import (
     port_open,
 )
 from sys_probe import run
+from install_cleanup import remove_installed_dependencies, purge_system_data, purge_user_data, stop_uninstall_agents
 
 import claude_proxy  # вкл/откл HTTPS_PROXY для Claude Code (~/.claude/settings.json)
 import git_proxy  # issue #130: вкл/откл SOCKS5 github-proxy в ~/.gitconfig (xray 10808)
@@ -132,6 +135,7 @@ from claude_wrappers import (
     CLAUDE_APP_MARKER,
     _install_claude_app_wrapper,
     _remove_claude_app_wrapper,
+    _claude_wrapper_path,
 )
 
 
@@ -146,6 +150,102 @@ def _prompt_choice(name: str) -> str:
         if answer in CHOICES:
             return answer
         print("Допустимо: adopt, overwrite, skip.")
+
+
+def _install_file_groups():
+    home = Path.home()
+    return {
+        "claude": [getattr(claude_proxy, "SETTINGS", home / ".claude/settings.json")],
+        "git": [Path(os.environ.get("GIT_CONFIG_GLOBAL", home / ".gitconfig")),
+                Path(os.environ.get("XDG_CONFIG_HOME", home / ".config")) / "git/config"],
+        "vscode": list(getattr(vscode_proxy, "SETTINGS_PATHS", ())),
+        "codex": [_codex_wrapper_path(name) for name, _, _ in CODEX_WRAPPERS]
+                 + [_codex_wrapper_path(CODEX_CLI_WRAPPER_LEGACY_NAME)],
+        "zsh": [_zshrc_path()],
+        "claude_app": [_claude_wrapper_path()],
+    }
+
+
+def _tracked_install(env, paths, action, *, record=True):
+    if record:
+        install_restore.capture_install_files(env, paths)
+    result = action()
+    if record:
+        install_restore.record_install_files(env, paths)
+    return result
+
+
+def _restore_user_files(env):
+    groups = _install_file_groups()
+    mixed = [*groups["claude"], *groups["git"], *groups["vscode"], *groups["zsh"]]
+    return install_restore.restore_install_files(env, [path for paths in groups.values() for path in paths], mixed=mixed)
+
+
+def _remaining_user_artifacts(*, skip_paths=()):
+    skip_paths = set(map(str, skip_paths))
+    paths = [(path, [marker]) for name, _, marker in CODEX_WRAPPERS for path in [_codex_wrapper_path(name)]]
+    paths.extend([
+        (_codex_wrapper_path(CODEX_CLI_WRAPPER_LEGACY_NAME), [CODEX_WRAPPERS[0][2]]),
+        (_zshrc_path(), [ZSHRC_PATH_MARKER, ZSHRC_CODEX_FUNC_MARKER_BEGIN, ZSHRC_CODEX_FUNC_MARKER_END]),
+        (_claude_wrapper_path(), [CLAUDE_APP_MARKER]),
+        (Path(PPP_HOOK_PATH), [PPP_HOOK_MARKER]),
+    ])
+    remaining = []
+    for path, markers in paths:
+        if str(path.absolute()) in skip_paths:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+            if any(marker in text for marker in markers):
+                remaining.append(str(path))
+        except FileNotFoundError:
+            continue
+        except (OSError, UnicodeError):
+            remaining.append(str(path) + " (не прочитан)")
+    return remaining
+
+
+def _remove_optional_features(env, runner):
+    state, readable = local_state.load_state_checked(path=env.state_path)
+    if not readable:
+        return {"ok": False, "errors": ["state_unreadable"]}
+    errors = []
+    runtime = state.get("runtime") or {}
+    if not isinstance(runtime, dict):
+        return {"ok": False, "errors": ["runtime_invalid"]}
+    raw = runtime.get("active_isolate")
+    lease = local_state.load_active_isolate(path=env.state_path)
+    if raw is not None and lease is None:
+        errors.append("PF: lease невалиден; token сохранён для разбора")
+    else:
+        disabled = isolate_firewall.disable_isolation(token=(lease or {}).get("token"))
+        if not disabled.get("ok"):
+            errors.append("PF: " + (disabled.get("err") or "правила не сняты"))
+        elif lease and not local_state.clear_active_isolate(path=env.state_path):
+            errors.append("PF: lease не очищен")
+    raw_throttle = runtime.get("active_throttle")
+    if raw_throttle is not None:
+        throttle = local_state.load_active_throttle(path=env.state_path)
+        if throttle is None:
+            errors.append("Traffic Guard: lease невалиден; token сохранён")
+        else:
+            import traffic_shape
+            cleared = traffic_shape.clear_throttle(token=throttle["token"])
+            if not cleared.get("ok"):
+                errors.append("Traffic Guard: " + (cleared.get("err") or "не снят"))
+            elif not local_state.clear_active_throttle(path=env.state_path):
+                errors.append("Traffic Guard: lease не очищен")
+    if system_proxy_control._load_leases(env.state_path):
+        proxy = system_proxy_control.restore(path=env.state_path, runner=runner)
+        if not proxy.get("ok"):
+            errors.append("system-proxy: " + (proxy.get("err") or "не восстановлен"))
+    go = go_proxy.disable(full=True, owned_only=True)
+    if not go.get("ok"):
+        errors.append("go-proxy: " + (go.get("error") or "не снят"))
+    audit = privoxy_audit.uninstall(runner=runner, require_tty=False)
+    if not audit.get("ok"):
+        errors.append("privoxy audit: " + (audit.get("error") or "не снят"))
+    return {"ok": not errors, "errors": errors}
 
 
 
@@ -204,6 +304,12 @@ def cmd_install(args) -> int:
         print("install отменён.")
         return 1
 
+    before = local_state.load_state(path=env.state_path)
+    detected = before.get("detected_environment") or {}
+    legacy_files = any(isinstance(value, dict) and value.get("management", {}).get("managed")
+                       for value in detected.values()) and "install_files" not in detected
+    files = _install_file_groups()
+
     # 5) apply: confirm=True, choices собраны, launchagent ставится тоже.
     result = apply_install(
         env=env, confirm=True, choices=choices,
@@ -211,103 +317,110 @@ def cmd_install(args) -> int:
         force_endpoint_overwrite=getattr(args, "force_endpoint_overwrite", False),
     )
     if result.get("ok"):
-        # Claude Code обязан ходить через прокси (изоляция режет api.anthropic.com напрямую).
-        # Best-effort: не критично для install, но удобно «из коробки».
-        # Issue #307 round 2 (Codex cycle-review finding 1): -y НЕ разрешает перезапись ЧУЖИХ
-        # значений; force — только явный --force-proxy-overwrite (прецедент force_endpoint_overwrite).
-        _proxy_force = bool(getattr(args, "force_proxy_overwrite", False))
-        cp = claude_proxy.enable(force=_proxy_force)
-        cp_note = ("Claude Code: HTTPS_PROXY прописан в ~/.claude/settings.json."
-                   if cp.get("ok") else
-                   f"Claude Code: не удалось прописать HTTPS_PROXY ({cp.get('err', 'unknown')}).")
-        # issue #130: git → SOCKS5 (xray 10808) scoped на github.com, автоматически, без ручных
-        # правок ~/.gitconfig. Best-effort (не критично для install, но часть «одна команда, всё
-        # правильно» — git умеет нативный SOCKS5, в отличие от Claude Code).
-        gp = git_proxy.enable(force=_proxy_force)
-        gp_note = (f"git: github-proxy прописан в ~/.gitconfig ({gp.get('proxy', '')})."
-                   if gp.get("ok") else
-                   f"git: не удалось прописать github-proxy ({gp.get('err', 'unknown')}).")
-        # Watchdog-plist: фоновый пинг туннеля раз в 90с + macOS-нотификация при падении.
-        # Best-effort (не критично для install), но удобно «из коробки» — защищает от «остался без ИИ».
-        wd_ok, wd_err = _install_generic_launchagent(
-            env, runner,
-            template_name="com.srouter.watchdog.plist",
-            label="com.srouter.watchdog",
-            marker="srouter-managed-watchdog-v1",
-            script_path=env.root / "health.py",
-        )
-        wd_note = ("Watchdog: установлен (нотификация при падении туннеля, poll 20с)."
-                   if wd_ok else
-                   f"Watchdog: не установлен ({wd_err}).")
-        # ppp-hook: мгновенный split-route при VPN up (/etc/ppp/ip-up, от root, без osascript).
-        ppp_note = _install_ppp_hook(env, runner)
-        # Codex SOCKS5-wrappers (~/.local/bin wrappers через ~/bin) + launchctl env + PATH +
-        # shell-функция codex() в ~/.zshrc — чтобы Codex (CLI и App) ходил напрямую в xray (10808),
-        # минуя privoxy (портит WS-стриминг). Функция (#96) гарантирует победу над brew в PATH.
-        codex_note = _install_codex_wrappers(env)
-        codex_func_note = _install_codex_zsh_function(env)
-        # issue #189: codenv (LaunchAgent com.srouter.codenv) ВОССТАНОВЛЕН в install.
-        # Эмпирика (verify, lsof per-process ChatGPT.app): ChatGPT.app = Electron-оболочка над
-        # Rust-бинарником — ДВА стека. Chromium-оболочка уважает СИСТЕМНЫЙ SOCKS (scutil) — работает.
-        # Rust app-server (/Resources/codex, основной WS к wss://chatgpt.com) НЕ уважает системный SOCKS,
-        # берёт ТОЛЬКО env SOCKS5 → без env идёт напрямую → GFW рвёт (error_kind=TimedOut в logs_2.sqlite).
-        # config.toml [network] proxy_url МЁРТВ в codex 0.146. Исторически (до контракта
-        # 2026-10-07) единственный путь для Rust app-server = env SOCKS5 в launchd gui-домене →
-        # codenv (RunAtLoad + StartInterval=300, переживает ребут). Сейчас ambient-прокси в
-        # gui-домен не сеется (контракт: агент — только residual-чистка), прокси App задаётся
-        # точечно — ~/bin/codex-app-proxy (--proxy-server) / per-tool wrappers.
-        # РАНЬШЕ (PR #187/#185) codenv деактивировали из-за #130 (CC SOCKS5-несовместимость), НО эмпирика
-        # #189 опровергает конфликт: CC CLI читает прокси из ~/.claude/settings.json (claude_proxy.py),
-        # НЕ из launchd gui-env → месяц коэкзиста CC+Codex это подтверждает (codenv был загружен весь месяц).
-        # Корень «error 5» #189: PR #187 деактивировал install-codenv, но plist на диске остался как
-        # placeholder-шаблон (не отрендерен) → job перезагрузился с __SROUTER_CODENV_PATH__ → error 5 →
-        # env не применялся → сломалось после обеда. Восстановление = правильный рендер plist тут.
-        codenv_note = _install_launchctl_env(env, runner)
-        # issue #185: scoped SOCKS5 для codex-расширения openai.chatgpt через VSCode http.proxy.
-        # Отдельный клиент от ChatGPT.app (расширение в Code/Cursor, не GUI-приложение). Комплементарен
-        # codenv: codenv покрывает Rust app-server ChatGPT.app, VSCode http.proxy — расширение. CC
-        # (отдельный процесс, свой ~/.claude/settings.json) НЕ затрагивается ни одним из них.
-        vp = vscode_proxy.enable(force=_proxy_force)
-        if vp.get("ok"):
-            vp_note = ("scoped SOCKS5 в VSCode http.proxy (Code/Cursor) — расширение openai.chatgpt, "
-                       "CC не затрагивается (#185)"
-                       + (f" Пути: {', '.join(vp.get('paths') or [])}" if vp.get("paths") else ""))
-        else:
-            vp_note = f"scoped VSCode http.proxy не установлен ({vp.get('err', 'unknown')})."
-        env_note = f"{codenv_note} VSCode: {vp_note}"
-        path_note = _ensure_home_bin_in_path(env)
-        codex_iso_note = _install_codex_isolation(env, runner)
-        # Claude.app wrapper (инцидент 2026-10-07): Chromium-стек Electron игнорирует env —
-        # нужен argv --proxy-server; без wrapper'а App из Dock идёт напрямую за GFW.
-        claude_note = _install_claude_app_wrapper(env)
-        # Marker-migration table (issue #112 Часть 4): регистрируем текущие маркеры wrappers/zshrc/codenv
-        # в state.known_markers. При будущей смене версии маркера old останется как legacy → следующий
-        # install мигрирует old→current. Без регистрации install использует только current (safe fallback).
-        # Best-effort: ошибка/отсутствие state_path не блокируют install (маркеры в коде всё равно валидны).
         try:
-            _km_state_path = env.state_path
-            for _entry in CODEX_WRAPPERS:
-                populate_known_markers(_km_state_path, "wrappers", [_entry[2]])
-            populate_known_markers(_km_state_path, "wrappers", [CLAUDE_APP_MARKER])
-            populate_known_markers(_km_state_path, "zshrc_path", [ZSHRC_PATH_MARKER])
-            populate_known_markers(_km_state_path, "zshrc_codex_func",
-                                   [ZSHRC_CODEX_FUNC_MARKER_BEGIN, ZSHRC_CODEX_FUNC_MARKER_END])
-            populate_known_markers(_km_state_path, "codenv", [CODEX_ENV_MARKER])
-        except Exception:  # noqa: BLE001 — cleanup не должен маскировать основную ошибку
-            pass
-        print("Установка стека завершена: brew-сервисы, конфиги, DNS, LaunchAgent применены.\n"
-              f"{cp_note}\n"
-              f"{gp_note}\n"
-              f"{wd_note}\n"
-              f"{ppp_note}\n"
-              f"{codex_note}\n"
-              f"{codex_func_note}\n"
-              f"{env_note}\n"
-              f"{path_note}\n"
-              f"{codex_iso_note}\n"
-              f"{claude_note}\n"
-              f"Дашборд: http://127.0.0.1:8787  (srouter status — проверить)")
-        return 0
+            def tracked(group, action):
+                return _tracked_install(env, files[group], action, record=not legacy_files)
+
+            # Claude Code обязан ходить через прокси (изоляция режет api.anthropic.com напрямую).
+            # Best-effort: не критично для install, но удобно «из коробки».
+            # Issue #307 round 2 (Codex cycle-review finding 1): -y НЕ разрешает перезапись ЧУЖИХ
+            # значений; force — только явный --force-proxy-overwrite (прецедент force_endpoint_overwrite).
+            _proxy_force = bool(getattr(args, "force_proxy_overwrite", False))
+            cp = tracked("claude", lambda: claude_proxy.enable(force=_proxy_force))
+            cp_note = ("Claude Code: HTTPS_PROXY прописан в ~/.claude/settings.json."
+                       if cp.get("ok") else
+                       f"Claude Code: не удалось прописать HTTPS_PROXY ({cp.get('err', 'unknown')}).")
+            # issue #130: git → SOCKS5 (xray 10808) scoped на github.com, автоматически, без ручных
+            # правок ~/.gitconfig. Best-effort (не критично для install, но часть «одна команда, всё
+            # правильно» — git умеет нативный SOCKS5, в отличие от Claude Code).
+            gp = tracked("git", lambda: git_proxy.enable(force=_proxy_force))
+            gp_note = (f"git: github-proxy прописан в ~/.gitconfig ({gp.get('proxy', '')})."
+                       if gp.get("ok") else
+                       f"git: не удалось прописать github-proxy ({gp.get('err', 'unknown')}).")
+            # Watchdog-plist: фоновый пинг туннеля раз в 90с + macOS-нотификация при падении.
+            # Best-effort (не критично для install), но удобно «из коробки» — защищает от «остался без ИИ».
+            wd_ok, wd_err = _install_generic_launchagent(
+                env, runner,
+                template_name="com.srouter.watchdog.plist",
+                label="com.srouter.watchdog",
+                marker="srouter-managed-watchdog-v1",
+                script_path=env.root / "health.py",
+            )
+            wd_note = ("Watchdog: установлен (нотификация при падении туннеля, poll 20с)."
+                       if wd_ok else
+                       f"Watchdog: не установлен ({wd_err}).")
+            # ppp-hook: мгновенный split-route при VPN up (/etc/ppp/ip-up, от root, без osascript).
+            ppp_note = _install_ppp_hook(env, runner)
+            # Codex SOCKS5-wrappers (~/.local/bin wrappers через ~/bin) + launchctl env + PATH +
+            # shell-функция codex() в ~/.zshrc — чтобы Codex (CLI и App) ходил напрямую в xray (10808),
+            # минуя privoxy (портит WS-стриминг). Функция (#96) гарантирует победу над brew в PATH.
+            codex_note = tracked("codex", lambda: _install_codex_wrappers(env))
+            codex_func_note = tracked("zsh", lambda: _install_codex_zsh_function(env))
+            # issue #189: codenv (LaunchAgent com.srouter.codenv) ВОССТАНОВЛЕН в install.
+            # Эмпирика (verify, lsof per-process ChatGPT.app): ChatGPT.app = Electron-оболочка над
+            # Rust-бинарником — ДВА стека. Chromium-оболочка уважает СИСТЕМНЫЙ SOCKS (scutil) — работает.
+            # Rust app-server (/Resources/codex, основной WS к wss://chatgpt.com) НЕ уважает системный SOCKS,
+            # берёт ТОЛЬКО env SOCKS5 → без env идёт напрямую → GFW рвёт (error_kind=TimedOut в logs_2.sqlite).
+            # config.toml [network] proxy_url МЁРТВ в codex 0.146. Исторически (до контракта
+            # 2026-10-07) единственный путь для Rust app-server = env SOCKS5 в launchd gui-домене →
+            # codenv (RunAtLoad + StartInterval=300, переживает ребут). Сейчас ambient-прокси в
+            # gui-домен не сеется (контракт: агент — только residual-чистка), прокси App задаётся
+            # точечно — ~/bin/codex-app-proxy (--proxy-server) / per-tool wrappers.
+            # РАНЬШЕ (PR #187/#185) codenv деактивировали из-за #130 (CC SOCKS5-несовместимость), НО эмпирика
+            # #189 опровергает конфликт: CC CLI читает прокси из ~/.claude/settings.json (claude_proxy.py),
+            # НЕ из launchd gui-env → месяц коэкзиста CC+Codex это подтверждает (codenv был загружен весь месяц).
+            # Корень «error 5» #189: PR #187 деактивировал install-codenv, но plist на диске остался как
+            # placeholder-шаблон (не отрендерен) → job перезагрузился с __SROUTER_CODENV_PATH__ → error 5 →
+            # env не применялся → сломалось после обеда. Восстановление = правильный рендер plist тут.
+            codenv_note = _install_launchctl_env(env, runner)
+            # issue #185: scoped SOCKS5 для codex-расширения openai.chatgpt через VSCode http.proxy.
+            # Отдельный клиент от ChatGPT.app (расширение в Code/Cursor, не GUI-приложение). Комплементарен
+            # codenv: codenv покрывает Rust app-server ChatGPT.app, VSCode http.proxy — расширение. CC
+            # (отдельный процесс, свой ~/.claude/settings.json) НЕ затрагивается ни одним из них.
+            vp = tracked("vscode", lambda: vscode_proxy.enable(force=_proxy_force))
+            if vp.get("ok"):
+                vp_note = ("scoped SOCKS5 в VSCode http.proxy (Code/Cursor) — расширение openai.chatgpt, "
+                           "CC не затрагивается (#185)"
+                           + (f" Пути: {', '.join(vp.get('paths') or [])}" if vp.get("paths") else ""))
+            else:
+                vp_note = f"scoped VSCode http.proxy не установлен ({vp.get('err', 'unknown')})."
+            env_note = f"{codenv_note} VSCode: {vp_note}"
+            path_note = tracked("zsh", lambda: _ensure_home_bin_in_path(env))
+            codex_iso_note = _install_codex_isolation(env, runner)
+            # Claude.app wrapper (инцидент 2026-10-07): Chromium-стек Electron игнорирует env —
+            # нужен argv --proxy-server; без wrapper'а App из Dock идёт напрямую за GFW.
+            claude_note = tracked("claude_app", lambda: _install_claude_app_wrapper(env))
+            # Marker-migration table (issue #112 Часть 4): регистрируем текущие маркеры wrappers/zshrc/codenv
+            # в state.known_markers. При будущей смене версии маркера old останется как legacy → следующий
+            # install мигрирует old→current. Без регистрации install использует только current (safe fallback).
+            # Best-effort: ошибка/отсутствие state_path не блокируют install (маркеры в коде всё равно валидны).
+            try:
+                _km_state_path = env.state_path
+                for _entry in CODEX_WRAPPERS:
+                    populate_known_markers(_km_state_path, "wrappers", [_entry[2]])
+                populate_known_markers(_km_state_path, "wrappers", [CLAUDE_APP_MARKER])
+                populate_known_markers(_km_state_path, "zshrc_path", [ZSHRC_PATH_MARKER])
+                populate_known_markers(_km_state_path, "zshrc_codex_func",
+                                       [ZSHRC_CODEX_FUNC_MARKER_BEGIN, ZSHRC_CODEX_FUNC_MARKER_END])
+                populate_known_markers(_km_state_path, "codenv", [CODEX_ENV_MARKER])
+            except Exception:  # noqa: BLE001 — cleanup не должен маскировать основную ошибку
+                pass
+            print("Установка стека завершена: brew-сервисы, конфиги, DNS, LaunchAgent применены.\n"
+                  f"{cp_note}\n"
+                  f"{gp_note}\n"
+                  f"{wd_note}\n"
+                  f"{ppp_note}\n"
+                  f"{codex_note}\n"
+                  f"{codex_func_note}\n"
+                  f"{env_note}\n"
+                  f"{path_note}\n"
+                  f"{codex_iso_note}\n"
+                  f"{claude_note}\n"
+                  f"Дашборд: http://127.0.0.1:8787  (srouter status — проверить)")
+            return 0
+        except (OSError, ValueError, TypeError) as exc:
+            print(f"install выполнен частично: история восстановления не сохранена ({exc}).", file=sys.stderr)
+            return 2
     blocked = ", ".join(result.get("blocked") or ["unknown"])
     print(f"install остановлен: {blocked}", file=sys.stderr)
     if "xray_endpoint_overwrite_blocked" in (result.get("blocked") or []):
@@ -319,154 +432,162 @@ def cmd_install(args) -> int:
     return 2
 
 
-def cmd_uninstall(args) -> int:
-    """Полный откат к дефолту: brew-сервисы, конфиги (restore из бэкапа), DNS, LaunchAgent.
-
-    apply_uninstall сам выгружает демон и останавливает сервисы. ДОПОЛНИТЕЛЬНО удаляет
-    split-route до VPS (install_lib про маршрут не знает).
-    """
+def cmd_uninstall(args, *, runner=None) -> int:
+    """Вернуть прежние настройки; данные и зависимости удалять только по отдельному выбору."""
     env = _env_from_args(args)
-    runner = make_privileged_runner(run)
-    state_path = getattr(args, "state", None)
-
-    # 1) Discovery + показ плана.
+    runner = runner or make_privileged_runner(run)
+    state_path = getattr(env, "state_path", None) or getattr(args, "state", None)
     try:
         plan = build_uninstall_plan(env=env)
-    except Exception as exc:  # noqa: BLE001 — CLI entry point, не роняем stack trace в пользователя
+    except Exception as exc:  # noqa: BLE001 — CLI discovery boundary
         print(f"uninstall: сбой discovery: {exc}", file=sys.stderr)
         return 2
     print(format_uninstall_plan(plan))
-    print()
-
-    # 2) Подтверждение (полный откат — серьёзный шаг).
-    # Не-TTY запуск допустим ТОЛЬКО с -y/--yes (промпт не нужен). Без TTY и без -y — отказ:
-    # _prompt_bool зависнет на EOF. Раньше isatty()-gate стоял ДО проверки yes → -y игнорировался
-    # в не-TTY среде (cron/launchd/CI/фоновый процесс). Issue #106.
+    if not plan.get("state_readable"):
+        print("uninstall остановлен: state_unreadable; данные восстановления сохранены.", file=sys.stderr)
+        return 2
     if not sys.stdin.isatty() and not getattr(args, "yes", False):
         print("uninstall: подтверждение требует терминал (используйте -y/--yes).", file=sys.stderr)
         return 2
-    if not getattr(args, "yes", False) and not _prompt_bool("Полный откат стека к дефолту?"):
+    purge = bool(getattr(args, "purge", False))
+    remove_deps = bool(getattr(args, "remove_deps", False))
+    if not getattr(args, "yes", False):
+        if not purge:
+            purge = _prompt_bool("Удалить все данные srouter, включая конфиги, ключи, журналы и бэкапы?")
+        if not remove_deps:
+            remove_deps = _prompt_bool("Удалить также зависимости, установленные srouter (общие пакеты останутся)?")
+    print("Данные: " + ("удалить после успешного отката" if purge else "сохранить конфиги, ключи и бэкапы"))
+    if purge:
+        for path in plan.get("purge_paths", []):
+            print(f"  {path}")
+    print("Зависимости: " + ((", ".join(plan.get("dependencies") or []) or "нет учтённых пакетов")
+                            if remove_deps else "сохранить"))
+    if not getattr(args, "yes", False) and not _prompt_bool("Выполнить этот план удаления?"):
         print("uninstall отменён.")
         return 1
 
-    # Защищённый Privoxy нельзя отдавать legacy apply_uninstall: тот управляет пользовательскими
-    # brew-services и не имеет права писать /Library. Сначала одной root-транзакцией возвращаем
-    # прежний user-service/state, затем обычный uninstall применяет существующую provenance-семантику.
-    env_state_path = getattr(env, "state_path", None)
-    protected_state = bool(env_state_path) and privoxy_system.state_protected(env_state_path)
+    stopped = stop_uninstall_agents(env, runner)
+    if not stopped.get("ok"):
+        print("uninstall остановлен: агенты не выгружены: " + ", ".join(stopped.get("blocked") or []), file=sys.stderr)
+        return 2
+    try:
+        optional = _remove_optional_features(env, runner)
+    except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+        optional = {"ok": False, "errors": ["Дополнительные интеграции: " + str(exc)]}
+
+    protected_state = bool(state_path) and privoxy_system.state_protected(state_path)
     physical_protected = False
-    if isinstance(env, InstallEnv) and env_state_path:
+    if isinstance(env, InstallEnv) and state_path:
         try:
             physical_protected = (
-                Path(env_state_path).resolve() == (Path(__file__).resolve().parent / "srouter.local.json").resolve()
+                Path(state_path).resolve() == (Path(__file__).resolve().parent / "srouter.local.json").resolve()
                 and privoxy_system.protection_present()
             )
         except OSError:
-            physical_protected = False
+            pass
     if physical_protected or protected_state:
-        protected = privoxy_system.unprotect(
-            state_path=env_state_path or state_path or InstallEnv.from_env().state_path,
-            restore=True,
-            runner=run,
-        )
+        protected = privoxy_system.unprotect(state_path=state_path, restore=True, runner=run,
+                                             require_tty=not getattr(args, "yes", False))
         if not protected.get("ok"):
-            print(f"uninstall остановлен: защищённый privoxy не восстановлен "
-                  f"({protected.get('error', 'unknown')})", file=sys.stderr)
+            print(f"uninstall остановлен: защищённый privoxy не восстановлен ({protected.get('error', 'unknown')})",
+                  file=sys.stderr)
             return 2
 
-    # 3) apply_uninstall: ВСЕ 4 категории. Сам остановит сервисы и выгрузит демон.
-    result = apply_uninstall(
-        env=env,
-        confirmations={"configs": True, "services": True, "dns": True, "launchagent": True},
-        runner=runner,
-    )
+    result = apply_uninstall(env=env, confirmations={"configs": True, "services": True, "dns": True, "launchagent": True},
+                             runner=runner)
     if not result.get("ok"):
-        blocked = ", ".join(result.get("blocked") or ["unknown"])
-        print(f"uninstall остановлен: {blocked}", file=sys.stderr)
+        print("uninstall остановлен: " + ", ".join(result.get("blocked") or ["unknown"])
+              + ("; " + result["error"] if result.get("error") else ""), file=sys.stderr)
         return 2
-    # leftover (issue #110 Дефект 1): компоненты, которые srouter СТАВИЛ, но не откатил (нет backup /
-    # маркер пропал). НЕ ошибка (ok=True — uninstall не крашится), но partial: следующий install увидит
-    # эти конфиги как reclaimable (Дефект 2) либо foreign. Сообщаем честно, rc=2 — иначе headline
-    # «Откат завершён» маскирует, что по сути ничего не откатили.
-    leftover = result.get("leftover") or []
-    partial_configs = bool(leftover)
 
-    # 4) Удалить split-route (новое — install_lib про маршрут не знает).
+    errors = list(optional.get("errors") or [])
+    if not optional.get("ok") and not errors:
+        errors.append("Дополнительные интеграции не восстановлены")
+    for item in result.get("leftover") or []:
+        errors.append(f"{item['name']}: {item.get('reason', 'не восстановлен')}")
+    notes = []
     route_rc = _remove_active_split_route(state_path, runner)
+    if route_rc != 0:
+        errors.append("split-route не восстановлен")
+    try:
+        restored = _restore_user_files(env)
+    except (OSError, ValueError, TypeError) as exc:
+        restored = {"ok": False, "handled": [], "fallback": [], "blocked": [], "errors": [str(exc)]}
+    errors.extend(restored.get("errors") or [])
+    handled = set(restored.get("handled") or [])
+    blocked = set(restored.get("blocked") or [])
+    files = _install_file_groups()
 
-    # 5) Снять HTTPS_PROXY для Claude Code — privoxy больше не запущен, прокси бессмысленен.
-    cp = claude_proxy.disable()
-    cp_note = ". Claude Code HTTPS_PROXY снят." if cp.get("ok") else ""
-    # 5a) issue #130: снять github-proxy из ~/.gitconfig (xray SOCKS5 больше не запущен) —
-    # возвращает git к состоянию до srouter.
-    gp = git_proxy.disable()
-    cp_note += ". git github-proxy снят." if gp.get("ok") else ". git github-proxy не снят."
-    # 5b) issue #185: снять scoped SOCKS5 из VSCode http.proxy (симметрично install). Чужой http.proxy
-    # не трогаем (fail-closed provenance — vscode_proxy.disable сверяет значение).
-    vp = vscode_proxy.disable()
-    cp_note += ". VSCode codex http.proxy снят." if vp.get("ok") else ". VSCode codex http.proxy не снят."
+    def skip(group):
+        paths = {str(Path(path).absolute()) for path in files[group]}
+        return bool(paths) and (paths <= handled or bool(paths & blocked))
 
-    # 6) Удалить ppp-hook (/etc/ppp/ip-up) — мгновенный split-route больше не нужен.
-    ppp_note = ". " + _remove_ppp_hook(runner)
-    # 7) Удалить Codex SOCKS5-wrappers + shell-функцию codex() + снять launchctl env + убрать ~/bin
-    #    из PATH (всё ставил install). marker-gate: чужое не трогаем.
-    codex_note = ". " + _remove_codex_wrappers()
-    codex_func_note = ". " + _remove_codex_zsh_function()
-    env_status = _remove_launchctl_env(runner)
-    env_note = ". " + env_status["note"]
-    path_note = ". " + _remove_home_bin_from_path()
-    codex_iso_status = _remove_codex_isolation(env, runner)
-    codex_iso_note = ". " + codex_iso_status["note"]
-    # Claude.app wrapper — симметрично install (marker-gate: current ИЛИ legacy — наш).
-    claude_note = ". " + _remove_claude_app_wrapper()
+    cp = {"ok": True} if skip("claude") else claude_proxy.disable()
+    gp = {"ok": True} if skip("git") else git_proxy.disable()
+    vp = (vscode_proxy.disable(skip_paths=handled | blocked)
+          if (handled | blocked) and not skip("vscode") else
+          {"ok": True} if skip("vscode") else vscode_proxy.disable())
+    for label, status in (("Claude Code", cp), ("git github-proxy", gp), ("VSCode", vp)):
+        if not status.get("ok") or status.get("err"):
+            errors.append(f"{label} не восстановлен: {status.get('err', 'unknown')}")
 
-    # env-cleanup fail-closed (issue #94 DEFECT A): мёртвый прокси остался в gui-домене → НЕ успех,
-    # даже если всё остальное прошло. Раньше env_note просто конкатенировался в сообщение → fail-open
-    # (rc=0 при живом socks5://127.0.0.1:10808 в GUI). ok=False пробрасываем в ненулевой rc.
-    # Тот же инвариант — git-proxy (Codex cycle-review PR #221, issue #130): gp["ok"]=False раньше
-    # менял только текст (cp_note), но не rc → «Откат завершён» rc=0 при locked ~/.gitconfig, пока
-    # git всё ещё указывает на мёртвый 127.0.0.1:10808 (xray уже остановлен apply_uninstall).
-    # Шапка сообщения зависит от итога: «Откат завершён» только при подтверждённо снятом env И
-    # git-proxy И без leftover (issue #110 Дефект 1), иначе «Откат выполнен частично» — rc=2.
-    full_ok = env_status["ok"] and gp.get("ok", False) and not partial_configs and codex_iso_status["ok"]
-    headline = "Откат завершён" if full_ok else "Откат выполнен частично"
-    changed = {action["category"] for action in result.get("actions", []) if action.get("changed")}
-    categories_note = ", ".join(
-        f"{label}: {'изменено' if category in changed else 'без изменений'}"
-        for category, label in (("services", "сервисы"), ("configs", "конфиги"),
-                                ("dns", "DNS"), ("launchagent", "LaunchAgent")))
-    print(f"{headline}: {categories_note}"
-          + (". split-route удалён." if route_rc == 0 else ", split-route не удалён — см. выше.")
-          + cp_note
-          + ppp_note
-          + codex_note
-          + codex_func_note
-          + env_note
-          + path_note
-          + codex_iso_note
-          + claude_note)
-    # leftover per-имённо (issue #110): «частично» без деталей = новый обман. Оператор должен видеть,
-    # КАКИЕ конфиги srouter ставил, но не откатил (следующий install авторазрешит их как reclaimable
-    # с backup, либо потребует решения если они foreign).
-    if leftover:
-        names = ", ".join(item["name"] for item in leftover)
-        print(f"uninstall выполнен частично: конфиги оставлены ({names}) — не найден backup/маркер. "
-              f"Повторный install авторазрешит их (с backup) либо потребует adopt/overwrite/skip.",
-              file=sys.stderr)
+    notes.append(_remove_ppp_hook(runner, env=env))
+    if isinstance(env, InstallEnv):
+        remaining_state, readable = local_state.load_state_checked(path=env.state_path)
+        history = (remaining_state.get("detected_environment") or {}).get("install_files") or {}
+        if not readable or str(Path(PPP_HOOK_PATH).absolute()) in history:
+            errors.append("PPP-hook: исходный файл не восстановлен; история сохранена")
+    untouched = handled | blocked
+    notes.append(_remove_codex_wrappers(skip_paths=untouched) if untouched else _remove_codex_wrappers())
+    if not skip("zsh"):
+        notes.append(_remove_codex_zsh_function())
+        notes.append(_remove_home_bin_from_path())
+    env_status = _remove_launchctl_env(runner, env=env)
+    notes.append(env_status["note"])
     if not env_status["ok"]:
-        print(f"uninstall завершён с ошибкой: Codex env не подтверждённо снят — {env_status['note']}",
-              file=sys.stderr)
-        return 2
-    if not gp.get("ok", False):
-        print(f"uninstall завершён с ошибкой: git github-proxy не подтверждённо снят — "
-              f"{gp.get('err', 'unknown')}", file=sys.stderr)
-        return 2
-    if partial_configs:
-        return 2
-    if not codex_iso_status["ok"]:
-        print(f"uninstall завершён с ошибкой: {codex_iso_status['note']}", file=sys.stderr)
-        return 2
-    return 0
+        errors.append("Codex env не восстановлен: " + env_status["note"])
+    codex = _remove_codex_isolation(env, runner)
+    notes.append(codex["note"])
+    if not codex["ok"]:
+        errors.append(codex["note"])
+    if str(_claude_wrapper_path().absolute()) not in untouched:
+        notes.append(_remove_claude_app_wrapper())
+    remaining = _remaining_user_artifacts(skip_paths=handled) if handled else _remaining_user_artifacts()
+    errors.extend("Не удалён managed-артефакт: " + path for path in remaining)
+
+    if not errors:
+        try:
+            install_restore.finish_file_restore(env, [*handled, *restored.get("fallback", [])])
+        except (OSError, ValueError, TypeError) as exc:
+            errors.append("История восстановления не сохранена: " + str(exc))
+    if remove_deps and not errors:
+        dependencies = remove_installed_dependencies(env, runner)
+        if not dependencies.get("ok"):
+            errors.append(dependencies.get("err") or "Зависимости не удалены")
+        for item in dependencies.get("kept", []):
+            notes.append(f"Пакет {item['name']} сохранён: нужен {', '.join(item['used_by'])}.")
+    if purge and not errors:
+        system_data = purge_system_data(runner)
+        if not system_data.get("ok"):
+            errors.append(system_data.get("err") or "Системные данные не удалены")
+    if purge and not errors:
+        purged = purge_user_data(env)
+        if not purged.get("ok"):
+            errors.append(purged.get("err") or "Данные не удалены")
+
+    changed = {action["category"] for action in [*stopped.get("actions", []), *result.get("actions", [])] if action.get("changed")}
+    categories = ", ".join(f"{label}: {'изменено' if category in changed else 'без изменений'}"
+                           for category, label in (("services", "сервисы"), ("configs", "конфиги"),
+                                                   ("dns", "DNS"), ("launchagent", "LaunchAgent")))
+    print(("Откат выполнен частично: " if errors else "Откат завершён: ") + categories)
+    for note in notes:
+        if note:
+            print(note)
+    for error in errors:
+        print("uninstall: " + error, file=sys.stderr)
+    if errors and purge:
+        print("Удаление данных отложено: история и бэкапы сохранены для повторного отката.", file=sys.stderr)
+    return 2 if errors else 0
 
 
 def _is_loaded():
@@ -1593,6 +1714,9 @@ def build_parser() -> argparse.ArgumentParser:
                                 "~/.claude/settings.json и settings.json редакторов "
                                 "(чужие значения сохраняются в backup; по умолчанию install "
                                 "на чужое значение честно отказывает).")
+        if name == "uninstall":
+            p.add_argument("--purge", action="store_true", help="После полного отката удалить данные, конфиги и бэкапы srouter.")
+            p.add_argument("--remove-deps", action="store_true", help="Удалить только записанные как установленные srouter зависимости, сохраняя общие пакеты.")
         p.set_defaults(func=fn)
 
     # sync (#200): импорт endpoint активного узла из РАБОЧЕГО xray config в srouter.local.json,

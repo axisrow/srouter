@@ -23,6 +23,7 @@ from dashboard_nodes import probe_nodes, probe_nodes_snapshot
 from dashboard_traffic import probe_traffic_guard
 import node_selector
 import sys_probe
+from srouter_launchd import tracked_route_action
 import traffic_shape  # throttle-движок (#13): зовём через атрибут (traffic_shape.apply_throttle)
 import isolate_firewall  # PF-изоляция доменов: зовём через атрибут
 import git_proxy  # вкл/откл git-прокси для github (через git config --global)
@@ -68,7 +69,9 @@ def _sudo_route_ip(action, route_ip):
     # ВАЖНО: shell_cmd собран из констант и validated local_state, ввод запроса сюда не попадает никогда.
     # Если кто-то добавит динамическую команду — обязан добавить вайтлист + экранирование.
     applescript = f'do shell script "{shell_cmd}" with administrator privileges'
-    return sys_probe.run([OSASCRIPT, "-e", applescript], timeout=60)
+    return tracked_route_action(action, route_ip, GATEWAY,
+                                lambda: sys_probe.run([OSASCRIPT, "-e", applescript], timeout=60),
+                                runner=sys_probe.run)
 
 
 def sudo_route(action):

@@ -412,7 +412,10 @@ def _sync_split_route(previous, name, state_path):
             return result
 
         # 2) add нового ПЕРВЫМ (fail-closed на gateway/ip уже внутри моста).
-        added = _route_result(_sudo_route_ip("add", new_ip, gateway))
+        from srouter_launchd import tracked_route_action, route_owned_for_switch
+        added = _route_result(tracked_route_action("add", new_ip, gateway,
+                              lambda: _sudo_route_ip("add", new_ip, gateway),
+                              runner=sys_probe.run, state_path=state_path))
         result["added"] = added
 
         # 4) idempotent: «route already in table» / «File exists» — успех только
@@ -433,8 +436,10 @@ def _sync_split_route(previous, name, state_path):
                 return result
 
         # 3) delete прежнего — только после успешного/idempotent add и только если он отличается.
-        if old_ip and old_ip != new_ip:
-            result["removed"] = _route_result(_sudo_route_ip("remove", old_ip, gateway))
+        if old_ip and old_ip != new_ip and route_owned_for_switch(old_ip, state_path):
+            result["removed"] = _route_result(tracked_route_action("remove", old_ip, gateway,
+                                               lambda: _sudo_route_ip("remove", old_ip, gateway),
+                                               runner=sys_probe.run, state_path=state_path))
     except (subprocess.TimeoutExpired, subprocess.CalledProcessError, OSError, ValueError, RuntimeError) as exc:
         # subprocess: route command failures; OSError: системные ошибки;
         # ValueError: ошибки валидации; RuntimeError: ошибки runner (в т.ч. mock в тестах)
@@ -886,9 +891,12 @@ def ensure_split_route(state_path=None):
         # route через ppp0/иной → добавить split через физический шлюз.
         # root (ppp-hook) → route add напрямую (без osascript); user → osascript-мост.
         if os.geteuid() == 0:
-            added = _route_add_direct(route_ip, gateway)
+            mutate = lambda: _route_add_direct(route_ip, gateway)
         else:
-            added = _sudo_route_ip("add", route_ip, gateway)
+            mutate = lambda: _sudo_route_ip("add", route_ip, gateway)
+        from srouter_launchd import tracked_route_action
+        added = tracked_route_action("add", route_ip, gateway, mutate,
+                                     runner=sys_probe.run, state_path=state_path)
         return {"enabled": True, "added": added}
     except Exception as exc:  # noqa: BLE001 — «не бросает» контракт, осознанно широкий (#238 шаг 3)
         # Зовётся из ppp-hook (health.py:2506, от root) без своего try — r.get() сразу после

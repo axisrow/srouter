@@ -10,6 +10,7 @@ srouter.local.json
 # ОТДЕЛЬНОЙ строке — Docker/git парсят '#' как комментарий только в начале строки, inline-коммент
 # ломает паттерн (C4), и файл с секретами утекает в образ.
 srouter.local.json.tmp
+srouter.local.json.*.tmp
 # _backup() timestamped — прежний (чужой) конфиг с секретами (install_lib.py:599)
 *.srouter-backup-*
 

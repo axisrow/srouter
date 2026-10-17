@@ -922,9 +922,10 @@ class TestGitProxyExceptions:
                 assert result.get("ok") is False, "ok должен быть False при ошибке add"
                 assert result.get("data_loss") is False, "data_loss должен быть False после rollback"
 
-    def test_enable_with_txn_resolution(self):
+    def test_enable_with_txn_resolution(self, monkeypatch, tmp_path):
         """enable разрешает незавершённую транзакцию."""
         import git_proxy
+        monkeypatch.setattr(git_proxy.Path, "home", lambda: tmp_path)
 
         mock_txn_check = Mock(return_value={"ok": True, "resolved": True})
         mock_get_all = Mock(return_value={"present": False, "values": [], "unknown": False, "multi": False})
