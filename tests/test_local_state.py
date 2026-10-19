@@ -701,21 +701,30 @@ def test_load_state_missing_direct_domains_key_defaults_to_empty(tmp_path):
 # домены хранит в state (active+hash), two-phase apply (backup→validate→restart→promote). НЕ захватывает
 # весь foreign-конфиг. Эталон read-xray: sync_route_ip_from_xray; atomic-save: save_state.
 
-def _write_xray_routing_config(p, domains, outbound="reality-out", managed=False, ips=None):
+def _write_xray_routing_config(p, domains, outbound="reality-out", managed=False, ips=None,
+                               ips_only_rule=None):
     """Минимальный xray-config с routing.rules[0]={outboundTag, domain} — как production.
 
     managed=True → правило помечено _srouter_managed (после adopt). Имитирует текущий foreign
-    production-конфиг (28 доменов, БЕЗ маркера) при managed=False. ips — ip-matchers правила
-    (xray: domain OR ip в одном rule).
+    production-конфиг (28 доменов, БЕЗ маркера) при managed=False.
+    ips — legacy ip-матчеры В managed-правиле (xray соединяет матчеры одного rule через AND →
+    для сырых IP мертвы; форма живой машины до миграции).
+    ips_only_rule — отдельное ip-only правило сразу после managed (целевой канон, маркер
+    _srouter_managed_ips — как хирургия 2026-10-19 на живой машине).
     """
     rule = {"type": "field", "outboundTag": outbound, "domain": list(domains)}
     if ips:
         rule["ip"] = list(ips)
     if managed:
         rule["_srouter_managed"] = True
+    rules = [rule]
+    if ips_only_rule:
+        rules.append({"type": "field", "outboundTag": outbound,
+                      "ip": list(ips_only_rule), "_srouter_managed_ips": True})
+    rules.append({"type": "field", "outboundTag": "direct"})
     p.write_text(json.dumps({
         "outbounds": [{"tag": outbound, "protocol": "vless"}],
-        "routing": {"rules": [rule, {"type": "field", "outboundTag": "direct"}]},
+        "routing": {"rules": rules},
     }), encoding="utf-8")
 
 
@@ -1169,6 +1178,162 @@ def test_routing_add_ip_canonicalizes_and_remove_symmetric(tmp_path):
     cfg = json.loads(xray_p.read_text(encoding="utf-8"))
     managed = [x for x in cfg["routing"]["rules"] if x.get("_srouter_managed") is True]
     assert managed[0]["ip"] == ["78.47.183.125"], managed[0]["ip"]
+
+
+def _ip_rules(cfg):
+    """ip-only правила (_srouter_managed_ips) конфига — целевой дом ip-состава."""
+    return [x for x in cfg["routing"]["rules"] if x.get("_srouter_managed_ips") is True]
+
+
+def test_routing_apply_add_ip_creates_ip_rule_after_managed(tmp_path):
+    """add-ip: ip-состав живёт в ОТДЕЛЬНОМ ip-only правиле (_srouter_managed_ips) сразу после
+    managed. xray соединяет матчеры одного rule через AND → ip рядом с domain мёртв для сырых IP
+    (инцидент 2026-10-19: Telegram MTProto). Managed остаётся domain-only."""
+    xray_p = tmp_path / "xray-config.json"
+    state_p = tmp_path / "srouter.local.json"
+    _write_xray_routing_config(xray_p, BASELINE_DOMAINS, managed=True)
+    _managed_state(state_p, BASELINE_DOMAINS)
+    calls = []
+    r = local_state.routing_apply(
+        None, ips=["78.47.183.125"], action="add",
+        config_path=str(xray_p), state_path=state_p, runner=_ok_runner(calls),
+        port_checker=_port_checker_settle_then_up(),
+    )
+    assert r["ok"] is True, r
+    assert r["changed"] is True
+    cfg = json.loads(xray_p.read_text(encoding="utf-8"))
+    rules = cfg["routing"]["rules"]
+    managed_idx = next(i for i, x in enumerate(rules) if x.get("_srouter_managed") is True)
+    assert "ip" not in rules[managed_idx], "managed — domain-only"
+    ip_rule = _ip_rules(cfg)
+    assert len(ip_rule) == 1
+    assert rules.index(ip_rule[0]) == managed_idx + 1, "ip-правило сразу после managed, до catch-all"
+    assert ip_rule[0]["ip"] == ["78.47.183.125"]
+    assert "domain" not in ip_rule[0], "ip-only: без доменного ключа (AND-семантика)"
+    assert ip_rule[0]["outboundTag"] == "reality-out"
+    rt = json.loads(state_p.read_text(encoding="utf-8"))["routing"]
+    assert rt["active_ips"] == ["78.47.183.125"]
+    assert any("start" in c and "xray" in c for c in calls)
+
+
+def test_routing_apply_migrates_legacy_managed_ips_on_domain_apply(tmp_path):
+    """Миграция legacy-формы (live-машина: ip[] внутри managed + state-hash от этого состава):
+    обычный add-domain при ips=None переводит конфиг в канон — managed теряет ip, ip-правило
+    создаётся с тем же составом (structural-gate: миграция = changed даже при неизменных ips)."""
+    legacy_ips = ["78.47.183.125", "85.136.181.198"]
+    xray_p = tmp_path / "xray-config.json"
+    state_p = tmp_path / "srouter.local.json"
+    _write_xray_routing_config(xray_p, BASELINE_DOMAINS, managed=True, ips=legacy_ips)
+    _managed_state(state_p, BASELINE_DOMAINS, ips=legacy_ips)
+    calls = []
+    r = local_state.routing_apply(
+        ["telegram.org"], action="add",
+        config_path=str(xray_p), state_path=state_p, runner=_ok_runner(calls),
+        port_checker=_port_checker_settle_then_up(),
+    )
+    assert r["ok"] is True, r
+    assert r["changed"] is True, "структурная миграция — не no-op"
+    cfg = json.loads(xray_p.read_text(encoding="utf-8"))
+    rules = cfg["routing"]["rules"]
+    managed = [x for x in rules if x.get("_srouter_managed") is True]
+    assert "ip" not in managed[0]
+    assert "domain:telegram.org" in managed[0]["domain"]
+    ip_rule = _ip_rules(cfg)
+    assert len(ip_rule) == 1
+    assert ip_rule[0]["ip"] == legacy_ips, "legacy-состав переехал без потерь"
+    rt = json.loads(state_p.read_text(encoding="utf-8"))["routing"]
+    assert rt["active_ips"] == legacy_ips
+    assert any("start" in c and "xray" in c for c in calls)
+
+
+def test_routing_apply_ip_rule_idempotent_no_restart(tmp_path):
+    """Канонический конфиг (ip-правило уже в целевой форме) + повторный add существующего ip →
+    changed:False, рестарт не зван (structural-gate спит, содержимое не изменилось)."""
+    xray_p = tmp_path / "xray-config.json"
+    state_p = tmp_path / "srouter.local.json"
+    _write_xray_routing_config(xray_p, BASELINE_DOMAINS, managed=True,
+                               ips_only_rule=["78.47.183.125"])
+    _managed_state(state_p, BASELINE_DOMAINS, ips=["78.47.183.125"])
+    calls = []
+    r = local_state.routing_apply(
+        None, ips=["78.47.183.125"], action="add",
+        config_path=str(xray_p), state_path=state_p, runner=_ok_runner(calls),
+        port_checker=_port_checker_settle_then_up(),
+    )
+    assert r["ok"] is True
+    assert r["changed"] is False
+    assert calls == []
+
+
+def test_routing_apply_empty_ips_removes_ip_rule(tmp_path):
+    """remove-ip последнего ip → ip-only правило исчезает ЦЕЛИКОМ (канон «пустой состав = правила
+    нет», поднятый с уровня ключа на уровень правила: правило с ip:[] — мусор)."""
+    xray_p = tmp_path / "xray-config.json"
+    state_p = tmp_path / "srouter.local.json"
+    _write_xray_routing_config(xray_p, BASELINE_DOMAINS, managed=True,
+                               ips_only_rule=["78.47.183.125"])
+    _managed_state(state_p, BASELINE_DOMAINS, ips=["78.47.183.125"])
+    calls = []
+    r = local_state.routing_apply(
+        None, ips=["78.47.183.125"], ip_action="remove",
+        config_path=str(xray_p), state_path=state_p, runner=_ok_runner(calls),
+        port_checker=_port_checker_settle_then_up(),
+    )
+    assert r["ok"] is True, r
+    assert r["changed"] is True
+    cfg = json.loads(xray_p.read_text(encoding="utf-8"))
+    assert _ip_rules(cfg) == [], "ip-правило удалено, не обнулено"
+    managed = [x for x in cfg["routing"]["rules"] if x.get("_srouter_managed") is True]
+    assert "ip" not in managed[0]
+    rt = json.loads(state_p.read_text(encoding="utf-8"))["routing"]
+    assert rt["active_ips"] == []
+
+
+def test_routing_apply_drift_catches_external_ip_rule_edit(tmp_path):
+    """Внешняя правка ip[] в ip-only правиле мимо srouter ловится drift-детектором
+    (расширенный hash читается из ip-правила)."""
+    xray_p = tmp_path / "xray-config.json"
+    state_p = tmp_path / "srouter.local.json"
+    _write_xray_routing_config(xray_p, BASELINE_DOMAINS, managed=True,
+                               ips_only_rule=["78.47.183.125"])
+    _managed_state(state_p, BASELINE_DOMAINS, ips=["78.47.183.125"])
+    cfg = json.loads(xray_p.read_text(encoding="utf-8"))
+    _ip_rules(cfg)[0]["ip"] = ["1.2.3.4"]
+    xray_p.write_text(json.dumps(cfg), encoding="utf-8")
+    calls = []
+    r = local_state.routing_apply(
+        ["domain:telegram.org"], action="add",
+        config_path=str(xray_p), state_path=state_p, runner=_ok_runner(calls),
+        port_checker=_port_checker_settle_then_up(),
+    )
+    assert r["ok"] is False
+    assert "drift" in r.get("err", "").lower()
+    assert calls == []
+
+
+def test_routing_apply_ambiguous_ip_rules_refused(tmp_path):
+    """Два ip-only правила (руками навели) → отказ ambiguous_ip_rules до любых мутаций:
+    writer перестраивает ip-правило при любом apply — молча выбрать первое нельзя."""
+    xray_p = tmp_path / "xray-config.json"
+    state_p = tmp_path / "srouter.local.json"
+    _write_xray_routing_config(xray_p, BASELINE_DOMAINS, managed=True,
+                               ips_only_rule=["78.47.183.125"])
+    _managed_state(state_p, BASELINE_DOMAINS, ips=["78.47.183.125"])
+    cfg = json.loads(xray_p.read_text(encoding="utf-8"))
+    cfg["routing"]["rules"].insert(1, {"type": "field", "outboundTag": "reality-out",
+                                       "ip": ["10.0.0.0/24"], "_srouter_managed_ips": True})
+    xray_p.write_text(json.dumps(cfg), encoding="utf-8")
+    before = xray_p.read_bytes()
+    calls = []
+    r = local_state.routing_apply(
+        ["domain:telegram.org"], action="add",
+        config_path=str(xray_p), state_path=state_p, runner=_ok_runner(calls),
+        port_checker=_port_checker_settle_then_up(),
+    )
+    assert r["ok"] is False
+    assert r["err"] == "ambiguous_ip_rules", r
+    assert xray_p.read_bytes() == before, "конфиг не тронут"
+    assert calls == []
 
 
 def test_routing_apply_hash_drift_refuses(tmp_path):
@@ -2248,3 +2413,31 @@ def test_routing_apply_after_github_direct_has_no_drift(tmp_path):
     rules = json.loads(cfg_p.read_text(encoding="utf-8"))["routing"]["rules"]
     managed = [r for r in rules if r.get("_srouter_managed")][0]
     assert "domain:new.example" in managed["domain"], "новый домен — в managed-правило"
+
+
+def test_github_direct_split_hash_reads_ip_rule(tmp_path):
+    """Split при канонической форме (ip в отдельном правиле): hash-миграция читает ip-состав
+    из ip-правила (НЕ из managed, где его после фикса нет) — иначе первый post-split
+    routing_apply умрёт по drift (прецедент-комментарий в _github_direct_locked)."""
+    from local_state_routing import _routing_domains_hash
+
+    domains = _GH_ANTHROPIC + _GH_GITHUB + _GH_OTHER
+    cfg_p = tmp_path / "config.json"
+    _write_xray_routing_config(cfg_p, domains, managed=True, ips_only_rule=["203.0.113.9"])
+    state_p = tmp_path / "srouter.local.json"
+    _write_state(state_p, _gh_state(domains, ["203.0.113.9"]))
+    calls = []
+
+    out = local_state_routing.github_direct(
+        "on", config_path=cfg_p, state_path=state_p, runner=_ok_runner(calls),
+        port_checker=_port_checker_settle_then_up())
+
+    assert out["ok"] is True, out
+    rules = json.loads(cfg_p.read_text(encoding="utf-8"))["routing"]["rules"]
+    managed = [r for r in rules if r.get("_srouter_managed")][0]
+    assert "ip" not in managed, "managed domain-only — split не возвращает ip в managed"
+    ip_rule = [r for r in rules if r.get("_srouter_managed_ips")]
+    assert len(ip_rule) == 1 and ip_rule[0]["ip"] == ["203.0.113.9"], "ip-правило не тронуто"
+    st = json.loads(state_p.read_text(encoding="utf-8"))
+    assert st["routing"]["last_applied_hash"] == _routing_domains_hash(
+        sorted(managed["domain"]), ["203.0.113.9"]), "hash из rest-состава + ip-правила"
