@@ -872,9 +872,9 @@ def _managed_state(p, domains, ips=None):
     _write(p, {"nodes": [], "routing": rt})
 
 
-def test_routing_apply_add_ip_extends_managed_rule(tmp_path):
-    """add-ip: ip вливается в ТО ЖЕ managed-правило (инвариант «ровно одно managed»),
-    state.active_ips + расширенный hash пишутся, xray перезапущен."""
+def test_routing_apply_add_ip_commits_state_and_restarts(tmp_path):
+    """add-ip: ip-состав в ip-only правиле, state.active_ips + расширенный hash пишутся,
+    xray перезапущен (транзакционный контракт #136 в каноне двух правил)."""
     xray_p = tmp_path / "xray-config.json"
     state_p = tmp_path / "srouter.local.json"
     _write_xray_routing_config(xray_p, BASELINE_DOMAINS, managed=True)
@@ -889,19 +889,19 @@ def test_routing_apply_add_ip_extends_managed_rule(tmp_path):
     assert r["changed"] is True
     cfg = json.loads(xray_p.read_text(encoding="utf-8"))
     managed = [x for x in cfg["routing"]["rules"] if x.get("_srouter_managed") is True]
-    assert len(managed) == 1, "ip должен жить в существующем managed-правиле, не вторым"
-    assert managed[0]["ip"] == ["78.47.183.125"]
     assert managed[0]["domain"] == BASELINE_DOMAINS
+    assert _ip_rules(cfg)[0]["ip"] == ["78.47.183.125"]
     rt = json.loads(state_p.read_text(encoding="utf-8"))["routing"]
     assert rt["active_ips"] == ["78.47.183.125"]
     assert any("start" in c and "xray" in c for c in calls)
 
 
 def test_routing_apply_add_ip_idempotent(tmp_path):
-    """ip уже в правиле и в state → changed:False, restart не нужен."""
+    """ip уже в ip-правиле и в state (каноническая форма) → changed:False, restart не нужен."""
     xray_p = tmp_path / "xray-config.json"
     state_p = tmp_path / "srouter.local.json"
-    _write_xray_routing_config(xray_p, BASELINE_DOMAINS, managed=True, ips=["78.47.183.125"])
+    _write_xray_routing_config(xray_p, BASELINE_DOMAINS, managed=True,
+                               ips_only_rule=["78.47.183.125"])
     _managed_state(state_p, BASELINE_DOMAINS, ips=["78.47.183.125"])
     calls = []
     r = local_state.routing_apply(
@@ -1042,7 +1042,7 @@ def test_routing_apply_domain_and_ip_one_transaction(tmp_path):
     cfg = json.loads(xray_p.read_text(encoding="utf-8"))
     managed = [x for x in cfg["routing"]["rules"] if x.get("_srouter_managed") is True]
     assert "domain:telegram.org" in managed[0]["domain"]
-    assert managed[0]["ip"] == ["78.47.183.125"]
+    assert _ip_rules(cfg)[0]["ip"] == ["78.47.183.125"]
     starts = [c for c in calls if "start" in c and "xray" in c]
     assert len(starts) == 1, "оба изменения — один restart"
 
@@ -1148,7 +1148,8 @@ def test_routing_add_ip_canonicalizes_and_remove_symmetric(tmp_path):
     написания невидимы друг для друга НЕ становятся: remove в другом написании находит матчер."""
     xray_p = tmp_path / "xray-config.json"
     state_p = tmp_path / "srouter.local.json"
-    _write_xray_routing_config(xray_p, BASELINE_DOMAINS, managed=True, ips=["78.47.183.125"])
+    _write_xray_routing_config(xray_p, BASELINE_DOMAINS, managed=True,
+                               ips_only_rule=["78.47.183.125"])
     _managed_state(state_p, BASELINE_DOMAINS, ips=["78.47.183.125"])
     calls = []
     # add в /32-написании → идемпотентно к голому 78.47.183.125 (no-op, не дубль)
@@ -1166,8 +1167,8 @@ def test_routing_add_ip_canonicalizes_and_remove_symmetric(tmp_path):
     )
     assert r["ok"] is True and r["changed"] is True, r
     cfg = json.loads(xray_p.read_text(encoding="utf-8"))
-    managed = [x for x in cfg["routing"]["rules"] if x.get("_srouter_managed") is True]
-    assert managed[0]["ip"] == ["78.47.183.125", "10.9.8.0/24"], managed[0]["ip"]
+    ip_rule = _ip_rules(cfg)
+    assert ip_rule[0]["ip"] == ["78.47.183.125", "10.9.8.0/24"], ip_rule[0]["ip"]
     # remove в эквивалентном написании находит и убирает
     r = local_state.routing_apply(
         None, ips=["10.9.8.100/24"], ip_action="remove",
@@ -1176,8 +1177,8 @@ def test_routing_add_ip_canonicalizes_and_remove_symmetric(tmp_path):
     )
     assert r["ok"] is True and r["changed"] is True, r
     cfg = json.loads(xray_p.read_text(encoding="utf-8"))
-    managed = [x for x in cfg["routing"]["rules"] if x.get("_srouter_managed") is True]
-    assert managed[0]["ip"] == ["78.47.183.125"], managed[0]["ip"]
+    ip_rule = _ip_rules(cfg)
+    assert ip_rule[0]["ip"] == ["78.47.183.125"], ip_rule[0]["ip"]
 
 
 def _ip_rules(cfg):
@@ -2250,7 +2251,7 @@ def test_github_direct_on_splits_rules_and_flips(tmp_path):
 
     domains = _GH_ANTHROPIC + _GH_GITHUB + _GH_OTHER
     cfg_p = tmp_path / "config.json"
-    _write_xray_routing_config(cfg_p, domains, managed=True, ips=["203.0.113.9"])
+    _write_xray_routing_config(cfg_p, domains, managed=True, ips_only_rule=["203.0.113.9"])
     state_p = tmp_path / "srouter.local.json"
     _write_state(state_p, _gh_state(domains, ["203.0.113.9"]))
     calls = []
@@ -2274,9 +2275,11 @@ def test_github_direct_on_splits_rules_and_flips(tmp_path):
     assert managed[0]["outboundTag"] == "reality-out"
     idx = [rules.index(r) for r in (strict[0], github[0], managed[0])]
     assert idx == sorted(idx), "strict и github раньше managed"
-    assert managed[0]["ip"] == ["203.0.113.9"], "ip-матчеры остаются в managed"
+    assert "ip" not in managed[0], "managed domain-only — split не возвращает ip"
+    ip_rule = [r for r in rules if r.get("_srouter_managed_ips")]
+    assert len(ip_rule) == 1 and ip_rule[0]["ip"] == ["203.0.113.9"], "ip-правило не тронуто"
     assert any("xray" in " ".join(c) for c in calls), "рестарт зван"
-    # state-hash обновлён под rest-состав → следующий routing_apply не умрёт по drift
+    # state-hash обновлён под rest-состав + ip-правило → следующий routing_apply не умрёт по drift
     st = json.loads(state_p.read_text(encoding="utf-8"))
     assert st["routing"]["last_applied_hash"] == _routing_domains_hash(
         sorted(_GH_OTHER), ["203.0.113.9"])

@@ -1332,7 +1332,8 @@ def _surgical_config(active_address="203.0.113.10", tag="reality-out"):
         ],
         "routing": {"domainStrategy": "AsIs", "rules": [
             {"type": "field", "outboundTag": tag, "_srouter_managed": True,
-             "domain": ["domain:github.com", "domain:youtube.com"],
+             "domain": ["domain:github.com", "domain:youtube.com"]},
+            {"type": "field", "outboundTag": tag, "_srouter_managed_ips": True,
              "ip": ["203.0.113.99"]},
             {"type": "field", "outboundTag": "direct", "network": "tcp,udp"},
         ]},
@@ -1341,14 +1342,17 @@ def _surgical_config(active_address="203.0.113.10", tag="reality-out"):
 
 def _surgical_state_with_routing(state, config):
     """state + routing-секция с актуальным last_applied_hash (иначе пост-routing_apply
-    откажет по drift — fixture повторяет живую машину)."""
+    откажет по drift — fixture повторяет живую машину). ip-состав читается из ip-only
+    правила (_srouter_managed_ips), домены — из managed (канон двух правил)."""
     from local_state_routing import _routing_domains_hash
-    rule = config["routing"]["rules"][0]
+    rules = config["routing"]["rules"]
+    rule = rules[0]
+    ip_rule = next(r for r in rules if r.get("_srouter_managed_ips"))
     state["routing"] = {
         "outbound": rule["outboundTag"],
         "active": list(rule["domain"]),
-        "active_ips": list(rule["ip"]),
-        "last_applied_hash": _routing_domains_hash(rule["domain"], rule["ip"]),
+        "active_ips": list(ip_rule["ip"]),
+        "last_applied_hash": _routing_domains_hash(rule["domain"], ip_rule["ip"]),
     }
     return state
 
@@ -1399,7 +1403,9 @@ def test_surgical_select_replaces_outbound_and_commits(tmp_path):
     rule_after = cfg["routing"]["rules"][0]
     assert rule_after["domain"] == rule_before["domain"], "whitelist-домены не тронуты"
     assert rule_after["_srouter_managed"] is True, "маркер цел"
-    assert "203.0.113.20" in rule_after["ip"], "IP нового узла добавлен в правило"
+    assert "ip" not in rule_after, "managed domain-only (xray AND-семантика)"
+    ip_rule_after = [r for r in cfg["routing"]["rules"] if r.get("_srouter_managed_ips")][0]
+    assert "203.0.113.20" in ip_rule_after["ip"], "IP нового узла добавлен в ip-only правило"
     assert _active_state(state_path) == {"name": "hk-1", "pending": None}
     assert any("stop" in c[0] and "xray" in c[0] for c in calls), "рестарт зван"
 
