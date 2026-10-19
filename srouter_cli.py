@@ -1504,7 +1504,7 @@ def cmd_routing(args) -> int:
         pass  # routing_apply сам вернёт err=foreign_config_needs_adopt без adopt
     runner = make_privileged_runner(run)
     if is_ip:
-        # ip-matchers живут в том же managed-правиле, что и домены; доменный состав не трогается
+        # ip-matchers живут в ip-only правиле (_srouter_managed_ips, xray AND); доменный состав не трогается
         label = ", ".join(args.ips)
         r = local_state.routing_apply(
             None, ips=list(args.ips), ip_action=action, adopt=adopt, outbound=outbound,
@@ -1624,49 +1624,62 @@ def cmd_github_direct(args):
     return 0
 
 
-def _read_routing_domains(config_path, outbound):
-    """Текущие domain[] rule с outboundTag=outbound. None если rule не найден/битый."""
+def _read_routing_rules(config_path):
+    """routing.rules из xray-config для marker-based ридеров list. None если не читается/нет секции."""
     try:
         import json as _json
         from pathlib import Path
         data = _json.loads(Path(config_path).read_text(encoding="utf-8"))
-        for r in (data.get("routing") or {}).get("rules") or []:
-            if isinstance(r, dict) and r.get("outboundTag") == outbound and isinstance(r.get("domain"), list):
-                return r["domain"]
+        rules = (data.get("routing") or {}).get("rules")
+        return rules if isinstance(rules, list) else None
     except (OSError, json.JSONDecodeError, ValueError, TypeError, KeyError):
         # JSON операции + словари → OSError, json.JSONDecodeError, ValueError, TypeError, KeyError
         return None
+
+
+def _read_routing_domains(config_path, outbound):
+    """domain[] managed-правила (_srouter_managed + outboundTag). None если не найден/битый.
+
+    Маркер, а не первый tag-match: в конфиге несколько reality-out правил (strict/github/
+    ip-only) — first-match показывал чужие домены (strict) на живой машине."""
+    for r in _read_routing_rules(config_path) or []:
+        if (isinstance(r, dict) and r.get(local_state.ROUTING_MARKER) is True
+                and r.get("outboundTag") == outbound and isinstance(r.get("domain"), list)):
+            return r["domain"]
     return None
 
 
 def _read_routing_ips(config_path, outbound):
-    """Текущие ip[] того же rule (domain-состав без ip → пустой список; rule не найден → None)."""
-    try:
-        import json as _json
-        from pathlib import Path
-        data = _json.loads(Path(config_path).read_text(encoding="utf-8"))
-        for r in (data.get("routing") or {}).get("rules") or []:
-            if isinstance(r, dict) and r.get("outboundTag") == outbound and isinstance(r.get("domain"), list):
-                ips = r.get("ip")
-                return list(ips) if isinstance(ips, list) else []
-    except (OSError, json.JSONDecodeError, ValueError, TypeError, KeyError):
-        # JSON операции + словари → OSError, json.JSONDecodeError, ValueError, TypeError, KeyError
+    """ip-состав: union без дублей legacy managed-ip[] + ip-only правила (_srouter_managed_ips).
+
+    Порядок: legacy, затем ip-правило (на живой машине до миграции 11 записей в managed,
+    ip-правило — подмножество). Managed-правила нет → None; ip нет → []."""
+    managed = None
+    ip_rule = None
+    for r in _read_routing_rules(config_path) or []:
+        if not isinstance(r, dict) or r.get("outboundTag") != outbound:
+            continue
+        if r.get(local_state.ROUTING_MARKER) is True:
+            managed = r
+        elif r.get(local_state.ROUTING_IPS_MARKER) is True and ip_rule is None:
+            ip_rule = r
+    if managed is None:
         return None
-    return None
+    out = []
+    for src in (managed.get("ip"), (ip_rule or {}).get("ip")):
+        for i in src or []:
+            if isinstance(i, str) and i not in out:
+                out.append(i)
+    return out
 
 
 def _routing_has_marker(config_path, outbound):
-    """Есть ли _srouter_managed на rule с outboundTag=outbound."""
-    try:
-        import json as _json
-        from pathlib import Path
-        data = _json.loads(Path(config_path).read_text(encoding="utf-8"))
-        for r in (data.get("routing") or {}).get("rules") or []:
-            if isinstance(r, dict) and r.get("outboundTag") == outbound:
-                return r.get(local_state.ROUTING_MARKER) is True
-    except (OSError, json.JSONDecodeError, ValueError, TypeError):
-        # JSON операции + словари → OSError, json.JSONDecodeError, ValueError, TypeError
-        pass
+    """Есть ли _srouter_managed на rule с outboundTag=outbound (скан всех правил: strict/
+    ip-only идут рядом — порядок правил не должен влиять на вердикт)."""
+    for r in _read_routing_rules(config_path) or []:
+        if (isinstance(r, dict) and r.get("outboundTag") == outbound
+                and r.get(local_state.ROUTING_MARKER) is True):
+            return True
     return False
 
 
