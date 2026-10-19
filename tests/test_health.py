@@ -971,6 +971,22 @@ def _mock_xray_config_endpoint(monkeypatch, status, address=""):
 def _mock_vps_tcp(monkeypatch, reachable):
     """Подменить прямой TCP-probe до VPS endpoint (минуя прокси). reachable=True/False."""
     monkeypatch.setattr(health.sys_probe, "port_open", lambda host, port, timeout=1.0: reachable)
+    if not reachable:
+        # instant-ветка (инцидент 2026-10-19) при отказе дёргает route get/ipconfig. Глушим ТОЛЬКО
+        # эти команды (rc=1 → generic), остальное — делегация ранее установленному run (tape
+        # network/DNS-проб от _all_up_monkey и др. не ломается; канон mock-all-up-monkey).
+        outer_run = health.sys_probe.run
+
+        def _cascade_only_run(cmd, timeout, **kwargs):
+            # перехват ТОЛЬКО route get <endpoint>: `route -n get default` — маршрута network-пробы
+            # (#203), его отдаём tape'у; иначе гасим соседнюю пробу и check_all врёт.
+            vps_route_get = (len(cmd) > 3 and cmd[:3] == ["/sbin/route", "-n", "get"]
+                             and cmd[3] != "default")
+            if vps_route_get or cmd[:1] == ["/usr/sbin/ipconfig"]:
+                return {"rc": 1, "out": "", "err": "mocked-no-cascade", "timeout": False}
+            return outer_run(cmd, timeout, **kwargs)
+
+        monkeypatch.setattr(health.sys_probe, "run", _cascade_only_run)
 
 
 def test_vps_unreachable_when_tunnel_fail_is_driver_down(monkeypatch):
@@ -1088,6 +1104,9 @@ def test_vps_probe_config_endpoint_when_no_local_node_port_default_443(monkeypat
     _mock_active_node(monkeypatch, {})  # нет активного узла
     _mock_xray_config_endpoint(monkeypatch, "ok", address="198.51.100.99")
     monkeypatch.setattr(health.sys_probe, "port_open", _capture)
+    # instant-ветка (2026-10-19): отказ → route get/ipconfig — глушим каскад (rc=1 → generic).
+    monkeypatch.setattr(health.sys_probe, "run",
+                        lambda cmd, timeout: {"rc": 1, "out": "", "err": "mocked-no-cascade", "timeout": False})
     vps = health._upstream_vps_reachable()
     assert vps["status"] == "down", "config-endpoint недоступен → down (не info: узел-то есть в config)"
     assert probed == [("198.51.100.99", 443)], "нет узла + config ok → probe config-address:443"
@@ -1132,7 +1151,7 @@ def _mock_route_cascade(monkeypatch, route_out, iface_addr, route_rc=0):
     new-cascade-detector-mock-all-up-monkey: немокнутый каскад медленный и machine-dependent).
     """
 
-    def _run(cmd, timeout):
+    def _run(cmd, timeout, **kwargs):
         if cmd[:2] == ["/sbin/route", "-n"]:
             return {"rc": route_rc, "out": route_out, "err": "", "timeout": False}
         if cmd[:1] == ["/usr/sbin/ipconfig"]:

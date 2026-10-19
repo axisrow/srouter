@@ -174,6 +174,9 @@ class TestHealthExceptions:
             raise OSError("network unreachable")
 
         monkeypatch.setattr(health.sys_probe, "port_open", boom)
+        # instant-ветка (инцидент 2026-10-19) после отказа дёргает route get/ipconfig — глушим.
+        monkeypatch.setattr(health.sys_probe, "run",
+                            lambda cmd, timeout: {"rc": 1, "out": "", "err": "mocked-no-cascade", "timeout": False})
         node = {"endpoint_host": "vps.example.com", "port": 443}
         result = health._upstream_vps_reachable(node=node)
         assert result["status"] == "down"
