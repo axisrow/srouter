@@ -69,6 +69,7 @@ py-modules = [
     "dashboard_isolate",
     "git_proxy",
     "go_proxy",
+    "ao_proxy",
     "claude_proxy",
     "vscode_proxy",
     "proxy_config_contract",

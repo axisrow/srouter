@@ -30,6 +30,7 @@ import git_proxy  # вкл/откл git-прокси для github (через g
 import claude_proxy  # вкл/откл HTTPS_PROXY для Claude Code (~/.claude/settings.json)
 import health  # check_all для /health эндпоинта
 import proxy_registry  # единая картина прокси: кто настроен + идёт ли трафик
+import ao_proxy  # issue #436: синхронизация scmProxyUrl AO-демона при смене узла
 import metrics_store  # heartbeat-метрики туннеля (JSONL watchdog'а) для /api/metrics/tunnel
 import hot_routes  # _read_tail — bounded-чтение хвоста status.jsonl для /api/incidents
 import proxy_errors  # пассивный 5xx-rate из privoxy access-лога (observe-only)
@@ -208,6 +209,10 @@ def api_node_select(name):
     if not result.get("ok") and result.get("step") == "adopt-mode":
         # ожидаемый отказ hand-managed машины (#136/#313), не серверная ошибка
         return jsonify(result), 409
+    if result.get("ok"):
+        # issue #436: best-effort синк scmProxyUrl AO-демона с новым активным узлом.
+        # sync не бросает и в ответ не попадает: ошибка синка не отличима для UI от успеха.
+        ao_proxy.sync()
     return jsonify(result), (200 if result.get("ok") else 500)
 
 

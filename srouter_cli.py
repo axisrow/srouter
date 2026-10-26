@@ -68,6 +68,7 @@ import git_proxy  # issue #130: вкл/откл SOCKS5 github-proxy в ~/.gitcon
 import go_proxy  # 2026-09-30: тумблер Go-модулей в обход GFW (goproxy.cn-зеркало / wrapper-туннель)
 import isolate_firewall  # protect: вкл/откл PF-изоляции Anthropic (strict-подсети, 2026-10-09)
 import vscode_proxy  # issue #185: scoped SOCKS5 для codex-расширения через VSCode http.proxy
+import ao_proxy  # issue #436: scmProxyUrl AO-демона синхронен с эффективным прокси srouter
 import health  # doctor-проверки стека
 import privoxy_audit  # пассивный root-owned аудит lifecycle-команд Privoxy (#122)
 import privoxy_system  # root-gated system LaunchDaemon для Privoxy (#122)
@@ -529,7 +530,11 @@ def cmd_uninstall(args, *, runner=None) -> int:
     vp = (vscode_proxy.disable(skip_paths=handled | blocked)
           if (handled | blocked) and not skip("vscode") else
           {"ok": True} if skip("vscode") else vscode_proxy.disable())
-    for label, status in (("Claude Code", cp), ("git github-proxy", gp), ("VSCode", vp)):
+    # issue #436: снять НАШЕ scmProxyUrl AO-демона (xray остановлен — мёртвый socks в
+    # настройке демона ломал бы его SCM-клиентов). Value-match: чужое не трогаем (#112).
+    ap = ao_proxy.disable()
+    for label, status in (("Claude Code", cp), ("git github-proxy", gp), ("VSCode", vp),
+                          ("AO scm-proxy", ap)):
         if not status.get("ok") or status.get("err"):
             errors.append(f"{label} не восстановлен: {status.get('err', 'unknown')}")
 
@@ -1466,6 +1471,20 @@ def cmd_privoxy(args) -> int:
     return 0
 
 
+def _ao_scm_proxy_sync(context):
+    """Best-effort синк scmProxyUrl AO-демона после смены прокси-конфига (issue #436).
+
+    ao_proxy.sync не бросает; демона нет / значение уже верное — тихо (ok/skipped),
+    печатаем только реальное изменение и честную ошибку. Ошибка синка НЕ роняет
+    основную команду: прокси-конфиг уже применён, AO догонит при следующей смене.
+    """
+    r = ao_proxy.sync()
+    if r.get("ok") is False:
+        print(f"ao-proxy: scmProxyUrl не синхронизирован ({r.get('err')})", file=sys.stderr)
+    elif r.get("changed"):
+        print(f"ao-proxy: scmProxyUrl AO → {r.get('url') or '(напрямую)'}")
+
+
 def cmd_routing(args) -> int:
     """Управление routing-доменами production xray-config (#136).
 
@@ -1527,6 +1546,7 @@ def cmd_routing(args) -> int:
     verb = "добавлен" if action == "add" else "убран"
     if r.get("changed"):
         print(f"routing: {label} {verb}, xray перезапущен.")
+        _ao_scm_proxy_sync("routing")
     else:
         print(f"routing: {label} уже в нужном состоянии (no-op).")
     return 0
@@ -1569,6 +1589,7 @@ def cmd_node(args):
             if isinstance(ria, dict) and not ria.get("ok"):
                 print(f"  предупреждение: IP узла в routing-правило не добавлен "
                       f"({ria.get('err')})", file=sys.stderr)
+            _ao_scm_proxy_sync("node")
         else:
             print(f"node use: узел {name} уже активен (no-op).")
         return 0
@@ -1621,6 +1642,7 @@ def cmd_github_direct(args):
         print("github-direct: github ходит напрямую (туннель мёртв — верни `off`, когда оживёт).")
     else:
         print("github-direct: github снова через туннель.")
+    _ao_scm_proxy_sync("github-direct")
     return 0
 
 
