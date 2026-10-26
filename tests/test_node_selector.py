@@ -521,6 +521,31 @@ def test_api_node_select_success_uses_sys_probe_runner(monkeypatch):
     assert response.get_json() == {"ok": True, "active": "hk-1", "step": "done"}
 
 
+def test_api_node_select_success_syncs_ao_scm_proxy(monkeypatch):
+    """issue #436: успешная смена узла дёргает best-effort синк scmProxyUrl AO-демона.
+    Spy на ao_proxy в namespace СВЕЖЕГО dashboard_routes (_fresh_dashboard пересоздаёт
+    модуль — патчить импортированный заранее значило бы мутный no-op, канон #259);
+    sync под гвардом conftest — здесь проверяется только сам вызов."""
+    import importlib
+
+    dashboard = _fresh_dashboard(monkeypatch)
+    routes = importlib.import_module("dashboard_routes")
+    monkeypatch.setattr(dashboard.local_state, "enabled_nodes", lambda path=None: [{"name": "hk-1"}])
+    monkeypatch.setattr(
+        dashboard.node_selector,
+        "select_node",
+        lambda name, *, enabled_names, runner, state_path: {"ok": True, "active": "hk-1", "step": "done"},
+    )
+    calls = []
+    monkeypatch.setattr(routes, "ao_proxy",
+                        types.SimpleNamespace(sync=lambda *a, **k: calls.append(k) or {"ok": True}))
+
+    response = dashboard.app.test_client().post("/api/node/select/hk-1")
+
+    assert response.status_code == 200
+    assert len(calls) == 1
+
+
 def test_api_node_select_apply_failure_returns_500(monkeypatch):
     dashboard = _fresh_dashboard(monkeypatch)
     monkeypatch.setattr(dashboard.local_state, "enabled_nodes", lambda path=None: [{"name": "hk-1"}])

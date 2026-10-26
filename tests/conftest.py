@@ -171,3 +171,19 @@ def _block_osascript_admin(monkeypatch):
         return _real_run(cmd, *args, **kwargs)
 
     monkeypatch.setattr(subprocess, "run", _guarded_run)
+
+
+@pytest.fixture(autouse=True)
+def _block_ao_daemon_http(monkeypatch):
+    """Глобальный предохранитель (issue #436): ни один тест не ходит в ЖИВОЙ AO-демон.
+
+    ao_proxy.sync/disable резолвят демон через ~/.ao/running.json — на машине разработчика
+    демон запущен, случайный вызов из чужого теста сделал бы реальный PATCH его настроек.
+    Глушим discovery (_daemon_base_url → None): любой неявный sync/disable получает
+    "not_running" и тихо пропускается. Тесты самого ao_proxy передают base_url явно —
+    мимо discovery — поэтому реальные HTTP-сценарии там живут на loopback-заглушке;
+    test_ao_proxy::test_daemon_port_from_running_json возвращает настоящую функцию
+    поверх этого гварда (monkeypatch в тесте выигрывает у fixture, канон osascript-гварда).
+    """
+    import ao_proxy
+    monkeypatch.setattr(ao_proxy, "_daemon_base_url", lambda *a, **k: None)
