@@ -971,6 +971,22 @@ def _mock_xray_config_endpoint(monkeypatch, status, address=""):
 def _mock_vps_tcp(monkeypatch, reachable):
     """Подменить прямой TCP-probe до VPS endpoint (минуя прокси). reachable=True/False."""
     monkeypatch.setattr(health.sys_probe, "port_open", lambda host, port, timeout=1.0: reachable)
+    if not reachable:
+        # instant-ветка (инцидент 2026-10-19) при отказе дёргает route get/ipconfig. Глушим ТОЛЬКО
+        # эти команды (rc=1 → generic), остальное — делегация ранее установленному run (tape
+        # network/DNS-проб от _all_up_monkey и др. не ломается; канон mock-all-up-monkey).
+        outer_run = health.sys_probe.run
+
+        def _cascade_only_run(cmd, timeout, **kwargs):
+            # перехват ТОЛЬКО route get <endpoint>: `route -n get default` — маршрута network-пробы
+            # (#203), его отдаём tape'у; иначе гасим соседнюю пробу и check_all врёт.
+            vps_route_get = (len(cmd) > 3 and cmd[:3] == ["/sbin/route", "-n", "get"]
+                             and cmd[3] != "default")
+            if vps_route_get or cmd[:1] == ["/usr/sbin/ipconfig"]:
+                return {"rc": 1, "out": "", "err": "mocked-no-cascade", "timeout": False}
+            return outer_run(cmd, timeout, **kwargs)
+
+        monkeypatch.setattr(health.sys_probe, "run", _cascade_only_run)
 
 
 def test_vps_unreachable_when_tunnel_fail_is_driver_down(monkeypatch):
@@ -1088,6 +1104,9 @@ def test_vps_probe_config_endpoint_when_no_local_node_port_default_443(monkeypat
     _mock_active_node(monkeypatch, {})  # нет активного узла
     _mock_xray_config_endpoint(monkeypatch, "ok", address="198.51.100.99")
     monkeypatch.setattr(health.sys_probe, "port_open", _capture)
+    # instant-ветка (2026-10-19): отказ → route get/ipconfig — глушим каскад (rc=1 → generic).
+    monkeypatch.setattr(health.sys_probe, "run",
+                        lambda cmd, timeout: {"rc": 1, "out": "", "err": "mocked-no-cascade", "timeout": False})
     vps = health._upstream_vps_reachable()
     assert vps["status"] == "down", "config-endpoint недоступен → down (не info: узел-то есть в config)"
     assert probed == [("198.51.100.99", 443)], "нет узла + config ok → probe config-address:443"
@@ -1112,6 +1131,106 @@ def test_vps_placeholder_testnet_203_0_113_is_warn(monkeypatch):
     assert result["status"] == "ok", "placeholder — warn, не роняет вердикт (туннель жив)"
     vps_check = [c for c in result["checks"] if "vps" in c["name"].lower() and "upstream" in c["name"].lower()][0]
     assert vps_check.get("info") is True, "placeholder — info-only (не driver)"
+
+
+# ============================ инцидент 2026-10-19: протухший host-маршрут на VPS ============================
+# Статический host-маршрут 85.136.181.198 → 192.168.1.1 пережил смену сети (gw ушёл, Mac переехал
+# на хотспот 172.20.10.x) → connect() падал МГНОВЕННО (EADDRNOTAVAIL), весь голый путь к VPS был
+# чёрной дырой (в т.ч. socks5-прокси Telegram-клиента), а generic-вердикт «VPS мёртв? заплачен?»
+# уводил не туда. Отказ быстрее instant-порога = локальный стек (маршрут), не сеть → probe
+# различает и называет маршрут с рецептом.
+
+_ROUTE_GET_STALE = ("   route to: 85.136.181.198\ndestination: 85.136.181.198\n"
+                    "    gateway: 192.168.1.1\n  interface: en0\n")
+
+
+def _mock_route_cascade(monkeypatch, route_out, iface_addr, route_rc=0):
+    """Мок sys_probe.run для каскада пробы: route -n get / ipconfig getifaddr по argv.
+
+    Без мока instant-ветка дёргала бы реальные subprocess (канон
+    new-cascade-detector-mock-all-up-monkey: немокнутый каскад медленный и machine-dependent).
+    """
+
+    def _run(cmd, timeout, **kwargs):
+        if cmd[:2] == ["/sbin/route", "-n"]:
+            return {"rc": route_rc, "out": route_out, "err": "", "timeout": False}
+        if cmd[:1] == ["/usr/sbin/ipconfig"]:
+            return {"rc": 0, "out": iface_addr, "err": "", "timeout": False}
+        return {"rc": 1, "out": "", "err": "unexpected-cmd", "timeout": False}
+
+    monkeypatch.setattr(sys_probe, "run", _run)
+
+
+def test_vps_probe_instant_fail_stale_route_names_cause(monkeypatch):
+    """Instant-fail + host-маршрут на чужой /24 → down с рецептом маршрута, не generic «VPS мёртв»:
+    чинить надо маршрут (sudo route delete), не сервер/провайдера."""
+    _mock_active_node(monkeypatch, {"name": "vps-1", "endpoint_host": "85.136.181.198", "port": 443})
+    _mock_vps_tcp(monkeypatch, reachable=False)
+    _mock_route_cascade(monkeypatch, _ROUTE_GET_STALE, iface_addr="172.20.10.2")
+
+    vps = health._upstream_vps_reachable(instant_max=999.0)
+
+    assert vps["status"] == "down"
+    assert "протухший host-маршрут" in vps["detail"]
+    assert "192.168.1.1" in vps["detail"], "detail называет виновника — шлюз мёртвой сети"
+    assert "route -n delete" in vps["detail"], "detail несёт рецепт починки"
+
+
+def test_vps_probe_timeout_keeps_generic_down(monkeypatch):
+    """Таймаут (elapsed ≥ instant_max) → прежний generic-вердикт: сеть/сервер; route не спрашиваем."""
+    _mock_active_node(monkeypatch, {"name": "vps-1", "endpoint_host": "85.136.181.198", "port": 443})
+    _mock_vps_tcp(monkeypatch, reachable=False)
+
+    def _no_subprocess(cmd, timeout):
+        raise _pytest.fail("route не должен спрашиваться при сетевом таймауте")
+
+    monkeypatch.setattr(sys_probe, "run", _no_subprocess)
+
+    vps = health._upstream_vps_reachable(instant_max=0.0)
+
+    assert vps["status"] == "down"
+    assert "TCP timeout/refused" in vps["detail"]
+
+
+def test_vps_probe_route_gateway_in_subnet_is_not_stale(monkeypatch):
+    """Шлюз в том же /24, что адрес интерфейса → маршрут живой; instant-отказ = не маршрут → generic."""
+    _mock_active_node(monkeypatch, {"name": "vps-1", "endpoint_host": "85.136.181.198", "port": 443})
+    _mock_vps_tcp(monkeypatch, reachable=False)
+    _mock_route_cascade(monkeypatch, _ROUTE_GET_STALE.replace("192.168.1.1", "172.20.10.1"),
+                        iface_addr="172.20.10.2")
+
+    vps = health._upstream_vps_reachable(instant_max=999.0)
+
+    assert vps["status"] == "down"
+    assert "протухший" not in vps["detail"], "живой маршрут не флагается протухшим"
+
+
+def test_vps_probe_iface_without_ipv4_flags_stale(monkeypatch):
+    """Интерфейс маршрута без IPv4-адреса → маршрут заведомо мёртв → рецепт, не generic."""
+    _mock_active_node(monkeypatch, {"name": "vps-1", "endpoint_host": "85.136.181.198", "port": 443})
+    _mock_vps_tcp(monkeypatch, reachable=False)
+    _mock_route_cascade(monkeypatch, _ROUTE_GET_STALE, iface_addr="")
+
+    vps = health._upstream_vps_reachable(instant_max=999.0)
+
+    assert "протухший host-маршрут" in vps["detail"]
+
+
+def test_route_gateway_out_of_subnet_pure():
+    """Детектор = чистая функция: чужой /24 / iface без адреса → протухший; свой /24 / v6-шлюз / нет шлюза → нет."""
+    f = health._route_gateway_out_of_subnet
+    assert f("192.168.1.1", "172.20.10.2") is True, "чужой /24 = протухший"
+    assert f("172.20.10.1", "172.20.10.2") is False, "тот же /24 = живой"
+    assert f("192.168.1.1", "") is True, "iface без IPv4 = маршрут мёртв"
+    assert f("fe80::1", "172.20.10.2") is False, "v6-шлюз для v4-эндпоинта не флагаем"
+    assert f(None, "172.20.10.2") is False, "нет шлюза (link-route) — не наш случай"
+
+
+def test_parse_route_get_extracts_gateway_and_iface():
+    gw, iface = health._parse_route_get(_ROUTE_GET_STALE)
+    assert (gw, iface) == ("192.168.1.1", "en0")
+    assert health._parse_route_get("мусор без полей") == (None, None)
+    assert health._parse_route_get(None) == (None, None)
 
 
 def test_vps_placeholder_detector_matches_canonical(monkeypatch):

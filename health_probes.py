@@ -50,7 +50,8 @@ __all__ = [
     "_BULK_DEFAULT_URL", "_url_host",
     "_route_default_interface", "_inet_interface", "_network_interface_up",
     "DNS_PROBE_HOST", "_resolve_host", "_dns_up",
-    "VPS_TCP_PROBE_TIMEOUT", "_vps_endpoint", "_upstream_vps_reachable",
+    "VPS_TCP_PROBE_TIMEOUT", "VPS_TCP_PROBE_INSTANT_MAX", "_vps_endpoint", "_upstream_vps_reachable",
+    "_parse_route_get", "_route_gateway_out_of_subnet", "_stale_route_cause",
     # Инцидент 2026-10-08: годность exit'а для Anthropic (401 vs 403-регион vs cf-challenge)
     # и свежесть конфига xray vs процесса (рестарт не применён — процесс по старым маршрутам).
     "_anthropic_exit_check", "_xray_config_freshness_check",
@@ -62,6 +63,7 @@ LAUNCHCTL = "/bin/launchctl"
 CURL = "/usr/bin/curl"
 ROUTE = "/sbin/route"      # route -n get default — есть ли default route (issue #203)
 IFCONFIG = "/sbin/ifconfig"  # активный iface с inet — второй эшелон (issue #203)
+IPCONFIG = "/usr/sbin/ipconfig"  # адрес iface для различения протухшего host-маршрута (2026-10-19)
 
 # Порты компонентов стека — единый источник dashboard_common (issue #155). health.py уже сделал
 # import-guard fallback (canonical-fallback-port) — health_probes читает готовые константы оттуда,
@@ -1336,6 +1338,13 @@ def _dns_up():
 # _tunnel_up сдаться, чтобы различение «VPS мёртв» vs «локальный прокси упал» было осмысленным.
 VPS_TCP_PROBE_TIMEOUT = 3.0
 
+# Инцидент 2026-10-19: статический host-маршрут 85.136.181.198 → 192.168.1.1 пережил смену сети
+# (gw исчез, Mac переехал на хотспот) → connect() падал МГНОВЕННО (EADDRNOTAVAIL), весь голый путь
+# к VPS был чёрной дырой (включая socks5-прокси Telegram-клиента), а generic-вердикт «VPS мёртв?
+# заплачен/запущен?» уводил не туда. Отказ быстрее instant-порога = локальный стек (маршрут),
+# не сеть → probe спрашивает route get и называет маршрут с рецептом.
+VPS_TCP_PROBE_INSTANT_MAX = 0.5
+
 # TEST-NET 203.0.113.0/24 (RFC 5737) placeholder-детектор = canonical local_state._is_testnet_placeholder
 # (единый источник правды, #200). PR #196 ввёл здесь собственный inline-предикат без octet-валидации
 # → drift с canonical на 203.0.113.300/abc/-1 (post-review #198, cycle-review high-confirmed, канон
@@ -1365,7 +1374,51 @@ def _vps_endpoint(node):
     return host, port
 
 
-def _upstream_vps_reachable(node=None):
+def _parse_route_get(text):
+    """(gateway, interface) из вывода `route -n get <ip>`. (None, None) если поля нет/не строка."""
+    if not isinstance(text, str):
+        return None, None
+    gw_m = re.search(r"gateway:\s*(\S+)", text)
+    if_m = re.search(r"interface:\s*(\S+)", text)
+    return (gw_m.group(1) if gw_m else None, if_m.group(1) if if_m else None)
+
+
+def _route_gateway_out_of_subnet(gateway, iface_addr):
+    """True = шлюз маршрута вне /24 адреса интерфейса (протухший после смены сети).
+
+    /24-эвристика (хотспот /28 и ppp /32 укладываются: шлюз той же сети) — потолок: при ложном
+    негативе на нестандартной маске заменить на разбор ifconfig netmask. Пустой адрес интерфейса
+    = маршруту некуда ходить. IPv6-шлюз для IPv4-эндпоинта не флагаем (link-local норма).
+    """
+    if not gateway or not isinstance(gateway, str) or ":" in gateway:
+        return False
+    if not iface_addr:
+        return True
+    return gateway.split(".")[:3] != iface_addr.split(".")[:3]
+
+
+def _stale_route_cause(host):
+    """Причина «мгновенного отказа» — протухший host-маршрут: строка-рецепт или None. Не бросает.
+
+    sys_probe.run (список аргументов, абсолютные пути) → route get парсим, адрес iface смотрим
+    ipconfig'ом; расхождение /24 (или iface без адреса) = маршрут из мёртвой сети.
+    """
+    route = sys_probe.run([ROUTE, "-n", "get", str(host)], 5)
+    if route.get("rc") != 0:
+        return None
+    gateway, iface = _parse_route_get(route.get("out") or "")
+    if not gateway or not iface:
+        return None
+    addr = sys_probe.run([IPCONFIG, "getifaddr", iface], 5)
+    iface_addr = (addr.get("out") or "").strip() if addr.get("rc") == 0 else ""
+    if _route_gateway_out_of_subnet(gateway, iface_addr):
+        return (f"VPS недоступен: мгновенный отказ — протухший host-маршрут {host} → {gateway} "
+                f"({iface}: адрес {iface_addr or 'нет IPv4'}); почини: "
+                f"sudo route -n delete {host} (или перезапинь на шлюз текущей сети)")
+    return None
+
+
+def _upstream_vps_reachable(node=None, *, instant_max=VPS_TCP_PROBE_INSTANT_MAX):
     """Прямой TCP-probe до upstream VPS endpoint (БЕЗ прокси) — различение #194.
 
     _tunnel_up() бьёт через прокси к API-таргетам → connection-failed без различения «VPS мёртв»
@@ -1379,9 +1432,14 @@ def _upstream_vps_reachable(node=None):
     ходит по config-address (инцидент 2026-10-11). Явный node = target вызывающего — config
     его не перекрывает. Порт берётся из node (default 443): reader config'а port не отдаёт.
 
+    instant_max — потолок «мгновенного» отказа (сек): быстрее = локальный стек, не сеть
+    (инцидент 2026-10-19: протухший host-маршрут) → проба спрашивает route get и называет
+    маршрут. Тесты фиксируют порог аргументом (канон wall-clock-assert-is-not-the-invariant).
+
     Возвращает {status, detail}:
       ok   — TCP-connect успешен (VPS жив);
-      down — TCP timeout/refused (VPS мёртв);
+      down — TCP недоступен: timeout/refused (сеть/VPS) либо instant-fail с протухшим
+             host-маршрутом (detail называет шлюз и рецепт route delete);
       warn — placeholder TEST-NET 203.0.113.x (нельзя реально зондировать test-IP);
       info — нет активного узла / нет endpoint_host.
     Не бросает (probe-канон).
@@ -1418,14 +1476,22 @@ def _upstream_vps_reachable(node=None):
                 "detail": f"endpoint {host}:{port} — placeholder TEST-NET 203.0.113.x (RFC 5737), "
                           f"не маршрутизируется; замени на реальный VPS-адрес"}
     try:
+        probe_t0 = time.monotonic()
         reachable = sys_probe.port_open(host, port, timeout=VPS_TCP_PROBE_TIMEOUT)
+        probe_elapsed = time.monotonic() - probe_t0
     except OSError as exc:
         _log.debug("TCP-probe %s:%s: %s — считаем VPS недоступным", host, port, exc)
-        reachable = False
+        reachable, probe_elapsed = False, 0.0
     if reachable:
         return {"status": "ok",
                 "detail": f"VPS reachable: TCP-коннект до {host}:{port} "
                           f"(endpoint из {src}; VPS жив)"}
+    if probe_elapsed < instant_max:
+        # мгновенный отказ = не сетевой таймаут, а локальный стек: различаем протухший
+        # host-маршрут (инцидент 2026-10-19), иначе generic вводит в сторону «VPS мёртв».
+        stale = _stale_route_cause(host)
+        if stale:
+            return {"status": "down", "detail": stale}
     return {"status": "down",
             "detail": f"VPS недоступен: TCP timeout/refused до {host}:{port} "
                       f"(endpoint из {src}; VPS мёртв? заплачен/запущен?)"}
