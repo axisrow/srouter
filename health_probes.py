@@ -43,7 +43,8 @@ __all__ = [
     "_user_launchagent_plist", "_local_proxy_boot_persistence",
     "GFW_PROBE_DOMAINS", "GFW_CONTROL_DOMAIN", "_direct_domain_probe", "_gfw_domain_check",
     "_direct_first_check", "TUNNEL_TARGETS", "VENDOR_OUTAGE_MARKER",
-    "_tunnel_target_up", "_tunnel_up", "_tunnel_delivery_check", "_github_direct_split_check",
+    "_tunnel_target_up", "_tunnel_up", "_tunnel_delivery_check", "_tunnel_passengers",
+    "_github_direct_split_check",
     # #396 классы проб: direct (мимо прокси) + bulk (объёмная передача)
     "_no_proxy_env", "DIRECT_PROBE_URLS", "_direct_up", "_bulk_probe", "_bulk_status",
     "_BULK_DEFAULT_URL", "_url_host",
@@ -974,6 +975,32 @@ def _tunnel_up(extra_targets=None):
 # резке и живых канарейках → «туннель не доставляет» (обход whitelist/смерть Reality) — driver.
 _TUNNEL_DELIVERY_URL = "https://github.com/"
 
+# Пассажиры туннеля в detail доставки (2026-10-29, ChatGPT-инцидент): приложение-пробы
+# зелёные (локальная нога «app → 10808» жива), а лежат ВСЕ whitelist-домены за reality-out —
+# красная канарейка github не называет, КТО ещё лег, и в шумном выводе доктор-строка не
+# связывается с «ChatGPT.app сломался». Показываем пассажиров routing.active.
+_TUNNEL_PASSENGERS_MAX = 5
+
+
+def _tunnel_passengers(path=None):
+    """Домены-пассажиры туннеля из routing.active (без канарейки github.com). Не бросает.
+
+    local_state.load_state fail-soft; берём только «domain:»-записи (ip: — не домены),
+    дедуп в порядке объявления; битый state / мусор → [].
+    """
+    state = local_state.load_state(path)
+    entries = (state.get("routing") or {}).get("active")
+    if not isinstance(entries, list):
+        return []
+    domains = []
+    for entry in entries:
+        if not isinstance(entry, str) or not entry.startswith("domain:"):
+            continue
+        domain = entry[len("domain:"):].strip()
+        if domain and domain != "github.com" and domain not in domains:
+            domains.append(domain)
+    return domains
+
 
 def _tunnel_delivery_check(gfw_status):
     """GFW-канарейка github через прокси — доказательство, что туннель ДЕЙСТВИТЕЛЬНО доставляет.
@@ -999,11 +1026,19 @@ def _tunnel_delivery_check(gfw_status):
                 "detail": "туннель доставляет: github.com через прокси жив "
                           "(напрямую резан GFW — жив только через туннель)"}
     if gfw_status == "gfw":
-        return {"status": "down",
-                "detail": f"туннель не доставляет: github.com через прокси мёртв ({kind}), "
-                          f"при этом напрямую резан GFW — трафик туннеля не идёт "
-                          f"(обход whitelist/смерть Reality); канарейкам на direct-доступных "
-                          f"доменах верить нельзя"}
+        detail = (f"туннель не доставляет: github.com через прокси мёртв ({kind}), "
+                  f"при этом напрямую резан GFW — трафик туннеля не идёт "
+                  f"(обход whitelist/смерть Reality); канарейкам на direct-доступных "
+                  f"доменах верить нельзя")
+        # Пассажиры: их смерть здесь доказана (driver-down при подтверждённой резке) —
+        # перечисляем, чтобы сразу было видно, какие приложения легли тем же рейсом.
+        passengers = _health_facade._tunnel_passengers()
+        if passengers:
+            shown = passengers[:_TUNNEL_PASSENGERS_MAX]
+            extra = len(passengers) - len(shown)
+            detail += (f"; пассажиры туннеля легли: {', '.join(shown)}"
+                       + (f" …+{extra} ещё" if extra > 0 else ""))
+        return {"status": "down", "detail": detail}
     return {"status": "info",
             "detail": f"github.com через прокси недоступен ({kind}), но GFW-резка напрямую "
                       f"не подтверждена — не дискриминирует (github сам лежит / direct открыт)"}

@@ -7251,6 +7251,70 @@ def test_tunnel_delivery_info_when_tunnel_already_down(monkeypatch):
     assert td.get("info") is True, "туннель уже driver — доставка info (не дублируем)"
 
 
+# Пассажиры туннеля в detail доставки (2026-10-29, ChatGPT-инцидент): приложение-пробы
+# зелёные (локальная нога «app → 10808» жива), а лежат ВСЕ whitelist-домены за reality-out.
+# Красная канарейка github не называет, КТО ещё лег — operator не находит связь с ChatGPT
+# в шумном выводе. Detail перечисляет пассажиров routing.active.
+def test_tunnel_delivery_down_names_tunnel_passengers(monkeypatch):
+    """туннель не доставляет → detail называет пассажиров whitelist: сразу видно, какие
+    приложения легли тем же рейсом (chatgpt/openai/gemini едут тот же reality-out)."""
+    _all_up_monkey(monkeypatch)
+    _mock_gfw_status(monkeypatch, "gfw")
+    _mock_proxy_github(monkeypatch, ok=False)
+    monkeypatch.setattr(health, "_tunnel_passengers",
+                        lambda path=None: ["chatgpt.com", "openai.com", "gemini.google.com"])
+    result = health.check_all(active_claude=True)
+    td = next((c for c in result["checks"] if "доставка" in c["name"]), None)
+    assert td is not None
+    assert td["ok"] is False
+    assert "пассажиры туннеля легли" in td["detail"]
+    assert "chatgpt.com" in td["detail"], "detail называет легшие приложения"
+    assert "gemini.google.com" in td["detail"]
+
+
+def test_tunnel_delivery_down_without_passengers_keeps_detail(monkeypatch):
+    """Whitelist пуст/state не читается → detail без пассажиров, вердикт прежний (не падаем)."""
+    _all_up_monkey(monkeypatch)
+    _mock_gfw_status(monkeypatch, "gfw")
+    _mock_proxy_github(monkeypatch, ok=False)
+    monkeypatch.setattr(health, "_tunnel_passengers", lambda path=None: [])
+    result = health.check_all(active_claude=True)
+    td = next((c for c in result["checks"] if "доставка" in c["name"]), None)
+    assert td is not None
+    assert td["ok"] is False
+    assert "туннель не доставляет" in td["detail"], "базовый вердикт сохранён"
+    assert "пассажиры" not in td["detail"]
+
+
+def test_tunnel_delivery_info_has_no_passengers(monkeypatch):
+    """info-вердикт (резка не подтверждена / туннель уже driver) пассажиров не называет:
+    их смерть не доказана — не сеем ложную тревогу."""
+    _all_up_monkey(monkeypatch)
+    _mock_gfw_status(monkeypatch, "ok")
+    _mock_proxy_github(monkeypatch, ok=False)
+    monkeypatch.setattr(health, "_tunnel_passengers",
+                        lambda path=None: ["chatgpt.com", "openai.com"])
+    result = health.check_all(active_claude=True)
+    td = next((c for c in result["checks"] if "доставка" in c["name"]), None)
+    assert td is not None
+    assert td.get("info") is True
+    assert "пассажиры" not in td["detail"]
+
+
+def test_tunnel_passengers_reads_routing_active_excludes_canary(tmp_path):
+    """Читалка: «domain:»-записи routing.active → домены в порядке объявления; канарейка
+    github.com и ip:-записи не пассажиры; дедуп; битый state → [] (fail-soft)."""
+    state = {"routing": {"active": [
+        "domain:github.com", "domain:chatgpt.com", "ip:1.2.3.4",
+        "domain:openai.com", "domain:chatgpt.com", "мусор", 5,
+    ]}}
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps(state), encoding="utf-8")
+    assert health._tunnel_passengers(path) == ["chatgpt.com", "openai.com"]
+    path.write_text("{битый json", encoding="utf-8")
+    assert health._tunnel_passengers(path) == [], "битый state деградирует в пустой список"
+
+
 # ===== #427: «github-direct (путь github)» показывает РЕАЛЬНЫЙ путь, а не текст чужого чека =====
 # Шэдоуинг star-import: health_devworkflow._github_direct_check (#199, слои git-proxy) перетирал
 # health_probes._github_direct_check (#423, split-состояние) — оба вызова check_all звали одну
