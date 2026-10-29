@@ -60,7 +60,7 @@ Never commit `srouter.local.json`, `srouter_config.py`, `.env*`, real diagnostic
 
 **Only traffic that explicitly asks for the tunnel goes through it; everything else goes direct. No ambient env proxy is seeded into any layer.** Single source of the whitelist: `srouter.local.json` (`routing.active`/`routing.active_ips`).
 
-- xray managed rule (domains+ip → reality-out, catch-all direct) is mutated only via `srouter routing` (transactional `routing_apply`).
+- xray managed rules (domain-only rule `_srouter_managed` + ip-only rule `_srouter_managed_ips` → reality-out, catch-all direct) are mutated only via `srouter routing` (transactional `routing_apply`). Two rules, not one: xray combines matchers within a single rule with AND, so `ip[]` next to `domain[]` never matches raw IPs (2026-10-19 Telegram incident); legacy configs with `ip[]` inside the managed rule are migrated by the first apply.
 - LaunchAgent `com.srouter.codenv` does NOT seed proxy vars (pre-2026-10-07 it seeded privoxy 8118, fail-closed "no direct egress" — deliberately retired): it only periodically `unsetenv`s residual proxy keys in the launchctl gui domain.
 - CC sessions carry no global `HTTPS_PROXY` (empty strings in `~/.claude/settings.json` + NO_PROXY loopback/z.ai/yandex).
 - Explicit tunnel consumers: git per-host config, `codex-srouter` wrapper (socks5h pointwise), `curl -x socks5h://127.0.0.1:10808`.

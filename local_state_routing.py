@@ -6,9 +6,11 @@ I/O через фасад `local_state` (facade-lookup, канон moving-caller
 
 srouter управляет routing.rules секцией reality-out: adopt существующего rule (маркер
 _srouter_managed на уровне rule, НЕ top-level — foreign-конфиг не захватывается целиком), домены
-хранит в state (active + last_applied_hash для drift-detection). Two-phase: backup → modify →
-restart → promote. Эталон read-xray: local_state_xray._read_xray_vless_address; atomic-save:
-local_state.save_state; restart: install_lib._restart_component.
+хранит в state (active + last_applied_hash для drift-detection). ip-состав — в ОТДЕЛЬНОМ ip-only
+правиле (_srouter_managed_ips сразу после managed: xray соединяет матчеры одного rule через AND,
+ip[] рядом с domain[] для сырых IP мёртв — инцидент 2026-10-19, Telegram). Two-phase: backup →
+modify → restart → promote. Эталон read-xray: local_state_xray._read_xray_vless_address;
+atomic-save: local_state.save_state; restart: install_lib._restart_component.
 """
 import json
 from pathlib import Path
@@ -16,6 +18,7 @@ from pathlib import Path
 import local_state
 
 ROUTING_MARKER = "_srouter_managed"  # ключ в rule (xray игнорирует неизвестные ключи — безопасно)
+ROUTING_IPS_MARKER = "_srouter_managed_ips"  # ip-only правило: матчеры одного rule — AND, не OR
 DEFAULT_ROUTING_OUTBOUND = "reality-out"
 
 
@@ -71,6 +74,22 @@ def _routing_find_managed_rule(rules):
     if len(idxs) > 1:
         return -2  # ambiguous — несколько managed-секций, отказать
     return idxs[0] if idxs else -1
+
+
+def _routing_current_ips(rules, rule, ip_idx):
+    """Текущий ip-состав для drift/plan: legacy-источник приоритетен.
+
+    ip[] внутри managed-правила (форма до миграции 2026-10-19) читается оттуда; иначе — из
+    ip-only правила (_srouter_managed_ips, индекс ip_idx); иначе []. Чтение и вход routing_apply —
+    ОДИН валидатор _normalize_ip_list (формы не расходятся). Возвращает (ips, err)."""
+    raw = rule.get("ip")
+    if raw is None and ip_idx >= 0:
+        raw = rules[ip_idx].get("ip")
+    if raw is None:
+        return [], ""
+    if not isinstance(raw, list):
+        return None, "invalid_ip_field:not_a_list"
+    return _normalize_ip_list(raw)
 
 
 def _routing_domains_hash(domains, ips=None):
@@ -145,11 +164,16 @@ def routing_apply(hosts=None, *, action="add", ips=None, ip_action="add",
                   port_checker=None):
     """Применить изменение routing-матчеров (домены и/или ip) production xray-config + restart xray.
 
-    Домены и ip живут в ОДНОМ managed-правиле (xray: domain OR ip) — инвариант
-    «ровно одно managed-правило» не нарушается. hosts/ips=None → соответствующий состав
-    не трогается; оба None → no-op. ip-состав хранится в state (routing.active_ips),
-    расширенный hash покрывает оба состава (legacy-совместим: без ip хеш = старому).
-    Валидация ip строгая (ipaddress), отказ — до любых мутаций.
+    Канон — ДВА правила: managed (_srouter_managed) domain-only и ip-only (_srouter_managed_ips)
+    сразу после него: xray соединяет матчеры одного rule через AND, НЕ OR (правка 2026-10-19,
+    инцидент Telegram: ip[] рядом с domain[] для сырых IP мёртв). hosts/ips=None → соответствующий
+    состав не трогается; оба None и каноническая форма → no-op. ip-состав хранится в state
+    (routing.active_ips), расширенный hash покрывает оба состава (legacy-совместим: без ip хеш =
+    старому). Legacy-форма (ip[] внутри managed) мигрируется первым apply (structural-gate —
+    рестарт с эквивалентной семантикой). Инварианты: ровно одно managed-правило, не более одного
+    ip-правила (два → ambiguous_ip_rules). Adopt захватывает только доменное правило (критерий
+    требует domain) — немаркированное ip-правило не трогается. Валидация ip строгая (ipaddress),
+    отказ — до любых мутаций.
 
     Hybrid adopt: foreign-config без маркера → требует adopt=True (захватить секцию). После adopt
     rule помечается _srouter_managed, домены + hash пишутся в state. Locate по маркеру, не по tag
@@ -241,20 +265,21 @@ def _routing_apply_locked(config_path, state_path, outbound, hosts, action, adop
             return {"ok": False, "changed": False, "err": f"adopt_needs_one_{outbound}_rule"}
         idx = matches[0]
 
+    # ip-only правило (_srouter_managed_ips) writer перестраивает при ЛЮБОМ apply → ambiguity-гвард
+    # безусловный, даже при ips=None (молча взять первое из двух нельзя).
+    ip_idx = _rule_index_by_marker(rules, ROUTING_IPS_MARKER)
+    if ip_idx == -2:
+        return {"ok": False, "changed": False, "err": "ambiguous_ip_rules"}
+
     rule = rules[idx]
     current_domains = list(rule.get("domain") or [])
-    # ip[] читаем со сторожем: конфиг hand-managed (adopt-режим) — там может лежать скаляр
-    # или не-строки (int ipaddress парсит — путаница естественна). Без стража: sorted/join
-    # ловит TypeError вне fail-soft контракта, либо чар-сплит строки уходит в hash/конфиг.
-    raw_ip = rule.get("ip")
-    if raw_ip is None:
-        current_ips = []
-    elif isinstance(raw_ip, list):
-        current_ips, ip_err = _normalize_ip_list(raw_ip)
-        if ip_err:
-            return {"ok": False, "changed": False, "err": ip_err}
-    else:
-        return {"ok": False, "changed": False, "err": "invalid_ip_field:not_a_list"}
+    # ip[] читаем со сторожем (_routing_current_ips: legacy managed-ip[] приоритетен, иначе
+    # ip-only правило): конфиг hand-managed (adopt-режим) — там может лежать скаляр или не-строки
+    # (int ipaddress парсит — путаница естественна). Без стража: sorted/join ловит TypeError вне
+    # fail-soft контракта, либо чар-сплит строки уходит в hash/конфиг.
+    current_ips, ip_err = _routing_current_ips(rules, rule, ip_idx)
+    if ip_err:
+        return {"ok": False, "changed": False, "err": ip_err}
 
     # 2. читать state ОДИН раз здесь (readable проверяем всегда, drift — только когда есть с чем
     #    сравнивать). Битый существующий state-файл → fail-closed ДО любых мутаций конфига: не смеем
@@ -275,7 +300,12 @@ def _routing_apply_locked(config_path, state_path, outbound, hosts, action, adop
 
     new_domains = routing_plan(current_domains, hosts, action=action)
     new_ips = routing_plan_ips(current_ips, ips, action=ip_action)
-    if new_domains == current_domains and new_ips == current_ips:
+    # structural-gate: содержимое сошлось, но форма неканонична (legacy ip[] в managed / ip-правило
+    # отсутствует при непустом составе / лишнее при пустом) → миграция в канон двух правил.
+    # Без него add-domain при неизменных ip навсегда оставлял бы legacy-форму (инцидент 2026-10-19).
+    structural_stale = ("ip" in rule) or ((ip_idx == -1) != (not new_ips))
+    if (new_domains == current_domains and new_ips == current_ips
+            and not structural_stale):
         return {"ok": True, "changed": False, "err": ""}  # idempotent, restart не нужен
 
     # 3. backup (two-phase: восстановим при ошибке restart) — читаем СВЕЖИЙ config под lock.
@@ -288,16 +318,20 @@ def _routing_apply_locked(config_path, state_path, outbound, hosts, action, adop
     state_existed = state_p.exists()
     original_state_text = state_p.read_text(encoding="utf-8") if state_existed else ""
 
-    # 4. modify rule in-place copy + atomic write (tmp+fsync+replace — единый _atomic_write_text)
+    # 4. modify: managed — domain-only (xray соединяет матчеры одного rule через AND → ip[] рядом
+    #    с domain[] мёртв для сырых IP, инцидент 2026-10-19), ip-состав — в ОТДЕЛЬНОМ ip-only
+    #    правиле сразу после managed. atomic write (tmp+fsync+replace — единый _atomic_write_text)
     new_rule = dict(rule)
     new_rule["domain"] = new_domains
-    if new_ips:
-        new_rule["ip"] = new_ips
-    else:
-        new_rule.pop("ip", None)  # пустой ip-состав = каноническое правило без ключа
+    new_rule.pop("ip", None)  # канон: managed без ip-ключа (пустой состав = ключа нет)
     new_rule[ROUTING_MARKER] = True
     new_rules = list(rules)
-    new_rules[idx] = new_rule
+    new_rules[idx] = new_rule  # замена на месте → длину не меняет
+    if ip_idx != -1:
+        new_rules.pop(ip_idx)  # delete-then-insert: позиция idx+1 гарантирована
+    if new_ips:
+        new_rules.insert(idx + 1, {"type": "field", "outboundTag": outbound,
+                                   "ip": list(new_ips), ROUTING_IPS_MARKER: True})
     new_data = dict(data)
     new_data["routing"] = dict(routing)
     new_data["routing"]["rules"] = new_rules
@@ -520,10 +554,14 @@ def _github_direct_locked(action, config_path, state_path, runner, port_checker,
         config_path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
     if migration and state_path:
         # hash под НОВЫЙ rest-состав managed-правила — иначе следующий routing_apply умрёт по drift.
+        # ip-состав после канона 2026-10-19 живёт в ip-only правиле (в managed его нет) — lenient-
+        # чтение по маркеру; строгую валидацию позже даст drift-guard routing_apply.
+        ip_rule_idx = _rule_index_by_marker(rules, ROUTING_IPS_MARKER)
+        ip_part = (rules[ip_rule_idx].get("ip") or []) if ip_rule_idx >= 0 else []
         st, readable = local_state._load_state_checked(state_path)
         if readable and isinstance(st, dict):
             st.setdefault("routing", {})["last_applied_hash"] = _routing_domains_hash(
-                m_rule.get("domain") or [], m_rule.get("ip") or [])
+                m_rule.get("domain") or [], ip_part)
             local_state._atomic_write_text(
                 state_path, json.dumps(st, ensure_ascii=False, indent=2) + "\n")
 
