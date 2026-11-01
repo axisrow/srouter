@@ -2843,6 +2843,30 @@ def test_print_report_tunnel_fail_no_vendor_outage_advises_node(monkeypatch, cap
     assert health.VENDOR_OUTAGE_MARKER not in out
 
 
+@pytest.mark.parametrize("verdict", ["chain-wedge", "tunnel"])
+def test_print_report_tunnel_verdict_prints_discriminator_and_ipsb_trap(
+        monkeypatch, capsys, verdict):
+    """#411: при chain-wedge/tunnel doctor ведёт ДИСКРИМИНАТОРОМ (probe-порт узла:
+    любой домен ездит до узла по inboundTag-правилу) ДО любых рестартов, и предупреждает
+    про ловушку ip.sb (не в whitelist → через основной порт показывает локальный IP)."""
+    monkeypatch.setattr(health, "cached_attribution", lambda **k: {
+        "verdict": verdict, "culprit": "c", "detail": "d",
+        "chain_wedge": verdict == "chain-wedge"})
+    health._print_report({"status": "ok", "checks": []})
+    out = capsys.readouterr().out
+    assert "probe.socks_port" in out, f"должен назвать дискриминатор-порт, got:\n{out}"
+    assert "api.ip.sb" in out and "НЕ в whitelist" in out, f"факт-гвардия ip.sb, got:\n{out}"
+    # Ревью #443: outer-SNI/dest у reality-out и probe-out ОДНИ → DPI их не различает;
+    # живой probe при мёртвом основном пути = privoxy-плечо (не DPI), а мёртвый probe
+    # делится по VPS TCP-чеку: зависший xray молчит на всех inbound'ах сразу.
+    assert "upstream VPS" in out, f"мёртвый probe делится по VPS TCP-чеку, got:\n{out}"
+    assert "privoxy" in out, f"живой probe при мёртвом основном = privoxy-плечо, got:\n{out}"
+    assert "Reality-сесси" in out, f"рестарт xray — с оговоркой про Reality-сессии, got:\n{out}"
+    assert "DPI" in out, f"оговорка: при DPI-окне рестарт бесполезен, got:\n{out}"
+    tail = out[out.index("• молчит"):]
+    assert "TCP" in tail, f"ветка мёртвого probe обязана звать VPS TCP-чек, got:\n{out}"
+
+
 # ==================== рендер _print_report: info ⊥ ok (две независимые оси) ====================
 # ДЫРА: `mark = "⚠️" if c.get("info") else (...)` читал info РАНЬШЕ ok → для info-чека ok не
 # читался никогда. Но info означает «не участвует в агрегации вердикта» (drivers), а НЕ «есть о
