@@ -1147,13 +1147,31 @@ def _attribution_from_events(events, now=None):
         verdict, culprit = "provider", "локальная сеть/провайдер"
         detail = f"прямые сайты {d_ok}/{d_n} за 10м"
     elif tun_rate is not None and tun_rate < ATTRIB_RATE_BAD:
-        if (d_n >= ATTRIB_MIN_SAMPLES and dir_rate is not None
-                and dir_rate >= ATTRIB_RATE_BAD
-                and tun_to_rate is not None and tun_to_rate >= ATTRIB_RATE_BAD):
-            verdict, culprit = "chain-wedge", "залипание прокси-стека (privoxy/xray)"
-            detail = (f"via-proxy молчит (timeout {t_to}/{t_n} за 10м) при живом direct "
-                      f"({d_ok}/{d_n}); форензика: srouter privoxy status / launchctl print, "
-                      f"затем рестарт privoxy/xray руками")
+        # #411: «chain-wedge» смешивал DPI-окно узла и реальное залипание локального
+        # стека. Дискриминатор по тем же событиям: ЧАСТИЧНО живой туннель (ok-пробы
+        # через тот же прокси-стек в окне) = стек трафик проводит, таймауты
+        # пер-соединительные/пер-SNI → деградация пути до узла (DPI-драмп), рестарт
+        # локального стека не нужен. Залипание = ТОЛЬКО полное молчание (t_ok == 0,
+        # выборка ≥ порога) при живом direct: эпизод 2026-10-08 (27/64 ok, рестарт не
+        # понадобился) не должен звать мутацию. Порог консервативен намеренно: wedge,
+        # начавшийся посреди окна, доедет до вердикта ≤10м (окно сползёт) — цена
+        # задержки меньше цены лишнего рестарта боевого стека.
+        direct_alive = (d_n >= ATTRIB_MIN_SAMPLES and dir_rate is not None
+                        and dir_rate >= ATTRIB_RATE_BAD)
+        silent = (tun_to_rate is not None and tun_to_rate >= ATTRIB_RATE_BAD)
+        if direct_alive and silent and t_n >= ATTRIB_MIN_SAMPLES:
+            if t_ok == 0:
+                verdict, culprit = "chain-wedge", "залипание прокси-стека (privoxy/xray)"
+                detail = (f"via-proxy молчит (timeout {t_to}/{t_n} за 10м) при живом direct "
+                          f"({d_ok}/{d_n}); дискриминатор раньше мутации — probe-порт узла "
+                          f"(см. doctor), privoxy status / launchctl print; рестарт: xray "
+                          f"пересоздаёт Reality-сессии, при активном DPI-окне бесполезен")
+            else:
+                verdict, culprit = "tunnel", "туннель/VPS/DPI"
+                detail = (f"стек НЕ залип: {t_ok} ok через тот же прокси за 10м при "
+                          f"таймаутах {t_to}/{t_n} и живом direct ({d_ok}/{d_n}) — "
+                          f"деградация пути/SNI-драмп (DPI-окно); рестарт не нужен, "
+                          f"окно обычно закрывается само")
         else:
             verdict, culprit = "tunnel", "туннель/VPS/DPI"
             detail = f"туннель ok {t_ok}/{t_n} за 10м"
@@ -1271,6 +1289,24 @@ def _print_report(result):
         _v, _c, _d = attr.get("verdict"), attr.get("culprit") or "", attr.get("detail") or ""
         line = f"\nЧто тормозит: {_v}" + (f" — {_c}" if _c else "") + (f" ({_d})" if _d else "")
         print(line)
+        if _v in ("chain-wedge", "tunnel"):
+            # #411: дискриминатор «узел/путь vs локальный стек» ДО любых рестартов.
+            # probe-порт узла (nodes[].probe.socks_port) маршрутизируется по inboundTag
+            # → probe-out (gen_xray_config): ЛЮБОЙ домен через него ездит до узла,
+            # минуя privoxy и whitelist. Обе ветки исхода наблюдаемы и не требуют
+            # мутации; ip.sb-ловушка — потому что основной порт пускает его direct.
+            print("  Дискриминатор до рестартов (#411):")
+            print("    curl -x socks5h://127.0.0.1:<probe.socks_port узла> https://api.ip.sb/ip")
+            print("    • отвечает IP узла → путь до узла жив; молчит основной путь = DPI-окно/")
+            print("      SNI-драмп или залипание сессий reality-out — рестарт xray пересоздаёт")
+            print("      Reality-сессии (иногда лечит), при активном DPI-окне бесполезен")
+            print("    • молчит и probe-порт → узел/путь недоступны — локальный стек ни при чём,")
+            print("      рестарты не нужны (ждать окна/сменить узел вручную)")
+            print("    нет probe-порта → жёстко блокированный домен из routing.active через 8118:")
+            print("      ответ/204 = туннель и managed-правило живы, мёртв только SNI/поток")
+            print("  Ловушка: api.ip.sb НЕ в whitelist — через 8118/10808 идёт direct и отвечает")
+            print("    локальным IP: это НЕ индикатор туннеля (exit-IP — только probe-порт или")
+            print("    whitelisted-домен)")
     if result["status"] != "ok":
         print("\nЧто проверить:")
         failed_names = " ".join(c["name"] for c in result["checks"] if not c["ok"] and not c.get("info"))

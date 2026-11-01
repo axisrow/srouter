@@ -49,10 +49,10 @@ def test_attribution_direct_down_says_provider():
 
 
 def test_attribution_tunnel_timeouts_with_direct_ok_says_wedge():
-    """direct жив, туннель молчит — сигнатура застрявшего стека. ПРОД-shape (ревью #397):
-    curl убивается собственным --max-time раньше kill'а sys_probe → статус
-    connection-failed c rc 28 и кодом 000, НЕ литеральный "timeout"."""
-    out = _events(tunnel=(2, 8), direct=(10, 0))
+    """direct жив, туннель молчит ПОЛНОСТЬЮ (0 ok) — сигнатура застрявшего стека.
+    ПРОД-shape (ревью #397): curl убивается собственным --max-time раньше kill'а
+    sys_probe → статус connection-failed c rc 28 и кодом 000, НЕ литеральный "timeout"."""
+    out = _events(tunnel=(0, 8), direct=(10, 0))
     for e in out:
         if e["kind"] == "tunnel" and e["status"] != "ok":
             e["status"] = "connection-failed"
@@ -61,16 +61,60 @@ def test_attribution_tunnel_timeouts_with_direct_ok_says_wedge():
     attr = health._attribution_from_events(out, now=NOW)
     assert attr["verdict"] == "chain-wedge"
     assert attr["chain_wedge"] is True
-    assert "privoxy" in attr["detail"] or "рестарт" in attr["detail"]
+    assert "via-proxy молчит" in attr["detail"]
+
+
+def test_attribution_wedge_detail_leads_with_discriminator_not_restart():
+    """#411: подсказка wedge НЕ должна толкать к рестарту первым делом — сначала
+    дискриминатор (probe-порт узла / DPI-окно), мутация последним средством."""
+    out = _events(tunnel=(0, 8), direct=(10, 0))
+    for e in out:
+        if e["kind"] == "tunnel" and e["status"] != "ok":
+            e["status"] = "connection-failed"
+            e["rc"] = 28
+    detail = health._attribution_from_events(out, now=NOW)["detail"]
+    assert "дискриминатор" in detail
+    assert "DPI-окн" in detail, "должен предупредить: при DPI-окне рестарт бесполезен"
+    assert detail.index("дискриминатор") < detail.index("рестарт")
 
 
 def test_attribution_classic_timeout_status_still_counts_as_silence():
     """Литеральный timeout/no-response (легаси-путь) тоже считается «молчанием»."""
-    out = _events(tunnel=(2, 8), direct=(10, 0))
+    out = _events(tunnel=(0, 8), direct=(10, 0))
     for e in out:
         if e["kind"] == "tunnel" and e["status"] != "ok":
             e["status"] = "timeout"
     assert health._attribution_from_events(out, now=NOW)["verdict"] == "chain-wedge"
+
+
+def test_attribution_partial_tunnel_success_is_dpi_window_not_wedge():
+    """#411 (эпизод 2026-10-08): direct жив, via-proxy таймауты доминируют, НО часть
+    проб через тот же прокси-стек проходит — стек трафик проводит, это НЕ залипание:
+    деградация пути до узла / SNI-драмп (DPI-окно). Рестарт не нужен (шум к мутации)."""
+    out = _events(tunnel=(3, 9), direct=(8, 0))
+    for e in out:
+        if e["kind"] == "tunnel" and e["status"] != "ok":
+            e["status"] = "connection-failed"
+            e["rc"] = 28
+            e["code"] = "000"
+    attr = health._attribution_from_events(out, now=NOW)
+    assert attr["verdict"] == "tunnel"
+    assert attr["chain_wedge"] is False
+    assert "НЕ залип" in attr["detail"]
+    assert "рестарт" in attr["detail"] and "не нужен" in attr["detail"]
+
+
+def test_attribution_wedge_requires_tunnel_sample_floor():
+    """Полное молчание из 2 событий — не основание звать wedge (шум): как и прочие
+    rate-правила, ветка требует выборку ≥ ATTRIB_MIN_SAMPLES."""
+    out = _events(tunnel=(0, 2), direct=(8, 0))
+    for e in out:
+        if e["kind"] == "tunnel" and e["status"] != "ok":
+            e["status"] = "connection-failed"
+            e["rc"] = 28
+    attr = health._attribution_from_events(out, now=NOW)
+    assert attr["verdict"] == "tunnel"
+    assert attr["chain_wedge"] is False
 
 
 def test_attribution_tunnel_resets_with_direct_ok_says_tunnel():
