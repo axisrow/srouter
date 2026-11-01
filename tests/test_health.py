@@ -2856,8 +2856,15 @@ def test_print_report_tunnel_verdict_prints_discriminator_and_ipsb_trap(
     out = capsys.readouterr().out
     assert "probe.socks_port" in out, f"должен назвать дискриминатор-порт, got:\n{out}"
     assert "api.ip.sb" in out and "НЕ в whitelist" in out, f"факт-гвардия ip.sb, got:\n{out}"
-    assert "DPI-окн" in out, f"должен назвать исход «DPI-окно» (рестарт бесполезен), got:\n{out}"
+    # Ревью #443: outer-SNI/dest у reality-out и probe-out ОДНИ → DPI их не различает;
+    # живой probe при мёртвом основном пути = privoxy-плечо (не DPI), а мёртвый probe
+    # делится по VPS TCP-чеку: зависший xray молчит на всех inbound'ах сразу.
+    assert "upstream VPS" in out, f"мёртвый probe делится по VPS TCP-чеку, got:\n{out}"
+    assert "privoxy" in out, f"живой probe при мёртвом основном = privoxy-плечо, got:\n{out}"
     assert "Reality-сесси" in out, f"рестарт xray — с оговоркой про Reality-сессии, got:\n{out}"
+    assert "DPI" in out, f"оговорка: при DPI-окне рестарт бесполезен, got:\n{out}"
+    tail = out[out.index("• молчит"):]
+    assert "TCP" in tail, f"ветка мёртвого probe обязана звать VPS TCP-чек, got:\n{out}"
 
 
 # ==================== рендер _print_report: info ⊥ ok (две независимые оси) ====================
