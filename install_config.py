@@ -522,12 +522,19 @@ def format_plan(plan):
         if item.get("conflicts"):
             # #416: авто-конфликты идут дефолтным путём (backup → перегенерация → рестарт) под общее
             # y/N; остальное (non_brew_binary) — только явным флагом, интерактивного квиза больше нет.
-            if _conflicts_auto_resolved(item):
+            # План — поверхность согласия y/N: текст обязан совпадать с тем, что реально сделает
+            # apply (review PR #442). Без config_present backup НЕ создаётся (needs_backup требует
+            # существующий файл) — обещать его нельзя; единственный авто-конфликт без конфига —
+            # foreign_port: перегенерация + рестарт, который может не пройти (fail-closed, порт занят).
+            if not _conflicts_auto_resolved(item):
+                lines.append(f"  требуется флаг --{name} adopt|overwrite|skip; причины: {', '.join(item['conflicts'])}")
+            elif item.get("config_present"):
                 lines.append(f"  apply перезапишет с backup {item.get('config_path')}"
                              + plan.get("backup_suffix", "")
                              + f"; причины: {', '.join(item['conflicts'])}")
             else:
-                lines.append(f"  требуется флаг --{name} adopt|overwrite|skip; причины: {', '.join(item['conflicts'])}")
+                lines.append(f"  apply создаст конфиг и рестартует сервис; порт занят чужим процессом "
+                             f"— рестарт может не пройти (fail-closed); причины: {', '.join(item['conflicts'])}")
     lines.append("")
     launchagent = plan.get("launchagent") or {}
     lines.append(

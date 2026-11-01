@@ -483,9 +483,10 @@ def test_real_text_templates_have_exact_managed_marker():
 # ============================ #416: формат плана вместо «выбор обязателен» ============================
 
 def test_format_plan_auto_conflict_announces_backup_overwrite(tmp_path):
-    """#416: авто-конфликт (foreign_config) в плане — объявление перезаписи с backup, не «выбор обязателен»."""
+    """#416: авто-конфликт (foreign_config, файл существует) — объявление перезаписи с backup."""
     plan = {"state_path": "/tmp/s.json", "homebrew": {"available": True},
             "components": {"privoxy": {"conflict": True, "conflicts": ["foreign_config"],
+                                       "config_present": True,
                                        "config_path": "/opt/homebrew/etc/privoxy/config",
                                        "config_managed": False, "service": "none", "port_owner": None}},
             "launchagent": {}, "state_sections_to_write": [], "backup_suffix": ".srouter-backup-<ts>"}
@@ -508,6 +509,29 @@ def test_format_plan_non_auto_conflict_requires_flag(tmp_path):
 
     assert "требуется флаг --privoxy adopt|overwrite|skip" in text
     assert "non_brew_binary" in text
+
+
+def test_format_plan_port_conflict_without_config_does_not_promise_backup(tmp_path):
+    """#416 (review PR #442): foreign_port БЕЗ конфига — план не обещает backup (файла нет,
+    needs_backup не сработает), а честно сообщает рестарт на занятом порту.
+
+    План — поверхность согласия для y/N: обещание несуществующего backup = ложное согласие.
+    """
+    plan = {"state_path": "/tmp/s.json", "homebrew": {"available": True},
+            "components": {"privoxy": {"conflict": True, "conflicts": ["foreign_port"],
+                                       "config_present": False,
+                                       "config_path": "/opt/homebrew/etc/privoxy/config",
+                                       "config_managed": False, "service": "none", "port_owner": None}},
+            "launchagent": {}, "state_sections_to_write": [], "backup_suffix": ".srouter-backup-<ts>"}
+
+    text = install_lib.format_plan(plan)
+
+    assert "перезапишет" not in text, "файла нет — обещать backup нельзя"
+    # строка-сабтайтл компонента (два пробела отступа) — именно она поверхность согласия
+    sublines = [line for line in text.splitlines() if line.startswith("  ") and "apply" in line]
+    assert len(sublines) == 1, text
+    assert "srouter-backup" not in sublines[0], f"строка компонента без backup-обещания: {sublines[0]}"
+    assert "рестарт" in sublines[0] and "порт" in sublines[0], f"честный текст про рестарт: {sublines[0]}"
 
 
 # ============================ issue #110 Дефект 2: stale-managed = reclaimable (не foreign) ============================
