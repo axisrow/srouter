@@ -13,7 +13,9 @@ Dock-launch обязан снова работать сам по себе).
 Этот модуль — explicit, отдельно вызываемая операция (`srouter system-proxy repair|restore`),
 НЕ скрытая часть install/start/watchdog. Она:
   - определяет активный network service по default route (`route -n get default` → interface →
-    `networksetup -listnetworkserviceorder` → сервис для этого device);
+    `networksetup -listnetworkserviceorder` → сервис для этого device); default route через
+    VPN-интерфейс (ipsecN/utunN/pppN) Device-матчем не резолвится — фан-аут на ВСЕ VPN-сервисы
+    (какой держит туннель, networksetup не показывает; #439), status называет это явно;
   - читает текущий SOCKS endpoint этого сервиса (`networksetup -getsocksfirewallproxy`);
   - если endpoint уже наш (127.0.0.1:10808) — просто включает канал (state=on), если выключен;
   - если endpoint чужой и ВЫКЛЮЧЕН — бэкапит его в srouter.local.json (runtime.system_proxy),
@@ -147,18 +149,24 @@ def _default_interface(runner):
 
 
 def _service_for_interface(iface, runner):
-    """Имя network service (`networksetup` label) для устройства iface, или ''.
+    """(compat) первый network service для iface или ''. См. _services_for_interface."""
+    services = _services_for_interface(iface, runner)
+    return services[0] if services else ""
 
-    `networksetup -listnetworkserviceorder` печатает пары строк:
+
+def _parse_service_order(out):
+    """[(имя сервиса, device)] из вывода `networksetup -listnetworkserviceorder`.
+
+    Печатает пары строк:
         (1) Wi-Fi
         (Hardware Port: Wi-Fi, Device: en0)
-    Первая непустая непронумерованная строка выше — имя сервиса.
+    VPN-сервисы своё устройство НЕ отдают — device='' (живой захват #439):
+        (2) HitVPN
+        (Hardware Port: production.hitvpn, Device: )
     """
-    r = _run([NETWORKSETUP, "-listnetworkserviceorder"], 4, runner)
-    if r.get("timeout") or r.get("rc") not in (0, None):
-        return ""
+    pairs = []
     pending_name = ""
-    for raw in (r.get("out") or "").splitlines():
+    for raw in (out or "").splitlines():
         line = raw.strip()
         if line.startswith("(") and "Hardware Port" not in line and ")" in line:
             # "(1) Wi-Fi" -> "Wi-Fi"
@@ -169,14 +177,52 @@ def _service_for_interface(iface, runner):
             # точное имя устройства кончается либо на ')' (последний в строке), либо на ', ' (перед
             # следующим полем, напр. "Ethernet Address: ..."). Парсим значение целиком и сравниваем
             # точным равенством, не подстрокой.
+            device = ""
             marker = "Device: "
             idx = line.find(marker)
             if idx != -1:
                 rest = line[idx + len(marker):]
                 device = rest.split(")", 1)[0].split(",", 1)[0].strip()
-                if device == iface:
-                    return pending_name
-    return ""
+            pairs.append((pending_name, device))
+    return pairs
+
+
+# issue #439: default route через VPN-интерфейс (ipsec0/utunN/pppN). Сам туннель держит
+# ephemeral-сервис, которого в networksetup нет вовсе (живая диагностика #439: primary GUID
+# присутствует только в State-store), а setup-VPN-сервисы Device не отдают. Какой из них
+# держит туннель, из вывода networksetup не определить — фан-аут на все VPN-сервисы:
+# прокси-эндпоинт локальный (127.0.0.1:10808), от дефолтного интерфейса он не зависит.
+_VPN_IFACE_PREFIXES = ("ipsec", "utun", "ppp")
+
+
+def _is_vpn_iface(iface):
+    return any(iface.startswith(prefix) and iface[len(prefix):].isdigit()
+               for prefix in _VPN_IFACE_PREFIXES)
+
+
+def _resolve_services(iface, runner):
+    """-> (services, vpn_fallback). Точный Device-матч → один сервис; VPN-интерфейс без
+    матча → все VPN-сервисы (пустой Device) с vpn_fallback=True; прочее → ([], False)."""
+    r = _run([NETWORKSETUP, "-listnetworkserviceorder"], 4, runner)
+    if r.get("timeout") or r.get("rc") not in (0, None):
+        return [], False
+    pairs = _parse_service_order(r.get("out"))
+    exact = [name for name, device in pairs if device and device == iface]
+    if exact:
+        return exact, False
+    if _is_vpn_iface(iface):
+        return [name for name, device in pairs if name and not device], True
+    return [], False
+
+
+def _services_for_interface(iface, runner):
+    """Network services, на которых должен стоять системный SOCKS для default-интерфейса.
+
+    До #439 возвращался ОДИН сервис по точному Device-матчу; VPN-интерфейс в default route
+    не матчился вовсе → repair/status падали «не найден network service», системный SOCKS
+    никто не включал, приложения оставались direct (401 от OpenAI как «сбой из ниоткуда»).
+    """
+    return _resolve_services(iface, runner)[0]
 
 
 def _read_socks(service, runner):
@@ -201,22 +247,44 @@ def status(*, runner=sys_probe.run):
 
     {status: ok|unknown, interface, service, socks: {...}, target: bool}
     target=True когда endpoint уже наш (127.0.0.1:10808) И канал включён.
+
+    #439: default route через VPN-интерфейс резолвится фан-аутом на ВСЕ VPN-сервисы —
+    service тогда содержит имена через запятую, services — per-service детали
+    ({service, socks}), а target=True требует наш включённый endpoint на каждом:
+    какой из VPN-сервисов primary, из networksetup не видно, частичная настройка
+    гарантии не даёт. detail называет механизм fallback явно (issue: «не молча»).
     """
     iface = _default_interface(runner)
     if not iface:
         return {"status": "unknown", "interface": "", "service": "", "socks": None, "target": False,
                 "detail": "нет активного default route — network service не определён"}
-    service = _service_for_interface(iface, runner)
-    if not service:
+    services, vpn_fallback = _resolve_services(iface, runner)
+    if not services:
         return {"status": "unknown", "interface": iface, "service": "", "socks": None, "target": False,
                 "detail": f"не найден network service для интерфейса {iface}"}
-    socks = _read_socks(service, runner)
-    if socks is None:
-        return {"status": "unknown", "interface": iface, "service": service, "socks": None,
-                "target": False, "detail": f"networksetup -getsocksfirewallproxy {service} не отвечает"}
-    is_target = bool(socks["enabled"] and socks["server"] == TARGET_SERVER
-                      and socks["port"] == TARGET_PORT)
-    return {"status": "ok", "interface": iface, "service": service, "socks": socks, "target": is_target}
+    per_service = []
+    for service in services:
+        socks = _read_socks(service, runner)
+        if socks is None:
+            return {"status": "unknown", "interface": iface, "service": service, "socks": None,
+                    "target": False,
+                    "detail": f"networksetup -getsocksfirewallproxy {service} не отвечает"}
+        per_service.append({"service": service, "socks": socks})
+    is_target = all(e["socks"]["enabled"] and _is_target_endpoint(e["socks"])
+                    for e in per_service)
+    result = {"status": "ok", "interface": iface,
+              "service": ", ".join(e["service"] for e in per_service),
+              "services": per_service,
+              # сводный SOCKS для отображения: первый НЕ наш (ему нужен ремонт), иначе первый
+              "socks": next((e["socks"] for e in per_service
+                             if not (e["socks"]["enabled"] and _is_target_endpoint(e["socks"]))),
+                            per_service[0]["socks"]),
+              "target": is_target}
+    if vpn_fallback:
+        result["detail"] = (f"default route через VPN-интерфейс {iface}: network service не "
+                            f"резолвится по Device, SOCKS применяется ко всем VPN-сервисам "
+                            f"({result['service']})")
+    return result
 
 
 # ============================== lease-хранилище (issue #316) ==============================
@@ -274,6 +342,21 @@ def _is_target_endpoint(socks):
 
 def _same_endpoint(socks, server, port):
     return socks["server"] == server and socks["port"] == port
+
+
+def _aggregate(results):
+    """Сводный результат по per-service операциям (формат restore; repair — многосервисный
+    при default route через VPN, #439). Per-service warning'и всплывают наверх (канон
+    noisy-log-better-than-no-log)."""
+    ok = all(r["ok"] for r in results)
+    warnings = [r["warning"] for r in results if r.get("warning")]
+    return {"ok": ok,
+            "conflict": any(r.get("conflict") for r in results),
+            "err": None if ok else "; ".join(
+                r["err"] for r in results if not r["ok"] and r.get("err")),
+            "changed": any(r.get("changed") for r in results),
+            **({"warning": "; ".join(warnings)} if warnings else {}),
+            "results": results}
 
 
 # ============================== межпроцессный lock (находка 4) ==============================
@@ -370,6 +453,10 @@ def _lock_refusal(path, lock_timeout, status, detail):
 def repair(*, path=None, runner=sys_probe.run, lock_timeout=None):
     """Включить/выставить наш системный SOCKS endpoint на активном network service.
 
+    #439: default route через VPN-интерфейс → сервисов несколько (фан-аут на все VPN-сервисы),
+    repair применяется к каждому с per-service lease/конфликт-семантикой, результат агрегирован
+    (ok/conflict/err/changed/results — как restore).
+
     Идемпотентно: уже настроено и включено -> ok без мутации. Выключен наш endpoint ->
     только `-setsocksfirewallproxystate on` (существующий lease НЕ перезаписывается — чужой
     backup неприкосновенен, #316-3). Чужой ВЫКЛЮЧЕННЫЙ endpoint -> preflight-запись previous в
@@ -392,8 +479,17 @@ def _repair_locked(path, runner):
     if st["status"] != "ok":
         return {"ok": False, "conflict": False, "err": st.get("detail", "система не определена")}
 
-    service = st["service"]
-    socks = st["socks"]
+    # #439: под VPN-default сервисов несколько (фан-аут на все VPN-сервисы) — чиним каждый,
+    # агрегируя per-service результаты (формат restore).
+    results = [{"service": e["service"],
+                **_repair_service(path, leases, e["service"], e["socks"], runner)}
+               for e in st["services"]]
+    return _aggregate(results)
+
+
+def _repair_service(path, leases, service, socks, runner):
+    """Repair одного сервиса (до #439 — всё тело _repair_locked). socks — уже прочитанное
+    состояние сервиса из status(), повторного вызова networksetup не нужно."""
     lease = leases.get(service)
 
     if lease and lease.get("phase") == _PHASE_RESTORING:
@@ -524,15 +620,7 @@ def _restore_locked(path, runner, service):
     for svc in names:
         results.append({"service": svc,
                         **_restore_one(path, leases, svc, runner)})
-    ok = all(r["ok"] for r in results)
-    warnings = [r["warning"] for r in results if r.get("warning")]
-    return {"ok": ok,
-            "conflict": any(r.get("conflict") for r in results),
-            "err": None if ok else "; ".join(r["err"] for r in results if not r["ok"] and r.get("err")),
-            # Per-service warning'и всплывают наверх (AO-review 5110061682; канон
-            # noisy-log-better-than-no-log) — иначе self-heal-расчистка lease невидима.
-            **({"warning": "; ".join(warnings)} if warnings else {}),
-            "results": results}
+    return _aggregate(results)
 
 
 def _restore_one(path, leases, service, runner):
