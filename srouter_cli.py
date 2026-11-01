@@ -39,9 +39,11 @@ import speedtest_store  # speedtest: журнал ручных замеров с
 import node_selector  # node use: two-phase active-node apply (canonical/adopt-surgical)
 from install_lib import (
     CHOICES,
+    COMPONENTS,
     LAUNCHAGENT_LABEL,
     LAUNCHCTL,
     InstallEnv,
+    _conflicts_auto_resolved,
     _has_launchagent_marker,
     _launchd_domain,
     _launchd_is_loaded,
@@ -56,7 +58,6 @@ from install_lib import (
     format_plan,
     format_uninstall_plan,
     _install_generic_launchagent,
-    _reclaimable_resolves_all_conflicts,
     populate_known_markers,
     port_open,
 )
@@ -142,15 +143,6 @@ from claude_wrappers import (
 
 def _prompt_bool(label: str) -> bool:
     return input(f"{label} [y/N]: ").strip().lower() in {"y", "yes", "д", "да"}
-
-
-def _prompt_choice(name: str) -> str:
-    """adopt | overwrite | skip (install_lib.CHOICES)."""
-    while True:
-        answer = input(f"Выбор для {name} [adopt/overwrite/skip]: ").strip().lower()
-        if answer in CHOICES:
-            return answer
-        print("Допустимо: adopt, overwrite, skip.")
 
 
 def _install_file_groups():
@@ -253,8 +245,9 @@ def _remove_optional_features(env, runner):
 def cmd_install(args) -> int:
     """Полная установка стека: brew-сервисы + конфиги + DNS + LaunchAgent.
 
-    Показывает план, при конфликтах (чужие конфиги) спрашивает adopt/overwrite/skip,
-    подтверждает. Делегирует тяжёлую работу в install_lib.apply_install.
+    Показывает план и подтверждает ЕДИНЫМ y/N (#416): чужие конфиги авторазрешаются дефолтным
+    путём (backup → перегенерация → рестарт; план перечисляет перезаписи). Делегирует тяжёлую
+    работу в install_lib.apply_install; adopt/skip — только флагами --<name>.
     """
     env = _env_from_args(args)
     runner = make_privileged_runner(run)
@@ -270,29 +263,24 @@ def cmd_install(args) -> int:
     print(format_plan(plan))
     print()
 
-    # 3) Конфликты → интерактивный выбор per компонент.
-    # reclaimable («свой старый»: state.managed=True, маркер пропал, issue #110 Дефект 2) НЕ попадает
-    # в интерактивный фильтр — он тихо авторазрешается в apply_install (с backup). Иначе non-TTY install
-    # падал rc=2 на «своём старом» сразу после uninstall, даже с -y. НО только если reclaimable покрывает
-    # ВСЕ конфликты (cycle-review #111 cycle 1 finding 2): non_brew_binary и будущие conflict-типы НЕ
-    # поглощаются → остаются в фильтре, требуют adopt/overwrite/skip. Истинно foreign требует выбора.
-    choices = {}
-    conflicts = [(name, item) for name, item in (plan.get("components") or {}).items()
-                 if isinstance(item, dict) and item.get("conflict")
-                 and not _reclaimable_resolves_all_conflicts(item)]
-    if conflicts:
-        if not sys.stdin.isatty():
-            names = ", ".join(n for n, _ in conflicts)
-            print(f"install: обнаружены конфликты ({names}); разрешите вручную или удалите чужие "
-                  f"конфиги.", file=sys.stderr)
-            return 2
-        for name, item in conflicts:
-            reasons = ", ".join(item.get("conflicts") or [])
-            print(f"\nКонфликт по компоненту {name} ({reasons}):")
-            print(f"  config_path: {item.get('config_path')}")
-            print(f"  port_owner:  {item.get('port_owner') or '-'}")
-            choices[name] = _prompt_choice(name)
-        print()
+    # 3) #416: квиз adopt/overwrite/skip упразднён — интерактив только y/N (шаг 4). Конфликты
+    # foreign_config/foreign_port авторазрешаются дефолтным путём в apply_install (backup →
+    # перегенерация → рестарт); план выше перечисляет, что будет перезаписано и где ляжет backup.
+    # Конфликты ВНЕ авто-дефолта (non_brew_binary и будущие типы — cycle-review #111 c1 f2) разрешаются
+    # только явным флагом --<name> adopt|overwrite|skip (для скриптов и edge-кейсов): блок с подсказкой,
+    # без вопросов-слов ни в TTY, ни вне его.
+    choices = {name: getattr(args, name, None) for name in COMPONENTS
+               if getattr(args, name, None) in CHOICES}
+    blocking = [(name, item) for name, item in (plan.get("components") or {}).items()
+                if isinstance(item, dict) and item.get("conflict")
+                and not _conflicts_auto_resolved(item) and name not in choices]
+    if blocking:
+        names = ", ".join(
+            f"{name} ({', '.join(item.get('conflicts') or [])})" for name, item in blocking)
+        flags = " ".join(f"--{name} adopt|overwrite|skip" for name, _ in blocking)
+        print(f"install: конфликт требует явного решения: {names}. Разрешите флагом: {flags}",
+              file=sys.stderr)
+        return 2
 
     # 4) Подтверждение.
     # Не-TTY запуск допустим ТОЛЬКО с -y/--yes (промпт не нужен). Без TTY и без -y — отказ:
@@ -318,6 +306,11 @@ def cmd_install(args) -> int:
         force_endpoint_overwrite=getattr(args, "force_endpoint_overwrite", False),
     )
     if result.get("ok"):
+        # #416: одна строка на перезаписанный компонент — «что перезаписано, где backup».
+        for action in result.get("actions") or []:
+            if action.get("backup"):
+                print(f"{action['component']}: прежний конфиг перезаписан, оригинал сохранён: "
+                      f"{action['backup']}")
         try:
             def tracked(group, action):
                 return _tracked_install(env, files[group], action, record=not legacy_files)
@@ -1725,8 +1718,15 @@ def build_parser() -> argparse.ArgumentParser:
         add_env_flags(p)
         if name in ("install", "uninstall"):
             p.add_argument("-y", "--yes", action="store_true",
-                           help="Подтвердить без интерактивного промпта (конфликты всё равно блокируют).")
+                           help="Подтвердить без интерактивного промпта (неавторазрешимые конфликты "
+                                "всё равно требуют явного флага --<name>).")
         if name == "install":
+            # #416: per-компонентные выборы — ТОЛЬКО флагами (для скриптов/edge-кейсов); интерактив
+            # упрощён до y/N, дефолт для чужих конфигов — backup → перегенерация → рестарт.
+            for component in COMPONENTS:
+                p.add_argument(f"--{component}", choices=CHOICES, default=None,
+                               help=f"Явный выбор для конфликтов {component} (default: авто — "
+                                    f"backup + перегенерация)")
             p.add_argument("--force-endpoint-overwrite", action="store_true",
                            help="Обойти #200 защиту: перезаписать рабочий xray config placeholder'ом "
                                 "(осознанно; обычно запусти `srouter sync` вместо этого).")

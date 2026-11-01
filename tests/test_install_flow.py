@@ -480,6 +480,36 @@ def test_real_text_templates_have_exact_managed_marker():
     assert install_lib._has_marker(root / "templates" / "dnsmasq.conf") is True
 
 
+# ============================ #416: формат плана вместо «выбор обязателен» ============================
+
+def test_format_plan_auto_conflict_announces_backup_overwrite(tmp_path):
+    """#416: авто-конфликт (foreign_config) в плане — объявление перезаписи с backup, не «выбор обязателен»."""
+    plan = {"state_path": "/tmp/s.json", "homebrew": {"available": True},
+            "components": {"privoxy": {"conflict": True, "conflicts": ["foreign_config"],
+                                       "config_path": "/opt/homebrew/etc/privoxy/config",
+                                       "config_managed": False, "service": "none", "port_owner": None}},
+            "launchagent": {}, "state_sections_to_write": [], "backup_suffix": ".srouter-backup-<ts>"}
+
+    text = install_lib.format_plan(plan)
+
+    assert "apply перезапишет с backup /opt/homebrew/etc/privoxy/config.srouter-backup-<ts>" in text
+    assert "выбор обязателен" not in text
+
+
+def test_format_plan_non_auto_conflict_requires_flag(tmp_path):
+    """#416: non_brew_binary в плане — «требуется флаг», без интерактивного выбора."""
+    plan = {"state_path": "/tmp/s.json", "homebrew": {"available": True},
+            "components": {"privoxy": {"conflict": True, "conflicts": ["non_brew_binary"],
+                                       "config_path": "/opt/homebrew/etc/privoxy/config",
+                                       "config_managed": False, "service": "none", "port_owner": None}},
+            "launchagent": {}, "state_sections_to_write": [], "backup_suffix": ".srouter-backup-<ts>"}
+
+    text = install_lib.format_plan(plan)
+
+    assert "требуется флаг --privoxy adopt|overwrite|skip" in text
+    assert "non_brew_binary" in text
+
+
 # ============================ issue #110 Дефект 2: stale-managed = reclaimable (не foreign) ============================
 # install через _inspect_component считает компонент foreign ТОЛЬКО по маркеру в файле (стр.386):
 #   managed = config_path.exists() and _has_marker(config_path)

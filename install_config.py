@@ -281,25 +281,23 @@ def _port_owner(name, runner):
     return {}
 
 
-# Конфликты, которые reclaimable («свой старый»: state.managed=True, маркер пропал) авто-разрешает.
-# cycle-review #111 cycle 1 finding 2: reclaimable покрывает ТОЛЬКО stale-marker-состояние
-# (foreign_config — конфиг без маркера, foreign_port — порт занят). non_brew_binary — отдельная угроза
-# (чужой бинарник рядом), НЕ должна поглощаться reclaimable → install/restart brew-сервиса при живом
-# чужом бинарнике = конкуренция/падение. downstream-фильтры (apply_install, cmd_install) exempt компонент
-# только если reclaimable И ВСЕ его конфликты ∈ RECLAIMABLE_RESOLVES.
-RECLAIMABLE_RESOLVES = frozenset({"foreign_config", "foreign_port"})
+# Конфликты, которые install авторазрешает ДЕФОЛТНЫМ путём (backup → перегенерация → рестарт, #416):
+# foreign_config (чужой/маркер потерян конфиг по нашему пути) и foreign_port (порт занят — рестарт
+# остаётся fail-closed: порт не освободился → restart_failed). non_brew_binary — отдельная угроза
+# (чужой бинарник рядом), перезапись конфига её НЕ решает → требует явного флага --<name>
+# adopt|overwrite|skip (cycle-review #111 cycle 1 finding 2 — граница сохранена #416).
+AUTO_RESOLVES = frozenset({"foreign_config", "foreign_port"})
 
 
-def _reclaimable_resolves_all_conflicts(item):
-    """True если reclaimable-компонент можно авторазрешить без явного adopt/overwrite/skip.
+def _conflicts_auto_resolved(item):
+    """True если ВСЕ конфликты компонента покрываются дефолтным путём install (#416).
 
-    reclaimable должен покрывать КАЖДЫЙ конфликт компонента. non_brew_binary (или будущий conflict-тип)
-    НЕ покрыт → компонент блокируется (требует решения), даже если reclaimable=True.
+    Любой конфликт вне AUTO_RESOLVES (non_brew_binary или будущий тип) → False: компонент
+    блокируется без явного флага. Раньше эту роль играл reclaimable-гейт (#110/#111) — с #416
+    авто-путь распространяется и на истинно foreign конфиги (с обязательным backup).
     """
-    if not item.get("reclaimable"):
-        return False
     conflicts = item.get("conflicts") or []
-    return all(c in RECLAIMABLE_RESOLVES for c in conflicts)
+    return all(c in AUTO_RESOLVES for c in conflicts)
 
 
 def _inspect_component(name, env, runner, port_checker, prior_detected=None):
@@ -522,7 +520,14 @@ def format_plan(plan):
             f"port_owner={item.get('port_owner') or '-'}"
         )
         if item.get("conflicts"):
-            lines.append(f"  выбор обязателен: --{name} adopt|overwrite|skip; причины: {', '.join(item['conflicts'])}")
+            # #416: авто-конфликты идут дефолтным путём (backup → перегенерация → рестарт) под общее
+            # y/N; остальное (non_brew_binary) — только явным флагом, интерактивного квиза больше нет.
+            if _conflicts_auto_resolved(item):
+                lines.append(f"  apply перезапишет с backup {item.get('config_path')}"
+                             + plan.get("backup_suffix", "")
+                             + f"; причины: {', '.join(item['conflicts'])}")
+            else:
+                lines.append(f"  требуется флаг --{name} adopt|overwrite|skip; причины: {', '.join(item['conflicts'])}")
     lines.append("")
     launchagent = plan.get("launchagent") or {}
     lines.append(
@@ -1172,11 +1177,11 @@ def apply_install(env=None, *, confirm=False, choices=None, runner=run, port_che
     unresolved = []
     for name, item in plan["components"].items():
         choice = choices.get(name)
-        # reclaimable («свой старый»: state.managed=True, маркер пропал) — НЕ конфликт для пользователя
-        # (issue #110 Дефект 2): авторазрешается в managed-режим с backup. Иначе non-TTY install падал
-        # rc=2 сразу после uninstall. НО только если reclaimable покрывает ВСЕ конфликты (cycle-review
-        # #111 cycle 1 finding 2): non_brew_binary и будущие conflict-типы НЕ поглощаются → блокируют.
-        if item.get("conflict") and not _reclaimable_resolves_all_conflicts(item) and choice not in CHOICES:
+        # #416: квиз adopt/overwrite/skip упразднён. foreign_config/foreign_port авторазрешаются
+        # дефолтным путём — backup → перегенерация → рестарт (ниже, needs_backup гарантирует копию
+        # оригинала). Блокируют ТОЛЬКО конфликты вне AUTO_RESOLVES (non_brew_binary и будущие типы)
+        # без явного флага: перезапись конфига чужой бинарник не решает (cycle-review #111 c1 f2).
+        if item.get("conflict") and not _conflicts_auto_resolved(item) and choice not in CHOICES:
             unresolved.append(name)
     if unresolved:
         return {"ok": False, "blocked": unresolved, "actions": [], "plan": plan}
@@ -1236,21 +1241,21 @@ def apply_install(env=None, *, confirm=False, choices=None, runner=run, port_che
         if ownership_error:
             return {"ok": False, "blocked": [ownership_error], "actions": actions, "plan": plan}
         config_path = Path(item["config_path"])
-        # backup при overwrite ИЛИ reclaimable (issue #110 Дефект 2). reclaimable = «свой старый»
-        # (state.managed=True, маркер пропал) — ВСЕГДА backup перед перезаписью (канон fail-closed):
-        # если state устарел и под «своим старым» оказался чужой конфиг, он сохранится в .srouter-backup-*.
-        # Без этого (раньше backup только при choice=='overwrite') reclaimable перезаписался бы без бэкапа.
-        needs_backup = config_path.exists() and (
-            (choices.get(name) == "overwrite" and not _has_marker(config_path)) or item.get("reclaimable"))
+        # #416: backup ЛЮБОГО существующего конфига без нашего маркера — единое правило для авто-пути
+        # (foreign/reclaimable), явного overwrite и краёв между ними. Маркерный конфиг — наш
+        # (генератор его писал), его перегенерация не теряет пользовательских данных → без backup.
+        # Прежняя формула (overwrite-ИЛИ-reclaimable) различала «свой старый» и «чужой»; с авторазрешением
+        # #416 различие исчезло, а backup при перезаписи чужого стал обязательным дефолтом.
+        needs_backup = config_path.exists() and not _has_marker(config_path)
         if needs_backup:
             backup = _backup(config_path, env)
             if not backup:
                 return {"ok": False, "blocked": [f"{name}_backup_failed"], "actions": actions, "plan": plan}
             # state-first (issue #124): порядок «backup на диск → state знает → мутация target»
             # обязателен без исключений. Между _backup и следующим оператором, способным завершить
-            # функцию (включая xray endpoint-guard ниже — он бэкапится ДО этой проверки при
-            # choices['xray']=='overwrite'/reclaimable), ничего не должно быть, иначе окно остаётся,
-            # просто уже. Fail-closed: не смогли зафиксировать — не продолжаем, target не мутирован.
+            # функцию (включая xray endpoint-guard ниже — он бэкапится ДО этой проверки), ничего
+            # не должно быть, иначе окно остаётся, просто уже. Fail-closed: не смогли зафиксировать —
+            # не продолжаем, target не мутирован.
             intent_error = _record_backup_intent(env, name, config_path, backup)
             if intent_error:
                 return {"ok": False, "blocked": [f"{name}_backup_state_write_failed"],
@@ -1315,6 +1320,9 @@ def apply_install(env=None, *, confirm=False, choices=None, runner=run, port_che
                 return {"ok": False, "blocked": ["dns_apply_failed"], "error": dns.get("err"),
                         "actions": actions, "plan": plan}
         action = {"component": name, "mode": mode, "changed": True}
+        if backups.get(name):
+            # #416: однострочный отчёт «что перезаписано, где backup» — ссылка в action для CLI/скриптов.
+            action["backup"] = backups[name]
         # noisy-log-better-than-no-log (review #350): best-effort-ротация не роняет install,
         # но её сбой/пропуск обязан быть виден СРАЗУ — в actions и логе, а не только спустя
         # циклы в doctor-грани «накопление» (PR-3) без причины.
@@ -1524,7 +1532,9 @@ def component_facts(name, env, entry, *, config_path=None):
                                                               этого PR: retained-relic прошлого цикла
                                                               не считается — см. _resolve_backup not_before)
       маркер, entry НЕТ, ровно 1        → orphaned_backup   P1-3/F1: обрыв до записи state
-      маркер, entry НЕТ, 0              → leftover          наш конфиг без backup — не гадаем
+      маркер, entry НЕТ, 0              → remove            #416: наш created-конфиг — маркер решает,
+                                                              state — ускоритель, не доказательство
+      маркер, legacy managed, 0         → remove            #416: создан srouter (adopts маркер не несут)
       маркер, >1 backup, state молчит   → ambiguous         не выбираем «свежий»
       БЕЗ маркера, managed              → leftover          stale-managed (#110 Дефект 1)
       БЕЗ маркера, не managed           → none              true-foreign: чужое рядом легитимно (#110)
@@ -1610,13 +1620,15 @@ def component_facts(name, env, entry, *, config_path=None):
     if (managed or created_before_write) and provenance == "created":
         facts["recovery"] = "remove"
         return facts
-    if managed and entry.get("backup"):
-        # state обещает backup, которого на диске нет — состояние неопределённое: удалить нельзя
-        # (вдруг оригинал ещё вернётся), восстановить нечем. Сообщаем, не трогаем.
+    if facts["state_backup_missing"]:
+        # state обещает backup, которого на диске нет — fail-closed #124 (не гейтим на managed:
+        # обещание оригинала есть — удалять нельзя, вдруг оригинал ещё вернётся; восстановить нечем).
         facts["recovery"] = "leftover"
         return facts
-    # Наш конфиг (маркер), но история неизвестна: legacy-state без provenance либо обрыв до любой
-    # записи state и без backup (значит и overwrite не было — терять нечего, но и удалять вслепую
-    # нельзя: канон fail-safe leftover, как created-без-маркера в issue #112 Часть 2).
-    facts["recovery"] = "leftover" if managed or facts["config_present"] else "none"
+    # #416: provenance из файлового маркера. Сюда доходим только с живым маркером — файл писал наш
+    # генератор (adopt-конфиги маркера не несут: adopt не переписывает файл), а backup нет ни на
+    # диске, ни в обещаниях state → восстанавливать нечего → это наш created-конфиг, удалить.
+    # До #416 ветка была leftover/«left untouched»: потеря state навсегда выводила компонент из-под
+    # контроля uninstall (несимметрия из #416: «xray остался висеть», инцидент 2026-10-10).
+    facts["recovery"] = "remove"
     return facts

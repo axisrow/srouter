@@ -40,6 +40,16 @@ Local state should be unified in `srouter.local.json` with sections for nodes, a
 
 For apply/restart flows, use two-phase state: write pending intent, generate/apply/restart, then promote to active only after success. On failure, keep the previous active state and report the error/retry path.
 
+## Install/uninstall — интерактив только y/N (#416)
+
+`srouter install` спрашивает только y/N: конфликты `foreign_config`/`foreign_port` авторазрешаются
+дефолтным путём (backup `.srouter-backup-<ts>` → перегенерация генератором → рестарт, одна строка
+отчёта с путём backup). `adopt`/`skip` — только флагами `--xray|--privoxy|--dnsmasq`; `non_brew_binary`
+без флага блокирует установку (квиза со словами больше нет — не возвращать `_prompt_choice`).
+«Наш ли конфиг» решает файловый маркер, state — ускоритель: uninstall останавливает/откатывает всё
+помеченное маркером даже при утерянном state; fail-closed арбитражи #112/#124 (no-marker leftover,
+ambiguous backups, dead backup-pointers) сохранены для действительно чужого.
+
 ## Testing Guidelines
 
 Tests live under `tests/` (pytest-style, `test_*.py`). Run `pytest` from the repo root; `tests/conftest.py` adds the repo root to `sys.path` so root-level modules import without installing the package. Existing coverage spans local-state helpers, probe helpers, route validation, two-phase apply behavior, and the launchd/uninstall flow. Prefer adding tests there for non-trivial changes.
