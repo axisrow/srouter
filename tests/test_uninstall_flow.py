@@ -746,15 +746,14 @@ def test_apply_uninstall_leftover_empty_when_fully_restored(tmp_path):
 
 
 def test_apply_uninstall_no_leftover_for_fresh_install_without_backup(tmp_path):
-    """cycle-review #111 cycle 2 finding B (регрессия) + #112 legacy-граница: marker-managed БЕЗ
-    provenance → НЕ leftover, НЕ удалён.
+    """cycle-review #111 cycle 2 finding B (регрессия) + #416: marker-managed БЕЗ provenance → удалён.
 
     Сценарий: state БЕЗ provenance (legacy, до #112), managed=True, маркер ЕСТЬ, backup НЕТ.
     - #111 cycle 2 finding B: НЕ leftover (состояние определённое, маркер на месте) → rc=0, не partial.
-    - #112: legacy-без-provenance НЕ удаляется (требует явного provenance='created', чтобы не удалить
-      adopt-конфиг по ошибке). Конфиг оставлен «left untouched» — оператор повторяет install →
-      fresh provenance='created' → uninstall удалит (см. test_uninstall_removes_created_config).
-    Двойная защита: не маскируем под partial (rc=0) И не удаляем вслепую по legacy-state.
+    - #416: «наш ли конфиг» решает маркер, state — ускоритель; backup нет ни на диске, ни в
+      обещаниях state → восстанавливать нечего → УДАЛИТЬ (до #416 консервативно оставляли —
+      конфиг висел вечно). Fail-closed границы #112/#124 (no-marker, ambiguous, dead-pointer)
+      не затронуты.
     """
     env = _env(tmp_path)
     config = env.component_paths("privoxy")["config"]
@@ -776,10 +775,8 @@ def test_apply_uninstall_no_leftover_for_fresh_install_without_backup(tmp_path):
     )
 
     assert result["ok"] is True
-    assert result["leftover"] == [], ("legacy marker-managed без provenance — НЕ leftover: определённое "
-                                      "состояние, rc=0. Deep remove требует явного provenance (см. #112 ч.2).")
-    # #112: legacy-без-provenance НЕ удаляется (консервативно) — конфиг оставлен.
-    assert config.exists(), "legacy state без provenance → конфиг НЕ удалён (требуется fresh install)"
+    assert result["leftover"] == [], "marker-managed без backup — не partial: удаляем чисто (#416)"
+    assert not config.exists(), "#416: маркер без backup = created-конфиг → удалить, не оставлять"
 
 
 def test_main_uninstall_apply_nonzero_when_leftover(tmp_path):
@@ -992,12 +989,13 @@ def test_uninstall_then_install_idempotent_created(tmp_path):
     assert state2["detected_environment"]["dnsmasq"]["management"]["provenance"] == "created"
 
 
-def test_apply_uninstall_legacy_state_without_provenance_left_untouched(tmp_path):
-    """Часть 2 обратная совместимость: state БЕЗ provenance (legacy, до #112) + marker + no backup.
+def test_apply_uninstall_legacy_state_without_provenance_removes(tmp_path):
+    """#416 (замена консервативной ветки #112): legacy state БЕЗ provenance + marker + no backup.
 
-    Консервативно: НЕ removable (требует явного provenance='created') → "left untouched".
-    Не удаляем то, о чём не знаем (srouter мог adopt, не create). Оператор повторяет install →
-    fresh provenance → uninstall удалит. Регресс: legacy-state не сломан новой семантикой.
+    Прежний консерватизм «srouter мог adopt, не create» опровергается конструкцией: adopt-конфиги
+    НЕ несут маркер (маркер пишет только _write_component_config). Маркер ⇒ генератор писал файл;
+    backup нет ни на диске, ни в обещаниях state ⇒ восстанавливать нечего ⇒ created ⇒ удалить.
+    Прежнее «left untouched» оставляло конфиг висеть вечно (несимметрия install/uninstall из #416).
     """
     env = _env(tmp_path)
     config = env.component_paths("privoxy")["config"]
@@ -1018,7 +1016,36 @@ def test_apply_uninstall_legacy_state_without_provenance_left_untouched(tmp_path
     )
 
     assert result["ok"] is True
-    # legacy без provenance → НЕ удаляем (не знаем, created или overwrote) → конфиг оставлен.
-    assert config.exists(), "legacy state без provenance → НЕ удалён (консервативно)"
-    # НЕ leftover (состояние определённое: маркер на месте, srouter владеет) — как свежий install до #112.
-    assert result["leftover"] == [], "legacy marker-managed не leftover (определённое состояние)"
+    assert not config.exists(), "#416: маркер = наш; backup нет → удалить (не «left untouched»)"
+    assert result["leftover"] == [], "определённое состояние — не partial"
+    state = json.loads(env.state_path.read_text(encoding="utf-8"))
+    assert state["detected_environment"]["privoxy"]["management"]["mode"] == "removed"
+
+
+def test_uninstall_removes_marked_config_and_stops_service_without_state_history(tmp_path):
+    """#416 ядро (инцидент 2026-10-10): state утерян/вычищен, маркер жив → uninstall УПРАВЛЯЕТ
+    компонентом: останавливает сервис (brew services stop) и удаляет конфиг, rc=0 без leftover.
+
+    До #416: managed=False из state → сервис не останавливался (xray «остался висеть»), конфиг
+    классифицировался leftover, uninstall репортил partial. Provenance теперь переживает потерю
+    state: файловый маркер — доказательство владения.
+    """
+    env = _env(tmp_path)
+    config = env.component_paths("privoxy")["config"]
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text("# srouter-managed-config-v1\nlisten-address 127.0.0.1:8118\n", encoding="utf-8")
+    _write_state(env, {})  # detected_environment пуст — истории нет
+
+    runner = FakeRunner()
+    result = install_lib.apply_uninstall(
+        env=env,
+        confirmations={"configs": True, "services": True, "dns": True, "launchagent": True},
+        runner=runner,
+    )
+
+    assert result["ok"] is True, f"маркер без state — полноценный rollback, не partial: {result}"
+    assert result["leftover"] == []
+    assert not config.exists(), "наш конфиг удалён"
+    stop_cmds = [c for c in runner.calls if "services" in c and "stop" in c]
+    assert any("privoxy" in c for c in stop_cmds), \
+        "сервис остановлен: stop-гейт пускает по маркеру (removable), не только по state-managed"

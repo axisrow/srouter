@@ -120,6 +120,37 @@ def test_conflict_plan_reports_foreign_config(tmp_path):
     assert b"foreign_config" in plan.stdout
 
 
+def test_conflict_auto_resolves_without_choice(tmp_path):
+    """#416: apply -y БЕЗ per-компонентных флагов на чужом конфиге → rc=0, авто-путь с backup.
+
+    Квиз adopt/overwrite/skip упразднён: дефолт — backup (.srouter-backup-*) → перегенерация →
+    рестарт. Флаги остаются для скриптов (см. test_conflict_resolution_via_explicit_choice).
+    """
+    env = _cli_env(tmp_path)
+    _write_foreign_xray_config(tmp_path)
+    xray_config = tmp_path / "homebrew" / "etc" / "xray" / "config.json"
+    original_content = xray_config.read_text(encoding="utf-8")
+
+    apply = subprocess.run(
+        ["python3", "install_lib.py", "apply", "-y",
+         "--state", env["SROUTER_STATE_PATH"], "--prefix", env["SROUTER_PREFIX"],
+         "--launchagents-dir", env["SROUTER_LAUNCHAGENTS_DIR"]],
+        cwd="/srouter", env=env, capture_output=True, timeout=30,
+    )
+
+    assert apply.returncode == 0, (
+        f"apply -y без выбора должен пройти авто-путём. rc={apply.returncode}\n"
+        f"stdout:\n{apply.stdout.decode(errors='replace')}\n"
+        f"stderr:\n{apply.stderr.decode(errors='replace')}"
+    )
+    backups = list(xray_config.parent.glob("config.json.srouter-backup-*"))
+    assert backups, "авто-путь создаёт backup оригинала"
+    assert backups[0].read_text(encoding="utf-8") == original_content, "backup = исходный чужой конфиг"
+    assert xray_config.read_text(encoding="utf-8") != original_content, "конфиг перегенерирован"
+    state = json.loads(Path(env["SROUTER_STATE_PATH"]).read_text(encoding="utf-8"))
+    assert state["detected_environment"]["xray"]["management"]["mode"] == "managed"
+
+
 @pytest.mark.parametrize("choice", ["overwrite", "adopt", "skip"])
 def test_conflict_resolution_via_explicit_choice(tmp_path, choice):
     """Каждый conflict-resolution choice (adopt/overwrite/skip) реально проходит через CLI, rc=0.

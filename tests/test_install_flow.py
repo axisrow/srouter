@@ -103,18 +103,81 @@ def test_apply_blocks_without_confirm_and_without_writing_state(tmp_path):
     assert not env.state_path.exists()
 
 
-def test_apply_blocks_unresolved_conflict(tmp_path):
+# ============================ issue #416: авто-дефолт вместо квиза adopt/overwrite/skip ============================
+# Прежний контракт: foreign_config/foreign_port без явного выбора БЛОКИРОВАЛИ apply (квиз из трёх
+# слов в TTY, rc=2 в non-TTY). Инцидент 2026-10-10: uninstall → install после сбоя стека упирался в
+# квиз. Новый контракт: дефолтный путь — backup (.srouter-backup-<ts>) → перегенерация → рестарт,
+# без единого слова от пользователя; adopt/skip — только флагами для скриптов/edge-кейсов.
+def test_apply_auto_overwrites_foreign_config_with_backup(tmp_path):
+    """#416: foreign_config без выбора → авто-путь: backup оригинала → конфиг с маркером → rc=ok.
+
+    Раньше: blocked=['privoxy']. Теперь: apply молча проходит дефолтным путём, оригинал
+    сохранён в .srouter-backup-*, action несёт ссылку на backup (отчёт «что перезаписано, где backup»).
+    """
     env = _env(tmp_path)
     config_path = env.component_paths("privoxy")["config"]
     config_path.parent.mkdir(parents=True)
     config_path.write_text("foreign config\n", encoding="utf-8")
 
-    result = install_lib.apply_install(env=env, confirm=True, choices={}, runner=FakeRunner(), port_checker=lambda *_: False)
+    runner = FakeRunner()
+    result = install_lib.apply_install(env=env, confirm=True, choices={},
+                                       runner=runner, port_checker=_port_checker_managed_up(runner.calls))
 
-    assert result["ok"] is False
+    assert result["ok"] is True, f"foreign_config авторазрешается дефолтным путём с backup: {result}"
+    backup_path = config_path.with_name("config.srouter-backup-2026-06-29T000000Z")
+    assert backup_path.read_text(encoding="utf-8") == "foreign config\n", "оригинал сохранён в backup"
+    assert install_lib.MARKER in config_path.read_text(encoding="utf-8"), "конфиг перегенерирован"
+    state = json.loads(env.state_path.read_text(encoding="utf-8"))
+    assert state["detected_environment"]["privoxy"]["management"]["provenance"] == "overwrote"
+    action = next(a for a in result["actions"] if a["component"] == "privoxy")
+    assert action["backup"] == str(backup_path), "action несёт backup для отчёта оператору"
+
+
+def test_apply_auto_resolves_foreign_port_without_choice(tmp_path):
+    """#416: foreign_port (порт занят чужим слушателем, конфига нет) — тоже авто-путь, не блок.
+
+    Перезапись не создаёт backup (файла не было); рестарт остаётся fail-closed (порт не освободился
+    → restart_failed), но это сбой рестарта, а не «выбор обязателен».
+    """
+    env = _env(tmp_path)
+    lsof = "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\nforeign 123 me 5u IPv4 0t0 TCP 127.0.0.1:10808 (LISTEN)\n"
+    runner = FakeRunner({(install_lib.LSOF, "-nP", "-iTCP:10808", "-sTCP:LISTEN"):
+                         {"rc": 0, "out": lsof, "err": "", "timeout": False}})
+
+    result = install_lib.apply_install(env=env, confirm=True, choices={},
+                                       runner=runner, port_checker=_port_checker_managed_up(runner.calls))
+
+    assert result["ok"] is True, f"foreign_port авторазрешается: {result}"
+    assert "xray" not in (result.get("blocked") or [])
+
+
+def test_apply_still_blocks_non_brew_binary_without_explicit_choice(tmp_path, monkeypatch):
+    """#416 граница: non_brew_binary НЕ входит в авто-дефолт — чужой бинарник рядом это не «чужой
+    конфиг», перезапись конфига его не решает; install при живом чужом бинарнике = конкуренция.
+    Требует явного флага (--privoxy adopt|overwrite|skip), квиз больше не спрашивает.
+    """
+    env = _env(tmp_path)
+    config_path = env.component_paths("privoxy")["config"]
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text("foreign config\n", encoding="utf-8")
+    fake_non_brew = tmp_path / "foreign-bin" / "privoxy"
+    fake_non_brew.parent.mkdir(parents=True)
+    fake_non_brew.write_text("#!/bin/sh\n", encoding="utf-8")
+    original_paths = env.component_paths
+
+    def paths_with_non_brew(name):
+        paths = dict(original_paths(name))
+        paths["non_brew"] = [fake_non_brew]
+        return paths
+
+    monkeypatch.setattr(env, "component_paths", paths_with_non_brew)
+
+    result = install_lib.apply_install(env=env, confirm=True, choices={}, runner=FakeRunner(),
+                                       port_checker=lambda *_: False)
+
+    assert result["ok"] is False, "non_brew_binary без флага — блок, не авто-путь"
     assert "privoxy" in result["blocked"]
-    assert config_path.read_text(encoding="utf-8") == "foreign config\n"
-    assert not env.state_path.exists()
+    assert config_path.read_text(encoding="utf-8") == "foreign config\n", "конфиг не тронут"
 
 
 def test_apply_blocks_invalid_traffic_guard_before_writing_xray_config(tmp_path):
@@ -356,44 +419,58 @@ def test_apply_blocks_broken_existing_state_without_overwriting(tmp_path):
     assert env.state_path.read_text(encoding="utf-8") == broken
 
 
-def test_foreign_config_with_marker_substring_is_conflict_and_blocks_apply(tmp_path):
+def test_foreign_config_with_marker_substring_is_still_foreign_and_auto_overwritten(tmp_path):
+    """Подстрока 'srouter-managed' в комментарии ≠ маркер: whole-line-контракт _has_marker.
+
+    До #416: foreign → блок без выбора. Теперь: foreign → авто-перезапись, НО оригинал обязан
+    сохраниться в backup — классификация «чужой» (не «наш по подстроке») остаётся краеугольной.
+    """
     env = _env(tmp_path)
     config_path = env.component_paths("privoxy")["config"]
     config_path.parent.mkdir(parents=True)
     original = "# my own notes about srouter-managed alternatives\nlisten-address 127.0.0.1:8118\n"
     config_path.write_text(original, encoding="utf-8")
 
+    runner = FakeRunner()
     result = install_lib.apply_install(
         env=env,
         confirm=True,
         choices={"xray": "skip", "dnsmasq": "skip"},
-        runner=FakeRunner(),
-        port_checker=lambda *_: False,
+        runner=runner,
+        port_checker=_port_checker_managed_up(runner.calls),
     )
 
-    assert result["ok"] is False
-    assert "privoxy" in result["blocked"]
-    assert config_path.read_text(encoding="utf-8") == original
+    assert result["ok"] is True
+    backups = list(config_path.parent.glob("config.srouter-backup-*"))
+    assert backups and backups[0].read_text(encoding="utf-8") == original, \
+        "оригинал (с подстрокой, но не маркером) сохранён в backup при авто-перезаписи"
+    assert install_lib.MARKER in config_path.read_text(encoding="utf-8")
 
 
-def test_foreign_config_with_marker_like_header_is_conflict_and_blocks_apply(tmp_path):
+def test_foreign_config_with_marker_like_header_is_still_foreign_and_auto_overwritten(tmp_path):
+    """'# srouter-managed: ...' — ПОХОЖАЯ на маркер первая строка, но не равная ему whole-line.
+
+    Тот же контракт, что выше: авто-перезапись с backup (#416), классификация «чужой» сохранена.
+    """
     env = _env(tmp_path)
     config_path = env.component_paths("privoxy")["config"]
     config_path.parent.mkdir(parents=True)
     original = "# srouter-managed: not generated by srouter\nlisten-address 127.0.0.1:8118\n"
     config_path.write_text(original, encoding="utf-8")
 
+    runner = FakeRunner()
     result = install_lib.apply_install(
         env=env,
         confirm=True,
         choices={"xray": "skip", "dnsmasq": "skip"},
-        runner=FakeRunner(),
-        port_checker=lambda *_: False,
+        runner=runner,
+        port_checker=_port_checker_managed_up(runner.calls),
     )
 
-    assert result["ok"] is False
-    assert "privoxy" in result["blocked"]
-    assert config_path.read_text(encoding="utf-8") == original
+    assert result["ok"] is True
+    backups = list(config_path.parent.glob("config.srouter-backup-*"))
+    assert backups and backups[0].read_text(encoding="utf-8") == original
+    assert install_lib.MARKER in config_path.read_text(encoding="utf-8")
 
 
 def test_real_text_templates_have_exact_managed_marker():
@@ -401,6 +478,60 @@ def test_real_text_templates_have_exact_managed_marker():
 
     assert install_lib._has_marker(root / "templates" / "privoxy.config") is True
     assert install_lib._has_marker(root / "templates" / "dnsmasq.conf") is True
+
+
+# ============================ #416: формат плана вместо «выбор обязателен» ============================
+
+def test_format_plan_auto_conflict_announces_backup_overwrite(tmp_path):
+    """#416: авто-конфликт (foreign_config, файл существует) — объявление перезаписи с backup."""
+    plan = {"state_path": "/tmp/s.json", "homebrew": {"available": True},
+            "components": {"privoxy": {"conflict": True, "conflicts": ["foreign_config"],
+                                       "config_present": True,
+                                       "config_path": "/opt/homebrew/etc/privoxy/config",
+                                       "config_managed": False, "service": "none", "port_owner": None}},
+            "launchagent": {}, "state_sections_to_write": [], "backup_suffix": ".srouter-backup-<ts>"}
+
+    text = install_lib.format_plan(plan)
+
+    assert "apply перезапишет с backup /opt/homebrew/etc/privoxy/config.srouter-backup-<ts>" in text
+    assert "выбор обязателен" not in text
+
+
+def test_format_plan_non_auto_conflict_requires_flag(tmp_path):
+    """#416: non_brew_binary в плане — «требуется флаг», без интерактивного выбора."""
+    plan = {"state_path": "/tmp/s.json", "homebrew": {"available": True},
+            "components": {"privoxy": {"conflict": True, "conflicts": ["non_brew_binary"],
+                                       "config_path": "/opt/homebrew/etc/privoxy/config",
+                                       "config_managed": False, "service": "none", "port_owner": None}},
+            "launchagent": {}, "state_sections_to_write": [], "backup_suffix": ".srouter-backup-<ts>"}
+
+    text = install_lib.format_plan(plan)
+
+    assert "требуется флаг --privoxy adopt|overwrite|skip" in text
+    assert "non_brew_binary" in text
+
+
+def test_format_plan_port_conflict_without_config_does_not_promise_backup(tmp_path):
+    """#416 (review PR #442): foreign_port БЕЗ конфига — план не обещает backup (файла нет,
+    needs_backup не сработает), а честно сообщает рестарт на занятом порту.
+
+    План — поверхность согласия для y/N: обещание несуществующего backup = ложное согласие.
+    """
+    plan = {"state_path": "/tmp/s.json", "homebrew": {"available": True},
+            "components": {"privoxy": {"conflict": True, "conflicts": ["foreign_port"],
+                                       "config_present": False,
+                                       "config_path": "/opt/homebrew/etc/privoxy/config",
+                                       "config_managed": False, "service": "none", "port_owner": None}},
+            "launchagent": {}, "state_sections_to_write": [], "backup_suffix": ".srouter-backup-<ts>"}
+
+    text = install_lib.format_plan(plan)
+
+    assert "перезапишет" not in text, "файла нет — обещать backup нельзя"
+    # строка-сабтайтл компонента (два пробела отступа) — именно она поверхность согласия
+    sublines = [line for line in text.splitlines() if line.startswith("  ") and "apply" in line]
+    assert len(sublines) == 1, text
+    assert "srouter-backup" not in sublines[0], f"строка компонента без backup-обещания: {sublines[0]}"
+    assert "рестарт" in sublines[0] and "порт" in sublines[0], f"честный текст про рестарт: {sublines[0]}"
 
 
 # ============================ issue #110 Дефект 2: stale-managed = reclaimable (не foreign) ============================
