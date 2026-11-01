@@ -20,7 +20,7 @@ EXPECTED_OWN_NAMES = {
     "_BOOTSTRAP_MAX_RETRIES", "_BOOTSTRAP_RETRY_DELAY",
     "_PORT_SETTLE_POLL_INTERVAL", "_PORT_SETTLE_MAX_WAIT", "_PORT_UP_MAX_WAIT",
     "_LAUNCHCTL_SERVICE_NOT_FOUND",
-    "RECLAIMABLE_RESOLVES",
+    "AUTO_RESOLVES",
     "_PRIVOXY_PORT", "_XRAY_SOCKS_PORT",
     # классы
     "InstallEnv",
@@ -32,7 +32,7 @@ EXPECTED_OWN_NAMES = {
     # функции — config/discovery/apply
     "_now", "_read_head", "_json_has_marker", "_has_marker",
     "load_known_markers", "populate_known_markers",
-    "_port_owner", "_reclaimable_resolves_all_conflicts", "_inspect_component",
+    "_port_owner", "_conflicts_auto_resolved", "_inspect_component",
     "_discover_network", "_discover_probe_readiness", "_homebrew_available",
     "_privoxy_protected_for_env", "build_plan", "format_plan",
     "_backup", "_record_backup_intent", "discover_backups", "component_facts", "_resolve_backup",
@@ -66,7 +66,7 @@ EXPECTED_CONSTANTS = {
     "LAUNCHAGENT_MARKER": "srouter-managed-launchagent-v1",
     "UNINSTALL_CATEGORIES": ("configs", "services", "dns", "launchagent"),
     "_LAUNCHCTL_SERVICE_NOT_FOUND": 113,
-    "RECLAIMABLE_RESOLVES": frozenset({"foreign_config", "foreign_port"}),
+    "AUTO_RESOLVES": frozenset({"foreign_config", "foreign_port"}),
 }
 
 

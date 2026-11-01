@@ -154,11 +154,17 @@ def test_marker_and_backup_without_state_entry_is_orphaned_backup(tmp_path):
     assert facts["backup"] == str(backup)
 
 
-def test_marker_without_state_and_without_backup_is_leftover(tmp_path):
-    """Наш конфиг, но истории нет и backup нет — не гадаем: ни удалять, ни восстанавливать."""
+def test_marker_without_state_and_without_backup_is_remove(tmp_path):
+    """#416: маркер решает «наш ли конфиг», state — ускоритель, не единственное доказательство.
+
+    Маркер + ни backup на диске, ни обещания в state → восстанавливать нечего, а файл писан нашим
+    генератором (adopt-конфиги маркера не несут) → это created-конфиг, удалить. До #416 — leftover
+    («не гадаем»), из-за чего uninstall при потере state оставлял наш конфиг висеть (инцидент
+    2026-10-10: xray остался после uninstall).
+    """
     env = _env(tmp_path)
     _target(env)
-    assert _facts(env, {})["recovery"] == "leftover"
+    assert _facts(env, {})["recovery"] == "remove"
 
 
 def test_multiple_backups_without_state_hint_is_ambiguous(tmp_path):
@@ -266,21 +272,19 @@ def test_stale_adopted_or_restored_with_live_marker_yields_to_disk_evidence(tmp_
 
 
 @pytest.mark.parametrize("mode", ["adopted", "restored"])
-def test_stale_adopted_or_restored_with_live_marker_but_no_backup_is_leftover(tmp_path, mode):
-    """Граница фикса P1 round 2: живой маркер БЕЗ backup — leftover, не restore/orphaned_backup.
+def test_stale_adopted_or_restored_with_live_marker_but_no_backup_is_remove(tmp_path, mode):
+    """#416: живой маркер без backup перебивает и устаревший adopted/restored-state.
 
-    Маркер жив (target реально наш), но ни backup на диске, ни managed-подтверждения в state —
-    состояние неопределённое (мог быть adopted без последующего overwrite, мог быть interrupted
-    apply без ветки needs_backup). Не гадаем: то же fail-safe правило, что для managed-конфига без
-    provenance/backup (последняя ветка component_facts). Явный тест на то, что фикс НЕ расширяет
-    доверие сверх disk-evidence — только там, где evidence реально есть (маркер + backup вместе).
+    Маркер мог остаться только от РЕАЛЬНОЙ перезаписи нашим генератором (adopt конфиг не пишент);
+    «adopted» в state после этого — устаревшая память (например, install#2 с --privoxy adopt поверх
+    нашего же конфига install#1). Конфиг наш, backup нет → удалить, не leftover. Симметрично
+    правилу «живой маркер бьёт state» из фикса P1 round 2.
     """
     env = _env(tmp_path)
     target = _target(env)  # маркер живой, backup рядом НЕ создаём
     facts = _facts(env, _entry(target, mode=mode, managed=False))
-    assert facts["recovery"] == "leftover", (
-        "живой маркер без backup — недостаточно evidence для restore/orphaned_backup; "
-        "не подтверждённое действие → leftover, а не молчаливое 'none'"
+    assert facts["recovery"] == "remove", (
+        "живой маркер без backup = наш created-конфиг независимо от устаревшего state-режима"
     )
 
 
@@ -326,7 +330,9 @@ def test_backup_discovery_is_scoped_to_its_own_config_path(tmp_path):
     _backup_next_to(xray)  # backup ТОЛЬКО для xray
 
     assert install_lib.discover_backups(privoxy) == [], "чужой backup не виден для privoxy"
-    assert _facts(env, {}, name="privoxy")["recovery"] == "leftover"
+    assert _facts(env, {}, name="privoxy")["recovery"] == "remove", (
+        "маркер на privoxy есть, backup'ов его нет → наш created-конфиг (#416)"
+    )
 
 
 # ==================== cycle-review: retained backup от прошлого install-цикла (P1) ====================
