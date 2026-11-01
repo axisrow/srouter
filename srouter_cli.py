@@ -1287,11 +1287,22 @@ def cmd_system_proxy(args) -> int:
         if st["status"] != "ok":
             print(f"system-proxy: {st.get('detail', 'состояние не определено')}", file=sys.stderr)
             return 1
-        socks = st["socks"]
         marker = "✅ (target)" if st["target"] else "⚠️"
         print(f"system-proxy: сервис={st['service']} (interface={st['interface']}) {marker}")
-        print(f"  SOCKS: enabled={socks['enabled']} {socks['server']}:{socks['port']} "
-              f"authenticated={socks['authenticated']}")
+        if st.get("detail"):
+            # #439: VPN-fallback обязан быть назван явно, не молча (issue).
+            print(f"  {st['detail']}")
+        services = st.get("services") or []
+        if len(services) > 1:
+            # #439: VPN-фан-аут — per-service состояние, не только сводный SOCKS первого.
+            for e in services:
+                s = e["socks"]
+                print(f"  {e['service']}: enabled={s['enabled']} {s['server']}:{s['port']} "
+                      f"authenticated={s['authenticated']}")
+        else:
+            socks = st["socks"]
+            print(f"  SOCKS: enabled={socks['enabled']} {socks['server']}:{socks['port']} "
+                  f"authenticated={socks['authenticated']}")
         return 0 if st["target"] else 1
 
     if action == "repair":
