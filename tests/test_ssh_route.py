@@ -193,6 +193,37 @@ def test_refuses_without_managed_rule(tmp_path):
     assert calls == []
 
 
+def test_ambiguous_ssh_rules_refuse_on_and_off(tmp_path):
+    """Дубль маркера _srouter_ssh (ручная правка) → refuse по канону ambiguous_managed_rules.
+
+    Без гварда: on вставил бы ТРЕТЬЕ правило, off сделал бы rules.pop(-2) — удалил бы
+    произвольное чужое правило с записью конфига и рестартом xray (ревью PR #451).
+    """
+    cfg_p = tmp_path / "config.json"
+    _write_cfg(cfg_p, ["domain:example.com"])
+    data = json.loads(cfg_p.read_text(encoding="utf-8"))
+    dup = {"type": "field", "port": "22", "outboundTag": "direct", SSH_ROUTE_MARKER: True}
+    data["routing"]["rules"].append(dict(dup))
+    data["routing"]["rules"].append(dict(dup))  # дубль маркера — эмуляция ручной правки
+    cfg_p.write_text(json.dumps(data), encoding="utf-8")
+    before = cfg_p.read_bytes()
+    state_p = tmp_path / "srouter.local.json"
+    _write_state(state_p)
+    calls = []
+
+    for action in ("on", "off"):
+        out = local_state_routing.ssh_route(
+            action, config_path=cfg_p, state_path=state_p,
+            runner=_ok_runner(calls), port_checker=_port_checker_settle_then_up())
+        assert out["ok"] is False, out
+        assert out["err"] == "ambiguous_ssh_rules", out
+        assert cfg_p.read_bytes() == before, f"{action}: конфиг не тронут"
+    assert calls == [], "рестарт не зван"
+    # status — та же fail-closed симметрия (не «on: False» при двух правилах)
+    st = local_state_routing.ssh_route_status(config_path=cfg_p)
+    assert st == {"ok": False, "err": "ambiguous_ssh_rules"}, st
+
+
 # ============================ status / coexistence ============================
 
 

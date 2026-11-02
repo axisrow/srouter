@@ -230,7 +230,8 @@ def audit(config_path=None, *, home=None, socks_port=None):
     if unverifiable:
         detail = (f"Match с невычислимыми критериями задаёт ProxyCommand ({', '.join(unverifiable)}) "
                   f"— проверьте вручную" + (f"; {detail}" if detail else ""))
-        status = "warn"
+        if status != "down":  # down не затирается: реальный обход туннеля серьёзнее невычислимости
+            status = "warn"
     if status == "ok":
         defaults = effective_params("srouter-default.invalid", sections)
         try:

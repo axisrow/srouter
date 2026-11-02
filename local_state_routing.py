@@ -583,7 +583,10 @@ def ssh_route_status(config_path=None):
     rules = routing.get("rules") if isinstance(routing, dict) else None
     if not isinstance(rules, list):
         return {"ok": False, "err": "no_routing_rules"}
-    return {"ok": True, "on": _rule_index_by_marker(rules, SSH_ROUTE_MARKER) >= 0}
+    idx = _rule_index_by_marker(rules, SSH_ROUTE_MARKER)
+    if idx == -2:  # дубль маркера — fail-closed симметрично ssh_route (не «выключено»)
+        return {"ok": False, "err": "ambiguous_ssh_rules"}
+    return {"ok": True, "on": idx >= 0}
 
 
 def ssh_route(action, *, config_path=None, state_path=None, runner=None,
@@ -627,6 +630,10 @@ def _ssh_route_locked(action, config_path, runner, port_checker, outbound):
         return {"ok": False, "changed": False, "step": "read", "err": "ambiguous_managed_rules"}
 
     s_idx = _rule_index_by_marker(rules, SSH_ROUTE_MARKER)
+    if s_idx == -2:
+        # дубль маркера (ручная правка конфига): on вставил бы третье правило, off сделал бы
+        # rules.pop(-2) и удалил произвольное чужое правило — refuse по канону ambiguous_managed_rules
+        return {"ok": False, "changed": False, "step": "read", "err": "ambiguous_ssh_rules"}
     if action == "on":
         if s_idx >= 0:
             if rules[s_idx].get("outboundTag") == outbound:

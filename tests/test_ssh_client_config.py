@@ -169,6 +169,29 @@ Host *
     assert "Match" in out["detail"]
 
 
+def test_audit_down_wins_over_unverifiable_match(tmp_path):
+    """Offenders (хост мимо туннеля) не затираются warn'ом unverifiable-Match (ревью PR #451).
+
+    Down — максимальная серьёзность: реальный обход туннеля важнее невычислимости Match;
+    сам Match при этом остаётся упомянутым в detail."""
+    _home(tmp_path, f"""\
+Match exec /usr/bin/choose-proxy
+    ProxyCommand {NC}
+
+Host work
+    ProxyCommand none
+
+Host *
+    ProxyCommand {NC}
+    ServerAliveInterval 15
+    ServerAliveCountMax 4
+""")
+    out = scc.audit(home=tmp_path)
+    assert out["status"] == "down", out
+    assert "work" in out["detail"], "offender назван"
+    assert "Match" in out["detail"], "unverifiable тоже упомянут"
+
+
 def test_audit_never_raises_on_garbage(tmp_path):
     _home(tmp_path, "\n\nKeyWithoutValue\n!!!\n")
     out = scc.audit(home=tmp_path)
