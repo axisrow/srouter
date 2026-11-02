@@ -1446,6 +1446,15 @@ def test_local_proxy_down_when_port_closed(monkeypatch):
         or "closed" in result["detail"].lower(), "detail объясняет: крах (port закрыт)"
 
 
+def _mock_legacy_privoxy_label(monkeypatch):
+    """Резолв brew-лейблов privoxy (2026-10-29) пиним к legacy: ни одного plist на диске →
+    _privoxy_brew_label() = homebrew.mxcl.privoxy. Без мока резолв читает РЕАЛЬНЫЙ
+    ~/Library/LaunchAgents (на sh.brew-машине вернёт sh.brew.privoxy, и label-keyed моки
+    _service_running разъедутся) — канон unmocked-probe-is-machine-dependent."""
+    monkeypatch.setattr(health, "_user_launchagent_plist",
+                        lambda label: Path("/nonexistent-srouter-mock") / f"{label}.plist")
+
+
 def test_local_proxy_zombie_when_port_open_but_service_not_running(monkeypatch):
     """ДЫРА #204: port open + service NOT running → ЗОМБИ. Порт слушается (кем-то), но launchd-сервис
     не Running → privoxy-процесс отвалился от launchd (orphan) либо порт занят чужим. Раньше
@@ -1453,6 +1462,7 @@ def test_local_proxy_zombie_when_port_open_but_service_not_running(monkeypatch):
     статична → re-check подтверждает not_running; backoff гасим (unit-тест, не sleep-тест)."""
     monkeypatch.setattr(health, "_port_up", lambda port: True)
     monkeypatch.setattr(health, "_zombie_recheck_delay", lambda: None)
+    _mock_legacy_privoxy_label(monkeypatch)
 
     def fake_running(label, domain=None):
         return "not_running" if label == health.PRIVOXY_SYSTEM_LABEL or label == "homebrew.mxcl.privoxy" else "running"
@@ -1494,6 +1504,7 @@ def test_local_proxy_zombie_requires_confirmed_not_running(monkeypatch):
     #330: подтверждение теперь двусрезное (re-check); backoff гасим (unit-тест)."""
     monkeypatch.setattr(health, "_port_up", lambda port: True)
     monkeypatch.setattr(health, "_zombie_recheck_delay", lambda: None)
+    _mock_legacy_privoxy_label(monkeypatch)
     monkeypatch.setattr(health, "_service_running", lambda label, domain=None: "not_running"
                         if (label == health.PRIVOXY_SYSTEM_LABEL or label == "homebrew.mxcl.privoxy")
                         else "running")
@@ -1515,6 +1526,7 @@ def test_local_proxy_not_zombie_when_brew_registration_running(monkeypatch):
     monkeypatch.setattr(health, "_zombie_recheck_delay", lambda: None)
     monkeypatch.setattr(privoxy_system, "protection_present",
                         lambda layout=privoxy_system.DEFAULT_LAYOUT: True)
+    _mock_legacy_privoxy_label(monkeypatch)
 
     def fake_running(label, domain=None):
         if label == health.PRIVOXY_SYSTEM_LABEL and domain == "system":
@@ -1538,6 +1550,7 @@ def test_local_proxy_not_zombie_when_protected_registration_running(monkeypatch)
     monkeypatch.setattr(health, "_zombie_recheck_delay", lambda: None)
     monkeypatch.setattr(privoxy_system, "protection_present",
                         lambda layout=privoxy_system.DEFAULT_LAYOUT: False)
+    _mock_legacy_privoxy_label(monkeypatch)
 
     def fake_running(label, domain=None):
         if label == health.PRIVOXY_BREW_LABEL:
@@ -1720,6 +1733,87 @@ def test_local_proxy_true_zombie_without_any_xray_registration(monkeypatch):
     assert "xray зомби" in result["detail"].lower()
 
 
+# Миграция brew-лейблов 2026-10-29 (privoxy-сестра #368): свежие brew services регистрируют
+# privoxy как sh.brew.privoxy (plist sh.brew.privoxy.plist), legacy — homebrew.mxcl.privoxy.
+# Захардкоженный legacy-label даёт ложного зомби + ложный «plist отсутствует» на sh.brew-машине
+# (стенограмма 2026-10-29: brew services restart privoxy вылечил туннель, launchd registration
+# sh.brew.privoxy.plist state=running — а doctor продолжил warning'ить по legacy-имени).
+def test_privoxy_service_target_prefers_sh_brew_when_both_plists_exist(monkeypatch, tmp_path):
+    """Обе регистрации на диске → sh.brew.privoxy (актуальный brew — приоритет резолва)."""
+    agents = tmp_path / "LaunchAgents"
+    agents.mkdir()
+    for label in ("sh.brew.privoxy", "homebrew.mxcl.privoxy"):
+        (agents / f"{label}.plist").write_text("<plist/>", encoding="utf-8")
+    monkeypatch.setattr(health, "_user_launchagent_plist", lambda label: agents / f"{label}.plist")
+    monkeypatch.setattr(health.privoxy_system, "protection_present", lambda: False)
+    label, domain = health._privoxy_service_target()
+    assert label == "sh.brew.privoxy"
+    assert domain == f"gui/{os.getuid()}", "brew-mode — домен user-agent, как раньше"
+
+
+def test_privoxy_service_target_falls_back_to_legacy_when_only_legacy_plist(monkeypatch, tmp_path):
+    """Машина до апгрейда brew (legacy-plist единственный) → homebrew.mxcl.privoxy."""
+    agents = tmp_path / "LaunchAgents"
+    agents.mkdir()
+    (agents / "homebrew.mxcl.privoxy.plist").write_text("<plist/>", encoding="utf-8")
+    monkeypatch.setattr(health, "_user_launchagent_plist", lambda label: agents / f"{label}.plist")
+    monkeypatch.setattr(health.privoxy_system, "protection_present", lambda: False)
+    assert health._privoxy_service_target()[0] == "homebrew.mxcl.privoxy"
+
+
+def test_privoxy_service_target_falls_back_to_legacy_when_no_plists(monkeypatch):
+    """Ни одной регистрации (настоящий orphan) → legacy fallback — вердикты «нет регистрации»
+    (зомби при живом порте, warn персистентности) не ослабляются."""
+    _mock_no_registrations(monkeypatch)
+    assert health._privoxy_service_target()[0] == "homebrew.mxcl.privoxy"
+
+
+def test_local_proxy_up_green_with_sh_brew_privoxy_registration(monkeypatch, tmp_path):
+    """ГЛАВНЫЙ red→green: sh.brew-машина (launchctl по legacy-label privoxy отвечает
+    «не загружен», реальная sh.brew-регистрация running) → probe ok. До фикса: label
+    homebrew.mxcl.privoxy → not_running + порт жив → ложный зомби (down)."""
+    def fake_run(cmd, timeout):
+        joined = " ".join(cmd)
+        if "homebrew.mxcl.privoxy" in joined:
+            return {"rc": 3, "out": "", "err": "not loaded", "timeout": False}
+        if "sh.brew.privoxy" in joined:
+            return {"rc": 0, "out": "\tstate = running\n\tpid = 46123\n", "err": "", "timeout": False}
+        if "com.srouter.privoxy" in joined:
+            # system-регистрации на brew-машине нет — альтернатива #341 не Running.
+            return {"rc": 3, "out": "", "err": "not loaded", "timeout": False}
+        return {"rc": 0, "out": "\tstate = running;\n", "err": "", "timeout": False}  # xray legacy
+
+    monkeypatch.setattr(health, "_port_up", lambda port: True)
+    monkeypatch.setattr(health, "_zombie_recheck_delay", lambda: None)
+    monkeypatch.setattr(health.privoxy_system, "protection_present", lambda: False)
+    monkeypatch.setattr(health.sys_probe, "run", fake_run)
+    agents = tmp_path / "LaunchAgents"
+    agents.mkdir()
+    (agents / "sh.brew.privoxy.plist").write_text("<plist/>", encoding="utf-8")
+    monkeypatch.setattr(health, "_user_launchagent_plist", lambda label: agents / f"{label}.plist")
+    result = health._local_proxy_up()
+    assert result["status"] == "ok", "sh.brew-регистрация privoxy running → НЕ зомби"
+    assert "зомби" not in result["detail"].lower()
+
+
+def test_boot_persistence_ok_with_sh_brew_privoxy_registration(monkeypatch, tmp_path):
+    """sh.brew-машина (legacy-plist privoxy отсутствует) → plist резолвится через
+    sh.brew.privoxy.plist → ok. До фикса: путь строился по legacy-label → ложный warn
+    «plist отсутствует — после перезагрузки не поднимется»."""
+    monkeypatch.setattr(health, "_port_up", lambda port: True)
+    monkeypatch.setattr(health.sys_probe, "run", lambda cmd, timeout:
+                        {"rc": 0, "out": "\tstate = running;\n\tpid = 1;\n", "err": "", "timeout": False})
+    monkeypatch.setattr(health.privoxy_system, "protection_present", lambda: False)
+    agents = tmp_path / "LaunchAgents"
+    agents.mkdir()
+    for label in ("sh.brew.privoxy", "homebrew.mxcl.xray"):
+        (agents / f"{label}.plist").write_text("<plist/>", encoding="utf-8")
+    monkeypatch.setattr(health, "_user_launchagent_plist", lambda label: agents / f"{label}.plist")
+    result = health._local_proxy_boot_persistence()
+    assert result["status"] == "ok", "sh.brew-plist privoxy на диске + job загружен → ok"
+    assert "не поднимется" not in result["detail"].lower()
+
+
 def test_check_all_surfaces_registration_mode_facet_as_info(monkeypatch):
     """#341: грань режима регистрации попадает в check_all как ОТДЕЛЬНЫЙ info-only warn —
     ok=False (это предупреждение, не подтверждение здоровья — канон #225), info=True (не driver)."""
@@ -1824,6 +1918,7 @@ def test_local_proxy_zombie_confirmed_when_recheck_still_not_running(monkeypatch
     реальный orphan — детектор не превращается в всегда-зелёный, канон detector-is-function)."""
     monkeypatch.setattr(health, "_port_up", lambda port: True)
     monkeypatch.setattr(health, "_zombie_recheck_delay", lambda: None)
+    _mock_legacy_privoxy_label(monkeypatch)
     monkeypatch.setattr(health, "_service_running", lambda label, domain=None:
                         "not_running" if label in (health.PRIVOXY_SYSTEM_LABEL, health.PRIVOXY_BREW_LABEL)
                         else "running")
