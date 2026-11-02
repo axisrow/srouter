@@ -223,6 +223,16 @@ def _all_up_monkey(monkeypatch, *, probe_status="ok", probe_detail="runtime: к�
     monkeypatch.setattr(health, "_backup_slots_probe",
                         lambda: {"status": "ok", "detail": "mock: бэкап-слоты консистентны",
                                  "findings": []})
+    # #445: liveness-чеки watchdog'а/keeper'а читают живой /tmp-heartbeat + ~/Library/LaunchAgents
+    # (dev-машина: watchdog установлен и тикает; CI: ничего не установлено) — мокаем ok/info,
+    # иначе machine state (свежесть heartbeat, наличие плит) драйвит вердикт недетерминированно.
+    # Сценарные тесты самих чеков — tests/test_watchdog_keeper.py (мокают пути, не функции).
+    monkeypatch.setattr(health, "_watchdog_liveness_check",
+                        lambda: {"id": "watchdog", "name": "watchdog (heartbeat)", "ok": True,
+                                 "info": True, "detail": "mock: heartbeat свежий"})
+    monkeypatch.setattr(health, "_watchdog_keeper_liveness_check",
+                        lambda: {"id": "watchdog-keeper", "name": "watchdog-keeper (heartbeat)",
+                                 "ok": True, "info": True, "detail": "mock: keeper тикает"})
 
 
 # ============================ _claude_proxy_probe (детект lsof) ============================

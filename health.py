@@ -93,6 +93,35 @@ _DEGRADED_NOTIFY_COOLDOWN_ENV = "SROUTER_WATCHDOG_DEGRADED_COOLDOWN"
 _DOWN_NOTIFY_COOLDOWN_DEFAULT_SEC = 600
 _DOWN_NOTIFY_COOLDOWN_ENV = "SROUTER_WATCHDOG_DOWN_COOLDOWN"
 
+# #445 (инцидент 02.11): keeper watchdog'а — монитор монитора. «Watchdog умер тихо» из
+# issue оказался misdiagnosis (метрики писались весь день; job state=exited — норма между
+# тиками cron-джобы), но дыра реальна: при ПОСТОЯННОЙ смерти watchdog'а (битый деплой в
+# главный чекаут — он и есть live-путь для launchd; апгрейд python framework; unload)
+# никто не узнает. Keeper = второй launchd-cron (300с): heartbeat = mtime WATCHDOG_STATE
+# (пишется каждым прогоном watchdog'а), push «Упало: watchdog» по канону пар #315/#380 —
+# recovery только после прозвучавшего down, cooldown против флапа, sleep-guard (keeper сам
+# не тикал во сне → смерть не доказана). Cron-канон self-heal: StartInterval=20 УЖЕ
+# перезапускает упавший watchdog (тик ≤20с, эмпирия 02.11: crash-окна git-merge
+# self-heal'ились за 1 тик); KeepAlive в plist НЕ добавлять — exit 1 на degraded-прогоне
+# дал бы tight-loop check_all-спинов.
+WATCHDOG_LABEL = "com.srouter.watchdog"
+WATCHDOG_KEEPER_LABEL = "com.srouter.watchdog-keeper"
+WATCHDOG_KEEPER_STATE = Path("/tmp/srouter-watchdog.keeper.json")
+WATCHDOG_PLIST = Path.home() / "Library" / "LaunchAgents" / f"{WATCHDOG_LABEL}.plist"
+WATCHDOG_KEEPER_PLIST = (Path.home() / "Library" / "LaunchAgents"
+                         / f"{WATCHDOG_KEEPER_LABEL}.plist")
+# Грация после собственного простоя keeper'а (сон/загрузка): heartbeat не старше пропуска
+# keeper'а + 120с — смерть не доказана (после пробуждения тик watchdog'а догоняет).
+_WATCHDOG_KEEPER_GRACE_SEC = 120
+_WATCHDOG_HEARTBEAT_STALE_DEFAULT_SEC = 300
+_WATCHDOG_HEARTBEAT_STALE_ENV = "SROUTER_WATCHDOG_HEARTBEAT_STALE"
+_KEEPER_DOWN_COOLDOWN_DEFAULT_SEC = 900
+_KEEPER_DOWN_COOLDOWN_ENV = "SROUTER_WATCHDOG_KEEPER_COOLDOWN"
+# Doctor-чек keeper'а: молчание длиннее 5 пропущенных тиков (300с×5 + запас) при свежем
+# watchdog-heartbeat (машина бодрая) = keeper мёртв.
+_KEEPER_MAX_SILENCE_DEFAULT_SEC = 1800
+_KEEPER_MAX_SILENCE_ENV = "SROUTER_WATCHDOG_KEEPER_MAX_SILENCE"
+
 # #358 п.2: анти-флап гистерезис — смена состава пушится только после N проб подряд
 # с одним и тем же новым составом (probe-интервал ~20с → окно ~40с при N=2). Фильтр на
 # входе; cooldown (#326) остаётся верхней границей частоты поверх него. 1 = легаси.
@@ -288,6 +317,73 @@ def _dashboard_check():
     return chk
 
 
+def _watchdog_liveness_check():
+    """#445: жив ли сам watchdog — heartbeat (mtime WATCHDOG_STATE) + launchd-форензика.
+
+    «Молчание журнала» (status.jsonl пишет только переходы) перестаёт быть невидимым:
+    doctor/health видят протухший heartbeat как симптом. Дешёвая happy-путь (exists+stat);
+    subprocess (launchctl print) — только на failure-path (паттерн _dashboard_check).
+    ok=False DRIVER только на ДОКАЗАННОЙ смерти: heartbeat протух сверх порога либо джоба
+    выгружена из launchd. Остальное — info (машина без watchdog'а; /tmp очищен при живых
+    тиках — первый тик перепишет) — не роняет вердикт (канон #329 «легитимная
+    конфигурация», machine-independence тестов).
+    """
+    now = time.time()
+    if not WATCHDOG_PLIST.exists():
+        return {"id": "watchdog", "name": "watchdog (heartbeat)", "ok": True, "info": True,
+                "detail": "watchdog не установлен (srouter install поставит)"}
+    age = _heartbeat_age_sec(WATCHDOG_STATE, now)
+    stale = _watchdog_heartbeat_stale_sec()
+    if age is None:
+        snap = _launchd_job_snapshot(WATCHDOG_LABEL)
+        if not snap.get("loaded"):
+            return {"id": "watchdog", "name": "watchdog (heartbeat)", "ok": False,
+                    "detail": "watchdog-плит есть, но джоба не загружена в launchd — "
+                              "машина слепа; ремонт: srouter install"}
+        return {"id": "watchdog", "name": "watchdog (heartbeat)", "ok": True, "info": True,
+                "detail": "heartbeat-файла нет (первый тик ≤20с или /tmp очищен — "
+                          "джоба тикает, runs=" + str(snap.get("runs")) + ")"}
+    if age > stale:
+        return {"id": "watchdog", "name": "watchdog (heartbeat)", "ok": False,
+                "detail": f"heartbeat устарел на {int(age)}с (> {stale}с) — watchdog не "
+                          "тикает (crash-loop/завис/unload); ремонт: launchctl kickstart "
+                          f"-k gui/{os.getuid()}/{WATCHDOG_LABEL}, диагностика: srouter doctor"}
+    return {"id": "watchdog", "name": f"watchdog (heartbeat {int(age)}с назад)",
+            "ok": True, "info": True, "detail": f"heartbeat свежий ({int(age)}с)"}
+
+
+def _watchdog_keeper_liveness_check():
+    """#445: жив ли keeper (монитор монитора). Driver ТОЛЬКО при свежем watchdog-heartbeat
+    (машина заведомо бодрая): оба heartbeat старые → машина спала/не тикала, keeper не
+    доказанно мёртв (sleep-guard, симметрично вердикту keeper'а) — info."""
+    now = time.time()
+    if not WATCHDOG_KEEPER_PLIST.exists():
+        return {"id": "watchdog-keeper", "name": "watchdog-keeper (heartbeat)", "ok": True,
+                "info": True,
+                "detail": "keeper не установлен — пуш при потере heartbeat watchdog'а "
+                          "недоступен (srouter install поставит)"}
+    kage = _heartbeat_age_sec(WATCHDOG_KEEPER_STATE, now)
+    if kage is None:
+        return {"id": "watchdog-keeper", "name": "watchdog-keeper (heartbeat)", "ok": True,
+                "info": True, "detail": "keeper ещё не тикал (первый тик ≤5 мин)"}
+    silence = _keeper_max_silence_sec()
+    if kage > silence:
+        hb_age = _heartbeat_age_sec(WATCHDOG_STATE, now)
+        if hb_age is not None and hb_age <= _watchdog_heartbeat_stale_sec():
+            return {"id": "watchdog-keeper", "name": "watchdog-keeper (heartbeat)",
+                    "ok": False,
+                    "detail": f"keeper молчит {int(kage)}с (> {silence}с) при свежем "
+                              "watchdog-heartbeat — монитор монитора мёртв; ремонт: "
+                              "srouter install"}
+        return {"id": "watchdog-keeper", "name": "watchdog-keeper (heartbeat)", "ok": True,
+                "info": True,
+                "detail": f"keeper молчит {int(kage)}с, но watchdog-heartbeat тоже стар — "
+                          "машина спала/не тикала, ложной тревоги нет"}
+    return {"id": "watchdog-keeper",
+            "name": f"watchdog-keeper (heartbeat {int(kage)}с назад)",
+            "ok": True, "info": True, "detail": f"keeper heartbeat свежий ({int(kage)}с)"}
+
+
 def check_all(*, active_claude=False):
     """Все проверки стека. {status: ok|degraded|down, checks: [{name, ok, detail?, info?}]}.
 
@@ -299,6 +395,10 @@ def check_all(*, active_claude=False):
     checks.append({"name": f"privoxy ({PRIVOXY_PORT})", "ok": _port_up(PRIVOXY_PORT)})
     checks.append({"name": f"xray ({XRAY_PORT})", "ok": _port_up(XRAY_PORT)})
     checks.append(_dashboard_check())
+    # #445: жив ли сам монитор — doctor/health видят молчание watchdog'а как симптом
+    # (driver только на доказанной смерти; на здоровых машинах info — агрегацию не трогает).
+    checks.append(_watchdog_liveness_check())
+    checks.append(_watchdog_keeper_liveness_check())
     tun_ok, tun_detail, tun_vendor_outage, tun_timings = _tunnel_up(
         extra_targets=_metrics_probe_options()["metrics_targets"])
     # #207: vendor outage (оба вендора HTTP 5xx = канал жив, вендоры лежат) структурно помечаем
@@ -1432,6 +1532,44 @@ def _down_notify_cooldown_sec():
         return _DOWN_NOTIFY_COOLDOWN_DEFAULT_SEC
 
 
+def _env_seconds(name, default, lo, hi):
+    """Секунды из env: clamp [lo, hi], мусор/отсутствие → дефолт (#445, канон more-options-better)."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return max(lo, min(hi, int(raw)))
+    except ValueError:
+        return default
+
+
+def _watchdog_heartbeat_stale_sec():
+    """Порог «heartbeat протух» (#445): 60..3600с, дефолт 300 (5 мин — «дольше N минут»
+    из issue; тик watchdog'а 20с, throttle метрик 60с → 300с = 15 пропущенных тиков)."""
+    return _env_seconds(_WATCHDOG_HEARTBEAT_STALE_ENV,
+                        _WATCHDOG_HEARTBEAT_STALE_DEFAULT_SEC, 60, 3600)
+
+
+def _keeper_cooldown_sec():
+    """Cooldown повторных «Упало: watchdog» keeper'а: 0..86400с, дефолт 900 (как degraded)."""
+    return _env_seconds(_KEEPER_DOWN_COOLDOWN_ENV,
+                        _KEEPER_DOWN_COOLDOWN_DEFAULT_SEC, 0, 86400)
+
+
+def _keeper_max_silence_sec():
+    """Порог молчания keeper'а для doctor-чека: 300..86400с, дефолт 1800."""
+    return _env_seconds(_KEEPER_MAX_SILENCE_ENV,
+                        _KEEPER_MAX_SILENCE_DEFAULT_SEC, 300, 86400)
+
+
+def _heartbeat_age_sec(path, now):
+    """Возраст heartbeat-файла в секундах или None (нет файла/не читается). Не бросает."""
+    try:
+        return max(0.0, now - Path(path).stat().st_mtime)
+    except OSError:
+        return None
+
+
 def _degraded_confirm_probes():
     """Гистерезис смены состава (#358 п.2) из env: сколько проб подряд должен держаться
     новый состав до пуша. Clamp [1, 10]: 1 — легаси-поведение (немедленный пуш),
@@ -1915,6 +2053,97 @@ def _cmd_watchdog_locked(result):
     return 0 if cur == "ok" else 1
 
 
+# ============================ #445: keeper watchdog'а ============================
+def _watchdog_keeper_verdict(now, *, heartbeat_mtime, snapshot, prev,
+                             stale_sec, grace_sec, cooldown_sec):
+    """Чистый вердикт keeper'а (#445): push «Упало: watchdog» при доказанной смерти.
+
+    Доказательство смерти (все три условия): heartbeat протух И это не первый прогон
+    keeper'а (baseline — тихий, как lifecycle/status fresh-прогоны) И sleep-guard не
+    спасает (heartbeat не старше пропуска keeper'а + grace — иначе машина спала, keeper
+    тоже не тикал, тик watchdog'а догонит после пробуждения). Диагноз — по launchd-
+    снапшоту (verify-dont-guess): не загружена / тики идут при молчащем heartbeat
+    (crash-loop импорта — эмпирия 02.11: окно git-merge в live-чекауте валит
+    `from health_probes import *`; hang даёт ту же картину первым тиком) / тиков нет
+    (launchd не респавнит). Канон #315/#380: recovery («Восстановлено») только после
+    прозвучавшего «Упало»; повторное «Упало» в окне cooldown молчит и НЕ двигает
+    down_notified (подавленный пуш эпизод не закрывает — recovery донесёт).
+
+    Возвращает {action, msg, sound, reason, down_notified, last_down_push}: action ∈
+    {alive, baseline, wait, down, down-suppressed}; msg/sound — что пушить (None = тишина).
+    """
+    prev_run_ts = _state_float(prev, "prev_run_ts")
+    hb_age = None if heartbeat_mtime is None else max(0.0, now - heartbeat_mtime)
+    last_down_push = _state_float(prev, "last_down_push")
+    if hb_age is not None and hb_age <= stale_sec:
+        if prev.get("down_notified"):
+            return {"action": "alive", "msg": "Восстановлено: watchdog", "sound": "Glass",
+                    "reason": None, "down_notified": False, "last_down_push": last_down_push}
+        return {"action": "alive", "msg": None, "sound": None, "reason": None,
+                "down_notified": False, "last_down_push": last_down_push}
+    if prev_run_ts <= 0.0:
+        return {"action": "baseline", "msg": None, "sound": None, "reason": None,
+                "down_notified": False, "last_down_push": 0.0}
+    if hb_age is not None and hb_age <= max(0.0, now - prev_run_ts) + grace_sec:
+        # Сон/загрузка: keeper сам не тикал, watchdog не обязан был — смерть не доказана.
+        return {"action": "wait", "msg": None, "sound": None, "reason": "catchup",
+                "down_notified": bool(prev.get("down_notified")),
+                "last_down_push": last_down_push}
+    runs = snapshot.get("runs")
+    if not snapshot.get("loaded"):
+        reason, msg = "unloaded", ("Упало: watchdog — джоба не загружена в launchd; "
+                                   "ремонт: srouter install")
+    elif prev.get("prev_runs") is not None and isinstance(runs, int) \
+            and runs > prev.get("prev_runs"):
+        reason, msg = "crash-loop", ("Упало: watchdog — тики идут, heartbeat не пишется "
+                                     "(crash-loop импорта или /tmp очищен); смотри "
+                                     "stderr-лог watchdog'а")
+    else:
+        age_txt = f"{int(hb_age)}с" if hb_age is not None else "heartbeat-файла нет"
+        reason, msg = "no-ticks", (f"Упало: watchdog — тиков нет ({age_txt} без heartbeat; "
+                                   "launchd не респавнит или прогон завис)")
+    if prev.get("down_notified") and now - last_down_push < cooldown_sec:
+        return {"action": "down-suppressed", "msg": None, "sound": None, "reason": reason,
+                "down_notified": True, "last_down_push": last_down_push}
+    return {"action": "down", "msg": msg, "sound": "Basso", "reason": reason,
+            "down_notified": True, "last_down_push": now}
+
+
+def cmd_watchdog_keeper():
+    """Один прогон keeper'а watchdog'а (launchd com.srouter.watchdog-keeper, раз в 300с).
+
+    Машина без установленного watchdog'а — no-op (keeper без объекта мониторинга
+    бессмыслен, иначе вечный «не загружена» каждые cooldown). Сеть не трогает: stat +
+    launchctl print + osascript-push. Возвращает 0 (жив/baseline/wait) или 1 (down —
+    как cmd_watchdog, для ручных прогонов).
+    """
+    if not WATCHDOG_PLIST.exists():
+        return 0
+    now = time.time()
+    prev = _read_watchdog_state(WATCHDOG_KEEPER_STATE)
+    try:
+        heartbeat_mtime = WATCHDOG_STATE.stat().st_mtime
+    except OSError:
+        heartbeat_mtime = None
+    snapshot = _launchd_job_snapshot(WATCHDOG_LABEL)
+    verdict = _watchdog_keeper_verdict(
+        now, heartbeat_mtime=heartbeat_mtime, snapshot=snapshot, prev=prev,
+        stale_sec=_watchdog_heartbeat_stale_sec(),
+        grace_sec=_WATCHDOG_KEEPER_GRACE_SEC,
+        cooldown_sec=_keeper_cooldown_sec())
+    if verdict["msg"]:
+        _notify(verdict["msg"], verdict["sound"])
+    # State пишется каждым прогоном (включая baseline/wait) — heartbeat самого keeper'а
+    # для doctor-чека (_watchdog_keeper_liveness_check).
+    _write_watchdog_state(WATCHDOG_KEEPER_STATE, {
+        "prev_run_ts": now,
+        "prev_runs": snapshot.get("runs"),
+        "down_notified": verdict["down_notified"],
+        "last_down_push": verdict["last_down_push"],
+    })
+    return 0 if verdict["action"] in ("alive", "baseline", "wait") else 1
+
+
 def main(argv=None):
     """CLI: check (отчёт) | watchdog (нотификация при переходе)."""
     import argparse
@@ -1922,11 +2151,15 @@ def main(argv=None):
     sub = p.add_subparsers(dest="cmd")
     sub.add_parser("check", help="Разовый прогон проверок, отчёт ✅/❌.")
     sub.add_parser("watchdog", help="Один прогон watchdog'а (для launchd): нотификация при переходе.")
+    sub.add_parser("watchdog-keeper",
+                   help="Один прогон keeper'а (#445): пуш «Упало: watchdog» при потере heartbeat.")
     sub.add_parser("ensure-split-route-root", help="Split-route при VPN up (ppp-hook, от root).")
     args = p.parse_args(argv)
 
     if args.cmd == "watchdog":
         return cmd_watchdog()
+    if args.cmd == "watchdog-keeper":
+        return cmd_watchdog_keeper()
     if args.cmd == "ensure-split-route-root":
         # ppp-hook (/etc/ppp/ip-up) — от root, route add напрямую (без osascript).
         import node_selector
