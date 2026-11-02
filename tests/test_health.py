@@ -7477,3 +7477,92 @@ def test_github_direct_line_absent_when_split_not_done(monkeypatch):
     stray = [c["name"] for c in result["checks"] if "github-direct" in c["name"]]
     assert not stray, \
         f"#427: split не делался — строки быть не должно, got: {stray}"
+
+
+# ============================ #447: «приложение не запущено» ≠ деградация ============================
+# Регрессия на вердикт-гейт (общий для doctor и watchdog'а): «не запущен» (probe unknown) →
+# info-only (не в failed-композиции, вердикт не роняет); «запущен, маршрут мёртв» (probe down,
+# external) → настоящий driver (в failed-композиции). Probe-level исходы обеих проб покрыты в
+# test_claude_app_proxy.py (test_unknown_when_not_running / down-тесты) и test_codex_app_proxy.py
+# (test_app_not_running / STALE-down) — здесь замокан гейт агрегации, канон _all_up_monkey.
+_APP_PROXY_CHECKS = (  # (probe-глобал в health, уникальная подстрока имени чека)
+    ("_claude_app_proxy_check", "claude-app-proxy"),
+    ("_codex_app_proxy_check", "gui-env SOCKS5"),
+    ("_codex_app_chromium_proxy_check", "Chromium system-proxy"),
+)
+
+
+def test_check_all_app_not_running_is_info_not_degradation(monkeypatch):
+    """#447 п.2: «App не запущен» во всех трёх app-чéках — info-only: ok=False + info=True,
+    имени в failed-композиции watchdog'а нет, живой стек остаётся ok (не роняет статус дня)."""
+    _all_up_monkey(monkeypatch)
+    for probe, _ in _APP_PROXY_CHECKS:
+        monkeypatch.setattr(health, probe, lambda: {"status": "unknown", "source": "n/a",
+                                                    "detail": "не запущен (mock #447)"})
+    result = health.check_all()
+    assert result["status"] == "ok", "закрытые App — не деградация стека"
+    failed = [c["name"] for c in result["checks"] if not c["ok"] and not c.get("info")]
+    for _, needle in _APP_PROXY_CHECKS:
+        chk = _check_by_name(result, needle)
+        assert chk["ok"] is False and chk.get("info") is True, \
+            f"{needle}: unknown → ok=False + info=True (не driver), got {chk}"
+        assert not any(needle in name for name in failed), \
+            f"#447: «не запущен» попал в failed-композицию ({needle}): {failed}"
+
+
+def test_check_all_app_running_dead_route_is_driver(monkeypatch):
+    """#447 п.3: «запущен, но маршрут мёртв» (probe down, external) — настоящий driver
+    во всех трёх app-чéках: ok=False БЕЗ info, имя в failed-композиции, вердикт degraded."""
+    _all_up_monkey(monkeypatch)
+    for probe, _ in _APP_PROXY_CHECKS:
+        monkeypatch.setattr(health, probe, lambda: {"status": "down", "source": "runtime",
+                                                    "detail": "НАПРЯМУЮ (mock #447)"})
+    result = health.check_all()
+    assert result["status"] == "degraded", "мёртвый маршрут живого App — настоящая деградация"
+    failed = [c["name"] for c in result["checks"] if not c["ok"] and not c.get("info")]
+    for _, needle in _APP_PROXY_CHECKS:
+        chk = _check_by_name(result, needle)
+        assert chk["ok"] is False and not chk.get("info"), \
+            f"{needle}: down → driver (ok=False, без info), got {chk}"
+        assert any(needle in name for name in failed), \
+            f"#447: мёртвый маршрут вне failed-композиции ({needle}): {failed}"
+
+
+def test_watchdog_failed_composition_excludes_info_app_check(monkeypatch, tmp_path):
+    """#447: verdict watchdog'а (failed-состав статус-события) исключает info-чек «не запущен»,
+    но включает driver «маршрут мёртв» — на переходе ok→degraded (канон _cmd_watchdog_locked:
+    not ok and not info). Изоляция тика — канон _gated_watchdog_tick (state/log в tmp)."""
+    state_file = tmp_path / "watchdog.last"
+    state_file.write_text(json.dumps(
+        {"status": "ok", "failed": [], "last_degraded_push": 0.0}, ensure_ascii=False))
+    status_log = tmp_path / "status.jsonl"
+    monkeypatch.setattr(health, "WATCHDOG_STATE", state_file)
+    monkeypatch.setattr(health, "WATCHDOG_STATUS_LOG", status_log)
+    monkeypatch.setattr(health, "WATCHDOG_METRICS_STATE", tmp_path / "metrics.state.json")
+    monkeypatch.setattr(health.metrics_store, "METRICS_LOG", tmp_path / "metrics.jsonl")
+    monkeypatch.setattr(health.diag_netprobe, "current_net", lambda: None)
+    monkeypatch.setattr(health, "_metrics_probe_options", lambda: {"enabled": False})
+    monkeypatch.setattr(health, "cached_attribution", lambda: None)
+    monkeypatch.setattr(health, "_tunnel_parameter_note", lambda: None)
+    monkeypatch.setattr(health, "check_all", lambda **kw: {
+        "status": "degraded",
+        "checks": [
+            # «не запущен»: ok=False, но info — в failed-состав не попадает
+            {"name": "claude-app-proxy (Claude.app маршрут)", "ok": False, "info": True,
+             "detail": "Claude.app не запущен — проверять маршрут нечего"},
+            # «запущен, маршрут мёртв»: driver
+            {"name": "codex-app-proxy (ChatGPT.app gui-env SOCKS5)", "ok": False,
+             "detail": "ChatGPT.app App-процессы НАПРЯМУЮ"},
+            {"name": "privoxy", "ok": True},
+        ]})
+    monkeypatch.setattr(health, "_notify", lambda msg, sound="Glass": None)
+    monkeypatch.setenv(_COOLDOWN_ENV, "0")
+    monkeypatch.setenv("SROUTER_WATCHDOG_DEGRADED_CONFIRM", "1")
+    health.cmd_watchdog()
+    lines = _read_status_lines(status_log)
+    assert len(lines) == 1, "ok→degraded — одно статус-событие"
+    failed = lines[0]["current"]["failed"]
+    assert failed == ["codex-app-proxy (ChatGPT.app gui-env SOCKS5)"], \
+        f"#447: info-чек «не запущен» должен быть вырезан из failed-состава: {failed}"
+    added = lines[0]["diff"]["added_details"]
+    assert list(added) == failed, f"#447: причина деградации — только у driver'а: {added}"
