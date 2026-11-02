@@ -434,6 +434,10 @@ _SUBMODULE_NAMES = {
     "github_direct": "local_state_routing",
     "github_direct_status": "local_state_routing",
     "GITHUB_RULE_MARKER": "local_state_routing",
+    # --- ssh-route: port 22 → туннель (#438) ---
+    "ssh_route": "local_state_routing",
+    "ssh_route_status": "local_state_routing",
+    "SSH_ROUTE_MARKER": "local_state_routing",
 }
 
 

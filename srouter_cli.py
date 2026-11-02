@@ -1673,6 +1673,88 @@ def cmd_github_direct(args):
     return 0
 
 
+def cmd_ssh_route(args):
+    """port 22 → всегда туннель (#438): on/off/status (см. local_state_routing.ssh_route).
+
+    Порт 22 наружу закрыт — SSH без правила уходит в catch-all direct и рвётся. Правило
+    ставится первым из семейства: даже `github-direct on` не может увести SSH напрямую.
+    """
+    action = getattr(args, "ssh_route_action", None)
+    state_path = getattr(args, "state", None)
+    config_path = getattr(args, "xray_config", None) or local_state.XRAY_CONFIG_PATH
+    if action == "status":
+        st = local_state.ssh_route_status(config_path=config_path)
+        if not st.get("ok"):
+            print(f"ssh route: {st.get('err', 'failed')}", file=sys.stderr)
+            return 2
+        state_txt = "ВКЛ (port 22 → туннель)" if st.get("on") else \
+            "НЕТ — включи `srouter ssh route on`"
+        print(f"ssh route: правило port 22: {state_txt}")
+        return 0
+    runner = make_privileged_runner(run)
+    result = local_state.ssh_route(
+        action, config_path=config_path, state_path=state_path,
+        runner=runner, port_checker=port_open)
+    if not result.get("ok"):
+        print(f"ssh route {action}: отказ "
+              f"({result.get('step', '—')}): {result.get('err', 'failed')}", file=sys.stderr)
+        if result.get("step") == "restart":
+            print("  (конфиг откачен к предыдущему, xray перезапущен старым конфигом)",
+                  file=sys.stderr)
+        return 2
+    if not result.get("changed"):
+        print(f"ssh route: правило port 22 уже {'включено' if action == 'on' else 'выключено'} "
+              f"(no-op).")
+        return 0
+    if action == "on":
+        print("ssh route: port 22 → туннель ВКЛ (#438). SSH больше не зависит от прямых портов.")
+    else:
+        print("ssh route: правило port 22 выключено (выкл).")
+    return 0
+
+
+def cmd_ssh_setup(args):
+    """Managed-include ~/.ssh/srouter.conf + Include в конец ~/.ssh/config (#438).
+
+    Ручное действие (roadmap: observe → manual): дефолты «SSH через туннель» + keepalive
+    (ServerAliveInterval/CountMax) для всех хостов. Include в КОНЦЕ — явные настройки
+    кастомных секций сохраняются; опасные из них ловит `srouter ssh status` (аудит).
+    """
+    import ssh_client_config
+    config_path = getattr(args, "config", None)
+    result = ssh_client_config.setup(
+        config_path=config_path, interval=args.interval, countmax=args.countmax)
+    if not result.get("ok"):
+        print(f"ssh setup: отказ: {result.get('err', 'failed')}", file=sys.stderr)
+        return 2
+    if result.get("backup"):
+        print(f"ssh setup: backup прежнего конфига: {result['backup']}")
+    if not result.get("changed"):
+        print("ssh setup: managed-include уже актуален (no-op).")
+    else:
+        print(f"ssh setup: {result.get('managed')} записан, Include добавлен "
+              f"в {result.get('config')}.")
+    audit_res = ssh_client_config.audit(config_path=config_path)
+    print(f"ssh аудит: {audit_res.get('status')} — {audit_res.get('detail', '')}")
+    return 0
+
+
+def cmd_ssh_status(args):
+    """Сводка #438: правило port 22 в xray + клиентский ssh-config (read-only)."""
+    config_path = getattr(args, "xray_config", None) or local_state.XRAY_CONFIG_PATH
+    st = local_state.ssh_route_status(config_path=config_path)
+    if st.get("ok"):
+        state_txt = "ВКЛ (port 22 → туннель)" if st.get("on") else \
+            "НЕТ — включи `srouter ssh route on`"
+    else:
+        state_txt = f"неизвестно ({st.get('err', 'failed')})"
+    print(f"ssh route: правило port 22: {state_txt}")
+    import ssh_client_config
+    audit_res = ssh_client_config.audit(config_path=getattr(args, "config", None))
+    print(f"ssh аудит: {audit_res.get('status')} — {audit_res.get('detail', '')}")
+    return 0
+
+
 def _read_routing_domains(config_path, outbound):
     """Текущие domain[] rule с outboundTag=outbound. None если rule не найден/битый."""
     try:
@@ -1968,6 +2050,41 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--xray-config", default=local_state.XRAY_CONFIG_PATH,
                         help="Путь к production xray-config.json.")
         sp.set_defaults(func=cmd_github_direct)
+
+    # ssh (#438): порт 22 наружу закрыт — весь SSH через туннель, никогда напрямую.
+    p_ssh = sub.add_parser(
+        "ssh", help="SSH через туннель (#438): route on|off|status, setup, status.")
+    p_ssh_sub = p_ssh.add_subparsers(dest="ssh_subcommand", required=True)
+    p_ssr = p_ssh_sub.add_parser(
+        "route", help="Правило port 22 → туннель в xray: on — включить, off — убрать, status.")
+    p_ssr_sub = p_ssr.add_subparsers(dest="ssh_route_action", required=True)
+    for ssr_name, ssr_help in (
+        ("on", "SSH всегда через туннель (правило port 22, ставится первым из семейства)."),
+        ("off", "Убрать правило port 22."),
+        ("status", "Показать, включено ли правило."),
+    ):
+        sp = p_ssr_sub.add_parser(ssr_name, help=ssr_help)
+        sp.add_argument("--state", default=None, help="Путь к srouter.local.json.")
+        sp.add_argument("--xray-config", default=local_state.XRAY_CONFIG_PATH,
+                        help="Путь к production xray-config.json.")
+        sp.set_defaults(func=cmd_ssh_route)
+    sp = p_ssh_sub.add_parser(
+        "setup",
+        help="Managed-include ~/.ssh/srouter.conf (ProxyCommand-туннель + ServerAlive) + "
+             "Include в конец ~/.ssh/config. Backup при первой модификации.")
+    sp.add_argument("--config", default=None, help="Путь к ssh-конфигу (по умолчанию ~/.ssh/config).")
+    sp.add_argument("--interval", type=int, default=15, metavar="SEC",
+                    help="ServerAliveInterval (сек, по умолчанию 15).")
+    sp.add_argument("--countmax", type=int, default=4, metavar="N",
+                    help="ServerAliveCountMax (по умолчанию 4).")
+    sp.set_defaults(func=cmd_ssh_setup)
+    sp = p_ssh_sub.add_parser(
+        "status", help="Сводка (#438): правило port 22 в xray + аудит клиентского ssh-config.")
+    sp.add_argument("--state", default=None, help="Путь к srouter.local.json.")
+    sp.add_argument("--xray-config", default=local_state.XRAY_CONFIG_PATH,
+                    help="Путь к production xray-config.json.")
+    sp.add_argument("--config", default=None, help="Путь к ssh-конфигу (по умолчанию ~/.ssh/config).")
+    sp.set_defaults(func=cmd_ssh_status)
 
     # speedtest (2026-10-12): ручной замер скорости с записью в журнал
     # (~/Library/Logs/srouter-speedtest.jsonl), метки записи — сеть + VPN.

@@ -532,6 +532,28 @@ srouter git-proxy disable --full    # + снять бесхозные ГЛОБА
 отвечал на SYN), при этом путь через туннель давал 200 за ~0.7 c, а `api.github.com` оставался
 прямодоступным. Прямой путь — вероятностный fallback, не гарантия; в GFW-окнах живёт туннель.
 
+## SSH через туннель `srouter ssh` (#438)
+
+Порт 22 наружу закрыт (GFW): SSH напрямую — `Connection refused`, а длинные сессии
+(`dokku git:sync --build` и т.п.) через туннель рвутся без правила и без keepalive.
+Два слоя, оба ручные (roadmap: observe → manual action):
+
+```bash
+srouter ssh route on      # правило xray «port 22 → туннель» (ставится ПЕРВЫМ из семейства:
+                          # даже github-direct on не уводит SSH напрямую)
+srouter ssh route status  # включено ли правило
+srouter ssh route off     # убрать правило
+srouter ssh setup         # managed-include ~/.ssh/srouter.conf: ProxyCommand nc -x
+                          # 127.0.0.1:10808 -X 5 + ServerAliveInterval 15 / CountMax 4
+                          # + Include в КОНЕЦ ~/.ssh/config (backup при первой модификации)
+srouter ssh status        # сводка: правило в xray + аудит ~/.ssh/config (ProxyCommand
+                          # покрывает все хосты? ServerAlive заданы? кто идёт мимо туннеля?)
+```
+
+`Include` в конце: наш `Host *` работает как дефолт (first-obtained-wins) — явные настройки
+кастомных секций сохраняются, но секция с `ProxyCommand none`/чужим прокси будет видна в
+аудите как `down`. `setup` идемпотентен и не переписывает ваш конфиг целиком.
+
 ## Тумблер `srouter go-proxy` (2026-09-30)
 
 `proxy.golang.org` — та же GFW-чёрная дыра, что и github.com в плохие окна (эмпирика
@@ -1085,6 +1107,29 @@ GFW windows, direct `github.com` was a TCP black hole from a cellular hotspot an
 (20.205.243.166 dropped SYN), while the tunnel path returned 200 in ~0.7 s and `api.github.com`
 stayed directly reachable. Treat the direct path as a probabilistic fallback, not a guarantee;
 during GFW windows the tunnel is what works.
+
+## SSH through the tunnel `srouter ssh` (#438)
+
+Outbound port 22 is closed (GFW): direct SSH gets `Connection refused`, and long sessions
+(`dokku git:sync --build` etc.) break through the tunnel without a routing rule and keepalive.
+Two layers, both manual (roadmap: observe → manual action):
+
+```bash
+srouter ssh route on      # xray rule "port 22 → tunnel" (inserted FIRST in the rule family:
+                          # even github-direct on cannot send SSH direct)
+srouter ssh route status  # is the rule on
+srouter ssh route off     # remove the rule
+srouter ssh setup         # managed include ~/.ssh/srouter.conf: ProxyCommand nc -x
+                          # 127.0.0.1:10808 -X 5 + ServerAliveInterval 15 / CountMax 4
+                          # + Include at the END of ~/.ssh/config (backup on first change)
+srouter ssh status        # summary: xray rule + ~/.ssh/config audit (does ProxyCommand
+                          # cover all hosts? ServerAlive set? who bypasses the tunnel?)
+```
+
+`Include` at the end: our `Host *` acts as the default (first-obtained-wins) — explicit
+custom-section settings are preserved, but a section with `ProxyCommand none`/a foreign
+proxy shows up in the audit as `down`. `setup` is idempotent and never rewrites your
+config wholesale.
 
 ## The `srouter go-proxy` toggle (2026-09-30)
 

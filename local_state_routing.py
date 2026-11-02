@@ -543,3 +543,119 @@ def _github_direct_locked(action, config_path, state_path, runner, port_checker,
                 "err": f"restart_failed:{restart.get('err') or restart.get('rc')}"}
     return {"ok": True, "changed": True, "step": "done", "direct": target == "direct",
             "migrated": migration}
+
+
+# ============================ ssh-route: port 22 → всегда туннель (#438) ============================
+# Порт 22 наружу закрыт (Connection refused напрямую), туннель через SOCKS5 — работает, но
+# длинные сессии рвутся, если путь не закреплён правилом. Правило port=22 → tunnel обязано
+# стоять РАНЬШЕ любого правила, способного увести 22-й порт в direct: catch-all direct и
+# github-правило (github-direct on переворачивает его in-place в direct). Никогда не
+# пишется в state (не входит в managed-hash) — config единственный источник правды, как у
+# github_direct. Маркер — свой (инвариант «ровно одно managed-правило» не нарушается).
+SSH_ROUTE_MARKER = "_srouter_ssh"
+SSH_ROUTE_PORT = "22"  # xray port-matcher: строка/диапазон
+_SSH_INSERT_MARKERS = (GITHUB_RULE_MARKER, STRICT_RULE_MARKER, ROUTING_MARKER)
+
+
+def _ssh_route_insert_index(rules):
+    """Индекс вставки: перед ПЕРВЫМ правилом семейства (strict/github/managed) или
+    перед первым direct-outbound (catch-all/чужие direct-правила). -1 если якорей нет."""
+    idxs = []
+    for marker in _SSH_INSERT_MARKERS:
+        i = _rule_index_by_marker(rules, marker)
+        if i >= 0:
+            idxs.append(i)
+    direct = [i for i, r in enumerate(rules)
+              if isinstance(r, dict) and r.get("outboundTag") == "direct"]
+    if direct:
+        idxs.append(direct[0])
+    return min(idxs) if idxs else -1
+
+
+def ssh_route_status(config_path=None):
+    """Read-only: {ok, on} — стоит ли port-22 правило. Не бросает (фейл-софт как github_direct_status)."""
+    config_path = config_path or local_state.XRAY_CONFIG_PATH
+    try:
+        data = json.loads(Path(config_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {"ok": False, "err": "config_unreadable"}
+    routing = data.get("routing") if isinstance(data, dict) else None
+    rules = routing.get("rules") if isinstance(routing, dict) else None
+    if not isinstance(rules, list):
+        return {"ok": False, "err": "no_routing_rules"}
+    return {"ok": True, "on": _rule_index_by_marker(rules, SSH_ROUTE_MARKER) >= 0}
+
+
+def ssh_route(action, *, config_path=None, state_path=None, runner=None,
+                    port_checker=None, outbound=None):
+    """Включить/выключить port-22 правило: on — SSH всегда через туннель (#438), off — убрать.
+
+    Транзакция по канону github_direct: flock → byte-exact backup → atomic write → restart →
+    rollback (конфиг byte-exact + recovery-рестарт) при провале. Правило вставляется ПЕРВЫМ из
+    семейства (строже github-direct миграции) — github-direct on не может увести SSH напрямую.
+    Без managed-правила — refuse (adopt_needed, как github_direct): чужой конфиг не трогаем.
+    Не бросает."""
+    if action not in ("on", "off"):
+        return {"ok": False, "changed": False, "step": "validate", "err": "bad_action"}
+    config_path = config_path or local_state.XRAY_CONFIG_PATH
+    import local_state_xray  # lazy — тег туннеля резолвим на adopt-машине из state
+    outbound = outbound or local_state_xray._routing_outbound_tag(state_path)
+    try:
+        with local_state._routing_config_lock(config_path):
+            return _ssh_route_locked(
+                action, config_path, runner, port_checker, outbound)
+    except OSError:
+        return {"ok": False, "changed": False, "step": "lock", "err": "config_lock_failed"}
+
+
+def _ssh_route_locked(action, config_path, runner, port_checker, outbound):
+    import install_lib  # lazy, как routing_apply (circular-import канон)
+
+    try:
+        raw = Path(config_path).read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except (OSError, ValueError, TypeError):
+        return {"ok": False, "changed": False, "step": "read", "err": "config_unreadable"}
+    routing = data.get("routing") if isinstance(data, dict) else None
+    rules = routing.get("rules") if isinstance(routing, dict) else None
+    if not isinstance(rules, list) or not rules:
+        return {"ok": False, "changed": False, "step": "read", "err": "no_routing_rules"}
+    m_idx = _routing_find_managed_rule(rules)
+    if m_idx == -1:
+        return {"ok": False, "changed": False, "step": "read", "err": "adopt_needed"}
+    if m_idx == -2:
+        return {"ok": False, "changed": False, "step": "read", "err": "ambiguous_managed_rules"}
+
+    s_idx = _rule_index_by_marker(rules, SSH_ROUTE_MARKER)
+    if action == "on":
+        if s_idx >= 0:
+            if rules[s_idx].get("outboundTag") == outbound:
+                return {"ok": True, "changed": False, "step": "noop"}
+            rules[s_idx]["outboundTag"] = outbound  # тег переехал (переименование outbound)
+        else:
+            insert_at = _ssh_route_insert_index(rules)
+            if insert_at == -1:
+                return {"ok": False, "changed": False, "step": "read", "err": "no_insert_anchor"}
+            rules.insert(insert_at, {"type": "field", "port": SSH_ROUTE_PORT,
+                                     "outboundTag": outbound, SSH_ROUTE_MARKER: True})
+    else:
+        if s_idx == -1:
+            return {"ok": True, "changed": False, "step": "noop"}
+        rules.pop(s_idx)
+
+    if not local_state._atomic_write_text(
+            config_path, json.dumps(data, ensure_ascii=False, indent=2) + "\n"):
+        return {"ok": False, "changed": False, "step": "write", "err": "config_write_failed"}
+    try:
+        restart = install_lib._restart_component("xray", runner, port_checker=port_checker)
+    except Exception as exc:  # noqa: BLE001 — runner инжектируемый, тип не под контролем
+        restart = {"rc": 1, "out": "", "err": f"restart_exception:{exc}", "timeout": False}
+    if restart.get("timeout") or restart.get("rc") != 0:
+        local_state._atomic_write_text(config_path, raw)
+        try:
+            install_lib._restart_component("xray", runner, port_checker=port_checker)
+        except Exception:  # noqa: BLE001 — recovery любой ценой тише основного отказа
+            pass
+        return {"ok": False, "changed": False, "step": "restart",
+                "err": f"restart_failed:{restart.get('err') or restart.get('rc')}"}
+    return {"ok": True, "changed": True, "step": "done", "on": action == "on"}
