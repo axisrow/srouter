@@ -13,6 +13,7 @@ wall-clock-assert-is-not-the-invariant — ни одного sleep), mock-format
 нет ни launchctl, ни osascript — все IO мокаются).
 """
 
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -202,6 +203,40 @@ def test_cmd_keeper_recovery_push(monkeypatch, tmp_path):
     assert pushes == [("Восстановлено: watchdog", "Glass")]
     state = json.loads((tmp_path / "keeper.json").read_text(encoding="utf-8"))
     assert state["down_notified"] is False
+
+
+def test_cmd_keeper_lock_busy_skips_tick(monkeypatch, tmp_path):
+    """Ревью #449: параллельный прогон держит lock — тик пропускается (паттерн cmd_watchdog,
+    Codex P1-2/P1-3). Без lock тик + ручной прогон читают один prev: дубли пушей,
+    инвертированный порядок «Упало/Восстановлено», потеря state. Занятый lock = другой
+    прогон делает работу → тишина и БЕЗ записи state (ни down-пуша, ни recovery)."""
+    hb = tmp_path / "hb.json"
+    hb.write_text("{}", encoding="utf-8")
+    os.utime(hb, (1000.0, 1000.0))  # heartbeat протух — кандидат на down
+    keeper_state = {"prev_run_ts": 4900.0, "prev_runs": 125, "down_notified": False,
+                    "last_down_push": 0.0}
+    keeper_path = tmp_path / "keeper.json"
+    keeper_path.write_text(json.dumps(keeper_state), encoding="utf-8")
+    monkeypatch.setattr(health, "WATCHDOG_PLIST", tmp_path / "wd.plist")
+    (tmp_path / "wd.plist").write_text("x", encoding="utf-8")
+    monkeypatch.setattr(health, "WATCHDOG_KEEPER_PLIST", tmp_path / "keeper.plist")
+    (tmp_path / "keeper.plist").write_text("x", encoding="utf-8")
+    monkeypatch.setattr(health, "WATCHDOG_STATE", hb)
+    monkeypatch.setattr(health, "WATCHDOG_KEEPER_STATE", keeper_path)
+    monkeypatch.setattr(health, "_launchd_job_snapshot", lambda *a, **k: _snap(runs=125))
+    monkeypatch.setattr(health.time, "time", lambda: 5000.0)
+    pushes = []
+    monkeypatch.setattr(health, "_notify", lambda msg, sound="Glass": pushes.append((msg, sound)))
+    lock_file = open(str(keeper_path) + ".lock", "w")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        rc = health.cmd_watchdog_keeper()
+        assert rc == 0
+        assert pushes == []  # ни down (stale heartbeat), ни recovery — работа за другим прогоном
+        assert json.loads(keeper_path.read_text(encoding="utf-8")) == keeper_state
+    finally:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        lock_file.close()
 
 
 # ============================ liveness-чеки в check_all ============================

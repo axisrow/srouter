@@ -2119,29 +2119,55 @@ def cmd_watchdog_keeper():
     """
     if not WATCHDOG_PLIST.exists():
         return 0
-    now = time.time()
-    prev = _read_watchdog_state(WATCHDOG_KEEPER_STATE)
+    # Межпроцессный lock (ревью #449, паттерн cmd_watchdog Codex P1-2/P1-3): тик launchd +
+    # ручной прогон могут идти параллельно — без lock оба читают один prev (дубли пушей,
+    # инвертированный порядок «Упало/Восстановлено», лишний/потерянный recovery). Занят →
+    # тик пропускаем: работу делает держатель, следующий тик через 300с. LOCK_NB: keeper
+    # не должен висеть на чужом прогоне. Сам lock — best-effort: не открылся — гоним
+    # без лока, мониторинг не падает из-за форензики.
+    lock_file = None
     try:
-        heartbeat_mtime = WATCHDOG_STATE.stat().st_mtime
-    except OSError:
-        heartbeat_mtime = None
-    snapshot = _launchd_job_snapshot(WATCHDOG_LABEL)
-    verdict = _watchdog_keeper_verdict(
-        now, heartbeat_mtime=heartbeat_mtime, snapshot=snapshot, prev=prev,
-        stale_sec=_watchdog_heartbeat_stale_sec(),
-        grace_sec=_WATCHDOG_KEEPER_GRACE_SEC,
-        cooldown_sec=_keeper_cooldown_sec())
-    if verdict["msg"]:
-        _notify(verdict["msg"], verdict["sound"])
-    # State пишется каждым прогоном (включая baseline/wait) — heartbeat самого keeper'а
-    # для doctor-чека (_watchdog_keeper_liveness_check).
-    _write_watchdog_state(WATCHDOG_KEEPER_STATE, {
-        "prev_run_ts": now,
-        "prev_runs": snapshot.get("runs"),
-        "down_notified": verdict["down_notified"],
-        "last_down_push": verdict["last_down_push"],
-    })
-    return 0 if verdict["action"] in ("alive", "baseline", "wait") else 1
+        lock_path = Path(str(WATCHDOG_KEEPER_STATE) + ".lock")
+        lock_file = open(lock_path, "w")
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            _log.debug("watchdog-keeper: параллельный прогон держит lock — тик пропущен")
+            lock_file.close()
+            lock_file = None
+            return 0
+    except OSError as exc:
+        if lock_file is not None:
+            lock_file.close()
+            lock_file = None
+        _log.warning("watchdog-keeper: lock-файл недоступен (%s) — прогон без лока", exc)
+    try:
+        now = time.time()
+        prev = _read_watchdog_state(WATCHDOG_KEEPER_STATE)
+        try:
+            heartbeat_mtime = WATCHDOG_STATE.stat().st_mtime
+        except OSError:
+            heartbeat_mtime = None
+        snapshot = _launchd_job_snapshot(WATCHDOG_LABEL)
+        verdict = _watchdog_keeper_verdict(
+            now, heartbeat_mtime=heartbeat_mtime, snapshot=snapshot, prev=prev,
+            stale_sec=_watchdog_heartbeat_stale_sec(),
+            grace_sec=_WATCHDOG_KEEPER_GRACE_SEC,
+            cooldown_sec=_keeper_cooldown_sec())
+        if verdict["msg"]:
+            _notify(verdict["msg"], verdict["sound"])
+        # State пишется каждым прогоном (включая baseline/wait) — heartbeat самого keeper'а
+        # для doctor-чека (_watchdog_keeper_liveness_check).
+        _write_watchdog_state(WATCHDOG_KEEPER_STATE, {
+            "prev_run_ts": now,
+            "prev_runs": snapshot.get("runs"),
+            "down_notified": verdict["down_notified"],
+            "last_down_push": verdict["last_down_push"],
+        })
+        return 0 if verdict["action"] in ("alive", "baseline", "wait") else 1
+    finally:
+        if lock_file is not None:
+            lock_file.close()  # освобождает flock
 
 
 def main(argv=None):
