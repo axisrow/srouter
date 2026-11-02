@@ -825,7 +825,8 @@ def _collect_launchd_lifecycle():
     protected = privoxy_system.protection_present()
     return {
         "privoxy": _launchd_job_snapshot(
-            privoxy_system.SYSTEM_LABEL if protected else "homebrew.mxcl.privoxy",
+            # резолв поколения лейблов (2026-10-29): protected → system, brew → sh.brew/legacy
+            _privoxy_service_target()[0],
             plist_path=(privoxy_system.DEFAULT_LAYOUT.launchdaemon_path if protected else None),
             domain=("system" if protected else None),
         ),
