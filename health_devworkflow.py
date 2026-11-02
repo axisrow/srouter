@@ -15,7 +15,7 @@ _log = logging.getLogger("srouter.health")
 
 # star-import re-export (канон star-import-reexport-contract) — см. health_probes.py докстринг __all__.
 __all__ = ["_vscode_proxy_check", "GH_DIRECT_HINT", "_github_direct_check",
-           "_git_proxy_route_check"]
+           "_git_proxy_route_check", "_ssh_tunnel_check"]
 
 # ============================ #185: scoped SOCKS5 для codex через VSCode http.proxy ============================
 
@@ -218,3 +218,54 @@ def _git_proxy_route_check():
             "detail": (f"git→github через ЧУЖОЙ proxy {proxy or '(пусто)'} (слой {layer}) — "
                        f"самовольное переключение. "
                        f"Чинить: srouter git-proxy enable --force")}
+
+
+# ============================ #438: SSH через туннель ============================
+
+def _ssh_tunnel_check():
+    """SSH-маршрут (#438): port 22 → туннель в xray + клиентский ssh-config. info-only ВСЕГДА.
+
+    Два слоя: (1) правило _srouter_ssh в routing.rules xray (ssh_route_status) — без него
+    port 22 уходит в catch-all direct (напрямую закрыт → отказ/обрывы); (2) аудит
+    ~/.ssh/config (ssh_client_config.audit) — ProxyCommand должен покрывать все хосты
+    (first-obtained-wins: кастомные секции перекрывают `Host *`), плюс ServerAlive-дефолты.
+    info-only ВСЕГДА (как _github_direct_check): пользовательский ssh-конфиг не часть
+    srouter-стека — это подсказка `srouter ssh route on` / `srouter ssh setup`, не сбой
+    (политика roadmap: observe → manual action). Не бросает (probe-канон).
+    """
+    try:
+        import local_state_routing
+        import ssh_client_config
+        route = local_state_routing.ssh_route_status()
+        client = ssh_client_config.audit()
+    except (ImportError, OSError, ValueError, TypeError) as exc:
+        _log.debug("ssh-чек недоступен: %s — пропущен", exc)
+        return {"status": "unknown", "detail": f"ssh-чек недоступен — пропущен: {exc}"}
+    # оба слоя fail-soft по контракту, но мусор/не-dict гасим явно (isinstance-страж github_direct)
+    route_on = bool(isinstance(route, dict) and route.get("ok") and route.get("on"))
+    route_err = route.get("err") if isinstance(route, dict) and not route.get("ok") else None
+    client_status = client.get("status") if isinstance(client, dict) else "unknown"
+    client_detail = (client.get("detail") or "") if isinstance(client, dict) else ""
+
+    parts = []
+    if route_err:
+        parts.append(f"xray-правило: неизвестно ({route_err})")
+    elif route_on:
+        parts.append("xray: port 22 → туннель ВКЛ")
+    else:
+        parts.append("xray: правила port 22 нет — включи `srouter ssh route on`")
+
+    if client_status == "ok":
+        parts.append(f"ssh-config: {client_detail}")
+    elif client_status == "unknown":
+        parts.append("ssh-config: неизвестно")
+    else:
+        parts.append(f"ssh-config: {client_status} — {client_detail}")
+
+    if route_on and client_status == "ok":
+        status = "ok"
+    elif client_status == "down":
+        status = "down"  # клиентский bypass ломает сессии уже сейчас — хуже отсутствующего правила
+    else:
+        status = "warn"
+    return {"status": status, "detail": "; ".join(parts)}

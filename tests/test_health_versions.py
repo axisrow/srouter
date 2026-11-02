@@ -295,6 +295,9 @@ def _machine_state_monkey(monkeypatch):
                         lambda *a, **kw: {"status": "unknown", "detail": "mock: github-direct"})
     monkeypatch.setattr(health, "_git_proxy_route_check",
                         lambda: {"status": "ok", "detail": "mock: git github-proxy managed"})
+    # #438: ssh-чек — синхронно с _all_up_monkey (гвард test_machine_state_mock_guard).
+    monkeypatch.setattr(health, "_ssh_tunnel_check",
+                        lambda: {"status": "ok", "detail": "mock: ssh через туннель"})
     monkeypatch.setattr(health, "_runtime_model_override_check",
                         lambda: {"status": "ok", "detail": "mock: без override"})
     monkeypatch.setattr(health, "_installed_versions_check",

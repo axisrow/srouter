@@ -124,6 +124,7 @@ class TestParserSurface:
             "node",  # 2026-10-11: смена активного узла (use; canonical/adopt-surgical)
             "github-direct",  # 2026-10-11: путь github (on/off/status; три списка)
             "speedtest",  # 2026-10-12: ручной замер скорости (журнал сеть+VPN, --list)
+            "ssh",  # 2026-11-02 #438: SSH через туннель (route on|off|status, setup, status)
         }
 
     def test_nested_subcommand_paths_preserved(self, surface):

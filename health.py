@@ -728,6 +728,14 @@ def check_all(*, active_claude=False):
     if gpr["status"] != "down":
         gpr_check["info"] = True
     checks.append(gpr_check)
+    # SSH-маршрут (#438): port 22 → туннель в xray + клиентский ProxyCommand/ServerAlive.
+    # info-only ВСЕГДА (как gh/git direct): пользовательский ssh-конфиг не часть srouter-стека,
+    # отсутствие правила/дефолтов — подсказка `srouter ssh route on` / `srouter ssh setup`,
+    # не сбой стека (roadmap: observe → manual action).
+    ssh_t = _ssh_tunnel_check()
+    ssh_check = {"name": "ssh tunnel (port 22 + ProxyCommand)",
+                 "ok": ssh_t["status"] == "ok", "info": True, "detail": ssh_t["detail"]}
+    checks.append(ssh_check)
     # Установленные codex/claude-code binary на диске (#145): инвентаризация, info-only ВСЕГДА
     # (несколько версий — ранний сигнал конфликта #135, не сбой стека). unknown (ничего не установлено)
     # тоже info — не роняет вердикт. Doctor показывает картину, не угадывает.

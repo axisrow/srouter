@@ -204,6 +204,10 @@ def _all_up_monkey(monkeypatch, *, probe_status="ok", probe_detail="runtime: к�
                         lambda: {"status": "ok", "detail": "mock: github direct"})
     monkeypatch.setattr(health, "_git_proxy_route_check",
                         lambda: {"status": "ok", "detail": "mock: git github-proxy managed"})
+    # #438: ssh-чек читает живой xray-config + ~/.ssh/config — мокаем ok, иначе состояние
+    # dev-машины драйвит вердикт (гвард test_machine_state_mock_guard).
+    monkeypatch.setattr(health, "_ssh_tunnel_check",
+                        lambda: {"status": "ok", "detail": "mock: ssh через туннель"})
     monkeypatch.setattr(health, "_runtime_model_override_check",
                         lambda: {"status": "ok", "detail": "mock: без override"})
     monkeypatch.setattr(health, "_installed_versions_check",
