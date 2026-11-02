@@ -238,6 +238,15 @@ watchdog, ppp-hook, Claude Code/git-прокси, Codex SOCKS5-wrappers + env). 
 `doctor` — разовая диагностика здоровья. Watchdog (запускается автоматически) — нотификация при
 падении туннеля. Неинтерактивный путь для CI/скриптов — `./install.sh apply` (см. `install_lib.py`).
 
+Install не задаёт вопросов кроме y/N (#416): чужие/остаточные конфиги компонентов авторазрешаются
+дефолтным путём — backup `.srouter-backup-<ts>` → перегенерация генератором → рестарт, с одной
+строкой отчёта «что перезаписано, где backup». Явные выборы (`--xray|--privoxy|--dnsmasq
+adopt|overwrite|skip`) — только флагами, для скриптов и edge-кейсов; конфликт `non_brew_binary`
+(чужой бинарник рядом) без флага блокирует установку. Uninstall управляет всем, что помечено
+файловым маркером srouter, даже при утерянном state (маркер — доказательство владения, state —
+ускоритель); действительно чужие конфиги без маркера остаются нетронутыми, fail-closed арбитражи
+(неоднозначные backup'ы, мёртвые указатели) сохранены.
+
 `privoxy protect --strict` переносит только Privoxy в root-controlled LaunchDaemon, но запускает
 сам proxy от бесправного пользователя `nobody`. Его plist/config становятся недоступны для записи
 обычным процессам. Исполняемый файл и нужные библиотеки копируются из Homebrew в root-owned каталог,
@@ -784,6 +793,15 @@ srouter privoxy audit uninstall   # removes daemon but preserves evidence log
 watchdog, ppp-hook, Claude Code/git proxy). `start`/`stop`/`restart` — only the dashboard daemon.
 `doctor` — one-shot health diagnostics. Watchdog (auto-loaded) — notification on tunnel drop.
 Non-interactive path for CI/scripts — `./install.sh apply` (see `install_lib.py`).
+
+Install asks nothing but y/N (#416): foreign or leftover component configs resolve through the
+default path — backup `.srouter-backup-<ts>` → regeneration by the generator → restart, with a
+one-line report of what was overwritten and where the backup lives. Explicit choices
+(`--xray|--privoxy|--dnsmasq adopt|overwrite|skip`) are flag-only, for scripts and edge cases; a
+`non_brew_binary` conflict (foreign binary nearby) blocks install unless flagged. Uninstall manages
+everything marked with the on-disk srouter marker even when state was lost (the marker is the proof
+of ownership, state is an accelerator); truly foreign markerless configs stay untouched, and the
+fail-closed arbitrations (ambiguous backups, dead backup pointers) are preserved.
 
 `privoxy protect --strict` moves only Privoxy to a root-controlled LaunchDaemon while the proxy
 itself runs as the unprivileged `nobody` user. Its plist/config are not writable by normal processes.

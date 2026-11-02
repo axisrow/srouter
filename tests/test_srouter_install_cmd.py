@@ -1,11 +1,13 @@
-"""e2e-тесты srouter.cmd_install: -y/--yes минует TTY-gate (issue #106).
+"""e2e-тесты srouter.cmd_install: -y/--yes минует TTY-gate (issue #106), #416 — без квиза.
 
 cmd_install падал в не-TTY среде (cron/launchd/CI/фоновый процесс) ДАЖЕ с -y: isatty()-gate
 (подтверждение установки) стоял ДО проверки args.yes. -y именно для того, чтобы промпт не
 требовался → TTY не требовался. Симметрично test_srouter_uninstall_cmd.py (эталон stub'а).
 
-Покрываем gate-логику подтверждения (cmd_install:544). Конфликт-блок (cmd_install:530) НЕ трогаем —
-там TTY нужен legitimately (per-компонентный выбор adopt/overwrite/skip неразрешим через -y).
+#416: интерактив install — только y/N. Конфликты foreign_config/foreign_port авторазрешаются
+дефолтным путём (backup → перегенерация → рестарт) в apply_install; adopt/skip — флагами
+--xray/--privoxy/--dnsmasq. Неавторазрешимые конфликты (non_brew_binary) блокируют rc=2 с подсказкой
+флага — слов печатать не надо ни в TTY, ни вне его.
 """
 import sys
 from pathlib import Path
@@ -141,26 +143,91 @@ def test_cmd_install_idempotent_after_partial_uninstall(monkeypatch):
                      f"авторазрешается с backup, получил rc={rc}")
 
 
-def test_cmd_install_foreign_conflict_still_blocks_non_tty(monkeypatch, capsys):
-    """Дефект 2 регресс-гард: ИСТИННО foreign (reclaimable=False) → non-TTY по-прежнему rc=2.
+def test_cmd_install_foreign_conflict_auto_resolves_non_tty(monkeypatch):
+    """#416: true-foreign конфликт (reclaimable=False) в non-TTY с -y → НЕ rc=2, а авто-путь.
 
-    Фикс не должен открывать дыру: настоящий чужой конфиг (srouter никогда не ставил) остаётся
-    конфликтом, требующим явного adopt/overwrite/skip. non-TTY без выбора → rc=2 (как до фикса).
+    Прежний контракт «без выбора → rc=2» и был квизом из issue. Теперь: apply_install зовётся
+    (дефолтный путь backup → перегенерация → рестарт внутри), rc=0. Защита чужого = backup +
+    отчёт, а не блокировка с требованием напечатать слово.
     """
     _stub_cmd_install_internals(monkeypatch, apply_ok=True, tty=False)
+    seen = {}
     monkeypatch.setattr(srouter_cli, "build_plan", lambda **k: {
         "components": {
             "privoxy": {"name": "privoxy", "conflict": True, "reclaimable": False,
                         "conflicts": ["foreign_config"], "config_path": "/tmp/x", "port_owner": None},
         }
     })
+    monkeypatch.setattr(srouter_cli, "apply_install",
+                        lambda **k: (seen.update(k), {"ok": True, "blocked": [], "actions": []})[1])
 
     rc = srouter.cmd_install(_args(yes=True))
 
-    assert rc == 2, ("true-foreign (reclaimable=False) — конфликт, non-TTY без выбора → rc=2, "
-                     f"получил rc={rc}")
-    err = capsys.readouterr().err.lower()
-    assert "конфликт" in err, "stderr объясняет: конфликт требует ручного разрешения"
+    assert rc == 0, f"foreign_config в non-TTY с -y должен идти авто-путём, получил rc={rc}"
+    assert seen.get("choices") == {}, "без флагов choices пуст — авторазрешение в apply_install"
+
+
+def test_cmd_install_non_auto_conflict_blocks_with_flag_hint(monkeypatch, capsys):
+    """#416: non_brew_binary не авторазрешается — rc=2 с подсказкой флага (и в TTY тоже).
+
+    Никакого интерактивного выбора слов: единственный путь — явный флаг --<name> adopt|overwrite|skip.
+    """
+    _stub_cmd_install_internals(monkeypatch, apply_ok=True, tty=True)
+    monkeypatch.setattr(srouter_cli, "build_plan", lambda **k: {
+        "components": {
+            "privoxy": {"name": "privoxy", "conflict": True, "reclaimable": False,
+                        "conflicts": ["foreign_config", "non_brew_binary"],
+                        "config_path": "/tmp/x", "port_owner": None},
+        }
+    })
+
+    rc = srouter.cmd_install(_args(yes=True))
+
+    assert rc == 2, "non_brew_binary без флага — блок даже с -y и в TTY"
+    err = capsys.readouterr().err
+    assert "--privoxy" in err, f"stderr подсказывает флаг: {err}"
+
+
+def test_cmd_install_passes_component_choice_flags(monkeypatch):
+    """#416: флаги --xray/--privoxy/--dnsmasq (adopt|overwrite|skip) доходят до apply_install.choices."""
+    _stub_cmd_install_internals(monkeypatch, apply_ok=True, tty=False)
+    seen = {}
+    monkeypatch.setattr(srouter_cli, "apply_install",
+                        lambda **k: (seen.update(k), {"ok": True, "blocked": [], "actions": []})[1])
+
+    args = _args(yes=True)
+    args.privoxy = "skip"
+    rc = srouter.cmd_install(args)
+
+    assert rc == 0
+    assert seen.get("choices") == {"privoxy": "skip"}, "флаг компонента передан в apply_install"
+
+
+def test_cmd_install_reports_overwritten_backups(monkeypatch, capsys):
+    """#416: после apply — по одной строке на перезаписанный компонент: где лежит backup оригинала."""
+    _stub_cmd_install_internals(monkeypatch, apply_ok=True, tty=False)
+    monkeypatch.setattr(srouter_cli, "apply_install", lambda **k: {
+        "ok": True, "blocked": [],
+        "actions": [{"component": "privoxy", "mode": "managed", "changed": True,
+                     "backup": "/tmp/x/config.srouter-backup-2026-11-01T000000Z"}],
+    })
+
+    rc = srouter.cmd_install(_args(yes=True))
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "privoxy" in out and "/tmp/x/config.srouter-backup-2026-11-01T000000Z" in out, (
+        f"отчёт называет компонент и путь backup: {out}"
+    )
+
+
+def test_parser_exposes_component_choice_flags():
+    """#416: srouter install принимает --xray/--privoxy/--dnsmasq adopt|overwrite|skip (для скриптов)."""
+    args = srouter_cli.build_parser().parse_args(
+        ["install", "-y", "--xray", "skip", "--privoxy", "adopt"])
+    assert args.xray == "skip"
+    assert args.privoxy == "adopt"
+    assert args.dnsmasq is None
 
 
 # ============================ issue #189: codenv (gui-env SOCKS5) ВОССТАНОВЛЕН + VSCode scoped =====

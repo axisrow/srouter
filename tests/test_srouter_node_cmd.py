@@ -139,3 +139,26 @@ def test_noop_maps_to_rc0(tmp_path, monkeypatch, capsys):
 
     assert rc == 0
     assert "уже активен" in capsys.readouterr().out
+
+
+# ==================== issue #436: после смены узла — синк scmProxyUrl AO ====================
+def test_success_syncs_ao_scm_proxy(tmp_path, monkeypatch, capsys):
+    """Переключение узла меняет прокси-конфигурацию → хвост зовёт ao sync (issue #436).
+    Spy на srouter_cli.ao_proxy; сам sync под гвардом conftest (демон недоступен в тестах)."""
+    state_path = tmp_path / "srouter.local.json"
+    _write_state(state_path, _state())
+    calls = []
+    monkeypatch.setattr(srouter_cli.ao_proxy, "sync",
+                        lambda *a, **k: calls.append(k) or {"ok": True, "changed": False})
+    monkeypatch.setattr(node_selector, "select_node",
+                        lambda *a, **k: {"ok": False, "step": "adopt-mode", "active": "sg-1"})
+    monkeypatch.setattr(node_selector, "select_node_surgical",
+                        lambda name, **k: {"ok": True, "changed": True, "step": "done",
+                                           "from": "sg-1", "to": "hk-1"})
+    _patch_runner(monkeypatch)
+
+    rc = srouter_cli.cmd_node(_args("hk-1", state=str(state_path),
+                                    xray_config=str(tmp_path / "config.json")))
+
+    assert rc == 0
+    assert len(calls) == 1

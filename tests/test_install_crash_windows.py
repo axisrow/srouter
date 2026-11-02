@@ -693,12 +693,13 @@ def test_dead_state_backup_is_not_substituted_by_stray_neighbour(tmp_path):
     )
 
 
-def test_uninstall_reports_leftover_for_marked_config_without_any_history(tmp_path):
-    """Регресс-гвард: маркер жив, записи в state нет, backup'ов нет → leftover, не молчание.
+def test_uninstall_removes_marked_config_without_any_history(tmp_path):
+    """#416 (переписан гвард прошлой семантики): маркер жив, записи в state нет, backup'ов нет.
 
-    Эту ветку потеряла правка предыдущего раунда cycle-review (условие сузилось на
-    state_backup_missing и перестало ловить «истории нет вообще»). Классификация редьюсера была
-    верной всё это время — терялся именно доклад оператору, то есть ровно то, что чиним.
+    Прежний контракт (leftover + «удалять вслепую нельзя») оставлял наш конфиг висеть при любой
+    потере state — та самая несимметрия из #416. Новый: маркер = доказательство владения (его
+    пишет только наш генератор), backup нет ни на диске, ни в обещаниях state → created-конфиг →
+    удалить, rc=0 без leftover. Молчание здесь больше не ложь: откат реально состоялся.
     """
     env = _env(tmp_path)
     config_path = env.component_paths("privoxy")["config"]
@@ -716,10 +717,8 @@ def test_uninstall_reports_leftover_for_marked_config_without_any_history(tmp_pa
         env=env, confirmations={"configs": True}, runner=FakeRunner())
 
     assert result["ok"] is True
-    assert any(item["name"] == "privoxy" for item in result["leftover"]), (
-        "наш конфиг (маркер) без истории — не откатан; молчание = ложный «Откат завершён»"
-    )
-    assert config_path.exists(), "удалять вслепую нельзя — восстанавливать нечем"
+    assert result["leftover"] == [], "откат состоялся — partial-доклад был бы ложью"
+    assert not config_path.exists(), "наш created-конфиг удалён по маркеру (#416)"
 
 
 def test_uninstall_does_not_report_foreign_config_with_stray_backups(tmp_path):

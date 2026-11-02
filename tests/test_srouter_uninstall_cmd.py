@@ -229,3 +229,18 @@ def test_cmd_uninstall_returns_nonzero_when_git_proxy_not_removed(monkeypatch, c
     assert rc == 2, f"git-proxy не снят → ненулевой rc (fail-closed), получил {rc}"
     err = capsys.readouterr().err.lower()
     assert "git" in err, f"stderr объясняет причину (git-proxy не снят): {err}"
+
+
+# ==================== issue #436: uninstall снимает НАШЕ scmProxyUrl AO-демона ====================
+def test_cmd_uninstall_disables_ao_scm_proxy(monkeypatch):
+    """issue #436: uninstall обязан снять наш scmProxyUrl (== socks5h:10808) — после остановки
+    xray мёртвый прокси в демоне ломал бы его SCM-клиентов. Value-match: чужое не трогаем."""
+    _stub_cmd_uninstall_internals(monkeypatch, env_ok=True, tty=False)
+    calls = {"ao_disable": 0}
+    monkeypatch.setattr(srouter_cli, "ao_proxy", SimpleNamespace(
+        disable=lambda: (calls.__setitem__("ao_disable", 1), {"ok": True, "changed": True})[1]))
+
+    rc = srouter.cmd_uninstall(_args(yes=True))
+
+    assert rc == 0
+    assert calls["ao_disable"] == 1, "uninstall обязан снять scmProxyUrl AO (issue #436)"

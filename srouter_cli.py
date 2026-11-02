@@ -39,9 +39,11 @@ import speedtest_store  # speedtest: журнал ручных замеров с
 import node_selector  # node use: two-phase active-node apply (canonical/adopt-surgical)
 from install_lib import (
     CHOICES,
+    COMPONENTS,
     LAUNCHAGENT_LABEL,
     LAUNCHCTL,
     InstallEnv,
+    _conflicts_auto_resolved,
     _has_launchagent_marker,
     _launchd_domain,
     _launchd_is_loaded,
@@ -56,7 +58,6 @@ from install_lib import (
     format_plan,
     format_uninstall_plan,
     _install_generic_launchagent,
-    _reclaimable_resolves_all_conflicts,
     populate_known_markers,
     port_open,
 )
@@ -68,6 +69,7 @@ import git_proxy  # issue #130: вкл/откл SOCKS5 github-proxy в ~/.gitcon
 import go_proxy  # 2026-09-30: тумблер Go-модулей в обход GFW (goproxy.cn-зеркало / wrapper-туннель)
 import isolate_firewall  # protect: вкл/откл PF-изоляции Anthropic (strict-подсети, 2026-10-09)
 import vscode_proxy  # issue #185: scoped SOCKS5 для codex-расширения через VSCode http.proxy
+import ao_proxy  # issue #436: scmProxyUrl AO-демона синхронен с эффективным прокси srouter
 import health  # doctor-проверки стека
 import privoxy_audit  # пассивный root-owned аудит lifecycle-команд Privoxy (#122)
 import privoxy_system  # root-gated system LaunchDaemon для Privoxy (#122)
@@ -141,15 +143,6 @@ from claude_wrappers import (
 
 def _prompt_bool(label: str) -> bool:
     return input(f"{label} [y/N]: ").strip().lower() in {"y", "yes", "д", "да"}
-
-
-def _prompt_choice(name: str) -> str:
-    """adopt | overwrite | skip (install_lib.CHOICES)."""
-    while True:
-        answer = input(f"Выбор для {name} [adopt/overwrite/skip]: ").strip().lower()
-        if answer in CHOICES:
-            return answer
-        print("Допустимо: adopt, overwrite, skip.")
 
 
 def _install_file_groups():
@@ -252,8 +245,9 @@ def _remove_optional_features(env, runner):
 def cmd_install(args) -> int:
     """Полная установка стека: brew-сервисы + конфиги + DNS + LaunchAgent.
 
-    Показывает план, при конфликтах (чужие конфиги) спрашивает adopt/overwrite/skip,
-    подтверждает. Делегирует тяжёлую работу в install_lib.apply_install.
+    Показывает план и подтверждает ЕДИНЫМ y/N (#416): чужие конфиги авторазрешаются дефолтным
+    путём (backup → перегенерация → рестарт; план перечисляет перезаписи). Делегирует тяжёлую
+    работу в install_lib.apply_install; adopt/skip — только флагами --<name>.
     """
     env = _env_from_args(args)
     runner = make_privileged_runner(run)
@@ -269,29 +263,24 @@ def cmd_install(args) -> int:
     print(format_plan(plan))
     print()
 
-    # 3) Конфликты → интерактивный выбор per компонент.
-    # reclaimable («свой старый»: state.managed=True, маркер пропал, issue #110 Дефект 2) НЕ попадает
-    # в интерактивный фильтр — он тихо авторазрешается в apply_install (с backup). Иначе non-TTY install
-    # падал rc=2 на «своём старом» сразу после uninstall, даже с -y. НО только если reclaimable покрывает
-    # ВСЕ конфликты (cycle-review #111 cycle 1 finding 2): non_brew_binary и будущие conflict-типы НЕ
-    # поглощаются → остаются в фильтре, требуют adopt/overwrite/skip. Истинно foreign требует выбора.
-    choices = {}
-    conflicts = [(name, item) for name, item in (plan.get("components") or {}).items()
-                 if isinstance(item, dict) and item.get("conflict")
-                 and not _reclaimable_resolves_all_conflicts(item)]
-    if conflicts:
-        if not sys.stdin.isatty():
-            names = ", ".join(n for n, _ in conflicts)
-            print(f"install: обнаружены конфликты ({names}); разрешите вручную или удалите чужие "
-                  f"конфиги.", file=sys.stderr)
-            return 2
-        for name, item in conflicts:
-            reasons = ", ".join(item.get("conflicts") or [])
-            print(f"\nКонфликт по компоненту {name} ({reasons}):")
-            print(f"  config_path: {item.get('config_path')}")
-            print(f"  port_owner:  {item.get('port_owner') or '-'}")
-            choices[name] = _prompt_choice(name)
-        print()
+    # 3) #416: квиз adopt/overwrite/skip упразднён — интерактив только y/N (шаг 4). Конфликты
+    # foreign_config/foreign_port авторазрешаются дефолтным путём в apply_install (backup →
+    # перегенерация → рестарт); план выше перечисляет, что будет перезаписано и где ляжет backup.
+    # Конфликты ВНЕ авто-дефолта (non_brew_binary и будущие типы — cycle-review #111 c1 f2) разрешаются
+    # только явным флагом --<name> adopt|overwrite|skip (для скриптов и edge-кейсов): блок с подсказкой,
+    # без вопросов-слов ни в TTY, ни вне его.
+    choices = {name: getattr(args, name, None) for name in COMPONENTS
+               if getattr(args, name, None) in CHOICES}
+    blocking = [(name, item) for name, item in (plan.get("components") or {}).items()
+                if isinstance(item, dict) and item.get("conflict")
+                and not _conflicts_auto_resolved(item) and name not in choices]
+    if blocking:
+        names = ", ".join(
+            f"{name} ({', '.join(item.get('conflicts') or [])})" for name, item in blocking)
+        flags = " ".join(f"--{name} adopt|overwrite|skip" for name, _ in blocking)
+        print(f"install: конфликт требует явного решения: {names}. Разрешите флагом: {flags}",
+              file=sys.stderr)
+        return 2
 
     # 4) Подтверждение.
     # Не-TTY запуск допустим ТОЛЬКО с -y/--yes (промпт не нужен). Без TTY и без -y — отказ:
@@ -317,6 +306,11 @@ def cmd_install(args) -> int:
         force_endpoint_overwrite=getattr(args, "force_endpoint_overwrite", False),
     )
     if result.get("ok"):
+        # #416: одна строка на перезаписанный компонент — «что перезаписано, где backup».
+        for action in result.get("actions") or []:
+            if action.get("backup"):
+                print(f"{action['component']}: прежний конфиг перезаписан, оригинал сохранён: "
+                      f"{action['backup']}")
         try:
             def tracked(group, action):
                 return _tracked_install(env, files[group], action, record=not legacy_files)
@@ -529,7 +523,11 @@ def cmd_uninstall(args, *, runner=None) -> int:
     vp = (vscode_proxy.disable(skip_paths=handled | blocked)
           if (handled | blocked) and not skip("vscode") else
           {"ok": True} if skip("vscode") else vscode_proxy.disable())
-    for label, status in (("Claude Code", cp), ("git github-proxy", gp), ("VSCode", vp)):
+    # issue #436: снять НАШЕ scmProxyUrl AO-демона (xray остановлен — мёртвый socks в
+    # настройке демона ломал бы его SCM-клиентов). Value-match: чужое не трогаем (#112).
+    ap = ao_proxy.disable()
+    for label, status in (("Claude Code", cp), ("git github-proxy", gp), ("VSCode", vp),
+                          ("AO scm-proxy", ap)):
         if not status.get("ok") or status.get("err"):
             errors.append(f"{label} не восстановлен: {status.get('err', 'unknown')}")
 
@@ -1282,11 +1280,22 @@ def cmd_system_proxy(args) -> int:
         if st["status"] != "ok":
             print(f"system-proxy: {st.get('detail', 'состояние не определено')}", file=sys.stderr)
             return 1
-        socks = st["socks"]
         marker = "✅ (target)" if st["target"] else "⚠️"
         print(f"system-proxy: сервис={st['service']} (interface={st['interface']}) {marker}")
-        print(f"  SOCKS: enabled={socks['enabled']} {socks['server']}:{socks['port']} "
-              f"authenticated={socks['authenticated']}")
+        if st.get("detail"):
+            # #439: VPN-fallback обязан быть назван явно, не молча (issue).
+            print(f"  {st['detail']}")
+        services = st.get("services") or []
+        if len(services) > 1:
+            # #439: VPN-фан-аут — per-service состояние, не только сводный SOCKS первого.
+            for e in services:
+                s = e["socks"]
+                print(f"  {e['service']}: enabled={s['enabled']} {s['server']}:{s['port']} "
+                      f"authenticated={s['authenticated']}")
+        else:
+            socks = st["socks"]
+            print(f"  SOCKS: enabled={socks['enabled']} {socks['server']}:{socks['port']} "
+                  f"authenticated={socks['authenticated']}")
         return 0 if st["target"] else 1
 
     if action == "repair":
@@ -1466,6 +1475,20 @@ def cmd_privoxy(args) -> int:
     return 0
 
 
+def _ao_scm_proxy_sync(context):
+    """Best-effort синк scmProxyUrl AO-демона после смены прокси-конфига (issue #436).
+
+    ao_proxy.sync не бросает; демона нет / значение уже верное — тихо (ok/skipped),
+    печатаем только реальное изменение и честную ошибку. Ошибка синка НЕ роняет
+    основную команду: прокси-конфиг уже применён, AO догонит при следующей смене.
+    """
+    r = ao_proxy.sync()
+    if r.get("ok") is False:
+        print(f"ao-proxy: scmProxyUrl не синхронизирован ({r.get('err')})", file=sys.stderr)
+    elif r.get("changed"):
+        print(f"ao-proxy: scmProxyUrl AO → {r.get('url') or '(напрямую)'}")
+
+
 def cmd_routing(args) -> int:
     """Управление routing-доменами production xray-config (#136).
 
@@ -1527,6 +1550,7 @@ def cmd_routing(args) -> int:
     verb = "добавлен" if action == "add" else "убран"
     if r.get("changed"):
         print(f"routing: {label} {verb}, xray перезапущен.")
+        _ao_scm_proxy_sync("routing")
     else:
         print(f"routing: {label} уже в нужном состоянии (no-op).")
     return 0
@@ -1569,6 +1593,7 @@ def cmd_node(args):
             if isinstance(ria, dict) and not ria.get("ok"):
                 print(f"  предупреждение: IP узла в routing-правило не добавлен "
                       f"({ria.get('err')})", file=sys.stderr)
+            _ao_scm_proxy_sync("node")
         else:
             print(f"node use: узел {name} уже активен (no-op).")
         return 0
@@ -1621,6 +1646,7 @@ def cmd_github_direct(args):
         print("github-direct: github ходит напрямую (туннель мёртв — верни `off`, когда оживёт).")
     else:
         print("github-direct: github снова через туннель.")
+    _ao_scm_proxy_sync("github-direct")
     return 0
 
 
@@ -1703,8 +1729,15 @@ def build_parser() -> argparse.ArgumentParser:
         add_env_flags(p)
         if name in ("install", "uninstall"):
             p.add_argument("-y", "--yes", action="store_true",
-                           help="Подтвердить без интерактивного промпта (конфликты всё равно блокируют).")
+                           help="Подтвердить без интерактивного промпта (неавторазрешимые конфликты "
+                                "всё равно требуют явного флага --<name>).")
         if name == "install":
+            # #416: per-компонентные выборы — ТОЛЬКО флагами (для скриптов/edge-кейсов); интерактив
+            # упрощён до y/N, дефолт для чужих конфигов — backup → перегенерация → рестарт.
+            for component in COMPONENTS:
+                p.add_argument(f"--{component}", choices=CHOICES, default=None,
+                               help=f"Явный выбор для конфликтов {component} (default: авто — "
+                                    f"backup + перегенерация)")
             p.add_argument("--force-endpoint-overwrite", action="store_true",
                            help="Обойти #200 защиту: перезаписать рабочий xray config placeholder'ом "
                                 "(осознанно; обычно запусти `srouter sync` вместо этого).")

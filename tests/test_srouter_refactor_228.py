@@ -364,6 +364,9 @@ class TestReexportSurfaceIsComplete:
     # Список зафиксирован намеренно: читать git из теста — хрупко (пустой clone, shallow).
     # Включая `annotations`: `from __future__ import annotations` связывает настоящий объект
     # _Feature, то есть это такой же атрибут модуля, как остальные (проверено, не домысел).
+    # #416: _prompt_choice (квиз adopt/overwrite/skip) и _reclaimable_resolves_all_conflicts
+    # удалены осознанно — интерактив install упрощён до y/N; гвард охраняет от СЛУЧАЙНОЙ потери,
+    # контрактные удаления фиксируются здесь явно.
     BASELINE = {
         "CHOICES",
         "annotations", "CODEX_CLI_WRAPPER_LEGACY_NAME", "CODEX_CLI_WRAPPER_NAME", "CODEX_ENV_LABEL",
@@ -378,8 +381,8 @@ class TestReexportSurfaceIsComplete:
         "_install_launchctl_env", "_install_one_wrapper", "_install_ppp_hook", "_is_ip_literal",
         "_is_loaded", "_is_privileged_cmd", "_launchd_domain", "_launchd_is_loaded",
         "_launchd_reload", "_looks_like_managed_codex_wrapper", "_migrate_legacy_codex_cli_wrapper",
-        "_prompt_bool", "_prompt_choice", "_read_routing_domains",
-        "_reclaimable_resolves_all_conflicts", "_remove_active_split_route",
+        "_prompt_bool", "_read_routing_domains",
+        "_remove_active_split_route",
         "_remove_codex_isolation", "_remove_codex_wrappers", "_remove_codex_zsh_function",
         "_remove_home_bin_from_path", "_remove_launchctl_env", "_remove_one_wrapper",
         "_remove_ppp_hook", "_routing_has_marker", "_to_osascript", "_version_string",

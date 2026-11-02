@@ -133,7 +133,10 @@ def _component_uninstall_item(name, env, detected):
         else:
             status = "unmanaged — left untouched"
     elif recovery == "remove":
-        status = "managed — created config, remove available"
+        # #416: «наш ли конфиг» решает маркер — remove доступен и без state-истории (state —
+        # ускоритель). managed=False при живом маркере = история потеряна, а не «чужое».
+        status = ("managed — created config, remove available" if managed
+                  else "marker-managed — created config (no state history), remove available")
     elif recovery == "restore":
         status = "managed — restore available"
     elif recovery == "orphaned_backup":
@@ -194,12 +197,9 @@ def _leftover_reason(item):
         if item.get("provenance") == "created":
             return "created-config: marker missing (обрыв install / подмена) — fail-safe, не удалено"
         return "stale-managed: not restorable and marker missing"
-    # Маркер жив, но истории нет: ни backup рядом, ни записи в state. Восстанавливать нечем, удалять
-    # вслепую нельзя. ГРАНИЦА #111 cycle 2 finding B: legacy marker-managed БЕЗ provenance — состояние
-    # ОПРЕДЕЛЁННОЕ (конфиг наш и валиден), это не partial → rc=0, не leftover.
-    if item.get("managed"):
-        return ""
-    return "srouter-маркер в конфиге, но ни backup, ни записи в state — не откатано"
+    # #416: «маркер жив, но истории нет» больше не leftover — component_facts классифицирует это как
+    # remove (наш created-конфиг) и uninstall реально удаляет его. Докладывать нечего.
+    return ""
 
 
 def _launchagent_uninstall_item(env, detected):
@@ -620,7 +620,9 @@ def _restore_dns(plan, runner):
     leases = network.get("dns_restore") or {}
     dnsmasq = next((item for item in plan.get("components", []) if item.get("name") == "dnsmasq"), {})
     if not leases:
-        if not (dnsmasq.get("managed") or dnsmasq.get("restorable")):
+        # #416: маркерный dnsmasq — наш, даже если state потерян (removable без state-истории):
+        # DNS на 127.0.0.1 после снятия нашего dnsmasq был бы мёртвым → honest-fail, не «unmanaged».
+        if not (dnsmasq.get("managed") or dnsmasq.get("restorable") or dnsmasq.get("removable")):
             return {"rc": 0, "err": "dnsmasq unmanaged"}
         service = (network.get("channels") or {}).get("wifi_service")
         if not service:
@@ -910,8 +912,17 @@ def main(argv=None, *, runner=run):
                             install_launchagent=install_launchagent, runner=runner)
     if result["ok"]:
         print("apply завершён успешно: изменения сохранены (подтверждено через --yes).")
+        # #416: одна строка на перезаписанный компонент — где лежит backup оригинала.
+        for action in result.get("actions") or []:
+            if action.get("backup"):
+                print(f"{action['component']}: прежний конфиг сохранён в {action['backup']}")
         return 0
     print("apply остановлен: " + ", ".join(result.get("blocked") or ["unknown"]), file=sys.stderr)
+    # #416: конфликты вне авто-дефолта (non_brew_binary) разрешаются только флагами — подсказка.
+    unresolved = [name for name in (result.get("blocked") or []) if name in COMPONENTS]
+    if unresolved:
+        flags = " ".join(f"--{name} adopt|overwrite|skip" for name in unresolved)
+        print(f"  разрешите явно: {flags}", file=sys.stderr)
     if "plan" in result:
         print(format_plan(result["plan"]), file=sys.stderr)
     return 2
