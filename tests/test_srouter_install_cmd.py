@@ -71,6 +71,9 @@ def _stub_cmd_install_internals(monkeypatch, *, apply_ok=True, tty=True):
         enable=lambda force=False: (_force_seen("git", force),
                                     {"ok": True, "proxy": "socks5h://127.0.0.1:10808"})[1]))
     monkeypatch.setattr(srouter_cli, "_install_generic_launchagent", lambda *a, **k: (True, ""))
+    # #445: keeper-логи — _watchdog_keeper_env читает env.log_out/err; стаб _env_from_args
+    # выше отдаёт SimpleNamespace без них → мокаем identity (как остальные best-effort хелперы).
+    monkeypatch.setattr(srouter_cli, "_watchdog_keeper_env", lambda env: env)
     monkeypatch.setattr(srouter_cli, "_install_ppp_hook", lambda *a, **k: "")
     monkeypatch.setattr(srouter_cli, "_install_codex_wrappers", lambda env: "")
     if hasattr(srouter_cli, "_install_codex_zsh_function"):

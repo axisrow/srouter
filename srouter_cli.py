@@ -343,6 +343,19 @@ def cmd_install(args) -> int:
             wd_note = ("Watchdog: установлен (нотификация при падении туннеля, poll 20с)."
                        if wd_ok else
                        f"Watchdog: не установлен ({wd_err}).")
+            # #445: keeper watchdog'а — монитор монитора (пуш «Упало: watchdog» при потере
+            # heartbeat дольше 5 мин; инцидент 02.11). Best-effort, как сам watchdog; свои
+            # логи (не dashboard-файлы) — форензика crash-loop'а не смешивается с Flask-шумом.
+            wk_ok, wk_err = _install_generic_launchagent(
+                _watchdog_keeper_env(env), runner,
+                template_name="com.srouter.watchdog-keeper.plist",
+                label="com.srouter.watchdog-keeper",
+                marker="srouter-managed-watchdog-keeper-v1",
+                script_path=env.root / "health.py",
+            )
+            wk_note = ("Watchdog-keeper: установлен (пуш при потере heartbeat watchdog'а, "
+                       "раз в 5 мин)." if wk_ok else
+                       f"Watchdog-keeper: не установлен ({wk_err}).")
             # ppp-hook: мгновенный split-route при VPN up (/etc/ppp/ip-up, от root, без osascript).
             ppp_note = _install_ppp_hook(env, runner)
             # Codex SOCKS5-wrappers (~/.local/bin wrappers через ~/bin) + launchctl env + PATH +
@@ -403,6 +416,7 @@ def cmd_install(args) -> int:
                   f"{cp_note}\n"
                   f"{gp_note}\n"
                   f"{wd_note}\n"
+                  f"{wk_note}\n"
                   f"{ppp_note}\n"
                   f"{codex_note}\n"
                   f"{codex_func_note}\n"
@@ -727,6 +741,15 @@ def _netprobe_env():
     return replace(env,
                    log_out=env.log_out.with_name("srouter-netprobe.out.log"),
                    log_err=env.log_err.with_name("srouter-netprobe.err.log"))
+
+
+def _watchdog_keeper_env(env):
+    """InstallEnv keeper'а (#445): те же SROUTER_*-переопределения, но СВОИ логи — форензика
+    crash-loop'а keeper'а не смешивается с Flask-шумом dashboard-логов (watchdog туда пишет
+    исторически; keeper — новый агент, повторять не нужно)."""
+    return replace(env,
+                   log_out=env.log_out.with_name("srouter-watchdog-keeper.out.log"),
+                   log_err=env.log_err.with_name("srouter-watchdog-keeper.err.log"))
 
 
 def _netprobe_subprocess(env, mode, timeout, extra=None):

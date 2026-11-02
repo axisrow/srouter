@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- __SROUTER_WATCHDOG-KEEPER_MARKER__ -->
+<!-- Keeper watchdog'а (#445, инцидент 02.11): раз в 300с проверяет heartbeat самого
+     watchdog'а (mtime /tmp/srouter-watchdog.last) и пушит «Упало: watchdog» при
+     доказанной смерти (протухший heartbeat + sleep-guard; диагноз по launchd-снапшоту:
+     не загружена / crash-loop импорта / тиков нет). Восстановление — «Восстановлено:
+     watchdog» только после прозвучавшего «Упало» (канон пар #315/#380), cooldown
+     SROUTER_WATCHDOG_KEEPER_COOLDOWN (900с) против флапа.
+     Сам watchdog — cron-джоба (StartInterval=20): launchd сам перезапускает упавший
+     прогон следующим тиком, KeepAlive в plist НЕ нужен (exit 1 на degraded-прогоне дал
+     бы tight-loop). «job state = exited» у cron-джобы — норма между тиками, не смерть:
+     живость смотри по heartbeat (`srouter doctor`, чек «watchdog (heartbeat Nс назад)»).
+     CLI: python3 health.py watchdog-keeper (работает и без plist). -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>__SROUTER_WATCHDOG-KEEPER_LABEL__</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__SROUTER_PYTHON_BIN__</string>
+    <string>__SROUTER_WATCHDOG-KEEPER_PATH__</string>
+    <string>watchdog-keeper</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__SROUTER_ROOT_DIR__</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartInterval</key>
+  <integer>300</integer>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>__SROUTER_LOG_OUT__</string>
+  <key>StandardErrorPath</key>
+  <string>__SROUTER_LOG_ERR__</string>
+</dict>
+</plist>

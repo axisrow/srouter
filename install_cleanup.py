@@ -74,6 +74,7 @@ def _extra_launchagents(env):
     agents = []
     markers = {
         "com.srouter.watchdog": "srouter-managed-watchdog-v1",
+        "com.srouter.watchdog-keeper": "srouter-managed-watchdog-keeper-v1",
         "com.srouter.netprobe": "srouter-managed-netprobe-v1",
         "com.srouter.codenv": "srouter-managed-codex-env-v1",
         "com.srouter.isolate": "__SROUTER_ISOLATE_STRICT_MARKER__",

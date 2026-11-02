@@ -320,6 +320,13 @@ def _machine_state_monkey(monkeypatch):
     monkeypatch.setattr(health, "_backup_slots_probe",
                         lambda: {"status": "ok", "detail": "mock: бэкап-слоты консистентны",
                                  "findings": []})
+    # #445: liveness-чеки watchdog'а/keeper'а — тот же мок, что в каноне (_all_up_monkey).
+    monkeypatch.setattr(health, "_watchdog_liveness_check",
+                        lambda: {"id": "watchdog", "name": "watchdog (heartbeat)", "ok": True,
+                                 "info": True, "detail": "mock: heartbeat свежий"})
+    monkeypatch.setattr(health, "_watchdog_keeper_liveness_check",
+                        lambda: {"id": "watchdog-keeper", "name": "watchdog-keeper (heartbeat)",
+                                 "ok": True, "info": True, "detail": "mock: keeper тикает"})
 
 
 def test_check_all_status_ok_when_nothing_installed(monkeypatch, tmp_path):
