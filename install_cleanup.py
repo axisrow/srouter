@@ -906,9 +906,19 @@ def main(argv=None, *, runner=run):
 
     choices = {name: getattr(args, name) for name in COMPONENTS if getattr(args, name)}
     install_launchagent = True
+    cli = None
+    post_install_record = True
     if args.mode == "init":
         choices = {name: "skip" for name in COMPONENTS} | choices
         install_launchagent = False
+    elif args.mode == "apply":
+        # #410: record-режим post-install этапа — из PRE-apply state (после apply сам этап уже
+        # создал бы install_files, и legacy-различие стёрлось бы). Ленивый import: srouter_cli
+        # тянет CLI-зависимости, plan/uninstall-путям они не нужны — тот же паттерн, что у
+        # делегации uninstall-apply в srouter_cli.cmd_uninstall ниже.
+        import srouter_cli
+        cli = srouter_cli
+        post_install_record = cli.should_record_install_files(env)
     result = apply_install(env=env, confirm=args.yes, choices=choices,
                             install_launchagent=install_launchagent, runner=runner)
     if result["ok"]:
@@ -917,6 +927,20 @@ def main(argv=None, *, runner=run):
         for action in result.get("actions") or []:
             if action.get("backup"):
                 print(f"{action['component']}: прежний конфиг сохранён в {action['backup']}")
+        if cli is not None:
+            # #410: общий post-install этап (proxies/watchdogs/wrappers/codenv/marker-миграции) —
+            # та же реализация run_post_install, что у `srouter install`. Раньше install.sh apply
+            # ставил стек БЕЗ wrapper'ов (этап жил только в cmd_install), и совет doctor'а
+            # «запусти install» на этой машине вёл в тупик (инцидент 2026-10-08). runner —
+            # с автодетектом привилегий (ppp-hook/osascript-мост), как у cmd_install.
+            # Контракт cmd_install сохранён: raise (OSError/ValueError/TypeError) из этапа —
+            # «выполнен частично» rc=2, не тихий exit 0.
+            try:
+                print(cli.run_post_install(env, cli.make_privileged_runner(runner),
+                                           record=post_install_record))
+            except (OSError, ValueError, TypeError) as exc:
+                print(f"apply выполнен частично: post-install этап упал ({exc}).", file=sys.stderr)
+                return 2
         return 0
     print("apply остановлен: " + ", ".join(result.get("blocked") or ["unknown"]), file=sys.stderr)
     # #416: конфликты вне авто-дефолта (non_brew_binary) разрешаются только флагами — подсказка.

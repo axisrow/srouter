@@ -96,11 +96,11 @@ def _gui_wrappers_check():
                     target = "?"
                 dangling = "" if os.path.exists(p) else " (ВИСЯЧИЙ — цель снесена)"
                 problems.append(f"{name}: симлинк на {target}{dangling} — вне управления srouter "
-                                f"(удали и запусти srouter install)")
+                                f"(удали и запусти srouter wrappers repair)")
                 continue
             if not p.exists():
                 if app_installed(name):
-                    problems.append(f"{name}: отсутствует — запусти srouter install")
+                    problems.append(f"{name}: отсутствует — запусти srouter wrappers repair")
                 else:
                     optional_absent.append(
                         f"{name}: отсутствует (app не установлен — wrapper опционален)")
@@ -108,20 +108,20 @@ def _gui_wrappers_check():
             if not p.is_file():
                 # FIFO/socket/device: exists() True, но read_text() блокируется навсегда —
                 # вешал watchdog (StartInterval=20) + /health + doctor разом (ревью #405).
-                problems.append(f"{name}: не regular file — удали и запусти srouter install")
+                problems.append(f"{name}: не regular file — удали и запусти srouter wrappers repair")
                 continue
             with p.open("r", encoding="utf-8") as fh:
                 content = fh.read(1 << 20)  # wrapper — единицы KB; cap 1MB против безлимитного read (ревью #405)
             if not any(m in content for m in ours_markers(name, marker)):
                 problems.append(f"{name}: без srouter-маркера — чужой, install его не трогает "
-                                f"(удали вручную и запусти srouter install)")
+                                f"(удали вручную и запусти srouter wrappers repair)")
                 continue
             if not os.access(p, os.X_OK):
-                problems.append(f"{name}: не исполняется — chmod +x или srouter install")
+                problems.append(f"{name}: не исполняется — srouter wrappers repair (перезапишет и chmod +x)")
         except (OSError, ValueError, TypeError) as exc:
             # Внешний shell на весь wrapper (lstat/exists/read гонки и права) — контракт
             # check_all «Не бросает» (health.py), как у соседних чеков (ревью #405).
-            problems.append(f"{name}: fs-ошибка ({str(exc)[:40]}) — запусти srouter install")
+            problems.append(f"{name}: fs-ошибка ({str(exc)[:40]}) — запусти srouter wrappers repair")
     if problems:
         return {"status": "warn", "source": "fs",
                 "detail": "Wrapper'ы вне управления srouter: "

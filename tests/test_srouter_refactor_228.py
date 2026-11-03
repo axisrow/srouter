@@ -125,6 +125,7 @@ class TestParserSurface:
             "github-direct",  # 2026-10-11: путь github (on/off/status; три списка)
             "speedtest",  # 2026-10-12: ручной замер скорости (журнал сеть+VPN, --list)
             "ssh",  # 2026-11-02 #438: SSH через туннель (route on|off|status, setup, status)
+            "wrappers",  # 2026-11-03 #410: точечный repair gui-wrapper'ов (repair) — исполняемый совет doctor
         }
 
     def test_nested_subcommand_paths_preserved(self, surface):

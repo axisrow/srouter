@@ -106,7 +106,9 @@ def test_warn_names_dangling_symlink(monkeypatch, tmp_path):
 
 
 def test_warn_names_missing_wrapper(monkeypatch, tmp_path):
-    """app установлен, wrapper отсутствует → warn «запусти srouter install» (чинится install'ом)."""
+    """app установлен, wrapper отсутствует → warn «запусти srouter wrappers repair» (#410):
+    совет должен быть исполним на конфликтной машине, где полный srouter install заблокирован
+    (инцидент 2026-10-08 — install.sh apply не ставил wrapper'ы, совет вёл в тупик)."""
     home = _mock_home(monkeypatch, tmp_path)
     _write_wrapper(home, "codex-srouter", _codex_marker("codex-srouter"))
     _mock_apps(monkeypatch, tmp_path)
@@ -116,6 +118,9 @@ def test_warn_names_missing_wrapper(monkeypatch, tmp_path):
     assert res["status"] == "warn"
     for name in ("codex-app-proxy", claude_wrappers.CLAUDE_APP_WRAPPER_NAME):
         assert name in res["detail"], f"{name} отсутствует — должен быть назван; got {res}"
+    assert "wrappers repair" in res["detail"], f"совет называет точечный repair (#410); got {res}"
+    assert "запусти srouter install" not in res["detail"], (
+        f"совет «запусти srouter install» — тупик на конфликтной машине (#410); got {res}")
 
 
 def test_missing_wrapper_app_absent_is_unknown(monkeypatch, tmp_path):
