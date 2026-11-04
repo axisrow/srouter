@@ -140,6 +140,10 @@ from claude_wrappers import (
     _claude_wrapper_path,
 )
 
+# ChatGPT.app Dock-launcher (контракт владельца 2026-11-05: ChatGPT.app = группа Claude.app,
+# только 10808, никогда direct) — launcher .app-bundle + Dock-tile swap, см. codex_app_launcher.py.
+import codex_app_launcher
+
 
 def _prompt_bool(label: str) -> bool:
     return input(f"{label} [y/N]: ").strip().lower() in {"y", "yes", "д", "да"}
@@ -232,6 +236,13 @@ def _remove_optional_features(env, runner):
         proxy = system_proxy_control.restore(path=env.state_path, runner=runner)
         if not proxy.get("ok"):
             errors.append("system-proxy: " + (proxy.get("err") or "не восстановлен"))
+    if codex_app_launcher._load_swap(env.state_path):
+        # Dock-launcher ChatGPT.app: вернуть исходный тайл, иначе Dock остаётся указывать
+        # на удаляемый launcher (битый тайл после полного uninstall).
+        note, ok = codex_app_launcher.uninstall_launcher(env, runner=runner)
+        print(note)
+        if not ok:
+            errors.append("codex-app launcher: " + note)
     go = go_proxy.disable(full=True, owned_only=True)
     if not go.get("ok"):
         errors.append("go-proxy: " + (go.get("error") or "не снят"))
@@ -486,6 +497,31 @@ def cmd_wrappers_repair(args) -> int:
     print(_install_codex_wrappers(env))
     print(_install_claude_app_wrapper(env))
     return 0
+
+
+def cmd_wrappers_codex_app(args) -> int:
+    """Dock-launcher ChatGPT.app (контракт владельца 2026-11-05: ChatGPT.app = группа
+    Claude.app — только 10808, никогда direct). install: launcher .app-bundle в
+    ~/Applications (→ ~/bin/codex-app-proxy) + подмена Dock-тайла (defaults
+    persistent-others + killall Dock, исходный тайл — в state). uninstall: обратимо
+    возвращает тайл. status: read-only (тайл/argv-флаг живого процесса/scutil-снапшот).
+    См. codex_app_launcher.py и health_codenv._codex_app_chromium_proxy_check."""
+    env = _env_from_args(args)
+    action = getattr(args, "codex_app_action", None)
+    if action == "install":
+        print(codex_app_launcher.install_launcher(env))
+        return 0
+    if action == "uninstall":
+        note, ok = codex_app_launcher.uninstall_launcher(env)
+        print(note)
+        return 0 if ok else 1
+    st = codex_app_launcher.status()
+    print(f"codex-app launcher: {st['status']}")
+    print(f"  launcher установлен: {st['launcher_installed']}")
+    print(f"  Dock-тайл на launcher: {st['dock_tile_on_launcher']}")
+    print(f"  argv живого ChatGPT/Codex несёт --proxy-server: {st['live_app_flag']}")
+    print(f"  эффективный снапшот (scutil) что-то включил: {st['snapshot_any_enabled']}")
+    return 0 if st["status"] == "ok" else 1
 
 
 def cmd_uninstall(args, *, runner=None) -> int:
@@ -1910,12 +1946,26 @@ def build_parser() -> argparse.ArgumentParser:
     # wrappers repair (#410): точечная переустановка gui-wrapper'ов (codex-* + claude-app) тем же
     # продакшн-кодом, что install, без полного стека — исполняемый совет doctor'а gui-wrappers
     # на конфликтной машине (инцидент 2026-10-08: install заблокирован, wrapper отсутствовал).
-    p_wr = sub.add_parser("wrappers", help="Repair gui-wrapper'ов (codex-*, claude-app).")
+    p_wr = sub.add_parser("wrappers", help="Repair gui-wrapper'ов (codex-*, claude-app) + Dock-launcher ChatGPT.app.")
     p_wr_sub = p_wr.add_subparsers(dest="wrappers_action", required=True)
     p_wr_repair = p_wr_sub.add_parser(
         "repair", help="Переустановить wrapper'ы (marker-gate: чужое не трогаем).")
     add_env_flags(p_wr_repair)
     p_wr_repair.set_defaults(func=cmd_wrappers_repair)
+    # codex-app (контракт владельца 2026-11-05): Dock-launcher ChatGPT.app — install ставит
+    # launcher + подменяет Dock-тайл, uninstall обратимо возвращает, status read-only.
+    # Рецепт doctor'а при пустом снапшоте + запуске без --proxy-server.
+    p_ca = p_wr_sub.add_parser(
+        "codex-app", help="Dock-launcher ChatGPT.app: install/uninstall/status.")
+    p_ca_sub = p_ca.add_subparsers(dest="codex_app_action", required=True)
+    for ca_name, ca_help in (
+        ("install", "Launcher .app в ~/Applications + подмена Dock-тайла (исходный — в state)."),
+        ("uninstall", "Вернуть исходный Dock-тайл и удалить launcher."),
+        ("status", "Read-only: тайл/argv-флаг живого процесса/scutil-снапшот."),
+    ):
+        p_ca_x = p_ca_sub.add_parser(ca_name, help=ca_help)
+        add_env_flags(p_ca_x)
+        p_ca_x.set_defaults(func=cmd_wrappers_codex_app)
 
     # sync (#200): импорт endpoint активного узла из РАБОЧЕГО xray config в srouter.local.json,
     # когда local.json — placeholder test-IP, а xray — реальный VPS. Чинит рассинхрон источника
