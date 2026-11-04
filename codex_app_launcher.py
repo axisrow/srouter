@@ -21,9 +21,12 @@ system_proxy.status() (scutil --proxy, canon system_proxy.py:95).
 """
 from __future__ import annotations
 
+import copy
 import logging
 import os
 import plistlib
+import re
+import shutil
 from pathlib import Path
 from urllib.parse import quote
 
@@ -31,11 +34,6 @@ import local_state
 import sys_probe
 import system_proxy
 from install_lib import _write_text_atomic
-
-try:
-    from install_lib import run
-except ImportError:  # pragma: no cover
-    run = sys_probe.run
 
 _log = logging.getLogger("srouter.codex_app_launcher")
 
@@ -105,7 +103,6 @@ def _render_script() -> str:
 
 
 def _render_info_plist(app_name: str) -> str:
-    import plistlib as _pl
     info = {
         "CFBundleName": f"{app_name} (srouter)",
         "CFBundleDisplayName": f"{app_name} (srouter)",
@@ -114,7 +111,7 @@ def _render_info_plist(app_name: str) -> str:
         "CFBundlePackageType": "APPL",
         "CFBundleVersion": "1.0",
     }
-    return _pl.dumps(info).decode("utf-8")
+    return plistlib.dumps(info).decode("utf-8")
 
 
 def _script_is_ours(script: Path) -> bool:
@@ -244,7 +241,6 @@ def _dock_swap_to_launcher(env, app: Path, launcher: Path, runner) -> str:
 
 def _retarget_tile(original, launcher: Path, like: str):
     """Копия тайла с _CFURLString → launcher; остальное (GUID, label, book) сохранено."""
-    import copy
     tile = copy.deepcopy(original)
     tile.setdefault("tile-data", {}).setdefault("file-data", {})
     tile["tile-data"]["file-data"]["_CFURLString"] = _cfurl_for(launcher, like)
@@ -332,7 +328,6 @@ def uninstall_launcher(env, *, runner=sys_probe.run) -> tuple[str, bool]:
             return f"codex-app launcher: чужой {launcher} — не трогаем. {restore_note}", True
         return f"codex-app launcher: чужой {launcher} — не трогаем.", True
     try:
-        import shutil
         assert launcher is not None  # script is not None → launcher задан (инвариант)
         shutil.rmtree(launcher)
     except OSError as exc:
@@ -368,7 +363,6 @@ def status(*, runner=sys_probe.run) -> dict:
     live_app_flag = None
     r = runner([PS, "-axo", "pid=,args="], 3)
     if not r.get("timeout") and r.get("rc") in (0, None):
-        import re
         main_re = re.compile(r"/(?:ChatGPT|Codex)\.app/Contents/MacOS/", re.IGNORECASE)
         mains = [line for line in (r.get("out") or "").splitlines() if main_re.search(line)]
         if mains:
