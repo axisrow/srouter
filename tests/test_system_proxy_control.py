@@ -685,13 +685,17 @@ class VpnServiceRunner:
         return {"rc": 1, "out": "", "err": f"unexpected: {cmd}", "timeout": False}
 
 
-def test_services_for_interface_vpn_fanout_to_empty_device_services():
-    """#439: ipsec0 не матчится по Device (VPN-сервисы его не отдают) — резолв обязан
-    фан-аутиться на все VPN-сервисы (пустой Device), а не возвращать '' (repair падал
-    «не найден network service», системный SOCKS никто не включал)."""
+def test_services_for_interface_vpn_fanout_converges_all_services():
+    """Конвергенция (#439 follow-up): ipsec0 не матчится по Device (VPN-сервисы его не
+    отдают) — резолв обязан фан-аутиться на ВСЕ network service (физический Wi-Fi +
+    VPN-сервисы). Узкий фан-аут #439 (только пусто-Device) оставлял физический сервис
+    вне fan-out: после пересоздания VPN-профиля или утраты посева один repair под VPN
+    не конвергировал систему, снапшот снова зависел от того, кто primary."""
     runner = VpnServiceRunner()
-    assert system_proxy_control._services_for_interface("ipsec0", runner) == ["HitVPN", "fastvpn"]
-    assert system_proxy_control._services_for_interface("utun3", runner) == ["HitVPN", "fastvpn"]
+    assert system_proxy_control._services_for_interface("ipsec0", runner) == [
+        "Wi-Fi", "HitVPN", "fastvpn"]
+    assert system_proxy_control._services_for_interface("utun3", runner) == [
+        "Wi-Fi", "HitVPN", "fastvpn"]
 
 
 def test_services_for_interface_exact_device_match_beats_vpn_fanout():
@@ -708,59 +712,71 @@ def test_services_for_interface_non_vpn_unknown_iface_gets_no_fanout():
     assert system_proxy_control._services_for_interface("gif0", runner) == []
 
 
-def test_services_for_interface_vpn_iface_without_vpn_services():
-    """#439-край: VPN-интерфейс в default route, но VPN-сервисов в order нет (все
-    физические) → [] → honest-отказ, а не фан-аут на физические сервисы."""
+def test_services_for_interface_vpn_iface_with_only_device_services():
+    """Конвергенция-край: VPN-интерфейс в default route, а в order одни физические сервисы —
+    фан-аут возвращает их (это единственные кандидаты в primary при toggle VPN; endpoint
+    локальный, посев на них безопасен). Честный отказ остаётся только когда сервисов
+    нет вовсе."""
     order_no_vpn = """An asterisk (*) denotes that a network service is disabled.
 (1) Wi-Fi
 (Hardware Port: Wi-Fi, Device: en0)
 """
     runner = VpnServiceRunner(default_iface="utun5", service_order=order_no_vpn)
-    assert system_proxy_control._services_for_interface("utun5", runner) == []
+    assert system_proxy_control._services_for_interface("utun5", runner) == ["Wi-Fi"]
+    assert system_proxy_control._services_for_interface(
+        "utun5", VpnServiceRunner(default_iface="utun5", service_order="An asterisk (*) "
+                                  "denotes that a network service is disabled.\n")) == []
 
 
-def test_status_under_vpn_resolves_vpn_services_with_explicit_fallback_detail():
-    """#439 («явно логировать fallback, не молча»): status под VPN-default обязан
-    резолвить VPN-сервисы, показывать per-service состояние и называть механизм —
-    иначе диагностика «401 из ниоткуда» снова маскирует причину."""
+def test_status_under_vpn_resolves_all_services_with_explicit_fallback_detail():
+    """#439 («явно логировать fallback, не молча») + конвергенция: status под VPN-default
+    обязан резолвить ВСЕ сервисы (Wi-Fi + VPN), показывать per-service состояние и
+    называть механизм — иначе диагностика «401 из ниоткуда» снова маскирует причину."""
     runner = VpnServiceRunner()
     st = system_proxy_control.status(runner=runner)
     assert st["status"] == "ok"
     assert st["interface"] == "ipsec0"
-    assert st["service"] == "HitVPN, fastvpn"
+    assert st["service"] == "Wi-Fi, HitVPN, fastvpn"
     assert st["target"] is False
-    assert [e["service"] for e in st["services"]] == ["HitVPN", "fastvpn"]
+    assert [e["service"] for e in st["services"]] == ["Wi-Fi", "HitVPN", "fastvpn"]
     assert "VPN" in st["detail"] and "HitVPN" in st["detail"] and "fastvpn" in st["detail"]
 
 
-def test_status_target_under_vpn_requires_all_vpn_services():
-    """#439: какой из VPN-сервисов primary — из networksetup не видно, поэтому target
-    только когда наш endpoint включён на ВСЕХ (частичная настройка ≠ гарантия)."""
+def test_status_target_under_vpn_requires_all_services():
+    """#439 + конвергенция: какой сервис primary — из networksetup не видно, поэтому target
+    только когда наш endpoint включён на ВСЕХ (Wi-Fi + оба VPN; частичная настройка ≠
+    гарантия — любой может стать primary после toggle)."""
     runner = VpnServiceRunner()
     runner.socks["HitVPN"] = {"enabled": True, "server": "127.0.0.1", "port": 10808,
                               "authenticated": False}
-    assert system_proxy_control.status(runner=runner)["target"] is False
     runner.socks["fastvpn"] = {"enabled": True, "server": "127.0.0.1", "port": 10808,
                                "authenticated": False}
+    assert system_proxy_control.status(runner=runner)["target"] is False, (
+        "Wi-Fi вне target — конвергенция не завершена")
+    runner.socks["Wi-Fi"] = {"enabled": True, "server": "127.0.0.1", "port": 10808,
+                             "authenticated": False}
     assert system_proxy_control.status(runner=runner)["target"] is True
 
 
-def test_repair_under_vpn_sets_socks_on_all_vpn_services_wifi_untouched(tmp_path):
-    """#439 (симптом): repair при default route через ipsec0 обязан настраивать
-    системный SOCKS, а не падать. Прокси-эндпоинт локальный — работа не зависит от
-    дефолтного интерфейса; физический Wi-Fi при этом не мутируется."""
+def test_repair_under_vpn_converges_all_services_including_device_wifi(tmp_path):
+    """#439 (симптом) + конвергенция: repair при default route через ipsec0 обязан
+    настраивать системный SOCKS на ВСЕХ сервисах — и VPN, и физическом Wi-Fi.
+    Прокси-эндпоинт локальный — работа не зависит от дефолтного интерфейса; один repair
+    накрывает любые переключения primary (узкий фан-аут #439 Wi-Fi пропускал)."""
     state_file = tmp_path / "state.json"
     runner = VpnServiceRunner()
     res = system_proxy_control.repair(path=state_file, runner=runner)
     assert res["ok"] is True
-    for svc in ("HitVPN", "fastvpn"):
+    for svc in ("Wi-Fi", "HitVPN", "fastvpn"):
         s = runner.socks[svc]
         assert (s["server"], s["port"], s["enabled"]) == ("127.0.0.1", 10808, True), svc
-    assert runner.mutations(service="Wi-Fi") == [], "физический сервис вне fan-out не мутируется"
     leases = _sp_section(state_file)["leases"]
-    assert set(leases) == {"HitVPN", "fastvpn"}
+    assert set(leases) == {"Wi-Fi", "HitVPN", "fastvpn"}
     assert leases["HitVPN"]["previous"] == {"enabled": False, "server": "", "port": None,
                                             "authenticated": False}
+    assert leases["Wi-Fi"]["previous"] == {"enabled": False, "server": "old.proxy",
+                                           "port": 1080, "authenticated": False}, (
+        "previous Wi-Fi — честный снимок до посева (канон rollback-byte-exact)")
 
 
 def test_repair_under_vpn_conflict_on_one_service_still_repairs_other(tmp_path):
@@ -777,15 +793,18 @@ def test_repair_under_vpn_conflict_on_one_service_still_repairs_other(tmp_path):
     assert "fastvpn" in res["err"]
     s = runner.socks["HitVPN"]
     assert (s["server"], s["port"], s["enabled"]) == ("127.0.0.1", 10808, True)
+    assert (runner.socks["Wi-Fi"]["server"], runner.socks["Wi-Fi"]["enabled"]) == (
+        "127.0.0.1", True), "конфликт на одном сервисе не останавливает конвергенцию остальных"
     assert (runner.socks["fastvpn"]["server"],
             runner.socks["fastvpn"]["enabled"]) == ("corp.vpn.proxy", True), (
         "чужой включённый прокси неприкосновенен")
-    assert set(_sp_section(state_file)["leases"]) == {"HitVPN"}
+    assert set(_sp_section(state_file)["leases"]) == {"HitVPN", "Wi-Fi"}
 
 
-def test_restore_after_vpn_repair_returns_both_vpn_services(tmp_path):
-    """#439: per-service leases (#316-3) накрывают и VPN-фан-аут — restore возвращает
-    оба VPN-сервиса в исходное состояние и чистит оба lease."""
+def test_restore_after_vpn_repair_returns_all_services(tmp_path):
+    """#439 + конвергенция: per-service leases (#316-3) накрывают фан-аут — restore
+    возвращает ВСЕ сервисы (Wi-Fi — на его честный previous old.proxy, VPN — на пустой)
+    и чистит все lease."""
     state_file = tmp_path / "state.json"
     runner = VpnServiceRunner()
     assert system_proxy_control.repair(path=state_file, runner=runner)["ok"] is True
@@ -794,6 +813,8 @@ def test_restore_after_vpn_repair_returns_both_vpn_services(tmp_path):
     for svc in ("HitVPN", "fastvpn"):
         s = runner.socks[svc]
         assert (s["server"], s["enabled"]) == ("", False), svc
+    assert (runner.socks["Wi-Fi"]["server"], runner.socks["Wi-Fi"]["enabled"]) == (
+        "old.proxy", False), "Wi-Fi возвращается в свой previous, а не обнуляется"
     assert _sp_section(state_file)["leases"] == {}
 
 
@@ -821,9 +842,9 @@ def test_cli_status_under_vpn_prints_fallback_detail_and_per_service(tmp_path,
     rc = srouter_cli.cmd_system_proxy(args)
     captured = capsys.readouterr()
     assert rc == 1  # target ещё не наш — exit 1 как раньше
-    assert "HitVPN, fastvpn" in captured.out
+    assert "Wi-Fi, HitVPN, fastvpn" in captured.out
     assert "ipsec0" in captured.out
     assert st["detail"] in captured.out, "fallback обязан быть назван явно"
-    assert "HitVPN:" in captured.out and "fastvpn:" in captured.out, (
+    assert all(f"{svc}:" in captured.out for svc in ("Wi-Fi", "HitVPN", "fastvpn")), (
         "per-service строки — не только сводный SOCKS первого")
 

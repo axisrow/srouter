@@ -14,8 +14,9 @@ Dock-launch обязан снова работать сам по себе).
 НЕ скрытая часть install/start/watchdog. Она:
   - определяет активный network service по default route (`route -n get default` → interface →
     `networksetup -listnetworkserviceorder` → сервис для этого device); default route через
-    VPN-интерфейс (ipsecN/utunN/pppN) Device-матчем не резолвится — фан-аут на ВСЕ VPN-сервисы
-    (какой держит туннель, networksetup не показывает; #439), status называет это явно;
+    VPN-интерфейс (ipsecN/utunN/pppN) Device-матчем не резолвится — фан-аут на ВСЕ network
+    service, физические и VPN (какой держит туннель и какой станет primary после toggle,
+    networksetup не показывает; #439 + конвергенция), status называет это явно;
   - читает текущий SOCKS endpoint этого сервиса (`networksetup -getsocksfirewallproxy`);
   - если endpoint уже наш (127.0.0.1:10808) — просто включает канал (state=on), если выключен;
   - если endpoint чужой и ВЫКЛЮЧЕН — бэкапит его в srouter.local.json (runtime.system_proxy),
@@ -189,9 +190,12 @@ def _parse_service_order(out):
 
 # issue #439: default route через VPN-интерфейс (ipsec0/utunN/pppN). Сам туннель держит
 # ephemeral-сервис, которого в networksetup нет вовсе (живая диагностика #439: primary GUID
-# присутствует только в State-store), а setup-VPN-сервисы Device не отдают. Какой из них
-# держит туннель, из вывода networksetup не определить — фан-аут на все VPN-сервисы:
-# прокси-эндпоинт локальный (127.0.0.1:10808), от дефолтного интерфейса он не зависит.
+# присутствует только в State-store), а setup-VPN-сервисы Device не отдают. Какой сервис
+# держит туннель и какой станет primary после toggle VPN — из networksetup не определить,
+# поэтому фан-аут на ВСЕ network service (конвергенция, follow-up #439): прокси-эндпоинт
+# локальный (127.0.0.1:10808), от дефолтного интерфейса не зависит; узкий фан-аут #439
+# (только пусто-Device) оставлял физический сервис вне посева — снапшот снова зависел
+# от того, кто primary.
 _VPN_IFACE_PREFIXES = ("ipsec", "utun", "ppp")
 
 
@@ -202,7 +206,8 @@ def _is_vpn_iface(iface):
 
 def _resolve_services(iface, runner):
     """-> (services, vpn_fallback). Точный Device-матч → один сервис; VPN-интерфейс без
-    матча → все VPN-сервисы (пустой Device) с vpn_fallback=True; прочее → ([], False)."""
+    матча → ВСЕ network service (конвергенция: физические + VPN, follow-up #439)
+    с vpn_fallback=True; прочее → ([], False)."""
     r = _run([NETWORKSETUP, "-listnetworkserviceorder"], 4, runner)
     if r.get("timeout") or r.get("rc") not in (0, None):
         return [], False
@@ -211,7 +216,7 @@ def _resolve_services(iface, runner):
     if exact:
         return exact, False
     if _is_vpn_iface(iface):
-        return [name for name, device in pairs if name and not device], True
+        return [name for name, device in pairs if name], True
     return [], False
 
 
@@ -248,11 +253,12 @@ def status(*, runner=sys_probe.run):
     {status: ok|unknown, interface, service, socks: {...}, target: bool}
     target=True когда endpoint уже наш (127.0.0.1:10808) И канал включён.
 
-    #439: default route через VPN-интерфейс резолвится фан-аутом на ВСЕ VPN-сервисы —
+    #439: default route через VPN-интерфейс резолвится фан-аутом на ВСЕ network service —
     service тогда содержит имена через запятую, services — per-service детали
     ({service, socks}), а target=True требует наш включённый endpoint на каждом:
-    какой из VPN-сервисов primary, из networksetup не видно, частичная настройка
-    гарантии не даёт. detail называет механизм fallback явно (issue: «не молча»).
+    какой сервис primary (сейчас и после toggle VPN), из networksetup не видно,
+    частичная настройка гарантии не даёт. detail называет механизм fallback явно
+    (issue: «не молча»).
     """
     iface = _default_interface(runner)
     if not iface:
@@ -282,7 +288,7 @@ def status(*, runner=sys_probe.run):
               "target": is_target}
     if vpn_fallback:
         result["detail"] = (f"default route через VPN-интерфейс {iface}: network service не "
-                            f"резолвится по Device, SOCKS применяется ко всем VPN-сервисам "
+                            f"резолвится по Device, SOCKS применяется ко всем network service "
                             f"({result['service']})")
     return result
 
@@ -453,7 +459,8 @@ def _lock_refusal(path, lock_timeout, status, detail):
 def repair(*, path=None, runner=sys_probe.run, lock_timeout=None):
     """Включить/выставить наш системный SOCKS endpoint на активном network service.
 
-    #439: default route через VPN-интерфейс → сервисов несколько (фан-аут на все VPN-сервисы),
+    #439: default route через VPN-интерфейс → сервисов несколько (фан-аут на все
+    network service, конвергенция follow-up #439),
     repair применяется к каждому с per-service lease/конфликт-семантикой, результат агрегирован
     (ok/conflict/err/changed/results — как restore).
 
@@ -479,8 +486,8 @@ def _repair_locked(path, runner):
     if st["status"] != "ok":
         return {"ok": False, "conflict": False, "err": st.get("detail", "система не определена")}
 
-    # #439: под VPN-default сервисов несколько (фан-аут на все VPN-сервисы) — чиним каждый,
-    # агрегируя per-service результаты (формат restore).
+    # #439: под VPN-default сервисов несколько (фан-аут на все network service,
+    # конвергенция) — чиним каждый, агрегируя per-service результаты (формат restore).
     results = [{"service": e["service"],
                 **_repair_service(path, leases, e["service"], e["socks"], runner)}
                for e in st["services"]]
