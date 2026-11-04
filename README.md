@@ -353,7 +353,8 @@ binary/exec.LookPath), поэтому границей служит именно
   неверный системный SOCKS, а не отсутствие `--proxy-server`: `srouter doctor` покажет её явно
   и подскажет `srouter system-proxy repair` (настраивает и включает SOCKS `127.0.0.1:10808` на
   активном network service, бэкапя чужой выключенный endpoint; отказывает без мутации, если там
-  уже настроен чужой ВКЛЮЧЁННЫЙ прокси). `srouter system-proxy restore` возвращает бэкап.
+  уже настроен чужой ВКЛЮЧЁННЫЙ прокси; мутации транзакции исполняются одной партией —
+  один admin-диалог вместо диалога на каждую команду). `srouter system-proxy restore` возвращает бэкап.
 - **LaunchAgent `com.srouter.codenv` — residual-чистка gui-домена (контракт 2026-10-07)** —
   ambient env-прокси в launchd gui-домен НЕ сеется (через туннель ходит только явно попросившее:
   xray-правила, git per-host, per-tool wrappers, `curl -x`). Агент (RunAtLoad + StartInterval=300,

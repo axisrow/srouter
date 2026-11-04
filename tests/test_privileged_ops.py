@@ -231,3 +231,128 @@ def test_run_privileged_default_run_is_sys_probe():
     assert privileged_ops.run_privileged.__defaults__ is not None or True
     # run привязан к sys_probe.run — публичный контракт модуля.
     assert privileged_ops._DEFAULT_RUN is sys_probe.run
+
+
+# ==================== batch: ОДИН admin-диалог на транзакцию (#454) ====================
+
+def _socks_endpoint_cmd(service):
+    return [NETWORKSETUP, "-setsocksfirewallproxy", service, "127.0.0.1", "10808"]
+
+
+def _socks_state_cmd(service, state="on"):
+    return [NETWORKSETUP, "-setsocksfirewallproxystate", service, state]
+
+
+def test_build_osascript_batch_is_single_invocation_with_markers():
+    """Батч N whitelisted-команд = ОДИН osascript вызов: тело склеено с rc-маркерами
+    SROUTER_RC_<i> — per-cmd rc возвращается в одном диалоге, а не N диалогах."""
+    cmds = [_socks_endpoint_cmd("HitVPN"), _socks_state_cmd("HitVPN"),
+            _socks_endpoint_cmd("fastvpn"), _socks_state_cmd("fastvpn")]
+    out = privileged_ops.build_osascript_batch(cmds)
+    assert out[0] == privileged_ops.OSASCRIPT
+    assert out[1] == "-e"
+    script = out[2]
+    assert script.startswith('do shell script "')
+    assert script.endswith('" with administrator privileges')
+    assert script.count("do shell script") == 1, "батч обязан быть одним applescript-вызовом"
+    for i in range(1, len(cmds) + 1):
+        assert f"SROUTER_RC_{i}:" in script, f"rc-маркер команды {i} отсутствует в теле"
+
+
+def test_build_osascript_batch_canonical_escaping_of_whole_body():
+    """Экранирование: каждая команда shlex.quote по аргументам, ВСЁ тело целиком —
+    канонический _applescript_text (#154), ровно один раз (не по-командно)."""
+    import shlex
+
+    cmds = [_socks_endpoint_cmd("HitVPN"), _socks_state_cmd("HitVPN")]
+    expected_parts = []
+    for i, cmd in enumerate(cmds, 1):
+        expected_parts.append(" ".join(shlex.quote(str(a)) for a in cmd)
+                              + f' 2>&1; rc=$?; echo "SROUTER_RC_{i}:$rc"; [ "$rc" -eq 0 ] || exit 0')
+    body = "; ".join(expected_parts)
+    expected = (f'do shell script "{dashboard_common._applescript_text(body)}" '
+                f'with administrator privileges')
+    assert privileged_ops.build_osascript_batch(cmds)[2] == expected
+
+
+def test_build_osascript_batch_escape_blocks_injection():
+    """Злой service-name не разрывает applescript-строку и не выбивается в отдельную команду."""
+    evil = 'x"; do shell script "rm -rf /'
+    out = privileged_ops.build_osascript_batch([_socks_endpoint_cmd(evil)])
+    assert out[2].count('do shell script "') == 1
+
+
+def test_run_privileged_batch_whitelist_all_or_nothing(monkeypatch):
+    """Одна не-whitelisted команда в батче = отказ ВСЕГО батча: underlying run не зовётся,
+    ни одна команда не исполняется (fail-closed, как одиночный run_privileged)."""
+    monkeypatch.setattr("os.geteuid", lambda: 501)
+    calls = []
+
+    def fake_run(cmd, timeout):
+        calls.append(cmd)
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+
+    results = privileged_ops.run_privileged_batch(
+        [_socks_endpoint_cmd("HitVPN"), ["/bin/rm", "-rf", "/"]], run=fake_run)
+    assert calls == [], "чужая команда в батче не должна дойти до underlying run"
+    assert len(results) == 2
+    assert all(r["ok"] is False and r["rc"] != 0 for r in results)
+
+
+def test_run_privileged_batch_parses_per_cmd_results(monkeypatch):
+    """Парс маркеров: результат per-cmd (rc/out) выровнен по порядку cmds; rc≠0 = не-ok."""
+    monkeypatch.setattr("os.geteuid", lambda: 501)
+
+    def fake_run(cmd, timeout):
+        return {"rc": 0, "out": "seg-one\nSROUTER_RC_1:0\nseg-two\nSROUTER_RC_2:1\n",
+                "err": "", "timeout": False}
+
+    results = privileged_ops.run_privileged_batch(
+        [_socks_endpoint_cmd("A"), _socks_state_cmd("B")], run=fake_run)
+    assert len(results) == 2
+    assert results[0]["ok"] is True and results[0]["rc"] == 0
+    assert "seg-one" in results[0]["out"]
+    assert results[1]["ok"] is False and results[1]["rc"] == 1
+
+
+def test_run_privileged_batch_stop_on_failure_marks_rest_skipped(monkeypatch):
+    """stop-on-failure: после первой не-нулевой rc остальные команды в маркерах отсутствуют
+    (скрипт вышел) — помечаются skipped, не-ok (включать канал после упавшего endpoint нельзя)."""
+    monkeypatch.setattr("os.geteuid", lambda: 501)
+
+    def fake_run(cmd, timeout):
+        return {"rc": 0, "out": "SROUTER_RC_1:1\n", "err": "", "timeout": False}
+
+    results = privileged_ops.run_privileged_batch(
+        [_socks_endpoint_cmd("A"), _socks_state_cmd("A")], run=fake_run)
+    assert results[0]["ok"] is False and results[0]["rc"] == 1
+    assert results[1]["ok"] is False and results[1].get("skipped") is True
+    assert "остановлен" in results[1]["err"]
+
+
+def test_run_privileged_batch_cancelled_maps_to_all(monkeypatch):
+    """Отмена GUI-пароля (rc -128): скрипт не исполнялся — ВСЕ элементы cancelled."""
+    monkeypatch.setattr("os.geteuid", lambda: 501)
+
+    def fake_run(cmd, timeout):
+        return {"rc": -128, "out": "", "err": "User canceled.", "timeout": False}
+
+    results = privileged_ops.run_privileged_batch(
+        [_socks_endpoint_cmd("A"), _socks_state_cmd("A")], run=fake_run)
+    assert len(results) == 2
+    assert all(r["cancelled"] is True and r["ok"] is False for r in results)
+
+
+def test_run_privileged_batch_root_runs_per_cmd(monkeypatch):
+    """Под root батч-мост избыточен — команды идут напрямую, по одной."""
+    monkeypatch.setattr("os.geteuid", lambda: 0)
+    calls = []
+
+    def fake_run(cmd, timeout):
+        calls.append(list(cmd))
+        return {"rc": 0, "out": "", "err": "", "timeout": False}
+
+    results = privileged_ops.run_privileged_batch(
+        [_socks_endpoint_cmd("A"), _socks_state_cmd("A")], run=fake_run)
+    assert calls == [_socks_endpoint_cmd("A"), _socks_state_cmd("A")]
+    assert all(r["ok"] for r in results)

@@ -29,6 +29,7 @@ traffic_shape.py, isolate_firewall.py. Это значит — НЕТ одной
 
 import logging
 import os
+import re
 import shlex
 
 import sys_probe
@@ -119,6 +120,90 @@ def _normalize_result(r):
         "err": err,
         "timeout": timeout,
     }
+
+
+# ======================== batch: один admin-диалог на транзакцию (#454) ========================
+
+# Маркер per-cmd rc в батч-скрипте. Вывод разрешённых команд — фиксированные ответы
+# networksetup/brew/route, маркер в них не встречается (при появлении произвольного вывода
+# в мутациях сегменты придётся экранировать — не сегодняшний контракт).
+BATCH_RC_MARK = "SROUTER_RC"
+
+_BATCH_MARK_RE = re.compile(BATCH_RC_MARK + r"_(\d+):(-?\d+)")
+
+
+def build_osascript_batch(cmds):
+    """Склеить whitelisted-команды в ОДИН osascript-мост (один GUI-пароль на транзакцию).
+
+    Тело per-команды: shlex.quote по аргументам (как build_osascript) + `2>&1` +
+    rc-маркер `SROUTER_RC_<i>:$rc`; после не-нулевого rc скрипт завершается
+    (`exit 0`) — последующие команды НЕ исполняются (stop-on-failure: включать
+    канал после упавшего endpoint нельзя). Весь body целиком проходит канон
+    _applescript_text один раз (#154). Whitelist проверяет run_privileged_batch
+    (как run_privileged проверяет одиночную команду).
+    """
+    parts = []
+    for i, cmd in enumerate(cmds, 1):
+        cleaned = list(cmd[1:] if cmd and cmd[0] == SUDO else cmd)
+        shell_cmd = " ".join(shlex.quote(str(a)) for a in cleaned)
+        parts.append(f'{shell_cmd} 2>&1; rc=$?; echo "{BATCH_RC_MARK}_{i}:$rc"; '
+                     f'[ "$rc" -eq 0 ] || exit 0')
+    body = "; ".join(parts)
+    applescript = f'do shell script "{_applescript_text(body)}" with administrator privileges'
+    return [OSASCRIPT, "-e", applescript]
+
+
+def run_privileged_batch(cmds, *, timeout=DEFAULT_OSCRIPT_TIMEOUT, run=_DEFAULT_RUN):
+    """Выполнить СПИСОК привилегированных команд: под root — per-cmd напрямую (мост
+    избыточен), иначе ОДИН osascript-батч — один admin-диалог вместо N (#454).
+
+    Возвращает список нормализованных dict, выровненный по порядку cmds:
+      - per-cmd rc берётся из маркеров SROUTER_RC_<i>, stdout-сегмент — между маркерами;
+      - команда после сбоя предыдущей в маркерах отсутствует (stop-on-failure) →
+        {"ok": False, "skipped": True};
+      - отмена пароля/сбой osascript (rc скрипта ≠ 0): скрипт не исполнялся → ВСЕ
+        элементы одинаково не-ok с cancelled-семантикой (_normalize_result).
+    fail-closed: одна не-whitelisted команда = отказ ВСЕГО батча, underlying run не зовётся.
+    """
+    cmds = list(cmds)
+    if os.geteuid() == 0:
+        return [run_privileged(c, timeout=timeout, run=run) for c in cmds]
+
+    rejected = next((c for c in cmds if not is_allowed(c)), None)
+    if rejected is not None:
+        logger.warning("privileged_ops: batch reject non-whitelisted cmd head=%r",
+                       rejected[0] if rejected else None)
+        refusal = {"ok": False, "cancelled": False, "rc": 126, "out": "",
+                   "err": f"privileged_ops: команда не в whitelist: "
+                          f"{rejected[0] if rejected else '<empty>'}",
+                   "timeout": False}
+        return [dict(refusal) for _ in cmds]
+
+    wrapped = build_osascript_batch(cmds)
+    logger.debug("privileged_ops: osascript-batch of %d cmds", len(cmds))
+    r = _normalize_result(run(wrapped, timeout))
+    if r["rc"] not in (0, None):
+        # Скрипт не исполнялся (отмена пароля, сбой osascript) — ни одна команда не прошла.
+        return [dict(r) for _ in cmds]
+
+    out = r["out"] or ""
+    marks = {int(m.group(1)): (int(m.group(2)), m.start(), m.end())
+             for m in _BATCH_MARK_RE.finditer(out)}
+    results = []
+    prev_end = 0
+    for i in range(1, len(cmds) + 1):
+        info = marks.get(i)
+        if info is None:
+            results.append({"ok": False, "cancelled": False, "rc": None, "out": "",
+                            "err": "не выполнена — батч остановлен на предыдущей команде",
+                            "timeout": False, "skipped": True})
+            continue
+        rc, start, end = info
+        seg = out[prev_end:start].strip()
+        prev_end = end
+        results.append({"ok": rc == 0, "cancelled": False, "rc": rc, "out": seg,
+                        "err": "" if rc == 0 else (seg or f"rc={rc}"), "timeout": False})
+    return results
 
 
 def run_privileged(cmd, *, timeout=DEFAULT_OSCRIPT_TIMEOUT, run=_DEFAULT_RUN):

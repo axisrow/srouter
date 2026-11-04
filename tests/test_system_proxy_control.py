@@ -848,3 +848,144 @@ def test_cli_status_under_vpn_prints_fallback_detail_and_per_service(tmp_path,
     assert all(f"{svc}:" in captured.out for svc in ("Wi-Fi", "HitVPN", "fastvpn")), (
         "per-service строки — не только сводный SOCKS первого")
 
+
+# ==========================================================================
+# #454: батч-мутации — ОДИН admin-диалог на транзакцию (make_privileged_runner
+# помечает runner batch_capable; system_proxy_control клеит мутации в один osascript)
+# ==========================================================================
+
+import privileged_ops
+import srouter_privileged
+
+
+def test_make_privileged_runner_batch_capable_flag(monkeypatch):
+    """Флаг batch_capable: не-root runner — True (батч = один диалог), root — False
+    (прямые вызовы, батч-мост избыточен)."""
+    noop = lambda cmd, timeout: {"rc": 0, "out": "", "err": "", "timeout": False}
+    monkeypatch.setattr("os.geteuid", lambda: 501)
+    assert getattr(srouter_privileged.make_privileged_runner(noop), "batch_capable", False) is True
+    monkeypatch.setattr("os.geteuid", lambda: 0)
+    assert getattr(srouter_privileged.make_privileged_runner(noop), "batch_capable", False) is False
+
+
+def _batch_underlying(base_runner, osascript_outputs):
+    """make_privileged_runner поверх fake-underlying: osascript-батч (cmd[0]==OSASCRIPT)
+    отвечает заготовками по порядку вызовов — строка = rc-маркеры с rc=0 (батч исполнен),
+    int = прямой rc скрипта (отмена/сбой osascript, маркеров нет); остальное — base_runner."""
+    calls = []
+    scripted = list(osascript_outputs)
+
+    def fake(cmd, timeout):
+        calls.append(list(cmd))
+        if cmd[0] == privileged_ops.OSASCRIPT:
+            script = scripted.pop(0) if scripted else ""
+            if isinstance(script, int):
+                return {"rc": script, "out": "", "err": "forced batch failure", "timeout": False}
+            return {"rc": 0, "out": script, "err": "", "timeout": False}
+        return base_runner(cmd, timeout)
+
+    return fake, calls
+
+
+def test_repair_under_vpn_batch_runner_single_admin_dialog(tmp_path):
+    """#454 (головной сценарий): repair под ipsec0 при батч-раннере = РОВНО ОДИН
+    osascript-диалог на всю транзакцию (6 мутаций: endpoint+enable на Wi-Fi, HitVPN
+    и fastvpn — фан-аут конвергенции #453), leases промоутятся в active."""
+    state_file = tmp_path / "state.json"
+    runner = VpnServiceRunner()
+    fake, calls = _batch_underlying(
+        runner, ["".join(f"SROUTER_RC_{i}:0\n" for i in range(1, 7))])
+    batched = srouter_privileged.make_privileged_runner(fake)
+    res = system_proxy_control.repair(path=state_file, runner=batched)
+    osa_calls = [c for c in calls if c[0] == privileged_ops.OSASCRIPT]
+    assert len(osa_calls) == 1, (
+        f"один admin-диалог на транзакцию, а не {len(osa_calls)}; вызовы: {osa_calls}")
+    assert res["ok"] is True
+    leases = _sp_section(state_file)["leases"]
+    assert set(leases) == {"Wi-Fi", "HitVPN", "fastvpn"}
+    assert all(l["phase"] == "active" for l in leases.values())
+
+
+def test_repair_batch_partial_enable_failure_triggers_rollback_batch(tmp_path):
+    """enable-fail в батче: finalize гонит rollback-команды вторым батчем (второй диалог
+    только на failure-пути); после успешного отката lease расчищен, aggregate несёт err."""
+    state_file = tmp_path / "state.json"
+    runner = VpnServiceRunner()
+    # Батч 1 (6 команд): Wi-Fi и HitVPN endpoint+enable ok; fastvpn endpoint ok (5),
+    # enable fail (6). Батч 2: rollback endpoint fastvpn.
+    fake, calls = _batch_underlying(
+        runner, ["SROUTER_RC_1:0\nSROUTER_RC_2:0\nSROUTER_RC_3:0\nSROUTER_RC_4:0\n"
+                 "SROUTER_RC_5:0\nSROUTER_RC_6:1\n",
+                 "SROUTER_RC_1:0\n"])
+    batched = srouter_privileged.make_privileged_runner(fake)
+    res = system_proxy_control.repair(path=state_file, runner=batched)
+    osa_calls = [c for c in calls if c[0] == privileged_ops.OSASCRIPT]
+    assert len(osa_calls) == 2, "первый батч мутаций + второй батч отката"
+    assert res["ok"] is False and "fastvpn" in res["err"]
+    leases = _sp_section(state_file)["leases"]
+    assert set(leases) == {"Wi-Fi", "HitVPN"}, "fastvpn: успешный rollback расчистил lease"
+    assert all(l["phase"] == "active" for l in leases.values())
+
+
+def test_repair_batch_rollback_failure_keeps_lease_for_reconcile(tmp_path):
+    """Откат тоже не удался: lease остаётся (единственная копия previous), err называет
+    оба сбоя — reconcile дочитает при следующем repair (канон #316-1)."""
+    state_file = tmp_path / "state.json"
+    runner = VpnServiceRunner()
+    # Батч 1 (6 команд): Wi-Fi и HitVPN — успех, fastvpn — enable fail (позиция 6);
+    # батч 2 (rollback, одиночная команда идёт per-cmd через osascript-обёртку) — прямой rc=1.
+    fake, calls = _batch_underlying(
+        runner, ["SROUTER_RC_1:0\nSROUTER_RC_2:0\nSROUTER_RC_3:0\nSROUTER_RC_4:0\n"
+                 "SROUTER_RC_5:0\nSROUTER_RC_6:1\n", 1])
+    batched = srouter_privileged.make_privileged_runner(fake)
+    res = system_proxy_control.repair(path=state_file, runner=batched)
+    assert res["ok"] is False
+    assert "откат endpoint тоже не удался" in res["err"]
+    leases = _sp_section(state_file)["leases"]
+    assert set(leases) == {"Wi-Fi", "HitVPN", "fastvpn"}
+    assert all(leases[s]["phase"] == "active" for s in ("Wi-Fi", "HitVPN"))
+    assert leases["fastvpn"]["phase"] == "repairing", (
+        "lease остаётся — единственная копия previous сохранена для докрутки")
+
+
+def test_repair_batch_cancelled_leaves_repairing_leases_zero_mutations(tmp_path):
+    """Отмена диалога (-128): скрипт не исполнялся — ни одна мутация не прошла,
+    repairing-leases на диске (preflight), reconcile дочитывает. Строго лучше
+    прежнего пошагового частичного применения до отмены."""
+    state_file = tmp_path / "state.json"
+    runner = VpnServiceRunner()
+    calls = []
+
+    def fake(cmd, timeout):
+        calls.append(list(cmd))
+        if cmd[0] == privileged_ops.OSASCRIPT:
+            return {"rc": -128, "out": "", "err": "User canceled.", "timeout": False}
+        return runner(cmd, timeout)
+
+    batched = srouter_privileged.make_privileged_runner(fake)
+    res = system_proxy_control.repair(path=state_file, runner=batched)
+    assert res["ok"] is False
+    assert "отмен" in res["err"].lower()
+    assert _sp_section(state_file)["leases"] == {}, (
+        "скрипт не исполнялся — система не тронута, pending-lease не нужен "
+        "(канон прежнего per-cmd поведения: сбой endpoint = drop lease)")
+    osa_calls = [c for c in calls if c[0] == privileged_ops.OSASCRIPT]
+    assert len(osa_calls) == 1, "отменённый батч — один диалог, повторов нет"
+
+
+def test_restore_batch_runner_single_admin_dialog(tmp_path):
+    """restore active-lease при батч-раннере = один osascript-диалог (off/endpoint/on),
+    lease расчищен, система восстановлена."""
+    state_file = tmp_path / "state.json"
+    _seed_sp(state_file, {"leases": {"Wi-Fi": {
+        "phase": "active", "service": "Wi-Fi", "previous": dict(CORP_PREVIOUS)}}})
+    runner = ProxyRunner(enabled=True)  # наш target включён — как после repair
+    fake, calls = _batch_underlying(
+        runner, ["SROUTER_RC_1:0\nSROUTER_RC_2:0\nSROUTER_RC_3:0\n"])
+    batched = srouter_privileged.make_privileged_runner(fake)
+    res = system_proxy_control.restore(path=state_file, runner=batched)
+    osa_calls = [c for c in calls if c[0] == privileged_ops.OSASCRIPT]
+    assert len(osa_calls) == 1, f"один admin-диалог на restore, а не {len(osa_calls)}"
+    assert res["ok"] is True
+    assert _sp_section(state_file)["leases"] == {}
+

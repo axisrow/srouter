@@ -80,4 +80,9 @@ def make_privileged_runner(underlying_run=run, *, osascript_timeout: int = 60):
             return underlying_run(cmd, timeout)
         return underlying_run(_to_osascript(cmd), osascript_timeout)
 
+    # #454: не-root runner умеет батч (run_privileged_batch) — транзакция system_proxy
+    # склеивает все networksetup-мутации в ОДИН admin-диалог. Под root флаг не нужен:
+    # команды и так идут напрямую без диалогов. Тестовые fake-раннеры флага не имеют
+    # → сохраняют прежний per-cmd контракт.
+    runner.batch_capable = not am_root  # pyright: ignore[reportFunctionMemberAccess]
     return runner
