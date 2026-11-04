@@ -21,6 +21,7 @@ system_proxy.status() (scutil --proxy, canon system_proxy.py:95).
 """
 from __future__ import annotations
 
+import base64
 import copy
 import logging
 import os
@@ -53,6 +54,19 @@ DOCK_KEY = "persistent-others"
 
 # Кандидаты App — тот же порядок приоритета, что в codex-app-proxy wrapper (ChatGPT приоритет).
 _APP_CANDIDATES = ("/Applications/ChatGPT.app", "/Applications/Codex.app")
+
+# MAIN-процесс ChatGPT/Codex.app (argv --proxy-server виден только у него: helper-бандлы вида
+# "Codex (Service).app/Contents/MacOS/…" regex НЕ матчит — "Codex (Service)" ≠ "Codex.app",
+# тот же принцип, что _CODEX_APP_PATH_RE в health_codex.py). Единый детектор для status()
+# и health_codenv._codex_app_chromium_proxy_check (канон detector-must-be-function, ревью #457).
+CODEX_APP_MAIN_RE = re.compile(r"/(?:ChatGPT|Codex)\.app/Contents/MacOS/", re.IGNORECASE)
+
+
+def app_argv_has_proxy_flag(ps_out) -> bool:
+    """Живой main-процесс ChatGPT/Codex.app несёт --proxy-server в argv (канон ps-argv)?
+    False = процессы есть, флага нет (Dock-запуск мимо wrapper/launcher)."""
+    mains = [line for line in (ps_out or "").splitlines() if CODEX_APP_MAIN_RE.search(line)]
+    return bool(mains) and any("--proxy-server=" in line for line in mains)
 
 
 def _app_candidates():
@@ -184,6 +198,26 @@ def _write_dock_tiles(tiles, runner):
     return None
 
 
+def _encode_tile(tile) -> str:
+    """Тайл → base64(plist-байты). state пишется через json.dump, а живые тайлы Dock несут
+    book как plist data (bytes на выходе plistlib.loads — снято с defaults export):
+    dict с bytes в json.dump = TypeError → _save_swap False → подмена отменялась на каждом
+    install. Храним byte-exact (ревью #457): base64-строка JSON-безопасна и возвращает тайл
+    без искажений при restore."""
+    return base64.b64encode(plistlib.dumps(tile)).decode("ascii")
+
+
+def _decode_tile(blob):
+    """base64 → тайл (dict) или None (битая запись/не dict — restore честно откажет)."""
+    if not isinstance(blob, str):
+        return None
+    try:
+        tile = plistlib.loads(base64.b64decode(blob))
+    except (ValueError, OSError):
+        return None
+    return tile if isinstance(tile, dict) else None
+
+
 def _load_swap(path):
     """runtime.codex_app_launcher → dict или None (как system_proxy_control._load_leases)."""
     state = local_state.load_state(path=path)
@@ -221,7 +255,7 @@ def _dock_swap_to_launcher(env, app: Path, launcher: Path, runner) -> str:
                 "установлен, закрепи launcher вручную (~/Applications).")
     original = tiles[index]
     section = {"phase": "swapping", "app": app.as_posix(),
-               "launcher": launcher.as_posix(), "tile": original}
+               "launcher": launcher.as_posix(), "tile_b64": _encode_tile(original)}
     # Two-phase: pending + исходный тайл НА ДИСКЕ до мутации (канон AGENTS.md two-phase).
     if not _save_swap(env.state_path, section):
         return ("Dock-тайл: state не записывается — backup исходного тайла невозможен, "
@@ -233,7 +267,8 @@ def _dock_swap_to_launcher(env, app: Path, launcher: Path, runner) -> str:
         return f"Dock-тайл: {err} Исходный тайл сохранён (state codex_app_launcher) — " \
                f"откат: srouter wrappers codex-app uninstall."
     if not _save_swap(env.state_path, {"phase": "active", "app": app.as_posix(),
-                                       "launcher": launcher.as_posix(), "tile": original}):
+                                       "launcher": launcher.as_posix(),
+                                       "tile_b64": section["tile_b64"]}):
         _log.warning("codex_app_launcher: swap применён, но фаза active не записалась — "
                      "uninstall всё равно откатит по сохранённому тайлу")
     return f"Dock-тайл: подменён на launcher, исходный сохранён в state (killall Dock выполнен)."
@@ -252,12 +287,14 @@ def _restore_dock_tile(env, runner):
     section = _load_swap(env.state_path)
     if not section:
         return None, False
-    original = section.get("tile")
-    if not isinstance(original, dict):
-        return ("Dock-тайл: в state нет сохранённого тайла — вернуть нечего "
+    # Декодирование ДО preflight: битая base64-запись = нечего возвращать, мутации не начинаем.
+    original = _decode_tile(section.get("tile_b64"))
+    if original is None:
+        return ("Dock-тайл: в state нет валидного сохранённого тайла — вернуть нечего "
                 "(закрепи нужный вручную)."), False
     if not _save_swap(env.state_path, {"phase": "restoring", "app": section.get("app"),
-                                       "tile": original}):
+                                       "launcher": section.get("launcher"),
+                                       "tile_b64": section["tile_b64"]}):
         return ("Dock-тайл: state не записывается — фаза restoring не сохранена, "
                 "откат отменён (fail-closed)."), False
     dock = _dock_export(runner)
@@ -363,10 +400,10 @@ def status(*, runner=sys_probe.run) -> dict:
     live_app_flag = None
     r = runner([PS, "-axo", "pid=,args="], 3)
     if not r.get("timeout") and r.get("rc") in (0, None):
-        main_re = re.compile(r"/(?:ChatGPT|Codex)\.app/Contents/MacOS/", re.IGNORECASE)
-        mains = [line for line in (r.get("out") or "").splitlines() if main_re.search(line)]
-        if mains:
-            live_app_flag = any("--proxy-server=" in line for line in mains)
+        ps_lines = (r.get("out") or "").splitlines()
+        app_running = any(CODEX_APP_MAIN_RE.search(line) for line in ps_lines)
+        if app_running:
+            live_app_flag = app_argv_has_proxy_flag(r.get("out"))
 
     snap = system_proxy.status()
     snapshot_any_enabled = snap.get("any_enabled")

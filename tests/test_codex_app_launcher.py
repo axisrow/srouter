@@ -173,7 +173,8 @@ def test_dock_swap_replaces_tile_and_backs_up(monkeypatch, tmp_path):
         f"тайл указывает на launcher: {tile}"
     section = _state_section(_env(tmp_path).state_path)
     assert section and section.get("phase") == "active", f"state phase=active: {section}"
-    assert section["tile"]["tile-data"]["file-data"]["_CFURLString"] == \
+    saved = cal._decode_tile(section["tile_b64"])
+    assert saved["tile-data"]["file-data"]["_CFURLString"] == \
         f"file://{quote(str(app))}/", f"исходный тайл сохранён в state: {section}"
     assert "Dock" in note, f"note называет подмену Dock: {note}"
 
@@ -196,7 +197,40 @@ def test_dock_swap_preflight_state_written_before_mutation(monkeypatch, tmp_path
     assert seen.get("at_write"), "state-секция существовала на момент defaults write"
     assert seen["at_write"].get("phase") == "swapping", \
         f"preflight-фаза swapping ДО мутации: {seen['at_write']}"
-    assert seen["at_write"].get("tile"), "исходный тайл в preflight-записи"
+    assert cal._decode_tile(seen["at_write"]["tile_b64"]), "исходный тайл в preflight-записи"
+
+
+def test_dock_swap_survives_bytes_book_field(monkeypatch, tmp_path):
+    """Живой тайл Dock несёт book как plist data (bytes, снято с defaults export):
+    json.dump на bytes = TypeError → _save_swap False → подмена отменялась «state не
+    записывается» на КАЖДОМ install (str-only мок этого не ловил, ревью #457).
+    Тайл хранится byte-exact: base64(plistlib.dumps(tile)) + plistlib.loads при restore."""
+    home = _mock_home(monkeypatch, tmp_path)
+    app = _stub_app(monkeypatch, tmp_path)
+    env = _env(tmp_path)
+    tile = _dock_tile(app)
+    book = b"\x62\x6f\x6f\x6b-binary-\xff\xfe"
+    tile["tile-data"]["book"] = book
+    captured = {"writes": [], "killall": 0}
+
+    note = cal.install_launcher(env, runner=_fake_dock_runner(_dock_export([tile]), captured))
+
+    assert "подменён" in note.lower(), \
+        f"bytes в тайле не отменяют подмену (не «state не записывается»): {note}"
+    section = _state_section(env.state_path)
+    assert isinstance(section.get("tile_b64"), str), f"тайл в state как base64: {section.keys()}"
+    decoded = cal._decode_tile(section["tile_b64"])
+    assert decoded["tile-data"]["book"] == book, "тайл byte-exact"
+    assert decoded["tile-data"]["file-data"]["_CFURLString"] == \
+        tile["tile-data"]["file-data"]["_CFURLString"]
+    # restore: bytes возвращаются в тайле без искажения
+    launcher = home / "Applications" / "ChatGPT (srouter).app"
+    captured["writes"].clear()
+    cal.uninstall_launcher(env, runner=_fake_dock_runner(
+        _dock_export([_dock_tile(app, launcher_path=launcher)]), captured))
+    written = plistlib.loads(captured["writes"][-1][-1].encode())
+    assert written["persistent-others"][0]["tile-data"]["book"] == book, \
+        "restore возвращает book byte-exact"
 
 
 def test_install_without_dock_tile_notes_manual_step(monkeypatch, tmp_path):
@@ -277,7 +311,7 @@ def test_uninstall_preflight_restoring_phase(monkeypatch, tmp_path):
     assert seen.get("at_write"), "write-откат был"
     assert seen["at_write"].get("phase") == "restoring", \
         f"preflight restoring ДО мутации отката: {seen['at_write']}"
-    assert seen["at_write"].get("tile"), "исходный тайл ещё в state на момент отката"
+    assert cal._decode_tile(seen["at_write"]["tile_b64"]), "исходный тайл ещё в state"
 
 
 def test_uninstall_without_state_backup_removes_ours(monkeypatch, tmp_path):
@@ -411,8 +445,10 @@ def test_status_unknown_when_sources_unavailable(monkeypatch, tmp_path):
 
 def test_cli_wired_into_wrappers_and_uninstall():
     """`srouter wrappers codex-app install|uninstall|status` — расширение существующего
-    подкомандного дерева wrappers (без новой топ-левел команды); полный uninstall
-    возвращает тайл (uninstall_launcher в _remove_optional_features)."""
+    подкомандного дерева wrappers (без новой топ-левел команды); полный uninstall зовёт
+    uninstall_launcher БЕЗУСЛОВНО (ревью #457: гейт по _load_swap пропускал удаление
+    launcher при install'е с незакреплённым тайлом — state-секции нет → осиротевший
+    ~/Applications/*.app с exec на удалённый codex-app-proxy)."""
     import srouter_cli
     src = inspect.getsource(srouter_cli)
     assert "codex-app" in src, "subparser codex-app под wrappers"
@@ -420,3 +456,22 @@ def test_cli_wired_into_wrappers_and_uninstall():
     assert "uninstall_launcher(" in src, "CLI uninstall вызывает uninstall_launcher"
     uninstall_src = inspect.getsource(srouter_cli._remove_optional_features)
     assert "uninstall_launcher(" in uninstall_src, "полный uninstall откатывает Dock-тайл"
+    assert "_load_swap" not in uninstall_src, \
+        "гейт по state-секции убран — uninstall_launcher сам обрабатывает отсутствие секции"
+
+
+def test_app_flag_detector_single_source():
+    """Канон detector-must-be-function (ревью #457): ps-argv детектор --proxy-server один —
+    в codex_app_launcher; health_codenv переиспользует, своего regex не держит."""
+    import health_codenv
+    hc_src = inspect.getsource(health_codenv)
+    assert "app_argv_has_proxy_flag" in hc_src, "health_codenv зовёт общий детектор"
+    assert "_CODEX_APP_MAIN_RE" not in hc_src, "дубль regex в health_codenv удалён"
+    assert "app_argv_has_proxy_flag" in inspect.getsource(cal.status), "status() зовёт его же"
+    # поведение детектора (контракт ps-argv канона) — по обеим сторонам один:
+    assert cal.app_argv_has_proxy_flag(PS_MAIN_FLAG) is True
+    assert cal.app_argv_has_proxy_flag(PS_MAIN_NOFLAG) is False
+    assert cal.app_argv_has_proxy_flag(
+        "900 /Applications/ChatGPT.app/Contents/Resources/codex --proxy-server=x\n") is False, \
+        "non-main процесс (Resources, не Contents/MacOS) не матчится"
+    assert cal.app_argv_has_proxy_flag("") is False

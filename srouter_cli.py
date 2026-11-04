@@ -236,13 +236,14 @@ def _remove_optional_features(env, runner):
         proxy = system_proxy_control.restore(path=env.state_path, runner=runner)
         if not proxy.get("ok"):
             errors.append("system-proxy: " + (proxy.get("err") or "не восстановлен"))
-    if codex_app_launcher._load_swap(env.state_path):
-        # Dock-launcher ChatGPT.app: вернуть исходный тайл, иначе Dock остаётся указывать
-        # на удаляемый launcher (битый тайл после полного uninstall).
-        note, ok = codex_app_launcher.uninstall_launcher(env, runner=runner)
-        print(note)
-        if not ok:
-            errors.append("codex-app launcher: " + note)
+    # Dock-launcher ChatGPT.app: БЕЗУСЛОВНО (ревью #457) — install с незакреплённым тайлом
+    # state-секцию не пишет, гейт по её наличию оставлял бы осиротевший ~/Applications/*.app
+    # с exec на удалённый codex-app-proxy. uninstall_launcher сам корректно обрабатывает
+    # отсутствие секции / чужой launcher / «не был установлен».
+    note, ok = codex_app_launcher.uninstall_launcher(env, runner=runner)
+    print(note)
+    if not ok:
+        errors.append("codex-app launcher: " + note)
     go = go_proxy.disable(full=True, owned_only=True)
     if not go.get("ok"):
         errors.append("go-proxy: " + (go.get("error") or "не снят"))

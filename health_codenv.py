@@ -13,6 +13,7 @@ import time
 from urllib.parse import urlparse
 
 import sys_probe
+import codex_app_launcher
 import system_proxy
 import system_proxy_control
 from install_lib import _LAUNCHCTL_SERVICE_NOT_FOUND, _launchd_domain, _launchd_is_loaded
@@ -1187,18 +1188,6 @@ def _claude_app_proxy_check():
 # по протоколу HTTP(S) — только NetworkService реально держит сокеты к chatgpt.com.
 _NETWORK_SERVICE_MARK = "--utility-sub-type=network.mojom.NetworkService"
 
-# MAIN-процесс ChatGPT/Codex.app (argv --proxy-server виден только у него: helper-бандлы вида
-# "Codex (Service).app/Contents/MacOS/…" regex НЕ матчит — "Codex (Service)" ≠ "Codex.app",
-# тот же принцип, что _CODEX_APP_PATH_RE в health_codex.py).
-_CODEX_APP_MAIN_RE = re.compile(r"/(?:ChatGPT|Codex)\.app/Contents/MacOS/", re.IGNORECASE)
-
-
-def _app_launched_with_flag(ps_out):
-    """Живой main-процесс ChatGPT/Codex.app несёт --proxy-server в argv (канон ps-argv)?
-    False = процессы есть, флага нет (Dock-запуск мимо wrapper/launcher)."""
-    mains = [line for line in (ps_out or "").splitlines() if _CODEX_APP_MAIN_RE.search(line)]
-    return bool(mains) and any("--proxy-server=" in line for line in mains)
-
 
 def _codex_app_effective_proxy_snapshot():
     """Эффективный системный снапшот (scutil --proxy, canon system_proxy.py:95).
@@ -1269,7 +1258,9 @@ def _codex_app_chromium_proxy_check():
                 "detail": "ChatGPT.app/Codex.app Chromium network-service не активен"}
 
     # Ветка 2: эффективный снапшот + ps-argv — ДО lsof (детерминированная конфигурация).
-    has_flag = _app_launched_with_flag(r.get("out"))
+    # Детектор --proxy-server единый с codex_app_launcher (канон detector-must-be-function,
+    # ревью #457; импорт без цикла: codex_app_launcher не импортирует health*).
+    has_flag = codex_app_launcher.app_argv_has_proxy_flag(r.get("out"))
     if not has_flag:
         snapshot = _codex_app_effective_proxy_snapshot()
         if snapshot is False:
