@@ -11,7 +11,10 @@
 Dock-launch обязан снова работать сам по себе).
 
 Этот модуль — explicit, отдельно вызываемая операция (`srouter system-proxy repair|restore`),
-НЕ скрытая часть install/start/watchdog. Она:
+НЕ скрытая часть install/start/watchdog. Мутации транзакции исполняются ОДНОЙ партией
+(`_mutate_batch`): батч-раннер (`make_privileged_runner`, не-root) получает один
+admin-диалог на весь repair/restore вместо диалога на каждую networksetup-команду (#454);
+whitelist привилегированных команд при этом проверяется per-cmd, как прежде. Она:
   - определяет активный network service по default route (`route -n get default` → interface →
     `networksetup -listnetworkserviceorder` → сервис для этого device); default route через
     VPN-интерфейс (ipsecN/utunN/pppN) Device-матчем не резолвится — фан-аут на ВСЕ network
@@ -86,6 +89,7 @@ import os
 import time
 
 import local_state
+import privileged_ops
 import sys_probe
 from install_lib import NETWORKSETUP, ROUTE
 
@@ -130,6 +134,36 @@ def _mutate(cmd, runner, *, timeout=20):
     if r.get("timeout") or r.get("rc") not in (0, None):
         return None, r.get("err", "")
     return r, None
+
+
+_STOP_ERR = "не выполнена — транзакция остановлена на предыдущей команде"
+
+
+def _mutate_batch(cmds, runner):
+    """Выполнить список мутаций одной партией; возвращает список err по порядку cmds
+    (None = успех, строка = сбой или skip).
+
+    Батч-раннер (make_privileged_runner, не-root: флаг batch_capable) получает ВСЕ команды
+    одним osascript-вызовом — один admin-диалог на транзакцию (#454); остальные раннеры
+    (тестовые fake, root) — прежний per-cmd путь. stop-on-failure в обоих путях: после
+    первого сбоя остальные команды не исполняются (включать канал после упавшего
+    endpoint нельзя — off-first/безопасность мутаций важнее «дожать остаток»).
+    """
+    cmds = list(cmds)
+    if len(cmds) > 1 and getattr(runner, "batch_capable", False):
+        results = privileged_ops.run_privileged_batch(cmds, run=runner)
+        return [None if r["ok"] else
+                ("отменено пользователем (admin-диалог)" if r.get("cancelled")
+                 else (r.get("err") or f"rc={r.get('rc')}"))
+                for r in results]
+    errs = []
+    for cmd in cmds:
+        if errs and errs[-1] is not None:
+            errs.append(_STOP_ERR)
+            continue
+        _, err = _mutate(cmd, runner)
+        errs.append(err)
+    return errs
 
 
 def _default_interface(runner):
@@ -481,91 +515,137 @@ def repair(*, path=None, runner=sys_probe.run, lock_timeout=None):
 
 
 def _repair_locked(path, runner):
+    """Repair-транзакция plan → execute → finalize (#454): ветвь per-service определяется
+    из уже прочитанного status() (ветвление прежнего _repair_service без изменений),
+    ВСЕ networksetup-мутации всех сервисов исполняются одной партией — батч-раннер
+    (make_privileged_runner, не-root) показывает ОДИН admin-диалог вместо 2N.
+
+    #439: под VPN-default сервисов несколько (фан-аут) — чинятся все, per-service
+    lease/конфликт-семантика (#316) сохранена; write-preflight расширен до батча —
+    ВСЕ repairing-leases на диске ДО первой мутации.
+    """
     leases = _load_leases(path)
     st = status(runner=runner)
     if st["status"] != "ok":
         return {"ok": False, "conflict": False, "err": st.get("detail", "система не определена")}
 
-    # #439: под VPN-default сервисов несколько (фан-аут на все network service,
-    # конвергенция) — чиним каждый, агрегируя per-service результаты (формат restore).
-    results = [{"service": e["service"],
-                **_repair_service(path, leases, e["service"], e["socks"], runner)}
-               for e in st["services"]]
-    return _aggregate(results)
+    # --- PLAN: команды всех сервисов собираются в общий список (#439 конвергенция:
+    # st["services"] — ВСЕ network service, чинится каждый, агрегация _aggregate) ---
+    plan = []        # {"service", "kind": promote|enable|endpoint-enable, "cmds", "previous", "lease"}
+    by_service = {}  # svc -> результат без мутаций (refuse/conflict) — сразу известен
 
+    for e in st["services"]:
+        svc, socks = e["service"], e["socks"]
+        lease = leases.get(svc)
+        if lease and lease.get("phase") == _PHASE_RESTORING:
+            # Незавершённый restore (crash между шагами): repair поверх него создал бы lease-запись,
+            # противоречащую полу-применённому restore. Явный отказ — сначала `restore` дочитывает.
+            by_service[svc] = {"service": svc, "ok": False, "conflict": False,
+                               "err": f"{svc}: не завершён предыдущий restore (crash между шагами?) — "
+                                      f"выполните `srouter system-proxy restore`, затем повторите repair"}
+            continue
+        if _is_target_endpoint(socks):
+            # Наш endpoint уже стоит — просто включаем канал, если выключен.
+            if socks["enabled"]:
+                # previous = текущее состояние (AO-review 5110061682): restore из идемпотентного
+                # repair обязан быть no-op, а не обнуление SOCKS (см. докстринг _promote_repairing).
+                plan.append({"service": svc, "kind": "promote", "cmds": [],
+                             "previous": dict(socks), "lease": lease})
+            else:
+                plan.append({"service": svc, "kind": "enable",
+                             "cmds": [[NETWORKSETUP, "-setsocksfirewallproxystate", svc, "on"]],
+                             "previous": dict(socks), "lease": lease})
+            continue
+        if socks["enabled"] or socks["authenticated"]:
+            # Чужой прокси уже активен — не трогаем (может быть реальный рабочий прокси пользователя).
+            _log.warning("system_proxy_control: %s уже настроен на чужой SOCKS (%s:%s), repair отказал",
+                         svc, socks["server"], socks["port"])
+            by_service[svc] = {"service": svc, "ok": False, "conflict": True,
+                               "err": f"{svc}: уже настроен чужой SOCKS-прокси "
+                                      f"({socks['server']}:{socks['port']}), не перезаписываю"}
+            continue
+        # Чужой endpoint, выключен — бэкапим ДО мутаций (write-preflight, #316-1), потом подменяем.
+        previous = dict(socks)
+        leases[svc] = {"phase": _PHASE_REPAIRING, "service": svc, "previous": previous}
+        plan.append({"service": svc, "kind": "endpoint-enable",
+                     "cmds": [[NETWORKSETUP, "-setsocksfirewallproxy", svc,
+                               TARGET_SERVER, str(TARGET_PORT)],
+                              [NETWORKSETUP, "-setsocksfirewallproxystate", svc, "on"]],
+                     "previous": previous})
 
-def _repair_service(path, leases, service, socks, runner):
-    """Repair одного сервиса (до #439 — всё тело _repair_locked). socks — уже прочитанное
-    состояние сервиса из status(), повторного вызова networksetup не нужно."""
-    lease = leases.get(service)
+    # --- PREFLIGHT: все repairing-leases на диске ДО первой мутации (#316-1, батч-версия) ---
+    if any(p["kind"] == "endpoint-enable" for p in plan):
+        if not _save_leases(path, leases):
+            # На диске остался прежний lease (запись не прошла целиком) — ничего не потеряно.
+            return {"ok": False, "conflict": False,
+                    "err": "state не читается/не записывается — backup предыдущего endpoint "
+                           "невозможен, мутация отменена (fail-closed)"}
 
-    if lease and lease.get("phase") == _PHASE_RESTORING:
-        # Незавершённый restore (crash между шагами): repair поверх него создал бы lease-запись,
-        # противоречащую полу-применённому restore. Явный отказ — сначала `restore` дочитывает.
-        return {"ok": False, "conflict": False,
-                "err": f"{service}: не завершён предыдущий restore (crash между шагами?) — "
-                       f"выполните `srouter system-proxy restore`, затем повторите repair"}
+    # --- EXECUTE: одна партия мутаций (stop-on-failure внутри _mutate_batch) ---
+    all_errs = _mutate_batch([cmd for p in plan for cmd in p["cmds"]], runner)
 
-    if _is_target_endpoint(socks):
-        # Наш endpoint уже стоит — просто включаем канал, если выключен.
-        if socks["enabled"]:
-            # previous = текущее состояние (AO-review 5110061682): lease без честного снимка
-            # «до» разворачивался restore'ом в endpoint "" 0 + state off — обнуление SOCKS,
-            # настроенного install'ом. С честным снимком restore из идемпотентного repair —
-            # no-op (off -> endpoint target -> on == текущее состояние).
-            return _promote_repairing(path, leases, service, lease, changed=False,
-                                      previous=dict(socks))
-        _, err = _mutate([NETWORKSETUP, "-setsocksfirewallproxystate", service, "on"], runner)
-        if err is not None:
-            return {"ok": False, "conflict": False, "err": err}
-        return _promote_repairing(path, leases, service, lease, changed=True, previous=dict(socks))
+    # --- FINALIZE per-service по rc-срезам ---
+    rollbacks = []  # (plan-entry, enable_err) — откат endpoint вторым батчем
+    offset = 0
+    for p in plan:
+        svc = p["service"]
+        errs = all_errs[offset:offset + len(p["cmds"])]
+        offset += len(p["cmds"])
+        if p["kind"] == "promote":
+            by_service[svc] = {"service": svc, **_promote_repairing(
+                path, leases, svc, p["lease"], changed=False, previous=p["previous"])}
+        elif p["kind"] == "enable":
+            if errs[0] is None:
+                by_service[svc] = {"service": svc, **_promote_repairing(
+                    path, leases, svc, p["lease"], changed=True, previous=p["previous"])}
+            else:
+                by_service[svc] = {"service": svc, "ok": False, "conflict": False,
+                                   "err": f"{svc}: {errs[0]}"}
+        else:  # endpoint-enable
+            ep_err, en_err = errs[0], errs[1]
+            if ep_err is not None:
+                # Endpoint не применился (или батч остановлен до него) — система не тронута,
+                # pending не нужен (не расчищается — reconcile сбросит при следующем запуске).
+                _drop_lease_best_effort(path, leases, svc)
+                by_service[svc] = {"service": svc, "ok": False, "conflict": False,
+                                   "err": f"{svc}: {ep_err}"}
+            elif en_err is not None:
+                rollbacks.append((p, en_err))
+                by_service[svc] = None  # слот — заполнится после rollback-батча
+            else:
+                leases[svc] = {"phase": _PHASE_ACTIVE, "service": svc, "previous": p["previous"]}
+                res = {"service": svc, "ok": True, "conflict": False, "changed": True}
+                if not _save_leases(path, leases):
+                    # previous уже durably записан preflight'ом; не хватает только подтверждения
+                    # фазы — следующий repair/restore сам поднимет repairing→active по reconcile.
+                    _log.warning("system_proxy_control: repair применён, но promote lease "
+                                 "в state не записался")
+                    res["warning"] = ("repair применён, но подтверждение lease не записалось — "
+                                      "доподтвердится при следующем repair/restore")
+                by_service[svc] = res
 
-    if socks["enabled"] or socks["authenticated"]:
-        # Чужой прокси уже активен — не трогаем (может быть реальный рабочий прокси пользователя).
-        _log.warning("system_proxy_control: %s уже настроен на чужой SOCKS (%s:%s), repair отказал",
-                     service, socks["server"], socks["port"])
-        return {"ok": False, "conflict": True,
-                "err": f"{service}: уже настроен чужой SOCKS-прокси "
-                       f"({socks['server']}:{socks['port']}), не перезаписываю"}
-
-    # Чужой endpoint, выключен — бэкапим ДО мутаций (write-preflight, #316-1), потом подменяем.
-    previous = dict(socks)
-    leases[service] = {"phase": _PHASE_REPAIRING, "service": service, "previous": previous}
-    if not _save_leases(path, leases):
-        # На диске остался прежний lease (запись не прошла целиком) — ничего не потеряно.
-        return {"ok": False, "conflict": False,
-                "err": "state не читается/не записывается — backup предыдущего endpoint "
-                       "невозможен, мутация отменена (fail-closed)"}
-    _, err1 = _mutate(
-        [NETWORKSETUP, "-setsocksfirewallproxy", service, TARGET_SERVER, str(TARGET_PORT)], runner)
-    if err1 is not None:
-        # Система не тронута — pending не нужен (не расчищается — reconcile сбросит при следующем
-        # запуске, это best-effort).
-        _drop_lease_best_effort(path, leases, service)
-        return {"ok": False, "conflict": False, "err": err1}
-    _, err2 = _mutate([NETWORKSETUP, "-setsocksfirewallproxystate", service, "on"], runner)
-    if err2 is not None:
+    if rollbacks:
         # Rollback endpoint (state ещё не тронут — networksetup default state = off не зависит
-        # от endpoint, поэтому endpoint-write назад достаточно для восстановления prior state).
-        _, rb_err = _mutate(
-            [NETWORKSETUP, "-setsocksfirewallproxy", service,
-             previous["server"] or "", str(previous["port"] or 0)], runner)
-        if rb_err is None:
-            _drop_lease_best_effort(path, leases, service)
-        # rollback не удался: система осталась с нашим endpoint (выключен — не leak), а pending —
-        # единственная копия previous; ОСТАВЛЯЕМ его, reconcile дочитает (issue #316-1).
-        return {"ok": False, "conflict": False,
-                "err": err2 if rb_err is None else f"{err2}; откат endpoint тоже не удался "
-                                                   f"({rb_err}) — lease оставлен для докрутки"}
-    leases[service] = {"phase": _PHASE_ACTIVE, "service": service, "previous": previous}
-    if not _save_leases(path, leases):
-        # previous уже durably записан preflight'ом; не хватает только подтверждения фазы —
-        # следующий repair/restore сам поднимет repairing→active по reconcile.
-        _log.warning("system_proxy_control: repair применён, но promote lease в state не записался")
-        return {"ok": True, "conflict": False, "changed": True,
-                "warning": "repair применён, но подтверждение lease не записалось — "
-                           "доподтвердится при следующем repair/restore"}
-    return {"ok": True, "conflict": False, "changed": True}
+        # от endpoint, поэтому endpoint-write назад достаточен для prior state). Своя партия:
+        # второй admin-диалог только на failure-пути.
+        rb_errs = _mutate_batch(
+            [[NETWORKSETUP, "-setsocksfirewallproxy", p["service"],
+              p["previous"]["server"] or "", str(p["previous"]["port"] or 0)]
+             for p, _ in rollbacks], runner)
+        for (p, en_err), rb_err in zip(rollbacks, rb_errs):
+            svc = p["service"]
+            if rb_err is None:
+                _drop_lease_best_effort(path, leases, svc)
+                by_service[svc] = {"service": svc, "ok": False, "conflict": False,
+                                   "err": f"{svc}: {en_err}"}
+            else:
+                # rollback не удался: система осталась с нашим endpoint (выключен — не leak),
+                # а pending — единственная копия previous; ОСТАВЛЯЕМ его (issue #316-1).
+                by_service[svc] = {"service": svc, "ok": False, "conflict": False,
+                                   "err": f"{svc}: {en_err}; откат endpoint тоже не удался "
+                                          f"({rb_err}) — lease оставлен для докрутки"}
+
+    return _aggregate([by_service[e["service"]] for e in st["services"]])
 
 
 def _promote_repairing(path, leases, service, lease, *, changed, previous=None):
@@ -712,17 +792,18 @@ def _restore_one(path, leases, service, runner):
 def _restore_apply(path, leases, service, previous, current, runner):
     """Мутации restore в off-first порядке (#316-2): выключенный канал с любым endpoint не может
     направить трафик ОС на чужой прокси. Любой сбой оставляет lease в текущей фазе — повторный
-    restore продолжает с того же места (см. reconcile-ветки _restore_one)."""
+    restore продолжает с того же места (см. reconcile-ветки _restore_one). Команды (off →
+    endpoint → on) исполняются одной партией: батч-раннер = один admin-диалог (#454);
+    stop-on-failure сохраняет off-first гарантию — после сбоя последующие не исполняются."""
+    cmds = []
     if current["enabled"]:
-        _, err = _mutate([NETWORKSETUP, "-setsocksfirewallproxystate", service, "off"], runner)
-        if err is not None:
-            return {"ok": False, "err": err}
-    _, err = _mutate([NETWORKSETUP, "-setsocksfirewallproxy", service,
-                      previous.get("server") or "", str(previous.get("port") or 0)], runner)
-    if err is not None:
-        return {"ok": False, "err": err}
-    _, err = _mutate([NETWORKSETUP, "-setsocksfirewallproxystate", service,
-                      "on" if previous.get("enabled") else "off"], runner)
+        cmds.append([NETWORKSETUP, "-setsocksfirewallproxystate", service, "off"])
+    cmds.append([NETWORKSETUP, "-setsocksfirewallproxy", service,
+                 previous.get("server") or "", str(previous.get("port") or 0)])
+    cmds.append([NETWORKSETUP, "-setsocksfirewallproxystate", service,
+                 "on" if previous.get("enabled") else "off"])
+    errs = _mutate_batch(cmds, runner)
+    err = next((e for e in errs if e is not None), None)
     if err is not None:
         return {"ok": False, "err": err}
     leases.pop(service, None)
