@@ -36,6 +36,7 @@ py-modules = [
     "srouter_privileged",
     "codex_wrappers",
     "claude_wrappers",
+    "codex_app_launcher",
     "srouter_launchd",
     "install_lib",
     "install_plist",

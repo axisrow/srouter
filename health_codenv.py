@@ -13,6 +13,8 @@ import time
 from urllib.parse import urlparse
 
 import sys_probe
+import codex_app_launcher
+import system_proxy
 import system_proxy_control
 from install_lib import _LAUNCHCTL_SERVICE_NOT_FOUND, _launchd_domain, _launchd_is_loaded
 from health_constants import PRIVOXY_PORT, XRAY_PORT
@@ -1187,6 +1189,17 @@ def _claude_app_proxy_check():
 _NETWORK_SERVICE_MARK = "--utility-sub-type=network.mojom.NetworkService"
 
 
+def _codex_app_effective_proxy_snapshot():
+    """Эффективный системный снапшот (scutil --proxy, canon system_proxy.py:95).
+    True = хоть что-то включено (включая PAC) — Chromium есть через что ходить;
+    False = снапшот ПУСТ (NE-VPN primary / ничего не включено) → Chromium direct;
+    None = нечитаем (timeout/формат) — fail-closed, вердикт по нему не строится."""
+    snap = system_proxy.status()
+    if snap.get("status") != "ok":
+        return None
+    return bool(snap.get("any_enabled"))
+
+
 def _codex_app_chromium_proxy_check():
     """ChatGPT.app Chromium NetworkService без прокси → down DRIVER (обычный запуск из Dock).
 
@@ -1203,16 +1216,25 @@ def _codex_app_chromium_proxy_check():
          `_NETWORK_SERVICE_MARK` в comm/args-строке И path-сегменту .app/, см. _is_codex_app_comm).
          Нет процесса → unknown (info-only, GPU/storage/renderer helper без NetworkService не
          матчится — верно unknown, не down, канон fail-closed).
-      2. Реальный runtime-маршрут (lsof): external ESTABLISHED → мимо прокси; socks к
+      2. Эффективный снапшот + ps-argv (контракт владельца 2026-11-05: ChatGPT.app = группа
+         Claude.app — только 10808, никогда direct): scutil-снапшот ПУСТ (system_proxy.status
+         any_enabled=False — NE-VPN primary HitVPN/VeePN опустошает снапшот, канон
+         hitvpn-ikev2-ephemeral-session-empties-proxy-snapshot) и main-процесс запущен БЕЗ
+         --proxy-server (Dock-запуск мимо wrapper) → Chromium пойдёт direct детерминированно,
+         независимо от lsof (config-level evidence, не wall-clock). Вердикт down DIRECT с
+         рецептом «обёртка ~/bin/codex-app-proxy или srouter wrappers codex-app install» —
+         НЕ ok по именным сервисам (system_proxy_control target=True при пустом снапшоте
+         врёт: named services настроены, а primary пуст) и НЕ «system-proxy repair»
+         (repair именных сервисов пустой снапшот не чинит). Снапшот нечитаем → ветка
+         пропускается (fail-closed), вердикт по маршруту.
+      3. Реальный runtime-маршрут (lsof): external ESTABLISHED → мимо прокси; socks к
          127.0.0.1:XRAY_PORT → доказанный прокси-путь.
-      3. Если маршрут доказанно external — смотрим `system_proxy_control.status()`:
+      4. Если маршрут доказанно external — смотрим `system_proxy_control.status()`:
          SOCKS-канал активного network service выключен/не тот endpoint → это и есть причина,
-         detail называет ИМЕННО её и предлагает `srouter system-proxy repair` (не "перезапусти
-         App" — перезапуск НЕ чинит выключенный системный SOCKS, живая регрессия это подтвердила;
-         не `codex-app-proxy` — обычный Dock-запуск должен работать сам).
+         detail называет ИМЕННО её и предлагает `srouter system-proxy repair`.
 
       status="ok"      — NetworkService активен, lsof доказывает SOCKS-маршрут;
-      status="down"    — NetworkService активен, lsof доказывает external (прямой) маршрут;
+      status="down"    — direct доказан (пустой снапшот+без флага ИЛИ lsof external);
       status="unknown" — NetworkService не активен ИЛИ маршрут не доказан (idle/lsof-сбой).
     """
     r = sys_probe.run([PS, "-axo", "pid=,args="], timeout=3)
@@ -1234,6 +1256,21 @@ def _codex_app_chromium_proxy_check():
     if not network_pids:
         return {"status": "unknown", "source": "n/a",
                 "detail": "ChatGPT.app/Codex.app Chromium network-service не активен"}
+
+    # Ветка 2: эффективный снапшот + ps-argv — ДО lsof (детерминированная конфигурация).
+    # Детектор --proxy-server единый с codex_app_launcher (канон detector-must-be-function,
+    # ревью #457; импорт без цикла: codex_app_launcher не импортирует health*).
+    has_flag = codex_app_launcher.app_argv_has_proxy_flag(r.get("out"))
+    if not has_flag:
+        snapshot = _codex_app_effective_proxy_snapshot()
+        if snapshot is False:
+            return {"status": "down", "source": "effective-snapshot",
+                    "detail": ("ChatGPT.app/Codex.app Chromium идёт напрямую: эффективный "
+                               f"системный снапшот ПУСТ (scutil --proxy — ни одного прокси, "
+                               f"NE-VPN primary опустошает снапшот), а процесс запущен БЕЗ "
+                               f"--proxy-server (Dock-запуск мимо wrapper). Рецепт: ~/bin/"
+                               f"codex-app-proxy или srouter wrappers codex-app install "
+                               f"(Dock-launcher)")}
 
     route = _app_pids_route(network_pids)
     if not route.get("verifiable"):

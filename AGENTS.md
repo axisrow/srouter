@@ -73,7 +73,7 @@ Never commit `srouter.local.json`, `srouter_config.py`, `.env*`, real diagnostic
 - xray managed rule (domains+ip → reality-out, catch-all direct) is mutated only via `srouter routing` (transactional `routing_apply`).
 - LaunchAgent `com.srouter.codenv` does NOT seed proxy vars (pre-2026-10-07 it seeded privoxy 8118, fail-closed "no direct egress" — deliberately retired): it only periodically `unsetenv`s residual proxy keys in the launchctl gui domain.
 - CC sessions carry no global `HTTPS_PROXY` (empty strings in `~/.claude/settings.json` + NO_PROXY loopback/z.ai/yandex).
-- Explicit tunnel consumers: git per-host config, `codex-srouter` wrapper (socks5h pointwise), `curl -x socks5h://127.0.0.1:10808`.
+- Explicit tunnel consumers: git per-host config, `codex-srouter` wrapper (socks5h pointwise), `curl -x socks5h://127.0.0.1:10808`, ChatGPT.app/Codex.app via `~/bin/codex-app-proxy` (`--proxy-server=socks5://127.0.0.1:10808`; Dock-запуск флаг не передаёт — `srouter wrappers codex-app install` ставит launcher .app-bundle в `~/Applications` и подменяет Dock-тайл, uninstall возвращает исходный; при NE-VPN primary scutil-снапшот пуст и Chromium без флага уходит direct — контракт 2026-11-05: только 10808, никогда direct).
 - Contract test: `tests/test_codex_env_contract.py` (stub launchctl: zero setenv + all six unsetenv).
 
 ## Manual PF isolation of Anthropic
