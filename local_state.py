@@ -421,6 +421,7 @@ _SUBMODULE_NAMES = {
     "sync_endpoint_from_xray": "local_state_xray",
     # --- routing domains (#136) ---
     "ROUTING_MARKER": "local_state_routing",
+    "ROUTING_IPS_MARKER": "local_state_routing",
     "DEFAULT_ROUTING_OUTBOUND": "local_state_routing",
     "routing_plan": "local_state_routing",
     "routing_plan_ips": "local_state_routing",
