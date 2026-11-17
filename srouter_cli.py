@@ -1717,7 +1717,8 @@ def cmd_node(args):
 
 
 def cmd_github_direct(args):
-    """Путь github: on — напрямую (туннель мёртв), off — обратно в туннель, status — что сейчас.
+    """Путь github: on — напрямую (туннель мёртв), off — обратно в туннель, status — что сейчас,
+    check — живой вердикт direct vs socks5h + готовая команда ретрая (#456).
 
     github — единственный сайт с двумя путями (эксперимент 2026-10-11); Claude — только
     туннель, остальные — только туннель (см. local_state_routing.github_direct).
@@ -1736,6 +1737,16 @@ def cmd_github_direct(args):
         path = "напрямую" if st.get("direct") else "через туннель"
         print(f"github-direct: github ходит {path}")
         return 0
+    if action == "check":
+        # #456: предсказуемый фоллбек вместо слепых direct-проб. Моки на владельце
+        # определения — health_probes (ленивый import: on/off/status не тянут health-стек).
+        import health_probes
+        verdict = health_probes._github_fallback_check()
+        print(f"github-direct check: {verdict.get('detail', '—')}")
+        if verdict.get("retry_cmd"):
+            print(f"  {verdict['retry_cmd']}")
+        # rc: есть рабочий путь (ok/warn) → 0; нет пути (down) → 1; мусор проб (unknown) → 2.
+        return {"ok": 0, "warn": 0, "down": 1, "unknown": 2}.get(verdict.get("status"), 1)
     runner = make_privileged_runner(run)
     result = local_state.github_direct(
         action, config_path=config_path, state_path=state_path,
@@ -2147,12 +2158,14 @@ def build_parser() -> argparse.ArgumentParser:
     # (туннель/напрямую). Claude и остальные — только туннель, командой не затрагиваются.
     p_gd = sub.add_parser(
         "github-direct",
-        help="Путь github: on — напрямую (туннель мёртв), off — в туннель, status — что сейчас.")
+        help="Путь github: on — напрямую (туннель мёртв), off — в туннель, status — что сейчас, "
+             "check — живой вердикт direct/socks5h (#456).")
     p_gd_sub = p_gd.add_subparsers(dest="github_direct_action", required=True)
     for gd_name, gd_help in (
         ("on", "Пустить github напрямую (туннель мёртв)."),
         ("off", "Вернуть github в туннель."),
         ("status", "Показать текущий путь github."),
+        ("check", "Живой вердикт: direct vs socks5h, готовая команда ретрая (#456)."),
     ):
         sp = p_gd_sub.add_parser(gd_name, help=gd_help)
         sp.add_argument("--state", default=None, help="Путь к srouter.local.json.")

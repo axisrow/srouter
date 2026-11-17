@@ -110,3 +110,53 @@ def test_noop_does_not_sync_ao(tmp_path, monkeypatch):
     _patch_runner(monkeypatch)
 
     assert srouter_cli.cmd_github_direct(_args("on", state=str(tmp_path / "s.json"))) == 0
+
+
+# ==================== #456: check — живой вердикт direct vs socks5h ====================
+# Мок на владельце определения (канон модуль-ВЛАДЕЛЕЦ): CLI резолвит
+# health_probes._github_fallback_check ленивым import — патчим health_probes.
+
+def test_check_warn_prints_verdict_and_retry_cmd(monkeypatch, capsys):
+    monkeypatch.setattr(
+        "health_probes._github_fallback_check",
+        lambda: {"status": "warn",
+                 "detail": "direct мёртв (timeout — GFW-окно), socks5h жив",
+                 "retry_cmd": "git -c http.proxy=socks5h://127.0.0.1:10808 clone|push|fetch"})
+
+    rc = srouter_cli.cmd_github_direct(_args("check"))
+
+    assert rc == 0, "живой фоллбек-путь найден → rc 0"
+    out = capsys.readouterr().out
+    assert "direct мёртв" in out
+    assert "git -c http.proxy=socks5h://127.0.0.1:10808 clone|push|fetch" in out
+
+
+def test_check_ok_direct_alive_maps_rc0(monkeypatch, capsys):
+    monkeypatch.setattr(
+        "health_probes._github_fallback_check",
+        lambda: {"status": "ok", "detail": "оба пути живы — git работай напрямую"})
+
+    rc = srouter_cli.cmd_github_direct(_args("check"))
+
+    assert rc == 0
+    assert "напрямую" in capsys.readouterr().out
+
+
+def test_check_down_maps_rc1(monkeypatch, capsys):
+    monkeypatch.setattr(
+        "health_probes._github_fallback_check",
+        lambda: {"status": "down", "detail": "оба пути мёртвы",
+                 "retry_cmd": "git -c http.proxy=socks5h://127.0.0.1:10808 clone|push|fetch"})
+
+    rc = srouter_cli.cmd_github_direct(_args("check"))
+
+    assert rc == 1, "рабочего пути нет → rc 1"
+    assert "оба пути мёртвы" in capsys.readouterr().out
+
+
+def test_check_unknown_maps_rc2(monkeypatch):
+    monkeypatch.setattr(
+        "health_probes._github_fallback_check",
+        lambda: {"status": "unknown", "detail": "github-fallback: пробы вернули мусор (не dict)"})
+
+    assert srouter_cli.cmd_github_direct(_args("check")) == 2

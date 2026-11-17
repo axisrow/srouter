@@ -101,11 +101,20 @@ class ProbeManager:
             return "unknown"
         return self.parse_brew_services(result.get("out") or "", names=None).get(name, "none")
 
-    def direct_probe(self, host: str, *, connect_timeout: int = 4, max_time: int = 8) -> Dict[str, Any]:
-        """Прямой curl к host МИНУЯ прокси (env -u) — достигается ли домен без туннеля?
+    def _proxy_free_env(self) -> Dict[str, str]:
+        """env БЕЗ proxy-переменных (оба регистра) — общий слой direct_probe/socks_probe.
 
-        Базовый слой без config — делят health.py (#206 GFW per-domain) и direct_first.py (#197).
-        env -u всех proxy-vars (оба регистра) — прямой путь минуя privoxy/xray.
+        Для socks_probe тоже обязателен: ambient NO_PROXY заставил бы curl с -x ОБОЙТИ прокси
+        для совпавшего хоста (канон #197 — ambient-env травит параметризованные пробы).
+        """
+        env = os.environ.copy()
+        for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+                    "http_proxy", "https_proxy", "all_proxy", "no_proxy"):
+            env.pop(key, None)
+        return env
+
+    def _reachable_result(self, r: Dict[str, Any]) -> Dict[str, Any]:
+        """reachable/kind из результата curl-прогона — один парсер direct_probe/socks_probe.
 
         Семантика reachable = ЛЮБОЙ HTTP-ответ сервера (включая 5xx): GFW даёт timeout/connection-reset,
         НЕ HTTP-ответ → сам факт HTTP-кода доказывает достижимость. 404/421/5xx =
@@ -118,15 +127,6 @@ class ProbeManager:
           reachable=False, kind="connection-failed"   — curl 000/no-response.
         Не бросает (probe-канон).
         """
-        env = os.environ.copy()
-        for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
-                    "http_proxy", "https_proxy", "all_proxy", "no_proxy"):
-            env.pop(key, None)
-        # https:// + путь '/' — GFW режет на TLS-handshake к корню; -I (HEAD) лёгкий.
-        r = self.run([self.curl_path, "-sS", "-o", "/dev/null", "-I",
-                      "--connect-timeout", str(connect_timeout), "--max-time", str(max_time),
-                      "-w", "%{http_code}", f"https://{host}/"],
-                     timeout=max_time + 2, env=env)
         if r.get("timeout"):
             return {"reachable": False, "kind": "timeout"}
         code = (r.get("out") or "").strip()
@@ -139,6 +139,39 @@ class ProbeManager:
         if self.tunnel_code_up(code_int):
             return {"reachable": True, "kind": "ok"}
         return {"reachable": True, "kind": "upstream-error"}
+
+    def direct_probe(self, host: str, *, connect_timeout: int = 4, max_time: int = 8) -> Dict[str, Any]:
+        """Прямой curl к host МИНУЯ прокси (env -u) — достигается ли домен без туннеля?
+
+        Базовый слой без config — делят health.py (#206 GFW per-domain) и direct_first.py (#197).
+        env -u всех proxy-vars (оба регистра) — прямой путь минуя privoxy/xray.
+        Парсер/семантика — общие с socks_probe (#456): см. _reachable_result.
+
+        Возвращает {"reachable": bool, "kind": str}. Не бросает (probe-канон).
+        """
+        # https:// + путь '/' — GFW режет на TLS-handshake к корню; -I (HEAD) лёгкий.
+        r = self.run([self.curl_path, "-sS", "-o", "/dev/null", "-I",
+                      "--connect-timeout", str(connect_timeout), "--max-time", str(max_time),
+                      "-w", "%{http_code}", f"https://{host}/"],
+                     timeout=max_time + 2, env=self._proxy_free_env())
+        return self._reachable_result(r)
+
+    def socks_probe(self, host: str, proxy_url: str, *,
+                    connect_timeout: int = 4, max_time: int = 8) -> Dict[str, Any]:
+        """curl к host через заданный прокси (-x) — доставляет ли ЭТОТ путь домен? (#456)
+
+        Зеркало direct_probe для прокси-путей: проверяем ровно ту дверь, которой будет ходить
+        ретрай (socks5h xray), а не «какой-нибудь прокси». Семантика reachable/кinds — та же,
+        что direct_probe (см. _reachable_result): ЛЮБОЙ HTTP-ответ = путь доставляет.
+        env без proxy-переменных — детерминизм против ambient NO_PROXY (см. _proxy_free_env).
+        Не бросает (probe-канон).
+        """
+        r = self.run([self.curl_path, "-sS", "-o", "/dev/null", "-I",
+                      "-x", proxy_url,
+                      "--connect-timeout", str(connect_timeout), "--max-time", str(max_time),
+                      "-w", "%{http_code}", f"https://{host}/"],
+                     timeout=max_time + 2, env=self._proxy_free_env())
+        return self._reachable_result(r)
 
 
 # ============================ Обратная совместимость ============================
@@ -176,6 +209,12 @@ def brew_service_state(result: Dict[str, Any], name: str) -> str:
 def direct_probe(host: str, *, connect_timeout: int = 4, max_time: int = 8) -> Dict[str, Any]:
     """Прямой curl к host МИНУЯ прокси (env -u) — достигается ли домен без туннеля?"""
     return _default_manager.direct_probe(host, connect_timeout=connect_timeout, max_time=max_time)
+
+
+def socks_probe(host: str, proxy_url: str, *, connect_timeout: int = 4, max_time: int = 8) -> Dict[str, Any]:
+    """curl к host через заданный прокси (-x) — доставляет ли ЭТОТ путь домен? (#456)"""
+    return _default_manager.socks_probe(host, proxy_url,
+                                        connect_timeout=connect_timeout, max_time=max_time)
 
 
 # Константы для обратной совместимости

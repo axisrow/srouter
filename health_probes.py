@@ -46,6 +46,8 @@ __all__ = [
     "_direct_first_check", "TUNNEL_TARGETS", "VENDOR_OUTAGE_MARKER",
     "_tunnel_target_up", "_tunnel_up", "_tunnel_delivery_check", "_tunnel_passengers",
     "_github_direct_split_check",
+    # #456 socks5h-фоллбек при GFW-окнах
+    "_github_socks_probe", "_github_fallback_check",
     # #396 классы проб: direct (мимо прокси) + bulk (объёмная передача)
     "_no_proxy_env", "DIRECT_PROBE_URLS", "_direct_up", "_bulk_probe", "_bulk_status",
     "_BULK_DEFAULT_URL", "_url_host",
@@ -1087,6 +1089,72 @@ def _github_direct_split_check():
     path = "напрямую (режим on)" if st.get("direct") else "через туннель (режим off)"
     return {"status": "info", "direct": bool(st.get("direct")),
             "detail": f"github ходит {path}"}
+
+
+# ============================ #456: github при GFW-окнах — socks5h-фоллбек ============================
+# Инцидент 2026-11-05: direct TLS github мёртв (окно), ретрай socks5h умер в ту же минуту
+# («Empty reply»), через минуты тот же путь — 200 за 2.6s. Окна флапают: из одной неудачи
+# нельзя выводить «socks тоже мёртв». Проверяем ОБА пути явно и отдаём готовую команду ретрая —
+# предсказуемый фоллбек-протокол вместо слепых direct-проб. Автодеградацию НЕ делаем (фаза 2
+# #422 — только после ручной валидации, roadmap-политика).
+
+try:
+    from dashboard_common import SOCKS_PROXY_URL as _SOCKS_PROXY  # socks5h://127.0.0.1:10808
+except (ImportError, SystemExit) as exc:  # noqa: BLE001 — канон git_proxy/health_constants guard
+    _log.info("dashboard_common недоступен (%s: %s) — github-фоллбек на fallback-константе",
+              type(exc).__name__, exc)
+    _SOCKS_PROXY = "socks5h://127.0.0.1:10808"  # canonical-fallback-port
+
+
+def _github_socks_probe(host):
+    """Проба github через xray SOCKS5 (_SOCKS_PROXY) — та же дверь, что git -c http.proxy=… (#456).
+
+    Обёртка над sys_probe.socks_probe по образцу _direct_domain_probe (базовый слой в
+    probe_manager — один curl-парсер, не дублировать). Дверь пробы = дверь ретрая: privoxy 8118
+    НЕ подходит (может лежать при живом socks — независимые службы). Контракт тот же:
+    {"reachable": bool, "kind": str}. Не бросает (probe-канон).
+    """
+    return sys_probe.socks_probe(host, proxy_url=_SOCKS_PROXY)
+
+
+def _github_fallback_check():
+    """Живой вердикт «какой путь до github работает СЕЙЧАС» + готовая команда ретрая (#456).
+
+    Матрица direct × socks5h (обе пробы всегда — живой путь помечается рабочим):
+      ok      — direct отвечает: git clone/push/fetch напрямую (путь рабочий); socks мёртв →
+                пометка «туннель деградировал» (FYI — туннель-стек, зона doctor);
+      warn    — direct мёртв (GFW-окно), socks5h жив → готовая команда ретрая + совет
+                мгновенного ретрая (окна флапают, ретраи дёшевы);
+      down    — оба пути мёртвы → подождать минуты; ретрай той же команды дёшев (окна короткие);
+      unknown — мусор от проб (не dict).
+    Обе пробы — на один хост: путь пробы = путь git-ретрая (канарейка #418, github.com).
+    Не бросает (probe-канон).
+    """
+    host = "github.com"
+    direct = _health_facade._direct_domain_probe(host)
+    socks = _health_facade._github_socks_probe(host)
+    if not isinstance(direct, dict) or not isinstance(socks, dict):
+        return {"status": "unknown", "detail": "github-fallback: пробы вернули мусор (не dict)"}
+    d_kind, s_kind = direct.get("kind"), socks.get("kind")
+    retry_cmd = f"git -c http.proxy={_SOCKS_PROXY} clone|push|fetch"
+    if direct.get("reachable"):
+        if socks.get("reachable"):
+            return {"status": "ok",
+                    "detail": f"оба пути живы (direct {d_kind}; socks5h {s_kind}) — git "
+                              f"clone/push/fetch работай напрямую (путь рабочий)"}
+        return {"status": "ok",
+                "detail": f"direct github.com жив ({d_kind}) — git работай напрямую (путь рабочий); "
+                          f"socks5h-туннель сейчас мёртв ({s_kind}) — туннель-стек деградировал "
+                          f"(картина: `srouter doctor`)"}
+    if socks.get("reachable"):
+        return {"status": "warn", "retry_cmd": retry_cmd,
+                "detail": f"direct мёртв ({d_kind} — GFW-окно), socks5h жив ({s_kind}) — git ретрай "
+                          f"через туннель СЕЙЧАС: окна флапают, ретраи дёшевы; из одной неудачи "
+                          f"не выводи «socks тоже мёртв» (#456)"}
+    return {"status": "down", "retry_cmd": retry_cmd,
+            "detail": f"оба пути мёртвы (direct {d_kind}; socks5h {s_kind}) — окно накрыло direct и "
+                      f"туннель; подожди 5–10 мин и повтори `srouter github-direct check`, ретрай "
+                      f"команды ниже тоже дёшев — окна короткие"}
 
 
 
