@@ -97,9 +97,12 @@ def state_protected(state_path):
         state = local_state.load_state(path=state_path)
     except (OSError, ValueError, TypeError, ImportError):
         return False
-    detected = state.get("detected_environment") if isinstance(state.get("detected_environment"), dict) else {}
-    entry = detected.get("privoxy") if isinstance(detected.get("privoxy"), dict) else {}
-    protection = entry.get("protection") if isinstance(entry.get("protection"), dict) else {}
+    detected = state.get("detected_environment")
+    detected = detected if isinstance(detected, dict) else {}
+    entry = detected.get("privoxy")
+    entry = entry if isinstance(entry, dict) else {}
+    protection = entry.get("protection")
+    protection = protection if isinstance(protection, dict) else {}
     return protection.get("service_scope") == "system" and protection.get("label") == privoxy_system.SYSTEM_LABEL
 
 
@@ -108,7 +111,8 @@ def _write_pending(state_path, previous):
     state, readable = local_state.load_state_checked(path=state_path)
     if not readable:
         return False
-    runtime = state.get("runtime") if isinstance(state.get("runtime"), dict) else {}
+    runtime = state.get("runtime")
+    runtime = runtime if isinstance(runtime, dict) else {}
     runtime["privoxy_protection_pending"] = {
         "action": "protect",
         "started_at": privoxy_system._now(),
@@ -123,9 +127,12 @@ def _write_unprotect_pending(state_path):
     state, readable = local_state.load_state_checked(path=state_path)
     if not readable:
         return False
-    detected = state.get("detected_environment") if isinstance(state.get("detected_environment"), dict) else {}
-    current = detected.get("privoxy") if isinstance(detected.get("privoxy"), dict) else {}
-    runtime = state.get("runtime") if isinstance(state.get("runtime"), dict) else {}
+    detected = state.get("detected_environment")
+    detected = detected if isinstance(detected, dict) else {}
+    current = detected.get("privoxy")
+    current = current if isinstance(current, dict) else {}
+    runtime = state.get("runtime")
+    runtime = runtime if isinstance(runtime, dict) else {}
     runtime["privoxy_protection_pending"] = {
         "action": "unprotect",
         "started_at": privoxy_system._now(),
@@ -140,7 +147,8 @@ def _mark_failed(state_path, error):
     state, readable = local_state.load_state_checked(path=state_path)
     if not readable:
         return
-    runtime = state.get("runtime") if isinstance(state.get("runtime"), dict) else {}
+    runtime = state.get("runtime")
+    runtime = runtime if isinstance(runtime, dict) else {}
     pending = runtime.get("privoxy_protection_pending")
     if isinstance(pending, dict):
         pending["failed_at"] = privoxy_system._now()
@@ -157,9 +165,12 @@ def _promote_state(state_path, *, backup_dir, layout=None):
     state, readable = local_state.load_state_checked(path=state_path)
     if not readable:
         return False
-    detected = state.get("detected_environment") if isinstance(state.get("detected_environment"), dict) else {}
-    previous = detected.get("privoxy") if isinstance(detected.get("privoxy"), dict) else {}
-    runtime = state.get("runtime") if isinstance(state.get("runtime"), dict) else {}
+    detected = state.get("detected_environment")
+    detected = detected if isinstance(detected, dict) else {}
+    previous = detected.get("privoxy")
+    previous = previous if isinstance(previous, dict) else {}
+    runtime = state.get("runtime")
+    runtime = runtime if isinstance(runtime, dict) else {}
     pending = runtime.get("privoxy_protection_pending")
     if isinstance(pending, dict) and isinstance(pending.get("previous"), dict):
         previous = pending["previous"]
@@ -192,14 +203,19 @@ def _restore_state_after_unprotect(state_path):
     state, readable = local_state.load_state_checked(path=state_path)
     if not readable:
         return False
-    detected = state.get("detected_environment") if isinstance(state.get("detected_environment"), dict) else {}
-    entry = detected.get("privoxy") if isinstance(detected.get("privoxy"), dict) else {}
-    protection = entry.get("protection") if isinstance(entry.get("protection"), dict) else {}
-    previous = protection.get("previous") if isinstance(protection.get("previous"), dict) else None
+    detected = state.get("detected_environment")
+    detected = detected if isinstance(detected, dict) else {}
+    entry = detected.get("privoxy")
+    entry = entry if isinstance(entry, dict) else {}
+    protection = entry.get("protection")
+    protection = protection if isinstance(protection, dict) else {}
+    previous = protection.get("previous")
+    previous = previous if isinstance(previous, dict) else None
     detected["privoxy"] = previous
     detected["last_checked_at"] = privoxy_system._now()
     state["detected_environment"] = detected
-    runtime = state.get("runtime") if isinstance(state.get("runtime"), dict) else {}
+    runtime = state.get("runtime")
+    runtime = runtime if isinstance(runtime, dict) else {}
     runtime.pop("privoxy_protection_pending", None)
     runtime["last_apply"] = privoxy_system._now()
     runtime["last_error"] = None
@@ -496,8 +512,10 @@ def protect(*, state_path, prefix="/opt/homebrew", runner=None, require_tty=True
     state, readable = local_state.load_state_checked(path=state_path)
     if not readable:
         return privoxy_system._result(False, error="state_unreadable")
-    detected = state.get("detected_environment") if isinstance(state.get("detected_environment"), dict) else {}
-    previous = detected.get("privoxy") if isinstance(detected.get("privoxy"), dict) else {}
+    detected = state.get("detected_environment")
+    detected = detected if isinstance(detected, dict) else {}
+    previous = detected.get("privoxy")
+    previous = previous if isinstance(previous, dict) else {}
     if not privoxy_system._write_pending(state_path, previous):
         return privoxy_system._result(False, error="pending_state_write_failed")
 

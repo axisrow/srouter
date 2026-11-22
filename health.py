@@ -1010,21 +1010,24 @@ def _metrics_probe_options(state_path=None):
         defaults = {}
     try:
         state = local_state.load_state(path=state_path)
-        raw = state.get("probes") if isinstance(state.get("probes"), dict) else {}
+        raw = state.get("probes")
+        raw = raw if isinstance(raw, dict) else {}
     except (OSError, ValueError, TypeError) as exc:
         _log.debug("metrics options: local state недоступен (%s) — дефолты", exc)
         raw = {}
 
     def _int_or(key, fallback, lo, hi):
         default = defaults.get(key, fallback)
-        try:
-            value = int(raw.get(key))
-        except (TypeError, ValueError):
+        raw_value = raw.get(key)  # None = ключа нет → дефолтная ветка; int(None) раньше падал так же
+        if raw_value is not None:
             try:
-                return max(lo, min(hi, int(default)))
+                return max(lo, min(hi, int(raw_value)))
             except (TypeError, ValueError):
-                return fallback
-        return max(lo, min(hi, value))
+                pass
+        try:
+            return max(lo, min(hi, int(default)))
+        except (TypeError, ValueError):
+            return fallback
 
     return {
         "enabled": raw.get("metrics_enabled", defaults.get("metrics_enabled")) is not False,
@@ -1757,7 +1760,7 @@ def _append_watchdog_status_event(previous, current, reasons=None, segment=None)
         # не восстановимую ретроспективой. None-сторона (legacy/битый state) → без diff.
         prev_failed = previous.get("failed") if isinstance(previous, dict) else None
         cur_failed = current.get("failed") if isinstance(current, dict) else None
-        diff = None
+        diff: "dict | None" = None  # added/removed — списки, added_details ниже — dict: разнотипно
         if isinstance(prev_failed, list) and isinstance(cur_failed, list):
             diff = {
                 "added": sorted(set(cur_failed) - set(prev_failed)),

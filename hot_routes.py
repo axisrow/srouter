@@ -603,9 +603,11 @@ def _load_cache(path):
         domain = _clean_hostname(domain)
         if domain is None:
             continue
-        if not _is_finite_number(count):
+        # isinstance вперёд: сужает count/last_seen для int()/float() ниже (_is_finite_number —
+        # plain bool, сужения не даёт); не-число не конечно, порядок проверок поведение не меняет.
+        if not isinstance(count, (int, float)) or not _is_finite_number(count):
             continue
-        if not _is_finite_number(last_seen):
+        if not isinstance(last_seen, (int, float)) or not _is_finite_number(last_seen):
             continue
         out[domain] = {
             "domain": domain,

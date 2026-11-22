@@ -58,7 +58,7 @@ def test_enable_rejects_socks_without_mutating_settings(monkeypatch, tmp_path):
     result = claude_proxy.enable()
 
     assert result["ok"] is False
-    assert "unsupported proxy scheme" in result["err"]
+    assert isinstance(result["err"], str) and "unsupported proxy scheme" in result["err"]
     assert json.loads(settings.read_text()) == original
     assert claude_proxy.status()["enabled"] is False
 
@@ -610,7 +610,7 @@ def test_enable_returns_structured_error_when_lock_unavailable(monkeypatch, tmp_
     _lock_unavailable_env(monkeypatch, tmp_path)
     r = claude_proxy.enable()
     assert r["ok"] is False
-    assert "settings lock unavailable" in r["err"]
+    assert isinstance(r["err"], str) and "settings lock unavailable" in r["err"]
     assert json.loads((tmp_path / "settings.json").read_text()) == {}, "settings не тронут"
 
 
@@ -619,7 +619,7 @@ def test_disable_returns_structured_error_when_lock_unavailable(monkeypatch, tmp
     _lock_unavailable_env(monkeypatch, tmp_path)
     r = claude_proxy.disable()
     assert r["ok"] is False
-    assert "settings lock unavailable" in r["err"]
+    assert isinstance(r["err"], str) and "settings lock unavailable" in r["err"]
 
 
 def test_lock_release_failure_is_wrapped_as_warning(monkeypatch, tmp_path):
@@ -636,7 +636,8 @@ def test_lock_release_failure_is_wrapped_as_warning(monkeypatch, tmp_path):
     monkeypatch.setattr(fcntl, "flock", _fail_unlock)
     r = claude_proxy.enable()
     assert r["ok"] is True, "операция закоммичена — release не меняет ok"
-    assert "lock release failed" in r.get("err", "")
+    err = r.get("err", "")  # один .get(): сужение через переменную (два вызова pyright не свяжет)
+    assert isinstance(err, str) and "lock release failed" in err
 
 
 # ============ issue #331: нейтрализация all_proxy/ALL_PROXY (SOCKS-плечо xray) ============
@@ -691,7 +692,7 @@ def test_enable_conflict_aggregates_proxy_and_neutral_causes(monkeypatch, tmp_pa
     assert r["ok"] is False
     assert r["conflict"] is True
     assert r["state"] == "foreign"
-    assert "all_proxy" in r["err"], "нейтральный конфликт назван в ТОМ ЖЕ ответе"
+    assert isinstance(r["err"], str) and "all_proxy" in r["err"], "нейтральный конфликт назван в ТОМ ЖЕ ответе"
     assert json.loads(settings.read_text()) == original, "мутации быть не должно"
 
 

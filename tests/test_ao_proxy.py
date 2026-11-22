@@ -23,7 +23,7 @@ SCM_PROXY_PATH = "/api/v1/settings/scm-proxy"
 class _StubAO(BaseHTTPRequestHandler):
     """Мини-двойник AO settings API: живой захват PATCH-тел (канон mock-format)."""
 
-    def log_message(self, *args):  # тишина в pytest-выводе
+    def log_message(self, format, *args):  # тишина в pytest-выводе; подпись base — (format, *args)
         pass
 
     def _reply(self, code, payload):
@@ -34,25 +34,39 @@ class _StubAO(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
+    def _stub_server(self) -> "_StubServer":
+        # self.server stdlib типизировал как BaseServer: динамическую пару handler↔stub-сервер
+        # pyright не выражает — единственный осознанный downcast на класс (см. _StubServer).
+        return self.server  # pyright: ignore[reportAttributeAccessIssue, reportReturnType]
+
     def do_GET(self):
         if self.path == SETTINGS_PATH:
-            self._reply(200, {"scmProxyUrl": self.server.scm_proxy_url})
+            self._reply(200, {"scmProxyUrl": self._stub_server().scm_proxy_url})
         else:
             self._reply(404, {"error": "not_found"})
 
     def do_PATCH(self):
         length = int(self.headers.get("Content-Length") or 0)
         body = json.loads(self.rfile.read(length) or b"{}")
-        self.server.patch_calls.append(body)
-        if self.server.fail_patch:
-            self._reply(self.server.fail_patch, {"error": "boom"})
+        srv = self._stub_server()
+        srv.patch_calls.append(body)
+        if srv.fail_patch:
+            self._reply(srv.fail_patch, {"error": "boom"})
             return
-        self.server.scm_proxy_url = body.get("url", "")
-        self._reply(200, {"scmProxyUrl": self.server.scm_proxy_url})
+        srv.scm_proxy_url = body.get("url", "")
+        self._reply(200, {"scmProxyUrl": srv.scm_proxy_url})
+
+
+class _StubServer(HTTPServer):
+    """HTTPServer + тестовое состояние: аннотации дают pyright типы вместо произвольных атрибутов."""
+
+    scm_proxy_url: str
+    patch_calls: list
+    fail_patch: int
 
 
 def _start_stub(*, scm_proxy_url="", fail_patch=0):
-    server = HTTPServer(("127.0.0.1", 0), _StubAO)
+    server = _StubServer(("127.0.0.1", 0), _StubAO)
     server.scm_proxy_url = scm_proxy_url
     server.patch_calls = []
     server.fail_patch = fail_patch

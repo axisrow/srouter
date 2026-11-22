@@ -124,7 +124,8 @@ def check_backup_slots(state_path=None, *, claude_settings=None, vscode_settings
         return {"status": "unknown",
                 "detail": "state нечитаем — консистентность бэкап-слотов не определить",
                 "findings": []}
-    detected = state.get("detected_environment") if isinstance(state.get("detected_environment"), dict) else {}
+    detected = state.get("detected_environment")
+    detected = detected if isinstance(detected, dict) else {}
     for name, entry in sorted(detected.items()):
         if not isinstance(entry, dict):
             continue

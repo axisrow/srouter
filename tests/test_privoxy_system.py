@@ -2092,7 +2092,7 @@ def test_install_helper_fail_closed_when_staged_tree_module_substituted_after_st
 # следующий инцидент). Канон probe-semantics-from-primary-source: RunAtLoad — man launchd.plist.
 
 
-def _control_runner(loaded=True):
+def _control_runner(loaded: "bool | str" = True):
     """Fake-runner для control(): sudo -k ок, helper restart ok, launchctl print по `loaded`
     (True/False/"timeout" — последний имитирует launchctl timeout, rc=None + timeout=True)."""
     def runner(cmd, timeout):
@@ -2311,7 +2311,7 @@ def _protect_success_harness(tmp_path, monkeypatch):
             return {"rc": 0, "out": "nobody", "err": "", "timeout": False}
         return {"rc": 0, "out": "ok", "err": "", "timeout": False}
 
-    kwargs = dict(
+    kwargs: dict = dict(  # значения разнотипны (str/int/bool/callable) — защитный **unpack в protect_as_root
         username=identity.pw_name,
         uid=identity.pw_uid,
         prefix=str(prefix),

@@ -183,8 +183,10 @@ def test_snapshot_writes_state_and_cached_reads_back(tmp_path):
     for e in _events():
         metrics_store.append_timing_event(e, log_path=log)
     attr = health._attribution_snapshot(now=NOW, log_path=log, state_path=state_path)
+    assert attr is not None  # свежий снапшот — не None-форма (в отличие от устаревшего кэша)
     assert attr["verdict"] == "ok"
     cached = health.cached_attribution(state_path=state_path, now=NOW + 60)
+    assert cached is not None  # кэш ещё свежий (NOW+60 в пределах TTL) — не None-форма
     assert cached["verdict"] == "ok"
 
 

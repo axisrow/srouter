@@ -7,6 +7,7 @@ import pytest
 def snapshot_module():
     source = Path(__file__).parent / 'macos/snapshot.py'
     spec = importlib.util.spec_from_file_location('vm_snapshot_guard_test', source)
+    assert spec is not None and spec.loader is not None  # гвард контракта spec_from_file_location
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

@@ -293,7 +293,8 @@ def _routing_apply_locked(config_path, state_path, outbound, hosts, action, adop
     if not state_readable or not isinstance(state, dict):
         return {"ok": False, "changed": False, "err": "state_unreadable"}
     if adopt is False or rule.get(ROUTING_MARKER) is True:
-        rt = state.get("routing") if isinstance(state.get("routing"), dict) else {}
+        rt = state.get("routing")
+        rt = rt if isinstance(rt, dict) else {}
         stored_hash = rt.get("last_applied_hash")
         if stored_hash and _routing_domains_hash(current_domains, current_ips) != stored_hash:
             return {"ok": False, "changed": False, "err": "hash_drift_config_changed_externally"}

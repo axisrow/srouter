@@ -153,7 +153,7 @@ def test_watchdog_breaks_simulated_hang():
     # долгом рестарте xray), второй обязан выйти за бюджет, а не висеть вечно.
     held = threading.Event()
     release = threading.Event()
-    result = {"exc": None, "elapsed": None}
+    result: dict = {"exc": None, "elapsed": None}  # значения разнотипны: исключение/float
 
     def holder():
         with node_selector._SELECT_LOCK:
@@ -217,7 +217,7 @@ def test_hotroutes_release_update_unbounded_clears_marker_under_contention(monke
 
     held = threading.Event()
     release = threading.Event()
-    cleared = {"v": None, "elapsed": None}
+    cleared: dict = {"v": None, "elapsed": None}  # значения разнотипны: bool/float
 
     def holder():
         with lk:  # держим дольше watchdog-бюджеа (0.05с) → bounded-реализация упала бы тут

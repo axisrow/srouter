@@ -68,9 +68,9 @@ def _fresh_dashboard(monkeypatch):
     monkeypatch.delitem(sys.modules, "dashboard_app", raising=False)
     monkeypatch.delitem(sys.modules, "dashboard_routes", raising=False)
     cfg = types.ModuleType("srouter_config")
-    cfg.GATEWAY = "192.0.2.1"
-    cfg.VPN_SERVER = "198.51.100.20"
-    cfg.VPN_EXIT_IP = "198.51.100.20"
+    setattr(cfg, "GATEWAY", "192.0.2.1")
+    setattr(cfg, "VPN_SERVER", "198.51.100.20")
+    setattr(cfg, "VPN_EXIT_IP", "198.51.100.20")
     monkeypatch.setitem(sys.modules, "srouter_config", cfg)
     dashboard = importlib.import_module("dashboard")
     dashboard._cache.update(ts=0.0, data=None)
@@ -587,7 +587,7 @@ def test_api_node_select_adopt_mode_returns_409(monkeypatch):
 def _install_gateway(monkeypatch, gateway="192.0.2.1"):
     """Фейковый srouter_config для ленивого import в node_selector._gateway_literal."""
     cfg = types.ModuleType("srouter_config")
-    cfg.GATEWAY = gateway
+    setattr(cfg, "GATEWAY", gateway)
     monkeypatch.setitem(sys.modules, "srouter_config", cfg)
     return cfg
 
@@ -1243,8 +1243,8 @@ def test_default_runner_cmd_not_list_stays_typed_error(monkeypatch):
 def _install_physical_prefixes(monkeypatch, prefixes, gateway="192.0.2.1"):
     """Фейковый srouter_config с PHYSICAL_IFACE_PREFIXES для ленивого import в node_selector."""
     cfg = types.ModuleType("srouter_config")
-    cfg.GATEWAY = gateway
-    cfg.PHYSICAL_IFACE_PREFIXES = prefixes
+    setattr(cfg, "GATEWAY", gateway)
+    setattr(cfg, "PHYSICAL_IFACE_PREFIXES", prefixes)
     monkeypatch.setitem(sys.modules, "srouter_config", cfg)
     return cfg
 

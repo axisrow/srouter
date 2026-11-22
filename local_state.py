@@ -35,6 +35,7 @@ import socket  # noqa: F401 — re-export surface: local_state.socket патчи
                 # local_state.socket.gethostbyname виден и там.
 from pathlib import Path
 from urllib.parse import urlsplit
+from typing import Any, Dict, Tuple  # аннотации контракта: state — dict с произвольными JSON-значениями
 
 # Путь к локальному state по умолчанию — рядом с этим модулем, не cwd.
 _DEFAULT_PATH = Path(__file__).resolve().parent / "srouter.local.json"
@@ -161,9 +162,11 @@ _DEFAULT_STATE = {
 }
 
 
-def load_state(path=None):
+def load_state(path=None) -> "Dict[str, Any]":
     """Загрузить state. Missing/broken/non-object -> безопасный _DEFAULT_STATE (копия).
-    Никогда не бросает.
+    Никогда не бросает. Значения — произвольный JSON, поэтому Dict[str, Any]: без аннотации
+    pyright выводит типы из литерала _DEFAULT_STATE (включая None-поля) и ломает сужение
+    isinstance-идиом у всех потребителей.
     """
     state, _readable = _load_state_checked(path)
     return state
@@ -176,7 +179,7 @@ def state_path(path=None):
     return Path(path) if path else _DEFAULT_PATH
 
 
-def load_state_checked(path=None):
+def load_state_checked(path=None) -> "Tuple[Dict[str, Any], bool]":
     """Загрузить state и вернуть (state, readable) для мутирующих операций.
 
     readable=False означает: файл существует, но его нельзя безопасно
@@ -185,7 +188,7 @@ def load_state_checked(path=None):
     return _load_state_checked(path)
 
 
-def _load_state_checked(path=None):
+def _load_state_checked(path=None) -> "Tuple[Dict[str, Any], bool]":
     """Загрузить state и отличить missing file от битого existing file.
 
     readable=False значит: файл был найден, но его нельзя безопасно перезаписывать мутатором.

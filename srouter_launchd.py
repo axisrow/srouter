@@ -58,7 +58,13 @@ def _host_route(route_ip, runner):
         if not result.get("timeout") and any(text in message for text in ("not in table", "no such process", "not in routing table")):
             return None, ""
         return None, "route_read_failed"
-    fields = dict(line.strip().split(":", 1) for line in (result.get("out") or "").splitlines() if ":" in line)
+    # "gateway: ip" → пара ключ-значение; partition даёт ровно 3 части (sep пуст ⇔ ":" нет в строке).
+    # Прежний dict(genexp по split(...)) выводился как dict[bytes, bytes] и ломал .get("flags") ниже.
+    fields = {}
+    for line in (result.get("out") or "").splitlines():
+        key, sep, value = line.strip().partition(":")
+        if sep:
+            fields[key] = value
     fields = {key: value.strip() for key, value in fields.items()}
     flags = fields.get("flags", "").strip("<>").split(",")
     if "HOST" not in flags or fields.get("destination") != route_ip:

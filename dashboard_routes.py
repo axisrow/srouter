@@ -456,7 +456,8 @@ def _throttle_apply(payload):
             # Движок сам подтвердил cleanup ok -> enable-ref свободен, token освобождён.
             # Честно рапортуем 'rolled back', cleanup-lease НЕ нужен (мусорный был бы).
             body["ok"] = False
-            body["err"] = (body.get("err") + "; " if body.get("err") else "") + "rolled back by engine"
+            err = body.get("err")  # один .get(): дубликат pyright не свяжет, None-ветка не сужается
+            body["err"] = (err + "; " if err else "") + "rolled back by engine"
             body["rollback"] = _throttle_result(rollback)
             return jsonify(body), 500
         # Внутреннего rollback не было ИЛИ он не ok (fail/cancel/timeout) — token жив на
@@ -555,7 +556,8 @@ def _throttle_clear():
         if cleared:
             body["throttle"] = None
         else:
-            body["err"] = (body.get("err") + "; " if body.get("err") else "") + (
+            err = body.get("err")  # один .get(): дубликат pyright не свяжет, None-ветка не сужается
+            body["err"] = (err + "; " if err else "") + (
                 "throttle cleared on pf, but active-lease state could not be persisted — "
                 "it may reappear after restart"
             )
@@ -666,7 +668,8 @@ def api_isolate_enable():
             {"domains": domains, "ips": {}, "unresolved": result.get("unresolved", []),
              "ports": ports, "token": token, "applied_at": int(time.time()), "phase": "working"}
         )
-        body["err"] = (body.get("err") + "; " if body.get("err") else "") + "pf enable-ref live — cleanup-lease persisted"
+        err = body.get("err")  # один .get(): дубликат pyright не свяжет, None-ветка не сужается
+        body["err"] = (err + "; " if err else "") + "pf enable-ref live — cleanup-lease persisted"
     return jsonify(body), 500
 
 
@@ -685,7 +688,8 @@ def api_isolate_disable():
         cleared = local_state.clear_active_isolate()
         body["isolate"] = None if cleared else _public_isolate(active)
         if not cleared:
-            body["err"] = (body.get("err") + "; " if body.get("err") else "") + (
+            err = body.get("err")  # один .get(): дубликат pyright не свяжет, None-ветка не сужается
+            body["err"] = (err + "; " if err else "") + (
                 "isolate disabled on pf, but lease state could not be persisted — may reappear after restart")
         return jsonify(body), 200
     body["still_active"] = True

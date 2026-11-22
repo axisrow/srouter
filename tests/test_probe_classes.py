@@ -133,6 +133,7 @@ def test_direct_up_or_semantics_any_target_ok(monkeypatch):
     monkeypatch.setattr(health.sys_probe, "run", fake_run)
     ok, detail, timings = health._direct_up()
     assert ok is True
+    assert timings is not None  # _direct_up несёт список замеров; None-форма — другой контракт
     assert len(timings) == 2
     assert all(t["kind"] == "direct" for t in timings)
 
@@ -144,6 +145,7 @@ def test_direct_up_all_down(monkeypatch):
     monkeypatch.setattr(health.sys_probe, "run", fake_run)
     ok, detail, timings = health._direct_up()
     assert ok is False
+    assert timings is not None  # даже при полном down — список замеров, не None-форма
     assert len(timings) == len(health.DIRECT_PROBE_URLS)
 
 
@@ -162,6 +164,7 @@ def test_direct_up_extra_targets_replaces_defaults(monkeypatch):
     monkeypatch.setattr(health.sys_probe, "run", fake_run)
     ok, _, timings = health._direct_up(extra_targets=["https://www.gstatic.com/generate_204"])
     assert ok is True
+    assert timings is not None  # _direct_up несёт список замеров; None-форма — другой контракт
     assert [t["target"] for t in timings] == ["www.gstatic.com"]
 
 
