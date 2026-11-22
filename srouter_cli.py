@@ -357,8 +357,8 @@ def run_post_install(env, runner, *, proxy_force=False, record=True) -> str:
     # (отдельный процесс, свой ~/.claude/settings.json) НЕ затрагивается ни одним из них.
     vp = tracked("vscode", lambda: vscode_proxy.enable(force=_proxy_force))
     if vp.get("ok"):
-        vp_note = ("scoped SOCKS5 в VSCode http.proxy (Code/Cursor) — расширение openai.chatgpt, "
-                   "CC не затрагивается (#185)"
+        vp_note = ("scoped HTTP-прокси xray 10808 в VSCode http.proxy (Code/Cursor) — расширение "
+                   "openai.chatgpt, CC не затрагивается (#185, #459)"
                    + (f" Пути: {', '.join(vp.get('paths') or [])}" if vp.get("paths") else ""))
     else:
         vp_note = f"scoped VSCode http.proxy не установлен ({vp.get('err', 'unknown')})."

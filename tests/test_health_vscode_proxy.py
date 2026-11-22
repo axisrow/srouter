@@ -1,9 +1,11 @@
-"""ТДД-тесты health._vscode_proxy_check: doctor видит scoped SOCKS5 через VSCode http.proxy (#185).
+"""ТДД-тесты health._vscode_proxy_check: doctor видит scoped-прокси codex через VSCode http.proxy (#185).
 
 Контракт _vscode_proxy_check() → {status, detail}:
-  status="ok"      — хотя бы один существующий settings.json содержит http.proxy == socks5h://10808;
+  status="ok"      — существующие settings.json содержат http.proxy == vscode_proxy.PROXY
+                     (http://127.0.0.1:10808 — xray socks-in, #459);
   status="unknown" — ни одного settings.json нет (редактор не установлен) — info-only (как desktop-proxy);
-  status="down"    — http.proxy есть, но НЕ socks5 (privoxy/HTTP рвёт WS #120) — driver;
+  status="down"    — http.proxy есть, но не наше значение: privoxy рвёт WS (#120), legacy socks5h
+                     ломает глобальный fetch VS Code (#459), чужой прокси мимо xray — driver;
   status="warn"    — один редактор ok, другой foreign/отсутствует — картина, info-only.
 
 Info-only ВСЕГДА (как endpoint-override / desktop-proxy-unknown): VSCode может быть не установлен,
@@ -26,14 +28,27 @@ def test_vscode_check_unknown_when_no_editor(monkeypatch):
     assert "не установлен" in res["detail"] or "нет" in res["detail"].lower()
 
 
-def test_vscode_check_ok_when_socks5_present(monkeypatch, tmp_path):
-    """settings.json с http.proxy=socks5h://10808 → ok."""
+def test_vscode_check_ok_when_managed_http_present(monkeypatch, tmp_path):
+    """settings.json с http.proxy=http://127.0.0.1:10808 (xray socks-in, #459) → ok."""
+    p = tmp_path / "Code.json"
+    p.write_text('{"http.proxy": "http://127.0.0.1:10808"}', encoding="utf-8")
+    _patch_paths(monkeypatch, [p])
+    res = health._vscode_proxy_check()
+    assert res["status"] == "ok"
+    assert "10808" in res["detail"]
+
+
+def test_vscode_check_down_on_legacy_socks_with_migration_hint(monkeypatch, tmp_path):
+    """#459: legacy socks5h://10808 → down: глобальный fetch VS Code шлёт TLS на SOCKS-порт.
+    detail называет причину и путь миграции."""
     p = tmp_path / "Code.json"
     p.write_text('{"http.proxy": "socks5h://127.0.0.1:10808"}', encoding="utf-8")
     _patch_paths(monkeypatch, [p])
     res = health._vscode_proxy_check()
-    assert res["status"] == "ok"
-    assert "10808" in res["detail"] or "socks" in res["detail"].lower()
+    assert res["status"] == "down"
+    assert "#459" in res["detail"]
+    assert "srouter install" in res["detail"]
+    assert "#120" not in res["detail"], "legacy — не privoxy, причина #120 тут ложна"
 
 
 def test_vscode_check_down_when_http_privoxy(monkeypatch, tmp_path):
@@ -44,6 +59,8 @@ def test_vscode_check_down_when_http_privoxy(monkeypatch, tmp_path):
     res = health._vscode_proxy_check()
     assert res["status"] == "down"
     assert "8118" in res["detail"] or "http" in res["detail"].lower()
+    assert "#120" in res["detail"], f"причина privoxy (рвёт WS) обязана быть в detail: {res['detail']}"
+    assert "#459" not in res["detail"], "privoxy — не legacy, подсказка миграции #459 тут ложна"
 
 
 def test_vscode_check_down_when_foreign_proxy(monkeypatch, tmp_path):
@@ -64,7 +81,7 @@ def test_vscode_check_down_even_when_one_editor_ok(monkeypatch, tmp_path):
     """
     ok = tmp_path / "Code" / "User" / "settings.json"
     ok.parent.mkdir(parents=True)
-    ok.write_text('{"http.proxy": "socks5h://127.0.0.1:10808"}', encoding="utf-8")
+    ok.write_text('{"http.proxy": "http://127.0.0.1:10808"}', encoding="utf-8")
     broken = tmp_path / "Cursor" / "User" / "settings.json"
     broken.parent.mkdir(parents=True)
     broken.write_text('{"http.proxy": "http://127.0.0.1:8118"}', encoding="utf-8")

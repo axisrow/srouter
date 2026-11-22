@@ -366,7 +366,9 @@ binary/exec.LookPath), поэтому границей служит именно
   пробы диагностики, рестарт xray рвал TLS чужого трафика, privoxy-SPOF). **Claude Code не
   конфликтует** (#130 снят): CC CLI читает прокси из `~/.claude/settings.json`, а не из launchd
   gui-env — и с контракта не сеет туда ничего.
-- **VSCode `http.proxy` (scoped, #185)** — `socks5h://127.0.0.1:10808` в настройке VSCode/Cursor.
+- **VSCode `http.proxy` (scoped, #185)** — `http://127.0.0.1:10808` в настройке VSCode/Cursor: HTTP-прокси
+  в тот же xray `socks-in` (он смешанный), не privoxy. Socks-схему не пишем (#459): глобальный `fetch`
+  VS Code с ней идёт на SOCKS-порт по TLS. Старое `socks5h://…` `srouter install` мигрирует сам.
   **Комплементарен codenv**: расширение `openai.chatgpt` в Code/Cursor — отдельный клиент от ChatGPT.app;
   строит `HTTP_PROXY`/`HTTPS_PROXY` **в env порождаемого codex-процесса**, не трогая Claude Code.
   ⚠️ Install правит **только существующий** `settings.json` редактора и **не создаёт** его сам — если
@@ -946,7 +948,9 @@ optimization (they route traffic through the right channel without relying on th
   in diagnostics, xray restarts tearing TLS of unrelated traffic, privoxy SPOF). **Claude Code
   does not conflict** (#130 resolved): the CC CLI reads its proxy from `~/.claude/settings.json`,
   not launchd gui-env — and seeds nothing there since the contract.
-- **VSCode `http.proxy` (scoped, #185)** — `socks5h://127.0.0.1:10808` in the VSCode/Cursor setting.
+- **VSCode `http.proxy` (scoped, #185)** — `http://127.0.0.1:10808` in the VSCode/Cursor setting: an HTTP
+  proxy into the same xray `socks-in` (it is mixed), not privoxy. No socks scheme (#459): VS Code's global
+  `fetch` would speak TLS to the SOCKS port. `srouter install` migrates an old `socks5h://…` value itself.
   **Complementary to codenv**: the `openai.chatgpt` extension in Code/Cursor is a separate client from
   ChatGPT.app; it builds `HTTP_PROXY`/`HTTPS_PROXY` **in the env of the spawned codex process**, leaving
   Claude Code untouched. ⚠️ Install only edits an **existing** editor `settings.json` and **does not

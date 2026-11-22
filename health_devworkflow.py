@@ -7,7 +7,6 @@ health.py остаётся тонким фасадом: `from health_devworkflow
 """
 from pathlib import Path
 import logging
-from urllib.parse import urlparse
 
 import git_proxy  # git github-proxy: managed SOCKS5 xray в ~/.gitconfig (#130, инцидент 2026-10-10)
 
@@ -21,20 +20,21 @@ __all__ = ["_vscode_proxy_check", "GH_DIRECT_HINT", "_github_direct_check",
 
 
 def _vscode_proxy_check():
-    """Scoped SOCKS5 для codex-расширения openai.chatgpt через VSCode `http.proxy` (#185).
+    """Scoped-прокси для codex-расширения openai.chatgpt через VSCode `http.proxy` (#185).
 
     Расширение openai.chatgpt запускает свой codex-binary (мимо wrapper), наследует HTTP_PROXY=privoxy
-    из ~/.claude/settings.json → privoxy рвёт WS (#96/#120). Scoped-фикс: VSCode http.proxy=socks5h://10808
-    → расширение строит HTTP_PROXY/HTTPS_PROXY В ENV codex-процессА (verify из extension.js), CC не трогает.
+    из ~/.claude/settings.json → privoxy рвёт WS (#96/#120). Scoped-фикс: VSCode http.proxy =
+    vscode_proxy.PROXY (http://127.0.0.1:10808, xray socks-in, #459) → расширение строит
+    HTTP_PROXY/HTTPS_PROXY В ENV codex-процессА (verify из extension.js), CC не трогает.
     Чек читает user-settings.json (Code+Cursor) и сверяет http.proxy.
 
     Возвращает {status, detail}:
-      ok      — ВСЕ настроенные (present+proxy) settings.json содержат socks5h://10808 (#309: чек
+      ok      — ВСЕ настроенные (present+proxy) settings.json содержат vscode_proxy.PROXY (#309: чек
                 проверяет все редакторы, не возвращается на первом совпавшем);
       unknown — ни одного settings.json нет (редактор не установлен) — info-only (как desktop-proxy);
-      down    — http.proxy есть, но НЕ socks5 хотя бы у одного редактора — даже при верном втором
-                (#309: ранний ok перекрывал сломанного; privoxy/HTTP рвёт WS #120, или чужой
-                корпоративный) — driver.
+      down    — http.proxy есть, но не наш хотя бы у одного редактора — даже при верном втором
+                (#309: ранний ok перекрывал сломанного; privoxy рвёт WS #120, legacy socks5h ломает
+                fetch VS Code #459 — detail подсказывает миграцию, или чужой корпоративный) — driver.
     Чек ВСЕГДА info-only (как endpoint-override): VSCode может быть не установлен, srouter-stack от этого
     не падает. ok/down — картина scoped-маршрута codex для диагностики, не driver агрегированного вердикта.
     """
@@ -53,21 +53,27 @@ def _vscode_proxy_check():
     # ранний ok перекрывал сломанного редактора (сценарий #120: Code=socks5 + Cursor=privoxy-http
     # давал ok, сломанный даже не попадал в detail; down-ветка была недостижима при хоть одном
     # верном — канон detector-must-be-function-not-constant).
-    socks_ok = [p for p, info in present.items()
-                if urlparse(info.get("proxy", "")).scheme.lower() in {"socks", "socks5", "socks5h"}]
-    # http.proxy задан, но НЕ socks5 хотя бы у одного → down (privoxy/HTTP рвёт WS, или чужой прокси
-    # мимо xray). Сломанный редактор не «перекрывается» верным — все перечисляются.
+    ok = [p for p, info in present.items() if info.get("proxy") == vscode_proxy.PROXY]
+    # http.proxy задан, но не наш хотя бы у одного → down (privoxy рвёт WS #120, legacy socks-схема
+    # ломает fetch VS Code #459, чужой прокси мимо xray). Сломанный не «перекрывается» верным.
     bad = [(p, info["proxy"]) for p, info in present.items()
-           if info.get("proxy") and p not in socks_ok]
+           if info.get("proxy") and p not in ok]
     if bad:
         bad_str = ", ".join(f"{Path(p).parent.parent.name}={proxy}" for p, proxy in bad)
-        ok_names = ", ".join(Path(p).parent.parent.name for p in socks_ok)  # 'Code' / 'Cursor'
-        ok_note = f"; верные: {ok_names}" if socks_ok else ""
+        ok_names = ", ".join(Path(p).parent.parent.name for p in ok)  # 'Code' / 'Cursor'
+        ok_note = f"; верные: {ok_names}" if ok else ""
+        why = []
+        if any(proxy in vscode_proxy.LEGACY_PROXIES for _, proxy in bad):
+            why.append("legacy socks-схема: fetch VS Code шлёт TLS на SOCKS-порт (#459), "
+                       "мигрирует `srouter install`")
+        if any(proxy not in vscode_proxy.LEGACY_PROXIES for _, proxy in bad):
+            why.append("privoxy/чужой прокси — codex рвёт WS (#120)")
         return {"status": "down",
-                "detail": f"VSCode http.proxy НЕ SOCKS5 ({bad_str}){ok_note} — codex рвёт WS через privoxy/чужой (#120)"}
-    if socks_ok:
-        names = ", ".join(Path(p).parent.parent.name for p in socks_ok)  # 'Code' / 'Cursor'
-        return {"status": "ok", "detail": f"VSCode http.proxy=SOCKS5 10808 ({names}) — codex расширения гонит через xray (#185)"}
+                "detail": f"VSCode http.proxy ≠ {vscode_proxy.PROXY} ({bad_str}){ok_note} — {'; '.join(why)}"}
+    if ok:
+        names = ", ".join(Path(p).parent.parent.name for p in ok)  # 'Code' / 'Cursor'
+        return {"status": "ok", "detail": f"VSCode http.proxy={vscode_proxy.PROXY} ({names}) — "
+                                          "codex расширения гонит через xray socks-in (#185, #459)"}
     # Файлы есть, http.proxy не задан совсем → unknown (scoped не настроен, но не сломан — info-only).
     return {"status": "unknown",
             "detail": "VSCode http.proxy не задан — codex расширения наследует privoxy из env (рвёт WS #120), scoped не активирован"}
