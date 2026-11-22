@@ -100,7 +100,7 @@ def status():
         return _unknown("scutil --proxy: неожиданный формат вывода")
 
     raw = _parse_scutil_dict(out)
-    result = {"status": "ok", "detail": ""}
+    result: dict = {"status": "ok", "detail": ""}  # разнотипные значения: str-поля + dict-секции каналов
     enabled_any = False
 
     for name, prefix in _CHANNELS:

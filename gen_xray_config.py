@@ -120,7 +120,8 @@ def _valid_host(value):
         return False
 
 
-def _safe_host(value, fallback=""):
+def _safe_host(value, fallback: str = "") -> str:
+    # fallback/возврат строго str: _is_valid_host пропускает только str, невалидное → fallback/""
     if _valid_host(value):
         return value
     return fallback if _valid_host(fallback) else ""
@@ -158,7 +159,8 @@ def _main_socks_inbound():
 
 
 def _probe_inbound(node):
-    probe = node.get("probe") if isinstance(node.get("probe"), dict) else {}
+    probe = node.get("probe")
+    probe = probe if isinstance(probe, dict) else {}
     port = _safe_port(probe.get("socks_port"), default=0)
     if not port:
         return {}
@@ -181,7 +183,8 @@ def _vless_outbound(node, tag, *, state_path=None):
     address = _safe_host(local_state.resolve_route_ip(node, path=state_path), endpoint) or endpoint
     if not address:
         return {}
-    reality = node.get("reality") if isinstance(node.get("reality"), dict) else {}
+    reality = node.get("reality")
+    reality = reality if isinstance(reality, dict) else {}
     sni = _safe_host(reality.get("sni"), endpoint)
     dest = _safe_host(reality.get("dest"), f"{sni}:443" if sni else "")
     user = {
@@ -238,7 +241,8 @@ def traffic_guard_validation_errors(state_path=None, traffic_guard_channel=None)
     """Ошибки Traffic Guard для apply/preflight-слоёв. Пустой список значит generation-safe."""
     guard = local_state.traffic_guard_config(path=state_path, channel=traffic_guard_channel)
     if guard.get("valid") is not True:
-        errors = guard.get("errors") if isinstance(guard.get("errors"), list) else []
+        errors = guard.get("errors")
+        errors = errors if isinstance(errors, list) else []
         return [str(error) for error in errors if error] or ["traffic_guard invalid"]
     if guard.get("mode") == "auto":
         channel = guard.get("channel")
@@ -246,7 +250,8 @@ def traffic_guard_validation_errors(state_path=None, traffic_guard_channel=None)
             return ['traffic_guard.mode "auto" requires traffic_guard_channel or traffic_guard.channel']
         # Канал резолвлен, но для него (после usb_tether->metered fallback) 0 политик:
         # config сгенерировался бы валидным с пустой защитой — тихое fail-open. Fail-closed.
-        domains = guard.get("domains") if isinstance(guard.get("domains"), dict) else {}
+        domains = guard.get("domains")
+        domains = domains if isinstance(domains, dict) else {}
         if not domains:
             return [f"traffic_guard.auto: selected channel {channel} has no policies"]
     return []
@@ -268,7 +273,8 @@ def _traffic_guard_domains(state_path=None, policy=None, guard=None, traffic_gua
     )
     if guard.get("mode") not in ("on", "auto") or guard.get("valid") is not True:
         return []
-    domains = guard.get("domains") if isinstance(guard.get("domains"), dict) else {}
+    domains = guard.get("domains")
+    domains = domains if isinstance(domains, dict) else {}
     out = []
     for domain, domain_policy in domains.items():
         if policy is not None and domain_policy != policy:
@@ -302,8 +308,11 @@ def generate_config(
     """
     cfg = _load_template(template_path)
     cfg = copy.deepcopy(cfg)
+    # Секции может не быть в пользовательском template; два вызова .get() pyright не свяжет —
+    # сужаем через одну переменную.
+    sr = cfg.get("srouter")
     cfg["srouter"] = {
-        **(cfg.get("srouter") if isinstance(cfg.get("srouter"), dict) else {}),
+        **(sr if isinstance(sr, dict) else {}),
         "marker": MARKER,
         "managed": True,
         "generated_by": "gen_xray_config.py",
@@ -374,7 +383,8 @@ def generate_config(
 
     cfg["inbounds"] = inbounds
     cfg["outbounds"] = outbounds
-    cfg["routing"] = cfg.get("routing") if isinstance(cfg.get("routing"), dict) else {}
+    routing = cfg.get("routing")  # секция может отсутствовать — сужение через одну переменную
+    cfg["routing"] = routing if isinstance(routing, dict) else {}
     cfg["routing"]["domainStrategy"] = cfg["routing"].get("domainStrategy") or "AsIs"
     cfg["routing"]["rules"] = rules
     return cfg

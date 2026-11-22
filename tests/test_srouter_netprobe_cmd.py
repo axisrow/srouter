@@ -35,7 +35,7 @@ def _fake_runner():
             return {"rc": 113, "out": "", "err": "Could not find service", "timeout": False}
         return {"rc": 0, "out": "", "err": "", "timeout": False}
 
-    runner.calls = calls
+    setattr(runner, "calls", calls)
     return runner
 
 
@@ -59,7 +59,7 @@ def test_netprobe_apply_renders_plist_and_bootstraps(monkeypatch, tmp_path):
     assert "diag_netprobe.py" in text, "рендер подставил путь скрипта"
     assert "srouter-netprobe.out.log" in text, "свои логи, не dashboard"
     assert "__SROUTER_" not in text, "плейсхолдеры заменены все"
-    assert any(len(c) > 1 and c[1] == "bootstrap" for c in runner.calls), "bootstrap вызван"
+    assert any(len(c) > 1 and c[1] == "bootstrap" for c in getattr(runner, "calls")), "bootstrap вызван"
 
 
 def test_netprobe_apply_is_idempotent(monkeypatch, tmp_path):
@@ -86,7 +86,7 @@ def test_netprobe_apply_refuses_foreign(monkeypatch, tmp_path):
 
     assert rc == 2
     assert plist.read_text(encoding="utf-8") == foreign, "чужой plist не перезаписан"
-    assert not any(len(c) > 1 and c[1] == "bootstrap" for c in runner.calls)
+    assert not any(len(c) > 1 and c[1] == "bootstrap" for c in getattr(runner, "calls"))
 
 
 def test_netprobe_stop_unloads_and_unlinks(monkeypatch, tmp_path):
@@ -101,7 +101,7 @@ def test_netprobe_stop_unloads_and_unlinks(monkeypatch, tmp_path):
 
     assert rc == 0
     assert not plist.exists(), "свой plist удалён после подтверждённой выгрузки"
-    assert any(len(c) > 1 and c[1] == "bootout" for c in runner.calls)
+    assert any(len(c) > 1 and c[1] == "bootout" for c in getattr(runner, "calls"))
 
 
 def test_netprobe_stop_keeps_foreign(monkeypatch, tmp_path):
@@ -117,7 +117,7 @@ def test_netprobe_stop_keeps_foreign(monkeypatch, tmp_path):
 
     assert rc == 2
     assert plist.read_text(encoding="utf-8") == foreign
-    assert not any(len(c) > 1 and c[1] == "bootout" for c in runner.calls)
+    assert not any(len(c) > 1 and c[1] == "bootout" for c in getattr(runner, "calls"))
 
 
 def test_netprobe_stop_when_not_installed(monkeypatch, tmp_path):

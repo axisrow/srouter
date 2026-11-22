@@ -108,7 +108,8 @@ def _component_uninstall_item(name, env, detected):
     узнаёт: механику записи install'а — был ли обрыв, в какой фазе, существуют ли промежуточные
     состояния. Утечка этой механики сюда и провалила PR #119 (гвард — tests/test_install_layering.py).
     """
-    entry = detected.get(name) if isinstance(detected.get(name), dict) else {}
+    entry = detected.get(name)
+    entry = entry if isinstance(entry, dict) else {}
     facts = component_facts(name, env, entry)
     recovery = facts["recovery"]
     managed = facts["managed"]
@@ -204,7 +205,8 @@ def _leftover_reason(item):
 
 
 def _launchagent_uninstall_item(env, detected):
-    entry = detected.get("launchagent") if isinstance(detected.get("launchagent"), dict) else {}
+    entry = detected.get("launchagent")
+    entry = entry if isinstance(entry, dict) else {}
     plist_path = Path(entry.get("plist_path") or env.launchagent_path())
     marker_present = plist_path.exists() and _has_launchagent_marker(plist_path)
     managed = _is_managed_entry(entry) or marker_present
@@ -233,8 +235,10 @@ def build_uninstall_plan(env=None, runner=run):
     del runner
     env = env or InstallEnv.from_env()
     state, readable = local_state.load_state_checked(path=env.state_path)
-    detected = state.get("detected_environment") if isinstance(state.get("detected_environment"), dict) else {}
-    network = state.get("network") if isinstance(state.get("network"), dict) else {}
+    detected = state.get("detected_environment")
+    detected = detected if isinstance(detected, dict) else {}
+    network = state.get("network")
+    network = network if isinstance(network, dict) else {}
     return {
         "mode": "uninstall-plan",
         "state_path": str(env.state_path),
@@ -403,8 +407,10 @@ def _mark_component_restored(env, item):
     state, readable = local_state.load_state_checked(path=env.state_path)
     if not readable:
         return "state_unreadable"
-    detected = state.get("detected_environment") if isinstance(state.get("detected_environment"), dict) else {}
-    entry = detected.get(item["name"]) if isinstance(detected.get(item["name"]), dict) else {}
+    detected = state.get("detected_environment")
+    detected = detected if isinstance(detected, dict) else {}
+    entry = detected.get(item["name"])
+    entry = entry if isinstance(entry, dict) else {}
     entry["config_path"] = item.get("config_path")
     if item.get("backup"):
         entry["backup"] = item["backup"]
@@ -416,7 +422,8 @@ def _mark_component_restored(env, item):
     detected[item["name"]] = entry
     state["detected_environment"] = detected
 
-    runtime = state.get("runtime") if isinstance(state.get("runtime"), dict) else {}
+    runtime = state.get("runtime")
+    runtime = runtime if isinstance(runtime, dict) else {}
     runtime["last_uninstall_restore"] = env.now
     state["runtime"] = runtime
     if local_state.save_state(state, path=env.state_path) is None:
@@ -434,8 +441,10 @@ def _mark_component_removed(env, item):
     state, readable = local_state.load_state_checked(path=env.state_path)
     if not readable:
         return "state_unreadable"
-    detected = state.get("detected_environment") if isinstance(state.get("detected_environment"), dict) else {}
-    entry = detected.get(item["name"]) if isinstance(detected.get(item["name"]), dict) else {}
+    detected = state.get("detected_environment")
+    detected = detected if isinstance(detected, dict) else {}
+    entry = detected.get(item["name"])
+    entry = entry if isinstance(entry, dict) else {}
     entry["config_path"] = item.get("config_path")
     # created-конфиг удалён — нечего восстанавливать. Чистим backup-ссылку (её не было для created,
     # но defensive: state-drift мог оставить). provenance=None (больше не managed).
@@ -448,7 +457,8 @@ def _mark_component_removed(env, item):
     detected[item["name"]] = entry
     state["detected_environment"] = detected
 
-    runtime = state.get("runtime") if isinstance(state.get("runtime"), dict) else {}
+    runtime = state.get("runtime")
+    runtime = runtime if isinstance(runtime, dict) else {}
     runtime["last_uninstall_remove"] = env.now
     state["runtime"] = runtime
     if local_state.save_state(state, path=env.state_path) is None:

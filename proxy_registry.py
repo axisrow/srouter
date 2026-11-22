@@ -478,7 +478,9 @@ def apply(ids=None, *, action, force=False):
             pre = None
         fn = spec.enable_fn if action == "enable" else spec.disable_fn
         try:
-            r = (fn(force=force) if action == "enable" else fn()) or {}
+            # fn формально Optional, но manageable-гейт валидации выше гарантирует не-None;
+            # остаточный None → TypeError → except-ветка ниже (сознательный defensive-путь).
+            r = (fn(force=force) if action == "enable" else fn()) or {}  # pyright: ignore[reportOptionalCall]
             entry = {"id": spec.id, "ok": bool(r.get("ok")), "err": str(r.get("err") or "")}
             if r.get("conflict"):
                 entry["conflict"] = True

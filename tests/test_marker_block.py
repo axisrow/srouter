@@ -263,7 +263,8 @@ def test_replace_managed_block_roundtrip_parser():
 def test_replace_managed_block_none_raises():
     """block is None → ValueError (контракт: caller проверяет None до вызова)."""
     with pytest.raises(ValueError):
-        replace_managed_block("content", None, "x")
+        # None передан НАМЕРЕННО — проверяем контракт ValueError, а не типы (pyright: ignore)
+        replace_managed_block("content", None, "x")  # pyright: ignore[reportArgumentType]
 
 
 # ============================ remove_managed_block ============================
@@ -329,7 +330,8 @@ def test_remove_managed_block_tight_trailing_is_fail_closed():
 def test_remove_managed_block_none_raises():
     """block is None → ValueError."""
     with pytest.raises(ValueError):
-        remove_managed_block("content", None)
+        # None передан НАМЕРЕННО — проверяем контракт ValueError, а не типы (pyright: ignore)
+        remove_managed_block("content", None)  # pyright: ignore[reportArgumentType]
 
 
 # ============================ is_managed_artifact ============================

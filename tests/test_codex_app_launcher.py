@@ -174,6 +174,7 @@ def test_dock_swap_replaces_tile_and_backs_up(monkeypatch, tmp_path):
     section = _state_section(_env(tmp_path).state_path)
     assert section and section.get("phase") == "active", f"state phase=active: {section}"
     saved = cal._decode_tile(section["tile_b64"])
+    assert saved is not None  # валидный base64-тайл декодируется
     assert saved["tile-data"]["file-data"]["_CFURLString"] == \
         f"file://{quote(str(app))}/", f"исходный тайл сохранён в state: {section}"
     assert "Dock" in note, f"note называет подмену Dock: {note}"
@@ -218,8 +219,10 @@ def test_dock_swap_survives_bytes_book_field(monkeypatch, tmp_path):
     assert "подменён" in note.lower(), \
         f"bytes в тайле не отменяют подмену (не «state не записывается»): {note}"
     section = _state_section(env.state_path)
+    assert section is not None, f"state-секция существует: {section}"
     assert isinstance(section.get("tile_b64"), str), f"тайл в state как base64: {section.keys()}"
     decoded = cal._decode_tile(section["tile_b64"])
+    assert decoded is not None, "тайл декодируется из base64"
     assert decoded["tile-data"]["book"] == book, "тайл byte-exact"
     assert decoded["tile-data"]["file-data"]["_CFURLString"] == \
         tile["tile-data"]["file-data"]["_CFURLString"]

@@ -229,8 +229,10 @@ def load_known_markers(state_path, surface, current_markers):
     legacy из state (migration). Без state/таблицы → только current (безопасный fallback, не угадываем).
     """
     state = local_state.load_state(path=state_path)
-    detected = state.get("detected_environment") if isinstance(state.get("detected_environment"), dict) else {}
-    table = detected.get("known_markers") if isinstance(detected.get("known_markers"), dict) else {}
+    detected = state.get("detected_environment")
+    detected = detected if isinstance(detected, dict) else {}
+    table = detected.get("known_markers")
+    table = table if isinstance(table, dict) else {}
     known = list(table.get(surface) or [])
     for m in current_markers:
         if m not in known:
@@ -248,8 +250,10 @@ def populate_known_markers(state_path, surface, markers):
     state, readable = local_state.load_state_checked(path=state_path)
     if not readable:
         return "state_unreadable"
-    detected = state.get("detected_environment") if isinstance(state.get("detected_environment"), dict) else {}
-    table = detected.get("known_markers") if isinstance(detected.get("known_markers"), dict) else {}
+    detected = state.get("detected_environment")
+    detected = detected if isinstance(detected, dict) else {}
+    table = detected.get("known_markers")
+    table = table if isinstance(table, dict) else {}
     existing = list(table.get(surface) or [])
     for m in markers:
         if m not in existing:
@@ -319,14 +323,16 @@ def _inspect_component(name, env, runner, port_checker, prior_detected=None):
     paths = env.component_paths(name)
     config_path = paths["config"]
     marker_managed = config_path.exists() and _has_marker(config_path)
-    prior = prior_detected.get(name) if isinstance(prior_detected.get(name), dict) else {}
+    prior = prior_detected.get(name)
+    prior = prior if isinstance(prior, dict) else {}
     state_managed = _is_managed_entry(prior)
     state_restored = _is_restored_entry(prior)
     # Привязка ownership к пути (cycle-review #111 cycle 1 finding 1): state.managed авторизует только
     # конфиг по ТОМУ ЖЕ пути, что записан в state. Смена --prefix (/opt/homebrew → /usr/local) или любое
     # другое перемещение → state от старого расположения НЕ делает чужой markerless-конфиг по новому пути
     # reclaimable (иначе install молча перезаписал бы его + рестарт сервиса без adopt/overwrite/skip).
-    prior_path = prior.get("config_path") if isinstance(prior.get("config_path"), str) else ""
+    prior_path = prior.get("config_path")
+    prior_path = prior_path if isinstance(prior_path, str) else ""
     state_owns_path = bool(prior_path) and str(Path(prior_path)) == str(config_path)
     managed = marker_managed or (state_managed and state_owns_path)
     stale_managed = state_managed and state_owns_path and not marker_managed
@@ -407,12 +413,15 @@ def _discover_network(runner):
 def _discover_probe_readiness(state_path, port_checker):
     readiness = {}
     for node in local_state.load_nodes(path=state_path):
-        probe = node.get("probe") if isinstance(node.get("probe"), dict) else {}
-        port = probe.get("socks_port")
+        probe = node.get("probe")
+        probe = probe if isinstance(probe, dict) else {}
+        port = probe.get("socks_port")  # None/мусор → TypeError ниже, port остаётся сырым значением
         try:
+            if port is None:
+                raise TypeError
             port = int(port)
             ready = bool(port_checker("127.0.0.1", port, timeout=0.25))
-        except (OSError, TimeoutError, ValueError, TypeError, OverflowError) as exc:
+        except (OSError, TimeoutError, ValueError, TypeError, OverflowError):
             ready = False
         readiness[node.get("name") or ""] = {"socks_port": port, "ready": ready}
     return readiness
@@ -448,7 +457,8 @@ def build_plan(env=None, runner=run, port_checker=port_open):
     # как второй арбитр managed (stateManaged) — без него «свой старый» конфиг = foreign. Раньше state
     # грузился после цикла inspect и читал только probes; теперь пробрасываем detected_env в inspect.
     state = local_state.load_state(path=env.state_path)
-    detected_env = state.get("detected_environment") if isinstance(state.get("detected_environment"), dict) else {}
+    detected_env = state.get("detected_environment")
+    detected_env = detected_env if isinstance(detected_env, dict) else {}
     brew_services = runner([BREW, "services", "list"], 8)
     service_states = _parse_brew_services(brew_services.get("out") or "")
     components = {}
@@ -471,7 +481,8 @@ def build_plan(env=None, runner=run, port_checker=port_open):
             item["service"] = service_states.get(name, "none" if brew_services.get("rc") == 0 else "unknown")
         components[name] = item
 
-    probes = state.get("probes") if isinstance(state.get("probes"), dict) else {}
+    probes = state.get("probes")
+    probes = probes if isinstance(probes, dict) else {}
     return {
         "mode": "plan",
         "state_path": str(env.state_path),
@@ -621,8 +632,10 @@ def _record_backup_intent(env, name, config_path, backup):
     Возвращает "" при успехе, иначе код ошибки ("state_unreadable" | "state_write_failed").
     """
     def mutate(state):
-        detected = state.get("detected_environment") if isinstance(state.get("detected_environment"), dict) else {}
-        prev = detected.get(name) if isinstance(detected.get(name), dict) else {}
+        detected = state.get("detected_environment")
+        detected = detected if isinstance(detected, dict) else {}
+        prev = detected.get(name)
+        prev = prev if isinstance(prev, dict) else {}
         entry = dict(prev)  # merge: если prev уже нёс management (idempotent/reclaimable) — не сносим его
         entry["config_path"] = str(config_path)
         entry["backup"] = str(backup)
@@ -669,7 +682,8 @@ def _state_backup_pointers(env):
     state, readable = local_state.load_state_checked(path=env.state_path)
     if not readable:
         return None
-    detected = state.get("detected_environment") if isinstance(state.get("detected_environment"), dict) else {}
+    detected = state.get("detected_environment")
+    detected = detected if isinstance(detected, dict) else {}
     pointers = []
     for entry in detected.values():
         if not isinstance(entry, dict):
@@ -1025,7 +1039,8 @@ def _record_network_channels(env, network):
     СЛОЙ: знание пишется там же, где открыто). Fail-closed: отказ записи прерывает apply.
     """
     def mutate(state):
-        merged = state.get("network") if isinstance(state.get("network"), dict) else {}
+        merged = state.get("network")
+        merged = merged if isinstance(merged, dict) else {}
         merged.update(network or {})
         state["network"] = merged
         runtime = state.setdefault("runtime", {})
@@ -1046,8 +1061,10 @@ def _record_component_applied(env, name, item, mode, backup):
     _applied_component_entry — та же форма, которую сверит финальная запись.
     """
     def mutate(state):
-        detected = state.get("detected_environment") if isinstance(state.get("detected_environment"), dict) else {}
-        prev = detected.get(name) if isinstance(detected.get(name), dict) else {}
+        detected = state.get("detected_environment")
+        detected = detected if isinstance(detected, dict) else {}
+        prev = detected.get(name)
+        prev = prev if isinstance(prev, dict) else {}
         detected[name] = _applied_component_entry(prev, item, mode, backup, now=env.now)
         state["detected_environment"] = detected
 
@@ -1067,7 +1084,8 @@ def _dnsmasq_service_status(runner):
 def _record_service_original(env, name, item, runner=run):
     def mutate(state):
         detected = state.setdefault("detected_environment", {})
-        entry = detected.get(name) if isinstance(detected.get(name), dict) else {}
+        entry = detected.get(name)
+        entry = entry if isinstance(entry, dict) else {}
         detected[name] = entry
         original = entry.get("service_restore")
         if original and original.get("config_path") == item["config_path"]:
@@ -1124,7 +1142,8 @@ def _record_launchagent_applied(env, plan):
     launchagent = plan.get("launchagent") or {}
 
     def mutate(state):
-        detected = state.get("detected_environment") if isinstance(state.get("detected_environment"), dict) else {}
+        detected = state.get("detected_environment")
+        detected = detected if isinstance(detected, dict) else {}
         detected["launchagent"] = _launchagent_entry(launchagent, env.now)
         state["detected_environment"] = detected
 
@@ -1143,10 +1162,12 @@ def _write_state_after_apply(env, plan, modes, backups, launchagent_action=None)
     state, readable = local_state.load_state_checked(path=env.state_path)
     if not readable:
         return "state_unreadable"
-    detected = state.get("detected_environment") if isinstance(state.get("detected_environment"), dict) else {}
+    detected = state.get("detected_environment")
+    detected = detected if isinstance(detected, dict) else {}
     for name, item in plan["components"].items():
         mode = modes.get(name, "skipped")
-        prev = detected.get(name) if isinstance(detected.get(name), dict) else {}
+        prev = detected.get(name)
+        prev = prev if isinstance(prev, dict) else {}
         if mode == "protected":
             # Не переписываем protection/previous/backup, которые создала двухфазная root-транзакция.
             # Reinstall лишь подтверждает, что защищённый компонент намеренно оставлен как есть.
@@ -1160,11 +1181,13 @@ def _write_state_after_apply(env, plan, modes, backups, launchagent_action=None)
     detected["last_checked_at"] = env.now
     state["detected_environment"] = detected
 
-    network = state.get("network") if isinstance(state.get("network"), dict) else {}
+    network = state.get("network")
+    network = network if isinstance(network, dict) else {}
     network.update(plan.get("network") or {})
     state["network"] = network
 
-    runtime = state.get("runtime") if isinstance(state.get("runtime"), dict) else {}
+    runtime = state.get("runtime")
+    runtime = runtime if isinstance(runtime, dict) else {}
     runtime["last_apply"] = env.now
     runtime["last_error"] = None
     state["runtime"] = runtime
@@ -1368,21 +1391,24 @@ def apply_install(env=None, *, confirm=False, choices=None, runner=run, port_che
 def _is_managed_entry(entry):
     if not isinstance(entry, dict):
         return False
-    management = entry.get("management") if isinstance(entry.get("management"), dict) else {}
+    management = entry.get("management")
+    management = management if isinstance(management, dict) else {}
     return management.get("managed") is True or management.get("mode") == "managed"
 
 
 def _is_adopted_entry(entry):
     if not isinstance(entry, dict):
         return False
-    management = entry.get("management") if isinstance(entry.get("management"), dict) else {}
+    management = entry.get("management")
+    management = management if isinstance(management, dict) else {}
     return management.get("mode") == "adopted"
 
 
 def _is_restored_entry(entry):
     if not isinstance(entry, dict):
         return False
-    management = entry.get("management") if isinstance(entry.get("management"), dict) else {}
+    management = entry.get("management")
+    management = management if isinstance(management, dict) else {}
     return management.get("mode") == "restored"
 
 
@@ -1395,7 +1421,8 @@ def _provenance_of(entry):
     """
     if not isinstance(entry, dict):
         return None
-    management = entry.get("management") if isinstance(entry.get("management"), dict) else {}
+    management = entry.get("management")
+    management = management if isinstance(management, dict) else {}
     return management.get("provenance")
 
 
@@ -1558,7 +1585,8 @@ def component_facts(name, env, entry, *, config_path=None):
     adopted = _is_adopted_entry(entry)
     restored = _is_restored_entry(entry)
     provenance = _provenance_of(entry)
-    original = entry.get("service_restore") if isinstance(entry.get("service_restore"), dict) else {}
+    original = entry.get("service_restore")
+    original = original if isinstance(original, dict) else {}
     created_before_write = (original.get("config_path") == str(path) and original.get("config_existed") is False)
     if created_before_write and provenance is None:
         provenance = "created"

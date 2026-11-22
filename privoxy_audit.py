@@ -804,9 +804,10 @@ def daemon(*, layout=DEFAULT_LAYOUT, popen=subprocess.Popen, chown=os.chown,
         _write_status(layout, {**counters, "state": "error", "last_error": f"eslogger_start_failed:{exc}"}, chown=chown)
         return 2
     assert child.stderr is not None
+    stderr_stream = child.stderr  # локаль для замыкания: pyright не переносит сужение assert внутрь def
 
     def drain_stderr():
-        for stderr_line in child.stderr:
+        for stderr_line in stderr_stream:
             stderr_lines.append(stderr_line.rstrip()[:400])
 
     stderr_thread = threading.Thread(target=drain_stderr, name="privoxy-audit-stderr", daemon=True)

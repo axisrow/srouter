@@ -205,8 +205,9 @@ def validate_traffic_guard(guard):
     return errors
 
 
-def traffic_guard_config(path=None, state=None, channel=None):
-    """Нормализованный Traffic Guard для generator/probe.
+def traffic_guard_config(path=None, state=None, channel=None) -> dict:
+    """Нормализованный Traffic Guard для generator/probe. Секции разнотипны
+    (str-режим, dict-домены, list-каналы) — возвращаем широкий dict.
 
     Возвращает dict с valid/errors; при ошибках безопасно отключает правила, но
     сохраняет явную причину для status/apply-слоёв.
@@ -219,7 +220,8 @@ def traffic_guard_config(path=None, state=None, channel=None):
         return {"mode": "off", "domains": {}, "channels": {}, "channel": "", "valid": False, "errors": errors}
     if not isinstance(guard, dict):
         guard = {}
-    domains = guard.get("domains") if isinstance(guard.get("domains"), dict) else {}
+    domains = guard.get("domains")
+    domains = domains if isinstance(domains, dict) else {}
     mode = guard.get("mode", "off")
     mode = mode if mode in _TRAFFIC_GUARD_MODES else "off"
     if mode == "auto":

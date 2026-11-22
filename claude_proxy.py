@@ -342,7 +342,8 @@ def enable(force=False):
         fresh = _load()
         if not isinstance(fresh, dict):
             return {"ok": False, "err": "settings.json стал нечитаем во время операции — отказ (issue #307)"}
-        fresh_env = fresh.get("env") if isinstance(fresh.get("env"), dict) else {}
+        fresh_env_raw = fresh.get("env")  # один вызов .get() — сужение через переменную:
+        fresh_env = fresh_env_raw if isinstance(fresh_env_raw, dict) else {}
         if {k: (k in fresh_env, fresh_env.get(k)) for k in ENV_KEYS + NEUTRAL_PROXY_KEYS} != decision_snapshot:
             return {"ok": False, "conflict": True, "state": state,
                     "err": "settings.json изменился во время операции — повторите (issue #307)"}

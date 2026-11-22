@@ -19,7 +19,7 @@ import traffic_shape
 
 
 # ============================ helpers ============================
-def _spy_run(calls, rc=0, out="", err="", timed_out=False):
+def _spy_run(calls, rc: "int | None" = 0, out="", err="", timed_out=False):  # rc=None = протаймутевший процесс
     """Фейковый sys_probe.run: пишет argv в calls, возвращает dashboard-style dict.
 
     Параметр `timeout` (секунды) реального sys_probe.run — не то же самое, что

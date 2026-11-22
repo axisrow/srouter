@@ -361,7 +361,7 @@ def test_disable_restore_backup_unknown_read_fails_closed_not_unset(monkeypatch,
 
     # Fail-closed: не мутируем при транзиентном сбое чтения backup
     assert r["ok"] is False, "disable() обязан fail-closed при unknown-чтении backup (не unset KEY)"
-    assert "backup" in r["err"].lower(), "ошибка должна указывать на сбой чтения backup"
+    assert isinstance(r["err"], str) and "backup" in r["err"].lower(), "ошибка должна указывать на сбой чтения backup"
 
     monkeypatch.setattr(git_proxy.sys_probe, "run", real_run)
     # KEY НЕ снят: managed-прокси остался, решение о restore не отброшено

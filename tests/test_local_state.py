@@ -1063,8 +1063,8 @@ def test_routing_apply_config_ip_field_malformed_refused(tmp_path):
         {"ips": ["78.47.183.125"], "ip_action": "add"},
         {"ips": None},
     ):
-        kw = dict(config_path=str(xray_p), state_path=state_p, runner=_ok_runner(calls),
-                  port_checker=_port_checker_settle_then_up())
+        kw: dict = dict(config_path=str(xray_p), state_path=state_p, runner=_ok_runner(calls),
+                        port_checker=_port_checker_settle_then_up())  # значения разнотипны
         kw.update(op)
         r = local_state.routing_apply(None, **kw)
         assert r["ok"] is False, op

@@ -19,7 +19,7 @@ import health
 # блок `arguments = { ... }` со строками-аргументами по одной на строку. НЕ выдуманный формат.
 
 def _print_out(*, path="/Users/u/Library/LaunchAgents/com.srouter.codenv.plist",
-               state="running", runs=3, last_exit_code=0,
+               state="running", runs=3, last_exit_code: "int | None" = 0,
                script="/Users/u/Projects/srouter/launchagents/srouter-codex-env.sh"):
     exit_line = f"\tlast exit code = {last_exit_code}\n" if last_exit_code is not None else ""
     return (

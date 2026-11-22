@@ -27,6 +27,9 @@ CHANNEL_SERVICE_KEYS = {"wifi": "wifi_service", "usb": "usb_tether_service"}
 _CFG_PATH = Path(__file__).resolve().parent / "srouter_config.py"
 try:
     _spec = importlib.util.spec_from_file_location("_srouter_config", _CFG_PATH)
+    if _spec is None or _spec.loader is None:
+        # spec/loader None — путь не файл/недоступен: та же каноническая ошибка, что для FileNotFoundError ниже
+        raise SystemExit("Нет srouter_config.py — скопируй: cp srouter_config.example.py srouter_config.py")
     _cfg = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(_cfg)
     GATEWAY = _cfg.GATEWAY
@@ -195,8 +198,9 @@ def _normalize_throughput_targets(raw, defaults):
     for item in items:
         if not isinstance(item, dict) or not _http_url(item.get("url")):
             continue
+        raw_bytes = item.get("bytes")  # None = ключа нет → 0 → continue ниже, как int(None)→TypeError раньше
         try:
-            expected_bytes = int(item.get("bytes"))
+            expected_bytes = int(raw_bytes) if raw_bytes is not None else 0
         except (TypeError, ValueError):
             continue
         if expected_bytes > 0:
@@ -212,7 +216,8 @@ def _probe_options(state_path=None):
     """Прочитать probes из local state без записи; битые значения заменяются defaults."""
     defaults = _probe_defaults()
     state = local_state.load_state(path=state_path)
-    raw = state.get("probes") if isinstance(state, dict) and isinstance(state.get("probes"), dict) else {}
+    raw = state.get("probes")  # один .get(): сужение через переменную (два вызова pyright не свяжет)
+    raw = raw if isinstance(raw, dict) else {}
     connect_timeout = _safe_seconds(raw.get("connect_timeout_sec"), defaults.get("connect_timeout_sec", 4))
     max_time = _safe_seconds(raw.get("max_time_sec"), defaults.get("max_time_sec", 8))
     if max_time < connect_timeout:

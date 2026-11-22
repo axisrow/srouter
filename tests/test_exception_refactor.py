@@ -1300,7 +1300,7 @@ class TestNodeSelectorExceptionHandlers:
         monkeypatch.setattr(node_selector.local_state, "active_node", boom)
         result = node_selector.ensure_split_route("/tmp/state.json")
         assert result["enabled"] is True
-        assert "ensure_split_route failed" in result["error"]
+        assert isinstance(result["error"], str) and "ensure_split_route failed" in result["error"]
 
 
 # ==========================================================================================
@@ -1552,7 +1552,7 @@ class TestLocalStateExceptionHandlers:
             return {"rc": 0, "timeout": False}  # recovery-рестарт успешен
 
         fake = types.ModuleType("install_lib")
-        fake._restart_component = restart
+        setattr(fake, "_restart_component", restart)
         monkeypatch.setitem(sys.modules, "install_lib", fake)
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1583,7 +1583,7 @@ class TestLocalStateExceptionHandlers:
             raise OSError("brew unavailable")
 
         fake = types.ModuleType("install_lib")
-        fake._restart_component = always_boom
+        setattr(fake, "_restart_component", always_boom)
         monkeypatch.setitem(sys.modules, "install_lib", fake)
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1636,6 +1636,7 @@ class TestDashboardCommonExceptions:
         cfg_path.write_text(bad_source, encoding="utf-8")
 
         spec = importlib.util.spec_from_file_location("_srouter_config_test", cfg_path)
+        assert spec is not None and spec.loader is not None  # гвард контракта spec_from_file_location
         cfg = importlib.util.module_from_spec(spec)
 
         with pytest.raises(expected_exc):
@@ -1947,7 +1948,7 @@ class TestNeverThrowsBoundaries:
             raise RuntimeError("brew wedged")
 
         fake = types.ModuleType("install_lib")
-        fake._restart_component = always_boom
+        setattr(fake, "_restart_component", always_boom)
         monkeypatch.setitem(sys.modules, "install_lib", fake)
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2053,7 +2054,7 @@ class TestNeverThrowsBoundaries:
         result = node_selector.ensure_split_route("/tmp/state.json")
         assert isinstance(result, dict), f"ensure_split_route бросил {type(exc).__name__} наружу"
         assert result["enabled"] is True
-        assert "ensure_split_route failed" in result["error"]
+        assert isinstance(result["error"], str) and "ensure_split_route failed" in result["error"]
 
 
 if __name__ == "__main__":

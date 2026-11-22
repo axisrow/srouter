@@ -3,6 +3,7 @@ import json
 import os
 import plistlib
 import pwd
+import subprocess
 from datetime import datetime, timezone
 
 import privoxy_audit
@@ -111,6 +112,7 @@ def test_normalize_event_keeps_attribution_and_redacts_secrets():
     )
 
     record = privoxy_audit.normalize_event(event)
+    assert record is not None, "валидный exec-event обязан нормализоваться"
 
     assert record["eslogger_schema_version"] == 4
     assert record["actor"]["pid"] == 123
@@ -435,7 +437,12 @@ def test_daemon_persists_only_matching_exec_events(tmp_path, monkeypatch):
         _event("/opt/homebrew/bin/brew", ["brew", "services", "stop", "privoxy"]),
     ]
 
-    class Child:
+    class Child(subprocess.Popen):
+        # Наследование — только контракт type[Popen] у daemon(); __init__ перекрыт целиком
+        # (реального процесса нет), _child_created=False глушит Popen.__del__.
+        def __init__(self, *args, **kwargs):
+            self._child_created = False
+
         pid = 9001
         stdout = io.StringIO("".join(json.dumps(value) + "\n" for value in events))
         stderr = io.StringIO("")
@@ -457,7 +464,7 @@ def test_daemon_persists_only_matching_exec_events(tmp_path, monkeypatch):
 
     rc = privoxy_audit.daemon(
         layout=layout,
-        popen=lambda *args, **kwargs: Child(),
+        popen=Child,
         chown=lambda path, uid, gid: None,
         grace=0,  # grace-handshake вылючен для unit-теста (мок-Child жив, реальный grace не нужен).
     )
@@ -486,7 +493,11 @@ def test_daemon_reports_fda_failure_when_eslogger_dies_during_grace(tmp_path, mo
         "marker": privoxy_audit.AUDIT_MARKER, "gid": identity.pw_gid,
     }), encoding="utf-8")
 
-    class FailingChild:
+    class FailingChild(subprocess.Popen):
+        # Тот же контракт type[Popen]: __init__ перекрыт, процесса нет.
+        def __init__(self, *args, **kwargs):
+            self._child_created = False
+
         pid = 9002
         # stdout пустой — eslogger падает до первого event.
         stdout = io.StringIO("")
@@ -506,7 +517,7 @@ def test_daemon_reports_fda_failure_when_eslogger_dies_during_grace(tmp_path, mo
 
     rc = privoxy_audit.daemon(
         layout=layout,
-        popen=lambda *args, **kwargs: FailingChild(),
+        popen=FailingChild,
         chown=lambda path, uid, gid: None,
         grace=0.2,  # короткий grace для теста; FailingChild.poll()=1 → падение поймано сразу.
     )
@@ -704,7 +715,11 @@ def test_daemon_rotates_event_log_between_events(tmp_path, monkeypatch):
     layout.event_log_path.write_text(
         json.dumps({"captured_at": "2026-08-01T00:00:00+00:00"}) + "\n", encoding="utf-8")
 
-    class Child:
+    class Child(subprocess.Popen):
+        # Контракт type[Popen]: __init__ перекрыт, процесса нет (см. первый Child).
+        def __init__(self, *args, **kwargs):
+            self._child_created = False
+
         pid = 9101
         stdout = io.StringIO(json.dumps(_event(
             "/opt/homebrew/bin/brew", ["brew", "services", "stop", "privoxy"])) + "\n")
@@ -725,7 +740,7 @@ def test_daemon_rotates_event_log_between_events(tmp_path, monkeypatch):
     monkeypatch.setattr(privoxy_audit.signal, "signal", lambda signum, handler: None)
     monkeypatch.setenv("SROUTER_AUDIT_LOG_ROTATE", "1")
 
-    rc = privoxy_audit.daemon(layout=layout, popen=lambda *args, **kwargs: Child(),
+    rc = privoxy_audit.daemon(layout=layout, popen=Child,
                               chown=lambda path, uid, gid: None, grace=0)
 
     kept = layout.event_log_path.read_text(encoding="utf-8").splitlines()
@@ -746,7 +761,11 @@ def test_daemon_rotation_failure_does_not_stop_writer(tmp_path, monkeypatch):
         "events_written": 0, "parse_errors": 0,
     }), encoding="utf-8")
 
-    class Child:
+    class Child(subprocess.Popen):
+        # Контракт type[Popen]: __init__ перекрыт, процесса нет (см. первый Child).
+        def __init__(self, *args, **kwargs):
+            self._child_created = False
+
         pid = 9102
         stdout = io.StringIO(json.dumps(_event(
             "/opt/homebrew/bin/brew", ["brew", "services", "stop", "privoxy"])) + "\n")
@@ -768,7 +787,7 @@ def test_daemon_rotation_failure_does_not_stop_writer(tmp_path, monkeypatch):
     monkeypatch.setenv("SROUTER_AUDIT_LOG_ROTATE", "1")
     monkeypatch.setattr(privoxy_audit, "rotate_event_log", lambda *args, **kwargs: False)
 
-    rc = privoxy_audit.daemon(layout=layout, popen=lambda *args, **kwargs: Child(),
+    rc = privoxy_audit.daemon(layout=layout, popen=Child,
                               chown=lambda path, uid, gid: None, grace=0)
 
     result = privoxy_audit.report(limit=10, layout=layout)
@@ -804,7 +823,11 @@ def test_daemon_rotation_throttled_to_hourly_gate(tmp_path, monkeypatch):
 
     events = [_event("/usr/bin/curl", ["curl", f"https://x{i}.example.com"]) for i in range(40)]
 
-    class Child:
+    class Child(subprocess.Popen):
+        # Контракт type[Popen]: __init__ перекрыт, процесса нет (см. первый Child).
+        def __init__(self, *args, **kwargs):
+            self._child_created = False
+
         pid = 9103
         stdout = io.StringIO("".join(json.dumps(value) + "\n" for value in events))
         stderr = io.StringIO("")
@@ -820,7 +843,7 @@ def test_daemon_rotation_throttled_to_hourly_gate(tmp_path, monkeypatch):
         def terminate(self):
             return None
 
-    privoxy_audit.daemon(layout=layout, popen=lambda *args, **kwargs: Child(),
+    privoxy_audit.daemon(layout=layout, popen=Child,
                          chown=lambda path, uid, gid: None, grace=0)
 
     assert len(calls) == 1, "throttle: одна проверка за прогон, не по одной на строку"

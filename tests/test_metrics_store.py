@@ -15,7 +15,8 @@ def _write_events(path, events):
             f.write(json.dumps(e, ensure_ascii=False, sort_keys=True) + "\n")
 
 
-def _event(ts, total_ms=200, status="ok", connect_ms=1, tls_ms=50, ttfb_ms=100):
+def _event(ts, total_ms: "int | None" = 200, status="ok", connect_ms=1,
+           tls_ms: "int | None" = 50, ttfb_ms=100):  # None = фаза без замера — легальный формат события
     from datetime import datetime
     return {"timestamp": datetime.fromtimestamp(ts).isoformat(), "ts": ts,
             "target": "api.anthropic.com", "code": "200" if status == "ok" else None,

@@ -1746,7 +1746,8 @@ def cmd_github_direct(args):
         if verdict.get("retry_cmd"):
             print(f"  {verdict['retry_cmd']}")
         # rc: есть рабочий путь (ok/warn) → 0; нет пути (down) → 1; мусор проб (unknown) → 2.
-        return {"ok": 0, "warn": 0, "down": 1, "unknown": 2}.get(verdict.get("status"), 1)
+        # статус-ключ всегда str (probe-канон); None/"" → дефолт 1 — как .get(None, 1) раньше
+        return {"ok": 0, "warn": 0, "down": 1, "unknown": 2}.get(verdict.get("status") or "", 1)
     runner = make_privileged_runner(run)
     result = local_state.github_direct(
         action, config_path=config_path, state_path=state_path,

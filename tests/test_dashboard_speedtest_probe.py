@@ -47,9 +47,9 @@ def test_gather_status_registers_speedtest_probe(monkeypatch):
     monkeypatch.delitem(sys.modules, "dashboard_app", raising=False)
     monkeypatch.delitem(sys.modules, "dashboard_routes", raising=False)
     cfg = types.ModuleType("srouter_config")
-    cfg.GATEWAY = "192.0.2.1"
-    cfg.VPN_SERVER = "198.51.100.20"
-    cfg.VPN_EXIT_IP = "198.51.100.20"
+    setattr(cfg, "GATEWAY", "192.0.2.1")
+    setattr(cfg, "VPN_SERVER", "198.51.100.20")
+    setattr(cfg, "VPN_EXIT_IP", "198.51.100.20")
     monkeypatch.setitem(sys.modules, "srouter_config", cfg)
     dashboard = importlib.import_module("dashboard")
     dashboard._cache.update(ts=0.0, data=None)

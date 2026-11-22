@@ -651,6 +651,35 @@ def select_node_surgical(name, *, enabled_names=None, runner=None, state_path=No
     previous = None
     begun = False
     backup_text = None
+
+    # Lazy (circular-import канон routing_apply) и ВНЕ try: top-level except обязан иметь
+    # рабочие хелперы при любом месте исключения — import/def внутри try оставляли окно,
+    # где _rollback_locked_config ещё не определён (pyright: possibly-unbound).
+    import install_lib
+
+    def _failed(res):
+        return bool(res.get("timeout")) or res.get("rc") != 0
+
+    def _rollback_locked_config():
+        """byte-exact конфиг + clear_pending + recovery-рестарт старым конфигом.
+
+        Зовётся ТОЛЬКО под _routing_config_lock (суффикс _locked, канон routing_apply):
+        flock повторно не берём — новый fd на тот же файл самодедлочится."""
+        rb = {"config": True, "pending": True, "restart": True}
+        # _atomic_write_text не бросает: False = ENOSPC/IO, конфиг остался новым.
+        rb["config"] = bool(local_state._atomic_write_text(config_path, backup_text))
+        try:
+            local_state.clear_pending(path=state_path)
+        except (OSError, ValueError):
+            rb["pending"] = False
+        try:
+            bad = _failed(install_lib._restart_component(
+                "xray", runner, port_checker=port_checker))
+        except Exception:  # noqa: BLE001 — runner инжектируемый (canon routing_apply)
+            bad = True
+        rb["restart"] = not bad
+        return rb
+
     try:
         previous = _active_name(state_path)
         # --- валидации ДО любых мутаций (fail-closed, как adopt-guard #379) ---
@@ -679,33 +708,6 @@ def select_node_surgical(name, *, enabled_names=None, runner=None, state_path=No
             return {"ok": False, "changed": False, "step": "validate",
                     "err": "placeholder_reality", "from": previous, "to": previous}
         new_addr = local_state.resolve_route_ip(node, path=state_path)
-
-        # Lazy (circular-import канон routing_apply) и ДО lock-блока: top-level except
-        # обязан иметь рабочие хелперы при любом месте исключения.
-        import install_lib
-
-        def _failed(res):
-            return bool(res.get("timeout")) or res.get("rc") != 0
-
-        def _rollback_locked_config():
-            """byte-exact конфиг + clear_pending + recovery-рестарт старым конфигом.
-
-            Зовётся ТОЛЬКО под _routing_config_lock (суффикс _locked, канон routing_apply):
-            flock повторно не берём — новый fd на тот же файл самодедлочится."""
-            rb = {"config": True, "pending": True, "restart": True}
-            # _atomic_write_text не бросает: False = ENOSPC/IO, конфиг остался новым.
-            rb["config"] = bool(local_state._atomic_write_text(config_path, backup_text))
-            try:
-                local_state.clear_pending(path=state_path)
-            except (OSError, ValueError):
-                rb["pending"] = False
-            try:
-                bad = _failed(install_lib._restart_component(
-                    "xray", runner, port_checker=port_checker))
-            except Exception:  # noqa: BLE001 — runner инжектируемый (canon routing_apply)
-                bad = True
-            rb["restart"] = not bad
-            return rb
 
         try:
             with local_state._routing_config_lock(config_path):

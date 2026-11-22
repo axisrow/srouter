@@ -98,7 +98,7 @@ def _fake_runner():
             # <domain>/<label> — agent-статус: НЕ загружен.
             return {"rc": 113, "out": "", "err": "Could not find service", "timeout": False}
         return {"rc": 0, "out": "", "err": "", "timeout": False}
-    runner.calls = calls
+    setattr(runner, "calls", calls)
     return runner
 
 
@@ -119,7 +119,7 @@ def test_install_launchctl_env_writes_plist(monkeypatch, tmp_path):
     assert srouter.CODEX_ENV_LABEL in plist_text
     assert "srouter-codex-env.sh" in plist_text
     # bootstrap вызван (_launchd_reload).
-    assert any(len(c) > 1 and c[1] == "bootstrap" for c in runner.calls), "bootstrap вызван"
+    assert any(len(c) > 1 and c[1] == "bootstrap" for c in getattr(runner, "calls")), "bootstrap вызван"
 
 
 def test_install_launchctl_env_warn_uses_print_not_broken_getenv_domain_arg(monkeypatch, tmp_path):
@@ -190,11 +190,11 @@ def test_remove_launchctl_env_bootouts_and_unlinks(monkeypatch, tmp_path):
 
     assert "снят" in note.lower()
     assert not plist.exists(), "plist удалён"
-    assert any(len(c) > 1 and c[1] == "bootout" for c in runner.calls), "bootout вызван"
+    assert any(len(c) > 1 and c[1] == "bootout" for c in getattr(runner, "calls")), "bootout вызван"
     # unsetenv для всех proxy-ключей через `launchctl asuser <uid> launchctl unsetenv KEY` (issue #191:
     # голый `unsetenv gui/<uid> KEY` эмпирически молча игнорирует домен — asuser реально исполняет
     # команду в bootstrap-контексте gui-пользователя, man launchctl).
-    unsetenvs = {c[5] for c in runner.calls
+    unsetenvs = {c[5] for c in getattr(runner, "calls")
                  if len(c) > 5 and c[1] == "asuser" and c[4] == "unsetenv"}
     assert {"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"} <= unsetenvs
 
@@ -246,7 +246,7 @@ def _print_runner(list_states):
             return {"rc": 113, "out": "", "err": "Could not find service", "timeout": False}
         return {"rc": 0, "out": "", "err": "", "timeout": False}
 
-    runner.calls = calls
+    setattr(runner, "calls", calls)
     return runner
 
 
@@ -270,7 +270,7 @@ def test_remove_launchctl_env_keeps_plist_when_still_loaded(monkeypatch, tmp_pat
     assert "всё ещё загружен" in note, f"True → «всё ещё загружен»: {note}"
     assert "plist оставлен" in note
     assert plist.exists(), "агент ещё загружен → plist оставлен (fail-safe)"
-    assert not any(len(c) > 1 and c[1] == "unsetenv" for c in runner.calls), \
+    assert not any(len(c) > 1 and c[1] == "unsetenv" for c in getattr(runner, "calls")), \
         "не выгружен → env НЕ очищаем (unsetenv не вызывается)"
 
 
@@ -292,7 +292,7 @@ def test_remove_launchctl_env_keeps_plist_when_print_timeout(monkeypatch, tmp_pa
     assert "не подтверждена выгрузка" in note, f"None → «не подтверждена выгрузка»: {note}"
     assert "plist оставлен" in note
     assert plist.exists(), "print timeout (неизвестно) → plist оставлен (fail-safe)"
-    assert not any(len(c) > 1 and c[1] == "unsetenv" for c in runner.calls)
+    assert not any(len(c) > 1 and c[1] == "unsetenv" for c in getattr(runner, "calls"))
 
 
 @pytest.mark.parametrize("print_result, marker", [
@@ -403,7 +403,7 @@ def _real_launchctl_runner(gui_env, *, print_missing_service=True, print_timeout
             return {"rc": 0, "out": "", "err": "", "timeout": False}
         return {"rc": 0, "out": "", "err": "", "timeout": False}
 
-    runner.calls = calls
+    setattr(runner, "calls", calls)
     return runner
 
 
@@ -434,7 +434,7 @@ def test_remove_launchctl_env_asuser_targets_real_key_not_domain_string(monkeypa
 
     srouter._remove_launchctl_env(runner)
 
-    asuser_calls = [c for c in runner.calls if len(c) > 1 and c[1] == "asuser"]
+    asuser_calls = [c for c in getattr(runner, "calls") if len(c) > 1 and c[1] == "asuser"]
     assert asuser_calls, "asuser вызван хотя бы раз"
     keys = {c[5] for c in asuser_calls if len(c) > 5 and c[2] == uid and c[4] == "unsetenv"}
     assert {"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"} <= keys, \
@@ -451,10 +451,10 @@ def test_remove_launchctl_env_verifies_via_print_gui_domain(monkeypatch, tmp_pat
 
     srouter._remove_launchctl_env(runner)
 
-    print_calls = [c for c in runner.calls
+    print_calls = [c for c in getattr(runner, "calls")
                    if len(c) > 2 and c[1] == "print" and c[2] == expected_domain]
-    assert print_calls, f"print {expected_domain} (без label) вызван для верификации env: {runner.calls}"
-    getenv_calls = [c for c in runner.calls if len(c) > 1 and c[1] == "getenv"]
+    assert print_calls, f'print {expected_domain} (без label) вызван для верификации env: {getattr(runner, "calls")}'
+    getenv_calls = [c for c in getattr(runner, "calls") if len(c) > 1 and c[1] == "getenv"]
     assert not getenv_calls, "getenv БОЛЬШЕ не используется для верификации (опровергнутый путь #191)"
 
 
@@ -619,7 +619,7 @@ def test_remove_launchctl_env_unset_keys_follow_unset_list(monkeypatch, tmp_path
 
     srouter._remove_launchctl_env(runner)
 
-    keys = {c[5] for c in runner.calls
+    keys = {c[5] for c in getattr(runner, "calls")
             if len(c) > 5 and c[1] == "asuser" and c[4] == "unsetenv"}
     assert set(srouter.CODEX_LAUNCHCTL_UNSET_KEYS) <= keys, \
         f"uninstall снимает все ключи UNSET-списка (включая ALL_PROXY/all_proxy): {keys}"
@@ -685,7 +685,7 @@ def test_install_launchctl_env_refuses_ao_worktree_root(monkeypatch, tmp_path):
     plist = home / "Library" / "LaunchAgents" / f"{srouter.CODEX_ENV_LABEL}.plist"
     assert not plist.exists(), f"plist с worktree-путём НЕ должен создаваться; note={note}"
     assert "worktree" in note.lower(), f"note объясняет причину отказа; got {note}"
-    assert not any(len(c) > 1 and c[1] == "bootstrap" for c in runner.calls), \
+    assert not any(len(c) > 1 and c[1] == "bootstrap" for c in getattr(runner, "calls")), \
         "bootstrap не вызывается — job не загружаем вовсе"
 
 

@@ -345,6 +345,7 @@ def test_current_net_status_known_flags_per_source(monkeypatch, tmp_path):
     # 2) необученный, но читаемый SSID — НЕ ложный ok
     monkeypatch.setattr(diag_netprobe, "read_ssid", lambda: "NewCafe")
     st = diag_netprobe.current_net_status()
+    assert st is not None  # SSID читается — не None-форма «нет сети»
     assert st["known"] is False and st["label"] == "NewCafe"
     # 3) map-ветка
     monkeypatch.setattr(diag_netprobe, "read_ssid", lambda: None)
@@ -357,6 +358,7 @@ def test_current_net_status_known_flags_per_source(monkeypatch, tmp_path):
     monkeypatch.setattr(diag_netprobe, "_gateway_mac", lambda ip: "aa:bb")
     diag_netprobe._GW_HINTED.clear()
     st = diag_netprobe.current_net_status()
+    assert st is not None  # gw-ветка — не None-форма «нет сети»
     assert st["known"] is False and st["source"] == "gw"
     # 5) нет сети
     monkeypatch.setattr(diag_netprobe, "_physical_gateway", lambda: (None, None))
