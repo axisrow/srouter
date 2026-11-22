@@ -9,14 +9,23 @@ Scoped-решение: VSCode-настройка `http.proxy=socks5h://127.0.0.1
 
 Канон: claude_proxy.py (read-modify-write JSON, atomic tmp+replace, fail-soft, provenance через
 значение-совпадение — чужой http.proxy не трогаем, fail-closed #112).
+
+Issue #459: значение — `http://127.0.0.1:10808`, тот же xray socks-in (он принимает и HTTP-прокси).
+socks-схему глобальный fetch VS Code (undici Socks5ProxyAgent + proxyTls от @vscode/proxy-agent)
+шлёт TLS прямо на SOCKS-порт. Прежнее socks5h-значение — legacy и наше: enable мигрирует его без
+force, disable снимает.
 """
 import json
+from urllib.parse import urlparse
+
+import pytest
 
 import vscode_proxy
 from dashboard_common import SOCKS_PROXY_URL
 
 
-EXPECTED_PROXY = "socks5h://127.0.0.1:10808"
+EXPECTED_PROXY = "http://127.0.0.1:10808"
+LEGACY_PROXY = "socks5h://127.0.0.1:10808"
 
 
 def _setup(monkeypatch, tmp_path, *, paths=None):
@@ -50,10 +59,12 @@ def test_enable_writes_proxy_and_status_on(monkeypatch, tmp_path):
     assert s["proxy"] == EXPECTED_PROXY
 
 
-def test_default_proxy_is_socks5_from_single_source():
-    """Контракт фиксируется из dashboard_common (issue #155 — единый источник порта 10808)."""
-    assert SOCKS_PROXY_URL == EXPECTED_PROXY
+def test_default_proxy_is_http_on_single_source_port():
+    """#459: http-схема в тот же xray socks-in. Адрес — из dashboard_common (issue #155 — единый
+    источник порта 10808); прежнее socks5h-значение — legacy (наше, мигрируется)."""
     assert vscode_proxy.PROXY == EXPECTED_PROXY
+    assert urlparse(vscode_proxy.PROXY).netloc == urlparse(SOCKS_PROXY_URL).netloc
+    assert vscode_proxy.LEGACY_PROXIES == (SOCKS_PROXY_URL,) == (LEGACY_PROXY,)
 
 
 def test_enable_preserves_other_keys(monkeypatch, tmp_path):
@@ -160,21 +171,22 @@ def test_enable_covers_both_editors(monkeypatch, tmp_path):
         assert json.loads(p.read_text())["http.proxy"] == EXPECTED_PROXY
 
 
-def test_enable_rejects_non_socks_scheme_without_mutating(monkeypatch, tmp_path):
-    """Регрессия #127-класс: даже ошибочная смена константы не должна записать HTTP в scoped-proxy.
+@pytest.mark.parametrize("bad_proxy", ["http://127.0.0.1:8118", LEGACY_PROXY])
+def test_enable_rejects_proxy_other_than_http_xray_without_mutating(monkeypatch, tmp_path, bad_proxy):
+    """Регрессия #127-класс: ошибочная смена константы не должна попасть в scoped-proxy.
 
-    codex через privoxy (HTTP 8118) рвёт WS (#120) — http.proxy обязан быть SOCKS5.
+    privoxy (HTTP 8118) рвёт WS codex (#120); socks-схема ломает глобальный fetch VS Code (#459).
     """
     paths = _setup(monkeypatch, tmp_path)
     original = {"other": 1}
     paths[0].parent.mkdir(parents=True)
     paths[0].write_text(json.dumps(original), encoding="utf-8")
-    monkeypatch.setattr(vscode_proxy, "PROXY", "http://127.0.0.1:8118")
+    monkeypatch.setattr(vscode_proxy, "PROXY", bad_proxy)
 
     r = vscode_proxy.enable()
 
     assert r["ok"] is False
-    assert "socks" in r["err"].lower() or "scheme" in r["err"].lower()
+    assert "xray" in r["err"].lower()
     assert json.loads(paths[0].read_text()) == original  # не мутирован
 
 
@@ -372,3 +384,70 @@ def test_enable_recheck_distinguishes_absent_from_json_null(monkeypatch, tmp_pat
 
     assert r["ok"] is False, "absent -> present-null в гонке: решение устарело, отказ"
     assert json.loads(paths[0].read_text(encoding="utf-8")) == {}, "запись не должна была состояться"
+
+
+# ==================== issue #459: http-схема + миграция legacy socks5h ====================
+
+def _write(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
+def test_status_legacy_socks_value_is_ours_not_foreign(monkeypatch, tmp_path):
+    """#459: прежнее значение srouter (socks5h) — наше: managed-on, не foreign. enabled=False,
+    пока не мигрировано, — панель предложит «Включить», и это миграция без force."""
+    paths = _setup(monkeypatch, tmp_path)
+    _write(paths[0], {"http.proxy": LEGACY_PROXY})
+
+    s = vscode_proxy.status()
+
+    assert s["state"] == "managed-on"
+    assert s["enabled"] is False
+    assert s["proxy"] == LEGACY_PROXY
+
+
+def test_enable_migrates_legacy_socks_value_without_force(monkeypatch, tmp_path):
+    """#459: enable() без force заменяет legacy socks5h на http-значение, не трогает остальное
+    и не создаёт sidecar-backup (значение наше, не чужое)."""
+    paths = _setup(monkeypatch, tmp_path)
+    _write(paths[0], {"http.proxy": LEGACY_PROXY, "editor.fontSize": 14})
+
+    r = vscode_proxy.enable()
+
+    assert r["ok"] is True, r
+    assert json.loads(paths[0].read_text()) == {"http.proxy": EXPECTED_PROXY, "editor.fontSize": 14}
+    assert not vscode_proxy._backup_path(paths[0]).exists()
+
+
+def test_enable_migrates_when_editors_hold_legacy_and_current(monkeypatch, tmp_path):
+    """#459: Code=legacy, Cursor=текущее — оба значения наши: не mixed-конфликт, миграция без force."""
+    paths = _setup(monkeypatch, tmp_path)
+    _write(paths[0], {"http.proxy": LEGACY_PROXY})
+    _write(paths[1], {"http.proxy": EXPECTED_PROXY})
+    assert vscode_proxy.status()["state"] == "managed-on"
+
+    assert vscode_proxy.enable()["ok"] is True
+
+    for p in paths:
+        assert json.loads(p.read_text())["http.proxy"] == EXPECTED_PROXY
+
+
+def test_enable_force_does_not_back_up_legacy_value(monkeypatch, tmp_path):
+    """#459: force по legacy-значению не кладёт его в sidecar как чужое — иначе disable() вернул бы
+    сломанный socks5h обратно."""
+    paths = _setup(monkeypatch, tmp_path)
+    _write(paths[0], {"http.proxy": LEGACY_PROXY})
+
+    assert vscode_proxy.enable(force=True)["ok"] is True
+
+    assert not vscode_proxy._backup_path(paths[0]).exists()
+
+
+def test_disable_removes_legacy_socks_value(monkeypatch, tmp_path):
+    """#459: disable снимает и legacy-значение — оно наше (value-match provenance, #112)."""
+    paths = _setup(monkeypatch, tmp_path)
+    _write(paths[0], {"http.proxy": LEGACY_PROXY, "other": 1})
+
+    assert vscode_proxy.disable()["ok"] is True
+
+    assert json.loads(paths[0].read_text()) == {"other": 1}

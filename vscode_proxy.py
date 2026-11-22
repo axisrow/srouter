@@ -1,4 +1,4 @@
-"""Вкл/откл scoped SOCKS5-прокси для codex-расширения openai.chatgpt через VSCode `http.proxy`.
+"""Вкл/откл scoped-прокси (HTTP в xray socks-in 10808, #459) для codex-расширения openai.chatgpt через VSCode `http.proxy`.
 
 Контекст (issue #185, эмпирика env-vs-PF вариант 1): VSCode-расширение `openai.chatgpt` запускает
 свой codex-binary (`.vscode/extensions/openai.chatgpt-*/bin/macos-aarch64/codex`), МИМО wrapper
@@ -38,16 +38,23 @@ import proxy_config_contract as _contract
 
 import backup_lib  # sidecar_path: единый источник суффикса lease-бэкапа (PR-1 #339)
 
-# Прокси codex = SOCKS5 xray 10808. Единый источник правды (issue #155) — dashboard_common.
+# Адрес xray socks-in 10808 — единый источник правды (issue #155): dashboard_common.SOCKS_PROXY_URL.
 # except SystemExit (НЕ BaseException): dashboard_common при отсутствии srouter_config.py поднимает
 # SystemExit (BaseException) → except Exception его пропустит, fallback не сработает в install-пути.
 # Ловим именно SystemExit, НЕ BaseException — иначе глотаем реальные ImportError/SyntaxError в самом
 # dashboard_common (канон gen_xray_config.py:34 после PR #162; memory systemexit-breaks-except-...).
 try:
-    from dashboard_common import SOCKS_PROXY_URL as _PROXY  # socks5h://127.0.0.1:10808
+    from dashboard_common import SOCKS_PROXY_URL as _SOCKS  # socks5h://127.0.0.1:10808
 except SystemExit:
-    _PROXY = "socks5h://127.0.0.1:10808"
-PROXY = _PROXY  # контракт для тестов/health
+    _SOCKS = "socks5h://127.0.0.1:10808"
+# Issue #459: HTTP-прокси в тот же xray socks-in (он смешанный: HTTP и SOCKS на одном порту).
+# socks-схему глобальный fetch VS Code отдаёт undici Socks5ProxyAgent, а @vscode/proxy-agent всегда
+# передаёт proxyTls — и undici идёт на SOCKS-порт по TLS (шум «malformed HTTP request \x16\x03» в
+# xray-error.log, fetch расширений падает). HTTP CONNECT несёт имя хоста — DNS удалённый, как у socks5h.
+PROXY = "http://" + urlparse(_SOCKS).netloc  # контракт для тестов/health
+# Значения, которые srouter писал раньше (#185): наши. status() не считает их foreign, enable()
+# заменяет без force, disable() снимает.
+LEGACY_PROXIES = (_SOCKS,)
 
 # Каноничная VSCode user-settings (Code + Cursor). Пользователь может пользоваться любым — покрываем оба.
 # SROUTER_VSCODE_SETTINGS (more-options-better, канон InstallEnv.from_env) — env-override для тестов/кастома:
@@ -71,6 +78,17 @@ SETTINGS_PATHS = _settings_paths()
 
 # VSCode-ключ прокси. Расширение openai.chatgpt читает именно его (workspace.getConfiguration("http").get("proxy")).
 KEY = "http.proxy"
+
+
+def _ours(value):
+    """Значение записал srouter: текущее PROXY или legacy (#459)."""
+    return value == PROXY or value in LEGACY_PROXIES
+
+
+def _classify(data):
+    """Состояние слота (dict settings.json). Legacy-значение — наше, а не foreign (#459)."""
+    val = data.get(KEY, "")
+    return _contract.classify(KEY in data, PROXY if _ours(val) else val, PROXY)
 
 
 def _load(path):
@@ -146,7 +164,7 @@ def status():
             states.append(st)
             continue
         val = data.get(KEY, "")
-        st = _contract.classify(KEY in data, val, PROXY)
+        st = _classify(data)
         per_path[str(path)] = {"present": True, "proxy": val, "state": st}
         states.append(st)
         if val:
@@ -174,11 +192,12 @@ def _read_backup(path):
 
 
 def enable(force=False):
-    """Прописать KEY = SOCKS5 в каждый СУЩЕСТВУЮЩИЙ settings.json редактора. {ok, err, paths, state?}.
+    """Прописать KEY = PROXY в каждый СУЩЕСТВУЮЩИЙ settings.json редактора. {ok, err, paths, state?}.
 
     Несуществующий файл НЕ создаём (VSCode сам создаст при первом запуске — не плодим мусор).
-    Не трогает другие настройки (read-modify-write). Контракт: PROXY обязан быть socks5-схемы
-    (#120 — privoxy/HTTP рвёт WS; #127-класс регрессии).
+    Не трогает другие настройки (read-modify-write). Контракт: PROXY — HTTP в xray socks-in
+    (#127-класс регрессии: privoxy 8118 рвёт WS codex #120, socks-схема ломает fetch VS Code #459).
+    Legacy-значение (#459) — наше: заменяется без force и не уходит в sidecar-backup.
 
     Issue #307: если в любом редакторе чужое значение http.proxy (или mixed) — отказ без
     мутации {ok: False, conflict: True, state}; перезапись только force=True, при этом
@@ -188,9 +207,10 @@ def enable(force=False):
     отказ БЕЗ замены файла (finding 3); состояние каждого файла перечитывается непосредственно
     перед записью — foreign, появившийся между gate и save, не затирается (finding 4).
     """
-    scheme = urlparse(PROXY).scheme.lower()
-    if scheme not in {"socks", "socks5", "socks5h"}:
-        return {"ok": False, "err": f"unsupported proxy scheme for codex (need socks5): {scheme or 'missing'}",
+    url = urlparse(PROXY)
+    if url.scheme != "http" or url.netloc != urlparse(_SOCKS).netloc:
+        return {"ok": False, "err": f"scoped http.proxy обязан быть HTTP в xray socks-in "
+                                    f"{urlparse(_SOCKS).netloc}, а не {PROXY} (#120, #459)",
                 "paths": []}
     gate = {}  # path -> (kind, dict|None) — снапшот, на котором принимается решение
     states = []
@@ -203,7 +223,7 @@ def enable(force=False):
                     "paths": []}
         if kind == "missing":
             continue  # редактор не установлен — ABSENT не участник конфликта
-        gate[path] = (data, _contract.classify(KEY in data, data.get(KEY, ""), PROXY))
+        gate[path] = (data, _classify(data))
         states.append(gate[path][1])
     state = _contract.aggregate(states)
     if _contract.needs_force(state) and not force:
@@ -228,7 +248,7 @@ def enable(force=False):
             return {"ok": False, "conflict": True, "state": state,
                     "err": f"{path}: settings.json изменился во время операции — повторите",
                     "paths": changed}
-        if force and KEY in data and data[KEY] != PROXY:
+        if force and KEY in data and not _ours(data[KEY]):
             # Provenance: чужое значение, которое сейчас затрём, — в sidecar-backup.
             backup = {"http.proxy": data[KEY]}
             try:
@@ -248,7 +268,7 @@ def enable(force=False):
 
 
 def disable(*, skip_paths=()):
-    """Убрать KEY из settings.json, ТОЛЬКО если val == PROXY (чужой не трогаем). {ok, err}. Идемпотентно.
+    """Убрать KEY из settings.json, ТОЛЬКО если значение наше (PROXY или legacy #459). {ok, err}. Идемпотентно.
 
     fail-closed provenance (#112): корпоративный/ручной http.proxy ≠ PROXY → оставляем на месте.
     Issue #307: если force-enable раньше перезаписал чужое значение — восстанавливаем его из
@@ -262,7 +282,7 @@ def disable(*, skip_paths=()):
         data = _load(path)
         if not isinstance(data, dict):
             continue  # missing/invalid — не наше, не трогаем (no mutation, ok)
-        if data.get(KEY) == PROXY:
+        if _ours(data.get(KEY)):
             backup = _read_backup(path)
             backup_consumed = False
             if isinstance(backup, dict) and backup.get(KEY) != PROXY:
