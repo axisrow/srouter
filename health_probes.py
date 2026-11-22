@@ -431,8 +431,8 @@ def _local_proxy_up():
             # facets вычислены, но не должны теряться, а restart-подсказка не должна вести к
             # рестарту privoxy поверх живой альтернативной регистрации.
             restart_hint += f"; privoxy НЕ рестартить — {'; '.join(facets)}"
-        result = {"status": "down",
-                  "detail": f"локальный прокси упал: {'; '.join(problems)}. Restart: {restart_hint}"}
+        result: dict = {"status": "down",  # разнотипные значения: str-поля + facets-список (#341)
+                        "detail": f"локальный прокси упал: {'; '.join(problems)}. Restart: {restart_hint}"}
         if facets:
             result["facets"] = facets
         return result
@@ -1259,8 +1259,9 @@ def _bulk_probe(url=None, expected_bytes=None):
         speed = float(tokens[6])
     except (IndexError, TypeError, ValueError):
         speed = None
+    raw_rc = r.get("rc")  # None = процесс не создан (OSError-ветка run()) → connection-failed ниже
     try:
-        rc = int(r.get("rc"))
+        rc = int(raw_rc) if raw_rc is not None else None
     except (TypeError, ValueError):
         rc = None
     status = _bulk_status(rc, code, bytes_dl, expected)
@@ -1471,8 +1472,9 @@ def _vps_endpoint(node):
     host = node.get("endpoint_host")
     if not isinstance(host, str) or not host or not local_state._is_valid_host(host):
         return None, None
+    raw_port = node.get("port")  # ключа port у узла может не быть — дефолт как у _safe_port
     try:
-        port = int(node.get("port"))
+        port = int(raw_port) if raw_port is not None else 443
     except (TypeError, ValueError):
         port = 443  # как gen_xray_config._safe_port default — Reality на TLS 443
     if not (1 <= port <= 65535):
@@ -1571,7 +1573,8 @@ def _upstream_vps_reachable(node=None, *, instant_max=VPS_TCP_PROBE_INSTANT_MAX)
             src = "рабочий xray config"
             if not isinstance(port, int) or not (1 <= port <= 65535):
                 port = 443  # ponytail: port из node (config-reader не отдаёт port), рассинхрон порта не доказан
-    if host is None:
+    # _vps_endpoint возвращает пары (None, None) — host и port опустошаются вместе, сужаем оба.
+    if host is None or port is None:
         return {"status": "info",
                 "detail": "нет активного узла / endpoint_host (VPS-probe неприменим)"}
     # Placeholder TEST-NET — детект ДО пробы: TCP до 203.0.113.x ничего не доказывает.

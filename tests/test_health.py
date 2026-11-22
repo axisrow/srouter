@@ -6032,6 +6032,7 @@ def test_tunnel_up_keeps_first_target_timing_for_series(monkeypatch):
     monkeypatch.setattr(health.sys_probe, "run", fake_run)
     ok, detail, vendor, timings = health._tunnel_up()
     assert ok is True
+    assert timings is not None  # канарейки TUNNEL_TARGETS непусты — None-ветка контракта недостижима
     assert timings[0]["target"] == "api.anthropic.com"
     assert timings[0]["code"] == "503"
     assert timings[1]["code"] == "200"
@@ -7174,6 +7175,7 @@ def test_tunnel_up_dedups_extras_by_host_not_url(monkeypatch):
     monkeypatch.setattr(health.sys_probe, "run", _tunnel_curl_returning("404"))
     ok, _, _, timings = health._tunnel_up(extra_targets=["https://api.anthropic.com"])
     assert ok is True
+    assert timings is not None  # дедуп срабатывает на списке — None-ветка недостижима
     hosts = [t.get("target") for t in timings]
     assert hosts.count("api.anthropic.com") == 1, "дубль канарейки отсечён по хосту"
 
@@ -7194,6 +7196,7 @@ def test_tunnel_window_stats_tail_covers_window_with_multi_target_writes(tmp_pat
                      for host in extras)
     log = tmp_path / "metrics.jsonl"
     log.write_text("\n".join(lines) + "\n")
+    assert _REAL_TUNNEL_WINDOW_STATS is not None  # гвард getattr-дефолта, как в counts_fails_in_window
     stats = _REAL_TUNNEL_WINDOW_STATS(now=now, log_path=str(log))
     assert stats == {"fails": 15, "samples": 15, "rate": 1.0}
 
@@ -7202,7 +7205,9 @@ def test_metrics_canary_target_guard_matches_first_tunnel_target():
     """Гвард связки констант: канареечный фильтр серий = хост первой канарейки. Смена
     TUNNEL_TARGETS без METRICS_CANARY_TARGET молча опустошила бы все фильтры и деградация
     перестала бы детектиться (cycle-review PR #378)."""
-    assert health.TUNNEL_TARGETS, "канарейки не пусты"
+    # Гвард для будущего редактора TUNNEL_TARGETS: pyright доказывает truthy на ТЕКУЩЕМ литерале,
+    # но проверка существует против будущей правки константы — гасим, не удаляем.
+    assert health.TUNNEL_TARGETS, "канарейки не пусты"  # pyright: ignore[reportAssertAlwaysTrue]
     assert urlsplit(health.TUNNEL_TARGETS[0]).hostname == \
         metrics_store.METRICS_CANARY_TARGET
 
