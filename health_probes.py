@@ -1040,9 +1040,16 @@ def _tunnel_delivery_check(gfw_status):
     Возвращает {status, detail}:
       ok   — github через прокси жив (туннель доставляет);
       down — github через прокси мёртв ПРИ подтверждённой GFW-резке (туннель не доставляет);
-      info — резка не подтверждена (github напрямую открыт / контроль недоступен — не различить).
+      info — резка не подтверждена (github напрямую открыт / контроль недоступен — не различить)
+             или github-direct on (github через прокси = тот же direct — туннель не проверяется).
     Не бросает (probe-канон).
     """
+    if _health_facade._github_direct_split_check().get("direct"):
+        # github-direct on: правило _srouter_github шлёт github в direct ВЫШЕ managed — канарейка
+        # «через прокси» ходит тем же direct (инцидент 2026-11-22: «смерть Reality» при живом туннеле).
+        return {"status": "info",
+                "detail": "github-direct on: github через прокси идёт напрямую — канарейка туннель не "
+                          "проверяет (вернуть github в туннель: `srouter github-direct off`)"}
     ok, detail, kind, _timing = _health_facade._tunnel_target_up(_TUNNEL_DELIVERY_URL, head=True)
     if ok:
         return {"status": "ok",
@@ -1128,15 +1135,27 @@ def _github_fallback_check():
       down    — оба пути мёртвы → подождать минуты; ретрай той же команды дёшев (окна короткие);
       unknown — мусор от проб (не dict).
     Обе пробы — на один хост: путь пробы = путь git-ретрая (канарейка #418, github.com).
+    github-direct on: socks5h 10808 для github — тот же direct (правило _srouter_github выше
+    managed), второго пути нет → socks-пробу не зовём; direct мёртв → down + `srouter github-direct off`.
+    Ретрай — urlmatch-ключом: generic http.proxy перекрыт managed http.https://github.com.proxy.
     Не бросает (probe-канон).
     """
     host = "github.com"
     direct = _health_facade._direct_domain_probe(host)
-    socks = _health_facade._github_socks_probe(host)
+    split_direct = bool(_health_facade._github_direct_split_check().get("direct"))
+    socks = {} if split_direct else _health_facade._github_socks_probe(host)
     if not isinstance(direct, dict) or not isinstance(socks, dict):
         return {"status": "unknown", "detail": "github-fallback: пробы вернули мусор (не dict)"}
     d_kind, s_kind = direct.get("kind"), socks.get("kind")
-    retry_cmd = f"git -c http.proxy={_SOCKS_PROXY} clone|push|fetch"
+    if split_direct:
+        if direct.get("reachable"):
+            return {"status": "ok",
+                    "detail": f"direct github.com жив ({d_kind}) — git работай как есть "
+                              f"(github-direct on: socks5h 10808 для github — тот же direct)"}
+        return {"status": "down", "retry_cmd": "srouter github-direct off",
+                "detail": f"direct мёртв ({d_kind} — GFW-окно); github-direct on: socks5h 10808 для "
+                          f"github — тот же direct, ретрай через него бесполезен — верни github в туннель"}
+    retry_cmd = f"git -c http.https://github.com.proxy={_SOCKS_PROXY} clone|push|fetch"
     if direct.get("reachable"):
         if socks.get("reachable"):
             return {"status": "ok",
