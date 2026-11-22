@@ -640,7 +640,8 @@ def select_node_surgical(name, *, enabled_names=None, runner=None, state_path=No
     (_atomic_write_text), rollback + recovery-рестарт при любой неудаче. Placeholder-
     reality узла (public_key/uuid "PLACEHOLDER" — класс sg-1 из state) = отказ ДО мутаций
     (санитайзеры _vless_outbound такое пропускают — мёртвый Reality). После commit —
-    пост-шаг: IP нового узла в managed-правило через routing_apply (её idempotent-gate
+    пост-шаг: IP нового узла в ip-only правило (_srouter_managed_ips) через routing_apply
+    (её idempotent-gate
     гасит лишний рестарт; провал — только предупреждение result["route_ip_apply"]:
     переключение уже применено и закоммичено).
 
@@ -784,7 +785,7 @@ def select_node_surgical(name, *, enabled_names=None, runner=None, state_path=No
             return {"ok": False, "changed": False, "step": "lock",
                     "err": f"config_lock_failed:{exc}", "from": previous, "to": previous}
 
-        # --- пост-шаг ВНЕ flock: IP нового узла в managed-правило (idempotent) ---
+        # --- пост-шаг ВНЕ flock: IP нового узла в ip-only правило _srouter_managed_ips (idempotent) ---
         result = {"ok": True, "changed": True, "step": "done", "from": previous, "to": name}
         try:
             route_res = local_state.routing_apply(
