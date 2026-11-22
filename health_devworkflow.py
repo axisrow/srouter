@@ -9,6 +9,7 @@ from pathlib import Path
 import logging
 
 import git_proxy  # git github-proxy: managed SOCKS5 xray в ~/.gitconfig (#130, инцидент 2026-10-10)
+import health as _health_facade  # noqa: E402 — резолвит inter-module вызовы через health для monkeypatch (канон #158)
 
 _log = logging.getLogger("srouter.health")
 
@@ -173,9 +174,16 @@ def _github_direct_check():
                           f"http.https://github.com.proxy. "
                           + GH_DIRECT_HINT}
     if layer == "global-urlmatch":
+        # github-direct on: xray шлёт github из 10808 в direct (правило _srouter_github выше managed) —
+        # VPS не участвует, git бьют GFW-окна direct (инцидент 2026-11-22).
+        if _health_facade._github_direct_split_check().get("direct"):
+            via = ("xray шлёт github в direct (github-direct on) — VPS не участвует, GFW-окна direct "
+                   "бьют и по git; вернуть github в туннель: `srouter github-direct off`")
+        else:
+            via = "git pull/push зависит от VPS"
         return {"status": "warn",
-                "detail": f"git github-proxy ВКЛЮЧЁН ({proxy or 'xray SOCKS5 10808'}) → "
-                          f"git pull/push зависит от VPS. " + GH_DIRECT_HINT}
+                "detail": f"git github-proxy ВКЛЮЧЁН ({proxy or 'xray SOCKS5 10808'}) → {via}. "
+                          + GH_DIRECT_HINT}
     if layer == "global-generic":
         return {"status": "warn",
                 "detail": f"git→github идёт через БЕСХОЗНЫЙ глобальный слой ({proxy}; {eff.get('detail')}) "

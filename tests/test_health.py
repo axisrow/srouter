@@ -7503,6 +7503,25 @@ def test_tunnel_delivery_info_when_tunnel_already_down(monkeypatch):
     assert td.get("info") is True, "туннель уже driver — доставка info (не дублируем)"
 
 
+def test_tunnel_delivery_info_when_github_direct_on(monkeypatch):
+    """Инцидент 2026-11-22: github-direct on — правило _srouter_github шлёт github в direct ВЫШЕ
+    managed, «github через прокси» = тот же direct, туннель не участвует. Его смерть при GFW-резке —
+    окно direct, не «смерть Reality»: info, не driver (иначе ложное «пассажиры туннеля легли»
+    при живом туннеле — probe 11081 на тот же узел отдавал 6/6)."""
+    _all_up_monkey(monkeypatch)
+    _mock_gfw_status(monkeypatch, "gfw")
+    _mock_proxy_github(monkeypatch, ok=False)
+    monkeypatch.setattr(health, "_github_direct_split_check",
+                        lambda *a, **kw: {"status": "info", "direct": True,
+                                          "detail": "github ходит напрямую (режим on)"})
+    result = health.check_all(active_claude=True)
+    td = next((c for c in result["checks"] if "доставка" in c["name"]), None)
+    assert td is not None
+    assert td.get("info") is True, "в режиме on канарейка туннель не проверяет — не driver"
+    assert "github-direct" in td["detail"], "detail называет причину: режим on"
+    assert result["status"] == "ok", "ложный driver-down не роняет вердикт"
+
+
 # Пассажиры туннеля в detail доставки (2026-10-29, ChatGPT-инцидент): приложение-пробы
 # зелёные (локальная нога «app → 10808» жива), а лежат ВСЕ whitelist-домены за reality-out.
 # Красная канарейка github не называет, КТО ещё лег — operator не находит связь с ChatGPT

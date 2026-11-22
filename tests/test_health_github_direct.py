@@ -19,12 +19,23 @@ srouter-critical-infra-24-7 (dev-workflow не должен зависеть о�
   status="warn"    — эффективный прокси есть → подсказка по конкретному слою;
   status="unknown" — effective_proxy unknown/ошибка (git config timeout/мусор).
 """
+import pytest
+
 import git_proxy
 import health
 
 # Реальный тестируемый чек — канонический _all_up_monkey его мокает, тесты check_all ниже
 # восстанавливают поверх (паттерн _REAL_NETWORK_INTERFACE_UP из test_health.py, #271).
 _REAL_GITHUB_DIRECT_CHECK = health._github_direct_check
+
+SPLIT_ON = {"status": "info", "direct": True, "detail": "github ходит напрямую (режим on)"}
+
+
+@pytest.fixture(autouse=True)
+def _github_direct_split_unknown(monkeypatch):
+    """Режим github-direct — с фасада, не из живого xray-конфига dev-машины (там он бывает on)."""
+    monkeypatch.setattr(health, "_github_direct_split_check",
+                        lambda *a, **kw: {"status": "unknown", "detail": "mock: split не выполнен"})
 
 
 # ============================ _github_direct_check: предикаты по effective_proxy ============================
@@ -58,6 +69,19 @@ def test_warn_detail_mentions_gh_go_stack_and_vps_independence(monkeypatch):
     detail = res["detail"].lower()
     assert "gh" in detail
     assert "vps" in detail or "напрямую" in detail
+
+
+def test_managed_proxy_with_github_direct_on_is_not_vps_dependent(monkeypatch):
+    """Инцидент 2026-11-22: github-direct on → xray шлёт github из 10808 в direct. git через
+    managed-прокси от VPS НЕ зависит — его бьют GFW-окна direct; «зависит от VPS» — ложь."""
+    monkeypatch.setattr(git_proxy, "effective_proxy",
+                        lambda repo=None: {"proxy": "socks5h://127.0.0.1:10808",
+                                           "layer": "global-urlmatch", "detail": "managed-on"})
+    monkeypatch.setattr(health, "_github_direct_split_check", lambda *a, **kw: dict(SPLIT_ON))
+    res = health._github_direct_check()
+    assert res["status"] == "warn"
+    assert "зависит от VPS" not in res["detail"], "в режиме on git через 10808 идёт direct"
+    assert "github-direct off" in res["detail"], "подсказка: как вернуть github в туннель"
 
 
 def test_hint_distinguishes_gh_env_vs_git_config_stack(monkeypatch):
